@@ -4736,6 +4736,70 @@ impl crate::federation::BlobStorage for PostgresBackend {
         Ok(key)
     }
 
+    async fn load_or_init_content_kem_identity(
+        &self,
+    ) -> Result<
+        crate::federation::identity_aggregate::ContentKemIdentity,
+        crate::federation::BlobError,
+    > {
+        use crate::federation::identity_aggregate::{
+            mint_content_kem_keypair, seal_content_kem_private, ContentKemIdentity,
+        };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+
+        let content_master = self.load_or_init_content_master().await?;
+        // Mint up-front so the INSERT carries the keypair; if a row already
+        // exists the INSERT is a no-op and the STABLE persisted pubkeys are
+        // read back (race-converges on the id=0 PK — re-minting would
+        // orphan peers' prior wraps).
+        let (x_priv, x_pub, ml_priv, ml_pub) = mint_content_kem_keypair()?;
+        let x_pub_b64 = B64.encode(x_pub);
+        let ml_pub_b64 = B64.encode(&ml_pub);
+        let x_priv_sealed = seal_content_kem_private(&content_master, &x_priv)?;
+        let ml_priv_sealed = seal_content_kem_private(&content_master, &ml_priv)?;
+
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_content_kem_identity \
+                    (id, key_kind, content_x25519_pubkey_b64, content_ml_kem_768_pubkey_b64, \
+                     content_x25519_privkey_sealed_b64, content_ml_kem_768_privkey_sealed_b64) \
+                 VALUES (0, 'software', $1, $2, $3, $4) \
+                 ON CONFLICT (id) DO NOTHING",
+                &[&x_pub_b64, &ml_pub_b64, &x_priv_sealed, &ml_priv_sealed],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("content-kem-identity insert: {e}"))
+            })?;
+        let row = client
+            .query_one(
+                "SELECT content_x25519_pubkey_b64, content_ml_kem_768_pubkey_b64 \
+                 FROM cirislens.federation_content_kem_identity WHERE id = 0",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("content-kem-identity select: {e}"))
+            })?;
+        let x25519_pubkey_b64: String = row.safe_get_with::<String, _, _, _>(
+            "content_x25519_pubkey_b64",
+            crate::federation::BlobError::Backend,
+        )?;
+        let ml_kem_768_pubkey_b64: String = row.safe_get_with::<String, _, _, _>(
+            "content_ml_kem_768_pubkey_b64",
+            crate::federation::BlobError::Backend,
+        )?;
+        Ok(ContentKemIdentity {
+            x25519_pubkey_b64,
+            ml_kem_768_pubkey_b64,
+        })
+    }
+
     // v4.1 (CIRISPersist#142, Cut B) — atomic chunked-blob upload.
     // Validates the manifest + every chunk (per-Inline-chunk SHA + size,
     // total_size == sum, 1:1 alignment), then inserts the N chunk rows +

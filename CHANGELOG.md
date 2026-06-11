@@ -5,6 +5,21 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased] — 5.4.0
+
+### Added — versioned `LocalIdentityAggregate` v1 (CIRISPersist#198; CEG 1.0 §5.6.8.8.2)
+
+A single-call snapshot of the local node's federation hybrid identity across the **three distinct §5.6.8.8.2 keypair roles** — so a consumer (the deployed lens-API, CIRISAgent 2.9.6) publishes/addresses the full identity in one call instead of composing four accessors + a derivation + a fallback ladder.
+
+- **`federation::identity_aggregate`** (new module, re-exported): `LocalIdentityAggregate` (`#[derive(Serialize, Deserialize)]`) carries `aggregate_version: u32` (= `1`; crypto-agility headroom — a future ML-KEM-1024 content-KEM bumps to `2`), the signing `key_id`/`pqc_key_id`, the role pubkeys, an optional `did_key` (`None` in v1 — deferred, no base58 dep), the collision-safe `identity_hash`, and `evaluated_at_unix_ms`. Plus `ContentKemIdentity`, `mint_content_kem_keypair`, `seal_content_kem_private`, `LOCAL_IDENTITY_AGGREGATE_VERSION`.
+- **The three roles.** Signing (Ed25519 + ML-DSA-65) — from persist's local signer; Ed25519 required. RET-transport (X25519 + Ed25519) — **`None` in v1** (the #199 seam: populate from `engine.edge.transport_identity_pubkeys()` once ciris-edge >= 2.1.0 is wired). Content-KEM (X25519 + ML-KEM-768) — persist **mints + seals** (this cut).
+- **§5.6.8.8.2 conformance — no derivation.** The content-KEM keypair is **freshly generated** via `ciris_crypto::{x25519::generate_ephemeral_keypair, ml_kem::generate_keypair}` — never an Edwards→Montgomery conversion of the Ed25519 signing key (that would be a conformance violation). It is minted once and **stable** across calls/reboots (idempotent `load_or_init`); re-minting would orphan peers' prior wraps.
+- **V073** (both backends) — `federation_content_kem_identity`, a single-row (`id=0`) table mirroring `federation_content_master` (V070). Stores the two content-KEM pubkeys plus the two **sealed** private halves. The privates are sealed under persist's content-at-rest master via the same AES-256-GCM discipline as the self/family DEK self-retention wrap (`at_rest_cascade::wrap_dek_for_persist`-shaped: `base64(nonce(12) ‖ aes256_gcm(content_master, sk))`), `key_kind` honest about being `software`. v1 surfaces only the pubkeys; the sealed privates are stored for the future at-rest-recipient decrypt path (not exercised here).
+- **`BlobStorage::load_or_init_content_kem_identity`** (both backends), **`Engine::local_identity_aggregate()`**, and **PyO3 `local_identity_aggregate() -> str`** (JSON). The identity_hash is SHA-256 over the present role pubkeys, role-labeled + length-prefixed (the collision-safe digest style of `scoring_factors_cache_key`); absent vs empty-string fields never collide.
+
+### Tests
+Struct-level (module unit tests): mint independence + sizing, seal round-trip via the wrap discipline, v1 shape (signing+KEM present, RET None, did_key None, version 1), identity_hash changes on a field change, absent≠empty, serde JSON round-trip. Backend conformance (both SQLite + live PG): content-KEM is fresh/independent (two backends mint different keypairs) and stable across calls; the full Engine aggregate is shape-conformant, content-KEM x25519 ≠ Ed25519 signing pubkey (§5.6.8.8.2), stable across two calls (identical identity_hash), serde-round-trips; no-signer Engine → error (signing role mandatory). Gates: backend-less `cargo test --features server -D warnings --no-run`; clippy `-D warnings` for full-feature + sqlite-only `--tests`; `cargo check --no-default-features`; `cargo fmt --all`. Live-PG full lib suite (1137) + sqlite-only (1137) green.
+
 ## [5.3.0] — 2026-06-11
 
 ### Added — substrate cache on `aggregate_scoring_factors_batch` (CIRISPersist#195; FSD §7)

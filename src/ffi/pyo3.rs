@@ -2290,6 +2290,89 @@ impl PyEngine {
         })
     }
 
+    /// v5.4.0 (CIRISPersist#198, CEG 1.0 §5.6.8.8.2) — return this node's
+    /// [`LocalIdentityAggregate`](crate::federation::LocalIdentityAggregate)
+    /// as JSON: a single-call snapshot of the federation hybrid identity
+    /// across the three §5.6.8.8.2 keypair roles.
+    ///
+    /// - **Signing** (Ed25519 + ML-DSA-65) — this Engine's local signer.
+    ///   Ed25519 required (raises `ValueError` with no signer); ML-DSA-65
+    ///   present only when a PQC signer is wired.
+    /// - **RET-transport** (X25519 + Ed25519) — **`None` in v1**. (#199):
+    ///   populate from `engine.edge.transport_identity_pubkeys()` once
+    ///   ciris-edge >= 2.1.0 is wired.
+    /// - **Content-KEM** (X25519 + ML-KEM-768) — a freshly-minted,
+    ///   persist-sealed keypair (NOT derived from the signing key —
+    ///   §5.6.8.8.2 forbids derivation), stable across calls/reboots.
+    ///
+    /// The lens publishes one endpoint; agent 2.9.6 calls it once and gets
+    /// the role bundle. Returns JSON-encoded `LocalIdentityAggregate`.
+    fn local_identity_aggregate(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use crate::federation::blobs::BlobStorage;
+            use crate::federation::LocalIdentityAggregate;
+
+            // Signing role — Ed25519 required.
+            let signer = self.local_signer.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "local_identity_aggregate: no local signing key configured (the signing role \
+                     is mandatory — pass local_key_id + local_key_path to the Engine constructor)",
+                )
+            })?;
+            let key_id = signer.key_id().to_string();
+            let pqc_key_id = signer.pqc_key_id().map(str::to_owned);
+            let ed25519_pubkey_b64 = signer.public_key_b64();
+
+            let runtime = self.runtime.clone();
+            let agg = py.detach(move || -> PyResult<LocalIdentityAggregate> {
+                // ML-DSA-65 pubkey read is async (HW signers may dispatch).
+                let ml_dsa_65_pubkey_b64 = runtime
+                    .block_on(async { signer.pqc_public_key_b64().await })
+                    .map_err(local_signer_err_to_py)?;
+
+                // Content-KEM role — persist-minted + sealed (stable).
+                let content = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            backend.load_or_init_content_kem_identity().await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            backend.load_or_init_content_kem_identity().await
+                        })
+                    }
+                }
+                .map_err(blob_err_to_py)?;
+
+                // RET-transport role — None in v1.
+                // RET-transport (#199): populate from
+                // engine.edge.transport_identity_pubkeys() once
+                // ciris-edge>=2.1.0 is wired.
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                Ok(LocalIdentityAggregate::assemble(
+                    key_id,
+                    pqc_key_id,
+                    ed25519_pubkey_b64,
+                    ml_dsa_65_pubkey_b64,
+                    None,
+                    None,
+                    Some(content.x25519_pubkey_b64),
+                    Some(content.ml_kem_768_pubkey_b64),
+                    now_ms,
+                ))
+            })?;
+
+            serde_json::to_string(&agg).map_err(|e| {
+                PyRuntimeError::new_err(format!("LocalIdentityAggregate JSON encode: {e}"))
+            })
+        })
+    }
+
     /// v1.4.0 (CIRISPersist#51) — Sign arbitrary bytes with the local
     /// ML-DSA-65 signing key. Returns the 3309-byte raw signature
     /// (FIPS 204 final).

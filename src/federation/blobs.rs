@@ -985,6 +985,37 @@ pub trait BlobStorage: Send + Sync {
         &self,
     ) -> impl Future<Output = Result<[u8; 32], BlobError>> + Send;
 
+    /// v5.4.0 (CIRISPersist#198, CEG 1.0 §5.6.8.8.2) — load this node's
+    /// **content-KEM identity** (the content-encryption keypair role of
+    /// the [`LocalIdentityAggregate`](crate::federation::LocalIdentityAggregate)),
+    /// minting + sealing it once on first call.
+    ///
+    /// On first call: mint a FRESH X25519 keypair + ML-KEM-768 keypair
+    /// via `ciris_crypto` (independent of the signing key —
+    /// §5.6.8.8.2 forbids deriving the content-KEM x25519 from any other
+    /// role key), seal the two PRIVATE halves under the content master via
+    /// [`load_or_init_content_master`](Self::load_or_init_content_master)
+    /// and [`seal_content_kem_private`](crate::federation::identity_aggregate::seal_content_kem_private)
+    /// (the same AES-256-GCM discipline as the self/family DEK
+    /// self-retention wrap), and persist them with the two pubkeys in the
+    /// single-row `federation_content_kem_identity` table (V073).
+    ///
+    /// **Idempotent / STABLE**: the keypair is minted once and read back
+    /// on every subsequent call (concurrent first-callers race on the
+    /// `id=0` PK and converge on the persisted value). Re-minting would
+    /// orphan every grant a peer has already wrapped to the prior
+    /// pubkeys, so first-write wins.
+    ///
+    /// Returns only the two **public** halves (what the aggregate
+    /// publishes + what peers wrap to). The sealed privates are stored
+    /// for the future at-rest-recipient decrypt path — not exercised in
+    /// v1.
+    fn load_or_init_content_kem_identity(
+        &self,
+    ) -> impl Future<
+        Output = Result<crate::federation::identity_aggregate::ContentKemIdentity, BlobError>,
+    > + Send;
+
     /// List the `key_id`s of every **currently-live** attester that
     /// has emitted a `holds_bytes:sha256:<prefix>` attestation for
     /// this blob.

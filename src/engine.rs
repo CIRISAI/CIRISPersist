@@ -1286,6 +1286,76 @@ impl Engine {
         }
     }
 
+    /// v5.4.0 (CIRISPersist#198, CEG 1.0 §5.6.8.8.2) — assemble this
+    /// node's [`LocalIdentityAggregate`](crate::federation::LocalIdentityAggregate):
+    /// a single-call snapshot of the federation hybrid identity across
+    /// the three §5.6.8.8.2 keypair roles.
+    ///
+    /// - **Signing** (Ed25519 + ML-DSA-65) — from this Engine's local
+    ///   signer. Ed25519 is required (an Engine with no local signer
+    ///   errors); ML-DSA-65 is `Some` only when a PQC signer is wired.
+    /// - **RET-transport** (X25519 + Ed25519) — **`None` in v1**. (#199):
+    ///   populate from `engine.edge.transport_identity_pubkeys()` once
+    ///   ciris-edge >= 2.1.0 is wired.
+    /// - **Content-KEM** (X25519 + ML-KEM-768) — a freshly-minted,
+    ///   persist-sealed keypair (NOT derived from the signing key —
+    ///   §5.6.8.8.2), loaded via
+    ///   [`load_or_init_content_kem_identity`](crate::federation::BlobStorage::load_or_init_content_kem_identity).
+    ///
+    /// The `identity_hash` is computed over the present role pubkeys; the
+    /// `aggregate_version` is `1`; `evaluated_at_unix_ms` is now.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn local_identity_aggregate(
+        &self,
+    ) -> Result<crate::federation::LocalIdentityAggregate, crate::federation::BlobError> {
+        use crate::federation::blobs::BlobStorage;
+        use crate::federation::LocalIdentityAggregate;
+
+        // ── Signing role — Ed25519 required, ML-DSA-65 optional. ──
+        let signer = self.local_signer.as_ref().ok_or_else(|| {
+            crate::federation::BlobError::Backend(
+                "local_identity_aggregate: no local signing key configured (the signing role is \
+                 mandatory — construct the Engine with local_key_id + local_key_path)"
+                    .to_string(),
+            )
+        })?;
+        let key_id = signer.key_id().to_string();
+        let pqc_key_id = signer.pqc_key_id().map(str::to_owned);
+        let ed25519_pubkey_b64 = signer.public_key_b64();
+        let ml_dsa_65_pubkey_b64 = signer
+            .pqc_public_key_b64()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("ml-dsa-65 pubkey: {e}")))?;
+
+        // ── Content-KEM role — persist-minted + sealed (stable). ──
+        let content = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.load_or_init_content_kem_identity().await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.load_or_init_content_kem_identity().await?,
+        };
+
+        // ── RET-transport role — None in v1 (#199 seam). ──
+        // RET-transport (#199): populate from
+        // engine.edge.transport_identity_pubkeys() once ciris-edge>=2.1.0
+        // is wired.
+        let reticulum_x25519_pubkey_b64 = None;
+        let reticulum_ed25519_pubkey_b64 = None;
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        Ok(LocalIdentityAggregate::assemble(
+            key_id,
+            pqc_key_id,
+            ed25519_pubkey_b64,
+            ml_dsa_65_pubkey_b64,
+            reticulum_x25519_pubkey_b64,
+            reticulum_ed25519_pubkey_b64,
+            Some(content.x25519_pubkey_b64),
+            Some(content.ml_kem_768_pubkey_b64),
+            now_ms,
+        ))
+    }
+
     /// v3.5.0 (CIRISPersist#125) — Engine-facade for
     /// [`BlobStorage::list_held_by`](crate::federation::BlobStorage::list_held_by).
     /// Returns the full SHA-256 of every blob this Engine has a
@@ -4414,5 +4484,129 @@ mod tests {
             after.scrub_signature_classical
         );
         assert_eq!(after2.promoted_at, after.promoted_at);
+    }
+
+    // ── v5.4.0 (CIRISPersist#198, CEG 1.0 §5.6.8.8.2) LocalIdentityAggregate ──
+
+    /// Assert the full v1 aggregate shape + §5.6.8.8.2 conformance on a
+    /// constructed engine: signing role populated, content-KEM `Some` and
+    /// independent of the signing key, RET-transport `None`, version 1,
+    /// stable across two calls, and a clean serde JSON round-trip.
+    ///
+    /// Gated to backend builds: `local_identity_aggregate` exists only
+    /// with a `postgres`/`sqlite` BackendDispatch arm, and this helper is
+    /// called only from the backend-gated tests below.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn assert_local_identity_aggregate_conformance(engine: &Engine) {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+
+        let agg = engine.local_identity_aggregate().await.expect("aggregate");
+
+        // Version + role presence.
+        assert_eq!(agg.aggregate_version, 1);
+        assert!(!agg.ed25519_pubkey_b64.is_empty(), "signing role required");
+        assert!(
+            agg.ml_dsa_65_pubkey_b64.is_some(),
+            "pqc_signer engine → ML-DSA-65 present"
+        );
+        assert!(
+            agg.reticulum_x25519_pubkey_b64.is_none() && agg.reticulum_ed25519_pubkey_b64.is_none(),
+            "RET-transport role is None in v1 (#199 seam)"
+        );
+        assert!(
+            agg.content_x25519_pubkey_b64.is_some() && agg.content_ml_kem_768_pubkey_b64.is_some(),
+            "content-KEM role populated in v1"
+        );
+        assert!(agg.did_key.is_none(), "did_key deferred in v1");
+        assert_eq!(agg.identity_hash.len(), 64, "sha256 hex identity_hash");
+
+        // §5.6.8.8.2: content-KEM x25519 is NOT the Ed25519 signing pubkey
+        // (no derivation; independently minted).
+        let content_x = agg.content_x25519_pubkey_b64.clone().unwrap();
+        assert_ne!(
+            content_x, agg.ed25519_pubkey_b64,
+            "content-KEM x25519 must never equal the Ed25519 signing pubkey (§5.6.8.8.2)"
+        );
+        assert_eq!(
+            B64.decode(&content_x).unwrap().len(),
+            32,
+            "content-KEM x25519 is 32 raw bytes"
+        );
+        assert_eq!(
+            B64.decode(agg.content_ml_kem_768_pubkey_b64.as_ref().unwrap())
+                .unwrap()
+                .len(),
+            ciris_crypto::ml_kem::ML_KEM_768_PUBKEY_LEN,
+            "content-KEM ML-KEM-768 is 1184 raw bytes"
+        );
+
+        // Stable across two calls (idempotent content-KEM load; identical
+        // pubkeys ⇒ identical identity_hash).
+        let agg2 = engine.local_identity_aggregate().await.expect("aggregate2");
+        assert_eq!(
+            agg.content_x25519_pubkey_b64, agg2.content_x25519_pubkey_b64,
+            "content-KEM x25519 stable across calls"
+        );
+        assert_eq!(
+            agg.content_ml_kem_768_pubkey_b64, agg2.content_ml_kem_768_pubkey_b64,
+            "content-KEM ML-KEM-768 stable across calls"
+        );
+        assert_eq!(
+            agg.identity_hash, agg2.identity_hash,
+            "identity_hash stable across calls"
+        );
+
+        // serde JSON round-trip.
+        let json = serde_json::to_string(&agg).unwrap();
+        let back: crate::federation::LocalIdentityAggregate = serde_json::from_str(&json).unwrap();
+        assert_eq!(agg, back);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn local_identity_aggregate_v1_conformance_sqlite() {
+        let engine = Engine::with_signer(pqc_signer("local-id"), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        assert_local_identity_aggregate_conformance(&engine).await;
+    }
+
+    /// No local signer → the signing role is mandatory → error (not a
+    /// silently-empty aggregate).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn local_identity_aggregate_requires_signing_role() {
+        // `from_shared` yields an Engine with `local_signer: None` (the
+        // cohabitation-view path) — the no-signing-role case.
+        let signed = Engine::with_signer(pqc_signer("local-id"), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let engine = Engine::from_shared(signed.backend().clone(), signed.signer().clone());
+        let err = engine
+            .local_identity_aggregate()
+            .await
+            .expect_err("no signer → error");
+        assert!(
+            matches!(err, crate::federation::BlobError::Backend(ref m) if m.contains("signing")),
+            "got: {err:?}"
+        );
+    }
+
+    /// Live-PG twin of the sqlite conformance test. Skips when
+    /// `CIRIS_PERSIST_TEST_PG_URL` is unset.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn local_identity_aggregate_v1_conformance_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let alias = format!("local-id-{}", uuid::Uuid::new_v4().simple());
+        let engine = Engine::with_signer(pqc_signer(&alias), &dsn)
+            .await
+            .expect("construct PG engine");
+        assert_local_identity_aggregate_conformance(&engine).await;
     }
 }

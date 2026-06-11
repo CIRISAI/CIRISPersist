@@ -42,6 +42,7 @@ pub mod blobs;
 pub mod emit;
 pub mod goal;
 pub mod hardware_attestation;
+pub mod identity_aggregate;
 pub mod location;
 // v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — operational-
 // data admit + merge surface (organization / org_membership /
@@ -112,6 +113,9 @@ pub use goal::{
     MetaGoalAlignment,
 };
 pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE};
+pub use identity_aggregate::{
+    ContentKemIdentity, LocalIdentityAggregate, LOCAL_IDENTITY_AGGREGATE_VERSION,
+};
 pub use operational::{
     MergeIntent, OrgMembership, Organization, PartnerRecord, SignedOrgMembership,
     SignedOrganization, SignedPartnerRecord, SubjectKind,

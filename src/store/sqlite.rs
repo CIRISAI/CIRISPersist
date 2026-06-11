@@ -4410,6 +4410,59 @@ impl crate::federation::BlobStorage for SqliteBackend {
         Ok(key)
     }
 
+    async fn load_or_init_content_kem_identity(
+        &self,
+    ) -> Result<
+        crate::federation::identity_aggregate::ContentKemIdentity,
+        crate::federation::BlobError,
+    > {
+        use crate::federation::identity_aggregate::{
+            mint_content_kem_keypair, seal_content_kem_private, ContentKemIdentity,
+        };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+
+        // Mint a fresh content-KEM keypair up-front so the INSERT carries
+        // it; if a row already exists the INSERT is a no-op and we read
+        // the persisted pubkeys back (race-converges on the id=0 PK). The
+        // freshly-minted material is discarded in the conflict case — the
+        // STABLE persisted keypair always wins (re-minting would orphan
+        // peers' prior wraps).
+        let content_master = self.load_or_init_content_master().await?;
+        let (x_priv, x_pub, ml_priv, ml_pub) = mint_content_kem_keypair()?;
+        let x_pub_b64 = B64.encode(x_pub);
+        let ml_pub_b64 = B64.encode(&ml_pub);
+        let x_priv_sealed = seal_content_kem_private(&content_master, &x_priv)?;
+        let ml_priv_sealed = seal_content_kem_private(&content_master, &ml_priv)?;
+
+        let conn = self.conn.clone();
+        let (stored_x, stored_ml) = (move || -> Result<(String, String), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_content_kem_identity \
+                    (id, key_kind, content_x25519_pubkey_b64, content_ml_kem_768_pubkey_b64, \
+                     content_x25519_privkey_sealed_b64, content_ml_kem_768_privkey_sealed_b64) \
+                 VALUES (0, 'software', ?1, ?2, ?3, ?4) \
+                 ON CONFLICT (id) DO NOTHING",
+                rusqlite::params![x_pub_b64, ml_pub_b64, x_priv_sealed, ml_priv_sealed],
+            )?;
+            conn.query_row(
+                "SELECT content_x25519_pubkey_b64, content_ml_kem_768_pubkey_b64 \
+                 FROM federation_content_kem_identity WHERE id = 0",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("load_or_init_content_kem_identity: {e}"))
+        })?;
+
+        Ok(ContentKemIdentity {
+            x25519_pubkey_b64: stored_x,
+            ml_kem_768_pubkey_b64: stored_ml,
+        })
+    }
+
     // v4.1 (CIRISPersist#142, Cut B) — atomic chunked-blob upload.
     // Validates the manifest + every chunk (per-Inline-chunk SHA + size,
     // total_size == sum, 1:1 alignment), then inserts the N chunk rows +
@@ -21855,5 +21908,50 @@ mod tests {
                 "a different root at the same (stream, subscriber, k) must reject, got: {err:?}"
             );
         }
+    }
+
+    // ── v5.4.0 (CIRISPersist#198, CEG 1.0 §5.6.8.8.2) content-KEM identity ──
+
+    /// §5.6.8.8.2 conformance: the minted content-KEM x25519 is a FRESH,
+    /// independent key — never derived from the Ed25519 signing key — and
+    /// the keypair is STABLE across calls (idempotent load_or_init), so
+    /// peers' prior wraps are never orphaned.
+    #[tokio::test]
+    async fn content_kem_identity_is_fresh_independent_and_stable() {
+        use crate::federation::blobs::BlobStorage;
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let first = backend.load_or_init_content_kem_identity().await.unwrap();
+        // Well-formed: x25519 = 32 raw bytes, ML-KEM-768 = 1184 raw bytes.
+        assert_eq!(B64.decode(&first.x25519_pubkey_b64).unwrap().len(), 32);
+        assert_eq!(
+            B64.decode(&first.ml_kem_768_pubkey_b64).unwrap().len(),
+            ciris_crypto::ml_kem::ML_KEM_768_PUBKEY_LEN
+        );
+
+        // Stable across calls within a backend: same pubkeys back
+        // (idempotent — re-minting would orphan peers' prior wraps).
+        let second = backend.load_or_init_content_kem_identity().await.unwrap();
+        assert_eq!(first.x25519_pubkey_b64, second.x25519_pubkey_b64);
+        assert_eq!(first.ml_kem_768_pubkey_b64, second.ml_kem_768_pubkey_b64);
+
+        // §5.6.8.8.2 independence: a SECOND, separate backend mints a
+        // DIFFERENT content-KEM keypair — proving fresh CSPRNG generation,
+        // not derivation from any shared/deterministic input.
+        let other = SqliteBackend::open_in_memory().await.unwrap();
+        other.run_migrations().await.unwrap();
+        let other_id = other.load_or_init_content_kem_identity().await.unwrap();
+        assert_ne!(
+            first.x25519_pubkey_b64, other_id.x25519_pubkey_b64,
+            "two independent mints must differ (fresh keygen, no derivation)"
+        );
+        assert_ne!(
+            first.ml_kem_768_pubkey_b64, other_id.ml_kem_768_pubkey_b64,
+            "two independent ML-KEM-768 mints must differ"
+        );
     }
 }
