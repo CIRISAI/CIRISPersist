@@ -676,6 +676,18 @@ jobs:
           - { os: ubuntu-latest,    label: linux-x86_64,   tag: manylinux_2_34_x86_64 }
           - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64 }
           - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64 }
+          # v5.5.4 (CIRISPersist#205) — windows-x86_64 wheel, Win7-capable
+          # FROM DAY ONE. persist shipped no Windows wheel before this; #205
+          # asks us to bake Win7 in rather than retrofit. Built with the
+          # Tier-3 `x86_64-win7-windows-msvc` target (nightly + `-Zbuild-std`)
+          # so std keeps the Win7 fallback paths (keyed events,
+          # GetSystemTimeAsFileTime, RtlGenRandom) instead of stable ≥1.78's
+          # hard-imported Win8/Win10 APIs (WaitOnAddress /
+          # GetSystemTimePreciseAsFileTime / ProcessPrng). The artifact runs
+          # unchanged on Win10/11. openssl-sys is satisfied by vcpkg static
+          # x64-windows-static (the `pyo3`→`postgres`→`dep:openssl` chain),
+          # mirroring the proven CIRISEdge#90 setup.
+          - { os: windows-latest,   label: windows-x86_64, tag: win_amd64 }
           # darwin-x86_64 (macos-13) intentionally omitted — GitHub
           # Actions Intel macOS runners have ongoing capacity issues
           # (jobs queue indefinitely). CIRISAgent's matrix dropped it
@@ -705,7 +717,41 @@ jobs:
       - name: install libtss2-dev + libsqlite3-dev (TPM + SQLite build deps)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev libsqlite3-dev
+      # v5.5.4 (CIRISPersist#205) — Windows openssl-sys link. The `pyo3`
+      # feature force-includes `postgres` → `dep:openssl` → openssl-sys;
+      # Linux/macOS have a system OpenSSL, Windows does not. vcpkg's
+      # static x64-windows-static triplet matches openssl-sys's expected
+      # `installed/x64-windows-static/{lib,include}` layout exactly and
+      # links statically, so the wheel has zero runtime OpenSSL dep. This
+      # is the proven CIRISEdge#90 approach (Strawberry-Perl/openssl-src
+      # and Chocolatey both failed there — perl @INC clash / wrong lib
+      # layout respectively).
+      - name: install OpenSSL via vcpkg (static, x64-windows-static)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$VCPKG_INSTALLATION_ROOT/vcpkg" install openssl:x64-windows-static --x-install-root="$VCPKG_INSTALLATION_ROOT/installed"
+          ROOT="$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static"
+          win_root=$(cygpath -w "$ROOT")
+          {
+            echo "OPENSSL_DIR=${win_root}"
+            echo "OPENSSL_LIB_DIR=${win_root}\\lib"
+            echo "OPENSSL_INCLUDE_DIR=${win_root}\\include"
+            echo "OPENSSL_STATIC=1"
+            echo "OPENSSL_NO_VENDOR=1"
+          } >> "$GITHUB_ENV"
+          echo "::notice::OPENSSL_DIR=${win_root} (vcpkg static x64-windows-static)"
+          ls -la "${ROOT}/lib/libssl.lib" "${ROOT}/lib/libcrypto.lib"
+      # Non-Windows: stable. Windows: nightly + rust-src, because the
+      # Tier-3 `x86_64-win7-windows-msvc` target ships no precompiled std,
+      # so the wheel must `-Zbuild-std` it from source (CIRISPersist#205).
       - uses: dtolnay/rust-toolchain@stable
+        if: runner.os != 'Windows'
+      - uses: dtolnay/rust-toolchain@nightly
+        if: runner.os == 'Windows'
+        with:
+          components: rust-src
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -733,8 +779,30 @@ jobs:
       #
       # On macOS, `--auditwheel skip` is a no-op (auditwheel doesn't
       # run there).
-      - name: maturin build
+      - name: maturin build (Linux/macOS)
+        if: runner.os != 'Windows'
         run: maturin build --release --strip --auditwheel skip
+      # v5.5.4 (CIRISPersist#205) — Windows Win7-capable build. nightly +
+      # `-Zbuild-std` (via CARGO_UNSTABLE_BUILD_STD) compiles std from
+      # source for the Tier-3 `x86_64-win7-windows-msvc` target, retaining
+      # the Win7 fallback paths. RUSTUP_TOOLCHAIN=nightly makes the cargo
+      # maturin invokes use nightly; CARGO_BUILD_TARGET routes the build to
+      # the win7 triple (maturin tags it win_amd64 — x86_64 + windows). The
+      # `confirm wheel shape` gate below asserts the cp310-abi3 tag landed.
+      - name: maturin build (Windows — Tier-3 Win7 via build-std)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+          CARGO_BUILD_TARGET: x86_64-win7-windows-msvc
+          CARGO_UNSTABLE_BUILD_STD: std,panic_abort
+        run: |
+          set -euo pipefail
+          if ! rustc --print target-list | grep -qx 'x86_64-win7-windows-msvc'; then
+            echo "::error::x86_64-win7-windows-msvc not in nightly target-list — target may have been renamed; check rustc release notes"
+            exit 1
+          fi
+          maturin build --release --strip --auditwheel skip
       # v3.6.2 (CIRISPersist#136) — explicit auditwheel-repair with
       # libsqlite3 excluded from the bundling pass. This is the same
       # pattern `pyarrow` uses (excludes libssl/libcrypto/libz) and
@@ -896,6 +964,9 @@ jobs:
         # showed mixed-mode maturin can silently emit cp31N-cp31N
         # wheels which break consumer install on other minors. Catching
         # at build time, before the wheel reaches PyPI.
+        # shell: bash so the glob/test syntax runs on Windows too (the
+        # runner default is pwsh).
+        shell: bash
         run: |
           ls -la target/wheels/
           if ! ls target/wheels/*-cp310-abi3-*.whl >/dev/null 2>&1; then
@@ -1249,6 +1320,10 @@ jobs:
             ["ciris_persist-wheel-linux-x86_64"]="x86_64-unknown-linux-gnu"
             ["ciris_persist-wheel-linux-aarch64"]="aarch64-unknown-linux-gnu"
             ["ciris_persist-wheel-darwin-aarch64"]="aarch64-apple-darwin"
+            # v5.5.4 (CIRISPersist#205) — Win7-capable wheel signs under the
+            # consumer-facing windows triple (the win7 build triple is an
+            # implementation detail; consumers match x86_64-pc-windows-msvc).
+            ["ciris_persist-wheel-windows-x86_64"]="x86_64-pc-windows-msvc"
           )
           SIGNED_BINARY_TARGETS=()
           for ARTDIR in "${!WHEEL_TARGET[@]}"; do

@@ -39,7 +39,31 @@ pub enum ComponentType {
     VerbSecondPass,
     /// Individual LLM call (sibling-table candidate).
     LlmCall,
+    /// v5.5.4 (CIRISPersist#203) — Wisdom-Based Deferral routed through
+    /// the LensCore capture fold. Agent 2.9.6 retired the bespoke WBD
+    /// HTTP POST (CIRISAgent#857/#866) — deferrals now ride
+    /// `LensClient.capture_event` as `DEFERRAL_ROUTED`, one of the 5
+    /// Commons Credits events in the closed capture taxonomy. lens-core
+    /// 1.0.1 stamps the component `deferral_routed`; before this variant
+    /// existed the whole trace seal failed `schema_malformed_json` on
+    /// every `$defer` (the deferring thought's entire trace was lost,
+    /// not just the deferral component).
+    DeferralRouted,
     /// Forward-compat fallback for unrecognized component types.
+    ///
+    /// v5.5.4 (CIRISPersist#203) — gains `#[serde(other)]`, mirroring
+    /// `ReasoningEventType::Unknown` (this file, line ~116), which got
+    /// the same treatment after CIRISLens#13. Without it, ANY component
+    /// value outside the closed set above fails the *entire* trace seal
+    /// rather than degrading — so the remaining Commons Credits capture
+    /// variants (and any future one) now ingest as `Unknown` instead of
+    /// 422'ing the whole trace. Promote a variant out of `Unknown` (like
+    /// `DeferralRouted` above) when persist needs its discriminant value.
+    ///
+    /// AV-15 safe: `#[serde(other)]` carries no payload (no
+    /// attacker-controlled bytes echoed); serializes back as
+    /// `"unknown"` regardless of the rejected input.
+    #[serde(other)]
     Unknown,
 }
 
@@ -416,6 +440,36 @@ mod tests {
             serde_json::to_string(&ComponentType::LlmCall).unwrap(),
             r#""llm_call""#
         );
+        // CIRISPersist#203 — the WBD-deferral component from the
+        // LensCore capture fold; must round-trip exactly.
+        assert_eq!(
+            serde_json::to_string(&ComponentType::DeferralRouted).unwrap(),
+            r#""deferral_routed""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ComponentType>(r#""deferral_routed""#).unwrap(),
+            ComponentType::DeferralRouted
+        );
+        assert_eq!(
+            serde_json::to_string(&ComponentType::Unknown).unwrap(),
+            r#""unknown""#
+        );
+    }
+
+    /// CIRISPersist#203 — regression: a component value outside the
+    /// closed set must degrade to `Unknown` (via `#[serde(other)]`),
+    /// never fail the whole trace seal. Before this, lens-core 1.0.1's
+    /// `deferral_routed` (and any future Commons Credits variant)
+    /// 422'd the deferring thought's entire trace `schema_malformed_json`.
+    /// Mirrors `reasoning_event_type_unknown_variant_absorbs_drift`.
+    #[test]
+    fn component_type_unknown_variant_absorbs_drift() {
+        for wire in [r#""some_future_component""#, r#""hot_garbage""#, r#""""#] {
+            let parsed: ComponentType = serde_json::from_str(wire)
+                .unwrap_or_else(|e| panic!("#203 — should absorb {wire}, not fail the seal: {e}"));
+            assert_eq!(parsed, ComponentType::Unknown);
+        }
+        // Catchall serializes back as "unknown" (AV-15: no echo of input).
         assert_eq!(
             serde_json::to_string(&ComponentType::Unknown).unwrap(),
             r#""unknown""#
