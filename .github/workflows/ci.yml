@@ -720,6 +720,14 @@ jobs:
           # bearing for the lens cutover. Add back via manual upload
           # if a real consumer materializes.
     runs-on: ${{ matrix.os }}
+    # ci-perf — single source of truth for the pinned Windows nightly. It
+    # is used in TWO places that MUST agree: the rust-src install below and
+    # RUSTUP_TOOLCHAIN in the build step. If they diverge, `-Zbuild-std`
+    # looks for std source in a toolchain that has no rust-src and fails
+    # ("…/library/Cargo.lock does not exist"). Bump deliberately; the date
+    # is the known-good nightly the v5.5.4 Win7 wheel shipped on.
+    env:
+      NIGHTLY_PIN: nightly-2026-06-12
     steps:
       - uses: actions/checkout@v4
       # v1.10.0 (CIRISPersist#87) — libtss2 for the `tpm` keyring
@@ -778,7 +786,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         if: runner.os == 'Windows'
         with:
-          toolchain: nightly-2026-06-12
+          toolchain: ${{ env.NIGHTLY_PIN }}
           components: rust-src
       # ci-perf — cache the wheel builds. This matrix was the ONLY build
       # job without rust-cache, and it holds the two longest jobs: the
@@ -829,15 +837,17 @@ jobs:
       # v5.5.4 (CIRISPersist#205) — Windows Win7-capable build. nightly +
       # `-Zbuild-std` (via CARGO_UNSTABLE_BUILD_STD) compiles std from
       # source for the Tier-3 `x86_64-win7-windows-msvc` target, retaining
-      # the Win7 fallback paths. RUSTUP_TOOLCHAIN=nightly makes the cargo
-      # maturin invokes use nightly; CARGO_BUILD_TARGET routes the build to
-      # the win7 triple (maturin tags it win_amd64 — x86_64 + windows). The
-      # `confirm wheel shape` gate below asserts the cp310-abi3 tag landed.
+      # the Win7 fallback paths. RUSTUP_TOOLCHAIN pins to the SAME dated
+      # nightly we installed rust-src on above (NIGHTLY_PIN) — using bare
+      # `nightly` here would resolve to a different, auto-installed toolchain
+      # with no rust-src and break build-std. CARGO_BUILD_TARGET routes the
+      # build to the win7 triple (maturin tags it win_amd64 — x86_64 +
+      # windows). The `confirm wheel shape` gate below asserts cp310-abi3.
       - name: maturin build (Windows — Tier-3 Win7 via build-std)
         if: runner.os == 'Windows'
         shell: bash
         env:
-          RUSTUP_TOOLCHAIN: nightly
+          RUSTUP_TOOLCHAIN: ${{ env.NIGHTLY_PIN }}
           CARGO_BUILD_TARGET: x86_64-win7-windows-msvc
           CARGO_UNSTABLE_BUILD_STD: std,panic_abort
         run: |
