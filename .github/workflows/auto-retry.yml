@@ -76,7 +76,17 @@ jobs:
           # ── Signal 2: transient signatures in the failed-step logs (mid-run
           # network/registry blips that DO produce logs). ──
           logs=$(gh run view "$RUN_ID" --repo "$REPO" --log-failed 2>/dev/null || true)
-          transient='Docker pull failed|Initialize containers|toomanyrequests|429 Too Many Requests|TLS handshake timeout|i/o timeout|[Cc]onnection reset|503 Service|502 Bad Gateway|504 Gateway|[Ss]ervice [Uu]navailable|unexpected EOF|net/http: (request canceled|TLS handshake)|failed to (pull|fetch|resolve)|temporary failure in name resolution'
+          # The registry-fetch cluster (HTTP2 framing / download failed /
+          # unable to update registry / curl failed / spurious network
+          # error) covers crates.io sparse-index blips that fail a fresh
+          # `cargo metadata` mid-job — hit 3× during the v6.0.0 cut on
+          # three different jobs (cirisgraph, the aarch64 wheel, the
+          # CanonicalBuild signer). All are unambiguous network signatures;
+          # none appears on a genuine compile/test failure. (The rarer
+          # "no matching package named … found" incomplete-index variant
+          # is deliberately NOT matched — it is indistinguishable from a
+          # genuine typo'd dependency, so it stays red for a human.)
+          transient='Docker pull failed|Initialize containers|toomanyrequests|429 Too Many Requests|TLS handshake timeout|i/o timeout|[Cc]onnection reset|503 Service|502 Bad Gateway|504 Gateway|[Ss]ervice [Uu]navailable|unexpected EOF|net/http: (request canceled|TLS handshake)|failed to (pull|fetch|resolve)|temporary failure in name resolution|HTTP2 framing layer|download of .* failed|unable to update registry|curl failed|spurious network error'
           # Genuine failures we must NEVER auto-rerun (would mask a real red).
           genuine='error\[E[0-9]|error: could not compile|test result: FAILED|panicked at|assertion .*failed|thread .* panicked|cargo (test|clippy|fmt).*error'
 
