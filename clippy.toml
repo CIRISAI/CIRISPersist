@@ -10,7 +10,7 @@
 # Pinning to our declared MSRV (`Cargo.toml`'s `rust-version`)
 # means clippy applies the lint set as it was at that toolchain,
 # even when the runner is newer.
-msrv = "1.75"
+msrv = "1.83"
 
 # We don't override `cognitive-complexity-threshold` etc. — clippy
 # defaults are reasonable for this crate's size. If a future

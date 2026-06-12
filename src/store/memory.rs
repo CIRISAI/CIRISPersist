@@ -569,7 +569,7 @@ impl Backend for MemoryBackend {
             .events
             .values()
             .filter(|(eid, row)| {
-                *eid > after_event_id && agent_id_hash.map_or(true, |h| row.agent_id_hash == h)
+                *eid > after_event_id && agent_id_hash.is_none_or(|h| row.agent_id_hash == h)
             })
             .map(|(eid, row)| (*eid, row.clone()))
             .collect();
@@ -1317,7 +1317,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_organizations
             .values()
-            .filter(|o| since.map_or(true, |s| o.asserted_at > s))
+            .filter(|o| since.is_none_or(|s| o.asserted_at > s))
             .cloned()
             .collect();
         rows.sort_by(|a, b| {
@@ -1338,7 +1338,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_org_memberships
             .values()
-            .filter(|m| since.map_or(true, |s| m.asserted_at > s))
+            .filter(|m| since.is_none_or(|s| m.asserted_at > s))
             .cloned()
             .collect();
         rows.sort_by(|a, b| {
@@ -1359,7 +1359,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_partner_records
             .values()
-            .filter(|p| since.map_or(true, |s| p.asserted_at > s))
+            .filter(|p| since.is_none_or(|s| p.asserted_at > s))
             .cloned()
             .collect();
         rows.sort_by(|a, b| {
@@ -1380,7 +1380,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut rows: Vec<_> = state
             .federation_partner_records
             .values()
-            .filter(|p| since.map_or(true, |s| p.asserted_at > s))
+            .filter(|p| since.is_none_or(|s| p.asserted_at > s))
             .cloned()
             .collect();
         rows.sort_by(|a, b| {
@@ -2604,20 +2604,20 @@ impl crate::outbound::OutboundQueue for MemoryBackend {
             .outbound_queue
             .values()
             .filter(|r| {
-                filter.status.map_or(true, |s| r.status == s)
+                filter.status.is_none_or(|s| r.status == s)
                     && filter
                         .destination_key_id
                         .as_ref()
-                        .map_or(true, |d| r.destination_key_id == *d)
+                        .is_none_or(|d| r.destination_key_id == *d)
                     && filter
                         .sender_key_id
                         .as_ref()
-                        .map_or(true, |s| r.sender_key_id == *s)
+                        .is_none_or(|s| r.sender_key_id == *s)
                     && filter
                         .message_type
                         .as_ref()
-                        .map_or(true, |m| r.message_type == *m)
-                    && filter.enqueued_after.map_or(true, |t| r.enqueued_at >= t)
+                        .is_none_or(|m| r.message_type == *m)
+                    && filter.enqueued_after.is_none_or(|t| r.enqueued_at >= t)
             })
             .cloned()
             .collect();
