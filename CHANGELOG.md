@@ -5,6 +5,16 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [5.5.1] — 2026-06-11
+
+### Fixed — Windows portability (CIRISPersist#200; unblocks CIRISEdge#90 → CIRISLensCore → Agent 2.9.6 Windows wheels)
+
+Two persist lib sites used Unix-only APIs, failing the `windows-x86_64` build of any pyo3 consumer (surfaced on CIRISEdge#88's Windows wheel attempt at `Compiling ciris-persist v5.5.0`):
+- **`src/queue.rs` `shutdown_signal`** — `tokio::signal::unix::{signal, SignalKind}` is `#[cfg(unix)]`. Now cfg-split: Unix keeps SIGTERM+SIGINT; Windows uses the `tokio::signal::windows::{ctrl_c, ctrl_break}` analog (verified against the tokio API). The wheel path never calls this — the host handles signals — so it only needs to compile.
+- **`src/store/postgres.rs`** — `tokio_postgres::config::Host::Unix` is itself `#[cfg(unix)]` (no Unix-domain sockets on Windows); the match arm is now `#[cfg(unix)]`-gated, leaving `Tcp`-only exhaustive on Windows.
+
+Zero behavior change on Unix (clippy + queue tests green). End-to-end Windows validation rides CIRISEdge#88 CI (msvc+vcpkg openssl) — a local windows-gnu cross-check is walled by the `openssl-sys` toolchain, unrelated to these two sites.
+
 ## [5.5.0] — 2026-06-11
 
 ### Added — LocalIdentityAggregate RET-transport role completes the triple (CIRISPersist#199; CIRISEdge#65 v2.1.0)

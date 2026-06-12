@@ -202,6 +202,7 @@ impl PersisterHandle {
 /// process (FastAPI worker) handles signals; the lens shouldn't
 /// call this from inside the wheel. For Phase 1.1 standalone
 /// server, this is the recommended shutdown trigger.
+#[cfg(unix)]
 pub async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
@@ -209,6 +210,22 @@ pub async fn shutdown_signal() {
     tokio::select! {
         _ = term.recv() => tracing::info!("received SIGTERM; beginning graceful shutdown"),
         _ = int.recv()  => tracing::info!("received SIGINT; beginning graceful shutdown"),
+    }
+}
+
+/// Windows analog of [`shutdown_signal`] (CIRISPersist#200): Ctrl+C
+/// (≈ SIGINT) + Ctrl+Break (the closest console-event analog of SIGTERM).
+/// The wheel path never calls this — the host process handles signals —
+/// but the source tree must compile on `windows-x86_64` for the pyo3
+/// consumers (CIRISEdge#90 → CIRISLensCore → Agent 2.9.6 Windows wheels).
+#[cfg(windows)]
+pub async fn shutdown_signal() {
+    use tokio::signal::windows::{ctrl_break, ctrl_c};
+    let mut cc = ctrl_c().expect("install Ctrl+C handler");
+    let mut cb = ctrl_break().expect("install Ctrl+Break handler");
+    tokio::select! {
+        _ = cc.recv() => tracing::info!("received Ctrl+C; beginning graceful shutdown"),
+        _ = cb.recv() => tracing::info!("received Ctrl+Break; beginning graceful shutdown"),
     }
 }
 

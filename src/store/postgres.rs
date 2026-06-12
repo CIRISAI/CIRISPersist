@@ -151,6 +151,11 @@ impl PostgresBackend {
         let mut cfg = Config::new();
         cfg.host = pg_config.get_hosts().first().map(|h| match h {
             tokio_postgres::config::Host::Tcp(s) => s.clone(),
+            // CIRISPersist#200 — `Host::Unix` is `#[cfg(unix)]` in
+            // tokio-postgres (Unix-domain socket addresses don't exist on
+            // Windows). The arm is unreachable on Windows by construction;
+            // the gate keeps the match exhaustive across both targets.
+            #[cfg(unix)]
             tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
         });
         cfg.port = pg_config.get_ports().first().copied();
