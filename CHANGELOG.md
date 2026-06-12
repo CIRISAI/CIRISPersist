@@ -5,6 +5,24 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [5.5.4] — 2026-06-12
+
+### Fixed — trace seal no longer fails on lens-core deferral components (CIRISPersist#203)
+
+`engine.receive_and_persist` rejected any sealed trace carrying a Wisdom-Based Deferral component: agent 2.9.6 retired the bespoke WBD HTTP POST (CIRISAgent#857/#866), so deferrals now ride `LensClient.capture_event` as `DEFERRAL_ROUTED` and lens-core 1.0.1 stamps the component `deferral_routed` — a value absent from persist's `ComponentType` enum. The unknown variant failed serde deserialization → `schema_malformed_json` → the **entire** trace of every `$defer` was lost (not just the deferral component), deterministically, on both backends.
+
+- **`ComponentType::DeferralRouted`** added (serde `deferral_routed`).
+- **`ComponentType::Unknown` gains `#[serde(other)]`** — the root-cause fix. `ReasoningEventType::Unknown` got this after CIRISLens#13 (a 28-43% reject-rate incident from a closed enum rejecting an unknown variant); `ComponentType` never did, so it hard-failed the seal instead of degrading. Now the remaining 4 Commons Credits capture variants — and any future one — ingest as `Unknown` rather than 422'ing the whole trace. AV-15 safe (no payload echo; serializes back as `"unknown"`).
+- Regression tests (both backends via the lib suite): `deferral_routed` round-trips to `DeferralRouted`; out-of-set component values absorb to `Unknown` instead of failing.
+
+### Added — Windows wheel lane, Win7-capable from day one (CIRISPersist#205)
+
+persist published no Windows wheel before this. Rather than ship a stable-toolchain `win_amd64` wheel that silently fails to load on Windows 7 (stable Rust ≥1.78's prebuilt std hard-imports `WaitOnAddress` / `GetSystemTimePreciseAsFileTime` / `ProcessPrng`), the lane builds the Tier-3 **`x86_64-win7-windows-msvc`** target with nightly + `-Zbuild-std`, so std keeps the Win7 fallback paths (keyed events, `GetSystemTimeAsFileTime`, `RtlGenRandom`). The artifact runs unchanged on Win10/11; CIRISAgent's incoming Win7 SP1 tier pins to this floor.
+
+- New `pyo3-wheel` matrix entry `{ windows-latest, win_amd64 }`. openssl-sys (via the `pyo3`→`postgres`→`dep:openssl` chain) is satisfied by vcpkg static `x64-windows-static` — the proven CIRISEdge#90 approach, statically linked so the wheel has zero runtime OpenSSL dependency.
+- build-manifest signs the wheel under the consumer-facing `x86_64-pc-windows-msvc` triple; the `confirm wheel shape` gate (`shell: bash`) asserts the cp310-abi3 tag.
+- The Linux auditwheel / readelf and macOS Mach-O libsqlite3 gates remain OS-scoped and are skipped on Windows.
+
 ## [5.5.3] — 2026-06-12
 
 ### Changed — Postgres: bounded retry on connection acquisition (resilience)
