@@ -397,11 +397,37 @@ impl PostgresBackend {
         &self.pool
     }
 
+    /// Acquire a pooled connection, with a **bounded retry on transient
+    /// acquisition failure** (CIRISPersist#200 follow-on).
+    ///
+    /// Connection *acquisition* is idempotent — no query has run yet — so a
+    /// retry here can never duplicate a write; it only smooths a momentary DB
+    /// unavailability (restart / brief overload / failover, or a CI service-
+    /// container blip — the class behind the rare `nextest` exit-102 flake
+    /// that had no reproducible failing test). The happy path takes one
+    /// iteration (no added cost); a hard-down DB still surfaces the real error
+    /// after a short, bounded backoff (50 + 100 + 150 ms).
     async fn get_client(&self) -> Result<deadpool_postgres::Object, Error> {
-        self.pool
-            .get()
-            .await
-            .map_err(|e| Error::Backend(format!("pool get: {e}")))
+        const MAX_ATTEMPTS: u32 = 4;
+        let mut last_err = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.pool.get().await {
+                Ok(client) => return Ok(client),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            u64::from(attempt) * 50,
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+        Err(Error::Backend(format!(
+            "pool get (after {MAX_ATTEMPTS} attempts): {}",
+            last_err.expect("loop ran at least once")
+        )))
     }
 
     /// v4.7.0 (CIRISPersist#177) — register an `accord_public_keys`

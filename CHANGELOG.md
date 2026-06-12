@@ -5,6 +5,11 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [5.5.3] — 2026-06-12
+
+### Changed — Postgres: bounded retry on connection acquisition (resilience)
+`PostgresBackend::get_client` (the chokepoint every PG op funnels through) now retries a transient `pool.get()` failure up to 4× with short backoff (50/100/150 ms) before surfacing the error. Connection *acquisition* is idempotent — no query has run, so a retry can never duplicate a write — so this only smooths a momentary DB unavailability (restart / brief overload / failover). The happy path is one iteration (no added cost); a hard-down DB still fails after the bounded backoff. Closes the resilience gap behind a rare CI flake (a shared-Timescale-container connection blip surfaced as `nextest` exit-102 with no reproducible failing test — see #200 thread); the auto-retry net remains as defense-in-depth.
+
 ## [5.5.2] — 2026-06-11
 
 ### Security — cargo-deny: ignore RUSTSEC-2026-0177 (pyo3 `new_closure`, API unused by persist)
