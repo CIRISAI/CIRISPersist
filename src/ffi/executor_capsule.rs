@@ -305,27 +305,30 @@ pub fn build_capsule_with_destructor<'py>(
     let executor = build_persist_executor(runtime);
     let boxed_executor: Box<AsyncExecutor> = Box::new(executor);
     let raw: *mut AsyncExecutor = Box::into_raw(boxed_executor);
-    let name = std::ffi::CString::new("ciris_persist::executor_capsule_v1")
-        .expect("static name has no NUL bytes");
     // SAFETY: `raw` was just produced by `Box::into_raw`; we hand it
     // to PyCapsule, which calls the destructor exactly once at GC.
     // The destructor reconstructs the Box (recovering ownership)
     // before invoking vtable.drop on the inner data pointer.
     unsafe {
-        PyCapsule::new_with_destructor(py, raw as usize, Some(name), |raw_usize, _ctx| {
-            let raw_ptr = raw_usize as *mut AsyncExecutor;
-            if raw_ptr.is_null() {
-                return;
-            }
-            // SAFETY: raw_ptr is the pointer we Box::into_raw'd. It
-            // has not been observed by anyone else (the only path
-            // into this destructor is PyCapsule's single-fire GC).
-            let executor: Box<AsyncExecutor> = Box::from_raw(raw_ptr);
-            // Dispatch through the vtable's drop function (lives
-            // inside persist's .so; decrements the Arc<Runtime>).
-            (executor.vtable.drop)(executor.data);
-            // Box deallocates the AsyncExecutor envelope here.
-        })
+        PyCapsule::new_with_value_and_destructor(
+            py,
+            raw as usize,
+            c"ciris_persist::executor_capsule_v1",
+            |raw_usize, _ctx| {
+                let raw_ptr = raw_usize as *mut AsyncExecutor;
+                if raw_ptr.is_null() {
+                    return;
+                }
+                // SAFETY: raw_ptr is the pointer we Box::into_raw'd. It
+                // has not been observed by anyone else (the only path
+                // into this destructor is PyCapsule's single-fire GC).
+                let executor: Box<AsyncExecutor> = Box::from_raw(raw_ptr);
+                // Dispatch through the vtable's drop function (lives
+                // inside persist's .so; decrements the Arc<Runtime>).
+                (executor.vtable.drop)(executor.data);
+                // Box deallocates the AsyncExecutor envelope here.
+            },
+        )
     }
 }
 
