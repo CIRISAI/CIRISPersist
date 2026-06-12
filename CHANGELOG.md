@@ -5,7 +5,10 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [5.5.1] — 2026-06-11
+## [5.5.2] — 2026-06-11
+
+### Security — cargo-deny: ignore RUSTSEC-2026-0177 (pyo3 `new_closure`, API unused by persist)
+The newly-published advisory (pyo3 < 0.29.0 `PyCFunction::new_closure` missing a `Sync` bound) began failing the cargo-deny gate on every push. persist's FFI does **not** use `new_closure` / `new_closure_bound` / `PyCFunction::new` anywhere (verified) — the vulnerable path is unreachable — so it's ignored with justification in `deny.toml`; the pyo3 0.28→0.29 breaking-API migration is tracked separately. (The **v5.5.1 tag is a tombstone**: pushed before this ignore landed, so its CI failed cargo-deny and it never published; v5.5.2 carries the identical #200 fix plus the ignore.)
 
 ### Fixed — Windows portability (CIRISPersist#200; unblocks CIRISEdge#90 → CIRISLensCore → Agent 2.9.6 Windows wheels)
 
