@@ -449,7 +449,7 @@ pub trait FederationDirectory: Send + Sync {
         Ok(self
             .lookup_identity_for_occurrence(occurrence_key_id)
             .await?
-            .filter(|o| o.valid_until.is_none_or(|vu| vu > now))
+            .filter(|o| o.valid_until.map_or(true, |vu| vu > now))
             .and_then(|o| o.encryption_pubkeys))
     }
 

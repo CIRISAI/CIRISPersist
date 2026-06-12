@@ -1,12 +1,12 @@
 [package]
 name = "ciris-persist"
-version = "6.0.0"
+version = "5.5.3"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
 repository = "https://github.com/CIRISAI/CIRISPersist"
 authors = ["CIRIS AI <hello@ciris.ai>"]
-rust-version = "1.83"
+rust-version = "1.75"
 publish = false
 
 # Status: Phase 1 in flight (TDD + MDD; see MISSION.md).
@@ -592,7 +592,7 @@ url     = { version = "2.5", optional = true }
 # it is a separate top-level crate feature (`extension-module`) that
 # maturin turns on for the wheel build. See the `[features]` section.
 # This keeps `cargo test --features pyo3` linking libpython normally.
-pyo3 = { version = "0.29", features = ["abi3-py310"], optional = true }
+pyo3 = { version = "0.28", features = ["abi3-py310"], optional = true }
 
 # v0.6.0 (CIRISPersist#19) — post-ingest filter pipeline deps.
 # Light deps (regex) gate `scrub` + `extract`; heavy ML deps below

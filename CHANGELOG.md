@@ -5,26 +5,6 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [6.0.0] — 2026-06-12
-
-### Changed (BREAKING — dependency ABI) — pyo3 0.28 → 0.29 lockstep; chain-head of the CIRIS wheel family (CIRISPersist#201)
-
-persist is the head of the pyo3-version lockstep chain (**persist → edge → lens-core**). Two pyo3 minors cannot coexist in one Python process — the per-cdylib FFI tables / interpreter state are not ABI-compatible across minors — so a process that loads a pyo3-0.29 persist `.so` alongside a pyo3-0.28 edge `.so` crashes. This is a **cohabitation break**, which is why it lands as a **major** version, not a minor.
-
-**The `<6` ceiling is the firewall.** ciris-edge ≤ 2.1.2 pins `ciris-persist<6,>=5.2.0`. Cutting this as **6.0.0** means an existing edge install's own constraint *excludes* it — `pip install -U ciris-persist` in an edge-2.1.2 env cannot pull the 0.29 wheel, so the break can't happen by accident. There is **no publish-ordering dependency**: persist leads, edge 2.2.0 opts in deliberately with `ciris-persist>=6,<7` + its own pyo3 0.29, lens-core follows. (A 5.6.0 cut would have slipped *under* edge's `<6` and broken naive upgrades — the major bump is load-bearing, not cosmetic.)
-
-**Code (mechanical, FFI surface only — no behavior change):**
-- `src/ffi/pyo3.rs` — the 7 capsule exporters move `PyCapsule::new` (deprecated in 0.29) → `new_with_value`. The name argument type changed `Option<CString>` → `&'static CStr`, so each runtime `CString::new("ciris_persist::…")` is replaced by a compile-time `c"ciris_persist::…"` literal.
-- `src/ffi/executor_capsule.rs` — `new_with_destructor` → `new_with_value_and_destructor`, same `&'static CStr` name fix; the single-fire GC destructor (Box reclaim → vtable drop) is unchanged.
-
-**MSRV 1.75 → 1.83.** pyo3 0.29 sets `rust-version = "1.83"`; `Cargo.toml` + `clippy.toml` (whose MSRV is pinned *to* `Cargo.toml`'s, deliberately) move together. As that pin's own comment predicts, raising the lint floor surfaced 12 `clippy::unnecessary_map_or` findings (`Option::is_none_or` stabilized in 1.82) — applied via `clippy --fix` across `store/memory.rs`, `federation/location.rs`, `federation/mod.rs`. All are `map_or(true, f)` → `is_none_or(f)`, semantically identical.
-
-### Security — RUSTSEC-2026-0176 + RUSTSEC-2026-0177 genuinely cleared (no longer ignored)
-Both advisories are pyo3 `< 0.29.0` and are **fixed** in 0.29.0, so the two `deny.toml` ignores added in v5.5.2 (the `nth`/`nth_back` OOB read and the `new_closure` `Sync` bound — both verified unreachable in persist, but ignored to unblock the gate) are **removed**. cargo-deny now passes on `advisories ok` without them — the vulnerable code is gone from the tree, not merely walled off.
-
-### Tests
-Full local gate green under pyo3 0.29: build (pyo3,server) · `cargo fmt --check` · clippy `-D warnings` ×3 feature sets (pyo3+server, sqlite-only, postgres+server+pyo3) · backend-less `RUSTFLAGS=-D warnings cargo test --features server --no-run` · `cargo check --no-default-features` · `cargo deny` (advisories ok, ignores dropped) · sqlite lib suite (786) · live-PG lib suite (727) · maturin wheel build + `import ciris_persist` + pytest FFI (9) + capsule runtime smoke (6/8 exporters return a live `PyCapsule`; `local_signer`/`trust_scoring` hit their pre-capsule domain guards on a bare in-memory engine, as designed).
-
 ## [5.5.3] — 2026-06-12
 
 ### Changed — Postgres: bounded retry on connection acquisition (resilience)

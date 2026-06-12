@@ -77,6 +77,17 @@ ignore = [
     # unmaintained ignores above. Re-evaluate when candle/ort upgrade.
     "RUSTSEC-2025-0119",  # number_prefix unmaintained — transitive via indicatif → hf-hub
     "RUSTSEC-2024-0436",  # paste unmaintained — transitive via candle / ort macros
+
+    # v5.5.2 — two pyo3 0.28.x advisories, both fixed in pyo3 0.29.0, both
+    # newly published (began failing the cargo-deny gate). Both vulnerable
+    # paths are UNREACHABLE in persist (verified by grep): persist's FFI
+    # never uses `new_closure`/`PyCFunction::new`, and it only *builds*
+    # PyLists (`PyList::empty` + append) — it never `.nth()`/`.nth_back()`/
+    # `.skip()`-iterates an incoming Python list/tuple. Lifting these
+    # requires the pyo3 0.28→0.29 breaking-API migration, tracked
+    # separately; ignored here because neither is exploitable in persist.
+    "RUSTSEC-2026-0176",  # pyo3 nth/nth_back OOB read on PyList/PyTuple — adapter unused by persist
+    "RUSTSEC-2026-0177",  # pyo3 new_closure Sync bound — API unused by persist
 ]
 
 [sources]
