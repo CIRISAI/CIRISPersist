@@ -5,6 +5,19 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [5.5.5] — 2026-06-12
+
+### Changed — CIRISVerify 5.1.0 → 5.1.3 (Win7-capable verify; TPM-1.2→software degradation)
+
+All three verify crate pins flip together (the coherence invariant — `ciris-verify-core` / `ciris-crypto` / `ciris-keyring`, plus the `tpm`/`ios`/`android` target-table keyring entries — must share one tag or `ciris_crypto` splits into two graph versions and the types break). Verify 5.1.3 ships its own Win7-loadable wheel and TPM-1.2→software keyring degradation (CIRISVerify#67); persist's own Win7 wheel lane (#205, v5.5.4) now builds against a Win7-capable verify, so the whole stack lines up. Graph stays coherent: single `ciris-crypto`, all three resolved to the 5.1.3 rev. No persist API changes.
+
+### Security — rust-postgres advisory floors (RUSTSEC-2026-0178 / -0179 / -0180)
+
+Three newly-published advisories against persist's `postgres` stack, all malicious-**server** DoS: a short `DataRow` panic (-0178, `tokio-postgres`), unbounded SCRAM iteration CPU-exhaustion (-0179, `postgres-protocol`), and a malformed-`hstore` decode panic (-0180, `postgres-protocol`). Fixed upstream, so persist floors the direct deps — **`tokio-postgres` ≥ 0.7.18**, **`postgres-types` ≥ 0.2.14** (which pull `postgres-protocol` ≥ 0.6.12) — rather than ignoring them. Low relevance to persist's posture (the Postgres server is trusted infrastructure, not an attacker surface), but the fix is free and there's no reason to ship the vulnerable decoder paths. cargo-deny clean without any new ignores.
+
+### Tests
+Verified against 5.1.3 + the floors: build (postgres+server+pyo3) · clippy `-D warnings` (pyo3+server, sqlite-only) · cargo-deny (advisories ok) · sqlite lib (787) · live-PG lib (728).
+
 ## [5.5.4] — 2026-06-12
 
 ### Fixed — trace seal no longer fails on lens-core deferral components (CIRISPersist#203)
