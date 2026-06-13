@@ -458,7 +458,7 @@ pub trait FederationDirectory: Send + Sync {
         Ok(self
             .lookup_identity_for_occurrence(occurrence_key_id)
             .await?
-            .filter(|o| o.valid_until.map_or(true, |vu| vu > now))
+            .filter(|o| o.valid_until.is_none_or(|vu| vu > now))
             .and_then(|o| o.encryption_pubkeys))
     }
 
@@ -1477,7 +1477,7 @@ pub trait FederationDirectory: Send + Sync {
             .into_iter()
             .filter(|a| a.attesting_key_id == subject_key_id)
             .filter(|a| envelope_dimension(a).is_some_and(|d| d.starts_with("consent:state:")))
-            .filter(|a| a.expires_at.map_or(true, |exp| exp > now))
+            .filter(|a| a.expires_at.is_none_or(|exp| exp > now))
             .max_by_key(|a| a.asserted_at);
         Ok(match latest.as_ref().and_then(envelope_dimension) {
             Some(d) if d.starts_with("consent:state:granted") => hard_case::ConsentState::Granted,

@@ -17826,11 +17826,10 @@ impl PyEngine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => b.clone(),
         };
-        let name = std::ffi::CString::new("ciris_persist::federation_directory")
-            .expect("static name has no NUL bytes");
-        pyo3::types::PyCapsule::new(py, arc, Some(name)).map_err(|e| {
-            PyErr::new::<LensQueryError, _>(format!("federation_directory_capsule: {e}"))
-        })
+        pyo3::types::PyCapsule::new_with_value(py, arc, c"ciris_persist::federation_directory")
+            .map_err(|e| {
+                PyErr::new::<LensQueryError, _>(format!("federation_directory_capsule: {e}"))
+            })
     }
 
     /// v2.7.0 (CIRISPersist#109) — cross-module accessor for the
@@ -17856,9 +17855,7 @@ impl PyEngine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
         };
-        let name = std::ffi::CString::new("ciris_persist::outbound_queue")
-            .expect("static name has no NUL bytes");
-        pyo3::types::PyCapsule::new(py, dispatch, Some(name))
+        pyo3::types::PyCapsule::new_with_value(py, dispatch, c"ciris_persist::outbound_queue")
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("outbound_queue_capsule: {e}")))
     }
 
@@ -17881,9 +17878,7 @@ impl PyEngine {
             pqc_signer: self.local_signer.as_ref().and_then(|ls| ls.pqc_signer()),
             key_id: self.signer_key_id.clone(),
         };
-        let name = std::ffi::CString::new("ciris_persist::keyring_signer")
-            .expect("static name has no NUL bytes");
-        pyo3::types::PyCapsule::new(py, handle, Some(name))
+        pyo3::types::PyCapsule::new_with_value(py, handle, c"ciris_persist::keyring_signer")
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("keyring_signer_capsule: {e}")))
     }
 
@@ -17950,9 +17945,7 @@ impl PyEngine {
         py: Python<'py>,
     ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
         let handle: tokio::runtime::Handle = self.runtime.handle().clone();
-        let name = std::ffi::CString::new("ciris_persist::runtime_handle")
-            .expect("static name has no NUL bytes");
-        pyo3::types::PyCapsule::new(py, handle, Some(name))
+        pyo3::types::PyCapsule::new_with_value(py, handle, c"ciris_persist::runtime_handle")
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("runtime_handle_capsule: {e}")))
     }
 
@@ -18077,9 +18070,7 @@ impl PyEngine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
         };
-        let name = std::ffi::CString::new("ciris_persist::blob_storage")
-            .expect("static name has no NUL bytes");
-        pyo3::types::PyCapsule::new(py, dispatch, Some(name))
+        pyo3::types::PyCapsule::new_with_value(py, dispatch, c"ciris_persist::blob_storage")
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("blob_storage_capsule: {e}")))
     }
 
@@ -18109,9 +18100,7 @@ impl PyEngine {
         let Some(local_signer) = self.local_signer.clone() else {
             return Err(PyValueError::new_err("local_signer_unavailable"));
         };
-        let name = std::ffi::CString::new("ciris_persist::local_signer")
-            .expect("static name has no NUL bytes");
-        pyo3::types::PyCapsule::new(py, local_signer, Some(name))
+        pyo3::types::PyCapsule::new_with_value(py, local_signer, c"ciris_persist::local_signer")
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("local_signer_capsule: {e}")))
     }
 
@@ -18145,9 +18134,7 @@ impl PyEngine {
         let scoring = gate
             .map(|g| g.scoring_arc())
             .ok_or_else(|| PyValueError::new_err("trust_scoring_unavailable"))?;
-        let name = std::ffi::CString::new("ciris_persist::trust_scoring")
-            .expect("static name has no NUL bytes");
-        pyo3::types::PyCapsule::new(py, scoring, Some(name))
+        pyo3::types::PyCapsule::new_with_value(py, scoring, c"ciris_persist::trust_scoring")
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("trust_scoring_capsule: {e}")))
     }
 

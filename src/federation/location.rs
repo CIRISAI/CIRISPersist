@@ -135,7 +135,7 @@ pub fn member_in_geographic_constraint(
 ) -> bool {
     member_proofs.iter().any(|p| {
         p.withdrawn_at.is_none()
-            && p.valid_until.map_or(true, |vu| vu > now)
+            && p.valid_until.is_none_or(|vu| vu > now)
             && h3_cell_contained(&p.cell_id, constraint_cell)
     })
 }
