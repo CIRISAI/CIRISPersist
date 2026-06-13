@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781300344053,
+  "lastUpdate": 1781321407774,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -25157,6 +25157,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 342952,
             "range": "± 3080",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "eaf14a19037d5ff672d5f1cace5e2838416c136d",
+          "message": "v5.6.0 — SharedInstanceLease: cross-process leader election (#210)\n\nUnblocks CIRISEdge#100 (and edge v2.3.0 auto leader-election): multi-worker\ndeployments race to bind the Reticulum socket → EADDRINUSE. RNS\nshared-instance mode needs leader election; persist already owns the\nfamily's cross-process atomic state, so it's the home.\n\n- federation::shared_instance — SharedInstanceLease + DEFAULT_STALE_AFTER\n  + staleness_threshold.\n- 4 FederationDirectory methods (default-impl on the trait; real impls on\n  Postgres + SQLite): try_acquire / heartbeat / lookup / release. Additive,\n  non-breaking — backends inherit \"not implemented\" until overridden.\n- Atomic election: single-statement INSERT … ON CONFLICT DO UPDATE …\n  WHERE incumbent-heartbeat-is-stale → two racers can never both win.\n  Stale owner stolen with lease_version+1; demoted owner sees None on its\n  next heartbeat; release is ownership-checked + idempotent.\n- V074 (both backends): shared_instance_leases + heartbeat index. PG\n  TIMESTAMPTZ; SQLite RFC-3339 TEXT, fixed Micros+Z so the staleness\n  compare is a sound lexical `<`.\n- Edge consumes via the existing federation_directory_capsule — no new FFI.\n\nTested both backends (full lifecycle incl. steal/demotion/stale-release):\nsqlite lib 788, live-PG lib 729; fmt, clippy ×2 -D warnings, backend-less\n-D warnings, --no-default-features, cargo-deny all green.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-06-12T22:08:09-05:00",
+          "tree_id": "7e6010b12a191c1160a51e73ba5a395dae7b25d4",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/eaf14a19037d5ff672d5f1cace5e2838416c136d"
+        },
+        "date": 1781321406710,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40437501,
+            "range": "± 600140",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 3170813,
+            "range": "± 217365",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2552,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 6086,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 13145,
+            "range": "± 43",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 46527,
+            "range": "± 256",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 36,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 181,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 522,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 597,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2065,
+            "range": "± 71",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 80,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 249,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1093,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 54406,
+            "range": "± 2202",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 157856,
+            "range": "± 5015",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 558219,
+            "range": "± 7327",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 9536,
+            "range": "± 943",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 11865,
+            "range": "± 837",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 17765,
+            "range": "± 1366",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 35929,
+            "range": "± 2143",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1863058,
+            "range": "± 4422",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 4549339,
+            "range": "± 76539",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 243460,
+            "range": "± 22654",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 839489,
+            "range": "± 21091",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 44781425,
+            "range": "± 560674",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1469136,
+            "range": "± 108498",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 8123727,
+            "range": "± 213467",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 112437816,
+            "range": "± 782327",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 3701900,
+            "range": "± 210139",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 20785057,
+            "range": "± 354232",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 74143,
+            "range": "± 4357",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 72833,
+            "range": "± 4805",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 6786,
+            "range": "± 73",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 45251,
+            "range": "± 309",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 414734,
+            "range": "± 11263",
             "unit": "ns/iter"
           }
         ]
