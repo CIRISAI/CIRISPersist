@@ -19530,6 +19530,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // cohort_scope refusal is caller-side authorization failure (the
         // writer stamped a cohort it isn't a member of); ValueError (4xx).
         crate::federation::Error::WriteScopeRefused(_) => PyValueError::new_err(kind),
+        // v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — a refused
+        // `withdraws` (issuer satisfies none of the 4 admission rules)
+        // is caller-side authorization failure; ValueError (4xx).
+        crate::federation::Error::WithdrawsNotAdmitted { .. } => PyValueError::new_err(kind),
         // v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) —
         // operational-data admission rejections are all caller-fault
         // malformed-content / authorization failures; ValueError (4xx).

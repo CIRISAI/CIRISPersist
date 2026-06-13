@@ -1787,6 +1787,22 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             }
         }
 
+        // v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — broadened
+        // `withdraws` admission gate (parity with the sqlite + memory
+        // backends). A no-op for non-`withdraws` rows; for a `withdraws`
+        // it loads target T, resolves WHICH of the 4 admission rules
+        // authorizes the issuer, and stamps the rule onto the row for
+        // the per-rule audit metadata. The delegation walk uses the
+        // trait's own `get_attestation` / `list_attestations_by` (each
+        // acquires its own client). Runs AFTER §6.1 dedup and BEFORE
+        // persist_row_hash + INSERT — a refused withdraws leaves no
+        // trace and the recorded rule is covered by the row hash.
+        if let Some(rule) =
+            crate::federation::admission::check_withdraws_admission(self, &row).await?
+        {
+            row.withdraws_admission_rule = Some(rule);
+        }
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
@@ -17071,6 +17087,91 @@ mod tests {
             err,
             crate::federation::Error::AccordDimensionRequiresAccordHolder { .. }
         ));
+    }
+
+    /// v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3 / §8.1.11.2) — live-PG
+    /// coverage for the broadened `withdraws` admission gate. Proves
+    /// parity with the sqlite/memory suites on real Postgres: rule-2
+    /// subject self-revocation, §8.1.11.2 multi-subject independent
+    /// authority (any single subject suffices, no quorum), and the
+    /// unrelated-issuer refusal. Self-isolating: all key_ids carry a
+    /// `uuid_like()` suffix and attestation ids are `Uuid::new_v4()`, so
+    /// the test does not collide on a reused local PG. Runtime
+    /// verification pending (lead's docker PG, `CIRIS_PERSIST_TEST_PG_URL`).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_withdraws_admission_multisubject_rule2_and_refusal() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let prod = format!("pg-w-prod-{}", uuid_like());
+        let s1 = format!("pg-w-s1-{}", uuid_like());
+        let s2 = format!("pg-w-s2-{}", uuid_like());
+        let rando = format!("pg-w-rando-{}", uuid_like());
+        for k in [&prod, &s1, &s2, &rando] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: pg_admission_key(
+                        k,
+                        "primitive-a",
+                        crate::federation::types::identity_type::AGENT,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Target T with two independent subjects.
+        let mut t = pg_scores_attestation(&prod, &prod, &prod, "identity_binding:v1");
+        t.subject_key_ids = vec![s1.clone(), s2.clone()];
+        let tid = t.attestation_id.clone();
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: t })
+            .await
+            .unwrap();
+
+        let mk_withdraws = |issuer: &str| {
+            let mut w = pg_scores_attestation(issuer, issuer, issuer, "identity_binding:v1");
+            w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+            w.attestation_envelope = serde_json::json!({
+                "references_attestation_id": tid,
+                "withdrawal_reason": "test",
+            });
+            w
+        };
+
+        // §8.1.11.2 — only s2 revokes; independent authority admits it
+        // under rule 2 (no quorum).
+        let w = mk_withdraws(&s2);
+        let wid = w.attestation_id.clone();
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: w })
+            .await
+            .unwrap();
+        let got = backend.get_attestation(&wid).await.unwrap().unwrap();
+        assert_eq!(
+            got.withdraws_admission_rule,
+            Some(2),
+            "a single subject of a multi-subject T admits under rule 2"
+        );
+
+        // Unrelated key cannot withdraw T.
+        let bad = mk_withdraws(&rando);
+        let bad_id = bad.attestation_id.clone();
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: bad })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_withdraws_not_admitted");
+        assert!(
+            backend.get_attestation(&bad_id).await.unwrap().is_none(),
+            "refused withdraws leaves no trace on PG"
+        );
     }
 
     /// v4.6.0 (CIRISPersist#171/#176) — live-PG coverage for the

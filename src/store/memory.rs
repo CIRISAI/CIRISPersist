@@ -675,6 +675,21 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         )
         .await?;
 
+        // v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — broadened
+        // `withdraws` admission gate (parity with sqlite + postgres).
+        // Runs BEFORE the state lock is taken: the delegation walk +
+        // target-T lookup call `get_attestation` / `list_attestations_by`
+        // on `self`, which acquire the lock themselves — holding it
+        // across those awaits would deadlock (and not be `Send`). A
+        // no-op for non-`withdraws` rows; for a `withdraws` it stamps
+        // the admitting rule (1–4) onto the row. A refused withdraws
+        // returns before any row is pushed.
+        if let Some(rule) =
+            crate::federation::admission::check_withdraws_admission(self, &row).await?
+        {
+            row.withdraws_admission_rule = Some(rule);
+        }
+
         let mut state = self.state.lock().expect("memory backend lock");
         // FK enforcement parity with postgres: both attesting_key_id
         // and attested_key_id must exist in federation_keys.
@@ -4303,6 +4318,101 @@ mod tests {
             .collect();
         assert_eq!(composers.len(), 1, "second triple should be a no-op");
         assert_eq!(composers[0].attestation_id, "w-1");
+    }
+
+    // ── v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3 / §8.1.11.2) —
+    // broadened `withdraws` admission gate on the memory backend
+    // (parity with sqlite + postgres). The gate runs before the state
+    // lock; this test confirms the rule numbers + the
+    // independent-authority + the rule-3 delegation-chain path resolve
+    // identically here.
+
+    /// Build a memory-backend `withdraws` against `target_id`.
+    fn fix_withdraws(id: &str, issuer: &str, target_id: &str) -> Attestation {
+        let mut w = fix_attestation(id, issuer, issuer, issuer);
+        w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+        w.attestation_envelope = serde_json::json!({
+            "references_attestation_id": target_id,
+            "withdrawal_reason": "test",
+        });
+        w
+    }
+
+    /// Build a memory-backend `delegates_to` carrying `scope`.
+    fn fix_delegates_to(
+        id: &str,
+        granter: &str,
+        grantee: &str,
+        scope: serde_json::Value,
+    ) -> Attestation {
+        let mut d = fix_attestation(id, granter, grantee, granter);
+        d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        d.attestation_envelope = serde_json::json!({
+            "references_attestation_id": id,
+            "scope": scope,
+        });
+        d
+    }
+
+    #[tokio::test]
+    async fn memory_withdraws_admission_rules_2_3_and_refusal() {
+        let backend = MemoryBackend::new();
+        for k in ["prod", "s1", "s2", "proxy", "canon", "rando"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        // Target T: producer `prod`, subjects {s1, s2, canon}.
+        let mut t = fix_attestation("t-1", "prod", "prod", "prod");
+        t.subject_key_ids = vec!["s1".into(), "s2".into(), "canon".into()];
+        backend
+            .put_attestation(SignedAttestation { attestation: t })
+            .await
+            .unwrap();
+
+        // Rule 2 + §8.1.11.2 — only s1 revokes; admitted under rule 2.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_withdraws("w-s1", "s1", "t-1"),
+            })
+            .await
+            .unwrap();
+        let got = backend.get_attestation("w-s1").await.unwrap().unwrap();
+        assert_eq!(got.withdraws_admission_rule, Some(2));
+
+        // Rule 3 — proxy holds consent_revocation delegation to `canon`.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "d-1",
+                    "proxy",
+                    "canon",
+                    serde_json::json!(["share", "consent_revocation"]),
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_withdraws("w-proxy", "proxy", "t-1"),
+            })
+            .await
+            .unwrap();
+        let got = backend.get_attestation("w-proxy").await.unwrap().unwrap();
+        assert_eq!(got.withdraws_admission_rule, Some(3));
+
+        // Refusal — `rando` is neither producer, subject, nor delegate.
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_withdraws("w-bad", "rando", "t-1"),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_withdraws_not_admitted");
+        assert!(backend.get_attestation("w-bad").await.unwrap().is_none());
     }
 
     // ── v3.1.0 (CIRISPersist#117) — peer-mutation surface ──────────

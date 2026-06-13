@@ -5,6 +5,77 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.4.0] — 2026-06-13
+
+### Added — broadened `withdraws` admission gate (CIRISPersist#146 Ask 2; CEG §3.2.3 / §8.1.11.2)
+
+CEG 0.6 added subject authority to the wire format (Ask 1 shipped the
+`subject_key_ids` column + the `withdraws_admission_rule` audit field at
+v3.7.0). This cut wires the authority *enforcement*: the `put_attestation`
+path now resolves which of four admission rules authorizes a `withdraws`
+against its target `T`, and records the rule for read-side policy weighting.
+
+- **4-rule `withdraws` admission gate** (`admission::resolve_withdraws_admission_rule` +
+  `admission::check_withdraws_admission`, wired into `put_attestation` on all
+  three backends). A `withdraws` against `T` is admitted iff the issuer
+  satisfies any of: (1) producer self-revocation (`issuer == T.attesting_key_id`,
+  the pre-CEG-0.6 shape); (2) subject self-revocation (`issuer ∈ T.subject_key_ids`,
+  NEW); (3) a `consent_revocation`-scoped `delegates_to` chain reaching a
+  subject (proxy authority for canonical-hash subjects, NEW); (4) a
+  `consent_revocation`-scoped delegation reaching the producer or a subject
+  (existing delegation as a new admission path). The FIRST satisfied rule's
+  number (1–4) is stamped onto `Attestation::withdraws_admission_rule`.
+- **§8.1.11.2 multi-subject independent authority**: with `len(T.subject_key_ids) > 1`,
+  each subject is an independent revocation authority — a `withdraws` from ANY
+  single subject is admitted (rule 2 = membership in the set; rule 3 = reaching
+  any one subject). No quorum / no all-must-agree softening at the substrate.
+- **Delegation-chain resolver** (`admission::issuer_reaches_target_via_consent_revocation_delegation`):
+  a scope-filtered BFS over `delegates_to` out-edges — depth-bounded
+  (`MAX_WITHDRAWS_DELEGATION_DEPTH = 16`, mirrors `topology::MAX_DELEGATION_DEPTH`)
+  and cycle-guarded. Distinct from `topology::build_delegation_graph` because
+  proxy *revocation* authority requires `scope ⊇ {consent_revocation}` along the
+  path (a `retain`/`share`-only delegation confers no revocation right). The
+  `scope` field is admitted as either a bare string or a JSON array (set-containment).
+- **`Error::WithdrawsNotAdmitted`** (stable `kind()` token `federation_withdraws_not_admitted`;
+  pyo3 → `ValueError`/4xx): a `withdraws` whose issuer satisfies none of the four
+  rules is refused and leaves no trace.
+- **Scoped to CONSENT-revocation withdraws only.** §3.2.3 broadens the *consent*
+  authority basis; it is not the only authority basis for a `withdraws`. The
+  substrate emits `withdraws` on separately-authorized paths (takedown_handler,
+  Policy-J age-gate, evict_actor, sweeper) whose target is a `holds_bytes:sha256:*`
+  content-location directory row, signed by a moderation/operator key or a
+  self-attesting host. The gate therefore bypasses (admits with rule `None`) any
+  `withdraws` whose target `T.attestation_type` begins with
+  `HOLDS_BYTES_ATTESTATION_TYPE_PREFIX` — their authorization is established
+  upstream of persist. Genuine consent withdraws target a consent-bearing
+  Contribution (never a `holds_bytes` directory row), so the 4-rule gate still
+  fully applies to them.
+- **Out-of-order federation delivery** (design choice, operator-confirmed): when target `T`
+  is not locally present (a `withdraws` replicating ahead of `T`, or a malformed
+  envelope missing `references_attestation_id`), authority cannot be resolved, so
+  the row is admitted with `withdraws_admission_rule = None` (deferred resolution)
+  rather than rejected — preserving replication ordering and the §6.1 dedup/precedence
+  semantics. The 4-rule gate is fully enforced whenever `T` IS local; read-side
+  recompute enforces authority once `T` arrives.
+- **No migration** — `subject_key_ids` + `withdraws_admission_rule` columns already
+  exist (V055, v3.7.0). V078 stays unassigned for this lane.
+
+### Tests
+
+- sqlite (10, all green): rules 1/2/3/4 each record the right number; rule-3
+  wrong-scope refusal; §8.1.11.2 single-subject-suffices; unrelated-issuer
+  refusal; absent-target-defers-to-None; `holds_bytes`-target moderation
+  withdraws bypasses the consent gate while an unauthorized consent withdraws
+  is still refused (scope-lock regression test).
+- memory (1, green): rules 2 + 3 + refusal parity.
+- postgres (1, green against the docker PG): rule-2 + §8.1.11.2 multi-subject
+  + refusal, self-isolating (uuid-suffixed key_ids, `Uuid::new_v4()` attestation
+  ids).
+- Full feature set (`postgres sqlite server pyo3 cirisaudit secrets cirisnode
+  cirisgraph telemetry`): 1394 lib tests green, including the two
+  `takedown_handler` tests that the unscoped gate had regressed (caught on the
+  merge-target full-suite gate, fixed before ship).
+
 ## [6.3.0] — 2026-06-13
 
 ### Added — federation read accessors for the lens-core multimedia detectors (CIRISPersist#135; unblocks CIRISLensCore#29)

@@ -1493,6 +1493,22 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             }
         }
 
+        // v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — broadened
+        // `withdraws` admission gate. A no-op for non-`withdraws` rows;
+        // for a `withdraws` it loads the target T (by the envelope's
+        // `references_attestation_id`), resolves WHICH of the 4
+        // admission rules authorizes the issuer, and stamps the rule
+        // number onto the row for the per-rule audit metadata. Runs
+        // AFTER the §6.1 dedup (idempotent replay short-circuits before
+        // the walk) and BEFORE persist_row_hash + INSERT, so a refused
+        // withdraws leaves no trace and the recorded rule is covered by
+        // the row hash.
+        if let Some(rule) =
+            crate::federation::admission::check_withdraws_admission(self, &row).await?
+        {
+            row.withdraws_admission_rule = Some(rule);
+        }
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
@@ -12115,6 +12131,432 @@ mod tests {
             "subject_key_ids round-trip (federation-key + canonical-hash entries)"
         );
         assert_eq!(got.withdraws_admission_rule, None);
+    }
+
+    // ─── v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — broadened
+    // `withdraws` admission gate. Shared setup: a target attestation T
+    // (producer `prod`, subjects per-test) plus the keys involved.
+    // Helper builds a `withdraws` row against T from a given issuer.
+
+    /// Build a `withdraws` row from `issuer` referencing target id
+    /// `target_id` (the §3.2 `references_attestation_id`).
+    fn withdraws_against(id: &str, issuer: &str, target_id: &str) -> Attestation {
+        let mut w = fed_attestation(id, issuer, issuer, issuer);
+        w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+        w.attestation_envelope = serde_json::json!({
+            "references_attestation_id": target_id,
+            "withdrawal_reason": "test",
+        });
+        w
+    }
+
+    /// Build a `delegates_to` row from `granter` to `grantee` carrying
+    /// the given `scope` (string or array Value).
+    fn delegates_to(
+        id: &str,
+        granter: &str,
+        grantee: &str,
+        scope: serde_json::Value,
+    ) -> Attestation {
+        let mut d = fed_attestation(id, granter, grantee, granter);
+        d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        d.attestation_envelope = serde_json::json!({
+            "references_attestation_id": id,
+            "scope": scope,
+        });
+        d
+    }
+
+    /// Insert a federation_keys row (no-op if the helper is reused).
+    async fn ensure_key(backend: &SqliteBackend, key_id: &str) {
+        let _ = backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key(key_id, key_id, key_id),
+            })
+            .await;
+    }
+
+    /// Insert target T (a `scores` row) with the given producer +
+    /// subjects, returning its attestation_id.
+    async fn put_target_t(
+        backend: &SqliteBackend,
+        id: &str,
+        producer: &str,
+        subjects: &[&str],
+    ) -> String {
+        ensure_key(backend, producer).await;
+        let mut t = fed_attestation(id, producer, producer, producer);
+        t.subject_key_ids = subjects.iter().map(|s| s.to_string()).collect();
+        backend
+            .put_attestation(SignedAttestation { attestation: t })
+            .await
+            .unwrap();
+        id.to_string()
+    }
+
+    /// Rule 1 — producer self-revocation: `issuer == T.attesting_key_id`.
+    #[tokio::test]
+    async fn withdraws_admission_rule1_producer_self_revocation_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let tid = format!("t-{}", uuid::Uuid::new_v4());
+        let prod = format!("prod-{}", uuid::Uuid::new_v4());
+        put_target_t(&backend, &tid, &prod, &[]).await;
+
+        let wid = format!("w-{}", uuid::Uuid::new_v4());
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against(&wid, &prod, &tid),
+            })
+            .await
+            .unwrap();
+
+        let got = backend
+            .get_attestation(&wid)
+            .await
+            .unwrap()
+            .expect("withdraws admitted");
+        assert_eq!(
+            got.withdraws_admission_rule,
+            Some(1),
+            "producer self-revocation records rule 1"
+        );
+    }
+
+    /// Rule 2 — subject self-revocation: `issuer ∈ T.subject_key_ids`.
+    #[tokio::test]
+    async fn withdraws_admission_rule2_subject_self_revocation_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let tid = format!("t-{}", uuid::Uuid::new_v4());
+        let prod = format!("prod-{}", uuid::Uuid::new_v4());
+        let subj = format!("subj-{}", uuid::Uuid::new_v4());
+        ensure_key(&backend, &subj).await;
+        put_target_t(&backend, &tid, &prod, &[&subj]).await;
+
+        let wid = format!("w-{}", uuid::Uuid::new_v4());
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against(&wid, &subj, &tid),
+            })
+            .await
+            .unwrap();
+
+        let got = backend.get_attestation(&wid).await.unwrap().unwrap();
+        assert_eq!(
+            got.withdraws_admission_rule,
+            Some(2),
+            "subject self-revocation records rule 2"
+        );
+    }
+
+    /// Rule 3 — proxy authority: a `consent_revocation`-scoped
+    /// `delegates_to` chain from issuer reaching a canonical-hash
+    /// subject in `T.subject_key_ids`.
+    #[tokio::test]
+    async fn withdraws_admission_rule3_proxy_consent_revocation_chain_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let tid = format!("t-{}", uuid::Uuid::new_v4());
+        let prod = format!("prod-{}", uuid::Uuid::new_v4());
+        // canonical-hash subject (no federation_keys row — valid per §4.2.2)
+        let canon = format!("sha256:{}", "a".repeat(64));
+        let proxy = format!("proxy-{}", uuid::Uuid::new_v4());
+        let mid = format!("mid-{}", uuid::Uuid::new_v4());
+        ensure_key(&backend, &proxy).await;
+        ensure_key(&backend, &mid).await;
+        // The delegation's terminal recipient is the canonical-hash
+        // subject; `delegates_to.attested_key_id` is FK'd to
+        // federation_keys, so the canonical hash must be a registered
+        // key here (the Ask-6 rebinding case — a canonical subject that
+        // acquired a key). Authority resolution (rule 3) is unchanged.
+        ensure_key(&backend, &canon).await;
+        put_target_t(&backend, &tid, &prod, &[&canon]).await;
+
+        // proxy -> mid -> canon, both edges scoped consent_revocation
+        // (array form on the first edge, bare-string on the second).
+        let d1 = format!("d-{}", uuid::Uuid::new_v4());
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: delegates_to(
+                    &d1,
+                    &proxy,
+                    &mid,
+                    serde_json::json!(["retain", "consent_revocation"]),
+                ),
+            })
+            .await
+            .unwrap();
+        let d2 = format!("d-{}", uuid::Uuid::new_v4());
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: delegates_to(
+                    &d2,
+                    &mid,
+                    &canon,
+                    serde_json::json!("consent_revocation"),
+                ),
+            })
+            .await
+            .unwrap();
+
+        let wid = format!("w-{}", uuid::Uuid::new_v4());
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against(&wid, &proxy, &tid),
+            })
+            .await
+            .unwrap();
+
+        let got = backend.get_attestation(&wid).await.unwrap().unwrap();
+        assert_eq!(
+            got.withdraws_admission_rule,
+            Some(3),
+            "consent_revocation-scoped delegation chain to a subject records rule 3"
+        );
+    }
+
+    /// Rule 3 NEGATIVE — a `delegates_to` chain that does NOT carry
+    /// `consent_revocation` scope confers no proxy authority; the
+    /// withdraws is refused (`WithdrawsNotAdmitted`).
+    #[tokio::test]
+    async fn withdraws_admission_rule3_wrong_scope_refused_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let tid = format!("t-{}", uuid::Uuid::new_v4());
+        let prod = format!("prod-{}", uuid::Uuid::new_v4());
+        let canon = format!("sha256:{}", "b".repeat(64));
+        let proxy = format!("proxy-{}", uuid::Uuid::new_v4());
+        ensure_key(&backend, &proxy).await;
+        ensure_key(&backend, &canon).await;
+        put_target_t(&backend, &tid, &prod, &[&canon]).await;
+
+        // proxy -> canon but scoped only `retain` — no revocation right.
+        let d1 = format!("d-{}", uuid::Uuid::new_v4());
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: delegates_to(&d1, &proxy, &canon, serde_json::json!(["retain"])),
+            })
+            .await
+            .unwrap();
+
+        let wid = format!("w-{}", uuid::Uuid::new_v4());
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against(&wid, &proxy, &tid),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_withdraws_not_admitted",
+            "a non-consent_revocation delegation must not admit the withdraws"
+        );
+        assert!(
+            backend.get_attestation(&wid).await.unwrap().is_none(),
+            "refused withdraws leaves no trace"
+        );
+    }
+
+    /// Rule 4 — issuer holds a `consent_revocation`-scoped delegation
+    /// reaching the PRODUCER (rule-1 key). Distinct from rule 3 (which
+    /// reaches a subject); this proves the producer-reaching arm.
+    #[tokio::test]
+    async fn withdraws_admission_rule4_delegation_to_producer_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let tid = format!("t-{}", uuid::Uuid::new_v4());
+        let prod = format!("prod-{}", uuid::Uuid::new_v4());
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        ensure_key(&backend, &agent).await;
+        // No subjects → rules 2/3 cannot apply; only the producer-reach
+        // (rule 4) path can admit.
+        put_target_t(&backend, &tid, &prod, &[]).await;
+
+        let d1 = format!("d-{}", uuid::Uuid::new_v4());
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: delegates_to(
+                    &d1,
+                    &agent,
+                    &prod,
+                    serde_json::json!("consent_revocation"),
+                ),
+            })
+            .await
+            .unwrap();
+
+        let wid = format!("w-{}", uuid::Uuid::new_v4());
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against(&wid, &agent, &tid),
+            })
+            .await
+            .unwrap();
+
+        let got = backend.get_attestation(&wid).await.unwrap().unwrap();
+        assert_eq!(
+            got.withdraws_admission_rule,
+            Some(4),
+            "consent_revocation delegation reaching the producer records rule 4"
+        );
+    }
+
+    /// §8.1.11.2 — multi-subject INDEPENDENT authority: with N>1
+    /// subjects, a `withdraws` from ANY single subject is admitted under
+    /// rule 2 (no quorum / no all-must-agree). Proves the group-photo /
+    /// group-chat eviction case.
+    #[tokio::test]
+    async fn withdraws_admission_multisubject_single_subject_suffices_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let tid = format!("t-{}", uuid::Uuid::new_v4());
+        let prod = format!("prod-{}", uuid::Uuid::new_v4());
+        let s1 = format!("s1-{}", uuid::Uuid::new_v4());
+        let s2 = format!("s2-{}", uuid::Uuid::new_v4());
+        let s3 = format!("s3-{}", uuid::Uuid::new_v4());
+        for s in [&s1, &s2, &s3] {
+            ensure_key(&backend, s).await;
+        }
+        put_target_t(&backend, &tid, &prod, &[&s1, &s2, &s3]).await;
+
+        // Only s2 revokes — independent authority means this admits.
+        let wid = format!("w-{}", uuid::Uuid::new_v4());
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against(&wid, &s2, &tid),
+            })
+            .await
+            .unwrap();
+
+        let got = backend.get_attestation(&wid).await.unwrap().unwrap();
+        assert_eq!(
+            got.withdraws_admission_rule,
+            Some(2),
+            "any single subject of a multi-subject T is an independent revocation authority"
+        );
+    }
+
+    /// Refusal — an unrelated key (not producer, not subject, no
+    /// delegation) cannot withdraw T.
+    #[tokio::test]
+    async fn withdraws_admission_unrelated_issuer_refused_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let tid = format!("t-{}", uuid::Uuid::new_v4());
+        let prod = format!("prod-{}", uuid::Uuid::new_v4());
+        let subj = format!("subj-{}", uuid::Uuid::new_v4());
+        let rando = format!("rando-{}", uuid::Uuid::new_v4());
+        ensure_key(&backend, &subj).await;
+        ensure_key(&backend, &rando).await;
+        put_target_t(&backend, &tid, &prod, &[&subj]).await;
+
+        let wid = format!("w-{}", uuid::Uuid::new_v4());
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against(&wid, &rando, &tid),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_withdraws_not_admitted");
+    }
+
+    /// Out-of-order delivery — a `withdraws` whose target T is not yet
+    /// locally present is admitted with `withdraws_admission_rule =
+    /// None` (deferred authority resolution), NOT rejected.
+    #[tokio::test]
+    async fn withdraws_admission_absent_target_defers_to_none_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let prod = format!("prod-{}", uuid::Uuid::new_v4());
+        ensure_key(&backend, &prod).await;
+        let missing = format!("t-{}", uuid::Uuid::new_v4());
+
+        let wid = format!("w-{}", uuid::Uuid::new_v4());
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against(&wid, &prod, &missing),
+            })
+            .await
+            .unwrap();
+        let got = backend.get_attestation(&wid).await.unwrap().unwrap();
+        assert_eq!(
+            got.withdraws_admission_rule, None,
+            "withdraws against an absent target is admitted with deferred (None) rule"
+        );
+    }
+
+    /// v6.4.0 (CIRISPersist#146 Ask 2) — SCOPE lock: the §3.2.3 consent
+    /// gate applies ONLY to consent-bearing targets. A moderation /
+    /// operator withdraws against a `holds_bytes:sha256:*` content-
+    /// location directory row (takedown / age-gate / evict_actor /
+    /// sweeper) is admitted regardless of the consent rules (issuer is
+    /// neither producer nor subject), while a CONSENT withdraws from an
+    /// unauthorized issuer is still refused. This pins the regression
+    /// fix: the gate must not over-apply to the moderation paths.
+    #[tokio::test]
+    async fn withdraws_admission_holds_bytes_target_bypasses_consent_gate_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // A holder owns a holds_bytes directory row; a DISTINCT moderation
+        // key withdraws it (issuer != holder, no subjects, no delegation).
+        let holder = format!("holder-{}", uuid::Uuid::new_v4());
+        let moderator = format!("mod-{}", uuid::Uuid::new_v4());
+        ensure_key(&backend, &holder).await;
+        ensure_key(&backend, &moderator).await;
+
+        let sha = [0xABu8; 32];
+        let holds_type = crate::federation::blobs::holds_bytes_attestation_type(&sha);
+        let tid = format!("hb-{}", uuid::Uuid::new_v4());
+        let mut t = fed_attestation(&tid, &holder, &holder, &holder);
+        t.attestation_type = holds_type.clone();
+        t.attestation_envelope = crate::federation::blobs::holds_bytes_attestation_envelope(&sha);
+        backend
+            .put_attestation(SignedAttestation { attestation: t })
+            .await
+            .unwrap();
+
+        // Moderation withdraws (issuer = moderator, target = holder's
+        // holds_bytes row) — admitted, consent gate bypassed (rule None).
+        let wid = format!("w-{}", uuid::Uuid::new_v4());
+        let mut w = withdraws_against(&wid, &moderator, &tid);
+        w.attestation_envelope = serde_json::json!({
+            "references_attestation_id": tid,
+            "references_attestation_type": holds_type,
+            "kind": "withdraws",
+        });
+        backend
+            .put_attestation(SignedAttestation { attestation: w })
+            .await
+            .expect("moderation withdraws against a holds_bytes target must be admitted");
+        let got = backend.get_attestation(&wid).await.unwrap().unwrap();
+        assert_eq!(
+            got.withdraws_admission_rule, None,
+            "holds_bytes-target withdraws bypasses the consent gate (rule None)"
+        );
+
+        // Control: a CONSENT withdraws (target carries subject_key_ids,
+        // is NOT holds_bytes) from an unauthorized issuer is STILL refused.
+        let prod = format!("prod-{}", uuid::Uuid::new_v4());
+        let subj = format!("subj-{}", uuid::Uuid::new_v4());
+        let rando = format!("rando-{}", uuid::Uuid::new_v4());
+        for k in [&subj, &rando] {
+            ensure_key(&backend, k).await;
+        }
+        let ctid = format!("ct-{}", uuid::Uuid::new_v4());
+        put_target_t(&backend, &ctid, &prod, &[&subj]).await;
+        let cwid = format!("cw-{}", uuid::Uuid::new_v4());
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against(&cwid, &rando, &ctid),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_withdraws_not_admitted",
+            "the consent gate still refuses an unauthorized consent withdraws"
+        );
     }
 
     /// CIRISPersist#146 — §8.1.11.1 effective consent resolution: latest

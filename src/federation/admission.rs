@@ -948,6 +948,309 @@ pub fn check_consensus_protocol_form(consensus_protocol: &str) -> Result<(), Err
     }
 }
 
+// ─── v6.4.0 — broadened `withdraws` admission gate (CEG §3.2.3) ────
+
+/// The delegation-scope token a `delegates_to` edge MUST carry for it
+/// to confer proxy revocation authority under rule 3 / rule 4 (CEG
+/// §3.2.3: `scope ⊇ {consent_revocation}`). Matched against the
+/// `delegates_to` envelope's `scope` field, which persist admits as
+/// either a bare string OR a JSON array of strings (set-containment).
+pub const DELEGATION_SCOPE_CONSENT_REVOCATION: &str = "consent_revocation";
+
+/// Depth bound + cycle guard for the rule-3/rule-4 delegation walk.
+/// Mirrors [`crate::federation::topology::MAX_DELEGATION_DEPTH`] (16);
+/// a `delegates_to` graph deeper than this cannot confer revocation
+/// authority (a pathological chain is refused, not silently admitted).
+pub const MAX_WITHDRAWS_DELEGATION_DEPTH: usize = 16;
+
+/// True iff a `delegates_to` envelope's `scope` field contains the
+/// `consent_revocation` token. Accepts both wire shapes:
+///
+/// - `"scope": "consent_revocation"` (bare string), and
+/// - `"scope": ["retain", "consent_revocation"]` (array — set).
+///
+/// A delegation with no `scope`, or a `scope` that omits the token,
+/// does NOT confer proxy revocation authority (returns `false`).
+fn delegation_scope_grants_consent_revocation(envelope: &serde_json::Value) -> bool {
+    match envelope.get("scope") {
+        Some(serde_json::Value::String(s)) => s == DELEGATION_SCOPE_CONSENT_REVOCATION,
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .any(|v| v.as_str() == Some(DELEGATION_SCOPE_CONSENT_REVOCATION)),
+        _ => false,
+    }
+}
+
+/// v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — does `issuer` reach
+/// any key in `targets` via a `delegates_to` chain where **every edge
+/// on the path carries `consent_revocation` scope**? This is the
+/// reachability primitive behind rule 3 (chain to a canonical-hash
+/// subject) and the proxy half of rule 4.
+///
+/// # Why a purpose-built walk (not [`build_delegation_graph`])
+///
+/// [`crate::federation::topology::build_delegation_graph`] walks ALL
+/// `delegates_to` out-edges regardless of scope and flattens each
+/// edge's scope to a single string for display. Proxy *revocation*
+/// authority is narrower: the §3.2.3 contract requires the
+/// `consent_revocation` scope to hold along the delegated path, so a
+/// `delegates_to` granting only `retain`/`share` MUST NOT confer it.
+/// We therefore re-use the BFS shape (queue + visited cycle-guard +
+/// depth cap) but filter edges by scope-containment.
+///
+/// # Algorithm
+///
+/// BFS from `issuer`. At each granter, pull its `delegates_to`
+/// out-edges via [`FederationDirectory::list_attestations_by`]; an
+/// edge is *traversable* only if its envelope `scope ⊇
+/// {consent_revocation}`. If a traversable edge's recipient is in
+/// `targets`, return `true`. Cycle-guarded on the granter key and
+/// bounded by [`MAX_WITHDRAWS_DELEGATION_DEPTH`].
+async fn issuer_reaches_target_via_consent_revocation_delegation(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+    targets: &std::collections::HashSet<String>,
+    max_depth: usize,
+) -> Result<bool, Error> {
+    use std::collections::{HashSet, VecDeque};
+    let effective_depth = max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH);
+    if effective_depth == 0 {
+        return Ok(false);
+    }
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    queue.push_back((issuer.to_owned(), 0));
+    visited.insert(issuer.to_owned());
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= effective_depth {
+            continue;
+        }
+        let rows = directory.list_attestations_by(&current).await?;
+        for r in rows {
+            if r.attestation_type != attestation_type::DELEGATES_TO {
+                continue;
+            }
+            if !delegation_scope_grants_consent_revocation(&r.attestation_envelope) {
+                continue;
+            }
+            // A consent_revocation-scoped delegation edge to a target
+            // subject is sufficient — proxy authority established.
+            if targets.contains(&r.attested_key_id) {
+                return Ok(true);
+            }
+            if !visited.contains(&r.attested_key_id) && depth + 1 < effective_depth {
+                visited.insert(r.attested_key_id.clone());
+                queue.push_back((r.attested_key_id, depth + 1));
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3 / §8.1.11.2) — the
+/// broadened `withdraws` admission gate. Resolves WHICH of the four
+/// admission rules (if any) authorizes `issuer` to withdraw target
+/// `T`, and returns that rule number for the per-row audit metadata
+/// ([`Attestation::withdraws_admission_rule`]).
+///
+/// Pre-v6.4.0 the substrate admitted a `withdraws` from any
+/// federation-trusted key (no producer/subject check beyond the
+/// trust-threshold gate). CEG 0.6 §3.2.3 narrows + broadens that in
+/// one move: a `withdraws` against `T` is admitted iff `issuer.key_id`
+/// satisfies **any** of —
+///
+///   1. `issuer == T.attesting_key_id` (producer self-revocation; the
+///      pre-CEG-0.6 shape, unchanged).
+///   2. `issuer ∈ T.subject_key_ids` (subject self-revocation; NEW).
+///   3. ∃ `delegates_to` chain `issuer →* H` where `H ∈
+///      T.subject_key_ids` AND `scope ⊇ {consent_revocation}` (proxy
+///      authority for canonical-hash subjects; NEW).
+///   4. `issuer` holds a valid `delegates_to` (consent_revocation
+///      scope) → any key satisfying 1–3 (existing delegation as a new
+///      admission path).
+///
+/// # §8.1.11.2 multi-subject independent authority
+///
+/// When `len(T.subject_key_ids) > 1`, each subject is an INDEPENDENT
+/// revocation authority. The gate reflects this structurally: rule 2
+/// is satisfied by membership in the *set* (`any` over
+/// `subject_key_ids`), and rule 3 by reaching *any one* element of the
+/// subject set. There is no quorum / majority softening — a single
+/// subject's `withdraws` is admitted. The eviction semantics (any
+/// admitted subject `withdraws` evicts the Contribution from
+/// propagation) compose on the read side over the admitted rows.
+///
+/// # Rule ordering
+///
+/// Rules are checked cheapest-first (1, 2, then the delegation walks
+/// 3, 4) and the FIRST satisfied rule's number is recorded. Rule 1/2
+/// are field comparisons (no DB walk); 3/4 each cost a bounded BFS
+/// over `delegates_to` edges (depth ≤
+/// [`MAX_WITHDRAWS_DELEGATION_DEPTH`], cycle-guarded).
+///
+/// # Errors
+///
+/// - [`Error::WithdrawsNotAdmitted`] when none of the four rules hold
+///   (stable `kind()` token `federation_withdraws_not_admitted`).
+/// - [`Error::InvalidArgument`] when the `withdraws` envelope omits
+///   the required `references_attestation_id`, or names a target that
+///   does not exist (a `withdraws` against a non-existent `T` cannot
+///   be authority-checked).
+///
+/// `target_id` is the `withdraws` envelope's `references_attestation_id`
+/// (the attestation `T` being withdrawn).
+pub async fn resolve_withdraws_admission_rule(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+    target: &super::Attestation,
+) -> Result<u8, Error> {
+    // Rule 1 — producer self-revocation (no DB walk).
+    if issuer == target.attesting_key_id {
+        return Ok(1);
+    }
+    // Rule 2 — subject self-revocation. §8.1.11.2: membership in the
+    // subject SET, any single element suffices (no quorum).
+    if target.subject_key_ids.iter().any(|s| s == issuer) {
+        return Ok(2);
+    }
+    // Rule 3 — proxy authority: a consent_revocation-scoped
+    // `delegates_to` chain from `issuer` reaching ANY subject in
+    // `T.subject_key_ids` (§8.1.11.2: any single subject is enough).
+    if !target.subject_key_ids.is_empty() {
+        let subjects: std::collections::HashSet<String> =
+            target.subject_key_ids.iter().cloned().collect();
+        if issuer_reaches_target_via_consent_revocation_delegation(
+            directory,
+            issuer,
+            &subjects,
+            MAX_WITHDRAWS_DELEGATION_DEPTH,
+        )
+        .await?
+        {
+            return Ok(3);
+        }
+    }
+    // Rule 4 — `issuer` holds a valid consent_revocation-scoped
+    // `delegates_to` reaching a key that itself satisfies rule 1
+    // (the producer) or rule 2 (a subject). Rule 3 is already the
+    // subject-set reach; rule 4 closes the producer case + the
+    // "delegation to a subject who could self-revoke" case as an
+    // explicit admission path. We reach the producer key OR any
+    // subject key; reaching a subject collapses into rule 3's target
+    // set, so rule 4 is the producer-reaching arm.
+    {
+        let mut rule4_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+        rule4_targets.insert(target.attesting_key_id.clone());
+        for s in &target.subject_key_ids {
+            rule4_targets.insert(s.clone());
+        }
+        if issuer_reaches_target_via_consent_revocation_delegation(
+            directory,
+            issuer,
+            &rule4_targets,
+            MAX_WITHDRAWS_DELEGATION_DEPTH,
+        )
+        .await?
+        {
+            return Ok(4);
+        }
+    }
+    Err(Error::WithdrawsNotAdmitted {
+        issuer: issuer.to_string(),
+        target_attestation_id: target.attestation_id.clone(),
+    })
+}
+
+/// v6.4.0 (CIRISPersist#146 Ask 2) — the `put_attestation` entry point
+/// for the broadened gate. A no-op (`Ok(None)`) for any
+/// non-`withdraws` row; for a `withdraws` it loads target `T`
+/// (referenced by the envelope's `references_attestation_id`), runs
+/// [`resolve_withdraws_admission_rule`], and returns the admitting
+/// rule number for the caller to stamp onto
+/// [`Attestation::withdraws_admission_rule`].
+///
+/// Returns [`Error::WithdrawsNotAdmitted`] when target `T` IS locally
+/// known but no rule authorizes the issuer.
+///
+/// # Deferred resolution — out-of-order federation delivery
+///
+/// Authority rules 1–4 all read fields of the target `T`
+/// (`attesting_key_id` / `subject_key_ids`). When `T` is **not locally
+/// present** — the common federation case where a `withdraws`
+/// replicates before its target, or a malformed envelope omits
+/// `references_attestation_id` — persist CANNOT authority-check the
+/// revocation against a row it has not seen. Rather than reject (which
+/// would break out-of-order replication and silently drop legitimate
+/// subject revocations), the gate **admits the row with
+/// `withdraws_admission_rule = None`** (the documented "unresolved /
+/// pre-gate" sentinel on [`Attestation::withdraws_admission_rule`]).
+/// Authority is then a read-side concern: composition recomputes the
+/// rule once `T` is present (or treats an unresolved withdraws per the
+/// consumer's policy). The 4-rule gate is fully enforced whenever `T`
+/// IS local. **Design note flagged in the v6.4.0 cut report.**
+///
+/// # Scope — CONSENT-revocation withdraws ONLY (v6.4.0 regression fix)
+///
+/// CEG §3.2.3 broadens the authority basis for **consent**-revocation.
+/// It is NOT the only authority basis for a `withdraws`. The substrate
+/// emits `withdraws` on several SEPARATELY-authorized paths whose target
+/// `T` is a `holds_bytes:sha256:*` **content-location directory entry**,
+/// not a consent-bearing Contribution:
+///
+/// - **takedown** ([`crate::cirisnode::takedown_handler`]) — a
+///   moderation/operator key (already authorized by the takedown path)
+///   withdraws each holder's `holds_bytes` row.
+/// - **Policy-J age-gate** — same handler, age-assurance composition.
+/// - **`evict_actor` / sweeper** ([`crate::federation::blobs`],
+///   `engine.rs`) — a host self-attests it no longer holds the bytes.
+///
+/// These are content-location retractions, not consent revocations;
+/// their authority is established upstream of persist (the moderation
+/// path / the host's own self-attestation). The consent gate would
+/// wrongly reject a moderation key withdrawing a third-party holder's
+/// `holds_bytes` row (issuer ≠ holder, no subjects, no delegation), so
+/// the gate is **scoped to NON-`holds_bytes` targets**: a `withdraws`
+/// whose target `T.attestation_type` begins with
+/// [`crate::federation::blobs::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX`]
+/// bypasses the consent rules entirely (`Ok(None)`). Genuine consent
+/// withdraws target a consent-bearing Contribution (a `scores` /
+/// content attestation that may carry `subject_key_ids`), never a
+/// `holds_bytes` directory row — so the 4-rule gate still fully applies
+/// to them.
+pub async fn check_withdraws_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<Option<u8>, Error> {
+    if row.attestation_type != attestation_type::WITHDRAWS {
+        return Ok(None);
+    }
+    let Some(target_id) = crate::federation::precedence::references_attestation_id_from_envelope(
+        &row.attestation_envelope,
+    ) else {
+        // Malformed withdraws (no target ref) — unresolvable authority.
+        return Ok(None);
+    };
+    let Some(target) = directory.get_attestation(target_id).await? else {
+        // Target not locally present — defer authority to read side.
+        return Ok(None);
+    };
+    // Scope discriminator: a `holds_bytes:sha256:*` target is a
+    // content-location directory entry whose `withdraws` is emitted by a
+    // separately-authorized moderation / host self-attestation path
+    // (takedown / age-gate / evict_actor / sweeper). The §3.2.3 consent
+    // gate does NOT apply — admit with rule `None` (the moderation path
+    // owns its own authorization).
+    if target
+        .attestation_type
+        .starts_with(crate::federation::blobs::HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
+    {
+        return Ok(None);
+    }
+    let rule = resolve_withdraws_admission_rule(directory, &row.attesting_key_id, &target).await?;
+    Ok(Some(rule))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
