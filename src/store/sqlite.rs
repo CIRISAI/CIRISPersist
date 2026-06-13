@@ -2239,6 +2239,148 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_location_proofs_for: {e}")))
     }
 
+    // ── Shared-instance leases (CIRISPersist#210) ──────────────────
+
+    async fn try_acquire_shared_instance(
+        &self,
+        instance_name: &str,
+        owner_pid: i32,
+        owner_hostname: &str,
+        stale_after: Option<std::time::Duration>,
+    ) -> Result<Option<crate::federation::SharedInstanceLease>, crate::federation::Error> {
+        let now = chrono::Utc::now();
+        let stale = stale_after.unwrap_or(crate::federation::shared_instance::DEFAULT_STALE_AFTER);
+        // Fixed Micros+Z format on every write AND the threshold so the
+        // staleness check is a plain TEXT `<` (lexical == chronological
+        // only with one consistent format; every row here is written by
+        // these methods, so the invariant holds).
+        let now_s = now.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let threshold_s = crate::federation::shared_instance::staleness_threshold(now, stale)
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let conn = self.conn.clone();
+        let name = instance_name.to_owned();
+        let host = owner_hostname.to_owned();
+        (move || -> Result<Option<crate::federation::SharedInstanceLease>, rusqlite::Error> {
+            let conn = conn.lock();
+            // Insert fresh, or steal iff the incumbent's heartbeat is
+            // stale. SQLite serializes writers, so the race is naturally
+            // single-winner; the WHERE makes a live incumbent a 0-row
+            // no-op. `execute` returns rows-affected: >0 = we own it.
+            let affected = conn.execute(
+                "INSERT INTO shared_instance_leases \
+                    (instance_name, owner_pid, owner_hostname, acquired_at, \
+                     last_heartbeat_at, lease_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?4, 1) \
+                 ON CONFLICT(instance_name) DO UPDATE SET \
+                    owner_pid = excluded.owner_pid, \
+                    owner_hostname = excluded.owner_hostname, \
+                    acquired_at = excluded.acquired_at, \
+                    last_heartbeat_at = excluded.last_heartbeat_at, \
+                    lease_version = shared_instance_leases.lease_version + 1 \
+                 WHERE shared_instance_leases.last_heartbeat_at < ?5",
+                rusqlite::params![name, i64::from(owner_pid), host, now_s, threshold_s],
+            )?;
+            if affected == 0 {
+                return Ok(None); // a live owner holds it
+            }
+            let lease = conn.query_row(
+                "SELECT instance_name, owner_pid, owner_hostname, acquired_at, \
+                    last_heartbeat_at, lease_version \
+                 FROM shared_instance_leases WHERE instance_name = ?1",
+                [&name],
+                sqlite_row_to_shared_instance_lease,
+            )?;
+            Ok(Some(lease))
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("try_acquire_shared_instance: {e}")))
+    }
+
+    async fn heartbeat_shared_instance(
+        &self,
+        lease: &crate::federation::SharedInstanceLease,
+    ) -> Result<Option<crate::federation::SharedInstanceLease>, crate::federation::Error> {
+        let now_s = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let conn = self.conn.clone();
+        let lease = lease.clone();
+        (move || -> Result<Option<crate::federation::SharedInstanceLease>, rusqlite::Error> {
+            let conn = conn.lock();
+            // Refresh only if we're still the current owner (match on
+            // version + pid). 0 rows = our lease was stolen or is gone.
+            let affected = conn.execute(
+                "UPDATE shared_instance_leases SET last_heartbeat_at = ?1 \
+                 WHERE instance_name = ?2 AND lease_version = ?3 AND owner_pid = ?4",
+                rusqlite::params![
+                    now_s,
+                    lease.instance_name,
+                    lease.lease_version,
+                    i64::from(lease.owner_pid),
+                ],
+            )?;
+            if affected == 0 {
+                return Ok(None); // demoted — sibling took over
+            }
+            let updated = conn.query_row(
+                "SELECT instance_name, owner_pid, owner_hostname, acquired_at, \
+                    last_heartbeat_at, lease_version \
+                 FROM shared_instance_leases WHERE instance_name = ?1",
+                [&lease.instance_name],
+                sqlite_row_to_shared_instance_lease,
+            )?;
+            Ok(Some(updated))
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("heartbeat_shared_instance: {e}")))
+    }
+
+    async fn lookup_shared_instance_lease(
+        &self,
+        instance_name: &str,
+    ) -> Result<Option<crate::federation::SharedInstanceLease>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let name = instance_name.to_owned();
+        (move || -> Result<Option<crate::federation::SharedInstanceLease>, rusqlite::Error> {
+            let conn = conn.lock();
+            match conn.query_row(
+                "SELECT instance_name, owner_pid, owner_hostname, acquired_at, \
+                    last_heartbeat_at, lease_version \
+                 FROM shared_instance_leases WHERE instance_name = ?1",
+                [&name],
+                sqlite_row_to_shared_instance_lease,
+            ) {
+                Ok(l) => Ok(Some(l)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("lookup_shared_instance_lease: {e}"))
+        })
+    }
+
+    async fn release_shared_instance_lease(
+        &self,
+        lease: &crate::federation::SharedInstanceLease,
+    ) -> Result<(), crate::federation::Error> {
+        let conn = self.conn.clone();
+        let lease = lease.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            // Ownership-checked + idempotent: only our own current lease.
+            conn.execute(
+                "DELETE FROM shared_instance_leases \
+                 WHERE instance_name = ?1 AND lease_version = ?2 AND owner_pid = ?3",
+                rusqlite::params![
+                    lease.instance_name,
+                    lease.lease_version,
+                    i64::from(lease.owner_pid),
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("release_shared_instance_lease: {e}"))
+        })
+    }
+
     async fn communities_containing(
         &self,
         cell_id: &str,
@@ -7399,6 +7541,21 @@ fn sqlite_row_to_location_proof(
         attestation_evidence: row.get("attestation_evidence")?,
         withdrawn_at: withdrawn_at.as_deref().map(parse_rfc3339),
         persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+fn sqlite_row_to_shared_instance_lease(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::SharedInstanceLease> {
+    let acquired_at: String = row.get("acquired_at")?;
+    let last_heartbeat_at: String = row.get("last_heartbeat_at")?;
+    Ok(crate::federation::SharedInstanceLease {
+        instance_name: row.get("instance_name")?,
+        owner_pid: row.get("owner_pid")?,
+        owner_hostname: row.get("owner_hostname")?,
+        acquired_at: parse_rfc3339(&acquired_at),
+        last_heartbeat_at: parse_rfc3339(&last_heartbeat_at),
+        lease_version: row.get("lease_version")?,
     })
 }
 
@@ -12765,6 +12922,105 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// CIRISPersist#210 — full SharedInstanceLease lifecycle: acquire,
+    /// live-contention rejection, lookup, heartbeat, stale-steal (version
+    /// bump), demotion detection, ownership-checked release.
+    #[tokio::test]
+    async fn shared_instance_lease_election_lifecycle() {
+        use std::time::Duration;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let name = "reticulum:default";
+
+        // 1. Acquire on an empty slot → win, version 1.
+        let lease = backend
+            .try_acquire_shared_instance(name, 1001, "hostA", None)
+            .await
+            .unwrap()
+            .expect("first acquire wins");
+        assert_eq!(lease.owner_pid, 1001);
+        assert_eq!(lease.lease_version, 1);
+        assert_eq!(lease.instance_name, name);
+
+        // 2. A second, live contender → loses (None).
+        assert!(
+            backend
+                .try_acquire_shared_instance(name, 2002, "hostB", None)
+                .await
+                .unwrap()
+                .is_none(),
+            "a live owner blocks a second acquirer"
+        );
+
+        // 3. lookup reports the owner.
+        let found = backend
+            .lookup_shared_instance_lease(name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((found.owner_pid, found.lease_version), (1001, 1));
+
+        // 4. Owner heartbeats → still owner, same version, fresher beat.
+        let beat = backend
+            .heartbeat_shared_instance(&lease)
+            .await
+            .unwrap()
+            .expect("owner still holds");
+        assert_eq!((beat.owner_pid, beat.lease_version), (1001, 1));
+        assert!(beat.last_heartbeat_at >= lease.last_heartbeat_at);
+
+        // 5. Let the heartbeat age, then steal with a small stale window.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let stolen = backend
+            .try_acquire_shared_instance(name, 2002, "hostB", Some(Duration::from_millis(10)))
+            .await
+            .unwrap()
+            .expect("a stale owner is stealable");
+        assert_eq!(stolen.owner_pid, 2002);
+        assert_eq!(stolen.lease_version, 2, "steal increments the version");
+
+        // 6. The demoted original owner's heartbeat → None (takeover seen).
+        assert!(
+            backend
+                .heartbeat_shared_instance(&beat)
+                .await
+                .unwrap()
+                .is_none(),
+            "original owner learns its lease was stolen"
+        );
+
+        // 7. Owner releases → row gone; next acquire is fresh at v1.
+        backend
+            .release_shared_instance_lease(&stolen)
+            .await
+            .unwrap();
+        assert!(backend
+            .lookup_shared_instance_lease(name)
+            .await
+            .unwrap()
+            .is_none());
+        let fresh = backend
+            .try_acquire_shared_instance(name, 3003, "hostC", None)
+            .await
+            .unwrap()
+            .expect("acquire after release wins");
+        assert_eq!(fresh.lease_version, 1, "released slot → fresh lease at v1");
+
+        // 8. A stale (non-current) release must NOT evict the live owner.
+        backend
+            .release_shared_instance_lease(&stolen)
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .lookup_shared_instance_lease(name)
+                .await
+                .unwrap()
+                .is_some(),
+            "stale release never deletes another process's current lease"
         );
     }
 

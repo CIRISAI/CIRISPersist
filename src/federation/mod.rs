@@ -56,6 +56,10 @@ pub mod read;
 pub mod replication;
 pub mod rooting;
 pub mod schema_resolver;
+// CIRISPersist#210 — cross-process leader election (RNS shared-instance
+// owner; CIRISEdge#100). Backend-agnostic types + staleness helper; the
+// atomic acquire/heartbeat/release live in the backends.
+pub mod shared_instance;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_open;
 // v4.1 (CIRISPersist#142 Cut C2) — streaming-chunk AES-256-GCM + STREAM
@@ -138,6 +142,7 @@ pub use schema_resolver::BlobBackedSchemaResolver;
 pub use schema_resolver::{
     axis_from_dimension, AxisSchema, NoOpSchemaResolver, SchemaResolver, SchemaResolverError,
 };
+pub use shared_instance::{SharedInstanceLease, DEFAULT_STALE_AFTER};
 #[cfg(feature = "sqlite")]
 pub use sqlite_open::FederationDirectorySqlite;
 pub use stream_sth::{
@@ -1323,6 +1328,92 @@ pub trait FederationDirectory: Send + Sync {
         let _ = key_id;
         Err(Error::Backend(
             "peer_metadata_for not implemented for this backend".into(),
+        ))
+    }
+
+    // ── Shared-instance leases (CIRISPersist#210; CIRISEdge#100) ────
+    //
+    // Cross-process leader election for a named singleton (the RNS
+    // shared-instance owner). See [`shared_instance`] for the model.
+
+    /// Try to become the owner of `instance_name`. Atomic across racing
+    /// siblings — exactly one wins.
+    ///
+    /// - `Ok(Some(lease))` — won. The caller is now the server: hold the
+    ///   lease and call [`heartbeat_shared_instance`](Self::heartbeat_shared_instance)
+    ///   periodically. Won either because no row existed, or the prior
+    ///   owner's heartbeat aged past `stale_after` (a dead owner is
+    ///   stolen; `lease_version` increments so the demoted owner detects
+    ///   the takeover on its next heartbeat).
+    /// - `Ok(None)` — a *live* owner already holds it. The caller is a
+    ///   client; use [`lookup_shared_instance_lease`](Self::lookup_shared_instance_lease)
+    ///   to find who to dial.
+    /// - `Err(_)` — transport failure (DB unreachable etc.).
+    ///
+    /// `stale_after` defaults to
+    /// [`shared_instance::DEFAULT_STALE_AFTER`] (30s) when `None`. The
+    /// staleness threshold is computed client-side so the new row's
+    /// timestamps and the staleness comparison share one clock.
+    async fn try_acquire_shared_instance(
+        &self,
+        instance_name: &str,
+        owner_pid: i32,
+        owner_hostname: &str,
+        stale_after: Option<std::time::Duration>,
+    ) -> Result<Option<shared_instance::SharedInstanceLease>, Error> {
+        let _ = (instance_name, owner_pid, owner_hostname, stale_after);
+        Err(Error::Backend(
+            "try_acquire_shared_instance not implemented for this backend".into(),
+        ))
+    }
+
+    /// Refresh the lease's `last_heartbeat_at`. The owner calls this on a
+    /// timer (e.g. every 10s against a 30s `stale_after`).
+    ///
+    /// - `Ok(Some(lease))` — heartbeat landed; the caller is still owner
+    ///   (returned lease carries the refreshed `last_heartbeat_at`).
+    /// - `Ok(None)` — the lease was **stolen** (a stale window elapsed
+    ///   while the owner was paused and a sibling took over; the stored
+    ///   row's `lease_version`/owner no longer matches the held lease, or
+    ///   the row is gone). Treat as a demotion: stop owning, become a
+    ///   client, reconnect to the new owner.
+    /// - `Err(_)` — transport failure.
+    async fn heartbeat_shared_instance(
+        &self,
+        lease: &shared_instance::SharedInstanceLease,
+    ) -> Result<Option<shared_instance::SharedInstanceLease>, Error> {
+        let _ = lease;
+        Err(Error::Backend(
+            "heartbeat_shared_instance not implemented for this backend".into(),
+        ))
+    }
+
+    /// Look up the current owner of `instance_name` (live or stale).
+    /// `None` if no row exists. Clients use it to find who to dial;
+    /// operators use it to debug. Liveness is the caller's call from
+    /// `last_heartbeat_at` age.
+    async fn lookup_shared_instance_lease(
+        &self,
+        instance_name: &str,
+    ) -> Result<Option<shared_instance::SharedInstanceLease>, Error> {
+        let _ = instance_name;
+        Err(Error::Backend(
+            "lookup_shared_instance_lease not implemented for this backend".into(),
+        ))
+    }
+
+    /// Explicitly release the lease on graceful shutdown so a sibling can
+    /// take over immediately without waiting out `stale_after`. Idempotent
+    /// and ownership-checked: only deletes the row if the held lease is
+    /// still the current owner (matching `lease_version`); a no-op if the
+    /// lease was already stolen (never deletes another process's lease).
+    async fn release_shared_instance_lease(
+        &self,
+        lease: &shared_instance::SharedInstanceLease,
+    ) -> Result<(), Error> {
+        let _ = lease;
+        Err(Error::Backend(
+            "release_shared_instance_lease not implemented for this backend".into(),
         ))
     }
 }
