@@ -2776,6 +2776,50 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_hard_case_event).collect()
     }
 
+    async fn list_consent_revocations(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Subject-side revocations only: a `withdraws` admitted under rule
+        // 2/3/4 (rule 1 is the producer's own revoke), or a
+        // `consent:state:revoked` stance. NOT tier-filtered — the §10.1.3
+        // promotion-overdue check needs the local-tier rows too.
+        let cols = "attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
+            weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+            original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+            scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
+            withdraws_admission_rule, cohort_scope, tier, promoted_at";
+        let pred = "((attestation_type = 'withdraws' AND withdraws_admission_rule IN (2, 3, 4)) \
+                    OR (attestation_envelope->>'dimension') LIKE 'consent:state:revoked%')";
+        let rows = if let Some(s) = since {
+            client
+                .query(
+                    &format!(
+                        "SELECT {cols} FROM cirislens.federation_attestations \
+                         WHERE {pred} AND asserted_at >= $1 ORDER BY asserted_at DESC"
+                    ),
+                    &[&s],
+                )
+                .await
+        } else {
+            client
+                .query(
+                    &format!(
+                        "SELECT {cols} FROM cirislens.federation_attestations \
+                         WHERE {pred} ORDER BY asserted_at DESC"
+                    ),
+                    &[],
+                )
+                .await
+        }
+        .map_err(|e| crate::federation::Error::Backend(format!("list_consent_revocations: {e}")))?;
+        rows.into_iter().map(pg_row_to_attestation).collect()
+    }
+
     async fn communities_containing(
         &self,
         cell_id: &str,
@@ -22377,6 +22421,113 @@ mod tests {
     /// `INSERT … ON CONFLICT … WHERE stale` atomic election, live-owner
     /// rejection, heartbeat, stale-steal (version bump + RETURNING),
     /// demotion detection, ownership-checked release.
+    /// CIRISPersist#146 Ask 3 — consent-SLA watcher on live PG: exercises
+    /// the `list_consent_revocations` query (JSONB `dimension` LIKE +
+    /// `withdraws_admission_rule` filter) end-to-end through
+    /// `run_consent_sla_watch` — breach past deadline, then suppressed by
+    /// `consent:deletion_complete`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_consent_sla_watch_emits_breach_then_suppresses() {
+        use crate::federation::{hard_case::kind, FederationDirectory, HardCaseFilter};
+        use std::time::Duration;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let s = uuid_like();
+        let producer = format!("pg-prod-{s}");
+        let subject = format!("pg-subj-{s}");
+        let target = format!("pg-tgt-{s}");
+        for (k, ty) in [
+            (
+                &producer,
+                crate::federation::types::identity_type::PRIMITIVE,
+            ),
+            (&subject, crate::federation::types::identity_type::PRIMITIVE),
+            (&target, crate::federation::types::identity_type::PRIMITIVE),
+        ] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: pg_admission_key(k, k, ty),
+                })
+                .await
+                .unwrap();
+        }
+        let now = chrono::Utc::now();
+        let put = |attester: &str, dim: &str, at: chrono::DateTime<chrono::Utc>| {
+            let mut att = pg_scores_attestation(attester, &target, attester, dim);
+            att.asserted_at = at;
+            crate::federation::SignedAttestation { attestation: att }
+        };
+        backend
+            .put_attestation(put(
+                &producer,
+                "consent:deletion_sla:1:v1",
+                now - chrono::Duration::days(5),
+            ))
+            .await
+            .unwrap();
+        backend
+            .put_attestation(put(
+                &subject,
+                "consent:state:revoked:v1",
+                now - chrono::Duration::days(2),
+            ))
+            .await
+            .unwrap();
+
+        // Counts are global over the shared serial DB, so assert via THIS
+        // target's rows, not the watcher's global counters.
+        let window = Duration::from_secs(86_400);
+        let r1 = backend.run_consent_sla_watch(now, window).await.unwrap();
+        assert!(r1.revocations_scanned >= 1, "scan found our revocation");
+        let mine = |events: Vec<crate::federation::HardCaseEvent>| {
+            events
+                .into_iter()
+                .filter(|e| e.target_key_id.as_deref() == Some(target.as_str()))
+                .collect::<Vec<_>>()
+        };
+        let breaches = mine(
+            backend
+                .list_hard_case_events(HardCaseFilter {
+                    kind: Some(kind::CONSENT_SLA_BREACH.into()),
+                    since: None,
+                })
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            breaches.len(),
+            1,
+            "PG list_consent_revocations → breach for our target"
+        );
+        assert_eq!(
+            breaches[0].subject_key_id.as_deref(),
+            Some(subject.as_str())
+        );
+        assert_eq!(breaches[0].detail["sla_days"], 1);
+
+        // Re-scan is row-idempotent for our target (no duplicate).
+        backend.run_consent_sla_watch(now, window).await.unwrap();
+        let after = mine(
+            backend
+                .list_hard_case_events(HardCaseFilter {
+                    kind: Some(kind::CONSENT_SLA_BREACH.into()),
+                    since: None,
+                })
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            after.len(),
+            1,
+            "no duplicate breach row for our target on re-scan"
+        );
+    }
+
     /// CIRISPersist#146 Ask 3 — hard_case:* emission on live PG: JSONB
     /// `detail` round-trip, kind/since filters, and idempotency on the
     /// deterministic `event_id` (ON CONFLICT DO NOTHING).

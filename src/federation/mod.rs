@@ -119,7 +119,7 @@ pub use goal::{
     canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
     MetaGoalAlignment,
 };
-pub use hard_case::{ConsentState, HardCaseEvent, HardCaseFilter};
+pub use hard_case::{ConsentState, ConsentWatchReport, HardCaseEvent, HardCaseFilter};
 pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE};
 pub use identity_aggregate::{
     ContentKemIdentity, LocalIdentityAggregate, LOCAL_IDENTITY_AGGREGATE_VERSION,
@@ -1488,6 +1488,139 @@ pub trait FederationDirectory: Send + Sync {
             // unknown stance value never silently reads as granted).
             _ => hard_case::ConsentState::Unspecified,
         })
+    }
+
+    /// Subject-side revocations (consent observability scan, §8.1.11.3 /
+    /// §10.1.3) — every `consent:state:revoked` attestation plus every
+    /// subject-side `withdraws` (admission rule 2/3/4; rule 1 is the
+    /// *producer's* self-revoke, not a consent event). Returns the full
+    /// [`Attestation`] rows (`attested_key_id` = target `T`,
+    /// `attesting_key_id` = subject `s`, `asserted_at` = revocation time,
+    /// `tier`/`promoted_at` for the §10.1.3 local-tier check). Includes
+    /// **local-tier** rows (unlike [`list_attestations_for`](Self::list_attestations_for),
+    /// which is federation-only) — the promotion-overdue check needs them.
+    /// `since` bounds the scan; `None` = all.
+    async fn list_consent_revocations(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = since;
+        Err(Error::Backend(
+            "list_consent_revocations not implemented for this backend".into(),
+        ))
+    }
+
+    /// CEG §8.1.11.3 + §10.1.3 — the consent observability watcher. One
+    /// pass: for each subject-side revocation, (a) emit
+    /// `hard_case:consent_sla_breach` if the producer committed a
+    /// `consent:deletion_sla:{days}` on `T`, the deadline
+    /// (`revocation_at + days`) has passed, and no `consent:deletion_complete`
+    /// landed after the revocation; (b) emit
+    /// `hard_case:consent_revocation_promotion_overdue` if the revocation
+    /// is still local-tier (unpromoted) past `promotion_window`.
+    ///
+    /// Backend-agnostic default composing
+    /// [`list_consent_revocations`](Self::list_consent_revocations) +
+    /// [`list_attestations_for`](Self::list_attestations_for) +
+    /// [`record_hard_case`](Self::record_hard_case). Emission is idempotent
+    /// (deterministic `event_id`), so running every tick re-emits nothing
+    /// for already-recorded conditions. NOTE: the per-revocation
+    /// `list_attestations_for` is an N+1 read — fine for a periodic watcher
+    /// over a bounded `since` window; revisit if the revocation set grows
+    /// large.
+    async fn run_consent_sla_watch(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        promotion_window: std::time::Duration,
+    ) -> Result<hard_case::ConsentWatchReport, Error> {
+        fn envelope_dimension(a: &Attestation) -> Option<&str> {
+            a.attestation_envelope
+                .get("dimension")
+                .and_then(|v| v.as_str())
+        }
+        let promotion = chrono::Duration::from_std(promotion_window)
+            .unwrap_or_else(|_| chrono::Duration::hours(24));
+        let revocations = self.list_consent_revocations(None).await?;
+        let mut report = hard_case::ConsentWatchReport {
+            revocations_scanned: revocations.len(),
+            ..Default::default()
+        };
+        for rev in &revocations {
+            let target = &rev.attested_key_id;
+            let subject = &rev.attesting_key_id;
+            let revoked_at = rev.asserted_at;
+
+            // (a) §8.1.11.3 deletion-SLA breach.
+            let atts = self.list_attestations_for(target).await?;
+            let sla_days = atts
+                .iter()
+                .filter_map(|a| {
+                    envelope_dimension(a)
+                        .and_then(hard_case::parse_deletion_sla_days)
+                        .map(|days| (a.asserted_at, days))
+                })
+                .max_by_key(|(at, _)| *at)
+                .map(|(_, days)| days);
+            if let Some(days) = sla_days {
+                let deadline = revoked_at + chrono::Duration::days(i64::from(days));
+                let completed = atts.iter().any(|a| {
+                    envelope_dimension(a)
+                        .is_some_and(|d| d.starts_with("consent:deletion_complete"))
+                        && a.asserted_at > revoked_at
+                });
+                if now > deadline && !completed {
+                    self.record_hard_case(hard_case::HardCaseEvent {
+                        event_id: hard_case::watch_event_id(
+                            hard_case::kind::CONSENT_SLA_BREACH,
+                            target,
+                            revoked_at,
+                        ),
+                        kind: hard_case::kind::CONSENT_SLA_BREACH.to_string(),
+                        target_key_id: Some(target.clone()),
+                        subject_key_id: Some(subject.clone()),
+                        detail: serde_json::json!({
+                            "sla_days": days,
+                            "revocation_at": revoked_at.to_rfc3339(),
+                            "deadline": deadline.to_rfc3339(),
+                        }),
+                        emitted_at: now,
+                    })
+                    .await?;
+                    report.sla_breaches += 1;
+                }
+            }
+
+            // (b) §10.1.3 local-tier revocation unpromoted past the window.
+            // CAVEAT: persist's admission gate (AV-61) rejects subject-side
+            // revocations at the local tier — a subject revoke is always
+            // federation-tier — so under the *current* write model this
+            // condition has nothing to fire on. The check is kept
+            // forward-compatible: it fires correctly IF the #171
+            // agent-facing local-tier write/promote surface ever produces a
+            // local-tier subject revocation that then fails to promote. The
+            // §10.1.3-vs-AV-61 tension is flagged for CEG/§171 to resolve.
+            let local = rev.tier != crate::federation::types::attestation_tier::FEDERATION;
+            if local && rev.promoted_at.is_none() && now - revoked_at > promotion {
+                self.record_hard_case(hard_case::HardCaseEvent {
+                    event_id: hard_case::watch_event_id(
+                        hard_case::kind::CONSENT_REVOCATION_PROMOTION_OVERDUE,
+                        target,
+                        revoked_at,
+                    ),
+                    kind: hard_case::kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.to_string(),
+                    target_key_id: Some(target.clone()),
+                    subject_key_id: Some(subject.clone()),
+                    detail: serde_json::json!({
+                        "revocation_at": revoked_at.to_rfc3339(),
+                        "promotion_window_secs": promotion_window.as_secs(),
+                    }),
+                    emitted_at: now,
+                })
+                .await?;
+                report.promotion_overdue += 1;
+            }
+        }
+        Ok(report)
     }
 }
 
