@@ -87,3 +87,42 @@ pub enum ConsentState {
     /// Subject named in `subject_key_ids` but never declared a stance.
     Unspecified,
 }
+
+/// Outcome of one
+/// [`run_consent_sla_watch`](crate::federation::FederationDirectory::run_consent_sla_watch)
+/// pass (CEG §8.1.11.3 + §10.1.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsentWatchReport {
+    /// Subject-side revocations scanned this pass.
+    pub revocations_scanned: usize,
+    /// `consent_sla_breach` **conditions detected** this pass (deadline
+    /// passed, no `consent:deletion_complete`). Recording is idempotent
+    /// on `event_id`, so a re-scan detects the same active condition again
+    /// (count stays > 0) but writes no duplicate row; the count drops to 0
+    /// once the producer's `consent:deletion_complete` lands.
+    pub sla_breaches: usize,
+    /// `consent_revocation_promotion_overdue` conditions detected. See the
+    /// §10.1.3 caveat on
+    /// [`run_consent_sla_watch`](crate::federation::FederationDirectory::run_consent_sla_watch).
+    pub promotion_overdue: usize,
+}
+
+/// Parse the SLA window (days) from a `consent:deletion_sla:{days}`
+/// dimension (§5.6.8.6). Tolerates a trailing `:vN` version segment —
+/// takes the first integer-valued segment after the prefix. `None` if the
+/// dimension isn't a deletion-SLA or carries no integer.
+#[must_use]
+pub fn parse_deletion_sla_days(dimension: &str) -> Option<u32> {
+    dimension
+        .strip_prefix("consent:deletion_sla:")?
+        .split(':')
+        .find_map(|seg| seg.parse::<u32>().ok())
+}
+
+/// Deterministic `event_id` for a hard_case against `(kind, target,
+/// revocation)` — the idempotency key so a watcher re-scan of the same
+/// observed condition is a no-op rather than a duplicate row.
+#[must_use]
+pub fn watch_event_id(kind: &str, target_key_id: &str, revocation_at: DateTime<Utc>) -> String {
+    format!("{kind}:{target_key_id}:{}", revocation_at.timestamp())
+}

@@ -5,6 +5,21 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [5.8.0] — 2026-06-13
+
+### Added — consent-SLA watcher (CIRISPersist#146 Ask 3 complete; CEG §8.1.11.3 / §10.1.3)
+
+Completes #146's back half on the v5.7.0 primitives. The consent observability watcher scans subject-side revocations and emits the `hard_case:*` signals LensCore composes `detection:consent:*` over.
+
+- **`FederationDirectory::run_consent_sla_watch(now, promotion_window)`** — backend-agnostic default composing `list_consent_revocations` + `list_attestations_for` + `record_hard_case`. §8.1.11.3: for each subject-side revocation, if the producer committed a `consent:deletion_sla:{days}` on the target, the deadline (`revocation_at + days`) passed, and no `consent:deletion_complete` landed after the revocation → emit `hard_case:consent_sla_breach`. Emission is idempotent (deterministic `event_id`), so running every tick re-emits nothing for an already-recorded breach; it clears once the producer attests completion. Returns a `ConsentWatchReport` (revocations scanned, breach/overdue conditions detected this pass).
+- **`FederationDirectory::list_consent_revocations(since)`** (Postgres + SQLite) — the revocation scan: `consent:state:revoked` stances + subject-side `withdraws` (admission rule 2/3/4; rule 1 is the producer's own revoke). Returns full `Attestation` rows, **not** tier-filtered (the §10.1.3 check needs local-tier rows).
+- **`federation::hard_case`** gains `ConsentWatchReport`, `parse_deletion_sla_days`, `watch_event_id`.
+
+**§10.1.3 caveat (flagged, not silently shipped):** the `consent_revocation_promotion_overdue` check is implemented but currently fires on nothing — persist's admission gate (AV-61) rejects subject-side revocations at the local tier, so there are no local-tier subject revocations to be "promotion-overdue." The check is kept forward-compatible (it fires correctly if the #171 agent-facing local-tier write/promote surface ever produces one); the §10.1.3-vs-AV-61 tension is a real question for CEG/§171 to resolve.
+
+### Tests
+Both backends: the watcher emits a breach past the deadline, is idempotent on re-scan, and is suppressed by `consent:deletion_complete` (sqlite, clean DB); the PG path exercises `list_consent_revocations` (JSONB `dimension` LIKE + `withdraws_admission_rule` filter) end-to-end. Gate: fmt · clippy `-D warnings` ×2 · sqlite lib (791) · live-PG lib (731) · cargo-deny.
+
 ## [5.7.0] — 2026-06-13
 
 ### Added — `hard_case:*` emission surface + consent-state resolution (CIRISPersist#146; CEG 1.0-RC4 §7.0.2 / §8.1.11)

@@ -2452,6 +2452,45 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_hard_case_events: {e}")))
     }
 
+    async fn list_consent_revocations(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let since_s = since.map(|t| t.to_rfc3339());
+        let conn = self.conn.clone();
+        (move || -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+            let conn = conn.lock();
+            // Subject-side revocations only (withdraws rule 2/3/4, or a
+            // consent:state:revoked stance). NOT tier-filtered — §10.1.3
+            // promotion-overdue needs the local-tier rows.
+            let mut sql = String::from(
+                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                 FROM federation_attestations \
+                 WHERE ((attestation_type = 'withdraws' AND withdraws_admission_rule IN (2, 3, 4)) \
+                        OR json_extract(attestation_envelope, '$.dimension') LIKE 'consent:state:revoked%')",
+            );
+            let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+            if let Some(s) = since_s {
+                vals.push(s.into());
+                sql.push_str(" AND asserted_at >= ?1");
+            }
+            sql.push_str(" ORDER BY asserted_at DESC");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(vals.iter()),
+                sqlite_row_to_attestation,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_consent_revocations: {e}"))
+        })
+    }
+
     async fn communities_containing(
         &self,
         cell_id: &str,
@@ -12125,6 +12164,106 @@ mod tests {
             .await
             .unwrap();
         assert!(recent.is_empty(), "since-filter excludes pre-cutoff events");
+    }
+
+    /// CIRISPersist#146 Ask 3 — the consent-SLA watcher (§8.1.11.3): a
+    /// revocation past the producer's committed deletion-SLA deadline with
+    /// no `consent:deletion_complete` → `consent_sla_breach`; idempotent on
+    /// re-scan; suppressed once the producer attests completion.
+    #[tokio::test]
+    async fn consent_sla_watch_emits_breach_then_suppresses_on_completion() {
+        use crate::federation::{
+            hard_case::kind, FederationDirectory, HardCaseFilter, SignedAttestation,
+        };
+        use std::time::Duration;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["producer-1", "subject-1", "target-1"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, &format!("prim-{k}"), k),
+                })
+                .await
+                .unwrap();
+        }
+        let now = chrono::Utc::now();
+        let mk = |id: &str, attester: &str, dim: &str, at: chrono::DateTime<chrono::Utc>| {
+            let mut a = fed_attestation(id, attester, "target-1", attester);
+            a.attestation_envelope = serde_json::json!({ "id": id, "dimension": dim });
+            a.asserted_at = at;
+            SignedAttestation { attestation: a }
+        };
+        // Producer commits a 1-day deletion SLA on the target Contribution.
+        backend
+            .put_attestation(mk(
+                "sla",
+                "producer-1",
+                "consent:deletion_sla:1:v1",
+                now - chrono::Duration::days(5),
+            ))
+            .await
+            .unwrap();
+        // Subject revoked 2 days ago → deadline (revoke + 1d) is a day past.
+        backend
+            .put_attestation(mk(
+                "rev",
+                "subject-1",
+                "consent:state:revoked:v1",
+                now - chrono::Duration::days(2),
+            ))
+            .await
+            .unwrap();
+
+        let window = Duration::from_secs(86_400);
+        let r1 = backend.run_consent_sla_watch(now, window).await.unwrap();
+        assert_eq!(r1.revocations_scanned, 1);
+        assert_eq!(
+            r1.sla_breaches, 1,
+            "deadline passed, no completion → breach"
+        );
+
+        let breaches = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::CONSENT_SLA_BREACH.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].target_key_id.as_deref(), Some("target-1"));
+        assert_eq!(breaches[0].subject_key_id.as_deref(), Some("subject-1"));
+        assert_eq!(breaches[0].detail["sla_days"], 1);
+
+        // A second pass still detects the active condition, but records no
+        // duplicate row (idempotent on the deterministic event_id).
+        let r2 = backend.run_consent_sla_watch(now, window).await.unwrap();
+        assert_eq!(r2.sla_breaches, 1, "condition still active");
+        assert_eq!(
+            backend
+                .list_hard_case_events(HardCaseFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "no duplicate breach row on re-scan"
+        );
+
+        // Producer attests deletion-complete after the revocation → the
+        // condition is suppressed (no longer detected).
+        backend
+            .put_attestation(mk(
+                "done",
+                "producer-1",
+                "consent:deletion_complete:v1",
+                now - chrono::Duration::days(1),
+            ))
+            .await
+            .unwrap();
+        let r3 = backend.run_consent_sla_watch(now, window).await.unwrap();
+        assert_eq!(
+            r3.sla_breaches, 0,
+            "consent:deletion_complete suppresses the breach"
+        );
     }
 
     fn fed_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
