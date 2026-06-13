@@ -1893,6 +1893,156 @@ impl Engine {
         }
     }
 
+    /// v6.3.0 (CIRISPersist#135, Lane C) — Rust-public read facade over
+    /// [`ReadEngine::list_attestations`](crate::ceg::ReadEngine::list_attestations).
+    ///
+    /// CIRISLensCore#29.1's content-class-misclassification detector
+    /// reads quality / authenticity / production attestations against an
+    /// admitted content row to catch "declared as `film` but lacks
+    /// distributor + production-credits + festival attestations." The
+    /// attestation *class* is the open-vocabulary
+    /// [`AttestationFilter::dimension_prefixes`](crate::ceg::AttestationFilter)
+    /// axis (`content_rating:*`, CEG §10.1.5.4); the *scope* is gated by
+    /// `scope` against the row's `cohort_scope` (§4.3). Newest-first
+    /// `(asserted_at, attestation_id)` DESC, cursor-paged.
+    ///
+    /// Thin dispatch over the [`BackendDispatch`] enum so co-resident
+    /// Rust consumers (LensCore client-mode) don't `match` on the backend
+    /// themselves — the read-side sibling of the PyO3
+    /// `list_attestations` wrapper. Behaviour + ordering + scope gate
+    /// match the per-backend [`ReadEngine`](crate::ceg::ReadEngine) impl.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn list_attestations(
+        &self,
+        filter: crate::ceg::AttestationFilter,
+        cursor: Option<crate::ceg::AttestationCursor>,
+        limit: i64,
+        scope: crate::scope::CallerScope,
+    ) -> Result<crate::ceg::AttestationListPage, crate::ceg::Error> {
+        use crate::ceg::ReadEngine;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.list_attestations(filter, cursor, limit, scope).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.list_attestations(filter, cursor, limit, scope).await,
+        }
+    }
+
+    /// v6.3.0 (CIRISPersist#135, Lane C) — takedowns claimed against a
+    /// given `target_content_sha256` (the target of the moderation
+    /// claim), cursor-paged + filterable.
+    ///
+    /// CIRISLensCore#29.4's takedown-abuse detector reads per-target to
+    /// catch "single claimant emitting many takedowns against one
+    /// target" — set [`TakedownFilter::claimant_key_id`](crate::cirisnode::TakedownFilter)
+    /// for the per-target × per-claimant slice. Composes over
+    /// [`NodeCoreService::list_takedowns_for`](crate::cirisnode::NodeCoreService::list_takedowns_for)
+    /// (the V054-indexed `media_content_sha256` read, already
+    /// newest-first by `submitted_at DESC, contribution_id DESC`) then
+    /// AND-applies the claimant + `[since, until)` window and advances a
+    /// [`ListCursor`](crate::cirisnode::ListCursor) on the same
+    /// `(submitted_at, contribution_id)` tuple — the deterministic
+    /// ordering that storage query already emits, identical to
+    /// `list_contributions`'s cursor shape.
+    ///
+    /// The claimant secondary key lives in the Contribution `payload`
+    /// JSONB (`payload.claimant_key_id`), not an indexed column, so it is
+    /// applied in the facade over the already-bounded per-target row set
+    /// — avoiding a backend-divergent JSON-path predicate while keeping
+    /// both backends behaviourally identical (parity is structural: the
+    /// only SQL is the parametrized storage query).
+    #[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
+    pub async fn list_takedowns_for(
+        &self,
+        target_content_sha256: &str,
+        filter: crate::cirisnode::TakedownFilter,
+        cursor: Option<crate::cirisnode::ListCursor>,
+        limit: i64,
+    ) -> Result<crate::cirisnode::TakedownListPage, crate::cirisnode::Error> {
+        use crate::cirisnode::NodeCoreService;
+        media_validate_limit(limit)?;
+        let svc = self.node_core_service();
+        let rows = match &svc {
+            #[cfg(feature = "postgres")]
+            NodeCoreDispatch::Postgres(b) => b.list_takedowns_for(target_content_sha256).await?,
+            #[cfg(feature = "sqlite")]
+            NodeCoreDispatch::Sqlite(b) => b.list_takedowns_for(target_content_sha256).await?,
+        };
+        let claimant = filter.claimant_key_id.as_deref();
+        let kept = rows.into_iter().filter(|env| {
+            if let Some(c) = claimant {
+                if env.payload.get("claimant_key_id").and_then(|v| v.as_str()) != Some(c) {
+                    return false;
+                }
+            }
+            media_in_window(env.submitted_at, filter.since, filter.until)
+        });
+        let (items, next_cursor) = media_apply_cursor(kept, cursor, limit)?;
+        Ok(crate::cirisnode::TakedownListPage { items, next_cursor })
+    }
+
+    /// v6.3.0 (CIRISPersist#135, Lane C) — key-grants delivered to a
+    /// given `recipient_key_id`, cursor-paged + filterable.
+    ///
+    /// CIRISLensCore#29.3's key_grant-abuse detector reads per-recipient
+    /// to catch "single recipient receiving key_grants from many
+    /// unrelated publishers in a short window" (sybil sample pattern) —
+    /// set [`KeyGrantFilter::publisher_key_id`](crate::cirisnode::KeyGrantFilter)
+    /// for the per-recipient × per-publisher slice. Composes over
+    /// [`NodeCoreService::list_key_grants_for`](crate::cirisnode::NodeCoreService::list_key_grants_for)
+    /// — or the two-axis
+    /// [`list_key_grants_for_content`](crate::cirisnode::NodeCoreService::list_key_grants_for_content)
+    /// V054 index path when [`KeyGrantFilter::content_sha256`](crate::cirisnode::KeyGrantFilter)
+    /// pins a content hash — then AND-applies the publisher
+    /// (`author_id`) + `[since, until)` window and advances a
+    /// [`ListCursor`](crate::cirisnode::ListCursor) on the same
+    /// `(submitted_at, contribution_id)` tuple the storage query emits.
+    ///
+    /// The publisher secondary key is the top-level Contribution
+    /// `author_id`; the window filters `submitted_at` — both applied in
+    /// the facade over the already-bounded per-recipient row set, so the
+    /// only SQL is the parametrized storage query and both backends are
+    /// behaviourally identical.
+    #[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
+    pub async fn list_key_grants_for(
+        &self,
+        recipient_key_id: &str,
+        filter: crate::cirisnode::KeyGrantFilter,
+        cursor: Option<crate::cirisnode::ListCursor>,
+        limit: i64,
+    ) -> Result<crate::cirisnode::KeyGrantListPage, crate::cirisnode::Error> {
+        use crate::cirisnode::NodeCoreService;
+        media_validate_limit(limit)?;
+        let svc = self.node_core_service();
+        let rows = match (&svc, filter.content_sha256.as_deref()) {
+            #[cfg(feature = "postgres")]
+            (NodeCoreDispatch::Postgres(b), Some(sha)) => {
+                b.list_key_grants_for_content(sha, recipient_key_id).await?
+            }
+            #[cfg(feature = "postgres")]
+            (NodeCoreDispatch::Postgres(b), None) => {
+                b.list_key_grants_for(recipient_key_id).await?
+            }
+            #[cfg(feature = "sqlite")]
+            (NodeCoreDispatch::Sqlite(b), Some(sha)) => {
+                b.list_key_grants_for_content(sha, recipient_key_id).await?
+            }
+            #[cfg(feature = "sqlite")]
+            (NodeCoreDispatch::Sqlite(b), None) => b.list_key_grants_for(recipient_key_id).await?,
+        };
+        let publisher = filter.publisher_key_id.as_deref();
+        let kept = rows.into_iter().filter(|env| {
+            if let Some(p) = publisher {
+                if env.author_id != p {
+                    return false;
+                }
+            }
+            media_in_window(env.submitted_at, filter.since, filter.until)
+        });
+        let (items, next_cursor) = media_apply_cursor(kept, cursor, limit)?;
+        Ok(crate::cirisnode::KeyGrantListPage { items, next_cursor })
+    }
+
     /// v2.13.0 (CIRISPersist#113) — push-based change feed scoped to
     /// `detection_events`. Backs CIRISLensCore#20's `lens.alerts.*`
     /// subscription delivery.
@@ -2008,6 +2158,110 @@ impl Engine {
 
         tokio_stream::wrappers::ReceiverStream::new(rx)
     }
+}
+
+// ─── Media-detector read-facade helpers (v6.3.0, CIRISPersist#135) ──
+//
+// Shared by [`Engine::list_takedowns_for`] / [`Engine::list_key_grants_for`].
+// Both compose over the existing unpaged `NodeCoreService` listers
+// (V054-indexed, newest-first `submitted_at DESC, contribution_id DESC`)
+// and apply the filter + cursor in-facade. The cursor scheme mirrors
+// `list_contributions` exactly: a `(submitted_at, contribution_id)`
+// tuple, DESC, with `contribution_id` as the unique tiebreaker — so a
+// page boundary is deterministic even when many rows share a
+// `submitted_at`.
+
+/// Bound the page `limit` to the same `[1, 10000]` range the
+/// `list_contributions` / `list_votes` storage paths enforce.
+#[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
+pub(crate) fn media_validate_limit(limit: i64) -> Result<(), crate::cirisnode::Error> {
+    if !(1..=10_000).contains(&limit) {
+        return Err(crate::cirisnode::Error::InvalidArgument(format!(
+            "limit must be in [1, 10000], got {limit}"
+        )));
+    }
+    Ok(())
+}
+
+/// Half-open `[since, until)` window test on a row `submitted_at`.
+#[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
+pub(crate) fn media_in_window(
+    ts: chrono::DateTime<chrono::Utc>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    if let Some(s) = since {
+        if ts < s {
+            return false;
+        }
+    }
+    if let Some(u) = until {
+        if ts >= u {
+            return false;
+        }
+    }
+    true
+}
+
+/// Advance the `(submitted_at, contribution_id)`-DESC cursor over an
+/// already newest-first iterator, returning one capped page + the
+/// `next_cursor` (`Some` iff the page filled to `limit`, mirroring
+/// `list_contributions`). Validates the cursor version (`v1` only).
+#[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
+pub(crate) fn media_apply_cursor(
+    rows: impl Iterator<Item = crate::cirisnode::ContributionEnvelope>,
+    cursor: Option<crate::cirisnode::ListCursor>,
+    limit: i64,
+) -> Result<
+    (
+        Vec<crate::cirisnode::ContributionEnvelope>,
+        Option<crate::cirisnode::ListCursor>,
+    ),
+    crate::cirisnode::Error,
+> {
+    // Cursor predicate: in DESC `(submitted_at, contribution_id)` order,
+    // keep rows STRICTLY past the trailing row — i.e.
+    // `submitted_at < last_ts OR (submitted_at == last_ts AND
+    // contribution_id < last_id)`. Identical tuple-compare to the
+    // `list_contributions` SQL `WHERE` clause.
+    let after = match cursor {
+        None => None,
+        Some(c) => {
+            if c.version != "v1" {
+                return Err(crate::cirisnode::Error::InvalidArgument(format!(
+                    "ListCursor version {} unsupported (expected v1)",
+                    c.version
+                )));
+            }
+            Some((c.last_ts, c.last_id))
+        }
+    };
+    let mut items: Vec<crate::cirisnode::ContributionEnvelope> = Vec::new();
+    let cap = limit as usize;
+    for env in rows {
+        if let Some((last_ts, last_id)) = &after {
+            let past = env.submitted_at < *last_ts
+                || (env.submitted_at == *last_ts && env.contribution_id < *last_id);
+            if !past {
+                continue;
+            }
+        }
+        items.push(env);
+        if items.len() == cap {
+            break;
+        }
+    }
+    let next_cursor = if items.len() == cap {
+        items.last().map(|last| {
+            crate::cirisnode::ListCursor::from_trailing(
+                last.submitted_at,
+                last.contribution_id.clone(),
+            )
+        })
+    } else {
+        None
+    };
+    Ok((items, next_cursor))
 }
 
 /// v2.0 (CIRISPersist#93) — per-backend
@@ -4761,5 +5015,475 @@ mod tests {
             .await
             .expect("construct PG engine");
         assert_local_identity_aggregate_conformance(&engine).await;
+    }
+
+    // ── v6.3.0 (CIRISPersist#135, Lane C) — media-detector read facades ──
+    //
+    // Engine-level `list_takedowns_for` / `list_key_grants_for` +
+    // `list_attestations`. These exercise the public Rust facade
+    // end-to-end on SQLite (the lib-test backend); the PG twins are
+    // env-gated (compile-checked here, runtime-verified by the lead's
+    // localhost:5433 docker PG). The fixtures sign over the canonical
+    // envelope so `put_contribution` admits them with no trust gate and
+    // no registered author key (author_id == the signing pubkey).
+
+    #[cfg(feature = "cirisnode")]
+    fn media_pubkey_b64(key: &SigningKey) -> String {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ed25519_dalek::VerifyingKey;
+        let vk: VerifyingKey = key.verifying_key();
+        B64.encode(vk.to_bytes())
+    }
+
+    #[cfg(feature = "cirisnode")]
+    fn media_sign(
+        env: &crate::cirisnode::ContributionEnvelope,
+        key: &SigningKey,
+    ) -> crate::cirisnode::HybridSignature {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+        let canonical =
+            crate::cirisnode::verify::canonical_bytes_for_envelope(env).expect("canonical bytes");
+        crate::cirisnode::HybridSignature {
+            ed25519: B64.encode(key.sign(&canonical).to_bytes()),
+            ml_dsa_65: None,
+            signed_at: chrono::Utc::now(),
+        }
+    }
+
+    #[cfg(feature = "cirisnode")]
+    fn media_sha_hex(seed: u8) -> String {
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = seed.wrapping_add(i as u8);
+        }
+        hex::encode(bytes)
+    }
+
+    /// Build a signed `takedown_notice` Contribution with a chosen
+    /// claimant + `submitted_at` (so the secondary-key / window / cursor
+    /// axes are controllable).
+    #[cfg(feature = "cirisnode")]
+    fn media_build_takedown(
+        author_key: &SigningKey,
+        sha_hex: &str,
+        claimant_key_id: &str,
+        submitted_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::cirisnode::ContributionEnvelope {
+        use crate::cirisnode::{Cell, ContributionEnvelope, ContributionType, HybridSignature};
+        let author = media_pubkey_b64(author_key);
+        let payload = crate::cirisnode::TakedownNoticePayload {
+            content_sha256: sha_hex.to_owned(),
+            perceptual_hash: None,
+            content_holder_key_ids: vec![],
+            claimant_key_id: claimant_key_id.to_owned(),
+            legal_basis: crate::cirisnode::LegalBasis::Dmca512,
+            jurisdiction: "US".into(),
+            good_faith_statement: "good faith".into(),
+            claim_text: "claim".into(),
+            evidence_refs: vec![],
+            counter_notice_channel: None,
+            asserted_at: submitted_at,
+            expires_at: submitted_at + chrono::Duration::days(30),
+        };
+        let mut env = ContributionEnvelope {
+            contribution_id: uuid::Uuid::new_v4().to_string(),
+            contribution_type: ContributionType::Proposal,
+            author_id: author,
+            subject: Cell {
+                domain: format!("media-{}", uuid::Uuid::new_v4()),
+                language: "en".into(),
+                subject: Some(crate::cirisnode::TAKEDOWN_NOTICE_SUBJECT_KIND.into()),
+            },
+            payload: serde_json::to_value(&payload).unwrap(),
+            witness_set: None,
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: submitted_at,
+            },
+            submitted_at,
+        };
+        env.signature = media_sign(&env, author_key);
+        env
+    }
+
+    /// Build a signed `key_grant` Contribution with a chosen recipient +
+    /// content + `submitted_at`. The grant publisher is `author_key`.
+    #[cfg(feature = "cirisnode")]
+    fn media_build_key_grant(
+        author_key: &SigningKey,
+        sha_hex: &str,
+        recipient_key_id: &str,
+        submitted_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::cirisnode::ContributionEnvelope {
+        use crate::cirisnode::{Cell, ContributionEnvelope, ContributionType, HybridSignature};
+        let author = media_pubkey_b64(author_key);
+        let payload = crate::cirisnode::KeyGrantPayload {
+            recipient_key_id: recipient_key_id.to_owned(),
+            content_sha256: Some(sha_hex.to_owned()),
+            stream_id: None,
+            stream_epoch: None,
+            wrapped_dek_base64: {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode([0u8; 48])
+            },
+            wrap_algorithm: crate::cirisnode::WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm,
+            ratchet_version: 1,
+            key_validity_window: crate::cirisnode::KeyValidityWindow {
+                not_before: submitted_at,
+                not_after: submitted_at + chrono::Duration::days(30),
+            },
+            scope: crate::cirisnode::KeyGrantScope::SingleContent,
+            scope_id: sha_hex.to_owned(),
+            rotation_chain: vec![],
+        };
+        let mut env = ContributionEnvelope {
+            contribution_id: uuid::Uuid::new_v4().to_string(),
+            contribution_type: ContributionType::Proposal,
+            author_id: author,
+            subject: Cell {
+                domain: format!("media-{}", uuid::Uuid::new_v4()),
+                language: "en".into(),
+                subject: Some(crate::cirisnode::KEY_GRANT_SUBJECT_KIND.into()),
+            },
+            payload: serde_json::to_value(&payload).unwrap(),
+            witness_set: None,
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: submitted_at,
+            },
+            submitted_at,
+        };
+        env.signature = media_sign(&env, author_key);
+        env
+    }
+
+    /// Seed a contribution through the SQLite NodeCore dispatch the
+    /// Engine facade composes over.
+    #[cfg(all(feature = "sqlite", feature = "cirisnode"))]
+    async fn media_seed(engine: &Engine, env: crate::cirisnode::ContributionEnvelope) {
+        use crate::cirisnode::NodeCoreService;
+        match engine.node_core_service() {
+            NodeCoreDispatch::Sqlite(b) => {
+                b.put_contribution(env).await.expect("seed contribution")
+            }
+            #[cfg(feature = "postgres")]
+            NodeCoreDispatch::Postgres(b) => {
+                b.put_contribution(env).await.expect("seed contribution")
+            }
+        }
+    }
+
+    /// `list_takedowns_for` returns only the target's takedowns, honours
+    /// the `claimant_key_id` secondary filter, and respects the
+    /// `[since, until)` window.
+    #[cfg(all(feature = "sqlite", feature = "cirisnode"))]
+    #[tokio::test]
+    async fn list_takedowns_for_filters_target_claimant_and_window() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let k1 = SigningKey::from_bytes(&[0x11; 32]);
+        let k2 = SigningKey::from_bytes(&[0x22; 32]);
+        let claimant_a = media_pubkey_b64(&k1);
+        let claimant_b = media_pubkey_b64(&k2);
+        let target = media_sha_hex(0x40);
+        let other = media_sha_hex(0x41);
+        let t0 = "2026-01-01T00:00:00Z".parse().unwrap();
+        let t1 = "2026-02-01T00:00:00Z".parse().unwrap();
+        // target × claimant_a @ t0, target × claimant_b @ t1, other-target.
+        media_seed(&engine, media_build_takedown(&k1, &target, &claimant_a, t0)).await;
+        media_seed(&engine, media_build_takedown(&k2, &target, &claimant_b, t1)).await;
+        media_seed(&engine, media_build_takedown(&k1, &other, &claimant_a, t1)).await;
+
+        // Per-target: two rows, neither from `other`.
+        let page = engine
+            .list_takedowns_for(&target, Default::default(), None, 100)
+            .await
+            .expect("per-target");
+        assert_eq!(page.items.len(), 2, "both target takedowns");
+        assert!(page.next_cursor.is_none());
+
+        // Per-target × per-claimant: just claimant_a's.
+        let page = engine
+            .list_takedowns_for(
+                &target,
+                crate::cirisnode::TakedownFilter {
+                    claimant_key_id: Some(claimant_a.clone()),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .expect("per-claimant");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.items[0]
+                .payload
+                .get("claimant_key_id")
+                .and_then(|v| v.as_str()),
+            Some(claimant_a.as_str())
+        );
+
+        // Window `[t1, +inf)` excludes the t0 row.
+        let page = engine
+            .list_takedowns_for(
+                &target,
+                crate::cirisnode::TakedownFilter {
+                    since: Some(t1),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .expect("window");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].submitted_at, t1);
+    }
+
+    /// `list_takedowns_for` pages deterministically: a `limit`-1 walk
+    /// yields every row exactly once, newest-first, no duplicates across
+    /// the cursor boundary (even with a shared `submitted_at`).
+    #[cfg(all(feature = "sqlite", feature = "cirisnode"))]
+    #[tokio::test]
+    async fn list_takedowns_for_cursor_pages_without_gaps_or_dupes() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let k = SigningKey::from_bytes(&[0x33; 32]);
+        let claimant = media_pubkey_b64(&k);
+        let target = media_sha_hex(0x50);
+        // Five rows; two share a timestamp to exercise the
+        // contribution_id tiebreaker.
+        let shared = "2026-03-01T00:00:00Z".parse().unwrap();
+        let stamps: [chrono::DateTime<chrono::Utc>; 5] = [
+            "2026-03-05T00:00:00Z".parse().unwrap(),
+            "2026-03-04T00:00:00Z".parse().unwrap(),
+            shared,
+            shared,
+            "2026-03-02T00:00:00Z".parse().unwrap(),
+        ];
+        for ts in stamps {
+            media_seed(&engine, media_build_takedown(&k, &target, &claimant, ts)).await;
+        }
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = engine
+                .list_takedowns_for(&target, Default::default(), cursor.clone(), 2)
+                .await
+                .expect("page");
+            for it in &page.items {
+                seen.push(it.contribution_id.clone());
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 5, "every row once");
+        let mut deduped = seen.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), 5, "no duplicate across cursor boundary");
+    }
+
+    /// `list_key_grants_for` returns only the recipient's grants, honours
+    /// the `publisher_key_id` secondary filter, and the `content_sha256`
+    /// scope routes through the two-axis index path.
+    #[cfg(all(feature = "sqlite", feature = "cirisnode"))]
+    #[tokio::test]
+    async fn list_key_grants_for_filters_recipient_publisher_and_content() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let pub_a = SigningKey::from_bytes(&[0x44; 32]);
+        let pub_b = SigningKey::from_bytes(&[0x55; 32]);
+        let publisher_a = media_pubkey_b64(&pub_a);
+        let recipient = "recipient-key-1";
+        let other_recipient = "recipient-key-2";
+        let sha_x = media_sha_hex(0x60);
+        let sha_y = media_sha_hex(0x61);
+        let t = "2026-04-01T00:00:00Z".parse().unwrap();
+        media_seed(&engine, media_build_key_grant(&pub_a, &sha_x, recipient, t)).await;
+        media_seed(&engine, media_build_key_grant(&pub_b, &sha_y, recipient, t)).await;
+        media_seed(
+            &engine,
+            media_build_key_grant(&pub_a, &sha_x, other_recipient, t),
+        )
+        .await;
+
+        // Per-recipient: two grants (both publishers), none for `other`.
+        let page = engine
+            .list_key_grants_for(recipient, Default::default(), None, 100)
+            .await
+            .expect("per-recipient");
+        assert_eq!(page.items.len(), 2);
+
+        // Per-recipient × per-publisher: just publisher_a's.
+        let page = engine
+            .list_key_grants_for(
+                recipient,
+                crate::cirisnode::KeyGrantFilter {
+                    publisher_key_id: Some(publisher_a.clone()),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .expect("per-publisher");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].author_id, publisher_a);
+
+        // content_sha256 scope (two-axis index path): only the sha_x grant.
+        let page = engine
+            .list_key_grants_for(
+                recipient,
+                crate::cirisnode::KeyGrantFilter {
+                    content_sha256: Some(sha_x.clone()),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .expect("content-scope");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.items[0]
+                .payload
+                .get("content_sha256")
+                .and_then(|v| v.as_str()),
+            Some(sha_x.as_str())
+        );
+    }
+
+    /// `list_takedowns_for` / `list_key_grants_for` reject an
+    /// out-of-range `limit` (parity with the storage cap).
+    #[cfg(all(feature = "sqlite", feature = "cirisnode"))]
+    #[tokio::test]
+    async fn media_facades_reject_bad_limit() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let err = engine
+            .list_takedowns_for("deadbeef", Default::default(), None, 0)
+            .await
+            .expect_err("limit 0 rejected");
+        assert!(matches!(err, crate::cirisnode::Error::InvalidArgument(_)));
+        let err = engine
+            .list_key_grants_for("r", Default::default(), None, 99_999)
+            .await
+            .expect_err("limit too large");
+        assert!(matches!(err, crate::cirisnode::Error::InvalidArgument(_)));
+    }
+
+    /// `list_attestations` facade dispatches to the backend
+    /// `ReadEngine::list_attestations` — an empty store returns an empty
+    /// page (no error), proving the dispatch + scope plumbing compile and
+    /// run. (Row-level filter behaviour is covered by the ReadEngine
+    /// suite; this asserts the Engine facade wiring.)
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn list_attestations_facade_dispatches_to_backend_sqlite() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let page = engine
+            .list_attestations(
+                crate::ceg::AttestationFilter::default(),
+                None,
+                100,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .expect("list_attestations facade");
+        assert!(page.items.is_empty());
+        assert!(page.next_cursor.is_none());
+    }
+
+    /// PG twin of `list_takedowns_for_filters_target_claimant_and_window`
+    /// — env-gated; runtime-verified against the lead's docker PG.
+    #[cfg(all(feature = "postgres", feature = "cirisnode"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_takedowns_for_filters_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let alias = format!("media-td-{}", uuid::Uuid::new_v4().simple());
+        let engine = Engine::with_signer(pqc_signer(&alias), &dsn)
+            .await
+            .expect("PG engine");
+        let k1 = SigningKey::from_bytes(&[0x11; 32]);
+        let k2 = SigningKey::from_bytes(&[0x22; 32]);
+        let claimant_a = media_pubkey_b64(&k1);
+        let claimant_b = media_pubkey_b64(&k2);
+        let target = media_sha_hex(0x40);
+        let t0 = "2026-01-01T00:00:00Z".parse().unwrap();
+        let t1 = "2026-02-01T00:00:00Z".parse().unwrap();
+        media_seed(&engine, media_build_takedown(&k1, &target, &claimant_a, t0)).await;
+        media_seed(&engine, media_build_takedown(&k2, &target, &claimant_b, t1)).await;
+        let page = engine
+            .list_takedowns_for(
+                &target,
+                crate::cirisnode::TakedownFilter {
+                    claimant_key_id: Some(claimant_a.clone()),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .expect("per-claimant");
+        assert_eq!(page.items.len(), 1);
+    }
+
+    /// PG twin of the key_grant facade test — env-gated.
+    #[cfg(all(feature = "postgres", feature = "cirisnode"))]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_key_grants_for_filters_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let alias = format!("media-kg-{}", uuid::Uuid::new_v4().simple());
+        let engine = Engine::with_signer(pqc_signer(&alias), &dsn)
+            .await
+            .expect("PG engine");
+        let pub_a = SigningKey::from_bytes(&[0x44; 32]);
+        let publisher_a = media_pubkey_b64(&pub_a);
+        let recipient = format!("rec-{}", uuid::Uuid::new_v4());
+        let sha_x = media_sha_hex(0x60);
+        let t = "2026-04-01T00:00:00Z".parse().unwrap();
+        media_seed(
+            &engine,
+            media_build_key_grant(&pub_a, &sha_x, &recipient, t),
+        )
+        .await;
+        let page = engine
+            .list_key_grants_for(
+                &recipient,
+                crate::cirisnode::KeyGrantFilter {
+                    content_sha256: Some(sha_x.clone()),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .expect("content-scope");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].author_id, publisher_a);
     }
 }

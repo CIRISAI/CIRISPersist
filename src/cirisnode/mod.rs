@@ -97,8 +97,9 @@ pub use crate::federation::{
 pub use types::{
     Cell, ContributionEnvelope, ContributionListPage, ContributionType, ContributionsFilter,
     CreditsLedgerEntry, CreditsUpdate, DiversityProof, ExpertiseLedgerEntry, ExpertiseUpdate,
-    HybridSignature, ListCursor, ModerationEvent, PromotionAttestation, ReconsiderationAttestation,
-    ReconsiderationRequest, RoutableContributor, SlashingAttestation, TargetRowKind, VoteEnvelope,
+    HybridSignature, KeyGrantFilter, KeyGrantListPage, ListCursor, ModerationEvent,
+    PromotionAttestation, ReconsiderationAttestation, ReconsiderationRequest, RoutableContributor,
+    SlashingAttestation, TakedownFilter, TakedownListPage, TargetRowKind, VoteEnvelope,
     VoteListPage, VoteWeight, VotesFilter, Witness, WitnessSet,
 };
 

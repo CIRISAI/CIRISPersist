@@ -11770,6 +11770,167 @@ impl PyEngine {
         })
     }
 
+    /// v6.3.0 (CIRISPersist#135, Lane C) — takedowns against
+    /// `target_content_sha256`, cursor-paged + filtered. JSON-encoded
+    /// [`TakedownListPage`](crate::cirisnode::TakedownListPage).
+    ///
+    /// `filter_json` decodes to [`TakedownFilter`](crate::cirisnode::TakedownFilter)
+    /// (claimant secondary key + `[since, until)` window; `None` = empty
+    /// filter). `cursor_json` decodes to [`ListCursor`](crate::cirisnode::ListCursor)
+    /// (`None` = first page). Python sibling of
+    /// [`Engine::list_takedowns_for`](crate::Engine::list_takedowns_for)
+    /// — the cursor-paged superset of `cirisnode_list_takedowns_for_json`
+    /// for CIRISLensCore#29.4's takedown-abuse detector.
+    #[cfg(feature = "cirisnode")]
+    #[pyo3(signature = (target_content_sha256, filter_json=None, cursor_json=None, limit=100))]
+    fn cirisnode_list_takedowns_for_filtered_json(
+        &self,
+        py: Python<'_>,
+        target_content_sha256: &str,
+        filter_json: Option<&str>,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let target = target_content_sha256.to_owned();
+            let filter: crate::cirisnode::TakedownFilter = match filter_json {
+                None => Default::default(),
+                Some(s) => serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("TakedownFilter JSON decode: {e}"))
+                })?,
+            };
+            let cursor: Option<crate::cirisnode::ListCursor> =
+                match cursor_json {
+                    None => None,
+                    Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                        PyValueError::new_err(format!("ListCursor JSON decode: {e}"))
+                    })?),
+                };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    crate::engine::media_validate_limit(limit)
+                        .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                    let rows = match &self.backend {
+                        BackendDispatch::Postgres(pg) => pg.list_takedowns_for(&target).await,
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => {
+                            crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle())
+                                .list_takedowns_for(&target)
+                                .await
+                        }
+                    }
+                    .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                    let claimant = filter.claimant_key_id.as_deref();
+                    let kept = rows.into_iter().filter(|env| {
+                        if let Some(c) = claimant {
+                            if env.payload.get("claimant_key_id").and_then(|v| v.as_str())
+                                != Some(c)
+                            {
+                                return false;
+                            }
+                        }
+                        crate::engine::media_in_window(env.submitted_at, filter.since, filter.until)
+                    });
+                    let (items, next_cursor) =
+                        crate::engine::media_apply_cursor(kept, cursor, limit)
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                    let page = crate::cirisnode::TakedownListPage { items, next_cursor };
+                    serde_json::to_string(&page).map_err(|e| {
+                        PyRuntimeError::new_err(format!("TakedownListPage encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
+    /// v6.3.0 (CIRISPersist#135, Lane C) — key-grants to
+    /// `recipient_key_id`, cursor-paged + filtered. JSON-encoded
+    /// [`KeyGrantListPage`](crate::cirisnode::KeyGrantListPage).
+    ///
+    /// `filter_json` decodes to [`KeyGrantFilter`](crate::cirisnode::KeyGrantFilter)
+    /// (publisher secondary key + optional `content_sha256` scope +
+    /// `[since, until)` window). Python sibling of
+    /// [`Engine::list_key_grants_for`](crate::Engine::list_key_grants_for)
+    /// — the cursor-paged superset of `cirisnode_list_key_grants_for_json`
+    /// for CIRISLensCore#29.3's key_grant-abuse detector.
+    #[cfg(feature = "cirisnode")]
+    #[pyo3(signature = (recipient_key_id, filter_json=None, cursor_json=None, limit=100))]
+    fn cirisnode_list_key_grants_for_filtered_json(
+        &self,
+        py: Python<'_>,
+        recipient_key_id: &str,
+        filter_json: Option<&str>,
+        cursor_json: Option<&str>,
+        limit: i64,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let recipient = recipient_key_id.to_owned();
+            let filter: crate::cirisnode::KeyGrantFilter = match filter_json {
+                None => Default::default(),
+                Some(s) => serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("KeyGrantFilter JSON decode: {e}"))
+                })?,
+            };
+            let cursor: Option<crate::cirisnode::ListCursor> =
+                match cursor_json {
+                    None => None,
+                    Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                        PyValueError::new_err(format!("ListCursor JSON decode: {e}"))
+                    })?),
+                };
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::cirisnode::NodeCoreService;
+                    crate::engine::media_validate_limit(limit)
+                        .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                    let content = filter.content_sha256.as_deref();
+                    let rows = match (&self.backend, content) {
+                        (BackendDispatch::Postgres(pg), Some(sha)) => {
+                            pg.list_key_grants_for_content(sha, &recipient).await
+                        }
+                        (BackendDispatch::Postgres(pg), None) => {
+                            pg.list_key_grants_for(&recipient).await
+                        }
+                        #[cfg(feature = "sqlite")]
+                        (BackendDispatch::Sqlite(sq), Some(sha)) => {
+                            crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle())
+                                .list_key_grants_for_content(sha, &recipient)
+                                .await
+                        }
+                        #[cfg(feature = "sqlite")]
+                        (BackendDispatch::Sqlite(sq), None) => {
+                            crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle())
+                                .list_key_grants_for(&recipient)
+                                .await
+                        }
+                    }
+                    .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                    let publisher = filter.publisher_key_id.as_deref();
+                    let kept = rows.into_iter().filter(|env| {
+                        if let Some(p) = publisher {
+                            if env.author_id != p {
+                                return false;
+                            }
+                        }
+                        crate::engine::media_in_window(env.submitted_at, filter.since, filter.until)
+                    });
+                    let (items, next_cursor) =
+                        crate::engine::media_apply_cursor(kept, cursor, limit)
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                    let page = crate::cirisnode::KeyGrantListPage { items, next_cursor };
+                    serde_json::to_string(&page).map_err(|e| {
+                        PyRuntimeError::new_err(format!("KeyGrantListPage encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
     /// List key_grant Contributions for `recipient_key_id`. JSON
     /// array of [`ContributionEnvelope`](crate::cirisnode::ContributionEnvelope).
     #[cfg(feature = "cirisnode")]

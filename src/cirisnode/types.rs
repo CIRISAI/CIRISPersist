@@ -476,6 +476,92 @@ pub struct VoteListPage {
     pub next_cursor: Option<ListCursor>,
 }
 
+// ─── Media-detector read filters (v6.3.0, CIRISPersist#135) ─────────
+//
+// Lane C of the 6.X series — the federation read accessors lens-core's
+// multimedia detector family (CIRISLensCore#29) joins on. Both filters
+// follow the `EventFilter` / `ContributionsFilter` idiom: an optional
+// secondary key plus a `[since, until)` time window, all AND-composed,
+// every field optional. Paging reuses [`ListCursor`] /
+// [`ContributionListPage`]'s `(submitted_at, contribution_id)`-DESC
+// tuple cursor so a media-row page advances on the same deterministic
+// ordering the underlying `list_takedowns_for` / `list_key_grants_for`
+// storage queries already emit (`ORDER BY submitted_at DESC,
+// contribution_id DESC`; V054 indexed predicates).
+
+/// Filter for [`crate::Engine::list_takedowns_for`] (CIRISLensCore#29.4
+/// takedown-abuse detector). The PRIMARY key — the takedown TARGET
+/// `content_sha256` — is the method argument, not a filter field; this
+/// struct carries the optional secondary key + time window the detector
+/// AND-composes on top. Every field optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TakedownFilter {
+    /// Narrow to takedowns filed by this claimant
+    /// (`payload.claimant_key_id`). `None` returns every claimant —
+    /// the per-target read; `Some` is the per-target × per-claimant
+    /// read the detector uses to catch "single claimant emitting many
+    /// takedowns against one target".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimant_key_id: Option<String>,
+    /// Keep rows with `submitted_at >= since`. `None` = no lower bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+    /// Keep rows with `submitted_at < until` (half-open, mirrors the
+    /// change-feed cursor's strict upper boundary). `None` = no upper
+    /// bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
+}
+
+/// Filter for [`crate::Engine::list_key_grants_for`] (CIRISLensCore#29.3
+/// key_grant-abuse detector). The PRIMARY key — the grant
+/// `recipient_key_id` — is the method argument; this struct carries the
+/// optional secondary key + content scope + time window. Every field
+/// optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyGrantFilter {
+    /// Narrow to grants issued by this publisher (the Contribution
+    /// `author_id`). `None` returns every publisher — the per-recipient
+    /// read; `Some` is the per-recipient × per-publisher read the
+    /// detector uses to catch "single recipient receiving key_grants
+    /// from many unrelated publishers in a short window".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher_key_id: Option<String>,
+    /// Narrow to grants over this content hash
+    /// (`media_content_sha256`). When set, the read uses the
+    /// `list_key_grants_for_content` two-axis index path; `None` uses
+    /// the recipient-only index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+    /// Keep rows with `submitted_at >= since`. `None` = no lower bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+    /// Keep rows with `submitted_at < until` (half-open). `None` = no
+    /// upper bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
+}
+
+/// One page of takedown-notice Contributions, newest-first
+/// (`submitted_at DESC, contribution_id DESC`). v6.3.0 (#135).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TakedownListPage {
+    /// Matching `takedown_notice` Contributions.
+    pub items: Vec<ContributionEnvelope>,
+    /// Cursor for the next page; `None` at end of stream.
+    pub next_cursor: Option<ListCursor>,
+}
+
+/// One page of key_grant Contributions, newest-first
+/// (`submitted_at DESC, contribution_id DESC`). v6.3.0 (#135).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyGrantListPage {
+    /// Matching `key_grant` Contributions.
+    pub items: Vec<ContributionEnvelope>,
+    /// Cursor for the next page; `None` at end of stream.
+    pub next_cursor: Option<ListCursor>,
+}
+
 /// Routing-eligibility result row — one entry per qualified
 /// contributor for `(domain, language)`. Used by
 /// `MISSION.md` §3.3 deferral routing (steps 1-2).
