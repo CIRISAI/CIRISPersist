@@ -5,6 +5,21 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.2.0] — 2026-06-13
+
+### Added — the membership-change re-key keystone + roster-grow primitive (CIRISPersist#161 Ask 4/5, #152-r1; CEG §11.7.1 / §10.1.4)
+
+The self/family at-rest DEK cascade (v4.14.0) delivered content to a cohort's members *at write time*. What it lacked was the symmetric **membership-change** half: when a person adds a new device, or a family admits a member, the existing at-rest content has to become reachable to the newcomer — and the newcomer has to be served *future* writes too. This is that keystone, composed over `at_rest_cascade` (it reinvents no crypto — persist already retains every per-write DEK via its `__persist_self__` content-master grant, so it can re-wrap after the fact).
+
+- **Retroactive key-grant ADD re-wrap** (`at_rest_cascade::orchestrate::rekey_for_newcomers`, driven by `rekey_self_occurrence_add` / `rekey_family_member_add`, surfaced on `Engine`): for each at-rest blob the existing cohort already holds grants on, recover the DEK via the content-master self-retention grant, `wrap_dek_v2` it to the newcomer's `encryption_pubkeys`, and record the grant. **Idempotent** (a grant already present is a no-op, `ON CONFLICT DO NOTHING` + a pre-check), **fail-secure** (a newcomer lacking valid `encryption_pubkeys` is recorded in `excluded` and granted nothing — never a plaintext fallback).
+- **`add_family_member` — the roster-grow primitive** (both backends + memory). Family-member *addition* is now first-class and symmetric with the removal path (V067 revocation): addition mutates the roster in place (idempotent on `key_id`; Postgres uses an optimistic-concurrency `WHERE persist_row_hash = $prior` guard so a concurrent add can't lose a member to a stale read), removal stays append-only revocation. The re-key driver calls it first, so an admitted family member is served **both** past blobs (the re-key) **and** future writes (`resolve_recipients` now sees them on the roster). This closes the forward-path gap a re-key alone would leave.
+- **Producer-side stop-wrapping (forward secrecy).** The family cascade's `resolve_recipients` now filters `list_family_membership_revocations_for` — a member removed via V067 is excluded from *new* writes. This was a latent bug (the family path fanned out over the full admit history and kept wrapping to removed members); caught by a red test and fixed. Forward secrecy is automatic for past blobs (the per-write fresh DEK means a removed member simply never gets future DEKs); **retroactive revoke of past grants is intentionally out of scope** — CEG §11.7.1 Option-A relies on forward secrecy, not key destruction, and V067 models removal as append-only revocation the `*_active` reads compose against (V070 grants are never rewritten on remove).
+- **`hard_case:*` emissions**: `family_membership_change` (one per admitted newcomer) + `recipient_excluded` (one per fail-secure exclusion), idempotent on a `(kind, target, subject, observed-second)` event_id. LensCore composes `detection:*` over them.
+- **V077** (`federation_blob_key_grants_by_scope_recipient`): a `(cohort_scope, recipient_key_id)` composite index backing the new visibility-set read. **No new tables** — the keystone fully reuses V070's grant table + content master.
+
+### Tests
+Both backends + memory. SQLite + live-PG (1339 lib tests green): self-occurrence add grants a pre-existing blob + idempotent re-run; family add fail-secure-excludes a keyless newcomer + emits the two hard_case kinds + idempotent; **roster-grow forward path** — a genuinely-new member (not on the roster at write time) is added and served a *future* family write, on both sqlite and PG (the `add_family_member` UPDATE path + idempotent re-add); removed member excluded from new family writes (forward secrecy). Gate: fmt · clippy `-D warnings` (full feature set, all targets) · sqlite lib · live-PG lib.
+
 ## [6.1.0] — 2026-06-13
 
 ### Added — retention PyO3 FFI surface; the lens-facing `Engine` methods (CIRISPersist#218; CIRISLens#21, CIRISLensCore#51)

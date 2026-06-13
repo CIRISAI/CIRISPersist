@@ -34,6 +34,22 @@ pub mod kind {
     /// §10.1.3 — a subject-side revocation stayed local-tier (unpromoted
     /// to federation tier) past the operator-configured window.
     pub const CONSENT_REVOCATION_PROMOTION_OVERDUE: &str = "consent_revocation_promotion_overdue";
+    /// §11.7.1 / §10.1.4 (CIRISPersist#161 Ask 2/4, v6.1.0) — a family
+    /// roster delta was observed and the at-rest re-key walk ran: a member
+    /// was admitted (newcomer joins the cohort-visibility set) or removed
+    /// (future cascade writes drop them; forward secrecy is automatic via
+    /// the per-write fresh DEK). The observability primitive over a
+    /// membership ceremony, NOT the ceremony itself. `target_key_id` =
+    /// `family_key_id`; `detail` carries the granted / excluded split.
+    pub const FAMILY_MEMBERSHIP_CHANGE: &str = "family_membership_change";
+    /// §10.1.4 (CIRISPersist#161 Ask 4, v6.1.0) — during a membership-change
+    /// re-key, a newcomer was **fail-secure excluded** from a blob's grant
+    /// set because their occurrence carried no valid `encryption_pubkeys`.
+    /// They receive NO grant (never a plaintext fallback) and stay
+    /// unreachable until they register keys + the walk re-runs.
+    /// `subject_key_id` = the excluded occurrence; `detail` carries the
+    /// scope + the count of blobs they were excluded from.
+    pub const RECIPIENT_EXCLUDED: &str = "recipient_excluded";
 }
 
 /// A recorded `hard_case:*` observability event.
@@ -125,4 +141,74 @@ pub fn parse_deletion_sla_days(dimension: &str) -> Option<u32> {
 #[must_use]
 pub fn watch_event_id(kind: &str, target_key_id: &str, revocation_at: DateTime<Utc>) -> String {
     format!("{kind}:{target_key_id}:{}", revocation_at.timestamp())
+}
+
+/// Deterministic `event_id` for a [`kind::FAMILY_MEMBERSHIP_CHANGE`]
+/// emission (CIRISPersist#161 Ask 2/4, v6.1.0) — keyed on `(family,
+/// roster-delta member, observed-at)` so a re-run of the re-key walk over
+/// the *same* observed delta is idempotent. `observed_at` is the walk's
+/// `now`, truncated to whole seconds (matching [`watch_event_id`]) so a
+/// re-scan at the same logical instant collides; a genuinely later
+/// re-observation (a new ceremony second) is a distinct event.
+#[must_use]
+pub fn membership_change_event_id(
+    family_key_id: &str,
+    member_identity_key_id: &str,
+    observed_at: DateTime<Utc>,
+) -> String {
+    format!(
+        "{}:{family_key_id}:{member_identity_key_id}:{}",
+        kind::FAMILY_MEMBERSHIP_CHANGE,
+        observed_at.timestamp()
+    )
+}
+
+/// Deterministic `event_id` for a [`kind::RECIPIENT_EXCLUDED`] emission
+/// (CIRISPersist#161 Ask 4, v6.1.0) — keyed on `(cohort_scope, excluded
+/// occurrence, observed-at)`. Idempotent on the same walk-instant so a
+/// re-run that re-excludes the same keyless newcomer writes no duplicate
+/// row; once the newcomer registers keys (and the next walk grants them)
+/// the condition stops firing.
+#[must_use]
+pub fn recipient_excluded_event_id(
+    cohort_scope: &str,
+    excluded_key_id: &str,
+    observed_at: DateTime<Utc>,
+) -> String {
+    format!(
+        "{}:{cohort_scope}:{excluded_key_id}:{}",
+        kind::RECIPIENT_EXCLUDED,
+        observed_at.timestamp()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn membership_change_event_id_is_deterministic_and_sub_second_idempotent() {
+        let t0: DateTime<Utc> = "2026-06-12T10:00:00.100Z".parse().unwrap();
+        let t0b: DateTime<Utc> = "2026-06-12T10:00:00.900Z".parse().unwrap();
+        let t1: DateTime<Utc> = "2026-06-12T10:00:01.000Z".parse().unwrap();
+        let a = membership_change_event_id("fam", "carol", t0);
+        // Same whole-second instant ⇒ same id (sub-second re-scan = no-op).
+        assert_eq!(a, membership_change_event_id("fam", "carol", t0b));
+        // A later whole second ⇒ distinct id.
+        assert_ne!(a, membership_change_event_id("fam", "carol", t1));
+        // Member/target are part of the key.
+        assert_ne!(a, membership_change_event_id("fam", "dave", t0));
+        assert_ne!(a, membership_change_event_id("other", "carol", t0));
+        assert!(a.starts_with(kind::FAMILY_MEMBERSHIP_CHANGE));
+    }
+
+    #[test]
+    fn recipient_excluded_event_id_scopes_and_idempotent() {
+        let t0: DateTime<Utc> = "2026-06-12T10:00:00Z".parse().unwrap();
+        let a = recipient_excluded_event_id("self", "occ-bare", t0);
+        assert_eq!(a, recipient_excluded_event_id("self", "occ-bare", t0));
+        // Scope separates a self-add exclusion from a family-add exclusion.
+        assert_ne!(a, recipient_excluded_event_id("family", "occ-bare", t0));
+        assert!(a.starts_with(kind::RECIPIENT_EXCLUDED));
+    }
 }

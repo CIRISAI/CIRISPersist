@@ -373,8 +373,30 @@ pub mod orchestrate {
                             "cohort_scope:family write names unknown family_key_id {owner_or_family_key_id:?}"
                         ))
                     })?;
+                // Producer-side stop-wrapping (CIRISPersist#161 Ask 4,
+                // CEG §11.7.1): a member removed via V067 is dropped from
+                // the fan-out BEFORE we wrap — future writes simply exclude
+                // them (forward secrecy under the per-write fresh DEK). The
+                // `family.members` roster is the full admit history; compose
+                // it with the family-membership revocation table so an
+                // effective removal stops earning grants. (The per-member
+                // `list_identity_occurrences_active` further drops revoked
+                // *occurrences*; this drops revoked *memberships*.)
+                let revs = backend
+                    .list_family_membership_revocations_for(owner_or_family_key_id)
+                    .await
+                    .map_err(map_dir_err)?;
+                let now = chrono::Utc::now();
+                let removed: std::collections::HashSet<&str> = revs
+                    .iter()
+                    .filter(|r| r.effective_at <= now)
+                    .map(|r| r.removed_identity_key_id.as_str())
+                    .collect();
                 let mut out = Vec::new();
                 for member in &family.members {
+                    if removed.contains(member.key_id.as_str()) {
+                        continue;
+                    }
                     let occ = backend
                         .list_identity_occurrences_active(&member.key_id)
                         .await
@@ -482,6 +504,370 @@ pub mod orchestrate {
             granted,
             excluded,
         })
+    }
+
+    /// One newcomer's wrap target for the [`rekey_for_newcomers`] walk:
+    /// an occurrence key plus its (maybe-absent) content-encryption keys.
+    #[derive(Debug, Clone)]
+    pub struct Newcomer {
+        /// The newcomer occurrence's federation key_id.
+        pub occurrence_key_id: String,
+        /// Its content-encryption pubkeys, or `None` (⇒ fail-secure
+        /// excluded — no grant, never a plaintext fallback).
+        pub encryption_pubkeys: Option<EncryptionPubkeys>,
+    }
+
+    /// Outcome of a [`rekey_for_newcomers`] retroactive-ADD walk.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct RekeyResult {
+        /// Distinct at-rest blobs in the cohort-visibility set (the blobs
+        /// the existing cohort already holds grants on, in this scope).
+        pub blobs_scanned: usize,
+        /// `(newcomer_occurrence_key_id, grants_added)` — the count of NEW
+        /// grant rows written for each newcomer (re-running is idempotent:
+        /// a grant already present is a no-op and not counted).
+        pub granted: Vec<(String, usize)>,
+        /// Newcomer occurrence key_ids **fail-secure excluded** for lacking
+        /// valid `encryption_pubkeys`. They receive NO grant on ANY blob
+        /// in the set; the caller emits `hard_case:recipient_excluded`.
+        pub excluded: Vec<String>,
+    }
+
+    /// The **retroactive key-grant ADD re-wrap** (CIRISPersist#161 Ask 2/4,
+    /// CEG §11.7.1 / §10.1.4) — the membership-change keystone.
+    ///
+    /// When a new occurrence/member is admitted into a cohort, the existing
+    /// at-rest blobs in that cohort scope must become reachable to the
+    /// newcomer. For each blob the existing cohort (`existing_recipients`)
+    /// already holds grants on in `cohort_scope`, this:
+    ///
+    /// 1. recovers the per-write DEK via persist's `__persist_self__`
+    ///    content-master self-retention grant
+    ///    ([`unwrap_dek_for_persist`] over [`load_or_init_content_master`]);
+    /// 2. `wrap_dek_v2`s it to each newcomer's `encryption_pubkeys`; and
+    /// 3. `put_at_rest_grant`s the wrap.
+    ///
+    /// **Idempotent**: a newcomer already holding a grant for a blob is
+    /// skipped (the underlying `put_at_rest_grant` is `ON CONFLICT DO
+    /// NOTHING`, and the walk pre-checks the recipient set to avoid the
+    /// re-unwrap), so re-running adds nothing. **Fail-secure**: a newcomer
+    /// without valid `encryption_pubkeys` is recorded in
+    /// [`RekeyResult::excluded`] and granted nothing — never a plaintext
+    /// fallback.
+    ///
+    /// This composes over [`at_rest_cascade`](crate::federation::at_rest_cascade)
+    /// — it reinvents no crypto. It does NOT touch existing grants of
+    /// removed members (forward secrecy is automatic: the per-write fresh
+    /// DEK means future writes simply exclude them; see the module + V070
+    /// "never rewritten on remove" note). Retroactive *revoke* of past
+    /// grants is intentionally out of scope (V067 models removal as an
+    /// append-only revocation that the `*_active` read composes against; it
+    /// does not delete at-rest grant rows, and CEG §11.7.1 Option-A relies
+    /// on forward secrecy rather than retroactive key destruction).
+    pub async fn rekey_for_newcomers<B>(
+        backend: &B,
+        cohort_scope: &str,
+        existing_recipients: &[String],
+        newcomers: &[Newcomer],
+    ) -> Result<RekeyResult, BlobError>
+    where
+        B: BlobStorage + Sync,
+    {
+        if cohort_scope != SELF && cohort_scope != FAMILY {
+            return Err(BlobError::InvalidArgument(format!(
+                "rekey_for_newcomers is only for self/family, got cohort_scope {cohort_scope:?}"
+            )));
+        }
+
+        // Split newcomers into wrap-able (keyed) and fail-secure-excluded.
+        let mut keyed: Vec<(String, EncryptionPubkeys)> = Vec::new();
+        let mut excluded: Vec<String> = Vec::new();
+        for nc in newcomers {
+            match usable_keys(&nc.encryption_pubkeys) {
+                Some(k) => keyed.push((nc.occurrence_key_id.clone(), k.clone())),
+                None => excluded.push(nc.occurrence_key_id.clone()),
+            }
+        }
+
+        // The cohort-visibility set: blobs the existing cohort already
+        // holds grants on, in this scope. Empty existing-recipient set ⇒
+        // nothing to inherit (a brand-new cohort has no prior blobs).
+        let blobs = if existing_recipients.is_empty() {
+            Vec::new()
+        } else {
+            backend
+                .list_at_rest_blobs_for_recipients(existing_recipients, cohort_scope)
+                .await?
+        };
+
+        let mut granted: Vec<(String, usize)> = keyed.iter().map(|(k, _)| (k.clone(), 0)).collect();
+        if keyed.is_empty() || blobs.is_empty() {
+            return Ok(RekeyResult {
+                blobs_scanned: blobs.len(),
+                granted,
+                excluded,
+            });
+        }
+
+        let content_master = backend.load_or_init_content_master().await?;
+
+        for sha in &blobs {
+            // Which keyed newcomers still need a grant on this blob?
+            let already: std::collections::HashSet<String> = backend
+                .list_at_rest_grant_recipients(sha)
+                .await?
+                .into_iter()
+                .collect();
+            let needs: Vec<usize> = keyed
+                .iter()
+                .enumerate()
+                .filter(|(_, (k, _))| !already.contains(k))
+                .map(|(i, _)| i)
+                .collect();
+            if needs.is_empty() {
+                continue; // every newcomer already granted on this blob.
+            }
+
+            // Recover the DEK once per blob via persist's self-retention
+            // grant; a blob with no self-retention row is corrupt cascade
+            // state (every encrypt_and_cascade writes one) — surface it.
+            let self_grant = backend
+                .get_at_rest_grant(sha, PERSIST_SELF_RECIPIENT)
+                .await?
+                .ok_or_else(|| {
+                    BlobError::Backend(format!(
+                        "rekey: at-rest blob {} in the cohort-visibility set has no persist \
+                         self-retention row (corrupt cascade state)",
+                        hex::encode(sha)
+                    ))
+                })?;
+            let dek =
+                unwrap_dek_for_persist(&content_master, &self_grant.1).map_err(map_at_rest_err)?;
+
+            for i in needs {
+                let (occ_key_id, keys) = &keyed[i];
+                let wrapped = wrap_dek_v2(&keys.x25519_base64, &keys.ml_kem_768_base64, &dek)
+                    .map_err(map_at_rest_err)?;
+                backend
+                    .put_at_rest_grant(sha, occ_key_id, WRAP_ALGORITHM_V2, &wrapped, cohort_scope)
+                    .await?;
+                granted[i].1 += 1;
+            }
+        }
+
+        Ok(RekeyResult {
+            blobs_scanned: blobs.len(),
+            granted,
+            excluded,
+        })
+    }
+
+    /// Emit the membership-change `hard_case:*` observability events for a
+    /// completed [`rekey_for_newcomers`] walk (CIRISPersist#161 Ask 3/4):
+    /// one [`FAMILY_MEMBERSHIP_CHANGE`](crate::federation::hard_case::kind::FAMILY_MEMBERSHIP_CHANGE)
+    /// per newcomer (the observed roster delta), and one
+    /// [`RECIPIENT_EXCLUDED`](crate::federation::hard_case::kind::RECIPIENT_EXCLUDED)
+    /// per fail-secure-excluded keyless newcomer. Idempotent on the
+    /// deterministic `event_id`s — re-running the walk at the same logical
+    /// instant re-emits nothing.
+    ///
+    /// `target_key_id` is the family_key_id (family add) or the identity
+    /// key (self add). The events are recorded through the
+    /// [`record_hard_case`](FederationDirectory::record_hard_case) surface.
+    async fn emit_membership_hard_cases<B>(
+        backend: &B,
+        cohort_scope: &str,
+        target_key_id: &str,
+        result: &RekeyResult,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), BlobError>
+    where
+        B: FederationDirectory + Sync,
+    {
+        use crate::federation::hard_case;
+        // One membership-change event per newcomer (granted or excluded) —
+        // the roster delta persist observed.
+        let all_newcomers = result
+            .granted
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .chain(result.excluded.iter().map(|k| k.as_str()));
+        for member in all_newcomers {
+            let granted_count = result
+                .granted
+                .iter()
+                .find(|(k, _)| k == member)
+                .map(|(_, n)| *n);
+            backend
+                .record_hard_case(hard_case::HardCaseEvent {
+                    event_id: hard_case::membership_change_event_id(
+                        target_key_id,
+                        member,
+                        observed_at,
+                    ),
+                    kind: hard_case::kind::FAMILY_MEMBERSHIP_CHANGE.to_string(),
+                    target_key_id: Some(target_key_id.to_string()),
+                    subject_key_id: Some(member.to_string()),
+                    detail: serde_json::json!({
+                        "cohort_scope": cohort_scope,
+                        "blobs_scanned": result.blobs_scanned,
+                        "grants_added": granted_count,
+                        "excluded": granted_count.is_none(),
+                    }),
+                    emitted_at: observed_at,
+                })
+                .await
+                .map_err(|e| BlobError::Backend(format!("emit membership_change: {e}")))?;
+        }
+        // One recipient-excluded event per fail-secure exclusion.
+        for excluded in &result.excluded {
+            backend
+                .record_hard_case(hard_case::HardCaseEvent {
+                    event_id: hard_case::recipient_excluded_event_id(
+                        cohort_scope,
+                        excluded,
+                        observed_at,
+                    ),
+                    kind: hard_case::kind::RECIPIENT_EXCLUDED.to_string(),
+                    target_key_id: Some(target_key_id.to_string()),
+                    subject_key_id: Some(excluded.clone()),
+                    detail: serde_json::json!({
+                        "cohort_scope": cohort_scope,
+                        "blobs_scanned": result.blobs_scanned,
+                        "reason": "no_valid_encryption_pubkeys",
+                    }),
+                    emitted_at: observed_at,
+                })
+                .await
+                .map_err(|e| BlobError::Backend(format!("emit recipient_excluded: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Membership-change driver for a **family** member-add (CEG §11.7.1 /
+    /// §10.1.4, CIRISPersist#161 Ask 2/4) — the integration entry the
+    /// [`Engine`](crate::Engine) dispatches.
+    ///
+    /// Resolves the newcomer member identity's active occurrences (the
+    /// wrap targets) and the existing cohort recipients (every *other*
+    /// active member identity's active occurrences), runs
+    /// [`rekey_for_newcomers`] over the family-scope visibility set, and
+    /// emits the membership `hard_case:*` events. Idempotent + fail-secure
+    /// throughout. Returns the [`RekeyResult`].
+    ///
+    /// A keyless newcomer occurrence is excluded (no grant) and surfaced as
+    /// `hard_case:recipient_excluded`; the family roster itself is the
+    /// caller's responsibility (this runs *after* `put_family` admits the
+    /// member — the roster already names them).
+    pub async fn rekey_family_member_add<B>(
+        backend: &B,
+        family_key_id: &str,
+        new_member_identity_key_id: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<RekeyResult, BlobError>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        let family = backend
+            .lookup_family(family_key_id)
+            .await
+            .map_err(map_dir_err)?
+            .ok_or_else(|| {
+                BlobError::InvalidArgument(format!(
+                    "rekey_family_member_add names unknown family_key_id {family_key_id:?}"
+                ))
+            })?;
+
+        // Forward-path half (v6.2.0, #161 A4/A5): put the newcomer on the
+        // roster so `resolve_recipients` includes them in FUTURE family
+        // writes. Idempotent — re-running the driver, or admitting an
+        // already-rostered member, is a no-op here. The re-key below is the
+        // backward-path half (grant the newcomer PAST family blobs). Order
+        // matters only for crash-consistency: roster-grow first means a
+        // crash between the two leaves a rostered member missing some past
+        // grants (recoverable by re-running the driver — re-key is
+        // idempotent), never a re-keyed member absent from the roster.
+        backend
+            .add_family_member(
+                family_key_id,
+                crate::federation::types::FamilyMember {
+                    key_id: new_member_identity_key_id.to_string(),
+                    joined_at: observed_at,
+                    role: None,
+                },
+            )
+            .await
+            .map_err(map_dir_err)?;
+
+        // Newcomers = the new member identity's active occurrences.
+        let newcomers: Vec<Newcomer> = backend
+            .list_identity_occurrences_active(new_member_identity_key_id)
+            .await
+            .map_err(map_dir_err)?
+            .into_iter()
+            .map(|o| Newcomer {
+                occurrence_key_id: o.occurrence_key_id,
+                encryption_pubkeys: o.encryption_pubkeys,
+            })
+            .collect();
+
+        // Existing cohort = every OTHER current member's active occurrences.
+        let mut existing: Vec<String> = Vec::new();
+        for m in &family.members {
+            if m.key_id == new_member_identity_key_id {
+                continue;
+            }
+            let occ = backend
+                .list_identity_occurrences_active(&m.key_id)
+                .await
+                .map_err(map_dir_err)?;
+            existing.extend(occ.into_iter().map(|o| o.occurrence_key_id));
+        }
+
+        let result = rekey_for_newcomers(backend, FAMILY, &existing, &newcomers).await?;
+        emit_membership_hard_cases(backend, FAMILY, family_key_id, &result, observed_at).await?;
+        Ok(result)
+    }
+
+    /// Membership-change driver for a **self** occurrence-add (CEG §11.7.1
+    /// / §10.1.4) — a person admitting a new device-occurrence into their
+    /// self-collective.
+    ///
+    /// Newcomers = the named new occurrence(s); existing cohort = the
+    /// identity's *other* active occurrences. Runs the self-scope re-key +
+    /// emits the membership events. Mirror of [`rekey_family_member_add`].
+    pub async fn rekey_self_occurrence_add<B>(
+        backend: &B,
+        identity_key_id: &str,
+        new_occurrence_key_ids: &[String],
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<RekeyResult, BlobError>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        let active = backend
+            .list_identity_occurrences_active(identity_key_id)
+            .await
+            .map_err(map_dir_err)?;
+        let newset: std::collections::HashSet<&str> =
+            new_occurrence_key_ids.iter().map(String::as_str).collect();
+
+        let mut newcomers: Vec<Newcomer> = Vec::new();
+        let mut existing: Vec<String> = Vec::new();
+        for o in active {
+            if newset.contains(o.occurrence_key_id.as_str()) {
+                newcomers.push(Newcomer {
+                    occurrence_key_id: o.occurrence_key_id,
+                    encryption_pubkeys: o.encryption_pubkeys,
+                });
+            } else {
+                existing.push(o.occurrence_key_id);
+            }
+        }
+
+        let result = rekey_for_newcomers(backend, SELF, &existing, &newcomers).await?;
+        emit_membership_hard_cases(backend, SELF, identity_key_id, &result, observed_at).await?;
+        Ok(result)
     }
 
     /// The default-tier read: recover the plaintext blob body for a
