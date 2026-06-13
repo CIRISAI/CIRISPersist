@@ -33,7 +33,10 @@ use parking_lot::Mutex;
 use rusqlite::Connection;
 
 use super::service::MaintenanceService;
-use super::types::{ArchiveReport, ArchiveWindow, MaintenanceReport, PruneReport, VacuumReport};
+use super::types::{
+    ArchiveReport, ArchiveWindow, MaintenanceReport, PruneReport, RetentionPolicy,
+    RetentionPolicyRow, RetentionReport, VacuumReport,
+};
 use super::Error;
 
 /// v1.2.0 (CIRISPersist#48) — SQLite-backed
@@ -206,6 +209,156 @@ impl MaintenanceService for SqliteMaintenanceBackend {
             elapsed_ms,
         })
     }
+
+    // ── Retention (CIRISPersist#209) ───────────────────────────────
+
+    async fn set_retention(
+        &self,
+        table_name: String,
+        policy: RetentionPolicy,
+    ) -> Result<(), Error> {
+        crate::maintenance::validate_sql_identifier(&table_name)?;
+        crate::maintenance::validate_sql_identifier(&policy.time_column)?;
+        let conn = self.conn.clone();
+        let updated = Utc::now().to_rfc3339();
+        (move || -> Result<(), rusqlite::Error> {
+            let g = conn.lock();
+            g.execute(
+                "INSERT INTO retention_policies \
+                    (table_name, time_column, min_keep_secs, pressure_trigger_bytes, \
+                     pressure_target_bytes, interval_secs, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(table_name) DO UPDATE SET \
+                    time_column = excluded.time_column, \
+                    min_keep_secs = excluded.min_keep_secs, \
+                    pressure_trigger_bytes = excluded.pressure_trigger_bytes, \
+                    pressure_target_bytes = excluded.pressure_target_bytes, \
+                    interval_secs = excluded.interval_secs, \
+                    updated_at = excluded.updated_at",
+                rusqlite::params![
+                    table_name,
+                    policy.time_column,
+                    policy.min_keep_secs as i64,
+                    policy.pressure_trigger_bytes.map(|v| v as i64),
+                    policy.pressure_target_bytes.map(|v| v as i64),
+                    policy.interval_secs as i64,
+                    updated,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| map_sqlite_error(e, "set_retention"))
+    }
+
+    async fn get_retention(&self, table_name: &str) -> Result<Option<RetentionPolicy>, Error> {
+        let conn = self.conn.clone();
+        let name = table_name.to_owned();
+        (move || -> Result<Option<RetentionPolicy>, rusqlite::Error> {
+            let g = conn.lock();
+            match g.query_row(
+                "SELECT time_column, min_keep_secs, pressure_trigger_bytes, \
+                    pressure_target_bytes, interval_secs \
+                 FROM retention_policies WHERE table_name = ?1",
+                [&name],
+                sqlite_row_to_retention_policy,
+            ) {
+                Ok(p) => Ok(Some(p)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e),
+            }
+        })()
+        .map_err(|e| map_sqlite_error(e, "get_retention"))
+    }
+
+    async fn list_retention(&self) -> Result<Vec<RetentionPolicyRow>, Error> {
+        let conn = self.conn.clone();
+        (move || -> Result<Vec<RetentionPolicyRow>, rusqlite::Error> {
+            let g = conn.lock();
+            let mut stmt = g.prepare(
+                "SELECT table_name, time_column, min_keep_secs, pressure_trigger_bytes, \
+                    pressure_target_bytes, interval_secs \
+                 FROM retention_policies ORDER BY table_name",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(RetentionPolicyRow {
+                    table_name: row.get("table_name")?,
+                    policy: sqlite_row_to_retention_policy(row)?,
+                })
+            })?;
+            rows.collect()
+        })()
+        .map_err(|e| map_sqlite_error(e, "list_retention"))
+    }
+
+    async fn run_retention(&self, now: DateTime<Utc>) -> Result<Vec<RetentionReport>, Error> {
+        let policies = self.list_retention().await?;
+        let conn = self.conn.clone();
+        (move || -> Result<Vec<RetentionReport>, rusqlite::Error> {
+            let g = conn.lock();
+            let mut reports = Vec::with_capacity(policies.len());
+            for row in policies {
+                // Defense in depth — these reach DELETE SQL un-bindable.
+                if crate::maintenance::validate_sql_identifier(&row.table_name).is_err()
+                    || crate::maintenance::validate_sql_identifier(&row.policy.time_column).is_err()
+                {
+                    continue; // skip a malformed stored row rather than inject
+                }
+                // SQLite db size = page_count × page_size.
+                let page_count: i64 = g.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+                let page_size: i64 = g.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+                let db_size = (page_count.max(0) as u64) * (page_size.max(0) as u64);
+                let cutoff =
+                    (now - chrono::Duration::seconds(row.policy.min_keep_secs as i64)).to_rfc3339();
+                let pressure_gated = row.policy.pressure_trigger_bytes.is_some()
+                    && row.policy.pressure_target_bytes.is_some();
+                let do_sweep = match row.policy.pressure_trigger_bytes {
+                    Some(trigger) if pressure_gated => db_size >= trigger,
+                    _ => true,
+                };
+                let mut swept = false;
+                let mut rows_deleted = 0usize;
+                let mut exhausted = false;
+                if do_sweep {
+                    // Validated identifiers; cutoff is bound.
+                    let sql = format!(
+                        "DELETE FROM {} WHERE {} < ?1",
+                        row.table_name, row.policy.time_column
+                    );
+                    rows_deleted = g.execute(&sql, rusqlite::params![cutoff])?;
+                    swept = true;
+                    if let (true, Some(target)) = (pressure_gated, row.policy.pressure_target_bytes)
+                    {
+                        let pc: i64 = g.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+                        let ps: i64 = g.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+                        exhausted = (pc.max(0) as u64) * (ps.max(0) as u64) >= target;
+                    }
+                }
+                reports.push(RetentionReport {
+                    table_name: row.table_name,
+                    swept,
+                    rows_deleted,
+                    db_size_bytes: db_size,
+                    exhausted,
+                });
+            }
+            Ok(reports)
+        })()
+        .map_err(|e| map_sqlite_error(e, "run_retention"))
+    }
+}
+
+fn sqlite_row_to_retention_policy(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetentionPolicy> {
+    Ok(RetentionPolicy {
+        min_keep_secs: row.get::<_, i64>("min_keep_secs")?.max(0) as u64,
+        time_column: row.get("time_column")?,
+        pressure_trigger_bytes: row
+            .get::<_, Option<i64>>("pressure_trigger_bytes")?
+            .map(|v| v.max(0) as u64),
+        pressure_target_bytes: row
+            .get::<_, Option<i64>>("pressure_target_bytes")?
+            .map(|v| v.max(0) as u64),
+        interval_secs: row.get::<_, i64>("interval_secs")?.max(0) as u64,
+    })
 }
 
 #[cfg(test)]
@@ -239,6 +392,101 @@ mod tests {
         // modern hardware; assert it ran (non-panic) rather than a
         // strict time floor. CI runners can clock 0ms.
         let _ = report.elapsed_ms;
+    }
+
+    /// CIRISPersist#209 — retention CRUD + the pressure-gated sweep: flat
+    /// drop deletes rows past `min_keep`; pressure-gated below the trigger
+    /// is a total no-op; an injection-shaped table name is rejected.
+    #[tokio::test]
+    async fn retention_crud_sweep_and_injection_guard() {
+        let (backend, svc) = fresh_backend().await;
+        let conn = backend.conn_handle();
+        {
+            let g = conn.lock();
+            g.execute_batch("CREATE TABLE ret_test (ts TEXT NOT NULL, v INTEGER);")
+                .unwrap();
+        }
+        let now = Utc::now();
+        let insert = |ts: DateTime<Utc>, v: i64| {
+            let g = conn.lock();
+            g.execute(
+                "INSERT INTO ret_test (ts, v) VALUES (?1, ?2)",
+                params![fmt(ts), v],
+            )
+            .unwrap();
+        };
+        insert(now - Duration::days(40), 1); // past the 30d floor
+        insert(now - Duration::days(20), 2); // within the floor
+        insert(now - Duration::hours(1), 3); // recent
+
+        let flat = RetentionPolicy {
+            min_keep_secs: 30 * 86_400,
+            time_column: "ts".into(),
+            pressure_trigger_bytes: None,
+            pressure_target_bytes: None,
+            interval_secs: 4 * 3_600,
+        };
+        svc.set_retention("ret_test".into(), flat).await.unwrap();
+        assert_eq!(
+            svc.get_retention("ret_test")
+                .await
+                .unwrap()
+                .unwrap()
+                .min_keep_secs,
+            30 * 86_400
+        );
+        assert_eq!(svc.list_retention().await.unwrap().len(), 1);
+
+        // Flat sweep: only the 40d row is past the 30d floor.
+        let reports = svc.run_retention(now).await.unwrap();
+        let r = reports.iter().find(|r| r.table_name == "ret_test").unwrap();
+        assert!(r.swept);
+        assert_eq!(r.rows_deleted, 1);
+        let remaining: i64 = {
+            let g = conn.lock();
+            g.query_row("SELECT COUNT(*) FROM ret_test", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(remaining, 2, "20d + recent rows kept (sacred floor)");
+
+        // Pressure-gated below an unreachable trigger → no-op, even with
+        // min_keep 0 (the floor would otherwise drop everything).
+        let ten_tib: u64 = 10 * 1024 * 1024 * 1024 * 1024;
+        let gated = RetentionPolicy {
+            min_keep_secs: 0,
+            time_column: "ts".into(),
+            pressure_trigger_bytes: Some(ten_tib),
+            pressure_target_bytes: Some(ten_tib / 2),
+            interval_secs: 3_600,
+        };
+        svc.set_retention("ret_test".into(), gated).await.unwrap();
+        let reports2 = svc.run_retention(now).await.unwrap();
+        let r2 = reports2
+            .iter()
+            .find(|r| r.table_name == "ret_test")
+            .unwrap();
+        assert!(!r2.swept, "below pressure trigger → no churn");
+        let still: i64 = {
+            let g = conn.lock();
+            g.query_row("SELECT COUNT(*) FROM ret_test", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(still, 2, "no deletions while below the trigger");
+
+        // Injection guard: a non-identifier table name is rejected.
+        assert!(svc
+            .set_retention(
+                "ret_test; DROP TABLE ret_test".into(),
+                RetentionPolicy {
+                    min_keep_secs: 0,
+                    time_column: "ts".into(),
+                    pressure_trigger_bytes: None,
+                    pressure_target_bytes: None,
+                    interval_secs: 1,
+                },
+            )
+            .await
+            .is_err());
     }
 
     /// v1.2.0 (CIRISPersist#48) Test 2 — archive_expired removes

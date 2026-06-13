@@ -5,6 +5,25 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [5.9.0] — 2026-06-13
+
+### Added — pressure-gated retention primitive (CIRISPersist#209; CIRISLens#21)
+
+`trace_events` / `trace_llm_calls` grew unbounded post-cutover (the old `accord_traces` 90d retention didn't carry to the new write targets); the lens shipped a stopgap sweeper, but reaching into persist-owned tables from the lens is the wrong layer. This puts retention in the substrate, on `MaintenanceService` (which already owns `archive_expired`'s DELETEs).
+
+- **`set_retention` / `get_retention` / `list_retention` / `run_retention`** (both backends) + **V076 `retention_policies`** (durable across restarts). `RetentionPolicy` = `min_keep_secs` (the **sacred floor** — rows younger are never deleted), `time_column`, optional `pressure_trigger_bytes` / `pressure_target_bytes`, `interval_secs`.
+- **Pressure-gated sweep** (`run_retention`): below the trigger → **total no-op** (no churn); at/above → DELETE rows older than `min_keep`, reporting `exhausted` if still over target after sweeping all eligible. No pressure config → flat drop-after-`min_keep`. Size via `pg_database_size` (PG) / `page_count × page_size` (SQLite).
+- **Injection-safe**: `table_name` / `time_column` flow into `DELETE` SQL un-bindable, so both are gated through `validate_sql_identifier` (strict snake_case `table` / `schema.table`) before any write — and re-validated in the sweep. A non-identifier name is rejected at `set_retention`.
+
+**Scoped to v1 per #209** — the pressure-gated DELETE shape. Deferred: TimescaleDB `drop_chunks` / partition-drop (precise until-target reclaim — a row DELETE doesn't reclaim PG heap until VACUUM, so `exhausted` is best-effort under v1), fidelity-tiered `set_compaction` / `set_landmark_keep` (gated on #196 + the `keep_full_fidelity` CEG envelope), and the engine/PyO3 surface (`Engine.set_retention`) lens calls — a thin follow-up. Anchors the disk-pressure cluster (#148/#149).
+
+### Changed — CIRISVerify 5.1.3 → 5.2.0
+
+All three verify crate pins flip together (coherence: single `ciris-crypto` in the graph). 5.2.0 ships `TransportIdentityKeystore` (keyring-backed RNS transport identity + the import/migration primitives; CIRISVerify#68, unblocks CIRISEdge#99). Additive on persist's side — no API change; builds clean, full gate green.
+
+### Tests
+Both backends: retention CRUD + flat sweep (rows past the floor deleted, recent kept) + pressure-gated no-op below trigger + injection guard (sqlite); live-PG exercises `pg_database_size` + the validated-identifier DELETE on a temp table. Gate: fmt · clippy `-D warnings` ×2 · backend-less `-D warnings` · `--no-default-features` · cargo-deny · sqlite lib (792) · live-PG lib (732).
+
 ## [5.8.0] — 2026-06-13
 
 ### Added — consent-SLA watcher (CIRISPersist#146 Ask 3 complete; CEG §8.1.11.3 / §10.1.3)
