@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781375830952,
+  "lastUpdate": 1781377944092,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -26447,6 +26447,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 645134,
             "range": "± 2877",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "1899eeb0933f15b8a1b5481910943e057de72f69",
+          "message": "v6.0.1 — pyo3 0.28→0.29 re-land (#201, #216); edge unblocked\n\nThe 0.29 lockstep resumes — edge cleared its block (CIRISEdge#99/v2.5.0\nship-ready). Re-applies the 0.29 migration ON TOP of current main, so\n6.0.1 = everything through 5.9.0 (shared-instance, hard_case + consent\nobservability, consent-SLA watcher, retention, verify 5.2.0) + pyo3 0.29\nin one coherent cut (not a forward-port onto the stale 6.0.0 branch, per\n#216's superseded framing — main already had all that substrate + verify\n5.2.0, past #216's 5.8.0/5.1.3 asks).\n\n- pyo3 0.28→0.29: 7 PyCapsule::new→new_with_value + the\n  new_with_destructor→new_with_value_and_destructor executor capsule\n  (&'static CStr name → c\"...\" literals). MSRV 1.75→1.83 (Cargo.toml +\n  clippy.toml); is_none_or autofixes from the raised lint floor.\n- RUSTSEC-2026-0176/0177 genuinely cleared (pyo3 <0.29); v5.5.2 deny\n  ignores removed. cargo-deny clean, no pyo3 ignores.\n\n6.0.0 = tombstone (yanked); 6.0.1 = live 0.29 cut. Firewall: edge's <6\npin excludes 6.x from 0.28 envs; edge 2.5.0 opts in >=6.0.1,<7 + its own\n0.29; lens-core follows. 5.x line stays published (5.9.0) for 0.28\nconsumers mid-transition.\n\nGate green under 0.29: build, fmt, clippy -D warnings x2, backend-less\n-D warnings, --no-default-features, cargo-deny (no pyo3 ignores),\nsqlite 792, PG 732.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-06-13T13:50:52-05:00",
+          "tree_id": "251291cd2d06321001af2b15e363b209ea939a71",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/1899eeb0933f15b8a1b5481910943e057de72f69"
+        },
+        "date": 1781377943055,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 45675599,
+            "range": "± 206017",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2857034,
+            "range": "± 363706",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2388,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 5717,
+            "range": "± 28",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 12202,
+            "range": "± 871",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 43888,
+            "range": "± 185",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 143,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 506,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 577,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1992,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 74,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 227,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1009,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 47154,
+            "range": "± 717",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 145329,
+            "range": "± 5663",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 528500,
+            "range": "± 16799",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 8971,
+            "range": "± 485",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 9901,
+            "range": "± 1006",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 14271,
+            "range": "± 769",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 24833,
+            "range": "± 2608",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1575313,
+            "range": "± 22398",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 4967961,
+            "range": "± 54525",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 291703,
+            "range": "± 6601",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 892594,
+            "range": "± 19714",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 49445533,
+            "range": "± 485974",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1722815,
+            "range": "± 110141",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 8635501,
+            "range": "± 255221",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 123952606,
+            "range": "± 728101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 4562748,
+            "range": "± 260127",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 22661391,
+            "range": "± 529157",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 92679,
+            "range": "± 4908",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 85007,
+            "range": "± 4037",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 7183,
+            "range": "± 115",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 48283,
+            "range": "± 276",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 447326,
+            "range": "± 13266",
             "unit": "ns/iter"
           }
         ]
