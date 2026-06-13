@@ -9,7 +9,10 @@ use std::future::Future;
 
 use chrono::{DateTime, Utc};
 
-use super::types::{ArchiveReport, ArchiveWindow, MaintenanceReport, PruneReport, VacuumReport};
+use super::types::{
+    ArchiveReport, ArchiveWindow, MaintenanceReport, PruneReport, RetentionPolicy,
+    RetentionPolicyRow, RetentionReport, VacuumReport,
+};
 use super::Error;
 
 /// v1.2.0 (CIRISPersist#48) — operation surface for substrate
@@ -73,4 +76,41 @@ pub trait MaintenanceService: Send + Sync {
     /// state is preserved (each step commits independently before
     /// the next runs).
     fn maintain(&self) -> impl Future<Output = Result<MaintenanceReport, Error>> + Send;
+
+    // ── Retention (CIRISPersist#209) ───────────────────────────────
+
+    /// Set (or update) the retention policy for `table_name`. Idempotent —
+    /// re-applying the same policy is a no-op upsert. `table_name` and
+    /// `policy.time_column` are validated as strict SQL identifiers (they
+    /// reach `DELETE` SQL un-bindable); an invalid one is rejected before
+    /// any write. v1 stores the policy; the pressure-gated DELETE sweep is
+    /// [`run_retention`](Self::run_retention). (The TimescaleDB
+    /// `drop_chunks` / partition-drop strategies and fidelity-tiered
+    /// compaction are deferred per #209.)
+    fn set_retention(
+        &self,
+        table_name: String,
+        policy: RetentionPolicy,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// The stored policy for `table_name`, or `None`.
+    fn get_retention(
+        &self,
+        table_name: &str,
+    ) -> impl Future<Output = Result<Option<RetentionPolicy>, Error>> + Send;
+
+    /// All stored retention policies.
+    fn list_retention(&self)
+        -> impl Future<Output = Result<Vec<RetentionPolicyRow>, Error>> + Send;
+
+    /// Run one retention pass over every stored policy (§ pressure-gated
+    /// sweep). Per policy: measure db size; if pressure-gated and below the
+    /// trigger, no-op; otherwise DELETE rows older than `min_keep` (the
+    /// sacred floor) and report whether the pressure target was still
+    /// unmet (`exhausted`). Returns a [`RetentionReport`] per table. The
+    /// caller's scheduler decides cadence (honouring `interval_secs`).
+    fn run_retention(
+        &self,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Vec<RetentionReport>, Error>> + Send;
 }

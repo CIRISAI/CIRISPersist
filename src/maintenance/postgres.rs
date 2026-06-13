@@ -28,7 +28,10 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 
 use super::service::MaintenanceService;
-use super::types::{ArchiveReport, ArchiveWindow, MaintenanceReport, PruneReport, VacuumReport};
+use super::types::{
+    ArchiveReport, ArchiveWindow, MaintenanceReport, PruneReport, RetentionPolicy,
+    RetentionPolicyRow, RetentionReport, VacuumReport,
+};
 use super::Error;
 use crate::store::postgres::PostgresBackend;
 
@@ -225,6 +228,171 @@ impl MaintenanceService for PostgresMaintenanceBackend {
             elapsed_ms,
         })
     }
+
+    // ── Retention (CIRISPersist#209) ───────────────────────────────
+
+    async fn set_retention(
+        &self,
+        table_name: String,
+        policy: RetentionPolicy,
+    ) -> Result<(), Error> {
+        crate::maintenance::validate_sql_identifier(&table_name)?;
+        crate::maintenance::validate_sql_identifier(&policy.time_column)?;
+        let client = self
+            .backend
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("retention pool: {e}")))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.retention_policies \
+                    (table_name, time_column, min_keep_secs, pressure_trigger_bytes, \
+                     pressure_target_bytes, interval_secs, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, now()) \
+                 ON CONFLICT (table_name) DO UPDATE SET \
+                    time_column = EXCLUDED.time_column, \
+                    min_keep_secs = EXCLUDED.min_keep_secs, \
+                    pressure_trigger_bytes = EXCLUDED.pressure_trigger_bytes, \
+                    pressure_target_bytes = EXCLUDED.pressure_target_bytes, \
+                    interval_secs = EXCLUDED.interval_secs, \
+                    updated_at = now()",
+                &[
+                    &table_name,
+                    &policy.time_column,
+                    &(policy.min_keep_secs as i64),
+                    &policy.pressure_trigger_bytes.map(|v| v as i64),
+                    &policy.pressure_target_bytes.map(|v| v as i64),
+                    &(policy.interval_secs as i64),
+                ],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "set_retention"))?;
+        Ok(())
+    }
+
+    async fn get_retention(&self, table_name: &str) -> Result<Option<RetentionPolicy>, Error> {
+        let client = self
+            .backend
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("retention pool: {e}")))?;
+        let row = client
+            .query_opt(
+                "SELECT time_column, min_keep_secs, pressure_trigger_bytes, \
+                    pressure_target_bytes, interval_secs \
+                 FROM cirislens.retention_policies WHERE table_name = $1",
+                &[&table_name],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "get_retention"))?;
+        Ok(row.map(|r| pg_row_to_retention_policy(&r)))
+    }
+
+    async fn list_retention(&self) -> Result<Vec<RetentionPolicyRow>, Error> {
+        let client = self
+            .backend
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("retention pool: {e}")))?;
+        let rows = client
+            .query(
+                "SELECT table_name, time_column, min_keep_secs, pressure_trigger_bytes, \
+                    pressure_target_bytes, interval_secs \
+                 FROM cirislens.retention_policies ORDER BY table_name",
+                &[],
+            )
+            .await
+            .map_err(|e| map_pg_error(e, "list_retention"))?;
+        Ok(rows
+            .iter()
+            .map(|r| RetentionPolicyRow {
+                table_name: r.get("table_name"),
+                policy: pg_row_to_retention_policy(r),
+            })
+            .collect())
+    }
+
+    async fn run_retention(&self, now: DateTime<Utc>) -> Result<Vec<RetentionReport>, Error> {
+        let policies = self.list_retention().await?;
+        let client = self
+            .backend
+            .pool()
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("retention pool: {e}")))?;
+        let mut reports = Vec::with_capacity(policies.len());
+        for row in policies {
+            // Defense in depth — stored rows should already be valid, but
+            // these reach DELETE SQL un-bindable, so re-validate.
+            crate::maintenance::validate_sql_identifier(&row.table_name)?;
+            crate::maintenance::validate_sql_identifier(&row.policy.time_column)?;
+            let db_size: i64 = client
+                .query_one("SELECT pg_database_size(current_database())", &[])
+                .await
+                .map_err(|e| map_pg_error(e, "pg_database_size"))?
+                .get(0);
+            let db_size = db_size.max(0) as u64;
+            let cutoff = now - chrono::Duration::seconds(row.policy.min_keep_secs as i64);
+            let pressure_gated = row.policy.pressure_trigger_bytes.is_some()
+                && row.policy.pressure_target_bytes.is_some();
+            let do_sweep = match row.policy.pressure_trigger_bytes {
+                Some(trigger) if pressure_gated => db_size >= trigger,
+                _ => true, // flat schedule
+            };
+            let mut swept = false;
+            let mut rows_deleted = 0usize;
+            let mut exhausted = false;
+            if do_sweep {
+                // table_name + time_column are validated identifiers; cutoff is bound.
+                let sql = format!(
+                    "DELETE FROM {} WHERE {} < $1",
+                    row.table_name, row.policy.time_column
+                );
+                let n = client
+                    .execute(sql.as_str(), &[&cutoff])
+                    .await
+                    .map_err(|e| map_pg_error(e, "run_retention DELETE"))?;
+                rows_deleted = n as usize;
+                swept = true;
+                if let (true, Some(target)) = (pressure_gated, row.policy.pressure_target_bytes) {
+                    // Best-effort: a row DELETE doesn't reclaim heap until
+                    // VACUUM, so this measures the not-yet-reclaimed size —
+                    // precise targeting awaits the drop_chunks path (#209).
+                    let after: i64 = client
+                        .query_one("SELECT pg_database_size(current_database())", &[])
+                        .await
+                        .map_err(|e| map_pg_error(e, "pg_database_size"))?
+                        .get(0);
+                    exhausted = after.max(0) as u64 >= target;
+                }
+            }
+            reports.push(RetentionReport {
+                table_name: row.table_name,
+                swept,
+                rows_deleted,
+                db_size_bytes: db_size,
+                exhausted,
+            });
+        }
+        Ok(reports)
+    }
+}
+
+fn pg_row_to_retention_policy(r: &tokio_postgres::Row) -> RetentionPolicy {
+    RetentionPolicy {
+        min_keep_secs: r.get::<_, i64>("min_keep_secs").max(0) as u64,
+        time_column: r.get("time_column"),
+        pressure_trigger_bytes: r
+            .get::<_, Option<i64>>("pressure_trigger_bytes")
+            .map(|v| v.max(0) as u64),
+        pressure_target_bytes: r
+            .get::<_, Option<i64>>("pressure_target_bytes")
+            .map(|v| v.max(0) as u64),
+        interval_secs: r.get::<_, i64>("interval_secs").max(0) as u64,
+    }
 }
 
 #[cfg(test)]
@@ -244,6 +412,86 @@ mod tests {
         let arc = Arc::new(backend);
         let svc = PostgresMaintenanceBackend::new(arc.clone());
         Some((arc, svc))
+    }
+
+    /// CIRISPersist#209 — retention CRUD + flat sweep on live PG:
+    /// `pg_database_size` measured, the validated-identifier DELETE drops
+    /// rows past `min_keep`, recent rows kept. Uses a unique temp table
+    /// (cleaned up) to stay isolated on the shared serial DB.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_retention_crud_and_flat_sweep() {
+        let Some((arc, svc)) = fresh_backend().await else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let tbl = format!("ret_test_{}", Uuid::new_v4().simple());
+        let now = Utc::now();
+        {
+            let client = arc.pool().get().await.unwrap();
+            client
+                .execute(
+                    &format!("CREATE TABLE {tbl} (ts TIMESTAMPTZ NOT NULL, v INT)"),
+                    &[],
+                )
+                .await
+                .unwrap();
+            client
+                .execute(
+                    &format!("INSERT INTO {tbl} (ts, v) VALUES ($1, 1), ($2, 2)"),
+                    &[
+                        &(now - chrono::Duration::days(40)),
+                        &(now - chrono::Duration::hours(1)),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        let pol = RetentionPolicy {
+            min_keep_secs: 30 * 86_400,
+            time_column: "ts".into(),
+            pressure_trigger_bytes: None,
+            pressure_target_bytes: None,
+            interval_secs: 3_600,
+        };
+        svc.set_retention(tbl.clone(), pol).await.unwrap();
+        assert_eq!(
+            svc.get_retention(&tbl)
+                .await
+                .unwrap()
+                .unwrap()
+                .min_keep_secs,
+            30 * 86_400
+        );
+        assert!(svc
+            .list_retention()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.table_name == tbl));
+
+        let reports = svc.run_retention(now).await.unwrap();
+        let r = reports.iter().find(|r| r.table_name == tbl).unwrap();
+        assert!(r.swept);
+        assert_eq!(
+            r.rows_deleted, 1,
+            "40d row past the 30d floor deleted; recent kept"
+        );
+        assert!(r.db_size_bytes > 0, "pg_database_size measured");
+
+        // cleanup — drop the temp table + its policy row.
+        let client = arc.pool().get().await.unwrap();
+        client
+            .execute(&format!("DROP TABLE {tbl}"), &[])
+            .await
+            .unwrap();
+        client
+            .execute(
+                "DELETE FROM cirislens.retention_policies WHERE table_name = $1",
+                &[&tbl],
+            )
+            .await
+            .unwrap();
     }
 
     /// v1.2.0 (CIRISPersist#48) PG Test 1 — VACUUM ANALYZE runs

@@ -41,7 +41,10 @@ pub mod sqlite;
 pub mod types;
 
 pub use service::MaintenanceService;
-pub use types::{ArchiveReport, ArchiveWindow, MaintenanceReport, PruneReport, VacuumReport};
+pub use types::{
+    validate_sql_identifier, ArchiveReport, ArchiveWindow, MaintenanceReport, PruneReport,
+    RetentionPolicy, RetentionPolicyRow, RetentionReport, VacuumReport,
+};
 
 /// Maintenance-layer errors. Surface kinds map onto the PyO3 typed
 /// exception hierarchy via
