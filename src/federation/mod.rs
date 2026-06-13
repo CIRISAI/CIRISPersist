@@ -2079,6 +2079,29 @@ pub enum Error {
     #[error("partner_record set-semantics array not sorted: {0}")]
     SetSemanticsUnsorted(String),
 
+    /// v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3). A `withdraws`
+    /// attestation was refused because its `issuer` (`attesting_key_id`)
+    /// satisfies NONE of the four broadened admission rules against the
+    /// target `T`: (1) producer self-revocation, (2) subject
+    /// self-revocation, (3) a `consent_revocation`-scoped `delegates_to`
+    /// chain reaching a subject, (4) a `consent_revocation`-scoped
+    /// delegation reaching the producer or a subject. The row is not
+    /// stored. Distinct from [`Error::InvalidArgument`] so consumers can
+    /// pattern-match the authority rejection deterministically (stable
+    /// `kind()` token `federation_withdraws_not_admitted`). See
+    /// [`admission::resolve_withdraws_admission_rule`].
+    #[error(
+        "withdraws by issuer {issuer:?} against target attestation \
+         {target_attestation_id:?} is not admitted: the issuer satisfies none of the \
+         four §3.2.3 admission rules (producer / subject / delegated-proxy authority)"
+    )]
+    WithdrawsNotAdmitted {
+        /// The `attesting_key_id` of the refused `withdraws`.
+        issuer: String,
+        /// The `attestation_id` of the target `T` being withdrawn.
+        target_attestation_id: String,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     /// String-typed because each backend has its own error tree.
     #[error("backend: {0}")]
@@ -2125,6 +2148,7 @@ impl Error {
             Error::OperationalAuthority(_) => "federation_operational_authority",
             Error::PartnerRecordRollback { .. } => "federation_partner_record_rollback",
             Error::SetSemanticsUnsorted(_) => "federation_set_semantics_unsorted",
+            Error::WithdrawsNotAdmitted { .. } => "federation_withdraws_not_admitted",
             Error::Backend(_) => "federation_backend",
         }
     }
