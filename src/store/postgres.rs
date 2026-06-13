@@ -2709,6 +2709,73 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    // ── hard_case:* emission surface (CIRISPersist#146 Ask 3) ──────
+
+    async fn record_hard_case(
+        &self,
+        event: crate::federation::HardCaseEvent,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Idempotent on the deterministic event_id — a re-scan of the
+        // same observed condition is a no-op, not a duplicate row.
+        client
+            .execute(
+                "INSERT INTO cirislens.hard_case_events \
+                    (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (event_id) DO NOTHING",
+                &[
+                    &event.event_id,
+                    &event.kind,
+                    &event.target_key_id,
+                    &event.subject_key_id,
+                    &event.detail,
+                    &event.emitted_at,
+                ],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("record_hard_case: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_hard_case_events(
+        &self,
+        filter: crate::federation::HardCaseFilter,
+    ) -> Result<Vec<crate::federation::HardCaseEvent>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let mut sql = String::from(
+            "SELECT event_id, kind, target_key_id, subject_key_id, detail, emitted_at \
+             FROM cirislens.hard_case_events",
+        );
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut conds: Vec<String> = Vec::new();
+        if let Some(k) = filter.kind {
+            params.push(Box::new(k));
+            conds.push(format!("kind = ${}", params.len()));
+        }
+        if let Some(since) = filter.since {
+            params.push(Box::new(since));
+            conds.push(format!("emitted_at >= ${}", params.len()));
+        }
+        if !conds.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conds.join(" AND "));
+        }
+        sql.push_str(" ORDER BY emitted_at DESC, event_id DESC");
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client.query(&sql, &params_ref[..]).await.map_err(|e| {
+            crate::federation::Error::Backend(format!("list_hard_case_events: {e}"))
+        })?;
+        rows.into_iter().map(pg_row_to_hard_case_event).collect()
+    }
+
     async fn communities_containing(
         &self,
         cell_id: &str,
@@ -7601,6 +7668,20 @@ fn pg_row_to_shared_instance_lease(
         acquired_at: row.safe_get_with("acquired_at", mk_err)?,
         last_heartbeat_at: row.safe_get_with("last_heartbeat_at", mk_err)?,
         lease_version: row.safe_get_with("lease_version", mk_err)?,
+    })
+}
+
+fn pg_row_to_hard_case_event(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::HardCaseEvent, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    Ok(crate::federation::HardCaseEvent {
+        event_id: row.safe_get_with("event_id", mk_err)?,
+        kind: row.safe_get_with("kind", mk_err)?,
+        target_key_id: row.safe_get_with("target_key_id", mk_err)?,
+        subject_key_id: row.safe_get_with("subject_key_id", mk_err)?,
+        detail: row.safe_get_with("detail", mk_err)?,
+        emitted_at: row.safe_get_with("emitted_at", mk_err)?,
     })
 }
 
@@ -22293,6 +22374,69 @@ mod tests {
 
     /// v4.10.0 (CIRISPersist#154) — live-PG location_proof round-trip:
     /// CIRISPersist#210 — SharedInstanceLease lifecycle on live PG: the
+    /// `INSERT … ON CONFLICT … WHERE stale` atomic election, live-owner
+    /// rejection, heartbeat, stale-steal (version bump + RETURNING),
+    /// demotion detection, ownership-checked release.
+    /// CIRISPersist#146 Ask 3 — hard_case:* emission on live PG: JSONB
+    /// `detail` round-trip, kind/since filters, and idempotency on the
+    /// deterministic `event_id` (ON CONFLICT DO NOTHING).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_hard_case_event_record_list_and_idempotent() {
+        use crate::federation::{
+            hard_case::kind, FederationDirectory, HardCaseEvent, HardCaseFilter,
+        };
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Unique ids so serial reuse of the shared DB doesn't collide.
+        let suffix = uuid_like();
+        let id1 = format!("hc-breach-{suffix}");
+        let id2 = format!("hc-overdue-{suffix}");
+        let ev = |id: &str, k: &str| HardCaseEvent {
+            event_id: id.into(),
+            kind: k.into(),
+            target_key_id: Some(format!("target-{suffix}")),
+            subject_key_id: Some(format!("subject-{suffix}")),
+            detail: serde_json::json!({ "sla_days": 30, "suffix": suffix }),
+            emitted_at: "2026-06-13T00:00:00Z".parse().unwrap(),
+        };
+        backend
+            .record_hard_case(ev(&id1, kind::CONSENT_SLA_BREACH))
+            .await
+            .unwrap();
+        backend
+            .record_hard_case(ev(&id2, kind::CONSENT_REVOCATION_PROMOTION_OVERDUE))
+            .await
+            .unwrap();
+        // Re-record id1 — idempotent (ON CONFLICT DO NOTHING).
+        backend
+            .record_hard_case(ev(&id1, kind::CONSENT_SLA_BREACH))
+            .await
+            .unwrap();
+
+        // Filter to this test's breach kind + this run's window; assert the
+        // JSONB detail round-tripped and idempotency held.
+        let breaches = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::CONSENT_SLA_BREACH.into()),
+                since: Some("2026-06-13T00:00:00Z".parse().unwrap()),
+            })
+            .await
+            .unwrap();
+        let mine: Vec<_> = breaches.into_iter().filter(|e| e.event_id == id1).collect();
+        assert_eq!(mine.len(), 1, "idempotent on event_id — id1 not duplicated");
+        assert_eq!(mine[0].detail["sla_days"], 30);
+        assert_eq!(mine[0].detail["suffix"], suffix);
+        assert_eq!(
+            mine[0].target_key_id.as_deref(),
+            Some(format!("target-{suffix}").as_str())
+        );
+    }
+
     /// `INSERT … ON CONFLICT … WHERE stale` atomic election, live-owner
     /// rejection, heartbeat, stale-steal (version bump + RETURNING),
     /// demotion detection, ownership-checked release.

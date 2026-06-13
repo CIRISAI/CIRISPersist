@@ -2381,6 +2381,77 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    // ── hard_case:* emission surface (CIRISPersist#146 Ask 3) ──────
+
+    async fn record_hard_case(
+        &self,
+        event: crate::federation::HardCaseEvent,
+    ) -> Result<(), crate::federation::Error> {
+        let detail_json = serde_json::to_string(&event.detail).map_err(|e| {
+            crate::federation::Error::Backend(format!("hard_case detail serialize: {e}"))
+        })?;
+        let emitted_s = event.emitted_at.to_rfc3339();
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            // Idempotent on the deterministic event_id (re-scan = no-op).
+            conn.execute(
+                "INSERT INTO hard_case_events \
+                    (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(event_id) DO NOTHING",
+                rusqlite::params![
+                    event.event_id,
+                    event.kind,
+                    event.target_key_id,
+                    event.subject_key_id,
+                    detail_json,
+                    emitted_s,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("record_hard_case: {e}")))
+    }
+
+    async fn list_hard_case_events(
+        &self,
+        filter: crate::federation::HardCaseFilter,
+    ) -> Result<Vec<crate::federation::HardCaseEvent>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let kind = filter.kind.clone();
+        let since_s = filter.since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<crate::federation::HardCaseEvent>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut sql = String::from(
+                "SELECT event_id, kind, target_key_id, subject_key_id, detail, emitted_at \
+                 FROM hard_case_events",
+            );
+            let mut conds: Vec<String> = Vec::new();
+            let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+            if let Some(k) = kind {
+                vals.push(k.into());
+                conds.push(format!("kind = ?{}", vals.len()));
+            }
+            if let Some(s) = since_s {
+                vals.push(s.into());
+                conds.push(format!("emitted_at >= ?{}", vals.len()));
+            }
+            if !conds.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(&conds.join(" AND "));
+            }
+            sql.push_str(" ORDER BY emitted_at DESC, event_id DESC");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(vals.iter()),
+                sqlite_row_to_hard_case_event,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_hard_case_events: {e}")))
+    }
+
     async fn communities_containing(
         &self,
         cell_id: &str,
@@ -7559,6 +7630,22 @@ fn sqlite_row_to_shared_instance_lease(
     })
 }
 
+fn sqlite_row_to_hard_case_event(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::HardCaseEvent> {
+    let detail_s: String = row.get("detail")?;
+    let emitted_at: String = row.get("emitted_at")?;
+    Ok(crate::federation::HardCaseEvent {
+        event_id: row.get("event_id")?,
+        kind: row.get("kind")?,
+        target_key_id: row.get("target_key_id")?,
+        subject_key_id: row.get("subject_key_id")?,
+        detail: serde_json::from_str(&detail_s)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+        emitted_at: parse_rfc3339(&emitted_at),
+    })
+}
+
 /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13) — row → Organization.
 fn sqlite_row_to_organization(
     row: &rusqlite::Row<'_>,
@@ -11897,6 +11984,147 @@ mod tests {
             "subject_key_ids round-trip (federation-key + canonical-hash entries)"
         );
         assert_eq!(got.withdraws_admission_rule, None);
+    }
+
+    /// CIRISPersist#146 — §8.1.11.1 effective consent resolution: latest
+    /// non-expired `consent:state:*` from the subject wins; a later
+    /// `revoked` overrides an earlier `granted`; a subject who never
+    /// declared reads `Unspecified` (never silently granted).
+    #[tokio::test]
+    async fn resolve_consent_state_latest_revoked_overrides_granted() {
+        use crate::federation::{hard_case::ConsentState, FederationDirectory, SignedAttestation};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("target-1", "prim-t", "target-1"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("subject-1", "prim-s", "subject-1"),
+            })
+            .await
+            .unwrap();
+        let mk = |id: &str, dim: &str, at: &str| {
+            let mut a = fed_attestation(id, "subject-1", "target-1", "subject-1");
+            a.attestation_envelope = serde_json::json!({ "id": id, "dimension": dim });
+            a.asserted_at = at.parse().unwrap();
+            SignedAttestation { attestation: a }
+        };
+        let now = chrono::Utc::now();
+
+        // No stance declared yet → Unspecified.
+        assert_eq!(
+            backend
+                .resolve_consent_state("target-1", "subject-1", now)
+                .await
+                .unwrap(),
+            ConsentState::Unspecified
+        );
+
+        backend
+            .put_attestation(mk(
+                "c-grant",
+                "consent:state:granted:v1",
+                "2026-06-01T00:00:00Z",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .resolve_consent_state("target-1", "subject-1", now)
+                .await
+                .unwrap(),
+            ConsentState::Granted
+        );
+
+        // A later revocation overrides the earlier grant.
+        backend
+            .put_attestation(mk(
+                "c-revoke",
+                "consent:state:revoked:v1",
+                "2026-06-02T00:00:00Z",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .resolve_consent_state("target-1", "subject-1", now)
+                .await
+                .unwrap(),
+            ConsentState::Revoked
+        );
+
+        // A subject who never declared a stance reads Unspecified.
+        assert_eq!(
+            backend
+                .resolve_consent_state("target-1", "someone-else", now)
+                .await
+                .unwrap(),
+            ConsentState::Unspecified
+        );
+    }
+
+    /// CIRISPersist#146 Ask 3 — hard_case:* emission surface: record +
+    /// list with kind/since filters, and idempotency on the deterministic
+    /// `event_id` (a re-scan never double-emits).
+    #[tokio::test]
+    async fn hard_case_event_record_list_and_idempotent() {
+        use crate::federation::{
+            hard_case::kind, FederationDirectory, HardCaseEvent, HardCaseFilter,
+        };
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let ev = |id: &str, k: &str| HardCaseEvent {
+            event_id: id.into(),
+            kind: k.into(),
+            target_key_id: Some("target-1".into()),
+            subject_key_id: Some("subject-1".into()),
+            detail: serde_json::json!({ "sla_days": 30 }),
+            emitted_at: "2026-06-13T00:00:00Z".parse().unwrap(),
+        };
+        backend
+            .record_hard_case(ev("hc-1", kind::CONSENT_SLA_BREACH))
+            .await
+            .unwrap();
+        backend
+            .record_hard_case(ev("hc-2", kind::CONSENT_REVOCATION_PROMOTION_OVERDUE))
+            .await
+            .unwrap();
+        // Re-record hc-1 — idempotent, no duplicate row.
+        backend
+            .record_hard_case(ev("hc-1", kind::CONSENT_SLA_BREACH))
+            .await
+            .unwrap();
+
+        let all = backend
+            .list_hard_case_events(HardCaseFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2, "idempotent on event_id — hc-1 not duplicated");
+
+        let breaches = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::CONSENT_SLA_BREACH.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(breaches.len(), 1);
+        assert_eq!(breaches[0].event_id, "hc-1");
+        assert_eq!(breaches[0].detail["sla_days"], 30);
+
+        // since-filter excludes events before the cutoff.
+        let recent = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: None,
+                since: Some("2026-06-14T00:00:00Z".parse().unwrap()),
+            })
+            .await
+            .unwrap();
+        assert!(recent.is_empty(), "since-filter excludes pre-cutoff events");
     }
 
     fn fed_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {

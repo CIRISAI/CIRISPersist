@@ -5,6 +5,21 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [5.7.0] — 2026-06-13
+
+### Added — `hard_case:*` emission surface + consent-state resolution (CIRISPersist#146; CEG 1.0-RC4 §7.0.2 / §8.1.11)
+
+CEG 1.0-RC4 ratified `consent_role` (Accord §RC / CIRISAgent#760 OQ-1/2/3 = the `ConsentGate.lean` defaults), unblocking #146's back half. The `consent_role` *schema* already shipped (V020, anticipating OQ-1's flat overwrite-on-revoke enum); this cut adds the two substrate primitives the consent-SLA watcher needs.
+
+- **`hard_case_events` table (V075, both backends) + emission surface.** persist's first `hard_case:*` *emitter* (it previously only *gated*). `FederationDirectory::record_hard_case` / `list_hard_case_events` (real impls on Postgres + SQLite; default-"not implemented" elsewhere — additive, non-breaking). CEG separates substrate observability (`hard_case:*`, persist) from LensCore-composed derived detection (`detection:*`); this is the durable, queryable, operator-introspectable surface LensCore composes `detection:consent:*` over (chosen over a transient change-feed event — CIRISPersist#146 design decision). Emission is **idempotent on a deterministic `event_id`** (`ON CONFLICT DO NOTHING`), so a watcher re-scan never double-emits. Named kinds: `consent_sla_breach` (§8.1.11.3), `consent_revocation_promotion_overdue` (§10.1.3); open vocabulary.
+- **`FederationDirectory::resolve_consent_state` (§8.1.11.1).** Effective consent stance of subject `s` over target `T` at `now` — the latest non-expired `consent:state:*` from `s`, by `asserted_at` (a later `revoked` overrides an earlier `granted`); `Unspecified` if `s` never declared (an unknown stance value never silently reads as granted). Backend-agnostic default over `list_attestations_for`. (v1 resolves the direct subject; the `delegates_to` proxy chain is a follow-up.)
+- **`federation::hard_case`** module: `HardCaseEvent` / `HardCaseFilter` / `ConsentState` + the `kind` constants.
+
+This is the substrate foundation for the consent-SLA watcher background task (the scanning logic that emits through this surface) — the next #146 increment.
+
+### Tests
+Both backends: `resolve_consent_state` (grant → later-revoke override, unspecified-never-granted) and the `hard_case` emission surface (record/list with kind+since filters, `event_id` idempotency, JSONB `detail` round-trip on PG). Gate: fmt · clippy `-D warnings` (sqlite-only + postgres+server+pyo3) · backend-less `-D warnings` · `--no-default-features` · cargo-deny · sqlite lib (790) · live-PG lib (730).
+
 ## [5.6.0] — 2026-06-12
 
 ### Added — SharedInstanceLease: cross-process leader election (CIRISPersist#210; CIRISEdge#100)
