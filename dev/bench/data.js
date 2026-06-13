@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781325079305,
+  "lastUpdate": 1781333362388,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -25673,6 +25673,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 636290,
             "range": "± 13806",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "00fa8e3ea8b6942e294edde7b310297caba7b092",
+          "message": "v5.7.0 — hard_case:* emission surface + consent-state resolution (#146)\n\nCEG 1.0-RC4 §7.0.2 ratified consent_role (Agent#760 OQ-1/2/3 = ConsentGate.lean\ndefaults), unblocking #146's back half. The consent_role schema already\nshipped (V020, flat overwrite-on-revoke enum incl. peer/authorized_review,\nmatching OQ-1); this adds the two substrate primitives the consent-SLA\nwatcher needs.\n\n- V075 hard_case_events (both backends) + FederationDirectory::record_hard_case\n  / list_hard_case_events — persist's first hard_case:* EMITTER (was gate-only).\n  Durable/queryable/operator-introspectable surface (design decision over a\n  transient change-feed); LensCore composes detection:consent:* over it.\n  Idempotent on a deterministic event_id (ON CONFLICT DO NOTHING) so a watcher\n  re-scan never double-emits. Kinds: consent_sla_breach (§8.1.11.3),\n  consent_revocation_promotion_overdue (§10.1.3); open vocab.\n- FederationDirectory::resolve_consent_state (§8.1.11.1) — latest non-expired\n  consent:state:* from the subject; later revoked overrides granted;\n  Unspecified if never declared (unknown stance never reads as granted).\n  Backend-agnostic default over list_attestations_for.\n- federation::hard_case module: HardCaseEvent / HardCaseFilter / ConsentState\n  + kind constants. Additive trait methods (default-impl), non-breaking.\n\nFoundation for the consent-SLA watcher background task (next #146 increment).\n\nTested both backends: resolve_consent_state (grant→revoke override, unspecified)\n+ hard_case record/list/idempotent/JSONB-detail. fmt, clippy -D warnings x2,\nbackend-less -D warnings, --no-default-features, cargo-deny, sqlite 790, PG 730.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-06-13T01:27:15-05:00",
+          "tree_id": "2549408bc55c3966824d0c6c456110d2c13de7d9",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/00fa8e3ea8b6942e294edde7b310297caba7b092"
+        },
+        "date": 1781333361379,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 45686165,
+            "range": "± 30885",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2552391,
+            "range": "± 248146",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 2399,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 5700,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 12461,
+            "range": "± 185",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 44240,
+            "range": "± 738",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 31,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 175,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 506,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 577,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1991,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 71,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 222,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 968,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 48391,
+            "range": "± 5668",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 143441,
+            "range": "± 994",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 528279,
+            "range": "± 4622",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 8540,
+            "range": "± 607",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 9684,
+            "range": "± 440",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 14055,
+            "range": "± 1661",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 23985,
+            "range": "± 1344",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1584027,
+            "range": "± 5650",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 5422393,
+            "range": "± 62878",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 306377,
+            "range": "± 4849",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 959039,
+            "range": "± 22487",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 55345563,
+            "range": "± 545540",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1859907,
+            "range": "± 39014",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 9271939,
+            "range": "± 246398",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 138469402,
+            "range": "± 1841070",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 4771358,
+            "range": "± 198446",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 24538119,
+            "range": "± 398308",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 104748,
+            "range": "± 5377",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 93408,
+            "range": "± 3340",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 8080,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 52549,
+            "range": "± 1175",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 483817,
+            "range": "± 2837",
             "unit": "ns/iter"
           }
         ]
