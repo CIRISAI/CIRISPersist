@@ -60,6 +60,9 @@ pub mod schema_resolver;
 // owner; CIRISEdge#100). Backend-agnostic types + staleness helper; the
 // atomic acquire/heartbeat/release live in the backends.
 pub mod shared_instance;
+// CIRISPersist#146 Ask 3 — the substrate hard_case:* emission surface
+// (consent-SLA watcher + general observability primitive; CEG §8.1.11.3).
+pub mod hard_case;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_open;
 // v4.1 (CIRISPersist#142 Cut C2) — streaming-chunk AES-256-GCM + STREAM
@@ -116,6 +119,7 @@ pub use goal::{
     canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
     MetaGoalAlignment,
 };
+pub use hard_case::{ConsentState, HardCaseEvent, HardCaseFilter};
 pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE};
 pub use identity_aggregate::{
     ContentKemIdentity, LocalIdentityAggregate, LOCAL_IDENTITY_AGGREGATE_VERSION,
@@ -1415,6 +1419,75 @@ pub trait FederationDirectory: Send + Sync {
         Err(Error::Backend(
             "release_shared_instance_lease not implemented for this backend".into(),
         ))
+    }
+
+    // ── hard_case:* emission surface (CIRISPersist#146 Ask 3) ──────
+
+    /// Record a `hard_case:*` observability event (CEG §8.1.11.3 /
+    /// §10.1.3). **Idempotent on `event_id`** — the emitter derives a
+    /// deterministic id from `(kind, target, window)`, so re-recording
+    /// the same observed condition (e.g. a re-scan by the consent-SLA
+    /// watcher) is a no-op rather than a duplicate. See
+    /// [`hard_case`](crate::federation::hard_case).
+    async fn record_hard_case(&self, event: hard_case::HardCaseEvent) -> Result<(), Error> {
+        let _ = event;
+        Err(Error::Backend(
+            "record_hard_case not implemented for this backend".into(),
+        ))
+    }
+
+    /// List recorded `hard_case:*` events (LensCore consumes by kind +
+    /// recency to compose `detection:consent:*`). Newest first.
+    async fn list_hard_case_events(
+        &self,
+        filter: hard_case::HardCaseFilter,
+    ) -> Result<Vec<hard_case::HardCaseEvent>, Error> {
+        let _ = filter;
+        Err(Error::Backend(
+            "list_hard_case_events not implemented for this backend".into(),
+        ))
+    }
+
+    /// CEG §8.1.11.1 — effective consent stance of subject `s` over
+    /// target Contribution `T` at `now`. Default impl over
+    /// [`list_attestations_for`](Self::list_attestations_for): the latest
+    /// non-expired `consent:state:*` attestation whose `attesting_key_id`
+    /// is `s`, by `asserted_at`. `Unspecified` if `s` never declared a
+    /// stance against `T`.
+    ///
+    /// v1 resolves the **direct** subject only; the `delegates_to` proxy
+    /// chain (§8.1.11.1 `attesting_key_id ∈ delegates_to(s).proxies`) is
+    /// a follow-up — a delegate-emitted stance is not yet folded in.
+    async fn resolve_consent_state(
+        &self,
+        target_key_id: &str,
+        subject_key_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<hard_case::ConsentState, Error> {
+        // `dimension` is the envelope's "dimension" string (the same
+        // axis admission keys on); read it straight off the stored
+        // `attestation_envelope`.
+        fn envelope_dimension(a: &Attestation) -> Option<&str> {
+            a.attestation_envelope
+                .get("dimension")
+                .and_then(|v| v.as_str())
+        }
+        let rows = self.list_attestations_for(target_key_id).await?;
+        let latest = rows
+            .into_iter()
+            .filter(|a| a.attesting_key_id == subject_key_id)
+            .filter(|a| envelope_dimension(a).is_some_and(|d| d.starts_with("consent:state:")))
+            .filter(|a| a.expires_at.map_or(true, |exp| exp > now))
+            .max_by_key(|a| a.asserted_at);
+        Ok(match latest.as_ref().and_then(envelope_dimension) {
+            Some(d) if d.starts_with("consent:state:granted") => hard_case::ConsentState::Granted,
+            Some(d) if d.starts_with("consent:state:revoked") => hard_case::ConsentState::Revoked,
+            Some(d) if d.starts_with("consent:state:expired") => hard_case::ConsentState::Expired,
+            // A consent:state:* whose value isn't in the closed set, or
+            // no candidate at all → unspecified (forward-compat: an
+            // unknown stance value never silently reads as granted).
+            _ => hard_case::ConsentState::Unspecified,
+        })
     }
 }
 
