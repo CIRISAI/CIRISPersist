@@ -2774,6 +2774,96 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    // ── transport_destination (CIRISPersist#183, CEG §5.6.8.8.1) ───
+
+    async fn put_transport_destination(
+        &self,
+        destination: &crate::federation::TransportDestination,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Idempotent on the composite PK: a re-assert refreshes the
+        // timestamps in place (drop+re-register is the mutation model).
+        client
+            .execute(
+                "INSERT INTO cirislens.transport_destinations \
+                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (occurrence_key_id, transport_kind, destination) \
+                 DO UPDATE SET asserted_at = EXCLUDED.asserted_at, \
+                    last_seen_at = EXCLUDED.last_seen_at",
+                &[
+                    &destination.occurrence_key_id,
+                    &destination.transport_kind,
+                    &destination.destination,
+                    &destination.asserted_at,
+                    &destination.last_seen_at,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("put_transport_destination: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn list_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at \
+                 FROM cirislens.transport_destinations WHERE occurrence_key_id = $1 \
+                 ORDER BY transport_kind, destination",
+                &[&occurrence_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_transport_destinations_for: {e}"))
+            })?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(crate::federation::TransportDestination {
+                    occurrence_key_id: row.safe_get_with(0, crate::federation::Error::Backend)?,
+                    transport_kind: row.safe_get_with(1, crate::federation::Error::Backend)?,
+                    destination: row.safe_get_with(2, crate::federation::Error::Backend)?,
+                    asserted_at: row.safe_get_with(3, crate::federation::Error::Backend)?,
+                    last_seen_at: row.safe_get_with(4, crate::federation::Error::Backend)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn remove_transport_destination(
+        &self,
+        occurrence_key_id: &str,
+        transport_kind: &str,
+        destination: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let n = client
+            .execute(
+                "DELETE FROM cirislens.transport_destinations \
+                 WHERE occurrence_key_id = $1 AND transport_kind = $2 AND destination = $3",
+                &[&occurrence_key_id, &transport_kind, &destination],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("remove_transport_destination: {e}"))
+            })?;
+        Ok(n > 0)
+    }
+
     // ── hard_case:* emission surface (CIRISPersist#146 Ask 3) ──────
 
     async fn record_hard_case(

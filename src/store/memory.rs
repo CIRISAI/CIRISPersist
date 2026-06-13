@@ -120,6 +120,12 @@ struct State {
     /// unsigned [`PartnerRecord`]).
     federation_partner_record_sigs:
         HashMap<String, (Vec<ciris_verify_core::threshold::ThresholdSignature>, usize)>,
+    /// v6.5.0 (CIRISPersist#183, CEG §5.6.8.8.1) — per-occurrence
+    /// reachability rows, keyed by the composite PK
+    /// `(occurrence_key_id, transport_kind, destination)`. Parity with
+    /// the postgres/sqlite `transport_destinations` table.
+    transport_destinations:
+        HashMap<(String, String, String), crate::federation::TransportDestination>,
 }
 
 impl Default for MemoryBackend {
@@ -149,6 +155,7 @@ impl Default for MemoryBackend {
                 federation_partner_records: HashMap::new(),
                 federation_partner_record_sigs: HashMap::new(),
                 blackhole_rules: HashMap::new(),
+                transport_destinations: HashMap::new(),
             }),
         }
     }
@@ -861,6 +868,72 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             row,
         );
         Ok(())
+    }
+
+    // ── transport_destination (CIRISPersist#183, CEG §5.6.8.8.1) ───
+
+    async fn put_transport_destination(
+        &self,
+        destination: &crate::federation::TransportDestination,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        // FK parity with postgres/sqlite: the occurrence key must exist.
+        if !state
+            .federation_keys
+            .contains_key(&destination.occurrence_key_id)
+        {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "occurrence_key_id {} does not exist in federation_keys",
+                destination.occurrence_key_id
+            )));
+        }
+        // Idempotent on the composite PK (re-assert refreshes in place).
+        state.transport_destinations.insert(
+            (
+                destination.occurrence_key_id.clone(),
+                destination.transport_kind.clone(),
+                destination.destination.clone(),
+            ),
+            destination.clone(),
+        );
+        Ok(())
+    }
+
+    async fn list_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .transport_destinations
+            .values()
+            .filter(|d| d.occurrence_key_id == occurrence_key_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.transport_kind
+                .cmp(&b.transport_kind)
+                .then_with(|| a.destination.cmp(&b.destination))
+        });
+        Ok(rows)
+    }
+
+    async fn remove_transport_destination(
+        &self,
+        occurrence_key_id: &str,
+        transport_kind: &str,
+        destination: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let removed = state
+            .transport_destinations
+            .remove(&(
+                occurrence_key_id.to_owned(),
+                transport_kind.to_owned(),
+                destination.to_owned(),
+            ))
+            .is_some();
+        Ok(removed)
     }
 
     async fn list_identity_occurrences_for(

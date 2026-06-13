@@ -63,6 +63,10 @@ pub mod shared_instance;
 // CIRISPersist#146 Ask 3 — the substrate hard_case:* emission surface
 // (consent-SLA watcher + general observability primitive; CEG §8.1.11.3).
 pub mod hard_case;
+// CIRISPersist#183 — the "self at login" substrate vocabulary
+// (delegation/partnership envelope builders + scope tokens +
+// TransportDestination type; CEG §8.1.12.7 / §5.6.8.8.1).
+pub mod self_at_login;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_open;
 // v4.1 (CIRISPersist#142 Cut C2) — streaming-chunk AES-256-GCM + STREAM
@@ -146,6 +150,10 @@ pub use schema_resolver::BlobBackedSchemaResolver;
 pub use schema_resolver::{
     axis_from_dimension, AxisSchema, NoOpSchemaResolver, SchemaResolver, SchemaResolverError,
 };
+pub use self_at_login::{
+    delegates_to_agent_envelope, partnership_accept_envelope, partnership_grant_envelope,
+    TransportDestination, SELF_AT_LOGIN_DELEGATION_SCOPE,
+};
 pub use shared_instance::{SharedInstanceLease, DEFAULT_STALE_AFTER};
 #[cfg(feature = "sqlite")]
 pub use sqlite_open::FederationDirectorySqlite;
@@ -158,6 +166,7 @@ pub use topology::{
     DelegationGraph, EdgeType, FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology,
     WithdrawalEntry, MAX_DELEGATION_DEPTH,
 };
+pub use types::{device_class, identity_type};
 pub use types::{
     Attestation, Community, CommunityMember, CommunityMembershipRevocation, EncryptionPubkeys,
     Family, FamilyMember, FamilyMembershipRevocation, HybridPendingRow, IdentityOccurrence,
@@ -1443,6 +1452,56 @@ pub trait FederationDirectory: Send + Sync {
         let _ = lease;
         Err(Error::Backend(
             "release_shared_instance_lease not implemented for this backend".into(),
+        ))
+    }
+
+    // ── transport_destination (CIRISPersist#183, CEG §5.6.8.8.1) ───
+
+    /// v6.5.0 (CIRISPersist#183, CEG §5.6.8.8.1) — register (or refresh)
+    /// one reachable network address for an occurrence. **Idempotent on
+    /// the `(occurrence_key_id, transport_kind, destination)` PK** — a
+    /// re-assert updates `asserted_at` / `last_seen_at` in place. The
+    /// occurrence key must exist in `federation_keys` (FK).
+    ///
+    /// Reachability is mutable + disposable (drop + re-register, not
+    /// revoke), so this row carries no signature / `persist_row_hash`.
+    /// Default impl errors; the three backends override.
+    async fn put_transport_destination(
+        &self,
+        destination: &self_at_login::TransportDestination,
+    ) -> Result<(), Error> {
+        let _ = destination;
+        Err(Error::Backend(
+            "put_transport_destination not implemented for this backend".into(),
+        ))
+    }
+
+    /// v6.5.0 — list every reachable address registered for
+    /// `occurrence_key_id` ("how do I reach this occurrence?"). Empty
+    /// when none. Liveness filtering (on `last_seen_at` age) is
+    /// caller-side. Default impl errors; the three backends override.
+    async fn list_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        let _ = occurrence_key_id;
+        Err(Error::Backend(
+            "list_transport_destinations_for not implemented for this backend".into(),
+        ))
+    }
+
+    /// v6.5.0 — drop one reachable address (e.g. a stale relay). Returns
+    /// `true` if a row was removed, `false` if absent (idempotent).
+    /// Default impl errors; the three backends override.
+    async fn remove_transport_destination(
+        &self,
+        occurrence_key_id: &str,
+        transport_kind: &str,
+        destination: &str,
+    ) -> Result<bool, Error> {
+        let _ = (occurrence_key_id, transport_kind, destination);
+        Err(Error::Backend(
+            "remove_transport_destination not implemented for this backend".into(),
         ))
     }
 

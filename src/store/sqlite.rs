@@ -2433,6 +2433,106 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    // ── transport_destination (CIRISPersist#183, CEG §5.6.8.8.1) ───
+
+    async fn put_transport_destination(
+        &self,
+        destination: &crate::federation::TransportDestination,
+    ) -> Result<(), crate::federation::Error> {
+        let conn = self.conn.clone();
+        let d = destination.clone();
+        let asserted = d.asserted_at.to_rfc3339();
+        let last_seen = d.last_seen_at.map(|t| t.to_rfc3339());
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            // Idempotent on the composite PK: a re-assert refreshes the
+            // timestamps in place (drop+re-register is the mutation model).
+            conn.execute(
+                "INSERT INTO transport_destinations \
+                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(occurrence_key_id, transport_kind, destination) \
+                 DO UPDATE SET asserted_at = excluded.asserted_at, \
+                    last_seen_at = excluded.last_seen_at",
+                rusqlite::params![
+                    d.occurrence_key_id,
+                    d.transport_kind,
+                    d.destination,
+                    asserted,
+                    last_seen,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("put_transport_destination: {e}")))
+    }
+
+    async fn list_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let occ = occurrence_key_id.to_owned();
+        (move || -> Result<Vec<crate::federation::TransportDestination>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at \
+                 FROM transport_destinations WHERE occurrence_key_id = ?1 \
+                 ORDER BY transport_kind, destination",
+            )?;
+            let rows = stmt.query_map([&occ], |row| {
+                let occurrence_key_id: String = row.get(0)?;
+                let transport_kind: String = row.get(1)?;
+                let destination: String = row.get(2)?;
+                let asserted_at_str: String = row.get(3)?;
+                let last_seen_str: Option<String> = row.get(4)?;
+                let asserted_at = chrono::DateTime::parse_from_rfc3339(&asserted_at_str)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
+                let last_seen_at = last_seen_str.and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                });
+                Ok(crate::federation::TransportDestination {
+                    occurrence_key_id,
+                    transport_kind,
+                    destination,
+                    asserted_at,
+                    last_seen_at,
+                })
+            })?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_transport_destinations_for: {e}"))
+        })
+    }
+
+    async fn remove_transport_destination(
+        &self,
+        occurrence_key_id: &str,
+        transport_kind: &str,
+        destination: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let occ = occurrence_key_id.to_owned();
+        let kind = transport_kind.to_owned();
+        let dest = destination.to_owned();
+        (move || -> Result<bool, rusqlite::Error> {
+            let conn = conn.lock();
+            let n = conn.execute(
+                "DELETE FROM transport_destinations \
+                 WHERE occurrence_key_id = ?1 AND transport_kind = ?2 AND destination = ?3",
+                rusqlite::params![occ, kind, dest],
+            )?;
+            Ok(n > 0)
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("remove_transport_destination: {e}"))
+        })
+    }
+
     // ── hard_case:* emission surface (CIRISPersist#146 Ask 3) ──────
 
     async fn record_hard_case(

@@ -192,6 +192,74 @@ pub enum SignError {
     LocalSigner(#[from] crate::signing::LocalSignerError),
 }
 
+/// v6.5.0 (CIRISPersist#183, CEG §8.1.12.7) — one occurrence (app or
+/// agent) being co-admitted at login. The `occurrence_key_id` must
+/// already exist as a `federation_keys` row.
+#[derive(Debug, Clone)]
+pub struct SelfAtLoginOccurrence {
+    /// The occurrence's signing key — a `federation_keys.key_id`.
+    pub occurrence_key_id: String,
+    /// Closed-set per [`crate::federation::device_class`] —
+    /// `phone`/`laptop` for the app, `agent` for the agent.
+    pub device_class: String,
+    /// Optional opaque hardware-attestation blob (TPM / Secure Enclave
+    /// / StrongBox / …).
+    pub hardware_attestation: Option<String>,
+    /// The occurrence's content-encryption pubkeys (the §8.1.12.4 Self
+    /// DEK wrap-target). `None` ⇒ fail-secure excluded from the DEK
+    /// cascade (reported in
+    /// [`SelfAtLoginOutcome::self_dek_excluded`]).
+    pub encryption_pubkeys: Option<crate::federation::EncryptionPubkeys>,
+    /// Reachability addresses to register for this occurrence
+    /// (§5.6.8.8.1): `(transport_kind, destination)` pairs, e.g.
+    /// `("reticulum", "<dest-hash>")`. May be empty.
+    pub transport_destinations: Vec<(String, String)>,
+}
+
+/// v6.5.0 (CIRISPersist#183, CEG §8.1.12.7) — inputs to the
+/// [`Engine::self_at_login`] flow.
+#[derive(Debug, Clone)]
+pub struct SelfAtLoginInput {
+    /// The user's root identity key — a `federation_keys.key_id`. Both
+    /// occurrences are bound under it.
+    pub identity_key_id: String,
+    /// The app occurrence (`device_class: phone | laptop`).
+    pub app: SelfAtLoginOccurrence,
+    /// The agent occurrence (`device_class: agent`).
+    pub agent: SelfAtLoginOccurrence,
+    /// The shared `bilateral_pair_id` linking the partnership
+    /// grant/accept + delegation. Caller-minted (e.g.
+    /// `Uuid::new_v4()`).
+    pub bilateral_pair_id: String,
+    /// Override the delegation scope set. `None` ⇒ the full §8.1.12.7
+    /// set `[act_on_behalf, message_io, network_presence,
+    /// sub_delegation]`.
+    pub delegation_scope: Option<Vec<String>>,
+}
+
+/// v6.5.0 (CIRISPersist#183, CEG §8.1.12.7) — what
+/// [`Engine::self_at_login`] landed.
+#[derive(Debug, Clone)]
+pub struct SelfAtLoginOutcome {
+    /// `attestation_id` of the user-side `consent:partnership_grant`.
+    pub partnership_grant_id: String,
+    /// `attestation_id` of the agent-side `consent:partnership_accept`.
+    pub partnership_accept_id: String,
+    /// `attestation_id` of the `delegates_to` delegation.
+    pub delegation_id: String,
+    /// `true` if the delegation was promoted to the federation tier
+    /// (`false` if it was already federation — idempotent).
+    pub delegation_promoted: bool,
+    /// Count of occurrences the Self DEK cascade granted to (newly).
+    pub self_dek_granted: usize,
+    /// Occurrence keys fail-secure **excluded** from the DEK cascade
+    /// (registered no `encryption_pubkeys`). Empty in the happy path.
+    pub self_dek_excluded: Vec<String>,
+    /// Count of `transport_destination` rows registered across both
+    /// occurrences.
+    pub transport_destinations_registered: usize,
+}
+
 impl Engine {
     /// Construct an Engine with a pre-loaded
     /// [`LocalSigner`](crate::signing::LocalSigner) `Arc` plus a
@@ -1344,6 +1412,182 @@ impl Engine {
                 .await
             }
         }
+    }
+
+    /// v6.5.0 (CIRISPersist#183, CEG §8.1.12.7) — drive the full
+    /// **"self at login"** flow: co-admit the app + agent occurrences of
+    /// one user identity, cascade the Self DEK to both, partner +
+    /// delegate, promote the delegation to the federation tier, and
+    /// register reachability rows. Returns a [`SelfAtLoginOutcome`]
+    /// summarizing what landed.
+    ///
+    /// **Precondition** (upstream of this call): the user's identity key
+    /// and BOTH occurrence keys (app + agent) already exist as
+    /// `federation_keys` rows (key registration is the steward/keyring
+    /// path, not this flow). This method binds occurrences over those
+    /// keys, it does not mint them.
+    ///
+    /// What it composes (none of this is reinvented here):
+    /// 1. **Co-admit** — `put_identity_occurrence` for the app
+    ///    (`device_class: phone|laptop`) and the agent
+    ///    (`device_class: agent`) under one `identity_key` (#153).
+    /// 2. **Self-DEK cascade** — [`Engine::rekey_self_occurrence_add`]
+    ///    (v6.2.0) retroactively key-grant-wraps every existing
+    ///    `cohort_scope: self` DEK to both newcomers (§8.1.12.4), so the
+    ///    app and agent both decrypt. Fail-secure: a newcomer with no
+    ///    `encryption_pubkeys` is excluded, reported in the outcome.
+    /// 3. **Partner** — a `consent:partnership_grant` (user side) +
+    ///    `consent:partnership_accept` (agent side) sharing one
+    ///    `bilateral_pair_id`, written local-tier via
+    ///    `attestation_upsert_local`.
+    /// 4. **Delegate** — a `delegates_to(user → agent occurrence)` with
+    ///    scope `[act_on_behalf, message_io, network_presence,
+    ///    sub_delegation]` (§8.1.12.7), written local-tier.
+    /// 5. **Promote** — [`Engine::attestation_promote`] (#172) flips the
+    ///    delegation to the federation tier + hybrid-signs it so peers
+    ///    verify the agent's authority (§10.1.5 — "show up on network").
+    /// 6. **Reachability** — a `transport_destination` row per occurrence
+    ///    that supplied one (§5.6.8.8.1).
+    ///
+    /// The `identity_type` of the user's key is expected to carry at
+    /// least `{user}` per §7.0.1 (a set encoded in the TEXT column via
+    /// [`crate::federation::types::identity_type::join_set`]); this flow
+    /// reads occurrences, it does not rewrite the identity key's type.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn self_at_login(
+        &self,
+        input: SelfAtLoginInput,
+    ) -> Result<SelfAtLoginOutcome, crate::federation::Error> {
+        use crate::federation::types::{attestation_type, cohort_scope, LocalAttestationInput};
+        use crate::federation::{
+            delegates_to_agent_envelope, partnership_accept_envelope, partnership_grant_envelope,
+            IdentityOccurrence, SignedIdentityOccurrence, TransportDestination,
+        };
+
+        let now = chrono::Utc::now();
+        let directory = self.federation_directory();
+
+        // (1) Co-admit both occurrences under the one identity key.
+        for occ in [&input.app, &input.agent] {
+            let row = IdentityOccurrence {
+                identity_key_id: input.identity_key_id.clone(),
+                occurrence_key_id: occ.occurrence_key_id.clone(),
+                device_class: occ.device_class.clone(),
+                hardware_attestation: occ.hardware_attestation.clone(),
+                asserted_at: now,
+                valid_until: None,
+                encryption_pubkeys: occ.encryption_pubkeys.clone(),
+                persist_row_hash: String::new(),
+            };
+            directory
+                .put_identity_occurrence(SignedIdentityOccurrence {
+                    identity_occurrence: row,
+                })
+                .await?;
+        }
+
+        // (2) Self-DEK cascade to both newcomers (§8.1.12.4). Composes
+        // over the v6.2.0 retroactive re-key; fail-secure exclusions are
+        // surfaced, not silently dropped.
+        let newcomers = vec![
+            input.app.occurrence_key_id.clone(),
+            input.agent.occurrence_key_id.clone(),
+        ];
+        let rekey = self
+            .rekey_self_occurrence_add(&input.identity_key_id, &newcomers)
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("self_at_login self-DEK cascade: {e}"))
+            })?;
+
+        // (3) Partner: bilateral grant (user) + accept (agent), sharing
+        // one bilateral_pair_id. Local-tier, self-cohort.
+        let grant_id = directory
+            .attestation_upsert_local(LocalAttestationInput {
+                attesting_key_id: input.identity_key_id.clone(),
+                attested_key_id: Some(input.agent.occurrence_key_id.clone()),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: partnership_grant_envelope(
+                    &input.agent.occurrence_key_id,
+                    &input.bilateral_pair_id,
+                ),
+                subject_key_ids: Vec::new(),
+                cohort_scope: cohort_scope::SELF.to_owned(),
+            })
+            .await?;
+        let accept_id = directory
+            .attestation_upsert_local(LocalAttestationInput {
+                attesting_key_id: input.agent.occurrence_key_id.clone(),
+                attested_key_id: Some(input.identity_key_id.clone()),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: partnership_accept_envelope(
+                    &input.identity_key_id,
+                    &input.bilateral_pair_id,
+                ),
+                subject_key_ids: Vec::new(),
+                cohort_scope: cohort_scope::SELF.to_owned(),
+            })
+            .await?;
+
+        // (4) Delegate: user → agent occurrence with the §8.1.12.7 scope
+        // set. Written local-tier so (5) can promote it.
+        let scope: Vec<&str> = input
+            .delegation_scope
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect())
+            .unwrap_or_else(|| crate::federation::SELF_AT_LOGIN_DELEGATION_SCOPE.to_vec());
+        let delegation_id = directory
+            .attestation_upsert_local(LocalAttestationInput {
+                attesting_key_id: input.identity_key_id.clone(),
+                attested_key_id: Some(input.agent.occurrence_key_id.clone()),
+                attestation_type: attestation_type::DELEGATES_TO.to_owned(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: delegates_to_agent_envelope(
+                    &input.agent.occurrence_key_id,
+                    &input.bilateral_pair_id,
+                    &scope,
+                ),
+                subject_key_ids: Vec::new(),
+                cohort_scope: cohort_scope::SELF.to_owned(),
+            })
+            .await?;
+
+        // (5) Promote the delegation to the federation tier (§10.1.5 /
+        // #172) so peers verify the agent's authority.
+        let delegation_promoted = self.attestation_promote(&delegation_id).await?;
+
+        // (6) Reachability: a transport_destination per occurrence that
+        // supplied one (§5.6.8.8.1).
+        let mut transport_rows = 0usize;
+        for occ in [&input.app, &input.agent] {
+            for td in &occ.transport_destinations {
+                directory
+                    .put_transport_destination(&TransportDestination {
+                        occurrence_key_id: occ.occurrence_key_id.clone(),
+                        transport_kind: td.0.clone(),
+                        destination: td.1.clone(),
+                        asserted_at: now,
+                        last_seen_at: Some(now),
+                    })
+                    .await?;
+                transport_rows += 1;
+            }
+        }
+
+        Ok(SelfAtLoginOutcome {
+            partnership_grant_id: grant_id,
+            partnership_accept_id: accept_id,
+            delegation_id,
+            delegation_promoted,
+            self_dek_granted: rekey.granted.len(),
+            self_dek_excluded: rekey.excluded,
+            transport_destinations_registered: transport_rows,
+        })
     }
 
     /// v4.14.0 (CIRISPersist#152, CEG 0.18 §10.1.4) — the **default-tier**
@@ -5494,5 +5738,388 @@ mod tests {
             .expect("content-scope");
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].author_id, publisher_a);
+    }
+
+    // ── v6.5.0 (CIRISPersist#183, CEG §8.1.12.7) self-at-login ─────
+
+    /// Build a PQC-capable LocalSigner so `attestation_promote`'s
+    /// `sign_hybrid` (Ed25519 + ML-DSA-65) succeeds. A unique alias per
+    /// call keeps PG-side rows self-isolating.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn self_login_signer() -> (Arc<LocalSigner>, String) {
+        let alias = format!("self-login-steward-{}", uuid::Uuid::new_v4().simple());
+        let signing_key = SigningKey::from_bytes(&[0x3C; 32]);
+        let pqc = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+            &[0x3C ^ 0x55; 32],
+            "self-login-pqc",
+        )
+        .expect("pqc seed");
+        let pqc_arc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(pqc);
+        let signer = Arc::new(LocalSigner::from_parts(
+            signing_key,
+            alias.clone(),
+            Some(pqc_arc),
+            Some("self-login-pqc".to_owned()),
+        ));
+        (signer, alias)
+    }
+
+    /// Seed a `federation_keys` row directly so the FK + admission checks
+    /// the self-at-login flow runs against are satisfied (key minting is
+    /// upstream of the flow).
+    #[cfg(feature = "sqlite")]
+    async fn self_login_seed_key(engine: &Engine, key_id: &str, identity_type: &str) {
+        let sq = engine.sqlite_backend().expect("sqlite");
+        let conn = sq.conn_handle();
+        let key_id = key_id.to_owned();
+        let identity_type = identity_type.to_owned();
+        (move || {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT OR IGNORE INTO federation_keys (\
+                    key_id, pubkey_ed25519_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, \
+                    registration_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_key_id, \
+                    scrub_timestamp, persist_row_hash\
+                 ) VALUES (?1, 'AAAA', 'hybrid', ?2, ?1, \
+                          '2026-01-01T00:00:00Z', '{}', \
+                          x'00', '', ?1, '2026-01-01T00:00:00Z', '0')",
+                rusqlite::params![key_id, identity_type],
+            )
+            .unwrap();
+        })();
+    }
+
+    /// Happy path: co-admit app + agent occurrences, partner + delegate,
+    /// promote the delegation to federation tier, register reachability.
+    /// Proves the §8.1.12.7 flow lands every artifact through the
+    /// composed substrate.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn self_at_login_lands_full_flow() {
+        use crate::federation::types::identity_type;
+
+        let (signer, steward_alias) = self_login_signer();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let identity_key = format!("user-{suffix}");
+        let app_key = format!("app-{suffix}");
+        let agent_key = format!("agent-{suffix}");
+        // The promote path stamps `scrub_key_id = signer alias`, which
+        // must exist in federation_keys (FK).
+        self_login_seed_key(&engine, &steward_alias, identity_type::STEWARD).await;
+        // identity_type as a §7.0.1 set: this human is also a WA.
+        let set = identity_type::join_set([identity_type::USER, identity_type::WISE_AUTHORITY]);
+        assert_eq!(set, "user,wise_authority");
+        self_login_seed_key(&engine, &identity_key, &set).await;
+        self_login_seed_key(&engine, &app_key, identity_type::USER).await;
+        self_login_seed_key(&engine, &agent_key, identity_type::AGENT).await;
+
+        // Real content-KEM pubkeys so both occurrences are valid DEK
+        // wrap targets (not fail-secure-excluded).
+        let mk_keys = || {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            let (_xp, x_pub, _mp, ml_pub) =
+                crate::federation::identity_aggregate::mint_content_kem_keypair()
+                    .expect("mint content-kem");
+            crate::federation::EncryptionPubkeys {
+                x25519_base64: B64.encode(x_pub),
+                ml_kem_768_base64: B64.encode(ml_pub),
+            }
+        };
+
+        let pair_id = uuid::Uuid::new_v4().to_string();
+        let input = SelfAtLoginInput {
+            identity_key_id: identity_key.clone(),
+            app: SelfAtLoginOccurrence {
+                occurrence_key_id: app_key.clone(),
+                device_class: crate::federation::device_class::PHONE.to_owned(),
+                hardware_attestation: None,
+                encryption_pubkeys: Some(mk_keys()),
+                transport_destinations: vec![("reticulum".to_owned(), "dest-hash-app".to_owned())],
+            },
+            agent: SelfAtLoginOccurrence {
+                occurrence_key_id: agent_key.clone(),
+                device_class: crate::federation::device_class::AGENT.to_owned(),
+                hardware_attestation: None,
+                encryption_pubkeys: Some(mk_keys()),
+                transport_destinations: vec![(
+                    "websocket".to_owned(),
+                    "wss://relay/agent".to_owned(),
+                )],
+            },
+            bilateral_pair_id: pair_id.clone(),
+            delegation_scope: None,
+        };
+
+        let outcome = engine.self_at_login(input).await.expect("self_at_login");
+
+        // (1) Both occurrences co-admitted under the one identity key.
+        let dir = engine.federation_directory();
+        let occs = dir
+            .list_identity_occurrences_for(&identity_key)
+            .await
+            .expect("occurrences");
+        assert_eq!(occs.len(), 2, "app + agent co-admitted");
+
+        // (3) Partnership grant + accept written, distinct ids.
+        assert!(!outcome.partnership_grant_id.is_empty());
+        assert!(!outcome.partnership_accept_id.is_empty());
+        assert_ne!(outcome.partnership_grant_id, outcome.partnership_accept_id);
+
+        // (4)+(5) Delegation written + promoted to federation tier.
+        assert!(outcome.delegation_promoted, "delegation promoted");
+        let delegation = dir
+            .get_attestation(&outcome.delegation_id)
+            .await
+            .expect("get delegation")
+            .expect("delegation row exists");
+        assert_eq!(
+            delegation.attestation_type,
+            crate::federation::types::attestation_type::DELEGATES_TO
+        );
+        assert_eq!(
+            delegation.tier,
+            crate::federation::types::attestation_tier::FEDERATION,
+            "delegation is federation-tier after promote"
+        );
+        // The delegation carries the full §8.1.12.7 scope set.
+        let scope = delegation.attestation_envelope["scope"]
+            .as_array()
+            .expect("scope array");
+        assert_eq!(scope.len(), 4);
+
+        // (6) A transport_destination per occurrence.
+        assert_eq!(outcome.transport_destinations_registered, 2);
+        let app_dests = dir
+            .list_transport_destinations_for(&app_key)
+            .await
+            .expect("app dests");
+        assert_eq!(app_dests.len(), 1);
+        assert_eq!(app_dests[0].transport_kind, "reticulum");
+        assert_eq!(app_dests[0].destination, "dest-hash-app");
+
+        // (2) Both occurrences are valid wrap targets → neither
+        // fail-secure-excluded. `self_dek_granted` counts both (0 grants
+        // each since no prior self-blobs existed, but they are in the
+        // cohort). The cascade composes over the v6.2.0 re-key.
+        assert!(
+            outcome.self_dek_excluded.is_empty(),
+            "no fail-secure exclusions"
+        );
+        assert_eq!(
+            outcome.self_dek_granted, 2,
+            "both occurrences in self cohort"
+        );
+    }
+
+    /// transport_destination is idempotent on the composite PK + a
+    /// removed row is gone (drop+re-register reachability model).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn transport_destination_upsert_and_remove() {
+        use crate::federation::types::identity_type;
+        use crate::federation::TransportDestination;
+
+        let (signer, _alias) = self_login_signer();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let occ = format!("occ-{suffix}");
+        self_login_seed_key(&engine, &occ, identity_type::AGENT).await;
+        let dir = engine.federation_directory();
+        let now = chrono::Utc::now();
+
+        let mk = |kind: &str, dest: &str| TransportDestination {
+            occurrence_key_id: occ.clone(),
+            transport_kind: kind.to_owned(),
+            destination: dest.to_owned(),
+            asserted_at: now,
+            last_seen_at: Some(now),
+        };
+
+        dir.put_transport_destination(&mk("reticulum", "d1"))
+            .await
+            .expect("put 1");
+        // Re-assert same PK → idempotent (still one row).
+        dir.put_transport_destination(&mk("reticulum", "d1"))
+            .await
+            .expect("put 1 again");
+        dir.put_transport_destination(&mk("websocket", "wss://r"))
+            .await
+            .expect("put 2");
+        assert_eq!(
+            dir.list_transport_destinations_for(&occ)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Remove one → true; remove again → false (idempotent).
+        assert!(dir
+            .remove_transport_destination(&occ, "reticulum", "d1")
+            .await
+            .unwrap());
+        assert!(!dir
+            .remove_transport_destination(&occ, "reticulum", "d1")
+            .await
+            .unwrap());
+        assert_eq!(
+            dir.list_transport_destinations_for(&occ)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Seed a `federation_keys` row on Postgres so the FK + admission
+    /// checks the self-at-login flow runs against are satisfied.
+    #[cfg(feature = "postgres")]
+    async fn pg_seed_key(engine: &Engine, key_id: &str, identity_type: &str) {
+        let pg = engine.postgres_backend().expect("postgres");
+        let client = pg.pool().get().await.expect("pool get");
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_keys (\
+                    key_id, pubkey_ed25519_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, \
+                    registration_envelope, original_content_hash, \
+                    scrub_signature_classical, scrub_key_id, \
+                    scrub_timestamp, persist_row_hash\
+                 ) VALUES ($1, 'AAAA', 'hybrid', $2, $1, \
+                          '2026-01-01T00:00:00Z', '{}'::jsonb, \
+                          '', '', $1, '2026-01-01T00:00:00Z', '0') \
+                 ON CONFLICT (key_id) DO NOTHING",
+                &[&key_id, &identity_type],
+            )
+            .await
+            .expect("seed federation_key");
+    }
+
+    /// Postgres parity for [`self_at_login_lands_full_flow`]. Skips when
+    /// `CIRIS_PERSIST_TEST_PG_URL` is unset. Self-isolating: every key id
+    /// + bilateral_pair_id is uuid-suffixed so reruns against a reused PG
+    /// never collide or accumulate count-breaking rows.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn self_at_login_lands_full_flow_postgres() {
+        use crate::federation::types::identity_type;
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let (signer, steward_alias) = self_login_signer();
+        let engine = Engine::with_signer(signer, &dsn)
+            .await
+            .expect("postgres engine");
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let identity_key = format!("user-{suffix}");
+        let app_key = format!("app-{suffix}");
+        let agent_key = format!("agent-{suffix}");
+        let set = identity_type::join_set([identity_type::USER, identity_type::WISE_AUTHORITY]);
+        pg_seed_key(&engine, &steward_alias, identity_type::STEWARD).await;
+        pg_seed_key(&engine, &identity_key, &set).await;
+        pg_seed_key(&engine, &app_key, identity_type::USER).await;
+        pg_seed_key(&engine, &agent_key, identity_type::AGENT).await;
+
+        let mk_keys = || {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            let (_xp, x_pub, _mp, ml_pub) =
+                crate::federation::identity_aggregate::mint_content_kem_keypair()
+                    .expect("mint content-kem");
+            crate::federation::EncryptionPubkeys {
+                x25519_base64: B64.encode(x_pub),
+                ml_kem_768_base64: B64.encode(ml_pub),
+            }
+        };
+
+        let pair_id = uuid::Uuid::new_v4().to_string();
+        let outcome = engine
+            .self_at_login(SelfAtLoginInput {
+                identity_key_id: identity_key.clone(),
+                app: SelfAtLoginOccurrence {
+                    occurrence_key_id: app_key.clone(),
+                    device_class: crate::federation::device_class::LAPTOP.to_owned(),
+                    hardware_attestation: None,
+                    encryption_pubkeys: Some(mk_keys()),
+                    transport_destinations: vec![(
+                        "reticulum".to_owned(),
+                        format!("dest-{suffix}"),
+                    )],
+                },
+                agent: SelfAtLoginOccurrence {
+                    occurrence_key_id: agent_key.clone(),
+                    device_class: crate::federation::device_class::AGENT.to_owned(),
+                    hardware_attestation: None,
+                    encryption_pubkeys: Some(mk_keys()),
+                    transport_destinations: vec![],
+                },
+                bilateral_pair_id: pair_id,
+                delegation_scope: None,
+            })
+            .await
+            .expect("self_at_login pg");
+
+        assert!(outcome.delegation_promoted);
+        assert!(outcome.self_dek_excluded.is_empty());
+        assert_eq!(outcome.self_dek_granted, 2);
+        assert_eq!(outcome.transport_destinations_registered, 1);
+
+        let dir = engine.federation_directory();
+        assert_eq!(
+            dir.list_identity_occurrences_for(&identity_key)
+                .await
+                .expect("occurrences")
+                .len(),
+            2
+        );
+        let delegation = dir
+            .get_attestation(&outcome.delegation_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            delegation.tier,
+            crate::federation::types::attestation_tier::FEDERATION
+        );
+        let app_dests = dir
+            .list_transport_destinations_for(&app_key)
+            .await
+            .expect("dests");
+        assert_eq!(app_dests.len(), 1);
+        assert_eq!(app_dests[0].transport_kind, "reticulum");
+    }
+
+    /// identity_type set helpers (§7.0.1): join is sorted/deduped, and
+    /// set_contains sees members in both the single-value and
+    /// comma-joined cases.
+    #[test]
+    fn identity_type_set_helpers() {
+        use crate::federation::types::identity_type;
+        // Sorted + deduped regardless of insertion order.
+        let joined = identity_type::join_set(["wise_authority", "user", "user"]);
+        assert_eq!(joined, "user,wise_authority");
+        assert!(identity_type::set_contains(&joined, identity_type::USER));
+        assert!(identity_type::set_contains(
+            &joined,
+            identity_type::WISE_AUTHORITY
+        ));
+        // Single-value column still parses as a one-element set.
+        assert!(identity_type::set_contains("agent", identity_type::AGENT));
+        assert!(!identity_type::set_contains("agent", identity_type::USER));
+        assert_eq!(
+            identity_type::parse_set("user,wise_authority"),
+            vec!["user", "wise_authority"]
+        );
     }
 }

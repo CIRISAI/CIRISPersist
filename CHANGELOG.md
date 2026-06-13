@@ -5,6 +5,55 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.5.0] — 2026-06-13
+
+### Added — Self-at-login substrate (CIRISPersist#183; CEG §8.1.12.7 / §5.6.8.8.1 / §7.0.1)
+
+CEG §8.1.12.7 pins that an app and an agent are two occurrences of ONE user
+identity, sharing a Policy-L Self DEK, partnered + delegated at login. This
+cut wires the substrate half as a single `Engine`-level flow that composes
+the already-shipped primitives (occurrence tables #153, self re-key v6.2.0,
+`delegates_to` admission v6.4.0, `attestation_promote` #172) plus the small
+net-new pieces below.
+
+- **`Engine::self_at_login(SelfAtLoginInput) -> SelfAtLoginOutcome`** — drives
+  the full §8.1.12.7 flow: (1) co-admits the app (`device_class:phone|laptop`)
+  and agent (`device_class:agent`) occurrences under one `identity_key` via
+  `put_identity_occurrence`; (2) cascades the Self DEK to both via the v6.2.0
+  `rekey_self_occurrence_add` (§8.1.12.4, fail-secure exclusions surfaced in
+  the outcome); (3) writes a bilateral `consent:partnership_grant` +
+  `consent:partnership_accept` sharing one `bilateral_pair_id`; (4) writes a
+  `delegates_to(user → agent occurrence)` with scope set
+  `[act_on_behalf, message_io, network_presence, sub_delegation]`; (5) promotes
+  the delegation to the federation tier via `attestation_promote` (§10.1.5 —
+  peers verify the agent's authority); (6) registers a `transport_destination`
+  per occurrence (§5.6.8.8.1).
+- **`transport_destination` substrate (NET-NEW)** — V078 `transport_destinations`
+  table (both dialects) + `FederationDirectory::{put,list,remove}_transport_destination`
+  on all three backends (postgres + sqlite + memory). One reachable network
+  address per occurrence (`transport_kind` + `destination`), composite-PK
+  idempotent. Reachability is mutable + disposable (drop + re-register, not
+  revoke) so the rows carry no signature / `persist_row_hash`.
+- **`self_at_login` vocabulary module** — `delegates_to_agent_envelope` /
+  `partnership_grant_envelope` / `partnership_accept_envelope` builders +
+  scope tokens (`SELF_AT_LOGIN_DELEGATION_SCOPE`) + the `TransportDestination`
+  type. Consent dimensions carry the `:v1` version segment the §13.1 `scores`
+  admission gate requires.
+- **`identity_type` as a §7.0.1 set** — `identity_type::{USER, WISE_AUTHORITY}`
+  constants + `join_set` / `parse_set` / `set_contains` helpers. Persist stores
+  the conceptual set in its single free-form TEXT column as a sorted,
+  comma-joined value (e.g. `"user,wise_authority"`); the helpers are the
+  canonical encode/decode/contains surface. NOTE: this is the substrate
+  representation — persist did NOT previously model `identity_type` as a
+  structured set (the CEG-side "already a set post-v3.11" framing was not
+  reflected in persist's schema; this cut adds the encoding, not a schema break).
+
+### Migrations
+
+- **V078** (`transport_destinations`, both dialects) — per-occurrence
+  reachability rows; FK to `federation_keys(key_id)`, composite PK
+  `(occurrence_key_id, transport_kind, destination)`.
+
 ## [6.4.0] — 2026-06-13
 
 ### Added — broadened `withdraws` admission gate (CIRISPersist#146 Ask 2; CEG §3.2.3 / §8.1.11.2)

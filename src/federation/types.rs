@@ -124,6 +124,59 @@ pub mod identity_type {
     /// [`super::admission::default_reserved_prefix_rules`] enforces
     /// this.
     pub const TRUSTED_PUBLISHER: &str = "trusted_publisher";
+    /// v6.5.0 (CIRISPersist#183, CEG §7.0.1 / §8.1.12.7) — a human
+    /// user identity. Per §7.0.1 `identity_type` is conceptually a
+    /// **set** ("an identity can be both `{user}` and
+    /// `{wise_authority}`"); persist stores it as the single free-form
+    /// TEXT column above, so a multi-valued classification is encoded
+    /// as a comma-joined set (see [`join_set`] / [`parse_set`] /
+    /// [`set_contains`]). The "self at login" co-admission stamps each
+    /// occurrence's identity key with at least `{user}`.
+    pub const USER: &str = "user";
+    /// v6.5.0 (CIRISPersist#183, CEG §7.0.1) — a Wise Authority identity.
+    /// Carried alongside [`USER`] in the `identity_type` set when the
+    /// human is also a WA (e.g. `"user,wise_authority"`).
+    pub const WISE_AUTHORITY: &str = "wise_authority";
+
+    /// v6.5.0 (CEG §7.0.1) — join an `identity_type` **set** into the
+    /// single TEXT column representation: sorted, de-duplicated,
+    /// comma-joined (no whitespace), so the stored string is canonical
+    /// regardless of caller insertion order. Empty input yields an
+    /// empty string.
+    pub fn join_set<I, S>(types: I) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut v: Vec<String> = types
+            .into_iter()
+            .map(|s| s.as_ref().trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        v.sort();
+        v.dedup();
+        v.join(",")
+    }
+
+    /// v6.5.0 (CEG §7.0.1) — split a stored `identity_type` column back
+    /// into its set members. A plain single value (`"agent"`) parses to
+    /// a one-element set; a comma-joined value
+    /// (`"user,wise_authority"`) to its members. Whitespace-trimmed,
+    /// empties dropped.
+    pub fn parse_set(stored: &str) -> Vec<&str> {
+        stored
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// v6.5.0 (CEG §7.0.1) — does the stored `identity_type` set
+    /// contain `member`? True for both the single-value case
+    /// (`stored == member`) and the comma-joined-set case.
+    pub fn set_contains(stored: &str, member: &str) -> bool {
+        parse_set(stored).contains(&member)
+    }
 }
 
 /// Algorithm strings matching persist's `algorithm` column.
