@@ -5,6 +5,22 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [5.6.0] — 2026-06-12
+
+### Added — SharedInstanceLease: cross-process leader election (CIRISPersist#210; CIRISEdge#100)
+
+Multi-worker FastAPI/uvicorn deployments each call `init_edge_runtime` and race to bind the same Reticulum UDP socket — all but one fail `EADDRINUSE`. The clean fix is RNS shared-instance mode (one process owns the sockets, siblings attach); the missing piece was **leader election**. Persist already owns the family's cross-process atomic state, so it's the right home: liveness is a heartbeat-age query (a flock can't detect a crashed owner), the owner is operator-introspectable (`SELECT * FROM shared_instance_leases`), and every consumer already talks to persist.
+
+- **`federation::shared_instance`** (new module, re-exported): `SharedInstanceLease` (instance_name / owner_pid / owner_hostname / acquired_at / last_heartbeat_at / lease_version), `DEFAULT_STALE_AFTER` (30s), and the `staleness_threshold` helper.
+- **Four new `FederationDirectory` methods** (default-impl on the trait; real impls on the Postgres + SQLite backends): `try_acquire_shared_instance` / `heartbeat_shared_instance` / `lookup_shared_instance_lease` / `release_shared_instance_lease`. Additive — no breaking change; existing backends inherit the "not implemented" default until overridden (the in-memory backend, single-process by definition, does so).
+- **Atomic election** is a single-statement upsert — `INSERT … ON CONFLICT (instance_name) DO UPDATE … WHERE the incumbent heartbeat is stale` — so two siblings racing can never both win (the loser's `DO UPDATE WHERE` sees the just-written fresh heartbeat → 0 rows → `None`). A dead owner (heartbeat older than `stale_after`) is stolen with `lease_version + 1`; the demoted owner learns of the takeover when its next `heartbeat` returns `None` (version/pid no longer match). `release` is ownership-checked + idempotent — it never deletes a sibling's lease.
+- **V074** (both backends): `shared_instance_leases` + a `last_heartbeat_at` index. PG uses `TIMESTAMPTZ`; SQLite uses RFC-3339 TEXT with a fixed Micros+Z format on every write and the staleness threshold, so the comparison is a sound lexical `<`.
+
+Edge consumes the primitive through the existing `federation_directory_capsule` (it calls the trait on the concrete backend), so this ships with no new FFI surface.
+
+### Tests
+Full lifecycle on **both backends** (sqlite in-memory + live PG): acquire-wins, live-contention rejection, lookup, heartbeat-keeps-ownership, stale-steal (version bump), demotion detection on the stolen owner's heartbeat, and ownership-checked release (a stale release never evicts the current owner). Gate: fmt · clippy `-D warnings` (sqlite-only + postgres+server+pyo3) · backend-less `-D warnings` · `--no-default-features` check · cargo-deny · sqlite lib (788) · live-PG lib (729).
+
 ## [5.5.5] — 2026-06-12
 
 ### Changed — CIRISVerify 5.1.0 → 5.1.3 (Win7-capable verify; TPM-1.2→software degradation)
