@@ -5,6 +5,20 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.0.1] — 2026-06-13
+
+### Changed (BREAKING — dependency ABI) — pyo3 0.28 → 0.29 re-land; the 0.29 line resumes (CIRISPersist#201, #216)
+
+The pyo3 0.29 lockstep, deferred since the 6.0.0 cut was reverted (edge was blocked on its own 0.29 migration), now lands as **6.0.1** — edge cleared its block (cold-migration probe ship-ready, CIRISEdge#99/v2.5.0). This re-applies the 0.29 migration **on top of the current 5.x line**, so 6.0.1 = everything through **5.9.0** (shared-instance leases, hard_case emission + consent observability, consent-SLA watcher, retention, **verify 5.2.0**) **plus** pyo3 0.29 — a single coherent cut, not a forward-port of substrate onto the stale 6.0.0 branch.
+
+- **pyo3 0.28 → 0.29**: the 7 `PyCapsule::new` → `new_with_value` exporters + the `new_with_destructor` → `new_with_value_and_destructor` executor capsule (the name arg is `&'static CStr` in 0.29 → `c"…"` literals). MSRV 1.75 → **1.83** (pyo3 0.29's floor; `clippy.toml` moves in lockstep), which surfaced the `clippy::unnecessary_map_or` → `is_none_or` autofixes.
+- **RUSTSEC-2026-0176 + 0177 genuinely cleared** — both are pyo3 `< 0.29`; the v5.5.2 `deny.toml` ignores are **removed**, not merely unneeded. cargo-deny passes with no pyo3 ignores.
+
+**6.0.0 is the tombstone** (cut + published + yanked the same day during the first attempt; PyPI burns the filename). **6.0.1 is the live 0.29 cut.** Cohabitation firewall holds: edge ≤2.x pins `ciris-persist<6`, so a 6.x wheel is excluded from any 0.28-edge env; edge 2.5.0 opts in with `>=6.0.1,<7` + its own pyo3 0.29; lens-core follows. The **5.x line stays published (5.9.0)** for any 0.28 consumer still mid-transition.
+
+### Tests
+Full gate under pyo3 0.29: build (pyo3,server) · fmt · clippy `-D warnings` ×2 · backend-less `-D warnings` · `--no-default-features` · cargo-deny (advisories ok, **no pyo3 ignores**) · sqlite lib (792) · live-PG lib (732). The win7 build-std wheel lane already targets 0.29; the capsule runtime smoke covered the exporters on the original 6.0.0 cut.
+
 ## [5.9.0] — 2026-06-13
 
 ### Added — pressure-gated retention primitive (CIRISPersist#209; CIRISLens#21)
