@@ -5,6 +5,23 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.1.0] — 2026-06-13
+
+### Added — retention PyO3 FFI surface; the lens-facing `Engine` methods (CIRISPersist#218; CIRISLens#21, CIRISLensCore#51)
+
+5.9.0 shipped the retention primitive on the Rust `MaintenanceService` trait and called out "the engine/PyO3 surface (`Engine.set_retention`) lens calls — a thin follow-up" as deferred. This is that follow-up: the four methods now cross the FFI, so the lens can drive substrate-owned retention instead of reaching into persist tables with its stopgap sweeper.
+
+- **`Engine.set_retention` / `get_retention` / `list_retention` / `run_retention`** (both backends, via `BackendDispatch`). Structured shapes cross as **JSON strings** — `RetentionPolicy` / `RetentionPolicyRow` / `RetentionReport` are plain serde structs in `maintenance::types`, matching the established `VacuumReport` / `ArchiveReport` / `MaintenanceReport` convention (no new `#[pyclass]`). `run_retention(now=None)` is run-all (the per-table no-op-vs-sweep decision is internal to the pass, mirroring the trait); `now` accepts an RFC-3339 instant for deterministic tests.
+- **u64 byte values round-trip exactly across the boundary**: `pressure_*_bytes` / `db_size_bytes` ride as JSON numbers (serde emits the full u64, Python decodes an unbounded int), so the `u64::MAX as i64 == -1` SQL-layer narrowing never reaches Python. Verified at 10 TiB.
+- The `validate_sql_identifier` injection gate is **not bypassed** at the boundary — `table_name` / `time_column` route through the Rust gate before any write, exercised from Python with two injection attempts.
+
+### Fixed — injection-gate rejection is now a PERMANENT error, not retryable (carried in from #209)
+
+`validate_sql_identifier` returned `Error::Backend`, which `translate_error_kind` maps to the **retryable** `Transient` Python class — wrong for a malformed/injection-shaped identifier, which can never succeed on retry. Surfacing it through the new FFI made the mis-classification observable, so it's corrected here: `Error::InvalidArgument` → `Permanent`. (Caught by the Lane E drafting pass; fixed at the source in `maintenance::types`, not papered over at the boundary.)
+
+### Tests
+Both backends: the v5.9.0 retention CRUD/sweep/injection-guard Rust suite, with the injection guard strengthened to assert the **`maintenance_invalid_argument`** kind (permanent, not retryable). Python (`test_sqlite_engine.py`): set→get→list→run round-trip, 10 TiB u64 round-trip, and both injection paths (`table_name`, `time_column`) now asserting `ciris_persist.Permanent`. Gate: clippy `-D warnings` (full feature set) · sqlite lib · Python 8/8 · live-PG lib pending the cut.
+
 ## [6.0.1] — 2026-06-13
 
 ### Changed (BREAKING — dependency ABI) — pyo3 0.28 → 0.29 re-land; the 0.29 line resumes (CIRISPersist#201, #216)

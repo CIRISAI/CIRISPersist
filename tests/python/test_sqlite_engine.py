@@ -202,3 +202,90 @@ def test_reset_engine_unpins_singleton() -> None:
 
     # Leave a clean slate for any following test in this process.
     ciris_persist.reset_engine()
+
+
+def test_retention_ffi_round_trip_large_bytes() -> None:
+    """v6.0.1 (CIRISPersist#218) — Lane E retention FFI: set/get/list/run
+    cross the boundary as JSON, and a realistically large (10 TiB) u64
+    byte value round-trips exactly through the Python int (the
+    `u64 stored as i64` SQL gotcha must not corrupt the boundary value).
+    Skips on a non-sqlite wheel (see test_register_consumer_validation)."""
+    import json
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    try:
+        eng = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="retention-key")
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        # 10 TiB — a realistic disk-pressure cap, far above i32 and well
+        # within u64. Deliberately NOT u64::MAX (that narrows to -1 as i64).
+        ten_tib = 10 * (1024**4)  # 10_995_116_277_760
+        target = 8 * (1024**4)
+
+        # set: identifiers validated in the Rust layer; large u64 caps.
+        eng.set_retention(
+            "telemetry_raw",
+            min_keep_secs=3600,
+            time_column="ts",
+            pressure_trigger_bytes=ten_tib,
+            pressure_target_bytes=target,
+            interval_secs=86_400,
+        )
+
+        # get: large byte value round-trips exactly (no i64 corruption).
+        got = json.loads(eng.get_retention("telemetry_raw"))
+        assert got["min_keep_secs"] == 3600
+        assert got["time_column"] == "ts"
+        assert got["pressure_trigger_bytes"] == ten_tib
+        assert got["pressure_target_bytes"] == target
+        assert got["interval_secs"] == 86_400
+
+        # get on an unknown table is None.
+        assert eng.get_retention("no_such_table") is None
+
+        # list: contains exactly the one policy, with the value intact.
+        rows = json.loads(eng.list_retention())
+        assert len(rows) == 1
+        assert rows[0]["table_name"] == "telemetry_raw"
+        assert rows[0]["policy"]["pressure_trigger_bytes"] == ten_tib
+
+        # run: pressure-gated; with an empty in-memory db far below the
+        # 10 TiB trigger, the sweep is a no-op but still reports per table.
+        reports = json.loads(eng.run_retention())
+        assert isinstance(reports, list)
+        by_table = {r["table_name"]: r for r in reports}
+        assert "telemetry_raw" in by_table
+        rep = by_table["telemetry_raw"]
+        assert rep["swept"] is False  # db_size well under the 10 TiB trigger
+        assert rep["rows_deleted"] == 0
+        # db_size_bytes is a u64 that also rides the JSON boundary.
+        assert isinstance(rep["db_size_bytes"], int)
+        assert rep["db_size_bytes"] >= 0
+
+        # the injection gate is not bypassed at the FFI boundary, and a
+        # failed `validate_sql_identifier` raises a PERMANENT error: an
+        # injection-shaped identifier can never succeed on retry. (#218
+        # corrected the v5.9.0 (#209) `Error::Backend` → `InvalidArgument`,
+        # which `translate_error_kind` maps to `Permanent` rather than the
+        # retryable `Transient`.) Both the table_name and time_column paths
+        # route through the gate.
+        with pytest.raises(ciris_persist.Permanent):
+            eng.set_retention(
+                "bad; DROP TABLE x",
+                min_keep_secs=1,
+                time_column="ts",
+            )
+        with pytest.raises(ciris_persist.Permanent):
+            eng.set_retention(
+                "telemetry_raw",
+                min_keep_secs=1,
+                time_column="ts; --",
+            )
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()

@@ -173,7 +173,13 @@ pub fn validate_sql_identifier(ident: &str) -> Result<(), super::Error> {
     if (1..=2).contains(&parts.len()) && parts.iter().all(|p| part_ok(p)) {
         Ok(())
     } else {
-        Err(super::Error::Backend(format!(
+        // InvalidArgument, NOT Backend: a malformed/injection-shaped
+        // identifier is a permanent caller error (MUST NOT retry). It
+        // reaches un-bindable DELETE SQL, so the only safe response is to
+        // refuse — retrying the same identifier can never succeed. (Was
+        // `Backend` in #209, which mapped to the retryable `Transient`
+        // Python family; corrected when the FFI surface (#218) exposed it.)
+        Err(super::Error::InvalidArgument(format!(
             "invalid SQL identifier {ident:?} (expected snake_case `table` or `schema.table`)"
         )))
     }

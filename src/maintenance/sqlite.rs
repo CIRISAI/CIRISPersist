@@ -473,8 +473,10 @@ mod tests {
         };
         assert_eq!(still, 2, "no deletions while below the trigger");
 
-        // Injection guard: a non-identifier table name is rejected.
-        assert!(svc
+        // Injection guard: a non-identifier table name is rejected, and as
+        // a PERMANENT error (InvalidArgument, not the retryable Backend) —
+        // retrying the same identifier can never succeed.
+        let err = svc
             .set_retention(
                 "ret_test; DROP TABLE ret_test".into(),
                 RetentionPolicy {
@@ -486,7 +488,12 @@ mod tests {
                 },
             )
             .await
-            .is_err());
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "maintenance_invalid_argument",
+            "injection-shaped identifier must be a permanent (non-retryable) error"
+        );
     }
 
     /// v1.2.0 (CIRISPersist#48) Test 2 — archive_expired removes

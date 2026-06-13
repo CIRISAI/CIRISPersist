@@ -17777,6 +17777,232 @@ impl PyEngine {
         })
     }
 
+    // ── v6.0.1 (CIRISPersist#218) retention FFI surface ──────────
+    //
+    // Lane E exposes the v5.9.0 (#209) retention primitive
+    // (`MaintenanceService::{set,get,list,run}_retention`) to Python.
+    // Gate for CIRISLens#21 / CIRISLensCore#51. Consistent with the
+    // rest of the maintenance cluster: structured shapes cross the FFI
+    // as JSON strings (RetentionPolicy/RetentionPolicyRow/RetentionReport
+    // are plain serde structs in `maintenance::types`), so the lens-side
+    // shim decodes them field-for-field via `model_validate_json`. No new
+    // `#[pyclass]` shapes — that would diverge from the established
+    // VacuumReport/ArchiveReport/MaintenanceReport convention.
+    //
+    // u64 boundary note: `pressure_*_bytes` / `db_size_bytes` are `u64`
+    // in Rust and stored as i64 in SQL (the `u64::MAX as i64 == -1`
+    // gotcha lives in the backend impls). Across the FFI they ride as
+    // JSON numbers — serde_json emits the full u64 and Python's json
+    // decoder yields an unbounded int — so realistic large values
+    // (e.g. 10 TiB) round-trip exactly. The i64 narrowing is internal
+    // to the backend and out of scope for the boundary.
+
+    /// v6.0.1 (CIRISPersist#218) — Set (upsert) the retention policy for
+    /// `table_name`. `table_name` and `time_column` are validated as
+    /// strict SQL identifiers in the Rust layer (they reach DELETE SQL
+    /// un-bindable); an invalid one raises before any write. Both
+    /// `pressure_trigger_bytes` and `pressure_target_bytes` `None` = flat
+    /// drop-after-`min_keep`; both `Some` = pressure-gated. Returns None.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        table_name,
+        min_keep_secs,
+        time_column,
+        pressure_trigger_bytes=None,
+        pressure_target_bytes=None,
+        interval_secs=86_400,
+    ))]
+    fn set_retention(
+        &self,
+        py: Python<'_>,
+        table_name: &str,
+        min_keep_secs: u64,
+        time_column: &str,
+        pressure_trigger_bytes: Option<u64>,
+        pressure_target_bytes: Option<u64>,
+        interval_secs: u64,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let table_name = table_name.to_owned();
+            let policy = crate::maintenance::RetentionPolicy {
+                min_keep_secs,
+                time_column: time_column.to_owned(),
+                pressure_trigger_bytes,
+                pressure_target_bytes,
+                interval_secs,
+            };
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let svc =
+                        crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        svc.set_retention(table_name, policy)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let svc =
+                        crate::maintenance::sqlite::SqliteMaintenanceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        svc.set_retention(table_name, policy)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v6.0.1 (CIRISPersist#218) — Stored retention policy for
+    /// `table_name` as a JSON-encoded `RetentionPolicy`, or `None` when
+    /// no policy exists.
+    fn get_retention(&self, py: Python<'_>, table_name: &str) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let table_name = table_name.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let svc =
+                        crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let policy = svc
+                            .get_retention(&table_name)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        policy
+                            .map(|p| {
+                                serde_json::to_string(&p).map_err(|e| {
+                                    PyRuntimeError::new_err(format!("RetentionPolicy encode: {e}"))
+                                })
+                            })
+                            .transpose()
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let svc =
+                        crate::maintenance::sqlite::SqliteMaintenanceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let policy = svc
+                            .get_retention(&table_name)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        policy
+                            .map(|p| {
+                                serde_json::to_string(&p).map_err(|e| {
+                                    PyRuntimeError::new_err(format!("RetentionPolicy encode: {e}"))
+                                })
+                            })
+                            .transpose()
+                    })
+                }
+            })
+        })
+    }
+
+    /// v6.0.1 (CIRISPersist#218) — All stored retention policies as a
+    /// JSON-encoded array of `RetentionPolicyRow` (`{table_name, policy}`).
+    fn list_retention(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let svc =
+                        crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let rows = svc
+                            .list_retention()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("RetentionPolicyRow[] encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let svc =
+                        crate::maintenance::sqlite::SqliteMaintenanceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let rows = svc
+                            .list_retention()
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&rows).map_err(|e| {
+                            PyRuntimeError::new_err(format!("RetentionPolicyRow[] encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
+    /// v6.0.1 (CIRISPersist#218) — Run one pressure-gated retention pass
+    /// over **every** stored policy and return a JSON-encoded array of
+    /// `RetentionReport`. The trait's `run_retention(now)` is run-all by
+    /// design (the per-table no-op-vs-sweep decision is internal to the
+    /// pass), so the FFI mirrors that — there is no run-one variant.
+    /// `now` defaults to the substrate clock (`Utc::now()`); callers
+    /// MAY pass an RFC 3339 instant to drive deterministic tests.
+    #[pyo3(signature = (now=None))]
+    fn run_retention(&self, py: Python<'_>, now: Option<&str>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let now_dt = match now {
+                None => chrono::Utc::now(),
+                Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| {
+                        PyValueError::new_err(format!("run_retention: `now` must be RFC 3339: {e}"))
+                    })?
+                    .with_timezone(&chrono::Utc),
+            };
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let svc =
+                        crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let reports = svc
+                            .run_retention(now_dt)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&reports).map_err(|e| {
+                            PyRuntimeError::new_err(format!("RetentionReport[] encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let svc =
+                        crate::maintenance::sqlite::SqliteMaintenanceBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::maintenance::MaintenanceService;
+                        let reports = svc
+                            .run_retention(now_dt)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                        serde_json::to_string(&reports).map_err(|e| {
+                            PyRuntimeError::new_err(format!("RetentionReport[] encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
     // ── v2.7.0 (CIRISPersist#109) — PyCapsule cross-module accessors ──
     //
     // PyO3 `#[pyclass]` registration is per-extension-module. When
