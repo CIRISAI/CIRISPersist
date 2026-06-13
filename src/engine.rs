@@ -5428,7 +5428,16 @@ mod tests {
         let k2 = SigningKey::from_bytes(&[0x22; 32]);
         let claimant_a = media_pubkey_b64(&k1);
         let claimant_b = media_pubkey_b64(&k2);
-        let target = media_sha_hex(0x40);
+        // Unique-per-run target (64-hex, sha256-shaped) so the test is
+        // self-isolating against a reused PG — mirrors the key_grants twin's
+        // per-run `recipient`. A fixed target accumulates rows across runs on
+        // a persistent DB (CI's PG is ephemeral, but local verification reuses
+        // one) and breaks the exact-count assertion.
+        let target = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
         let t0 = "2026-01-01T00:00:00Z".parse().unwrap();
         let t1 = "2026-02-01T00:00:00Z".parse().unwrap();
         media_seed(&engine, media_build_takedown(&k1, &target, &claimant_a, t0)).await;

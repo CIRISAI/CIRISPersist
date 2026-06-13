@@ -5,6 +5,23 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.3.0] — 2026-06-13
+
+### Added — federation read accessors for the lens-core multimedia detectors (CIRISPersist#135; unblocks CIRISLensCore#29)
+
+CIRISLensCore#29's multimedia-tier detector families (content-class misclassification §29.1, key_grant abuse §29.3, takedown abuse §29.4) join on federation rows that had no Rust-public `Engine` read facade. This adds them, composing over the already-landed Phase-4 storage (no new SQL):
+
+- **`Engine::list_attestations(filter, cursor, limit, scope)`** — the Rust-public facade over `ReadEngine::list_attestations` (§29.1: attestations per content row × class).
+- **`Engine::list_takedowns_for(target_content_sha256, filter, cursor, limit)`** — `TakedownFilter { claimant_key_id, since, until }` (§29.4: takedowns per moderation target, optional claimant secondary key).
+- **`Engine::list_key_grants_for(recipient_key_id, filter, cursor, limit)`** — `KeyGrantFilter { publisher_key_id, content_sha256, since, until }` (§29.3: key_grants per recipient, optional publisher / content secondary keys).
+
+**Returns the row types Phase 4 actually landed** — `Attestation` / `ContributionEnvelope` and each storage trait's natural error — **not** the issue's pre-Phase-4 illustrative `Signed*` / `DerivedError` shapes, which have no types or storage behind them. (Takedowns/key_grants are `cirisnode.contributions` rows, subject_kind `takedown_notice` / `key_grant`, V054/V064 projected columns.) The takedown target is the content SHA-256 (`media_content_sha256`, the moderation target), not a federation key_id.
+
+Cursor/ordering mirrors `list_contributions`: `(submitted_at, contribution_id)` DESC with the id as unique tiebreaker, `limit` bounded `[1, 10000]`, `next_cursor` set iff the page fills. Secondary-key filters (`claimant_key_id` from `payload`, `publisher_key_id` from `author_id`) and the half-open `[since, until)` window are applied in-facade over the already index-bounded per-key row set — structural parity, no backend-divergent JSON-path predicate. PyO3 filtered wrappers added for takedowns/key_grants (sibling consistency with `cirisnode_list_contributions`); attestations already had their PyO3 surface.
+
+### Tests
+Both backends. SQLite (1390 lib tests) + live-PG: takedown target-isolation + claimant filter + window; cursor paging over shared-timestamp rows with no gaps/dupes; key_grant recipient-isolation + publisher + content-scope; bad-limit rejection; facade→backend dispatch. Fixed the `media_seed` test helper, which `unreachable!()`d on the Postgres dispatch arm (the PG-gated tests panicked in their own seed path before this — caught on live PG, not just compile). Gate: fmt · clippy `-D warnings` (full feature set, all targets) · sqlite lib · live-PG lib.
+
 ## [6.2.0] — 2026-06-13
 
 ### Added — the membership-change re-key keystone + roster-grow primitive (CIRISPersist#161 Ask 4/5, #152-r1; CEG §11.7.1 / §10.1.4)
