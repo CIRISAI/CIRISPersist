@@ -61,7 +61,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # v1.10.0 (CIRISPersist#87) — ciris-keyring's `tpm` feature
       # (auto-enabled for Linux targets, see Cargo.toml) builds
       # `tss-esapi`, which links libtss2 at build time.
@@ -131,7 +131,7 @@ jobs:
       # would defeat the matrix parallelization. The substrate
       # feature axis doesn't change what this test exercises (the
       # FFI panic-catch layer), so a single execution suffices.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         if: matrix.substrate.name == 'core'
         with:
           python-version: "3.11"
@@ -180,7 +180,7 @@ jobs:
     name: darwin-aarch64 (no postgres)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       # v0.7.2 — `cache-bin: false` on macos-14: the runner image
       # ships a rustup stub at `/Users/runner/.cargo/bin/cargo` that
@@ -245,7 +245,7 @@ jobs:
         cirislens_service_token_revocation cirislens_sequence
         cirislens_occurrence cirislens_legacy_migration
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -254,7 +254,7 @@ jobs:
           key: ios-${{ matrix.dir }}
           cache-bin: false
         continue-on-error: true
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
       - name: extract version from Cargo.toml
@@ -323,7 +323,7 @@ jobs:
           echo "✓ ${{ matrix.dir }}: $(ls -la "$DST" | awk '{print $5}') bytes"
           otool -D "$DST"
           file "$DST"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ciris-persist-ios-${{ matrix.dir }}
           path: dist/${{ matrix.dir }}/ciris_persist.abi3.so
@@ -338,14 +338,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: [ios-build]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: extract version from Cargo.toml
         id: version
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - name: download both iOS target artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: ciris-persist-ios-*
           path: artifacts/
@@ -360,7 +360,7 @@ jobs:
           tar -czf "dist/ciris-persist-v${VERSION}-ios.tar.gz" -C dist ios-device ios-simulator
           echo "✓ packaged ciris-persist-v${VERSION}-ios.tar.gz"
           ls -la dist/ciris-persist-v${VERSION}-ios.tar.gz
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ciris-persist-ios
           path: dist/ciris-persist-v*-ios.tar.gz
@@ -390,7 +390,7 @@ jobs:
         cirislens_service_token_revocation cirislens_sequence
         cirislens_occurrence cirislens_legacy_migration
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -526,7 +526,7 @@ jobs:
           echo "=== ${{ matrix.abi }} ==="
           ls -la dist/${{ matrix.abi }}/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ciris-persist-android-${{ matrix.abi }}
           path: dist/${{ matrix.abi }}/
@@ -537,14 +537,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: [android-ndk]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: extract version from Cargo.toml
         id: version
         run: |
           VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - name: download all ABI artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: ciris-persist-android-*
           path: artifacts/
@@ -628,11 +628,11 @@ jobs:
             "ciris_persist-${VERSION}-cp310-abi3-android_24_armeabi_v7a.whl"
 
           echo "✓ ciris-persist-v${VERSION}-android-wheels.tar.gz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ciris-persist-android
           path: dist/ciris-persist-v*-android.tar.gz
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ciris-persist-android-wheels
           path: dist/ciris-persist-v*-android-wheels.tar.gz
@@ -642,7 +642,7 @@ jobs:
     name: clippy + fmt + audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # v1.10.0 (CIRISPersist#87) — libtss2 for the `tpm` keyring
       # feature (clippy compiles the full graph).
       - name: install libtss2-dev (TPM build dep)
@@ -670,7 +670,7 @@ jobs:
     name: cargo deny (license + advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v2
 
@@ -729,7 +729,7 @@ jobs:
     env:
       NIGHTLY_PIN: nightly-2026-06-12
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # v1.10.0 (CIRISPersist#87) — libtss2 for the `tpm` keyring
       # feature on the Linux wheel builds. macOS wheels build the
       # base keyring (no tss-esapi), so this step is Linux-only.
@@ -788,23 +788,36 @@ jobs:
         with:
           toolchain: ${{ env.NIGHTLY_PIN }}
           components: rust-src
-      # ci-perf — cache the wheel builds. This matrix was the ONLY build
-      # job without rust-cache, and it holds the two longest jobs: the
-      # Windows job recompiles std-from-source (build-std) + the full
-      # graph every run (~24m cold), and the linux/darwin wheels recompile
-      # the verify+pyo3+postgres graph. Warm cache skips all of it. Keyed
-      # per (os,label) so matrix entries don't share/thrash a cache
-      # (target/ differs per triple — esp. the win7 build-std artifacts).
-      # cache-bin: false mirrors the macOS/iOS sites (rustup-init shadow).
-      # Zero quality impact: cargo fingerprints on Cargo.lock+rustc and
-      # always recompiles persist's own (changed) crate; the published
-      # wheel is identical to a clean build.
+      # Non-Windows: rust-cache handles the registry + target dep
+      # artifacts (linux/darwin wheels recompile the verify+pyo3+postgres
+      # graph cold otherwise). Keyed per label so entries don't thrash.
       - uses: Swatinem/rust-cache@v2
+        if: runner.os != 'Windows'
         with:
           key: wheel-${{ matrix.label }}
           cache-bin: false
         continue-on-error: true
-      - uses: actions/setup-python@v5
+      # Windows: an EXPLICIT cache, not rust-cache. rust-cache prunes
+      # target/ down to registry-dep artifacts, which drops the
+      # from-source std/core/alloc that `-Zbuild-std` compiles into the
+      # win7 target dir — the bulk of the ~20m. So cache ~/.cargo + the
+      # whole win7 target tree (std + deps + our crate; cargo refingerprints
+      # the changed crate, so the wheel stays identical to a clean build).
+      # Keyed on the PINNED nightly + Cargo.toml (Cargo.lock is gitignored).
+      # GH Actions cache is branch-scoped: the speedup lands once a run on
+      # `main` populates the key; PR/tag runs then restore via restore-keys.
+      - uses: actions/cache@v5
+        if: runner.os == 'Windows'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/x86_64-win7-windows-msvc
+          key: win7-buildstd-${{ env.NIGHTLY_PIN }}-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            win7-buildstd-${{ env.NIGHTLY_PIN }}-
+        continue-on-error: true
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - name: install maturin
@@ -1046,7 +1059,7 @@ jobs:
             ls target/wheels/*.whl 2>/dev/null || echo "  (no wheels)"
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ciris_persist-wheel-${{ matrix.label }}
           path: target/wheels/*.whl
@@ -1118,7 +1131,7 @@ jobs:
       contents: read
     steps:
       - name: download all multi-arch wheels (with retry)
-        # v1.6.0 — replaces `actions/download-artifact@v4` to absorb
+        # v1.6.0 — replaces `actions/download-artifact@v8` to absorb
         # transient `403 Forbidden: Error from intermediary` failures
         # from the v4 action's ListArtifacts call (v1.5.24's tag CI
         # hit this exact mode — see commit 0df1665's CI run 26105591714).
@@ -1218,7 +1231,7 @@ jobs:
       # actions:read on the GITHUB_TOKEN.
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # v1.10.0 (CIRISPersist#87) — libtss2 for the `tpm` keyring
       # feature; the emit_persist_extras step compiles the crate.
       - name: install libtss2-dev (TPM build dep)
@@ -1293,7 +1306,7 @@ jobs:
         # side `verify_tree(project="ciris-persist", target=...)`
         # can match. Single artifact dir per target.
         #
-        # v1.6.0 — replaces `actions/download-artifact@v4` to absorb
+        # v1.6.0 — replaces `actions/download-artifact@v8` to absorb
         # transient ListArtifacts 403s (see publish-pypi for the
         # underlying GitHub Actions infrastructure flake the v1.5.24
         # tag run surfaced). No flatten step here — the sign script
@@ -1621,7 +1634,7 @@ jobs:
             echo "- targets verified:"
             for T in "${TARGETS[@]}"; do echo "  - \`${T}\`"; done
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ciris-persist-build-manifest-${{ steps.version.outputs.version }}
           path: |
@@ -1658,7 +1671,7 @@ jobs:
       contents: write
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: extract version from Cargo.toml
         id: version
         run: |
