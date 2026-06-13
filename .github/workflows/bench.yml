@@ -56,7 +56,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -67,7 +67,7 @@ jobs:
           toolchain: stable
 
       - name: Cache cargo + criterion baseline
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -294,7 +294,7 @@ jobs:
         # workflow. The raw target/criterion/ tree is the
         # ground-truth for any post-hoc analysis past what
         # gh-pages exposes.
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: criterion-${{ github.run_id }}
