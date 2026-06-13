@@ -478,6 +478,31 @@ pub trait FederationDirectory: Send + Sync {
     /// gate.
     async fn put_family(&self, family: SignedFamily) -> Result<(), Error>;
 
+    /// v6.2.0 (CIRISPersist#161 A4/A5, CEG §11.7.1) — admit one identity
+    /// into an existing family roster, additively. This is the **roster-
+    /// grow** primitive that makes family-member *addition* first-class
+    /// and symmetric with the removal path
+    /// ([`put_family_membership_revocation`](Self::put_family_membership_revocation)):
+    /// addition mutates the roster in place, removal stays append-only
+    /// revocation the `*_active` reads compose against.
+    ///
+    /// Idempotent on `member.key_id`: a member already on the roster is a
+    /// no-op and returns `Ok(false)`; a genuine add returns `Ok(true)`.
+    /// The family must exist ([`Error::InvalidArgument`] otherwise).
+    /// Recomputes `persist_row_hash` over the grown roster.
+    ///
+    /// This is the forward-path half of a membership-change re-key: the
+    /// at-rest cascade re-key
+    /// ([`rekey_family_member_add`](crate::federation::at_rest_cascade::orchestrate::rekey_family_member_add))
+    /// grants the newcomer *past* family blobs; `add_family_member` puts
+    /// them on the roster so `resolve_recipients` includes them in
+    /// *future* writes too. The re-key driver calls this first.
+    async fn add_family_member(
+        &self,
+        family_key_id: &str,
+        member: types::FamilyMember,
+    ) -> Result<bool, Error>;
+
     /// v3.12.0 — fetch a single family by `family_key_id`. Returns
     /// `None` if absent.
     async fn lookup_family(&self, family_key_id: &str) -> Result<Option<Family>, Error>;

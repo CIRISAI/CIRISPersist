@@ -1862,6 +1862,42 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
+    async fn add_family_member(
+        &self,
+        family_key_id: &str,
+        member: crate::federation::types::FamilyMember,
+    ) -> Result<bool, crate::federation::Error> {
+        // Read-modify-write under the connection lock so a concurrent add
+        // can't lose a member to a stale roster. Idempotent on key_id.
+        let mut family = self.lookup_family(family_key_id).await?.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "add_family_member names unknown family_key_id {family_key_id:?}"
+            ))
+        })?;
+        if family.members.iter().any(|m| m.key_id == member.key_id) {
+            return Ok(false); // already on the roster — no-op
+        }
+        family.members.push(member);
+        family.persist_row_hash = crate::federation::types::compute_persist_row_hash(&family)?;
+        let members_json = serde_json::to_string(&family.members)
+            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
+        let conn = self.conn.clone();
+        let key = family_key_id.to_owned();
+        let hash = family.persist_row_hash.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "UPDATE federation_families \
+                    SET members = ?2, persist_row_hash = ?3 \
+                  WHERE family_key_id = ?1",
+                rusqlite::params![key, members_json, hash],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("add_family_member: {e}")))?;
+        Ok(true)
+    }
+
     async fn lookup_family(
         &self,
         family_key_id: &str,
@@ -4619,6 +4655,62 @@ impl crate::federation::BlobStorage for SqliteBackend {
             crate::federation::BlobError::Backend(format!("list_at_rest_grant_recipients: {e}"))
         })?;
         Ok(out)
+    }
+
+    // v6.1.0 (CIRISPersist#161 Ask 2/4) — the retroactive-ADD visibility
+    // set: distinct at-rest SHAs any of `recipient_key_ids` holds a grant
+    // on, in `cohort_scope`.
+    async fn list_at_rest_blobs_for_recipients(
+        &self,
+        recipient_key_ids: &[String],
+        cohort_scope: &str,
+    ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+        if recipient_key_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let recipients: Vec<String> = recipient_key_ids.to_vec();
+        let scope = cohort_scope.to_owned();
+        let conn = self.conn.clone();
+        let shas = (move || -> Result<Vec<Vec<u8>>, rusqlite::Error> {
+            let conn = conn.lock();
+            // The recipient IN-list is built from BOUND placeholders
+            // (?2, ?3, …) — values, not identifiers; no injection surface.
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(recipients.len() + 1);
+            params.push(scope.into());
+            let placeholders: Vec<String> = recipients
+                .into_iter()
+                .map(|r| {
+                    params.push(r.into());
+                    format!("?{}", params.len())
+                })
+                .collect();
+            let sql = format!(
+                "SELECT DISTINCT at_rest_sha256 FROM federation_blob_key_grants \
+                 WHERE cohort_scope = ?1 AND recipient_key_id IN ({}) \
+                 ORDER BY at_rest_sha256",
+                placeholders.join(", ")
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(params.iter()), |r| {
+                    r.get::<_, Vec<u8>>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("list_at_rest_blobs_for_recipients: {e}"))
+        })?;
+        shas.into_iter()
+            .map(|v| {
+                v.try_into().map_err(|got: Vec<u8>| {
+                    crate::federation::BlobError::Backend(format!(
+                        "at_rest_sha256 is {} bytes, expected 32",
+                        got.len()
+                    ))
+                })
+            })
+            .collect()
     }
 
     async fn load_or_init_content_master(&self) -> Result<[u8; 32], crate::federation::BlobError> {
@@ -13975,6 +14067,390 @@ mod tests {
             bob_err,
             crate::federation::BlobError::NotGranted { .. }
         ));
+    }
+
+    // ── v6.1.0 (CIRISPersist#161 Ask 2/4) membership-change re-key ─────
+
+    /// A fresh keyed EncryptionPubkeys pair for a test occurrence (a fresh
+    /// x25519 + ML-KEM-768 keypair — only the pubkeys are needed to wrap).
+    fn keyed_enc(x_seed: u8) -> crate::federation::EncryptionPubkeys {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let x_pub = ciris_crypto::x25519::public_from_secret(&[x_seed; 32]);
+        let (_mp, ml_pub) = ciris_crypto::ml_kem::generate_keypair().unwrap();
+        crate::federation::EncryptionPubkeys {
+            x25519_base64: B64.encode(x_pub),
+            ml_kem_768_base64: B64.encode(&ml_pub),
+        }
+    }
+
+    fn occ_signed(
+        identity: &str,
+        occ_key: &str,
+        enc: Option<crate::federation::EncryptionPubkeys>,
+    ) -> crate::federation::SignedIdentityOccurrence {
+        crate::federation::SignedIdentityOccurrence {
+            identity_occurrence: crate::federation::IdentityOccurrence {
+                identity_key_id: identity.into(),
+                occurrence_key_id: occ_key.into(),
+                device_class: crate::federation::types::device_class::AGENT.into(),
+                hardware_attestation: None,
+                asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                encryption_pubkeys: enc,
+                persist_row_hash: String::new(),
+            },
+        }
+    }
+
+    /// The keystone: a newcomer self-occurrence gains access to a
+    /// pre-existing self-scope blob via the retroactive ADD re-wrap, and a
+    /// re-run is idempotent (adds no further grants).
+    #[tokio::test]
+    async fn rekey_self_add_newcomer_reads_preexisting_blob_idempotent() {
+        use crate::federation::at_rest_cascade::orchestrate::{
+            encrypt_and_cascade, read_for_viewer, rekey_self_occurrence_add,
+        };
+        use crate::federation::types::cohort_scope::SELF;
+        use crate::federation::FederationDirectory;
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["root", "occ-old", "occ-new"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "root", k),
+                })
+                .await
+                .unwrap();
+        }
+        // Only the OLD occurrence exists at write time.
+        backend
+            .put_identity_occurrence(occ_signed("root", "occ-old", Some(keyed_enc(0x11))))
+            .await
+            .unwrap();
+
+        let plaintext = b"a self-scoped note written before the new device joined";
+        let result = encrypt_and_cascade(&backend, SELF, "root", plaintext, None)
+            .await
+            .unwrap();
+        assert_eq!(result.granted, vec!["occ-old".to_string()]);
+
+        // The new occurrence joins AFTER the write — initially NO grant.
+        backend
+            .put_identity_occurrence(occ_signed("root", "occ-new", Some(keyed_enc(0x22))))
+            .await
+            .unwrap();
+        assert!(
+            read_for_viewer(&backend, &result.at_rest_sha256, "occ-new")
+                .await
+                .is_err(),
+            "newcomer cannot read before the re-key walk"
+        );
+
+        // Run the re-key ADD walk for the newcomer.
+        let rk = rekey_self_occurrence_add(
+            &backend,
+            "root",
+            &["occ-new".to_string()],
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rk.blobs_scanned, 1);
+        assert_eq!(rk.granted, vec![("occ-new".to_string(), 1)]);
+        assert!(rk.excluded.is_empty());
+
+        // Newcomer now reads the pre-existing blob.
+        let recovered = read_for_viewer(&backend, &result.at_rest_sha256, "occ-new")
+            .await
+            .unwrap();
+        assert_eq!(recovered, plaintext);
+
+        // Idempotent: a second walk adds zero grants.
+        let rk2 = rekey_self_occurrence_add(
+            &backend,
+            "root",
+            &["occ-new".to_string()],
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rk2.granted, vec![("occ-new".to_string(), 0)]);
+        let recipients = backend
+            .list_at_rest_grant_recipients(&result.at_rest_sha256)
+            .await
+            .unwrap();
+        assert_eq!(
+            recipients,
+            vec!["occ-new".to_string(), "occ-old".to_string()]
+        );
+    }
+
+    /// A keyless newcomer is fail-secure excluded (no grant on ANY blob)
+    /// and surfaced as `hard_case:recipient_excluded` +
+    /// `hard_case:family_membership_change`; both are idempotent.
+    #[tokio::test]
+    async fn rekey_family_add_failsecure_excludes_keyless_and_emits_hard_cases() {
+        use crate::federation::at_rest_cascade::orchestrate::{
+            encrypt_and_cascade, read_for_viewer, rekey_family_member_add,
+        };
+        use crate::federation::hard_case::{kind, HardCaseFilter};
+        use crate::federation::types::cohort_scope::FAMILY;
+        use crate::federation::FederationDirectory;
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["fam", "alice", "carol", "alice-phone", "carol-phone"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+        // The family roster includes alice + carol from the start (V067
+        // models removal, not roster mutation; an add is a roster-set + a
+        // re-key walk once the newcomer's occurrence/keys arrive). alice
+        // has a keyed occurrence and writes a blob; carol's KEYLESS
+        // occurrence is registered only afterwards, so the original write
+        // could not reach her.
+        backend
+            .put_identity_occurrence(occ_signed("alice", "alice-phone", Some(keyed_enc(0x33))))
+            .await
+            .unwrap();
+        backend
+            .put_family(crate::federation::SignedFamily {
+                family: fed_family("fam", "Household", vec!["alice", "carol"], "unanimous"),
+            })
+            .await
+            .unwrap();
+        let plaintext = b"family blob written before carol registered a device";
+        let result = encrypt_and_cascade(&backend, FAMILY, "fam", plaintext, None)
+            .await
+            .unwrap();
+        assert_eq!(result.granted, vec!["alice-phone".to_string()]);
+
+        // carol registers a KEYLESS occurrence (her wrap target is invalid).
+        backend
+            .put_identity_occurrence(occ_signed("carol", "carol-phone", None))
+            .await
+            .unwrap();
+
+        let observed = chrono::Utc::now();
+        let rk = rekey_family_member_add(&backend, "fam", "carol", observed)
+            .await
+            .unwrap();
+        assert_eq!(rk.blobs_scanned, 1);
+        assert!(rk.granted.is_empty(), "keyless newcomer is never granted");
+        assert_eq!(rk.excluded, vec!["carol-phone".to_string()]);
+
+        // carol-phone still cannot read (fail-secure: no plaintext fallback).
+        assert!(
+            read_for_viewer(&backend, &result.at_rest_sha256, "carol-phone")
+                .await
+                .is_err()
+        );
+
+        // hard_case rows: one family_membership_change + one recipient_excluded.
+        let mc = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::FAMILY_MEMBERSHIP_CHANGE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(mc.len(), 1);
+        assert_eq!(mc[0].subject_key_id.as_deref(), Some("carol-phone"));
+        assert_eq!(mc[0].target_key_id.as_deref(), Some("fam"));
+
+        let exc = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::RECIPIENT_EXCLUDED.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(exc.len(), 1);
+        assert_eq!(exc[0].subject_key_id.as_deref(), Some("carol-phone"));
+
+        // Idempotent emission: re-running at the same instant adds no rows.
+        rekey_family_member_add(&backend, "fam", "carol", observed)
+            .await
+            .unwrap();
+        let all = backend
+            .list_hard_case_events(HardCaseFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2, "re-run at same instant is idempotent");
+    }
+
+    /// v6.2.0 (#161 A4/A5) — the forward-path half of the keystone: a
+    /// genuinely-new family member (NOT on the roster at write time) is
+    /// added to the roster by `rekey_family_member_add` and is then served
+    /// FUTURE family writes, not just re-keyed onto past blobs. This is the
+    /// gap the roster-grow primitive (`add_family_member`) closes.
+    #[tokio::test]
+    async fn rekey_family_member_add_grows_roster_and_serves_future_writes() {
+        use crate::federation::at_rest_cascade::orchestrate::{
+            encrypt_and_cascade, read_for_viewer, rekey_family_member_add,
+        };
+        use crate::federation::types::cohort_scope::FAMILY;
+        use crate::federation::FederationDirectory;
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["fam", "alice", "bob", "alice-phone", "bob-phone"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_identity_occurrence(occ_signed("alice", "alice-phone", Some(keyed_enc(0x66))))
+            .await
+            .unwrap();
+        // Roster starts with alice ONLY — bob is a genuinely-new member.
+        backend
+            .put_family(crate::federation::SignedFamily {
+                family: fed_family("fam", "Household", vec!["alice"], "unanimous"),
+            })
+            .await
+            .unwrap();
+
+        // A blob written before bob exists reaches only alice.
+        let blob1 = encrypt_and_cascade(&backend, FAMILY, "fam", b"before bob", None)
+            .await
+            .unwrap();
+        assert_eq!(blob1.granted, vec!["alice-phone".to_string()]);
+
+        // bob registers a KEYED occurrence, then is admitted.
+        backend
+            .put_identity_occurrence(occ_signed("bob", "bob-phone", Some(keyed_enc(0x77))))
+            .await
+            .unwrap();
+        let rk = rekey_family_member_add(&backend, "fam", "bob", chrono::Utc::now())
+            .await
+            .unwrap();
+        // Backward path: bob-phone gets a grant on the one past blob.
+        assert_eq!(rk.granted, vec![("bob-phone".to_string(), 1)]);
+        assert!(
+            read_for_viewer(&backend, &blob1.at_rest_sha256, "bob-phone")
+                .await
+                .is_ok()
+        );
+
+        // Roster grew: bob is now a member.
+        let fam = backend.lookup_family("fam").await.unwrap().unwrap();
+        assert!(
+            fam.members.iter().any(|m| m.key_id == "bob"),
+            "add_family_member put bob on the roster"
+        );
+
+        // Forward path (the gap this closes): a NEW write reaches BOTH.
+        let blob2 = encrypt_and_cascade(&backend, FAMILY, "fam", b"after bob", None)
+            .await
+            .unwrap();
+        let mut granted = blob2.granted.clone();
+        granted.sort();
+        assert_eq!(
+            granted,
+            vec!["alice-phone".to_string(), "bob-phone".to_string()],
+            "future family write reaches the newly-admitted member"
+        );
+
+        // Idempotent admission: re-adding bob is a no-op, no duplicate row.
+        assert!(
+            !backend
+                .add_family_member(
+                    "fam",
+                    crate::federation::types::FamilyMember {
+                        key_id: "bob".into(),
+                        joined_at: chrono::Utc::now(),
+                        role: None,
+                    },
+                )
+                .await
+                .unwrap(),
+            "re-admitting an existing member returns false"
+        );
+        let fam2 = backend.lookup_family("fam").await.unwrap().unwrap();
+        assert_eq!(
+            fam2.members.iter().filter(|m| m.key_id == "bob").count(),
+            1,
+            "no duplicate roster entry"
+        );
+    }
+
+    /// Producer-side stop-wrapping: a member removed via V067 is dropped
+    /// from `*_active`, so a NEW family cascade write excludes them — proven
+    /// without any explicit gate (the enumeration already enforces it).
+    #[tokio::test]
+    async fn removed_member_excluded_from_new_family_write() {
+        use crate::federation::at_rest_cascade::orchestrate::encrypt_and_cascade;
+        use crate::federation::types::cohort_scope::FAMILY;
+        use crate::federation::FederationDirectory;
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["fam", "alice", "dave", "alice-phone", "dave-phone"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_identity_occurrence(occ_signed("alice", "alice-phone", Some(keyed_enc(0x44))))
+            .await
+            .unwrap();
+        backend
+            .put_identity_occurrence(occ_signed("dave", "dave-phone", Some(keyed_enc(0x55))))
+            .await
+            .unwrap();
+        backend
+            .put_family(crate::federation::SignedFamily {
+                family: fed_family("fam", "Household", vec!["alice", "dave"], "unanimous"),
+            })
+            .await
+            .unwrap();
+
+        // Before removal: both occurrences are granted on a write.
+        let before = encrypt_and_cascade(&backend, FAMILY, "fam", b"v1", None)
+            .await
+            .unwrap();
+        let mut g = before.granted.clone();
+        g.sort();
+        assert_eq!(g, vec!["alice-phone".to_string(), "dave-phone".to_string()]);
+
+        // Remove dave (V067 effective immediately).
+        backend
+            .put_family_membership_revocation(crate::federation::SignedFamilyMembershipRevocation {
+                family_membership_revocation: crate::federation::FamilyMembershipRevocation {
+                    family_key_id: "fam".into(),
+                    removed_identity_key_id: "dave".into(),
+                    removed_at: "2026-06-11T00:00:00Z".parse().unwrap(),
+                    effective_at: "2026-06-11T00:00:00Z".parse().unwrap(),
+                    reason: Some("left the household".into()),
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+
+        // After removal: a NEW write excludes dave (producer stop-wrapping
+        // via the *_active enumeration — forward secrecy under a fresh DEK).
+        let after = encrypt_and_cascade(&backend, FAMILY, "fam", b"v2-post-removal", None)
+            .await
+            .unwrap();
+        assert_eq!(after.granted, vec!["alice-phone".to_string()]);
+        assert!(
+            !after.granted.contains(&"dave-phone".to_string()),
+            "removed member must not receive grants on new content"
+        );
     }
 
     /// Round-trip an identity_occurrence: write → list_for → reverse

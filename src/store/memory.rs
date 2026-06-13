@@ -897,6 +897,28 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
+    async fn add_family_member(
+        &self,
+        family_key_id: &str,
+        member: crate::federation::types::FamilyMember,
+    ) -> Result<bool, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let family = state
+            .federation_families
+            .get_mut(family_key_id)
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "add_family_member names unknown family_key_id {family_key_id:?}"
+                ))
+            })?;
+        if family.members.iter().any(|m| m.key_id == member.key_id) {
+            return Ok(false); // already on the roster — no-op
+        }
+        family.members.push(member);
+        family.persist_row_hash = crate::federation::types::compute_persist_row_hash(family)?;
+        Ok(true)
+    }
+
     async fn lookup_family(
         &self,
         family_key_id: &str,

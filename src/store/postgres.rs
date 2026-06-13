@@ -2196,6 +2196,55 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    async fn add_family_member(
+        &self,
+        family_key_id: &str,
+        member: crate::federation::types::FamilyMember,
+    ) -> Result<bool, crate::federation::Error> {
+        // Idempotent roster-grow. The read-modify-write races a concurrent
+        // add only if two members are admitted at the same instant; the
+        // `WHERE persist_row_hash = $4` guard makes the UPDATE a no-op on a
+        // stale read (0 rows affected → retry signalled), so we never lose
+        // a member to a lost update.
+        let mut family = self.lookup_family(family_key_id).await?.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "add_family_member names unknown family_key_id {family_key_id:?}"
+            ))
+        })?;
+        if family.members.iter().any(|m| m.key_id == member.key_id) {
+            return Ok(false); // already on the roster — no-op
+        }
+        let prior_hash = family.persist_row_hash.clone();
+        family.members.push(member);
+        family.persist_row_hash = crate::federation::types::compute_persist_row_hash(&family)?;
+        let members_value = serde_json::to_value(&family.members)
+            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let affected = client
+            .execute(
+                "UPDATE cirislens.federation_families \
+                    SET members = $2, persist_row_hash = $3 \
+                  WHERE family_key_id = $1 AND persist_row_hash = $4",
+                &[
+                    &family_key_id,
+                    &members_value,
+                    &family.persist_row_hash,
+                    &prior_hash,
+                ],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("add_family_member: {e}")))?;
+        if affected == 0 {
+            return Err(crate::federation::Error::Backend(format!(
+                "add_family_member on {family_key_id:?} lost a concurrent update (roster changed under the read); retry"
+            )));
+        }
+        Ok(true)
+    }
+
     async fn lookup_family(
         &self,
         family_key_id: &str,
@@ -4953,6 +5002,51 @@ impl crate::federation::BlobStorage for PostgresBackend {
             })?;
         rows.iter()
             .map(|r| r.safe_get_with("recipient_key_id", crate::federation::BlobError::Backend))
+            .collect()
+    }
+
+    // v6.1.0 (CIRISPersist#161 Ask 2/4) — the retroactive-ADD visibility
+    // set: distinct at-rest SHAs any of `recipient_key_ids` holds a grant
+    // on, in `cohort_scope`.
+    async fn list_at_rest_blobs_for_recipients(
+        &self,
+        recipient_key_ids: &[String],
+        cohort_scope: &str,
+    ) -> Result<Vec<[u8; 32]>, crate::federation::BlobError> {
+        if recipient_key_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        // `= ANY($2)` over a bound TEXT[] — no dynamic IN-list / injection
+        // surface, and a single bound array param regardless of arity.
+        let recipients: Vec<String> = recipient_key_ids.to_vec();
+        let rows = client
+            .query(
+                "SELECT DISTINCT at_rest_sha256 FROM cirislens.federation_blob_key_grants \
+                 WHERE cohort_scope = $1 AND recipient_key_id = ANY($2) \
+                 ORDER BY at_rest_sha256",
+                &[&cohort_scope, &recipients],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "list_at_rest_blobs_for_recipients: {e}"
+                ))
+            })?;
+        rows.iter()
+            .map(|r| {
+                let v: Vec<u8> =
+                    r.safe_get_with("at_rest_sha256", crate::federation::BlobError::Backend)?;
+                v.try_into().map_err(|got: Vec<u8>| {
+                    crate::federation::BlobError::Backend(format!(
+                        "at_rest_sha256 is {} bytes, expected 32",
+                        got.len()
+                    ))
+                })
+            })
             .collect()
     }
 
@@ -14339,6 +14433,309 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recipients, vec![keyed.clone()]);
+    }
+
+    /// v6.1.0 (CIRISPersist#161 Ask 2/4, CEG §11.7.1 / §10.1.4) — the
+    /// membership-change re-key keystone on Postgres (parity with the
+    /// sqlite `rekey_*` tests): a newcomer family member gains access to a
+    /// pre-existing family blob via the retroactive ADD walk; a keyless
+    /// newcomer is fail-secure excluded; both are idempotent; the
+    /// membership `hard_case:*` rows are emitted.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn rekey_family_member_add_keystone_pg() {
+        use crate::federation::at_rest_cascade::orchestrate::{
+            encrypt_and_cascade, read_for_viewer, rekey_family_member_add,
+        };
+        use crate::federation::hard_case::{kind, HardCaseFilter};
+        use crate::federation::types::cohort_scope::FAMILY;
+        use crate::federation::{EncryptionPubkeys, FederationDirectory};
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let now = chrono::Utc::now();
+        let s = uuid_like();
+        let fam = format!("fam-{s}");
+        let alice = format!("alice-{s}");
+        let carol = format!("carol-{s}");
+        let bob = format!("bob-{s}");
+        let alice_p = format!("alice-phone-{s}");
+        let carol_p = format!("carol-phone-{s}");
+        let bob_p = format!("bob-phone-{s}");
+        for kid in [&fam, &alice, &carol, &bob, &alice_p, &carol_p, &bob_p] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: fix_section_i_key(kid, "acme", now, true),
+                })
+                .await
+                .unwrap();
+        }
+
+        let keyed = |occ_key: &str, identity: &str, seed: u8| {
+            let x_pub = ciris_crypto::x25519::public_from_secret(&[seed; 32]);
+            let (_mp, ml_pub) = ciris_crypto::ml_kem::generate_keypair().unwrap();
+            crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: crate::federation::IdentityOccurrence {
+                    identity_key_id: identity.into(),
+                    occurrence_key_id: occ_key.into(),
+                    device_class: crate::federation::types::device_class::AGENT.into(),
+                    hardware_attestation: None,
+                    asserted_at: now,
+                    valid_until: None,
+                    encryption_pubkeys: Some(EncryptionPubkeys {
+                        x25519_base64: B64.encode(x_pub),
+                        ml_kem_768_base64: B64.encode(&ml_pub),
+                    }),
+                    persist_row_hash: String::new(),
+                },
+            }
+        };
+        let bare = |occ_key: &str, identity: &str| crate::federation::SignedIdentityOccurrence {
+            identity_occurrence: crate::federation::IdentityOccurrence {
+                identity_key_id: identity.into(),
+                occurrence_key_id: occ_key.into(),
+                device_class: crate::federation::types::device_class::AGENT.into(),
+                hardware_attestation: None,
+                asserted_at: now,
+                valid_until: None,
+                encryption_pubkeys: None,
+                persist_row_hash: String::new(),
+            },
+        };
+
+        // alice founds the family + writes a family blob.
+        backend
+            .put_identity_occurrence(keyed(&alice_p, &alice, 0x11))
+            .await
+            .unwrap();
+        let family = |members: Vec<&str>| crate::federation::SignedFamily {
+            family: crate::federation::Family {
+                family_key_id: fam.clone(),
+                family_name: "Household".into(),
+                members: members
+                    .into_iter()
+                    .map(|k| crate::federation::FamilyMember {
+                        key_id: k.into(),
+                        joined_at: now,
+                        role: None,
+                    })
+                    .collect(),
+                founded_at: now,
+                consensus_protocol: "unanimous".into(),
+                consensus_protocol_entrenched: false,
+                persist_row_hash: String::new(),
+            },
+        };
+        // Roster is set up front (V067 models removal, not roster
+        // mutation): alice + bob + carol. Only alice has an occurrence at
+        // write time, so the blob reaches only alice-phone; bob's keyed
+        // occurrence and carol's keyless one are registered afterwards.
+        backend
+            .put_family(family(vec![&alice, &bob, &carol]))
+            .await
+            .unwrap();
+        let plaintext = b"family blob written before bob/carol registered devices (pg)";
+        let result = encrypt_and_cascade(&backend, FAMILY, &fam, plaintext, None)
+            .await
+            .unwrap();
+        assert_eq!(result.granted, vec![alice_p.clone()]);
+
+        // bob registers a KEYED occurrence → gains access via the walk.
+        backend
+            .put_identity_occurrence(keyed(&bob_p, &bob, 0x22))
+            .await
+            .unwrap();
+        let observed = chrono::Utc::now();
+        let rk = rekey_family_member_add(&backend, &fam, &bob, observed)
+            .await
+            .unwrap();
+        assert_eq!(rk.blobs_scanned, 1);
+        assert_eq!(rk.granted, vec![(bob_p.clone(), 1)]);
+        assert!(rk.excluded.is_empty());
+        let recovered = read_for_viewer(&backend, &result.at_rest_sha256, &bob_p)
+            .await
+            .unwrap();
+        assert_eq!(recovered, plaintext);
+
+        // Idempotent: a second walk at the same instant adds zero grants.
+        let rk2 = rekey_family_member_add(&backend, &fam, &bob, observed)
+            .await
+            .unwrap();
+        assert_eq!(rk2.granted, vec![(bob_p.clone(), 0)]);
+
+        // carol registers a KEYLESS occurrence → fail-secure excluded.
+        backend
+            .put_identity_occurrence(bare(&carol_p, &carol))
+            .await
+            .unwrap();
+        let observed2 = chrono::Utc::now();
+        let rk3 = rekey_family_member_add(&backend, &fam, &carol, observed2)
+            .await
+            .unwrap();
+        assert!(rk3.granted.is_empty());
+        assert_eq!(rk3.excluded, vec![carol_p.clone()]);
+        assert!(read_for_viewer(&backend, &result.at_rest_sha256, &carol_p)
+            .await
+            .is_err());
+
+        // hard_case rows present for this family (filter by target via the
+        // membership-change kind, then narrow to our family_key_id).
+        let mc = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::FAMILY_MEMBERSHIP_CHANGE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert!(mc
+            .iter()
+            .any(|e| e.target_key_id.as_deref() == Some(fam.as_str())
+                && e.subject_key_id.as_deref() == Some(carol_p.as_str())));
+        let exc = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::RECIPIENT_EXCLUDED.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert!(exc
+            .iter()
+            .any(|e| e.subject_key_id.as_deref() == Some(carol_p.as_str())));
+    }
+
+    /// v6.2.0 (#161 A4/A5) — PG parity for the roster-grow forward path:
+    /// a genuinely-new member (NOT on the roster at write time) is added by
+    /// `rekey_family_member_add` (exercising the `add_family_member` UPDATE
+    /// path + concurrent-guard) and is then served a FUTURE family write.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn add_family_member_grows_roster_and_serves_future_writes_pg() {
+        use crate::federation::at_rest_cascade::orchestrate::{
+            encrypt_and_cascade, read_for_viewer, rekey_family_member_add,
+        };
+        use crate::federation::types::cohort_scope::FAMILY;
+        use crate::federation::{EncryptionPubkeys, FederationDirectory};
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let now = chrono::Utc::now();
+        let s = uuid_like();
+        let fam = format!("fam-{s}");
+        let alice = format!("alice-{s}");
+        let bob = format!("bob-{s}");
+        let alice_p = format!("alice-phone-{s}");
+        let bob_p = format!("bob-phone-{s}");
+        for kid in [&fam, &alice, &bob, &alice_p, &bob_p] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: fix_section_i_key(kid, "acme", now, true),
+                })
+                .await
+                .unwrap();
+        }
+        let keyed = |occ_key: &str, identity: &str, seed: u8| {
+            let x_pub = ciris_crypto::x25519::public_from_secret(&[seed; 32]);
+            let (_mp, ml_pub) = ciris_crypto::ml_kem::generate_keypair().unwrap();
+            crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: crate::federation::IdentityOccurrence {
+                    identity_key_id: identity.into(),
+                    occurrence_key_id: occ_key.into(),
+                    device_class: crate::federation::types::device_class::AGENT.into(),
+                    hardware_attestation: None,
+                    asserted_at: now,
+                    valid_until: None,
+                    encryption_pubkeys: Some(EncryptionPubkeys {
+                        x25519_base64: B64.encode(x_pub),
+                        ml_kem_768_base64: B64.encode(&ml_pub),
+                    }),
+                    persist_row_hash: String::new(),
+                },
+            }
+        };
+        backend
+            .put_identity_occurrence(keyed(&alice_p, &alice, 0x11))
+            .await
+            .unwrap();
+        // Roster starts with alice ONLY — bob is genuinely new.
+        backend
+            .put_family(crate::federation::SignedFamily {
+                family: crate::federation::Family {
+                    family_key_id: fam.clone(),
+                    family_name: "Household".into(),
+                    members: vec![crate::federation::FamilyMember {
+                        key_id: alice.clone(),
+                        joined_at: now,
+                        role: None,
+                    }],
+                    founded_at: now,
+                    consensus_protocol: "unanimous".into(),
+                    consensus_protocol_entrenched: false,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let blob1 = encrypt_and_cascade(&backend, FAMILY, &fam, b"before bob (pg)", None)
+            .await
+            .unwrap();
+        assert_eq!(blob1.granted, vec![alice_p.clone()]);
+
+        backend
+            .put_identity_occurrence(keyed(&bob_p, &bob, 0x22))
+            .await
+            .unwrap();
+        let rk = rekey_family_member_add(&backend, &fam, &bob, chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(rk.granted, vec![(bob_p.clone(), 1)]);
+        assert!(read_for_viewer(&backend, &blob1.at_rest_sha256, &bob_p)
+            .await
+            .is_ok());
+
+        // Roster grew (the PG UPDATE path).
+        let looked = backend.lookup_family(&fam).await.unwrap().unwrap();
+        assert!(looked.members.iter().any(|m| m.key_id == bob));
+
+        // Forward path: a NEW write reaches BOTH alice + bob.
+        let blob2 = encrypt_and_cascade(&backend, FAMILY, &fam, b"after bob (pg)", None)
+            .await
+            .unwrap();
+        let mut granted = blob2.granted.clone();
+        granted.sort();
+        let mut want = vec![alice_p.clone(), bob_p.clone()];
+        want.sort();
+        assert_eq!(granted, want);
+
+        // Idempotent re-add: no-op, no duplicate roster entry.
+        assert!(!backend
+            .add_family_member(
+                &fam,
+                crate::federation::FamilyMember {
+                    key_id: bob.clone(),
+                    joined_at: chrono::Utc::now(),
+                    role: None,
+                },
+            )
+            .await
+            .unwrap());
+        let looked2 = backend.lookup_family(&fam).await.unwrap().unwrap();
+        assert_eq!(
+            looked2.members.iter().filter(|m| m.key_id == bob).count(),
+            1
+        );
     }
 
     /// §I list_federation_keys round-trip + cursor pagination.

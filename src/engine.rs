@@ -1252,6 +1252,100 @@ impl Engine {
         }
     }
 
+    /// v6.1.0 (CIRISPersist#161 Ask 2/4, CEG §11.7.1 / §10.1.4) — the
+    /// **retroactive key-grant ADD re-wrap** for a **family** member-add.
+    ///
+    /// Run *after* `put_family` admits a new member: for every existing
+    /// family-scope at-rest blob the cohort already holds grants on, recover
+    /// the DEK (via persist's content-master self-retention grant), wrap it
+    /// to the new member's active occurrences, and record the grants —
+    /// making the pre-existing family content reachable to the newcomer.
+    /// Idempotent (re-running adds nothing) and fail-secure (a keyless
+    /// newcomer occurrence is excluded, never granted — surfaced as
+    /// `hard_case:recipient_excluded`). Emits one
+    /// `hard_case:family_membership_change` per newcomer.
+    ///
+    /// Does NOT retroactively revoke past grants of *removed* members —
+    /// forward secrecy is automatic (the per-write fresh DEK means future
+    /// writes simply exclude them). Returns the
+    /// [`RekeyResult`](crate::federation::at_rest_cascade::orchestrate::RekeyResult).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn rekey_family_member_add(
+        &self,
+        family_key_id: &str,
+        new_member_identity_key_id: &str,
+    ) -> Result<
+        crate::federation::at_rest_cascade::orchestrate::RekeyResult,
+        crate::federation::BlobError,
+    > {
+        use crate::federation::at_rest_cascade::orchestrate::rekey_family_member_add;
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                rekey_family_member_add(
+                    arc.as_ref(),
+                    family_key_id,
+                    new_member_identity_key_id,
+                    now,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                rekey_family_member_add(
+                    arc.as_ref(),
+                    family_key_id,
+                    new_member_identity_key_id,
+                    now,
+                )
+                .await
+            }
+        }
+    }
+
+    /// v6.1.0 (CIRISPersist#161 Ask 2/4, CEG §11.7.1 / §10.1.4) — the
+    /// retroactive ADD re-wrap for a **self** occurrence-add: a person
+    /// admitting new device-occurrence(s) into their self-collective. Same
+    /// idempotent + fail-secure contract as
+    /// [`rekey_family_member_add`](Engine::rekey_family_member_add); the
+    /// newcomers are `new_occurrence_key_ids`, the existing cohort is the
+    /// identity's other active occurrences.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn rekey_self_occurrence_add(
+        &self,
+        identity_key_id: &str,
+        new_occurrence_key_ids: &[String],
+    ) -> Result<
+        crate::federation::at_rest_cascade::orchestrate::RekeyResult,
+        crate::federation::BlobError,
+    > {
+        use crate::federation::at_rest_cascade::orchestrate::rekey_self_occurrence_add;
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                rekey_self_occurrence_add(
+                    arc.as_ref(),
+                    identity_key_id,
+                    new_occurrence_key_ids,
+                    now,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                rekey_self_occurrence_add(
+                    arc.as_ref(),
+                    identity_key_id,
+                    new_occurrence_key_ids,
+                    now,
+                )
+                .await
+            }
+        }
+    }
+
     /// v4.14.0 (CIRISPersist#152, CEG 0.18 §10.1.4) — the **default-tier**
     /// read for an at-rest self/family blob: recover the plaintext body
     /// for a granted `viewer_key_id`.

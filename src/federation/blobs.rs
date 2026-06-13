@@ -971,6 +971,26 @@ pub trait BlobStorage: Send + Sync {
         at_rest_sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
 
+    /// v6.1.0 (CIRISPersist#161 Ask 2/4, CEG §11.7.1 / §10.1.4) — the
+    /// **retroactive-ADD** enumeration: distinct `at_rest_sha256` of every
+    /// blob in `cohort_scope` that **any** of `recipient_key_ids` already
+    /// holds a grant on.
+    ///
+    /// This is the cohort-visibility set the membership-change re-key walk
+    /// joins a newcomer into: when a new occurrence/member is admitted, the
+    /// existing cohort members' grants name exactly the blobs the newcomer
+    /// should now reach. Filtered by `cohort_scope` (`self` | `family`) so a
+    /// self-add never leaks family content and vice-versa; the
+    /// `__persist_self__` self-retention row is never a discriminator (the
+    /// caller passes occurrence recipients, not the sentinel). Returns the
+    /// SHAs in stable ascending hex order. Empty `Vec` if `recipient_key_ids`
+    /// is empty or none hold any grant in scope.
+    fn list_at_rest_blobs_for_recipients(
+        &self,
+        recipient_key_ids: &[String],
+        cohort_scope: &str,
+    ) -> impl Future<Output = Result<Vec<[u8; 32]>, BlobError>> + Send;
+
     /// v4.14.0 (CIRISPersist#152) — load persist's software content
     /// master key, generating + persisting it once on first call.
     ///
