@@ -5,6 +5,24 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.7.0] — 2026-06-14
+
+### Added — CEG 1.0-RC5 consent clauses (Lane G): #161 Ask 5 + #146 Ask 5/6
+
+Three CEG clauses, blocked on RC5 spec text (CIRISRegistry#79, `v-ceg-1.0-rc5`) and now pinned, composed over already-shipped persist substrate. **No migration** — all three ride existing tables (`hard_case_events` V075, `federation_attestations`).
+
+- **#161 Ask 5 — removal-path membership emission (CEG §7.7 / §7.8).** The membership-removal write path (`put_family_membership_revocation` / `put_community_membership_revocation`, all three backends) now emits the existing `hard_case:family_membership_change` (and the **new** `hard_case:community_membership_change` §7.8 analog) with `change_kind: "removed"`, `subject_key_id`, `cohort_key_id`, `effective_at`. RC5 normalizes the prefix to cover **both** directions — no separate `member_removed` kind — so the v6.2.0 ADD-path payload also gains the canonical fields with `change_kind: "added"`. The forward-secrecy re-key keys on `effective_at`; emission is idempotent on a deterministic `event_id` derived from `(prefix, cohort, member, effective_at)`. The in-memory backend gains `record_hard_case` / `list_hard_case_events` for parity (previously sqlite/postgres-only).
+
+- **#146 Ask 5 — `consent_record` subject_kind admission (CEG §5.6.8.7).** A new `consent_record` admission gate (`admission::check_consent_record_admission`, wired into `put_attestation` on all three backends) admits a `scores` row carrying the `subject_kind = "consent_record"` discriminator (no new attestation_type — 1+4 preserved). Enforces: required fields `subject_key_id` / `stance` / `asserted_at`; closed `stance` set `{granted, revoked, expired}` with **`expired` substrate-emitted only** (producer-submitted `expired` rejected); §10.1.3 tier eligibility (a `revoked` consent_record is **not** local-tier-eligible). Single-subject authority — no quorum, no producer co-signature; the signature obligation is the ordinary hybrid signature on the existing verify path.
+
+- **#146 Ask 6 — `identity:canonical_binding` (CEG §5.6.8.14).** A new reserved `scores` dimension `identity:canonical_binding:{H}` — K's self-assertion that it is the federation identity behind canonical hash H (version-pin-exempt, like the attestation ladder). Admission widens the §3.2.3 `withdraws` gate (`resolve_withdraws_admission_rule`): a `withdraws` from K against a target whose `subject_key_ids` holds an H that K is bound to is admitted as **rule 2** (the binding promotes the canonical-hash subject to K's direct revocation authority). This closes the v6.4.0 rule-3 never-rebound-canonical-subject gap. Authorization that K==H is consumer-policy (proof-of-control out-of-band, NOT a wire obligation) — persist admits the self-assertion and resolves authority structurally.
+
+### Safety
+The new consent/withdraws paths are admission-only widenings — they never reject a previously-admitted row. The §3.2.3 holds_bytes-target bypass is untouched, so the moderation `takedown_handler` / Policy-J age-gate / `evict_actor` / sweeper withdraws (authorized upstream of persist) still admit with rule `None` — verified green.
+
+### Tests
+15 net-new tests across memory + sqlite + live-PG (self-isolating: uuid-suffixed keys, `Uuid::new_v4()` ids): the §7.7 removal emission (payload + idempotency), all consent_record gate arms (granted/federation admit, missing-field / bad-stance / producer-`expired` / revoked-local reject), and the canonical_binding rule-2 widening (refused pre-binding, admitted rule 2 post-binding). Full feature set (`postgres sqlite server pyo3 cirisaudit secrets cirisnode cirisgraph telemetry`) green: clippy clean, **1423 lib tests pass** against the reused local PG; takedown/evict/sweeper regression suite confirmed green.
+
 ## [6.6.1] — 2026-06-14
 
 ### Changed — CIRISVerify 5.2.0 → 5.3.0 (coherence re-pin for CIRISServer)

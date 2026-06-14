@@ -533,9 +533,17 @@ impl DimensionAdmissionPolicy {
         // these mechanisms lives in the attesting binary's commit
         // (CIRISVerify's own SLSA-stamped build) and the
         // calibration package's version, not the wire prefix.
+        //
+        // CEG 1.0-RC5 §5.6.8.14 carve-out: the canonical-binding dimension
+        // `identity:canonical_binding:{H}` is a structural identity claim
+        // (K asserts it is the federation identity behind canonical hash H)
+        // — the suffix is the bound hash, not a versioned mechanism, so it
+        // carries no `:vN`. Like the attestation ladder it is exempt from
+        // T3 version-pinning.
         if self.require_version_segment
             && !contains_version_segment(dim)
             && !self.is_attestation_ladder_dimension(dim)
+            && parse_canonical_binding_hash(dim).is_none()
         {
             return Err(Error::DimensionRejected {
                 dimension: dim.to_string(),
@@ -761,6 +769,117 @@ pub fn check_cohort_scope(cohort_scope: &str) -> Result<(), Error> {
     }
 }
 
+/// Pull the `subject_kind` discriminator out of an attestation envelope
+/// as a `&str` (the §5.6.8.7 ceremony discriminator on a `scores` row).
+/// `None` if absent / not a string — the common case (a bare `scores`
+/// on a free `dimension` carries no `subject_kind`).
+#[must_use]
+pub fn envelope_subject_kind(envelope: &serde_json::Value) -> Option<&str> {
+    envelope.get("subject_kind").and_then(|v| v.as_str())
+}
+
+/// v6.7.0 (CIRISPersist#146 Ask 5, CEG 1.0-RC5 §5.6.8.7) — admission
+/// gate for a `consent_record` ceremony Contribution. A `consent_record`
+/// rides the [`attestation_type::SCORES`] primitive with a
+/// `subject_kind = "consent_record"` envelope discriminator (NO new
+/// attestation_type; the 1+4 lockdown holds). This gate is a **no-op**
+/// (`Ok(())`) for any row that is not a `scores` carrying that
+/// discriminator — bare `scores` on `consent:state:*` and the four
+/// structural primitives flow through untouched.
+///
+/// For a `consent_record` the §5.6.8.7 admission rules are enforced:
+///
+///   1. **Required fields present** (rule 1): `subject_key_id`, `stance`,
+///      `asserted_at` (all string-valued in the envelope). All other
+///      envelope members are optional (`scope` / `valid_until` /
+///      `deletion_sla_days` / … ride the §0.9.2 omit rule).
+///   2. **Closed-set `stance`** (rule 2): one of `granted` / `revoked` /
+///      `expired`; and **`expired` is substrate-emitted only** — a
+///      producer/subject-submitted `expired` is rejected (it is the
+///      substrate's `valid_until`-passed emission, never a wire input).
+///   3. **Tier eligibility** (rule 3, §10.1.3): a `stance: revoked`
+///      `consent_record` carries subject revocation authority over
+///      another party's content → it is **NOT local-tier-eligible** and
+///      is rejected at `tier = "local"`. A `stance: granted` self-consent
+///      MAY be local (no tier restriction here; the §10.1.5.2 self-tier
+///      eligibility is enforced by [`check_local_tier_eligibility`]).
+///
+/// Rule 4 (composition with the §3.2.3 `withdraws` gate / no quorum) is
+/// not a *field* check — it is the single-subject authority already baked
+/// into [`resolve_withdraws_admission_rule`]; a `revoked` consent_record
+/// needs no producer co-signature. The signature obligation is the
+/// ordinary hybrid signature every federation-tier `scores` row carries
+/// (RC5: consent_record is a signature-only obligation on the existing
+/// verify path) — this gate adds no separate crypto step.
+///
+/// `tier` is the row's [`crate::federation::types::Attestation::tier`]
+/// (`"local"` / `"federation"`). Returns [`Error::InvalidArgument`] on
+/// any rule violation; the row is not stored.
+pub fn check_consent_record_admission(
+    attestation_type: &str,
+    envelope: &serde_json::Value,
+    tier: &str,
+) -> Result<(), Error> {
+    use crate::federation::types::consent_record;
+    // No-op unless this is a `scores` carrying the consent_record
+    // discriminator. (A `consent_record` MUST ride `scores` — §5.6.8.7
+    // "Rides existing scores attestation_type"; a non-scores row bearing
+    // the discriminator is malformed.)
+    if envelope_subject_kind(envelope) != Some(consent_record::SUBJECT_KIND) {
+        return Ok(());
+    }
+    if attestation_type != attestation_type::SCORES {
+        return Err(Error::InvalidArgument(format!(
+            "consent_record subject_kind must ride attestation_type='scores' \
+             (CEG §5.6.8.7), got '{attestation_type}'"
+        )));
+    }
+    // Rule 1 — required fields present + string-valued.
+    let require_str = |field: &str| -> Result<&str, Error> {
+        envelope
+            .get(field)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "consent_record requires a non-empty string '{field}' \
+                     (CEG §5.6.8.7 admission rule 1)"
+                ))
+            })
+    };
+    let _subject_key_id = require_str("subject_key_id")?;
+    let stance = require_str("stance")?;
+    let _asserted_at = require_str("asserted_at")?;
+    // Rule 2 — closed-set stance; reject a producer-submitted `expired`.
+    if !consent_record::stance::is_valid(stance) {
+        return Err(Error::InvalidArgument(format!(
+            "consent_record stance '{stance}' is not in the closed set \
+             {{granted, revoked, expired}} (CEG §5.6.8.7 admission rule 2)"
+        )));
+    }
+    if stance == consent_record::stance::EXPIRED {
+        return Err(Error::InvalidArgument(
+            "consent_record stance 'expired' is substrate-emitted only — a \
+             producer/subject MUST NOT assert it (CEG §5.6.8.7 admission rule 2)"
+                .to_string(),
+        ));
+    }
+    // Rule 3 — tier eligibility (§10.1.3): a `revoked` consent_record is
+    // subject revocation authority → never local-tier-eligible.
+    if stance == consent_record::stance::REVOKED
+        && tier == crate::federation::types::attestation_tier::LOCAL
+    {
+        return Err(Error::InvalidArgument(
+            "a consent_record with stance 'revoked' is NOT local-tier-eligible \
+             (CEG §10.1.3 / §5.6.8.7 admission rule 3): it carries subject \
+             revocation authority — it must be federation-tier (hybrid-signed) \
+             or promoted within the §10.1.3 bounded window"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// v4.4.0 (CIRISPersist#171, CEG §10.1.3/§10.1.5/§7.5) — gate a row's
 /// eligibility for the **local tier** (signature-deferred,
 /// producer-only-authority). Local-tier eligibility is producer
@@ -957,6 +1076,55 @@ pub fn check_consensus_protocol_form(consensus_protocol: &str) -> Result<(), Err
 /// either a bare string OR a JSON array of strings (set-containment).
 pub const DELEGATION_SCOPE_CONSENT_REVOCATION: &str = "consent_revocation";
 
+/// v6.7.0 (CIRISPersist#146 Ask 6, CEG 1.0-RC5 §5.6.8.14) — the reserved
+/// `scores` dimension prefix for a **canonical-binding** claim. A bare
+/// `scores` on `identity:canonical_binding:{H}` with `attesting_key_id =
+/// K` is K's self-assertion "I am the federation identity behind the
+/// canonical hash H". `{H}` is the suffix after this prefix. NOT a new
+/// primitive — a reserved `scores` dimension (1+4 preserved).
+pub const IDENTITY_CANONICAL_BINDING_PREFIX: &str = "identity:canonical_binding:";
+
+/// Parse the bound canonical hash `H` out of an
+/// `identity:canonical_binding:{H}` dimension. `None` if the dimension
+/// is not a canonical-binding or carries an empty suffix.
+#[must_use]
+pub fn parse_canonical_binding_hash(dimension: &str) -> Option<&str> {
+    dimension
+        .strip_prefix(IDENTITY_CANONICAL_BINDING_PREFIX)
+        .filter(|h| !h.is_empty())
+}
+
+/// v6.7.0 (CIRISPersist#146 Ask 6, CEG §5.6.8.14) — the set of canonical
+/// hashes `K` has an admitted `identity:canonical_binding` claim to. Each
+/// admitted binding widens K's `withdraws` authority: K is treated as
+/// authorized wherever one of these hashes appears in a target's
+/// `subject_key_ids` (§3.2.3 rule 2/3). A binding is a `scores` row with
+/// `attesting_key_id = K` on the reserved `identity:canonical_binding:{H}`
+/// dimension; we read K's out-rows via
+/// [`FederationDirectory::list_attestations_by`] and collect every `H`.
+///
+/// Authorization is consumer-policy (§5.6.8.14: proof-of-control of H is
+/// out-of-band, NOT a wire obligation) — persist admits the self-assertion
+/// and exposes it here; it does not adjudicate whether K legitimately
+/// controls H.
+async fn canonical_binding_hashes_for(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+) -> Result<std::collections::HashSet<String>, Error> {
+    let mut out = std::collections::HashSet::new();
+    for r in directory.list_attestations_by(issuer).await? {
+        if r.attestation_type != attestation_type::SCORES {
+            continue;
+        }
+        if let Some(h) =
+            envelope_dimension(&r.attestation_envelope).and_then(parse_canonical_binding_hash)
+        {
+            out.insert(h.to_owned());
+        }
+    }
+    Ok(out)
+}
+
 /// Depth bound + cycle guard for the rule-3/rule-4 delegation walk.
 /// Mirrors [`crate::federation::topology::MAX_DELEGATION_DEPTH`] (16);
 /// a `delegates_to` graph deeper than this cannot confer revocation
@@ -1063,9 +1231,20 @@ async fn issuer_reaches_target_via_consent_revocation_delegation(
 ///   1. `issuer == T.attesting_key_id` (producer self-revocation; the
 ///      pre-CEG-0.6 shape, unchanged).
 ///   2. `issuer ∈ T.subject_key_ids` (subject self-revocation; NEW).
+///      **v6.7.0 / CEG §5.6.8.14 widening:** ALSO satisfied when `issuer`
+///      K holds an admitted `identity:canonical_binding` to a canonical
+///      hash `H ∈ T.subject_key_ids` — the binding promotes the
+///      canonical-hash subject to K's real key, so K inherits H's DIRECT
+///      revocation authority (recorded as rule 2). This is the
+///      never-rebound-canonical-subject closure: H acquires a real
+///      revoker without H ever holding a key.
 ///   3. ∃ `delegates_to` chain `issuer →* H` where `H ∈
 ///      T.subject_key_ids` AND `scope ⊇ {consent_revocation}` (proxy
-///      authority for canonical-hash subjects; NEW).
+///      authority for canonical-hash subjects; NEW). Persist admits a
+///      `delegates_to` edge to a canonical-hash `attested_key_id` (no FK),
+///      so the BFS already reaches a canonical-hash subject directly; the
+///      §5.6.8.14 binding is the *direct*-authority complement (rule 2)
+///      for the case where the real key K, not a delegate, revokes.
 ///   4. `issuer` holds a valid `delegates_to` (consent_revocation
 ///      scope) → any key satisfying 1–3 (existing delegation as a new
 ///      admission path).
@@ -1113,6 +1292,23 @@ pub async fn resolve_withdraws_admission_rule(
     // subject SET, any single element suffices (no quorum).
     if target.subject_key_ids.iter().any(|s| s == issuer) {
         return Ok(2);
+    }
+    // Rule 2 (canonical-binding widening, CEG §5.6.8.14 / §4.2.2.2) —
+    // `issuer` K holds an admitted `identity:canonical_binding` to a
+    // canonical hash H that appears in `T.subject_key_ids`. The binding
+    // promotes the canonical-hash subject to K's real key_id, so K
+    // inherits H's DIRECT subject-revocation authority — rule 2. This is
+    // what lets a real key revoke against a never-rebound canonical
+    // subject it has since claimed. (Authorization that K==H is
+    // consumer-policy; persist admits the binding and resolves authority
+    // structurally — §5.6.8.14 normative-honesty clause.)
+    if !target.subject_key_ids.is_empty() {
+        let subjects: std::collections::HashSet<&str> =
+            target.subject_key_ids.iter().map(String::as_str).collect();
+        let bound = canonical_binding_hashes_for(directory, issuer).await?;
+        if bound.iter().any(|h| subjects.contains(h.as_str())) {
+            return Ok(2);
+        }
     }
     // Rule 3 — proxy authority: a consent_revocation-scoped
     // `delegates_to` chain from `issuer` reaching ANY subject in

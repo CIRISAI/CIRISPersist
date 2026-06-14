@@ -247,6 +247,42 @@ pub mod attestation_type {
     pub const RECANTS: &str = "recants";
 }
 
+/// v6.7.0 (CIRISPersist#146 Ask 5, CEG 1.0-RC5 §5.6.8.7) — the
+/// `consent_record` ceremony shape over the consent primitive. A
+/// `consent_record` rides the existing [`attestation_type::SCORES`]
+/// primitive with a `subject_kind = "consent_record"` discriminator in
+/// the envelope (NO new attestation_type — the 1+4 lockdown is
+/// preserved); it simply carries a locked payload schema (`stance`,
+/// `asserted_at`, …) instead of a free `dimension`. See
+/// [`crate::federation::admission::check_consent_record_admission`].
+pub mod consent_record {
+    /// The envelope `subject_kind` discriminator that marks a `scores`
+    /// row as a `consent_record` ceremony Contribution (§5.6.8.7).
+    pub const SUBJECT_KIND: &str = "consent_record";
+
+    /// The closed-set `stance` values (§5.6.8.7).
+    pub mod stance {
+        /// Subject affirms; processing may proceed within scope +
+        /// valid_until. A `granted` *self*-consent (sole authority) MAY
+        /// be local-tier (§10.1.5.2).
+        pub const GRANTED: &str = "granted";
+        /// Subject withdraws; producer must delete within the SLA
+        /// window. Carries subject revocation authority → **NOT
+        /// local-tier-eligible** (§10.1.3).
+        pub const REVOKED: &str = "revoked";
+        /// Substrate emission when `valid_until` passes without renewal.
+        /// **Substrate-emitted only** — a producer/subject MUST NOT
+        /// assert it (§5.6.8.7 rule 2).
+        pub const EXPIRED: &str = "expired";
+
+        /// True iff `s` is one of the three closed-set stance values.
+        #[must_use]
+        pub fn is_valid(s: &str) -> bool {
+            matches!(s, GRANTED | REVOKED | EXPIRED)
+        }
+    }
+}
+
 /// `federation_keys` row.
 ///
 /// Field order matters for serde default JSON serialization (field

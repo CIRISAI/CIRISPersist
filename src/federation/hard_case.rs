@@ -42,6 +42,14 @@ pub mod kind {
     /// membership ceremony, NOT the ceremony itself. `target_key_id` =
     /// `family_key_id`; `detail` carries the granted / excluded split.
     pub const FAMILY_MEMBERSHIP_CHANGE: &str = "family_membership_change";
+    /// §7.8 (CIRISPersist#161 Ask 5, v6.7.0 / CEG 1.0-RC5) — the community
+    /// analog of [`FAMILY_MEMBERSHIP_CHANGE`]: a community roster delta
+    /// (`change_kind: "added"` on a member-add, `"removed"` on a
+    /// membership-revocation). Same payload shape as the family prefix
+    /// (`change_kind` / `subject_key_id` / `cohort_key_id` / `effective_at`);
+    /// `target_key_id` = `community_key_id`. Substrate-emitted only (§7.8
+    /// emitter rule: `identity_type="substrate_persist"`).
+    pub const COMMUNITY_MEMBERSHIP_CHANGE: &str = "community_membership_change";
     /// §10.1.4 (CIRISPersist#161 Ask 4, v6.1.0) — during a membership-change
     /// re-key, a newcomer was **fail-secure excluded** from a blob's grant
     /// set because their occurrence carried no valid `encryption_pubkeys`.
@@ -163,6 +171,80 @@ pub fn membership_change_event_id(
     )
 }
 
+/// CEG §7.7 `change_kind` payload values for the membership-change
+/// prefixes ([`kind::FAMILY_MEMBERSHIP_CHANGE`] /
+/// [`kind::COMMUNITY_MEMBERSHIP_CHANGE`]). RC5 normalizes the prefix to
+/// cover **both** directions in one event class — there is NO separate
+/// `member_removed` kind; the direction lives in this payload field.
+pub mod change_kind {
+    /// A member was admitted to the roster (the add / re-key-newcomer
+    /// path). `effective_at` = the join instant.
+    pub const ADDED: &str = "added";
+    /// A member was removed from the roster (the membership-revocation
+    /// path; CIRISPersist#161 Ask 5). `effective_at` = the re-key epoch
+    /// boundary after which the removed member receives no new wrapped
+    /// content (§8.1.12.5 / §8.1.13.4 Option-A) — the forward-secrecy
+    /// re-key keys on it.
+    pub const REMOVED: &str = "removed";
+}
+
+/// Deterministic `event_id` for the **removal** arm of a membership-change
+/// emission (CIRISPersist#161 Ask 5, CEG §7.7 / §7.8) — keyed on
+/// `(prefix-kind, cohort, removed-member, effective_at)`. Per §7.7 the
+/// forward-secrecy re-key keys on `effective_at`, so the idempotency key
+/// does too: re-recording the *same* removal (same effective epoch) is a
+/// no-op, while a distinct removal ceremony (a later `effective_at`) is a
+/// distinct event. `kind` is [`kind::FAMILY_MEMBERSHIP_CHANGE`] or
+/// [`kind::COMMUNITY_MEMBERSHIP_CHANGE`].
+#[must_use]
+pub fn membership_removed_event_id(
+    kind: &str,
+    cohort_key_id: &str,
+    removed_identity_key_id: &str,
+    effective_at: DateTime<Utc>,
+) -> String {
+    format!(
+        "{kind}:removed:{cohort_key_id}:{removed_identity_key_id}:{}",
+        effective_at.timestamp()
+    )
+}
+
+/// Build the `change_kind: "removed"` membership-change event a backend's
+/// `put_family_membership_revocation` / `put_community_membership_revocation`
+/// path emits (CIRISPersist#161 Ask 5, CEG §7.7 / §7.8). One source of
+/// truth so all three backends produce a byte-identical event. `kind` is
+/// [`kind::FAMILY_MEMBERSHIP_CHANGE`] (family) or
+/// [`kind::COMMUNITY_MEMBERSHIP_CHANGE`] (community); `cohort_key_id` is the
+/// family/community key, `effective_at` the §7.7 re-key epoch boundary.
+/// `emitted_at` is set to `effective_at` so the row's recorded instant
+/// matches the idempotency window.
+#[must_use]
+pub fn membership_removed_event(
+    kind: &str,
+    cohort_key_id: &str,
+    removed_identity_key_id: &str,
+    effective_at: DateTime<Utc>,
+) -> HardCaseEvent {
+    HardCaseEvent {
+        event_id: membership_removed_event_id(
+            kind,
+            cohort_key_id,
+            removed_identity_key_id,
+            effective_at,
+        ),
+        kind: kind.to_string(),
+        target_key_id: Some(cohort_key_id.to_string()),
+        subject_key_id: Some(removed_identity_key_id.to_string()),
+        detail: serde_json::json!({
+            "change_kind": change_kind::REMOVED,
+            "subject_key_id": removed_identity_key_id,
+            "cohort_key_id": cohort_key_id,
+            "effective_at": effective_at.to_rfc3339(),
+        }),
+        emitted_at: effective_at,
+    }
+}
+
 /// Deterministic `event_id` for a [`kind::RECIPIENT_EXCLUDED`] emission
 /// (CIRISPersist#161 Ask 4, v6.1.0) — keyed on `(cohort_scope, excluded
 /// occurrence, observed-at)`. Idempotent on the same walk-instant so a
@@ -200,6 +282,41 @@ mod tests {
         assert_ne!(a, membership_change_event_id("fam", "dave", t0));
         assert_ne!(a, membership_change_event_id("other", "carol", t0));
         assert!(a.starts_with(kind::FAMILY_MEMBERSHIP_CHANGE));
+    }
+
+    #[test]
+    fn membership_removed_event_id_keys_on_effective_at_and_cohort() {
+        let e0: DateTime<Utc> = "2026-06-12T10:00:00.100Z".parse().unwrap();
+        let e0b: DateTime<Utc> = "2026-06-12T10:00:00.900Z".parse().unwrap();
+        let e1: DateTime<Utc> = "2026-06-12T10:00:01.000Z".parse().unwrap();
+        let a = membership_removed_event_id(kind::FAMILY_MEMBERSHIP_CHANGE, "fam", "carol", e0);
+        // Same re-key epoch second ⇒ same id (re-recording the same removal
+        // is a no-op; the forward-secrecy re-key keys on effective_at).
+        assert_eq!(
+            a,
+            membership_removed_event_id(kind::FAMILY_MEMBERSHIP_CHANGE, "fam", "carol", e0b)
+        );
+        // A later effective_at second ⇒ distinct removal event.
+        assert_ne!(
+            a,
+            membership_removed_event_id(kind::FAMILY_MEMBERSHIP_CHANGE, "fam", "carol", e1)
+        );
+        // Cohort + removed member are part of the key.
+        assert_ne!(
+            a,
+            membership_removed_event_id(kind::FAMILY_MEMBERSHIP_CHANGE, "fam", "dave", e0)
+        );
+        assert_ne!(
+            a,
+            membership_removed_event_id(kind::FAMILY_MEMBERSHIP_CHANGE, "other", "carol", e0)
+        );
+        // The community analog carries its own prefix.
+        assert_ne!(
+            a,
+            membership_removed_event_id(kind::COMMUNITY_MEMBERSHIP_CHANGE, "fam", "carol", e0)
+        );
+        assert!(a.starts_with(kind::FAMILY_MEMBERSHIP_CHANGE));
+        assert!(a.contains(":removed:"));
     }
 
     #[test]

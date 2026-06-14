@@ -709,6 +709,15 @@ pub mod orchestrate {
                     target_key_id: Some(target_key_id.to_string()),
                     subject_key_id: Some(member.to_string()),
                     detail: serde_json::json!({
+                        // CEG §7.7 canonical payload (1.0-RC5): direction +
+                        // subject + cohort + effective instant. The add path
+                        // is `change_kind: "added"` (the removal path emits
+                        // `"removed"` from `put_*_membership_revocation`).
+                        "change_kind": hard_case::change_kind::ADDED,
+                        "subject_key_id": member,
+                        "cohort_key_id": target_key_id,
+                        "effective_at": observed_at.to_rfc3339(),
+                        // Diagnostic fields persist has always carried.
                         "cohort_scope": cohort_scope,
                         "blobs_scanned": result.blobs_scanned,
                         "grants_added": granted_count,

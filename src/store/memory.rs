@@ -126,6 +126,11 @@ struct State {
     /// the postgres/sqlite `transport_destinations` table.
     transport_destinations:
         HashMap<(String, String, String), crate::federation::TransportDestination>,
+    /// v6.7.0 (CIRISPersist#146 Ask 3 / #161 Ask 5, CEG §7.7/§8.1.11.3) —
+    /// the `hard_case:*` emission surface, keyed by the deterministic
+    /// `event_id` (idempotent insert = no-op on conflict). Parity with the
+    /// postgres/sqlite `hard_case_events` table (V075).
+    federation_hard_case_events: HashMap<String, crate::federation::hard_case::HardCaseEvent>,
 }
 
 impl Default for MemoryBackend {
@@ -156,6 +161,7 @@ impl Default for MemoryBackend {
                 federation_partner_record_sigs: HashMap::new(),
                 blackhole_rules: HashMap::new(),
                 transport_destinations: HashMap::new(),
+                federation_hard_case_events: HashMap::new(),
             }),
         }
     }
@@ -728,6 +734,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             &attesting_identity_type,
         )?;
 
+        // v6.7.0 (CIRISPersist#146 Ask 5, CEG §5.6.8.7) — `consent_record`
+        // ceremony admission (required fields / closed stance set /
+        // substrate-only `expired` / §10.1.3 revoked-not-local). No-op for
+        // every non-`consent_record` row.
+        crate::federation::admission::check_consent_record_admission(
+            &row.attestation_type,
+            &row.attestation_envelope,
+            &row.tier,
+        )?;
+
         // v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer
         // dedup on `(references_attestation_id, attestation_type,
         // attesting_key_id)`. A duplicate composer is a typed
@@ -1122,6 +1138,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             }
         }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // CEG §7.7 (CIRISPersist#161 Ask 5) — emit the removal-direction
+        // membership-change hard_case (`change_kind: "removed"`), keyed on
+        // the re-key epoch (`effective_at`). Idempotent on the event_id.
+        let event = crate::federation::hard_case::membership_removed_event(
+            crate::federation::hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
+            &row.family_key_id,
+            &row.removed_identity_key_id,
+            row.effective_at,
+        );
+        state
+            .federation_hard_case_events
+            .entry(event.event_id.clone())
+            .or_insert(event);
         state.federation_family_membership_revocations.insert(
             (
                 row.family_key_id.clone(),
@@ -1146,6 +1175,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             }
         }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // CEG §7.8 (CIRISPersist#161 Ask 5) — community analog of the §7.7
+        // removal emission (`change_kind: "removed"`). Idempotent on event_id.
+        let event = crate::federation::hard_case::membership_removed_event(
+            crate::federation::hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE,
+            &row.community_key_id,
+            &row.removed_identity_key_id,
+            row.effective_at,
+        );
+        state
+            .federation_hard_case_events
+            .entry(event.event_id.clone())
+            .or_insert(event);
         state.federation_community_membership_revocations.insert(
             (
                 row.community_key_id.clone(),
@@ -1200,6 +1241,44 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.removed_identity_key_id.cmp(&b.removed_identity_key_id));
+        Ok(rows)
+    }
+
+    // ─── v6.7.0 (CIRISPersist#146 Ask 3 / #161 Ask 5) — hard_case:* surface.
+    //     Memory parity with the sqlite/postgres `hard_case_events` table so
+    //     the substrate's removal/SLA emissions behave identically on all
+    //     three backends. Idempotent on the deterministic `event_id`.
+
+    async fn record_hard_case(
+        &self,
+        event: crate::federation::hard_case::HardCaseEvent,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        state
+            .federation_hard_case_events
+            .entry(event.event_id.clone())
+            .or_insert(event);
+        Ok(())
+    }
+
+    async fn list_hard_case_events(
+        &self,
+        filter: crate::federation::hard_case::HardCaseFilter,
+    ) -> Result<Vec<crate::federation::hard_case::HardCaseEvent>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_hard_case_events
+            .values()
+            .filter(|e| filter.kind.as_ref().is_none_or(|k| &e.kind == k))
+            .filter(|e| filter.since.is_none_or(|s| e.emitted_at >= s))
+            .cloned()
+            .collect();
+        // Match the SQL backends: newest first, event_id as a stable tiebreak.
+        rows.sort_by(|a, b| {
+            b.emitted_at
+                .cmp(&a.emitted_at)
+                .then_with(|| b.event_id.cmp(&a.event_id))
+        });
         Ok(rows)
     }
 
@@ -4946,5 +5025,358 @@ mod tests {
         let dropped = backend.blackhole_prune_expired(now).await.unwrap();
         assert_eq!(dropped, 0);
         assert_eq!(backend.blackhole_list().await.unwrap().len(), 2);
+    }
+
+    // ─── v6.7.0 Lane G (CEG 1.0-RC5) — consent clauses ─────────────
+
+    use crate::federation::hard_case::{self, HardCaseFilter};
+    use crate::federation::types::{consent_record, FamilyMember};
+    use crate::federation::{
+        Family, FamilyMembershipRevocation, SignedFamily, SignedFamilyMembershipRevocation,
+    };
+
+    /// Bootstrap a backend with a family + the two keys, returning it.
+    async fn family_backend(family_key: &str, member_key: &str) -> MemoryBackend {
+        let backend = MemoryBackend::new();
+        for k in [family_key, member_key] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, k, "registry-steward"),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_family(SignedFamily {
+                family: Family {
+                    family_key_id: family_key.into(),
+                    family_name: "Test Household".into(),
+                    members: vec![FamilyMember {
+                        key_id: member_key.into(),
+                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        role: None,
+                    }],
+                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    consensus_protocol: "founder_only".into(),
+                    consensus_protocol_entrenched: false,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+        backend
+    }
+
+    // ── Clause 1 (#161 Ask 5, CEG §7.7) — removal-path emission ────
+
+    /// A family-membership revocation emits the §7.7
+    /// `family_membership_change` hard_case with `change_kind: "removed"`,
+    /// the RC5 payload (subject/cohort/effective_at), keyed on the re-key
+    /// epoch, and is idempotent on a re-submit at the same effective_at.
+    #[tokio::test]
+    async fn family_membership_revocation_emits_removed_hard_case() {
+        let backend = family_backend("fam-A", "carol").await;
+        let effective: chrono::DateTime<chrono::Utc> = "2026-06-10T12:00:00Z".parse().unwrap();
+        let rev = FamilyMembershipRevocation {
+            family_key_id: "fam-A".into(),
+            removed_identity_key_id: "carol".into(),
+            removed_at: "2026-06-10T11:00:00Z".parse().unwrap(),
+            effective_at: effective,
+            reason: Some("left the household".into()),
+            witness_set: Vec::new(),
+            persist_row_hash: String::new(),
+        };
+        backend
+            .put_family_membership_revocation(SignedFamilyMembershipRevocation {
+                family_membership_revocation: rev.clone(),
+            })
+            .await
+            .unwrap();
+
+        let events = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(hard_case::kind::FAMILY_MEMBERSHIP_CHANGE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "exactly one removal event");
+        let e = &events[0];
+        assert_eq!(e.kind, hard_case::kind::FAMILY_MEMBERSHIP_CHANGE);
+        assert_eq!(e.target_key_id.as_deref(), Some("fam-A"));
+        assert_eq!(e.subject_key_id.as_deref(), Some("carol"));
+        assert_eq!(e.detail["change_kind"], hard_case::change_kind::REMOVED);
+        assert_eq!(e.detail["cohort_key_id"], "fam-A");
+        assert_eq!(e.detail["subject_key_id"], "carol");
+        assert_eq!(e.detail["effective_at"], effective.to_rfc3339());
+
+        // Idempotent: a re-submit at the same effective_at writes no
+        // duplicate (the forward-secrecy re-key keys on effective_at).
+        backend
+            .put_family_membership_revocation(SignedFamilyMembershipRevocation {
+                family_membership_revocation: rev,
+            })
+            .await
+            .unwrap();
+        let events2 = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(hard_case::kind::FAMILY_MEMBERSHIP_CHANGE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(events2.len(), 1, "re-submit is idempotent on event_id");
+    }
+
+    // ── Clause 2 (#146 Ask 5, CEG §5.6.8.7) — consent_record ───────
+
+    /// Build a `consent_record` `scores` attestation envelope + row.
+    fn consent_record_row(
+        id: &str,
+        subject: &str,
+        stance: &str,
+        tier: &str,
+        include_required: bool,
+    ) -> Attestation {
+        let mut env = serde_json::json!({
+            "id": id,
+            "subject_kind": consent_record::SUBJECT_KIND,
+            "stance": stance,
+            "dimension": "consent:partnership_grant:v1",
+        });
+        if include_required {
+            env["subject_key_id"] = serde_json::json!(subject);
+            env["asserted_at"] = serde_json::json!("2026-06-01T00:00:00Z");
+        }
+        let mut a = fix_attestation(id, subject, "registry-steward", "registry-steward");
+        a.attestation_envelope = env;
+        a.tier = tier.to_string();
+        // A local-tier row must be cohort_scope=self (the v4.0 read-gate);
+        // federation rows keep the fixture default.
+        if tier == crate::federation::types::attestation_tier::LOCAL {
+            a.cohort_scope = crate::federation::types::cohort_scope::SELF.to_string();
+        }
+        a
+    }
+
+    async fn consent_backend() -> MemoryBackend {
+        let backend = MemoryBackend::new();
+        for k in ["registry-steward", "subject-key"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, k, "registry-steward"),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+    }
+
+    #[tokio::test]
+    async fn consent_record_granted_federation_admits() {
+        let backend = consent_backend().await;
+        let row = consent_record_row(
+            "cr-1",
+            "subject-key",
+            consent_record::stance::GRANTED,
+            crate::federation::types::attestation_tier::FEDERATION,
+            true,
+        );
+        backend
+            .put_attestation(SignedAttestation { attestation: row })
+            .await
+            .expect("granted/federation consent_record admits");
+    }
+
+    #[tokio::test]
+    async fn consent_record_missing_required_field_rejected() {
+        let backend = consent_backend().await;
+        let row = consent_record_row(
+            "cr-2",
+            "subject-key",
+            consent_record::stance::GRANTED,
+            crate::federation::types::attestation_tier::FEDERATION,
+            false, // omit subject_key_id / asserted_at
+        );
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: row })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("subject_key_id")),
+            "missing required field rejected, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consent_record_producer_submitted_expired_rejected() {
+        let backend = consent_backend().await;
+        let row = consent_record_row(
+            "cr-3",
+            "subject-key",
+            consent_record::stance::EXPIRED,
+            crate::federation::types::attestation_tier::FEDERATION,
+            true,
+        );
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: row })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("substrate-emitted only")),
+            "producer-submitted expired rejected, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consent_record_revoked_local_tier_rejected() {
+        let backend = consent_backend().await;
+        let row = consent_record_row(
+            "cr-4",
+            "subject-key",
+            consent_record::stance::REVOKED,
+            crate::federation::types::attestation_tier::LOCAL,
+            true,
+        );
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: row })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("not local-tier-eligible") || m.contains("NOT local-tier-eligible")),
+            "revoked local-tier rejected (§10.1.3), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consent_record_revoked_federation_tier_admits() {
+        let backend = consent_backend().await;
+        let row = consent_record_row(
+            "cr-5",
+            "subject-key",
+            consent_record::stance::REVOKED,
+            crate::federation::types::attestation_tier::FEDERATION,
+            true,
+        );
+        backend
+            .put_attestation(SignedAttestation { attestation: row })
+            .await
+            .expect("revoked/federation consent_record admits");
+    }
+
+    #[tokio::test]
+    async fn consent_record_bad_stance_rejected() {
+        let backend = consent_backend().await;
+        let row = consent_record_row(
+            "cr-6",
+            "subject-key",
+            "maybe",
+            crate::federation::types::attestation_tier::FEDERATION,
+            true,
+        );
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: row })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("closed set")),
+            "out-of-closed-set stance rejected, got {err:?}"
+        );
+    }
+
+    // ── Clause 3 (#146 Ask 6, CEG §5.6.8.14) — canonical_binding ───
+
+    /// A `withdraws` from K against a target whose `subject_key_ids`
+    /// holds a canonical hash H is admitted under rule 2 ONLY after K has
+    /// emitted an `identity:canonical_binding:{H}` self-assertion.
+    #[tokio::test]
+    async fn canonical_binding_widens_withdraws_rule2() {
+        let backend = MemoryBackend::new();
+        for k in ["registry-steward", "K", "producer"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, k, "registry-steward"),
+                })
+                .await
+                .unwrap();
+        }
+        let canonical_h = "canonical:sha256:deadbeefcafe";
+
+        // Target T: a producer `scores` naming the canonical hash H as a
+        // consent subject. (subject_key_ids takes canonical-hash entries —
+        // no FK.)
+        let mut target = fix_attestation("T-1", "producer", "producer", "registry-steward");
+        target.subject_key_ids = vec![canonical_h.to_string()];
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: target.clone(),
+            })
+            .await
+            .unwrap();
+
+        // Helper: a `withdraws` from K against T-1.
+        let withdraws_row = |id: &str| {
+            let mut w = fix_attestation(id, "K", "producer", "registry-steward");
+            w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+            w.attestation_envelope = serde_json::json!({
+                "id": id,
+                "references_attestation_id": "T-1",
+            });
+            w
+        };
+
+        // Before any binding: K is neither producer nor a subject → the
+        // 4-rule gate refuses (rule resolution finds nothing).
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_row("W-pre"),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::WithdrawsNotAdmitted { .. }),
+            "pre-binding withdraws not admitted, got {err:?}"
+        );
+
+        // K self-asserts the canonical binding K → H.
+        let mut binding = fix_attestation("bind-1", "K", "K", "registry-steward");
+        binding.attestation_envelope = serde_json::json!({
+            "id": "bind-1",
+            "dimension": format!("identity:canonical_binding:{canonical_h}"),
+            "score": 1.0,
+            "confidence": 1.0,
+            "witness_relation": "self",
+        });
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: binding,
+            })
+            .await
+            .expect("canonical_binding self-assertion admits");
+
+        // Now the same withdraws is admitted under rule 2 (binding
+        // promotes H to K's direct revocation authority).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_row("W-post"),
+            })
+            .await
+            .expect("post-binding withdraws admits");
+        let rows = backend.list_attestations_by("K").await.unwrap();
+        let w = rows
+            .iter()
+            .find(|r| r.attestation_id == "W-post")
+            .expect("W-post stored");
+        assert_eq!(
+            w.withdraws_admission_rule,
+            Some(2),
+            "canonical_binding admits as rule 2 (direct subject authority)"
+        );
     }
 }

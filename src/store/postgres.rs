@@ -1692,6 +1692,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             &attesting_identity_type,
         )?;
 
+        // v6.7.0 (CIRISPersist#146 Ask 5, CEG §5.6.8.7) — `consent_record`
+        // ceremony admission (required fields / closed stance set /
+        // substrate-only `expired` / §10.1.3 revoked-not-local). No-op for
+        // every non-`consent_record` row.
+        crate::federation::admission::check_consent_record_admission(
+            &row.attestation_type,
+            &row.attestation_envelope,
+            &row.tier,
+        )?;
+
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate validation. Rejects out-of-closed-set values
         // (notably `global`, a §8.1.8 feed-name, never a wire value)
@@ -2469,6 +2479,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(map_revocation_pg_err("family_membership_revocation"))?;
+        // CEG §7.7 (CIRISPersist#161 Ask 5) — emit the removal-direction
+        // membership-change hard_case (`change_kind: "removed"`), keyed on
+        // the re-key epoch. Idempotent on event_id (ON CONFLICT DO NOTHING).
+        self.record_hard_case(crate::federation::hard_case::membership_removed_event(
+            crate::federation::hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
+            &row.family_key_id,
+            &row.removed_identity_key_id,
+            row.effective_at,
+        ))
+        .await?;
         Ok(())
     }
 
@@ -2501,6 +2521,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(map_revocation_pg_err("community_membership_revocation"))?;
+        // CEG §7.8 (CIRISPersist#161 Ask 5) — community analog of the §7.7
+        // removal emission. Idempotent on event_id.
+        self.record_hard_case(crate::federation::hard_case::membership_removed_event(
+            crate::federation::hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE,
+            &row.community_key_id,
+            &row.removed_identity_key_id,
+            row.effective_at,
+        ))
+        .await?;
         Ok(())
     }
 
@@ -17262,6 +17291,273 @@ mod tests {
             backend.get_attestation(&bad_id).await.unwrap().is_none(),
             "refused withdraws leaves no trace on PG"
         );
+    }
+
+    // ─── v6.7.0 Lane G (CEG 1.0-RC5) — consent clauses, PG parity ──────
+
+    /// Clause 1 (#161 Ask 5, CEG §7.7) — a family-membership revocation on
+    /// real Postgres emits the `family_membership_change` hard_case with
+    /// `change_kind: "removed"` + the RC5 payload, and re-recording the
+    /// same removal event is idempotent (ON CONFLICT DO NOTHING).
+    /// Self-isolating: uuid-suffixed keys, filtered by the unique family.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_family_membership_revocation_emits_removed_hard_case() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::hard_case;
+        use crate::federation::FederationDirectory;
+
+        let fam = format!("pg-fam-{}", uuid_like());
+        let member = format!("pg-carol-{}", uuid_like());
+        for k in [&fam, &member] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: pg_admission_key(
+                        k,
+                        "primitive-a",
+                        crate::federation::types::identity_type::AGENT,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_family(crate::federation::SignedFamily {
+                family: crate::federation::Family {
+                    family_key_id: fam.clone(),
+                    family_name: "PG Household".into(),
+                    members: vec![crate::federation::types::FamilyMember {
+                        key_id: member.clone(),
+                        joined_at: chrono::Utc::now(),
+                        role: None,
+                    }],
+                    founded_at: chrono::Utc::now(),
+                    consensus_protocol: "founder_only".into(),
+                    consensus_protocol_entrenched: false,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let effective = chrono::Utc.with_ymd_and_hms(2026, 6, 10, 12, 0, 0).unwrap();
+        let rev = crate::federation::FamilyMembershipRevocation {
+            family_key_id: fam.clone(),
+            removed_identity_key_id: member.clone(),
+            removed_at: chrono::Utc::now(),
+            effective_at: effective,
+            reason: None,
+            witness_set: Vec::new(),
+            persist_row_hash: String::new(),
+        };
+        backend
+            .put_family_membership_revocation(crate::federation::SignedFamilyMembershipRevocation {
+                family_membership_revocation: rev.clone(),
+            })
+            .await
+            .unwrap();
+        // Re-record the same removal event — idempotent on event_id.
+        backend
+            .record_hard_case(hard_case::membership_removed_event(
+                hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
+                &rev.family_key_id,
+                &rev.removed_identity_key_id,
+                rev.effective_at,
+            ))
+            .await
+            .unwrap();
+
+        let events = backend
+            .list_hard_case_events(hard_case::HardCaseFilter {
+                kind: Some(hard_case::kind::FAMILY_MEMBERSHIP_CHANGE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        let mine: Vec<_> = events
+            .into_iter()
+            .filter(|e| e.target_key_id.as_deref() == Some(fam.as_str()))
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "exactly one (idempotent) removal event on PG"
+        );
+        assert_eq!(
+            mine[0].detail["change_kind"],
+            hard_case::change_kind::REMOVED
+        );
+        assert_eq!(mine[0].detail["cohort_key_id"], fam);
+        assert_eq!(mine[0].subject_key_id.as_deref(), Some(member.as_str()));
+        assert_eq!(mine[0].detail["effective_at"], effective.to_rfc3339());
+    }
+
+    /// Clause 2 (#146 Ask 5, CEG §5.6.8.7) — consent_record admission on
+    /// real Postgres: granted/federation admits; producer `expired` and
+    /// revoked/local are rejected.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_consent_record_admission() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let subj = format!("pg-cr-subj-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &subj,
+                    "primitive-a",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+
+        let mk = |stance: &str, tier: &str| {
+            let mut a = pg_scores_attestation(&subj, &subj, &subj, "consent:partnership_grant:v1");
+            a.attestation_envelope = serde_json::json!({
+                "subject_kind": crate::federation::types::consent_record::SUBJECT_KIND,
+                "subject_key_id": subj,
+                "stance": stance,
+                "asserted_at": "2026-06-01T00:00:00Z",
+                "dimension": "consent:partnership_grant:v1",
+                "score": 1.0,
+                "confidence": 0.9,
+            });
+            a.tier = tier.to_string();
+            if tier == crate::federation::types::attestation_tier::LOCAL {
+                a.cohort_scope = crate::federation::types::cohort_scope::SELF.to_string();
+            }
+            a
+        };
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: mk(
+                    crate::federation::types::consent_record::stance::GRANTED,
+                    crate::federation::types::attestation_tier::FEDERATION,
+                ),
+            })
+            .await
+            .expect("granted/federation consent_record admits on PG");
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: mk(
+                    crate::federation::types::consent_record::stance::EXPIRED,
+                    crate::federation::types::attestation_tier::FEDERATION,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("substrate-emitted only"))
+        );
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: mk(
+                    crate::federation::types::consent_record::stance::REVOKED,
+                    crate::federation::types::attestation_tier::LOCAL,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("local-tier-eligible"))
+        );
+    }
+
+    /// Clause 3 (#146 Ask 6, CEG §5.6.8.14) — canonical_binding widens the
+    /// `withdraws` gate on real Postgres: a `withdraws` from K against a T
+    /// naming canonical hash H is refused pre-binding, admitted as rule 2
+    /// after K's `identity:canonical_binding:{H}` self-assertion.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_canonical_binding_widens_withdraws_rule2() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let k = format!("pg-cb-K-{}", uuid_like());
+        let prod = format!("pg-cb-prod-{}", uuid_like());
+        let canon = format!("canonical:sha256:{}-{}", "c".repeat(32), uuid_like());
+        for key in [&k, &prod] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: pg_admission_key(
+                        key,
+                        "primitive-a",
+                        crate::federation::types::identity_type::AGENT,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        // Target T names the canonical hash H in subject_key_ids (no FK).
+        let mut t = pg_scores_attestation(&prod, &prod, &prod, "identity_binding:v1");
+        t.subject_key_ids = vec![canon.clone()];
+        let tid = t.attestation_id.clone();
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: t })
+            .await
+            .unwrap();
+
+        let mk_withdraws = || {
+            let mut w = pg_scores_attestation(&k, &k, &k, "identity_binding:v1");
+            w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+            w.attestation_envelope = serde_json::json!({
+                "references_attestation_id": tid,
+                "withdrawal_reason": "test",
+            });
+            w
+        };
+
+        // Pre-binding: refused.
+        let bad = mk_withdraws();
+        let bad_id = bad.attestation_id.clone();
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: bad })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_withdraws_not_admitted");
+        assert!(backend.get_attestation(&bad_id).await.unwrap().is_none());
+
+        // K self-asserts the canonical binding K → H.
+        let mut binding = pg_scores_attestation(&k, &k, &k, "identity_binding:v1");
+        binding.attestation_envelope = serde_json::json!({
+            "dimension": format!("identity:canonical_binding:{canon}"),
+            "score": 1.0,
+            "confidence": 1.0,
+            "witness_relation": "self",
+        });
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: binding,
+            })
+            .await
+            .expect("canonical_binding self-assertion admits on PG");
+
+        // Post-binding: admitted as rule 2.
+        let w = mk_withdraws();
+        let wid = w.attestation_id.clone();
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: w })
+            .await
+            .expect("post-binding withdraws admits on PG");
+        let got = backend.get_attestation(&wid).await.unwrap().unwrap();
+        assert_eq!(got.withdraws_admission_rule, Some(2));
     }
 
     /// v4.6.0 (CIRISPersist#171/#176) — live-PG coverage for the
