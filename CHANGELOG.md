@@ -5,6 +5,21 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.6.0] — 2026-06-14
+
+### Added — `Engine::with_hardware_signer` from-scratch TPM federation signer ctor (CIRISPersist#220)
+
+The from-scratch constructor a fabric node needs to give its `Engine` a TPM/Secure-Enclave/StrongBox-custodied **federation signing key** — so the signing key need never be read into the process when hardware is present.
+
+```rust
+pub async fn with_hardware_signer(signer: Arc<dyn HardwareSigner>, dsn: &str) -> Result<Self, EngineError>
+```
+
+A host obtains the signer via `ciris_keyring::get_platform_signer(key_id)` (which falls back to software when no hardware is present) and passes it in. Mirrors `with_signer` — connects + **runs migrations** via `build_backend` — but stores the `Arc<dyn HardwareSigner>` **directly** (`local_signer: None`, as in `from_shared`); it is the from-scratch counterpart to `from_shared` (which is cohabitation-only and runs no migrations). **Additive**: `with_signer` / `with_signer_arcs` unchanged. `sign_hybrid` is unavailable on Engines built this way — a hardware signer signs through the `HardwareSigner` trait. Pairs with the transport-identity half (CIRISVerify#68 / CIRISEdge#99); consumed by CIRISServer (the fabric node) for hardware key custody.
+
+### Tests
+`with_hardware_signer_migrates_and_is_hardware_only` (sqlite): successful construction proves migrations ran (`build_backend` propagates migration errors, unlike `from_shared`), a directory read proves the schema is live, and `sign_hybrid` → `LocalSignerUnavailable` proves the hardware-only `local_signer: None` shape. Full CI matrix green (clippy/fmt/audit, all feature jobs, wheels, android, ios, deny).
+
 ## [6.5.0] — 2026-06-13
 
 ### Added — Self-at-login substrate (CIRISPersist#183; CEG §8.1.12.7 / §5.6.8.8.1 / §7.0.1)
