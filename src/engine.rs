@@ -320,6 +320,34 @@ impl Engine {
         Self::with_signer(signer, dsn).await
     }
 
+    /// v6.6.0 (CIRISPersist#220) — construct a fresh Engine (connect + run
+    /// migrations, exactly like [`Engine::with_signer`]) whose federation
+    /// signing identity is an externally-supplied [`HardwareSigner`] — a TPM /
+    /// Secure-Enclave / StrongBox key obtained via
+    /// [`ciris_keyring::get_platform_signer`] (which itself falls back to a
+    /// software signer when no hardware is present). Unlike `with_signer`, no
+    /// raw seed is read into the process when the signer is hardware-backed.
+    ///
+    /// `local_signer` is `None` (as in [`Engine::from_shared`]), so
+    /// [`Engine::sign_hybrid`] is unavailable on Engines built this way — a
+    /// hardware signer performs its own signing through the [`HardwareSigner`]
+    /// trait. This is the from-scratch counterpart to `from_shared` (which is
+    /// cohabitation-only and runs no migrations).
+    pub async fn with_hardware_signer(
+        signer: Arc<dyn HardwareSigner>,
+        dsn: &str,
+    ) -> Result<Self, EngineError> {
+        let backend = build_backend(dsn).await?;
+        Ok(Engine {
+            backend,
+            signer,
+            local_signer: None,
+            replication_config: None,
+            #[cfg(feature = "cirisnode")]
+            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
+        })
+    }
+
     /// Borrow the public [`BackendDispatch`] enum the Engine
     /// composes. Consumers `match` on the variant and call the
     /// concrete backend's trait methods (`FederationDirectory`,
