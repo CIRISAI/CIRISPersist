@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.6.1] — 2026-06-14
+
+### Changed — CIRISVerify 5.2.0 → 5.3.0 (coherence re-pin for CIRISServer)
+
+All three verify crate pins flip together (`ciris-verify-core` / `ciris-crypto` / `ciris-keyring`, incl. the tpm/ios/android target tables) so the dependency graph resolves to a single `ciris_crypto` — CIRISServer composes `ciris-persist` + `ciris-verify` in one process and a split would be a type break. **Additive on persist's side** — no API change; full feature set builds clean, sqlite + live-PG lib suite green. 5.3.0 ships the CEG 1.0-RC5 verification surface the unblocked consent clauses (#146 Ask 5/6, #161 Ask 5) will consume in a follow-on cut.
+
 ## [6.6.0] — 2026-06-14
 
 ### Added — `Engine::with_hardware_signer` from-scratch TPM federation signer ctor (CIRISPersist#220)
