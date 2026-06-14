@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.7.2] — 2026-06-14
+
+### Changed — CIRISVerify 5.3.1 → 5.4.0 (coherence re-pin)
+
+All three verify pins flip together (`ciris-verify-core` / `ciris-crypto` / `ciris-keyring`, incl. the tpm/ios/android target tables) so the dependency graph stays single-`ciris_crypto` — downstream (CIRISServer / CIRISEdge) composes `ciris-persist` + `ciris-verify` in one process, where a split is a type break. 5.4.0 lands the verify-side transport_binding verifier (#28), the FIPS 203 ML-KEM-768 KAT (#53 P4), and the HW-token interface abstraction (#62). **Additive on persist's side** — no API change; full feature set + sqlite + live-PG green. Pin `ciris-persist>=6.7.2,<7`.
+
 ## [6.7.1] — 2026-06-14
 
 ### Fixed — `build_delegation_graph` now reads array-shaped delegation scope (CIRISPersist#219)
