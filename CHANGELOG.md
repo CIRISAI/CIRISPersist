@@ -17,6 +17,9 @@ Three CEG clauses, blocked on RC5 spec text (CIRISRegistry#79, `v-ceg-1.0-rc5`) 
 
 - **#146 Ask 6 — `identity:canonical_binding` (CEG §5.6.8.14).** A new reserved `scores` dimension `identity:canonical_binding:{H}` — K's self-assertion that it is the federation identity behind canonical hash H (version-pin-exempt, like the attestation ladder). Admission widens the §3.2.3 `withdraws` gate (`resolve_withdraws_admission_rule`): a `withdraws` from K against a target whose `subject_key_ids` holds an H that K is bound to is admitted as **rule 2** (the binding promotes the canonical-hash subject to K's direct revocation authority). This closes the v6.4.0 rule-3 never-rebound-canonical-subject gap. Authorization that K==H is consumer-policy (proof-of-control out-of-band, NOT a wire obligation) — persist admits the self-assertion and resolves authority structurally.
 
+### Changed — CIRISVerify 5.2.0 → 5.3.1 (CEG RC5 conformance; coherence re-pin for CIRISServer)
+All three verify pins flip together (`ciris-verify-core` / `ciris-crypto` / `ciris-keyring`, incl. the tpm/ios/android target tables) so the dependency graph resolves to a single `ciris_crypto` — CIRISServer composes `ciris-persist` + `ciris-verify` in one process and a split would be a type break. 5.3.1 is the RC5-conformant build (the multi-role steward `identity_type` set-membership fix in verify's `provenance.rs` — load-bearing for fabric-node stewards carrying e.g. `"steward,witness"`). Additive on persist's side — no API change. (v6.6.1 shipped the interim 5.3.0 pin; **6.7.0 supersedes it with 5.3.1** — pin `ciris-persist>=6.7.0,<7`.)
+
 ### Safety
 The new consent/withdraws paths are admission-only widenings — they never reject a previously-admitted row. The §3.2.3 holds_bytes-target bypass is untouched, so the moderation `takedown_handler` / Policy-J age-gate / `evict_actor` / sweeper withdraws (authorized upstream of persist) still admit with rule `None` — verified green.
 
