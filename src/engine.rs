@@ -3565,6 +3565,54 @@ mod tests {
         );
     }
 
+    /// v6.6.0 (CIRISPersist#220) — `with_hardware_signer` is the
+    /// from-scratch counterpart to `from_shared`: it RUNS migrations (via
+    /// `build_backend`, unlike `from_shared`) and stores the supplied
+    /// `Arc<dyn HardwareSigner>` directly with `local_signer: None`.
+    /// Successful construction proves migrations ran (`build_backend`
+    /// propagates migration errors); the post-construction directory read
+    /// proves the schema is live; and `sign_hybrid` being unavailable
+    /// proves the hardware-only signer shape (mirrors `from_shared`).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn with_hardware_signer_migrates_and_is_hardware_only() {
+        // A host obtains an Arc<dyn HardwareSigner> from ciris-keyring; here
+        // we synthesize one the way `with_signer` does (adapter over a
+        // LocalSigner) and hand it to the from-scratch hardware ctor.
+        let seed = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("seed engine");
+        let hw: Arc<dyn HardwareSigner> = seed.signer().clone();
+
+        let engine = Engine::with_hardware_signer(hw, "sqlite::memory:")
+            .await
+            .expect("with_hardware_signer constructs + migrates");
+
+        // Migrations ran: a directory read hits a live table (Ok(None)),
+        // not a "no such table" error — the differentiator from from_shared.
+        if let BackendDispatch::Sqlite(b) = engine.backend() {
+            let found = crate::federation::FederationDirectory::lookup_public_key(
+                b.as_ref(),
+                "nonexistent-key",
+            )
+            .await
+            .expect("schema is live");
+            assert!(found.is_none());
+        } else {
+            panic!("expected sqlite backend");
+        }
+
+        // Hardware-only shape: no LocalSigner → sign_hybrid unavailable.
+        let err = engine
+            .sign_hybrid(b"any message")
+            .await
+            .expect_err("hardware signer has no LocalSigner");
+        assert!(
+            matches!(err, SignError::LocalSignerUnavailable),
+            "got: {err:?}"
+        );
+    }
+
     // ── v2.13.0 (CIRISPersist#113) — detection-events facade + edge
     //    read + subscribe change-feed (LensCore #15 / #19 / #20 / #21 / #25)
 
