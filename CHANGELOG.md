@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.8.1] — 2026-06-14
+
+### Fixed — no-backend build (`-D warnings`) for the disk-pressure test helpers
+
+The v6.8.0 tag's CI failed at the `darwin-aarch64 (no postgres)` job (`cargo test --features server`, `RUSTFLAGS=-D warnings`): three disk-pressure test helpers (`TWO_GIB` / `FOUR_HUNDRED_MIB` consts + `blob_for`) were unused when neither `sqlite` nor `postgres` is enabled → `dead_code` → build failure. Now `#[cfg(feature = "sqlite")]`-gated like their consumers (the force-evict integration tests) and the sibling `seed_key` helper. **Publish is tag-gated, so v6.8.0 never reached PyPI — it's a CI-failure tombstone; 6.8.1 is the published 6.8 cut** (identical feature content: scoring aggregates #196/#197 + disk-pressure #148/#149 + verify 5.4.0). Pin `ciris-persist>=6.8.1,<7`. (Local-gate gap: the full-feature-set gate didn't run the no-backend combo; added to the mental checklist.)
+
 ## [6.8.0] — 2026-06-14
 
 ### Added — scoring-factor rollup (CIRISPersist#196) + streaming aggregate (CIRISPersist#197)

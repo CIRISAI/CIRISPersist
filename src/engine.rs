@@ -5347,7 +5347,9 @@ mod tests {
         (engine, stub, monitor)
     }
 
+    #[cfg(feature = "sqlite")]
     const TWO_GIB: u64 = 2 * 1024 * 1024 * 1024;
+    #[cfg(feature = "sqlite")]
     const FOUR_HUNDRED_MIB: u64 = 400 * 1024 * 1024;
 
     /// Seed a `federation_keys` row for `key_id` so a proxy/family
@@ -5361,6 +5363,7 @@ mod tests {
             .expect("seed key");
     }
 
+    #[cfg(feature = "sqlite")]
     fn blob_for(fill: u8) -> ([u8; 32], Vec<u8>) {
         let bytes = vec![fill; 256];
         use sha2::{Digest, Sha256};
