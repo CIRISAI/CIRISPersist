@@ -1367,6 +1367,26 @@ pub enum BlobError {
         sha256_hex: String,
     },
 
+    /// v6.8.0 (CIRISPersist#149) — the substrate is under disk pressure
+    /// at the **stop** tier (or tighter) and refused to ACCEPT or SERVE
+    /// federation-proxied content. Local + family content is never
+    /// refused. **Permanent / non-retryable for the proxy operation**:
+    /// the peer should fetch from another holder, not retry against this
+    /// node — the condition clears only when the host disk recovers, not
+    /// on retry. `operation` is `"accept"` (a proxy write) or `"serve"`
+    /// (a proxy read served to a peer); `tier` is the current pressure
+    /// tier label.
+    #[error(
+        "disk pressure ({tier}): refusing to {operation} federation-proxied content; \
+         local + family content is unaffected — fetch from another holder"
+    )]
+    DiskPressureProxyRefused {
+        /// `"accept"` (proxy write) or `"serve"` (proxy read to a peer).
+        operation: &'static str,
+        /// Current pressure tier label (`stop` / `host_at_risk`).
+        tier: &'static str,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -1387,6 +1407,7 @@ impl BlobError {
             BlobError::RangeSpansExternalChunk { .. } => "blob_range_spans_external_chunk",
             BlobError::NotGranted { .. } => "blob_not_granted",
             BlobError::NotHeld { .. } => "blob_not_held",
+            BlobError::DiskPressureProxyRefused { .. } => "blob_disk_pressure_proxy_refused",
             BlobError::Backend(_) => "blob_backend",
         }
     }

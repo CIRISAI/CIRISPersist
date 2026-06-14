@@ -38,10 +38,25 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 pub mod admission;
+// v6.8.0 (CIRISPersist#148) — operator-facing cache-size knob (proxy /
+// cache / server presets + human-readable byte parsing).
+pub mod cache_mode;
+// v6.8.0 (CIRISPersist#149) — proactive disk-pressure response (four
+// free-byte tiers + injectable statvfs source; defaults ON).
+pub mod disk_pressure;
 pub mod eviction;
 pub mod trust_scoring;
 
 pub use admission::AdmissionGate;
+pub use cache_mode::{
+    parse_human_bytes, ByteParseError, CacheMode, CACHE_DEFAULT_CACHE_BYTES, GIB, MIB,
+    PROXY_DEFAULT_CACHE_BYTES, PROXY_DEFAULT_TTL_SECONDS,
+};
+pub use disk_pressure::{
+    classify_free_bytes, DiskPressureConfig, DiskPressureMonitor, DiskPressureMonitorHandle,
+    DiskPressureSnapshot, FamilyPredicate, FreeBytesSource, PressureAction, PressureTier,
+    StatvfsFreeBytes, StubFreeBytes, TrustTier, MIN_POLL_INTERVAL,
+};
 pub use eviction::{
     EvictionCandidate, EvictionDecay, EvictionSweeper, SweepReport, DEFAULT_SWEEP_BATCH,
     MIN_SWEEP_INTERVAL,

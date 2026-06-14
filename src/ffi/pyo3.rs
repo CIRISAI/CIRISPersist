@@ -406,6 +406,18 @@ struct EngineCell {
     /// `set_multimedia_config_json` mutates the same cell-level state.
     #[cfg(feature = "cirisnode")]
     multimedia_config: Arc<std::sync::RwLock<Option<Arc<crate::cirisnode::MultimediaConfig>>>>,
+    /// v6.8.0 (CIRISPersist#149) — disk-pressure monitor, installed at
+    /// construction when a `disk_pressure` config resolves (kwarg or
+    /// env). `None` ⇒ disk-pressure response not active on this engine.
+    /// Holds the watch-state + injectable free-bytes source; the
+    /// PyO3 `disk_pressure_state()` reads its snapshot.
+    disk_pressure: std::sync::Mutex<Option<Arc<crate::federation::DiskPressureMonitor>>>,
+    /// v6.8.0 (CIRISPersist#149) — singleton background poll-loop handle
+    /// for the disk-pressure monitor. Spawned at construction when the
+    /// monitor is installed; `close()` calls `.stop()`. Mirrors the
+    /// `sweeper` field's lifecycle.
+    disk_pressure_handle:
+        std::sync::Mutex<Option<crate::federation::DiskPressureMonitorHandle>>,
 }
 
 /// The one global slot. `OnceLock` initializes the `Mutex` once;
@@ -441,6 +453,74 @@ fn engine_config_fingerprint(
         local_key_id.as_deref().unwrap_or(""),
         local_pqc_key_id.as_deref().unwrap_or(""),
     )
+}
+
+/// v6.8.0 (CIRISPersist#149) — build a
+/// [`DiskPressureConfig`](crate::federation::DiskPressureConfig) from
+/// an optional Python dict, then layer the `CIRIS_PERSIST_DISK_*` env
+/// overrides on top (env over dict — same resolution direction as the
+/// cache knob, env is the ops-override path). Recognized dict keys:
+/// `warn_free_bytes`, `crit_free_bytes`, `stop_free_bytes`,
+/// `host_at_risk_bytes` (human-readable strings via
+/// [`parse_human_bytes`](crate::federation::parse_human_bytes) or ints),
+/// `poll_interval` (seconds int), `monitor_path` (str).
+fn build_disk_pressure_config(
+    py: Python<'_>,
+    dict: Option<&Py<PyAny>>,
+) -> PyResult<crate::federation::DiskPressureConfig> {
+    use crate::federation::parse_human_bytes;
+    let mut cfg = crate::federation::DiskPressureConfig::default();
+    if let Some(obj) = dict {
+        let d = obj
+            .bind(py)
+            .cast::<PyDict>()
+            .map_err(|_| PyValueError::new_err("disk_pressure must be a dict of overrides"))?;
+        let bytes_key = |name: &str| -> PyResult<Option<u64>> {
+            match d.get_item(name)? {
+                None => Ok(None),
+                Some(v) => {
+                    let as_str: Result<String, _> = v.extract();
+                    if let Ok(s) = as_str {
+                        parse_human_bytes(&s)
+                            .map(Some)
+                            .map_err(|e| PyValueError::new_err(format!("disk_pressure.{name}: {e}")))
+                    } else {
+                        let as_u64: Result<u64, _> = v.extract();
+                        as_u64.map(Some).map_err(|_| {
+                            PyValueError::new_err(format!(
+                                "disk_pressure.{name} must be a byte string or int"
+                            ))
+                        })
+                    }
+                }
+            }
+        };
+        if let Some(v) = bytes_key("warn_free_bytes")? {
+            cfg.warn_free_bytes = v;
+        }
+        if let Some(v) = bytes_key("crit_free_bytes")? {
+            cfg.crit_free_bytes = v;
+        }
+        if let Some(v) = bytes_key("stop_free_bytes")? {
+            cfg.stop_free_bytes = v;
+        }
+        if let Some(v) = bytes_key("host_at_risk_bytes")? {
+            cfg.host_at_risk_bytes = v;
+        }
+        if let Some(v) = d.get_item("poll_interval")? {
+            let secs: Result<u64, _> = v.extract();
+            if let Ok(secs) = secs {
+                cfg.poll_interval = std::time::Duration::from_secs(secs);
+            }
+        }
+        if let Some(v) = d.get_item("monitor_path")? {
+            let p: Result<String, _> = v.extract();
+            if let Ok(p) = p {
+                cfg.monitor_path = std::path::PathBuf::from(p);
+            }
+        }
+    }
+    Ok(cfg.with_env_overrides())
 }
 
 /// `ciris_persist.Engine` — **process-singleton** handle to the
@@ -844,6 +924,45 @@ impl PyEngine {
         }
     }
 
+    /// v6.8.0 (CIRISPersist#149) — proxy-ACCEPT disk-pressure gate.
+    /// Returns `Err(DiskPressureProxyRefused)` (mapped to a Permanent
+    /// `ValueError` via [`blob_err_to_py`]) when the substrate is at the
+    /// stop tier (or tighter) AND `attesting_key_id` is proxy (neither
+    /// the local signer nor family). Local + family writes are NEVER
+    /// refused. No-op when no monitor is installed. Reads the cached
+    /// snapshot from the singleton cell — no statvfs per write.
+    fn disk_pressure_refuse_proxy_accept(&self, attesting_key_id: &str) -> PyResult<()> {
+        let slot = engine_slot();
+        let Some(cell) = slot.as_ref() else {
+            return Ok(());
+        };
+        let monitor = cell
+            .disk_pressure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(monitor) = monitor else {
+            return Ok(());
+        };
+        let snap = monitor.snapshot();
+        if !snap.refuses_proxy_writes {
+            return Ok(());
+        }
+        // Classify proxy vs local/family using the monitor's config
+        // predicate against the cell's signer key.
+        let cfg = monitor.config();
+        let is_protected = cfg.is_local_or_family(attesting_key_id, &cell.signer_key_id);
+        if is_protected {
+            return Ok(());
+        }
+        Err(blob_err_to_py(
+            crate::federation::BlobError::DiskPressureProxyRefused {
+                operation: "accept",
+                tier: snap.tier.label(),
+            },
+        ))
+    }
+
     /// v4.0 (FSD §11) — map this PyEngine's backend dispatch to the
     /// crate-level [`crate::engine::BackendDispatch`] so a thin
     /// [`crate::engine::Engine`] view can be built for
@@ -937,7 +1056,9 @@ impl PyEngine {
                         local_key_id=None, local_key_path=None,
                         local_pqc_key_id=None, local_pqc_key_path=None,
                         pqc_sweep_on_init=true,
-                        replication_sweeper_enabled=true))]
+                        replication_sweeper_enabled=true,
+                        cache_mode=None, max_cache_bytes=None,
+                        cache_ttl_seconds=None, disk_pressure=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -950,6 +1071,19 @@ impl PyEngine {
         local_pqc_key_path: Option<String>,
         pqc_sweep_on_init: bool,
         replication_sweeper_enabled: bool,
+        // v6.8.0 (CIRISPersist#148) — operator cache-size knob. Mode
+        // label ("proxy"|"cache"|"server") + human-readable byte cap
+        // ("10GB"/"500MB"/"100MiB") + proxy TTL. Resolution order:
+        // kwarg > env > mode-default (issue #148 §3).
+        cache_mode: Option<String>,
+        max_cache_bytes: Option<String>,
+        cache_ttl_seconds: Option<u32>,
+        // v6.8.0 (CIRISPersist#149) — disk-pressure config dict:
+        // {warn_free_bytes, crit_free_bytes, stop_free_bytes,
+        // host_at_risk_bytes (human-readable strings), poll_interval
+        // (seconds int), monitor_path (str)}. A present dict (even
+        // empty) activates the monitor with defaults-ON tiers.
+        disk_pressure: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         // ── v1.6.8 (CIRISPersist#75-78) — process-singleton gate ────
         //
@@ -1342,6 +1476,47 @@ impl PyEngine {
             });
         }
 
+        // v6.8.0 (#148) — resolve the operator cache-size knob:
+        // kwarg > env > mode-default. Start from any env config, then
+        // override with the explicit kwargs. The resolved CacheMode is
+        // folded onto a default ReplicationConfig and installed as the
+        // cell's initial replication_config so the auto-spawn-sweeper
+        // block below picks it up (Proxy/Cache → finite budget →
+        // sweeper spawns; Server → unbounded → idle).
+        let resolved_cache_mode: Option<crate::federation::CacheMode> = {
+            let mut mode = crate::federation::CacheMode::from_env();
+            if let Some(label) = cache_mode.as_deref() {
+                let base = crate::federation::CacheMode::mode_from_label(label).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "invalid cache_mode {label:?} (expected proxy|cache|server)"
+                    ))
+                })?;
+                mode = Some(base);
+            }
+            if let Some(ttl) = cache_ttl_seconds {
+                if let Some(crate::federation::CacheMode::Proxy { max_cache_bytes, .. }) = mode {
+                    mode = Some(crate::federation::CacheMode::Proxy {
+                        max_cache_bytes,
+                        cache_ttl_seconds: ttl,
+                    });
+                }
+            }
+            if let Some(raw) = max_cache_bytes.as_deref() {
+                let bytes = crate::federation::parse_human_bytes(raw)
+                    .map_err(|e| PyValueError::new_err(format!("max_cache_bytes: {e}")))?;
+                // A byte cap with no explicit mode means "cache mode".
+                let m = mode.unwrap_or(crate::federation::CacheMode::Cache {
+                    max_cache_bytes: bytes,
+                });
+                mode = Some(m.with_budget_bytes(bytes));
+            }
+            mode
+        };
+        let initial_replication_config = match resolved_cache_mode {
+            Some(m) => m.apply_to(crate::federation::ReplicationConfig::default()),
+            None => crate::federation::ReplicationConfig::default(),
+        };
+
         // v1.6.8 — install the canonical cell into the process
         // singleton, then hand back a handle cloned from it. `slot`
         // (the global lock) has been held since the top of `new`.
@@ -1361,17 +1536,19 @@ impl PyEngine {
             subscriptions: Arc::new(std::sync::Mutex::new(SubscriptionState::default())),
             rust_engine: std::sync::OnceLock::new(),
             // v3.4.0 (#123) — defaults: bootstrap-permissive trust gate,
-            // sweeper inactive (budget = u64::MAX). The three PyO3
-            // setters (`set_trust_threshold`, `set_storage_budget_bytes`,
+            // sweeper inactive (budget = u64::MAX). v6.8.0 (#148): the
+            // CacheMode-resolved config replaces the bare default when
+            // the operator opted in via kwarg/env. The PyO3 setters
+            // (`set_trust_threshold`, `set_storage_budget_bytes`,
             // `set_eviction_decay_half_life_days`) reconfigure on the
             // running cell; `sweeper` is recomputed in spawn_sweeper
             // when budget transitions from infinite to finite.
-            replication_config: std::sync::RwLock::new(Arc::new(
-                crate::federation::ReplicationConfig::default(),
-            )),
+            replication_config: std::sync::RwLock::new(Arc::new(initial_replication_config)),
             sweeper: std::sync::Mutex::new(None),
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
+            disk_pressure: std::sync::Mutex::new(None),
+            disk_pressure_handle: std::sync::Mutex::new(None),
         });
         // v3.4.0 (#123) — auto-spawn sweeper on init when the operator
         // opted in AND the installed config has a finite budget. The
@@ -1409,6 +1586,38 @@ impl PyEngine {
                 }
             }
         }
+
+        // v6.8.0 (#149) — disk-pressure monitor. Activates when the
+        // operator passed a `disk_pressure` dict OR set any
+        // CIRIS_PERSIST_DISK_* env var. Defaults-ON tiers + injectable
+        // statvfs source (production = StatvfsFreeBytes). A present dict
+        // (even empty) activates it; env-only also activates it.
+        let any_disk_env = std::env::var("CIRIS_PERSIST_DISK_WARN_BYTES").is_ok()
+            || std::env::var("CIRIS_PERSIST_DISK_CRIT_BYTES").is_ok()
+            || std::env::var("CIRIS_PERSIST_DISK_STOP_BYTES").is_ok()
+            || std::env::var("CIRIS_PERSIST_DISK_HOST_AT_RISK_BYTES").is_ok()
+            || std::env::var("CIRIS_PERSIST_DISK_POLL_INTERVAL").is_ok();
+        if disk_pressure.is_some() || any_disk_env {
+            let dp_cfg = build_disk_pressure_config(py, disk_pressure.as_ref())?;
+            let monitor = Arc::new(crate::federation::DiskPressureMonitor::new(dp_cfg));
+            // Prime the snapshot once synchronously (so an immediate
+            // disk_pressure_state() call reflects reality, not Normal).
+            monitor.poll_once();
+            // Spawn the background poll loop so the cached snapshot stays
+            // fresh at poll_interval and the enforcement paths read the
+            // latest tier without a per-call statvfs. Enter the runtime
+            // context so tokio::spawn works inside the sync constructor.
+            let handle = {
+                let _enter = cell.runtime.enter();
+                monitor.clone().spawn_poll_loop()
+            };
+            *cell.disk_pressure.lock().unwrap_or_else(|p| p.into_inner()) = Some(monitor);
+            *cell
+                .disk_pressure_handle
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(handle);
+        }
+
         let handle = PyEngine::from_cell(&cell);
         *slot = Some(cell);
         Ok(handle)
@@ -1491,6 +1700,15 @@ impl PyEngine {
                     // Stop signals + returns the JoinHandle; explicit
                     // drop satisfies clippy::let_underscore_future.
                     std::mem::drop(sweeper.stop());
+                }
+                // v6.8.0 (#149) — stop the disk-pressure poll loop too.
+                if let Some(dp) = cell
+                    .disk_pressure_handle
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                {
+                    std::mem::drop(dp.stop());
                 }
                 *slot = None;
             }
@@ -1620,6 +1838,88 @@ impl PyEngine {
                 .map(|report| report.rows_evicted as i64)
                 .map_err(blob_err_to_py)
         })
+    }
+
+    /// v6.8.0 (CIRISPersist#148) — current total local
+    /// `federation_blobs` bytes (the cache usage). For ops monitoring.
+    fn cache_usage_bytes(&self, py: Python<'_>) -> PyResult<u64> {
+        self.ensure_usable()?;
+        let runtime = self.runtime.clone();
+        let slot = engine_slot();
+        let cell = slot
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
+        let engine = crate::Engine::from_shared_with_local(
+            cell.engine_backend_dispatch(),
+            cell.signer.clone(),
+            cell.local_signer.clone(),
+        );
+        drop(slot);
+        py.detach(move || {
+            runtime
+                .block_on(async move { engine.federation_blob_bytes().await })
+                .map_err(blob_err_to_py)
+        })
+    }
+
+    /// v6.8.0 (CIRISPersist#148) — the operator-set (or mode-default)
+    /// storage budget in bytes. `u64::MAX` ⇒ unbounded (Server mode).
+    fn cache_budget_bytes(&self) -> PyResult<u64> {
+        self.ensure_usable()?;
+        let slot = engine_slot();
+        let cell = slot
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
+        let cfg = cell
+            .replication_config
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        Ok(cfg.storage_budget_bytes)
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — live disk-pressure snapshot for
+    /// monitoring. Re-polls the (injectable) free-bytes source, returns
+    /// a dict: `{free_bytes, tier, refuses_proxy_writes,
+    /// refuses_proxy_serves, force_evicts_proxy, active}`. When the
+    /// monitor was never installed, `active=False` and the tier is
+    /// `"normal"` (the substrate is not refusing anything).
+    fn disk_pressure_state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
+        let slot = engine_slot();
+        let cell = slot
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
+        let monitor = cell
+            .disk_pressure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        drop(slot);
+        let dict = PyDict::new(py);
+        match monitor {
+            Some(m) => {
+                // Re-poll so the snapshot is fresh (edge-logging only
+                // fires on transitions; this is a cheap statvfs read).
+                let snap = m.poll_once();
+                dict.set_item("active", true)?;
+                dict.set_item("free_bytes", snap.free_bytes)?;
+                dict.set_item("tier", snap.tier.label())?;
+                dict.set_item("refuses_proxy_writes", snap.refuses_proxy_writes)?;
+                dict.set_item("refuses_proxy_serves", snap.refuses_proxy_serves)?;
+                dict.set_item("force_evicts_proxy", snap.force_evicts_proxy)?;
+            }
+            None => {
+                let snap = crate::federation::DiskPressureSnapshot::normal();
+                dict.set_item("active", false)?;
+                dict.set_item("free_bytes", snap.free_bytes)?;
+                dict.set_item("tier", snap.tier.label())?;
+                dict.set_item("refuses_proxy_writes", false)?;
+                dict.set_item("refuses_proxy_serves", false)?;
+                dict.set_item("force_evicts_proxy", false)?;
+            }
+        }
+        Ok(dict)
     }
 
     /// v1.7.0 (CIRISPersist#79) — return a fresh handle to the
@@ -4637,6 +4937,11 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let payload = parse_put_blob_payload(payload_json)?;
+            // v6.8.0 (CIRISPersist#149) — proactive disk-pressure gate on
+            // the proxy-ACCEPT path. Same rule as `put_blob_signing`:
+            // refuse a proxy write at stop tier; local + family writes
+            // proceed.
+            self.disk_pressure_refuse_proxy_accept(&payload.attestation.attesting_key_id)?;
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
@@ -5542,6 +5847,44 @@ impl PyEngine {
         })
     }
 
+    /// v6.8.0 (CIRISPersist#149) — serve blob bytes to a federation
+    /// PEER, with the proactive disk-pressure gate on the proxy-SERVE
+    /// path. At the stop tier (or tighter) refuses to SERVE
+    /// federation-proxied content (blob with no local/family holder),
+    /// raising `ValueError` (`blob_disk_pressure_proxy_refused`, a
+    /// Permanent signal — the peer should fetch from another holder),
+    /// while still serving local + family content. Raises `ValueError`
+    /// (`blob_not_held`) when the blob is absent. Returns the blob body
+    /// as the same JSON shape as `get_blob_json`.
+    fn serve_blob_to_peer_json(
+        &self,
+        py: Python<'_>,
+        sha256_hex: &str,
+        requesting_peer_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sha = parse_sha256_hex(sha256_hex)?;
+            let peer = requesting_peer_key_id.to_owned();
+            let slot = engine_slot();
+            let cell = slot
+                .as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
+            let engine = cell.engine_view();
+            drop(slot);
+            py.detach(move || {
+                runtime.block_on(async move {
+                    let body = engine
+                        .serve_blob_to_peer(&sha, &peer)
+                        .await
+                        .map_err(blob_err_to_py)?;
+                    encode_blob_body_json(&body)
+                })
+            })
+        })
+    }
+
     /// v4.1 (CIRISPersist#142, Cut A) — byte-range read over a blob by
     /// SHA-256 (hex). RFC 9110 §14.4 semantics: `end_inclusive` is
     /// clamped to size-1; a `start` at/past the blob size raises
@@ -5921,6 +6264,14 @@ impl PyEngine {
             // v3.6.5 (CIRISPersist#137), generalized in v3.6.8 (#138,
             // #140) to a shared `select_signer` helper.
             let attesting_key_id_owned = attesting_key_id.to_string();
+
+            // v6.8.0 (CIRISPersist#149) — proactive disk-pressure gate on
+            // the proxy-ACCEPT path. At stop tier (or tighter) refuse a
+            // proxy write (attesting key neither the local signer nor
+            // family). Local + family writes are NEVER refused. Reads the
+            // cached snapshot (no statvfs per write).
+            self.disk_pressure_refuse_proxy_accept(&attesting_key_id_owned)?;
+
             let signer = self.select_signer(&attesting_key_id_owned);
             let media_type_owned = media_type.map(str::to_owned);
 
@@ -19606,6 +19957,13 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // Python callers branch on it.
         crate::federation::BlobError::NotGranted { .. }
         | crate::federation::BlobError::NotHeld { .. } => PyValueError::new_err(kind),
+        // v6.8.0 (CIRISPersist#149) — disk-pressure proxy refusal.
+        // PERMANENT (ValueError), NOT a retryable RuntimeError/Transient:
+        // the peer should fetch from another holder; retrying this node
+        // won't clear the condition (only host-disk recovery does).
+        crate::federation::BlobError::DiskPressureProxyRefused { .. } => {
+            PyValueError::new_err(kind)
+        }
         crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
     }
 }
@@ -21022,6 +21380,8 @@ mod tests {
             sweeper: std::sync::Mutex::new(None),
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
+            disk_pressure: std::sync::Mutex::new(None),
+            disk_pressure_handle: std::sync::Mutex::new(None),
         });
         *engine_slot() = Some(cell);
         sq
@@ -21169,6 +21529,8 @@ mod tests {
             sweeper: std::sync::Mutex::new(None),
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
+            disk_pressure: std::sync::Mutex::new(None),
+            disk_pressure_handle: std::sync::Mutex::new(None),
         });
         *engine_slot() = Some(cell);
 
@@ -21255,6 +21617,8 @@ mod tests {
             sweeper: std::sync::Mutex::new(None),
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
+            disk_pressure: std::sync::Mutex::new(None),
+            disk_pressure_handle: std::sync::Mutex::new(None),
         });
         (cell, sq)
     }
@@ -21945,6 +22309,39 @@ impl EngineCell {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(sq) => crate::engine::BackendDispatch::Sqlite(sq.clone()),
         }
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — build the canonical cohabitation
+    /// [`Engine`](crate::Engine) view onto this cell, with the
+    /// replication config, disk-pressure config, AND live disk-pressure
+    /// snapshot receiver attached. The proxy-accept / proxy-serve
+    /// enforcement paths (`put_blob_signing` / `serve_blob_to_peer`)
+    /// read the snapshot cheaply (no statvfs per call); the
+    /// force-evict-proxy sweep reads the config's family predicate.
+    /// Shares the cell's backend + signer (no second pool).
+    fn engine_view(&self) -> crate::Engine {
+        let mut engine = crate::Engine::from_shared_with_local(
+            self.engine_backend_dispatch(),
+            self.signer.clone(),
+            self.local_signer.clone(),
+        );
+        let cfg = self
+            .replication_config
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        engine = engine.with_replication_config_shared(cfg);
+        if let Some(monitor) = self
+            .disk_pressure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            engine = engine
+                .with_disk_pressure_config_shared(monitor.config())
+                .with_disk_pressure_state_shared(monitor.subscribe());
+        }
+        engine
     }
 }
 

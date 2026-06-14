@@ -137,9 +137,13 @@ pub use perceptual_hash::{
     NullPerceptualHashMatcher, OnMatchPolicy, PerceptualHashMatcher, SharedMatcher,
 };
 pub use replication::{
-    aggregate_trust_score, withdraws_attestation_envelope, AdmissionGate, EvictionCandidate,
-    EvictionDecay, EvictionSweeper, MemoryTrustScoring, ReplicationConfig, SweepReport,
-    TrustScoring, TrustScoringError, DEFAULT_SWEEP_BATCH, MIN_SWEEP_INTERVAL,
+    aggregate_trust_score, classify_free_bytes, parse_human_bytes, withdraws_attestation_envelope,
+    AdmissionGate, ByteParseError, CacheMode, DiskPressureConfig, DiskPressureMonitor,
+    DiskPressureMonitorHandle, DiskPressureSnapshot, EvictionCandidate, EvictionDecay,
+    EvictionSweeper, FamilyPredicate, FreeBytesSource,
+    MemoryTrustScoring, PressureAction, PressureTier, ReplicationConfig, StatvfsFreeBytes,
+    StubFreeBytes, SweepReport, TrustScoring, TrustScoringError, TrustTier, DEFAULT_SWEEP_BATCH,
+    MIN_POLL_INTERVAL, MIN_SWEEP_INTERVAL,
 };
 pub use rooting::{
     provenance_chain, root_binding, ProvenanceChain, ProvenanceLink, RootingRejection,
