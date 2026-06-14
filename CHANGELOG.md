@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.7.1] — 2026-06-14
+
+### Fixed — `build_delegation_graph` now reads array-shaped delegation scope (CIRISPersist#219)
+
+`federation/topology.rs` read the `delegates_to` envelope `scope` field as a bare string only, so every **self-at-login** delegation — whose `scope` is an array of tokens (`["act_on_behalf", "message_io", "network_presence", "sub_delegation"]`, per §8.1.12.7 / `self_at_login::delegates_to_agent_envelope`) — came out of the graph with an **empty `DelegationEdge.scope`**. Any `DelegationGraph` consumer that filters edges by scope hit this (surfaced by CIRISEdge v3.2.0's wire-layer delegation authority gate, CIRISEdge#108; edge had a local shape-tolerant workaround). The reader (`envelope_field_str_or_set`) now accepts **either** a bare string (unchanged) **or** an array, comma-joining array tokens into the set-as-string form persist already uses for multi-valued fields — so `edge.scope.split(',')` gives the token set for both shapes. Non-breaking (`scope` stays `String`); bare-string scopes are untouched. Unit test covers string passthrough, array join, the real self-at-login envelope, and absent/empty/non-string-array → `None` (so the `dimension` fallback still fires).
+
 ## [6.7.0] — 2026-06-14
 
 ### Added — CEG 1.0-RC5 consent clauses (Lane G): #161 Ask 5 + #146 Ask 5/6

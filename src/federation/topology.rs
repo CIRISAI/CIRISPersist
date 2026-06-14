@@ -454,7 +454,7 @@ pub async fn build_delegation_graph(
             if r.attestation_type != attestation_type::DELEGATES_TO {
                 continue;
             }
-            let scope = envelope_field_str(&r.attestation_envelope, "scope")
+            let scope = envelope_field_str_or_set(&r.attestation_envelope, "scope")
                 .or_else(|| envelope_field_str(&r.attestation_envelope, "dimension"))
                 .unwrap_or_default();
             let evidence_refs = envelope_evidence_refs(&r.attestation_envelope);
@@ -489,6 +489,27 @@ fn envelope_field_str(envelope: &serde_json::Value, field: &str) -> Option<Strin
         .get(field)
         .and_then(|v| v.as_str())
         .map(|s| s.to_owned())
+}
+
+/// v6.7.1 (CIRISPersist#219) — read a delegation envelope field that may be
+/// EITHER a bare string (`"scope": "consent_revocation"`) OR a set of tokens
+/// (`"scope": ["act_on_behalf", "message_io", …]`, the shape
+/// [`self_at_login::delegates_to_agent_envelope`](crate::federation::self_at_login::delegates_to_agent_envelope)
+/// emits per §8.1.12.7). A bare string passes through unchanged; an array is
+/// comma-joined into the set-as-string form persist already uses for
+/// multi-valued columns (matching the `identity_type` set encoding), so
+/// `DelegationEdge::scope` is populated for both shapes and a consumer can
+/// `scope.split(',')` for membership. Returns `None` for an absent field or
+/// an array with no string tokens (so the `dimension` fallback still fires).
+fn envelope_field_str_or_set(envelope: &serde_json::Value, field: &str) -> Option<String> {
+    match envelope.get(field) {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Array(arr)) => {
+            let tokens: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+            (!tokens.is_empty()).then(|| tokens.join(","))
+        }
+        _ => None,
+    }
 }
 
 fn envelope_evidence_refs(envelope: &serde_json::Value) -> Vec<String> {
@@ -600,5 +621,52 @@ mod tests {
         assert_eq!(envelope_field_str(&v, "missing"), None);
         let v2 = serde_json::json!({"scope": 42});
         assert_eq!(envelope_field_str(&v2, "scope"), None);
+    }
+
+    /// v6.7.1 (CIRISPersist#219) — the scope reader must accept BOTH a bare
+    /// string and an array of tokens; the self-at-login `delegates_to`
+    /// envelope emits an array, which the old string-only reader dropped to
+    /// empty (every self-at-login delegation edge came out scope-less).
+    #[test]
+    fn envelope_field_str_or_set_handles_string_and_array() {
+        // Bare string passes through unchanged.
+        let s = serde_json::json!({"scope": "consent_revocation"});
+        assert_eq!(
+            envelope_field_str_or_set(&s, "scope"),
+            Some("consent_revocation".into())
+        );
+        // Array is comma-joined (set-as-string), preserving order.
+        let a = serde_json::json!({"scope": ["act_on_behalf", "message_io"]});
+        assert_eq!(
+            envelope_field_str_or_set(&a, "scope"),
+            Some("act_on_behalf,message_io".into())
+        );
+        // The canonical #219 repro: the real self-at-login envelope.
+        let env = crate::federation::self_at_login::delegates_to_agent_envelope(
+            "agent-occ",
+            "pair-1",
+            &crate::federation::self_at_login::SELF_AT_LOGIN_DELEGATION_SCOPE,
+        );
+        let scope = envelope_field_str_or_set(&env, "scope").expect("array scope is read");
+        assert!(
+            !scope.is_empty(),
+            "#219: self-at-login scope must not be empty"
+        );
+        for tok in crate::federation::self_at_login::SELF_AT_LOGIN_DELEGATION_SCOPE {
+            assert!(
+                scope.split(',').any(|t| t == tok),
+                "scope set must contain {tok}"
+            );
+        }
+        // Absent / non-string-array → None, so the `dimension` fallback fires.
+        assert_eq!(envelope_field_str_or_set(&s, "missing"), None);
+        assert_eq!(
+            envelope_field_str_or_set(&serde_json::json!({"scope": []}), "scope"),
+            None
+        );
+        assert_eq!(
+            envelope_field_str_or_set(&serde_json::json!({"scope": [1, 2]}), "scope"),
+            None
+        );
     }
 }
