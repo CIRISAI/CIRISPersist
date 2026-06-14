@@ -121,7 +121,7 @@ pub use aggregates::repository::{
 };
 pub use aggregates::scoring::{
     AuditChainAggregate, CoherencePoint, DivergenceRow, HashChainGap, OverrideRateRow,
-    RecoveryEvent, ScoringFactorAggregate, TemporalDriftRow,
+    RecoveryEvent, ScoringFactorAggregate, StreamSummary, TemporalDriftRow,
 };
 pub use aggregates::scrub::ScrubAggregate;
 pub use list::federation::{
@@ -447,6 +447,27 @@ pub trait ReadEngine: Send + Sync {
         baseline_window: Option<TimeWindow>,
         scope: CallerScope,
     ) -> impl Future<Output = Result<Vec<ScoringFactorAggregate>, Error>> + Send;
+
+    /// Streaming variant (CIRISPersist#197, substrate side of
+    /// CIRISLensCore#44): invoke `callback` with each agent's
+    /// [`ScoringFactorAggregate`] as it completes, so the lens can
+    /// SSE/`StreamingResponse` per-agent rows instead of blocking on the
+    /// whole fleet. Returns a terminal [`StreamSummary`] once the scan
+    /// finishes.
+    ///
+    /// The callback returns `bool`: `false` aborts the scan (the future
+    /// resolves with `aborted: true` and no further callbacks fire).
+    /// Composed over the #196 rollup on Postgres+TimescaleDB (sub-second
+    /// total). Shares the batch path's scoring-factors cache — a warm
+    /// batch makes this a pure cache replay (`cache_hit: true`).
+    fn aggregate_scoring_factors_stream(
+        &self,
+        agent_id_hashes: Vec<String>,
+        window: TimeWindow,
+        baseline_window: Option<TimeWindow>,
+        scope: CallerScope,
+        callback: impl FnMut(ScoringFactorAggregate) -> bool + Send + 'static,
+    ) -> impl Future<Output = Result<StreamSummary, Error>> + Send;
 
     /// Granular: count traces matching a filter. Used by analysts
     /// composing narrower questions than the bundled aggregate.

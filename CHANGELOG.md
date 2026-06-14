@@ -5,6 +5,26 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.8.0] — 2026-06-14
+
+### Added — scoring-factor rollup (CIRISPersist#196) + streaming aggregate (CIRISPersist#197)
+
+Substrate side of CIRISLensCore#45 (#196) and CIRISLensCore#44 (#197).
+
+- **#196 — `trace_events_factor_rollup_1h` TimescaleDB continuous aggregate (migration V079).** `aggregate_scoring_factors_batch` aggregated raw `cirislens.trace_events` on every cold call — O(agents × traces-in-window), ~65s for 151 agents × 30d. V079 adds a 1h-bucketed continuous aggregate keyed `(time_bucket, agent_id_hash, deployment_domain, cohort_scope, cohort_target_id)` storing the bucket-summable factor **counts** (`trace_count` = `COUNT(DISTINCT trace_id)`, per-trace override / fragility / per-check-fail numerators via `COUNT(DISTINCT trace_id) FILTER (…)`, audit-seq/sig totals, DMA-score `SUM`+`COUNT`), plus the `add_continuous_aggregate_policy` (start_offset 7d, end_offset 1h, schedule_interval **knob** default 10min). The **multi-agent** batch (the fleet sweep) for an Unauthenticated caller now sums buckets — sub-second; a batch-of-one (the `aggregate_scoring_factors` detail path) and any Authenticated / pure-Postgres / pre-V079 caller fall through to the exact direct aggregation.
+  - **(a) Score source** = `payload` JSONB (the V009 `extracted_features` column is NULL for pipeline-skipped rows; the direct compute already reads `payload->>'…'`, so the rollup pre-aggregates the same source → equal answers).
+  - **(b) CEG §10.1.4 structural invisibility** = `cohort_scope` + `cohort_target_id` are grouping columns, but the CAGG's own `WHERE cohort_scope NOT IN ('self','family')` filters those rows **at materialization** (never written → cannot leak through a read-path bug). An Unauthenticated caller's admissible set is exactly the materialized broad-tiers, so the rollup is exact for them; self/family-admitting (Authenticated) callers fall through to direct, never under-counted.
+  - **(c) AV-43 `sample_count`** = the summed `trace_count`, surfaced verbatim.
+  - **CAGG-in-migration constraint:** refinery 0.9.2's tokio-postgres driver wraps every migration in a transaction with no no-transaction escape hatch, and TimescaleDB forbids CAGG DDL inside a txn. V079 runs the `CREATE MATERIALIZED VIEW … WITH (timescaledb.continuous)` + policy through a **`dblink` autonomous self-loop connection** (`user=current_user`), so the DDL executes outside refinery's transaction; the whole block no-ops when TimescaleDB is absent and when the CAGG already exists.
+
+- **#197 — `aggregate_scoring_factors_stream`.** New `ReadEngine` method (both backends + memory stub) delivering per-agent `ScoringFactorAggregate`s through a `FnMut(…) -> bool` callback (`false` aborts the cursor scan), resolving to a `StreamSummary { emitted, skipped, aborted, cache_hit, evaluated_at_unix_ms }`. Composed over the #196 rollup and **sharing the batch path's scoring-factors cache** (a warm batch is a pure replay). PyO3 surface `engine.aggregate_scoring_factors_stream(...)` returns an **async-iterator** (`ScoringFactorStream` — `__aiter__`/`__anext__` via already-resolved asyncio futures, no `pyo3-async-runtimes` / experimental-async dep) so the lens can `async for agg in …` and `StreamingResponse`/SSE the fleet; also supports the sync iterator protocol and a `.summary()` accessor.
+
+### Backends
+Both backends keep both methods functional. The continuous aggregate is **PG-only** (TimescaleDB); on sqlite (no CAGG) `aggregate_scoring_factors_batch`/`_stream` use the existing direct per-agent aggregation — correct, just not CAGG-fast (characterized in-code). No `Err("not implemented")` on either path.
+
+### Tests
+Net-new self-isolating tests (uuid-suffixed agent hashes): live-PG `read_section_e_factor_rollup_matches_direct` (rollup scalars == direct), `read_section_e_factor_rollup_excludes_self_family` (CEG §10.1.4 — a `self` row never appears in the public rollup), `read_section_e_stream_emits_and_aborts` (emit/skip tally + callback abort), and sqlite `re_scoring_factors_stream_sqlite`. The two CAGG tests require a TimescaleDB image (the lead's :5433 `timescale/timescaledb:latest-pg16`) and skip on plain Postgres. Full feature set (`postgres sqlite server pyo3 cirisaudit secrets cirisnode cirisgraph telemetry`) green: clippy clean; the pre-existing scoring suite (incl. `round_trip`, cache-watermark) stays green because batch-of-one keeps the direct compute.
+
 ## [6.7.1] — 2026-06-14
 
 ### Fixed — `build_delegation_graph` now reads array-shaped delegation scope (CIRISPersist#219)

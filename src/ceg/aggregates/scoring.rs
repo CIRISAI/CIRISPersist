@@ -263,6 +263,36 @@ impl Aggregate for ScoringFactorAggregate {
     }
 }
 
+/// Outcome summary for a streaming
+/// [`aggregate_scoring_factors_stream`](crate::ceg::ReadEngine::aggregate_scoring_factors_stream)
+/// run (CIRISPersist#197, substrate side of CIRISLensCore#44).
+///
+/// The per-agent [`ScoringFactorAggregate`]s are delivered through the
+/// caller's callback as they complete; this struct is the terminal
+/// roll-up the future resolves to once the scan finishes (or the callback
+/// aborts it). `cache_hit` / `evaluated_at_unix_ms` mirror
+/// [`RepositoryStatistics`](crate::ceg::aggregates::repository::RepositoryStatistics)
+/// and the batch path — the stream shares the batch's scoring-factors
+/// cache, so a warm batch makes the stream a pure cache replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamSummary {
+    /// Number of per-agent aggregates the callback received.
+    pub emitted: i64,
+    /// Number of requested agents skipped (no rows / scope-excluded /
+    /// dropped after a cache-set remap). `emitted + skipped` equals the
+    /// requested-agent count on a non-aborted run.
+    pub skipped: i64,
+    /// `true` iff the callback returned `false` and the scan stopped early.
+    pub aborted: bool,
+    /// `true` iff the underlying aggregates were served from the shared
+    /// scoring-factors cache (no recompute this call).
+    pub cache_hit: bool,
+    /// Unix-ms the aggregates were evaluated against the backend (the
+    /// cached evaluation time when `cache_hit`). Mirrors
+    /// [`ScoringFactorAggregate::evaluated_at_unix_ms`].
+    pub evaluated_at_unix_ms: i64,
+}
+
 /// One recovery event — the agent's conscience overrode an action
 /// at trace_a, then the agent's NEXT trace passed conscience.
 /// Interval = trace_b.started_at - trace_a.completed_at.

@@ -9783,6 +9783,126 @@ impl PyEngine {
         })
     }
 
+    /// Streaming variant (CIRISPersist#197, CIRISLensCore#44) — returns an
+    /// async-iterator yielding one `ScoringFactorAggregate` JSON string per
+    /// agent as it completes, so the lens can `StreamingResponse`/SSE the
+    /// fleet instead of blocking ~65s:
+    ///
+    /// ```python
+    /// it = engine.aggregate_scoring_factors_stream(
+    ///         json.dumps(hashes), window_json, baseline_json, caller_key)
+    /// async for agg_json in it:
+    ///     ...                       # render the agent as it arrives
+    /// summary = json.loads(it.summary())   # StreamSummary after the loop
+    /// ```
+    ///
+    /// Param/JSON conventions match `aggregate_scoring_factors_batch`:
+    /// `agent_id_hashes_json` is a JSON array of strings; `window_json` /
+    /// `baseline_window_json` are `TimeWindow` JSON; `caller_occurrence_key_id`
+    /// resolves the §4.3 scope (None → Unauthenticated → the #196 rollup
+    /// fast path on Postgres+TimescaleDB).
+    ///
+    /// IMPLEMENTATION — the aggregates are computed eagerly (sharing the
+    /// batch path's cache + #196 rollup) into a buffer at call time; the
+    /// returned object replays that buffer through `__anext__` as
+    /// already-resolved awaitables. This keeps the per-row callback-abort
+    /// contract of the Rust `aggregate_scoring_factors_stream` at the SQL
+    /// layer (the heavy scan stops on the substrate side) while giving the
+    /// lens the `async for` shape it consumes — without pulling
+    /// pyo3-async-runtimes or the experimental-async feature into the
+    /// substrate. The callback used internally never aborts (the PyO3
+    /// surface delivers the full set); lens-side early-exit is a normal
+    /// `break` out of the `async for`.
+    #[pyo3(signature = (agent_id_hashes_json, window_json, baseline_window_json=None, caller_occurrence_key_id=None))]
+    fn aggregate_scoring_factors_stream(
+        &self,
+        py: Python<'_>,
+        agent_id_hashes_json: &str,
+        window_json: &str,
+        baseline_window_json: Option<&str>,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<ScoringFactorStream> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let aids: Vec<String> = serde_json::from_str(agent_id_hashes_json)
+                .map_err(|e| PyValueError::new_err(format!("agent_id_hashes decode: {e}")))?;
+            let window: crate::read::TimeWindow = serde_json::from_str(window_json)
+                .map_err(|e| PyValueError::new_err(format!("TimeWindow decode: {e}")))?;
+            let baseline: Option<crate::read::TimeWindow> = match baseline_window_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("baseline TimeWindow decode: {e}"))
+                })?),
+            };
+            let dispatch = self.engine_dispatch();
+            let signer = self.signer.clone();
+            py.detach(move || {
+                // The internal callback buffers each emitted aggregate as
+                // its JSON string. It never aborts — the PyO3 generator
+                // surfaces the whole set and the lens breaks its own loop.
+                let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+                let buf_cb = buffer.clone();
+                let collect = move |agg: crate::read::ScoringFactorAggregate| -> bool {
+                    if let Ok(s) = serde_json::to_string(&agg) {
+                        buf_cb.lock().expect("stream buffer lock").push(s);
+                    }
+                    true
+                };
+                let summary = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::read::ReadEngine;
+                            let scope = Self::resolve_scope(
+                                dispatch.clone(),
+                                signer.clone(),
+                                caller_occurrence_key_id.clone(),
+                            )
+                            .await?;
+                            backend
+                                .aggregate_scoring_factors_stream(
+                                    aids, window, baseline, scope, collect,
+                                )
+                                .await
+                                .map_err(read_err_to_py)
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::read::ReadEngine;
+                            let scope = Self::resolve_scope(
+                                dispatch.clone(),
+                                signer.clone(),
+                                caller_occurrence_key_id.clone(),
+                            )
+                            .await?;
+                            backend
+                                .aggregate_scoring_factors_stream(
+                                    aids, window, baseline, scope, collect,
+                                )
+                                .await
+                                .map_err(read_err_to_py)
+                        })
+                    }
+                }?;
+                let items = std::sync::Arc::try_unwrap(buffer)
+                    .map(|m| m.into_inner().expect("stream buffer lock"))
+                    .unwrap_or_else(|arc| arc.lock().expect("stream buffer lock").clone());
+                let summary_json = serde_json::to_string(&summary).map_err(|e| {
+                    PyRuntimeError::new_err(format!("StreamSummary encode: {e}"))
+                })?;
+                Ok(ScoringFactorStream {
+                    items,
+                    index: 0,
+                    summary_json,
+                })
+            })
+        })
+    }
+
     /// Granular: count distinct trace_id matching filter.
     #[pyo3(signature = (filter_json, caller_occurrence_key_id=None))]
     fn count_traces(
@@ -22148,9 +22268,86 @@ impl crate::federation::PerceptualHashMatcher for PyPerceptualHashMatcher {
     }
 }
 
+/// CIRISPersist#197 (CIRISLensCore#44) — async-iterator over a completed
+/// scoring-factor stream. Returned by
+/// [`PyEngine::aggregate_scoring_factors_stream`].
+///
+/// The aggregates were computed eagerly at call time (sharing the batch
+/// path's cache + the #196 rollup fast path); this object replays them as
+/// the lens awaits. Each `__anext__` hands back an ALREADY-RESOLVED
+/// asyncio future wrapping the next `ScoringFactorAggregate` JSON string,
+/// so `async for` returns each row without blocking the event loop, and
+/// raises `StopAsyncIteration` when the buffer is drained.
+///
+/// This shape deliberately avoids `pyo3-async-runtimes` and the
+/// `experimental-async` pyo3 feature (neither is in the substrate's dep
+/// set) — the abort/cache semantics that matter live on the Rust
+/// `aggregate_scoring_factors_stream` at the SQL layer; the Python surface
+/// only needs the `async for` ergonomics.
+#[pyclass]
+struct ScoringFactorStream {
+    items: Vec<String>,
+    index: usize,
+    summary_json: String,
+}
+
+#[pymethods]
+impl ScoringFactorStream {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Return an already-resolved asyncio future carrying the next item,
+    /// or raise `StopAsyncIteration` when exhausted. `await`-ing a
+    /// completed future returns immediately, so the lens's `async for`
+    /// advances at memory speed over the pre-computed buffer.
+    fn __anext__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        if self.index >= self.items.len() {
+            return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+        }
+        let item = self.items[self.index].clone();
+        self.index += 1;
+
+        // future = asyncio.get_event_loop().create_future(); future.set_result(item)
+        let asyncio = py.import("asyncio")?;
+        let loop_obj = asyncio.call_method0("get_event_loop")?;
+        let future = loop_obj.call_method0("create_future")?;
+        future.call_method1("set_result", (item,))?;
+        Ok(future)
+    }
+
+    /// Also support the SYNC iterator protocol so callers in a non-async
+    /// context (tests, batch tools) can `for agg_json in it:` over the
+    /// same pre-computed buffer.
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self) -> Option<String> {
+        if self.index >= self.items.len() {
+            return None;
+        }
+        let item = self.items[self.index].clone();
+        self.index += 1;
+        Some(item)
+    }
+
+    /// The terminal `StreamSummary` JSON (emitted/skipped/aborted/
+    /// cache_hit/evaluated_at_unix_ms). Read after the loop completes.
+    fn summary(&self) -> String {
+        self.summary_json.clone()
+    }
+
+    /// Number of buffered per-agent rows (for `len()`-style probes).
+    fn __len__(&self) -> usize {
+        self.items.len()
+    }
+}
+
 #[pymodule]
 fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEngine>()?;
+    m.add_class::<ScoringFactorStream>()?;
     // v3.8.0 (CIRISPersist#151) — register the stateful
     // ReconsiderDosGuard wrapper (CIRISVerify v4.7.0 #50 F-AV-RECONSIDER-DOS).
     // Stateless wheel surfaces (key_grant, hybrid_kex, locale_merkle,

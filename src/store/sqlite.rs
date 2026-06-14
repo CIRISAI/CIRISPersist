@@ -10767,6 +10767,54 @@ impl crate::read::ReadEngine for SqliteBackend {
         Ok(out)
     }
 
+    async fn aggregate_scoring_factors_stream(
+        &self,
+        agent_id_hashes: Vec<String>,
+        window: crate::read::TimeWindow,
+        baseline_window: Option<crate::read::TimeWindow>,
+        scope: crate::scope::CallerScope,
+        mut callback: impl FnMut(crate::read::ScoringFactorAggregate) -> bool + Send + 'static,
+    ) -> Result<crate::read::StreamSummary, crate::read::Error> {
+        // CIRISPersist#197 — same compose-over-batch shape as Postgres so
+        // the stream shares the scoring-factors cache + abort semantics.
+        //
+        // PERF: there is NO TimescaleDB continuous aggregate on sqlite (the
+        // #196 rollup is PG-only), so the underlying batch here is the
+        // direct O(agents × traces) per-agent aggregation — correct, but
+        // not the sub-second CAGG fast path the Postgres+TimescaleDB
+        // Unauthenticated route gets. Streaming still lets the lens render
+        // agents as they complete instead of blocking on the whole fleet.
+        let aggs = self
+            .aggregate_scoring_factors_batch(&agent_id_hashes, window, baseline_window, scope)
+            .await?;
+
+        let cache_hit = aggs.first().map(|a| a.cache_hit).unwrap_or(false);
+        let evaluated_at_unix_ms = aggs.first().map(|a| a.evaluated_at_unix_ms).unwrap_or(0);
+
+        let mut emitted = 0i64;
+        let mut skipped = 0i64;
+        let mut aborted = false;
+        for agg in aggs {
+            if agg.trace_count == 0 {
+                skipped += 1;
+                continue;
+            }
+            emitted += 1;
+            if !callback(agg) {
+                aborted = true;
+                break;
+            }
+        }
+
+        Ok(crate::read::StreamSummary {
+            emitted,
+            skipped,
+            aborted,
+            cache_hit,
+            evaluated_at_unix_ms,
+        })
+    }
+
     async fn count_traces(
         &self,
         filter: crate::read::TraceFilter,
@@ -19881,6 +19929,68 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 5, 2, 0, 0, 0).unwrap(),
         )
         .unwrap()
+    }
+
+    /// CIRISPersist#197 — sqlite streaming path: emits one aggregate per
+    /// non-empty agent (over the direct aggregation — there is NO CAGG on
+    /// sqlite), tallies skipped, and aborts on callback `false`. Proves
+    /// the method is functional on sqlite (no `Err("not implemented")`).
+    #[tokio::test]
+    async fn re_scoring_factors_stream_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        insert_trace(
+            &backend, "s1", None, 0, "agent-x", "Scout", "legal", false, 0.5, None,
+        )
+        .await;
+        insert_trace(
+            &backend, "s2", None, 1, "agent-x", "Scout", "legal", true, 0.4, None,
+        )
+        .await;
+        insert_trace(
+            &backend, "s3", None, 2, "agent-y", "Echo", "legal", false, 0.6, None,
+        )
+        .await;
+        let window = scoring_window();
+
+        // a-empty has no traces → skipped.
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let c = collected.clone();
+        let summary = backend
+            .aggregate_scoring_factors_stream(
+                vec![
+                    "agent-x".to_owned(),
+                    "agent-y".to_owned(),
+                    "agent-empty".to_owned(),
+                ],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+                move |agg| {
+                    c.lock().unwrap().push(agg.agent_id_hash);
+                    true
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.emitted, 2, "agent-x + agent-y emitted");
+        assert_eq!(summary.skipped, 1, "agent-empty skipped");
+        assert!(!summary.aborted);
+        assert_eq!(collected.lock().unwrap().len(), 2);
+
+        // Abort on first callback.
+        let summary2 = backend
+            .aggregate_scoring_factors_stream(
+                vec!["agent-x".to_owned(), "agent-y".to_owned()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+                move |_a| false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary2.emitted, 1);
+        assert!(summary2.aborted);
     }
 
     /// Cache HIT: the second identical batch call is served from cache —
