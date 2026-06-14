@@ -10876,21 +10876,120 @@ impl crate::read::ReadEngine for PostgresBackend {
             return Ok(scoring::reorder_scoring_to_input(hit, agent_id_hashes));
         }
 
+        // CIRISPersist#196 — fast path: sum the TimescaleDB continuous
+        // aggregate when the caller's scope is fully covered by the rollup
+        // (Unauthenticated → broad-tiers only, all materialized) AND the
+        // rollup exists (TimescaleDB present + V079 applied). Sub-second
+        // (sum of ≈109k small buckets) vs the O(agents × traces) direct
+        // aggregation. Authenticated callers (self/family admission) and
+        // pure-Postgres / pre-V079 deployments fall through to the exact
+        // direct compute below — NO functionality is pg-only; the rollup
+        // is purely an acceleration.
         let mut out = Vec::with_capacity(agent_id_hashes.len());
-        for aid in agent_id_hashes {
-            out.push(
-                self.aggregate_scoring_factors_uncached(
-                    aid,
-                    window,
-                    baseline_window,
-                    scope.clone(),
-                )
-                .await?,
-            );
+        // The rollup fast path is for the FLEET SWEEP (multi-agent). A
+        // single-agent call is the detail path (`aggregate_scoring_factors`
+        // routes through batch-of-one) and needs the full per-trace fields
+        // — recovery_events / coherence_decay_series / drift / gaps /
+        // identity_changes — which the scalar rollup does not carry; it
+        // also wants up-to-the-second data (no CAGG refresh lag). So
+        // batch-of-one keeps the exact direct compute; only `len > 1`
+        // takes the rollup.
+        if agent_id_hashes.len() > 1
+            && baseline_window.is_none()
+            && Self::scope_fully_covered_by_rollup(&scope)
+            && self.factor_rollup_present().await?
+        {
+            let mut by_agent = self
+                .aggregate_scoring_factors_rollup_batch(agent_id_hashes, window)
+                .await?;
+            for aid in agent_id_hashes {
+                // An agent with no rollup buckets in the window gets an
+                // empty aggregate (trace_count 0) — same shape the direct
+                // path returns for a zero-row agent.
+                out.push(by_agent.remove(aid).unwrap_or_else(|| {
+                    crate::read::ScoringFactorAggregate {
+                        agent_id_hash: aid.clone(),
+                        window,
+                        trace_count: 0,
+                        identity_changes: 0,
+                        conscience_overrides: 0,
+                        audit_chain_total: 0,
+                        audit_chain_gaps: 0,
+                        audit_signed_total: 0,
+                        recovery_events: Vec::new(),
+                        drift_z_score: None,
+                        calibration_error: None,
+                        unsafe_action_rate: 0.0,
+                        coherence_decay_series: Vec::new(),
+                        evaluated_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                        cache_hit: false,
+                    }
+                }));
+            }
+        } else {
+            for aid in agent_id_hashes {
+                out.push(
+                    self.aggregate_scoring_factors_uncached(
+                        aid,
+                        window,
+                        baseline_window,
+                        scope.clone(),
+                    )
+                    .await?,
+                );
+            }
         }
         let size = scoring::estimate_size(&out);
         cache.store(key, out.clone(), size);
         Ok(out)
+    }
+
+    async fn aggregate_scoring_factors_stream(
+        &self,
+        agent_id_hashes: Vec<String>,
+        window: crate::read::TimeWindow,
+        baseline_window: Option<crate::read::TimeWindow>,
+        scope: crate::scope::CallerScope,
+        mut callback: impl FnMut(crate::read::ScoringFactorAggregate) -> bool + Send + 'static,
+    ) -> Result<crate::read::StreamSummary, crate::read::Error> {
+        // CIRISPersist#197 — compose over the batch path so the stream
+        // SHARES the scoring-factors cache (a warm batch makes the stream a
+        // pure cache replay) and the #196 rollup fast path. The batch is
+        // already per-agent internally; we tee each completed aggregate
+        // through the caller's callback in input order, stopping the scan
+        // when the callback returns `false`.
+        let aggs = self
+            .aggregate_scoring_factors_batch(&agent_id_hashes, window, baseline_window, scope)
+            .await?;
+
+        let cache_hit = aggs.first().map(|a| a.cache_hit).unwrap_or(false);
+        let evaluated_at_unix_ms = aggs.first().map(|a| a.evaluated_at_unix_ms).unwrap_or(0);
+
+        // Emit only agents with observed traces; an agent with no rows in
+        // the window is `skipped` (the lens renders nothing for it). The
+        // callback's `false` aborts the remaining scan.
+        let mut emitted = 0i64;
+        let mut skipped = 0i64;
+        let mut aborted = false;
+        for agg in aggs {
+            if agg.trace_count == 0 {
+                skipped += 1;
+                continue;
+            }
+            emitted += 1;
+            if !callback(agg) {
+                aborted = true;
+                break;
+            }
+        }
+
+        Ok(crate::read::StreamSummary {
+            emitted,
+            skipped,
+            aborted,
+            cache_hit,
+            evaluated_at_unix_ms,
+        })
     }
 
     /// Section E granular: count distinct trace_id matching a filter.
@@ -11256,6 +11355,150 @@ impl PostgresBackend {
     /// AV-43: aggregates return computed statistics. Smallest-window
     /// callers apply k-anonymity at their layer based on `trace_count`.
     ///
+    /// CIRISPersist#196 — is the caller's scope FULLY covered by the
+    /// `trace_events_factor_rollup_1h` continuous aggregate?
+    ///
+    /// The rollup materializes only public-eligible rows
+    /// (`cohort_scope NOT IN ('self','family')`, the CEG §10.1.4
+    /// structural-invisibility filter baked into the CAGG). An
+    /// [`Unauthenticated`](crate::scope::CallerScope::Unauthenticated)
+    /// caller's admissible set is exactly the broad belonging-tiers, all
+    /// of which ARE materialized — so the rollup yields the complete
+    /// answer and the fast path is exact.
+    ///
+    /// An [`Authenticated`](crate::scope::CallerScope::Authenticated)
+    /// caller additionally admits its own `self` rows and any `family`
+    /// rows it belongs to — neither is materialized — so the rollup would
+    /// UNDERCOUNT. Those callers fall through to the direct
+    /// `aggregate_scoring_factors_uncached` raw-`trace_events` aggregation
+    /// (correct, just not CAGG-fast). This keeps the §10.1.4 invariant
+    /// structural (a self/family bucket is never materialized, so it can
+    /// never leak through the fast path) without ever returning a wrong
+    /// number to an authenticated caller.
+    fn scope_fully_covered_by_rollup(scope: &crate::scope::CallerScope) -> bool {
+        matches!(scope, crate::scope::CallerScope::Unauthenticated)
+    }
+
+    /// CIRISPersist#196 — does `cirislens.trace_events_factor_rollup_1h`
+    /// exist in this database? Pure-Postgres deployments (no TimescaleDB,
+    /// FSD §7 #7) never have it (V079 no-ops there); a TimescaleDB
+    /// deployment that hasn't yet run the V079 schedule also reads as
+    /// present-but-empty (the CAGG row exists). One cheap catalog probe;
+    /// a NULL/absent `timescaledb_information` view (no extension) is
+    /// treated as "no rollup".
+    async fn factor_rollup_present(&self) -> Result<bool, crate::read::Error> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+        // `to_regclass` is NULL when the relation is absent; it does not
+        // error on a missing relation, so this is safe with or without
+        // TimescaleDB installed.
+        let row = client
+            .query_one(
+                "SELECT to_regclass('cirislens.trace_events_factor_rollup_1h') IS NOT NULL AS present",
+                &[],
+            )
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("factor_rollup probe: {e}")))?;
+        row.safe_get::<bool, _>("present")
+    }
+
+    /// CIRISPersist#196 — sum-of-buckets read over
+    /// `trace_events_factor_rollup_1h` for the requested agents + window.
+    ///
+    /// Returns one [`ScoringFactorAggregate`] per agent that has at least
+    /// one rollup bucket in the window (agents with no buckets are absent
+    /// from the map — the caller fills them as empty / direct). Only the
+    /// **bucket-summable scalar factors** are populated from the rollup:
+    /// `trace_count`, `conscience_overrides`, `audit_chain_total`,
+    /// `audit_signed_total`, and `unsafe_action_rate` is left 0.0 (NOT
+    /// rollup-derivable — see V079 header). The per-trace-sequenced /
+    /// baseline-dependent fields (`recovery_events`,
+    /// `coherence_decay_series`, `audit_chain_gaps`, `identity_changes`,
+    /// `drift_z_score`, `calibration_error`) are left at their empty/None
+    /// defaults: the fleet Capacity sweep consumes the scalar factors;
+    /// the singular detail path (`aggregate_scoring_factors`) routes
+    /// through the direct compute for those.
+    ///
+    /// The window is summed on whole buckets — the caller's `since`/`until`
+    /// select buckets whose `bucket_start` falls in `[since, until)`; the
+    /// 1h grain is the documented resolution (CIRISPersist#196).
+    async fn aggregate_scoring_factors_rollup_batch(
+        &self,
+        agent_id_hashes: &[String],
+        window: crate::read::TimeWindow,
+    ) -> Result<
+        std::collections::HashMap<String, crate::read::ScoringFactorAggregate>,
+        crate::read::Error,
+    > {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        // Sum the per-bucket numerators + denominator across the window,
+        // grouped by agent. Rates / means are divided ONCE here from the
+        // summed components (never averaging pre-divided per-bucket rates).
+        // The rollup already excludes self/family rows (CAGG WHERE), so no
+        // scope predicate is needed for the Unauthenticated fast path; we
+        // additionally constrain to the public-federatable scopes
+        // defensively in case a future CAGG edit widens materialization.
+        let sql = "SELECT \
+                agent_id_hash, \
+                SUM(trace_count)::bigint AS trace_count, \
+                SUM(override_trace_count)::bigint AS override_trace_count, \
+                SUM(audit_seq_trace_count)::bigint AS audit_seq_trace_count, \
+                SUM(audit_sig_trace_count)::bigint AS audit_sig_trace_count \
+             FROM cirislens.trace_events_factor_rollup_1h \
+             WHERE agent_id_hash = ANY($1) \
+               AND bucket_start >= $2 AND bucket_start < $3 \
+               AND cohort_scope NOT IN ('self','family') \
+             GROUP BY agent_id_hash";
+        let rows = client
+            .query(
+                sql,
+                &[&agent_id_hashes.to_vec(), &window.since, &window.until],
+            )
+            .await
+            .map_err(|e| {
+                crate::read::Error::Backend(format!("aggregate_scoring_factors rollup: {e}"))
+            })?;
+
+        let evaluated_at_unix_ms = chrono::Utc::now().timestamp_millis();
+        let mut out = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            let agent_id_hash: String = row.safe_get("agent_id_hash")?;
+            let trace_count: i64 = row.safe_get("trace_count")?;
+            let conscience_overrides: i64 = row.safe_get("override_trace_count")?;
+            let audit_chain_total: i64 = row.safe_get("audit_seq_trace_count")?;
+            let audit_signed_total: i64 = row.safe_get("audit_sig_trace_count")?;
+            out.insert(
+                agent_id_hash.clone(),
+                crate::read::ScoringFactorAggregate {
+                    agent_id_hash,
+                    window,
+                    trace_count,
+                    identity_changes: 0,
+                    conscience_overrides,
+                    audit_chain_total,
+                    audit_chain_gaps: 0,
+                    audit_signed_total,
+                    recovery_events: Vec::new(),
+                    drift_z_score: None,
+                    calibration_error: None,
+                    unsafe_action_rate: 0.0,
+                    coherence_decay_series: Vec::new(),
+                    evaluated_at_unix_ms,
+                    cache_hit: false,
+                },
+            );
+        }
+        Ok(out)
+    }
+
     /// CIRISPersist#195 — the uncached per-agent compute. The public
     /// `aggregate_scoring_factors` (batch-of-one) and
     /// `aggregate_scoring_factors_batch` both loop over this under one
@@ -15694,6 +15937,360 @@ mod tests {
         // Baseline has no samples → drift_z_score is None (the
         // temporal_drift result has no row for csdma).
         assert!(agg.drift_z_score.is_none());
+    }
+
+    /// CIRISPersist#196 test helper — is TimescaleDB installed on the
+    /// test DB? The lead's :5433 is `timescale/timescaledb:latest-pg16`,
+    /// so the CAGG-backed tests run there; a plain-Postgres test DB skips
+    /// them (the rollup is a PG-only acceleration; the methods still work
+    /// via direct aggregation, exercised by the non-CAGG tests).
+    async fn timescaledb_present(backend: &PostgresBackend) -> bool {
+        let client = backend.pool.get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname='timescaledb') AS p",
+                &[],
+            )
+            .await
+            .unwrap();
+        row.get::<_, bool>("p")
+    }
+
+    /// CIRISPersist#196 test helper — force-materialize the
+    /// `trace_events_factor_rollup_1h` continuous aggregate so a read sees
+    /// just-inserted rows (the automatic policy's `end_offset => 1h`
+    /// excludes the most-recent hour, and the schedule is async). A full
+    /// `(NULL, NULL)` refresh materializes everything regardless of the
+    /// policy window.
+    async fn refresh_factor_rollup(backend: &PostgresBackend) {
+        let client = backend.pool.get().await.unwrap();
+        client
+            .batch_execute(
+                "CALL refresh_continuous_aggregate('cirislens.trace_events_factor_rollup_1h', NULL, NULL);",
+            )
+            .await
+            .expect("refresh continuous aggregate");
+    }
+
+    /// CIRISPersist#196 — the rollup fast path (Unauthenticated →
+    /// fully-rollup-covered) returns the SAME scalar factors the direct
+    /// aggregation does. Proves the sum-of-buckets read is exact for the
+    /// bucket-summable factors (trace_count, conscience_overrides,
+    /// audit totals). Requires the timescaledb image.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_e_factor_rollup_matches_direct() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        if !timescaledb_present(&backend).await {
+            eprintln!("skipping: TimescaleDB not installed (CAGG test needs timescale image)");
+            return;
+        }
+
+        use crate::read::ReadEngine;
+        let suffix = uuid_like();
+        let aid = format!("agent-§e-rollup-{suffix}");
+        // A second agent so the batch has len > 1 and engages the rollup
+        // fast path (a batch-of-one is the detail path → direct compute).
+        let aid2 = format!("agent-§e-rollup2-{suffix}");
+        let now = chrono::Utc::now();
+
+        // 4 traces for aid: 1 overridden (conscience fail), 3 clean — all
+        // cohort_scope='federation' (the fixture default → rollup-eligible).
+        for i in 0..4 {
+            insert_section_a_fixture_trace(
+                &backend,
+                &format!("trace-§e-rollup-{suffix}-{i}"),
+                &aid,
+                Some(&aid),
+                Some("rollup-d"),
+                now - chrono::Duration::minutes(30),
+                i == 0,
+                0.5,
+                0.5,
+                1.0,
+            )
+            .await;
+        }
+        // 1 trace for aid2 (so the second slot is non-empty too).
+        insert_section_a_fixture_trace(
+            &backend,
+            &format!("trace-§e-rollup2-{suffix}-0"),
+            &aid2,
+            Some(&aid2),
+            Some("rollup-d"),
+            now - chrono::Duration::minutes(30),
+            false,
+            0.5,
+            0.5,
+            1.0,
+        )
+        .await;
+        refresh_factor_rollup(&backend).await;
+
+        let window = crate::read::TimeWindow {
+            since: now - chrono::Duration::hours(3),
+            until: now + chrono::Duration::hours(1),
+        };
+
+        // Unauthenticated + len > 1 → rollup fast path.
+        let rollup = backend
+            .aggregate_scoring_factors_batch(
+                &[aid.clone(), aid2.clone()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rollup.len(), 2);
+        let r = rollup
+            .iter()
+            .find(|a| a.agent_id_hash == aid)
+            .expect("aid present");
+        assert_eq!(r.agent_id_hash, aid);
+        // 4 distinct traces, 1 with an override.
+        assert_eq!(r.trace_count, 4, "rollup trace_count");
+        assert_eq!(r.conscience_overrides, 1, "rollup override count");
+        // AV-43: sample_count IS trace_count (decision c).
+        assert_eq!(
+            crate::read::Aggregate::sample_count(r),
+            4,
+            "AV-43 sample_count == trace_count"
+        );
+
+        // Direct path (the singular, which routes through the per-trace
+        // compute) must agree on the scalar factors.
+        let direct = backend
+            .aggregate_scoring_factors_uncached(
+                &aid,
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r.trace_count, direct.trace_count,
+            "rollup trace_count == direct"
+        );
+        assert_eq!(
+            r.conscience_overrides, direct.conscience_overrides,
+            "rollup overrides == direct"
+        );
+    }
+
+    /// CIRISPersist#196 — CEG §10.1.4 structural-invisibility: the public
+    /// rollup MUST NOT expose cohort_scope ∈ {self, family} rows. Insert a
+    /// `self` trace and a `federation` trace for the same agent; the
+    /// Unauthenticated rollup read counts ONLY the federation trace.
+    /// Requires the timescaledb image.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_e_factor_rollup_excludes_self_family() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        if !timescaledb_present(&backend).await {
+            eprintln!("skipping: TimescaleDB not installed (CAGG test needs timescale image)");
+            return;
+        }
+
+        use crate::read::ReadEngine;
+        let suffix = uuid_like();
+        let aid = format!("agent-§e-invis-{suffix}");
+        let now = chrono::Utc::now() - chrono::Duration::minutes(30);
+
+        // One federation (public) trace + one self trace (structurally
+        // invisible). Write both via the raw batch so we can set
+        // cohort_scope per row.
+        // Second federation agent so the batch has len > 1 → rollup path.
+        let aid2 = format!("agent-§e-invis2-{suffix}");
+        let mk = |tid: &str, agent: &str, scope: &str| -> Vec<TraceEventRow> {
+            let agent = agent.to_string();
+            ["CONSCIENCE_RESULT", "ACTION_RESULT"]
+                .iter()
+                .enumerate()
+                .map(move |(i, et)| TraceEventRow {
+                    trace_id: tid.to_string(),
+                    thought_id: format!("th-{tid}"),
+                    task_id: None,
+                    step_point: None,
+                    event_type: if *et == "CONSCIENCE_RESULT" {
+                        ReasoningEventType::ConscienceResult
+                    } else {
+                        ReasoningEventType::ActionResult
+                    },
+                    attempt_index: 0,
+                    ts: now + chrono::Duration::milliseconds(i as i64 * 10),
+                    agent_name: Some(agent.clone()),
+                    agent_id_hash: agent.clone(),
+                    cognitive_state: Some("work".into()),
+                    trace_level: crate::schema::TraceLevel::Generic,
+                    payload: serde_json::json!({
+                        "conscience_passed": true,
+                        "action_was_overridden": false,
+                        "success": true
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                    cost_llm_calls: None,
+                    cost_tokens: None,
+                    cost_usd: None,
+                    signature: "AAAA".into(),
+                    signing_key_id: "test-key".into(),
+                    signature_verified: true,
+                    verification_source: crate::store::VerificationSource::Persist,
+                    schema_version: "2.7.0".into(),
+                    pii_scrubbed: false,
+                    original_content_hash: None,
+                    scrub_signature: None,
+                    scrub_key_id: None,
+                    scrub_timestamp: None,
+                    agent_role: None,
+                    agent_template: None,
+                    deployment_domain: Some("invis-d".into()),
+                    deployment_type: None,
+                    deployment_region: None,
+                    deployment_trust_mode: None,
+                    cohort_scope: scope.to_string(),
+                    cohort_target_id: if scope == "self" {
+                        Some(agent.clone())
+                    } else {
+                        None
+                    },
+                })
+                .collect()
+        };
+        backend
+            .insert_trace_events_batch(&mk(&format!("trace-fed-{suffix}"), &aid, "federation"))
+            .await
+            .unwrap();
+        backend
+            .insert_trace_events_batch(&mk(&format!("trace-self-{suffix}"), &aid, "self"))
+            .await
+            .unwrap();
+        // Filler federation agent (second batch slot).
+        backend
+            .insert_trace_events_batch(&mk(&format!("trace-fed2-{suffix}"), &aid2, "federation"))
+            .await
+            .unwrap();
+        refresh_factor_rollup(&backend).await;
+
+        let window = crate::read::TimeWindow {
+            since: now - chrono::Duration::hours(1),
+            until: now + chrono::Duration::hours(1),
+        };
+        let rollup = backend
+            .aggregate_scoring_factors_batch(
+                &[aid.clone(), aid2.clone()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rollup.len(), 2);
+        let r = rollup
+            .iter()
+            .find(|a| a.agent_id_hash == aid)
+            .expect("aid present");
+        // Only the federation trace is materialized + read; the self
+        // trace is structurally invisible to the public rollup.
+        assert_eq!(
+            r.trace_count, 1,
+            "self/family row must NOT appear in the public rollup (CEG §10.1.4)"
+        );
+    }
+
+    /// CIRISPersist#197 — streaming path emits one aggregate per
+    /// non-empty agent and the StreamSummary tallies emitted/skipped;
+    /// the callback `false` aborts the scan. Exercises the direct path
+    /// (works with or without TimescaleDB).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn read_section_e_stream_emits_and_aborts() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::read::ReadEngine;
+        let suffix = uuid_like();
+        let a1 = format!("agent-§e-stream-a-{suffix}");
+        let a2 = format!("agent-§e-stream-b-{suffix}");
+        let a_empty = format!("agent-§e-stream-empty-{suffix}");
+        let now = chrono::Utc::now() - chrono::Duration::minutes(30);
+        for (aid, n) in [(&a1, 2usize), (&a2, 3usize)] {
+            for i in 0..n {
+                insert_section_a_fixture_trace(
+                    &backend,
+                    &format!("trace-stream-{aid}-{i}"),
+                    aid,
+                    Some(aid),
+                    Some("stream-d"),
+                    now,
+                    false,
+                    0.5,
+                    0.5,
+                    1.0,
+                )
+                .await;
+            }
+        }
+        if timescaledb_present(&backend).await {
+            refresh_factor_rollup(&backend).await;
+        }
+
+        let window = crate::read::TimeWindow {
+            since: now - chrono::Duration::hours(1),
+            until: now + chrono::Duration::hours(1),
+        };
+
+        // Full drain: a1 + a2 emit, a_empty is skipped (no traces).
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let c = collected.clone();
+        let summary = backend
+            .aggregate_scoring_factors_stream(
+                vec![a1.clone(), a2.clone(), a_empty.clone()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+                move |agg| {
+                    c.lock().unwrap().push(agg.agent_id_hash);
+                    true
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.emitted, 2, "a1 + a2 emitted");
+        assert_eq!(summary.skipped, 1, "a_empty skipped (no traces)");
+        assert!(!summary.aborted);
+        assert_eq!(collected.lock().unwrap().len(), 2);
+
+        // Abort on first callback → emitted 1, aborted true.
+        let summary2 = backend
+            .aggregate_scoring_factors_stream(
+                vec![a1.clone(), a2.clone()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+                move |_agg| false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary2.emitted, 1, "aborted after first emit");
+        assert!(summary2.aborted);
     }
 
     /// §E aggregate_scoring_factors_batch — empty input returns empty

@@ -3100,6 +3100,17 @@ impl crate::read::ReadEngine for MemoryBackend {
         Err(memory_read_unsupported("aggregate_scoring_factors_batch"))
     }
 
+    async fn aggregate_scoring_factors_stream(
+        &self,
+        _agent_id_hashes: Vec<String>,
+        _window: crate::read::TimeWindow,
+        _baseline: Option<crate::read::TimeWindow>,
+        _scope: crate::scope::CallerScope,
+        _callback: impl FnMut(crate::read::ScoringFactorAggregate) -> bool + Send + 'static,
+    ) -> Result<crate::read::StreamSummary, crate::read::Error> {
+        Err(memory_read_unsupported("aggregate_scoring_factors_stream"))
+    }
+
     async fn count_traces(
         &self,
         _filter: crate::read::TraceFilter,

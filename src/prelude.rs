@@ -70,9 +70,9 @@ pub use crate::scope::{CallerAdmission, CallerScope, ScopeRefusalReason};
 // `crate::ceg` home; the exported names are unchanged.
 pub use crate::ceg::{
     AuditChainAggregate, CoherencePoint, DeviationMetric, DivergenceRow, HashChainGap,
-    OverrideRateRow, RecoveryEvent, ScoringFactorAggregate, TemporalDriftRow, TimeWindow,
-    TraceComponentRow, TraceCursor, TraceDetail, TraceEnvelopeRefs, TraceFilter, TraceListPage,
-    TraceSummary,
+    OverrideRateRow, RecoveryEvent, ScoringFactorAggregate, StreamSummary, TemporalDriftRow,
+    TimeWindow, TraceComponentRow, TraceCursor, TraceDetail, TraceEnvelopeRefs, TraceFilter,
+    TraceListPage, TraceSummary,
 };
 
 // v4.0 (#159, FSD §5/§6) — the repository-statistics aggregate surface:
