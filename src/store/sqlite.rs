@@ -6310,6 +6310,10 @@ impl SqliteBackend {
                     size_bytes: size_bytes.max(0) as u64,
                     access_count: access_count.max(0) as u64,
                     last_accessed_at,
+                    // v6.8.0 (#149): provenance is resolved Engine-side
+                    // from the signer's holds_bytes index, not the blob
+                    // table (which has no attesting_key_id column).
+                    attesting_key_id: None,
                 });
             }
             Ok(out)

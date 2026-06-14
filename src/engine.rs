@@ -155,6 +155,22 @@ pub struct Engine {
     /// `None` = defaults (bootstrap-permissive, sweeper inactive).
     /// Cheaply clonable into the spawned sweeper task.
     replication_config: Option<Arc<crate::federation::ReplicationConfig>>,
+    /// v6.8.0 (CIRISPersist#149) — disk-pressure operator config. `None`
+    /// = the disk-pressure response is not installed on this Engine view
+    /// (the monitor + cached tier live on the PyO3 `EngineCell` /
+    /// sovereign owner). Carried here so the eviction sweeper's
+    /// force-evict-proxy-first classification can consult the
+    /// local/family predicate. Cheaply clonable into spawned tasks.
+    disk_pressure_config: Option<Arc<crate::federation::DiskPressureConfig>>,
+    /// v6.8.0 (CIRISPersist#149) — live disk-pressure snapshot receiver,
+    /// fed by the background monitor loop on the `EngineCell` /
+    /// sovereign owner. The proxy-accept (`put_blob_signing`) and
+    /// proxy-serve (`serve_blob_to_peer`) enforcement paths read
+    /// `borrow()` from this — O(1), no statvfs per call. `None` ⇒ no
+    /// monitor installed on this view (enforcement is a no-op: the
+    /// substrate refuses nothing).
+    disk_pressure_state:
+        Option<tokio::sync::watch::Receiver<crate::federation::DiskPressureSnapshot>>,
     /// v3.6.0 (CIRISPersist#134) — media-sharing operator config
     /// (counter-notice window + immediate-eviction basis set). `None`
     /// = persist defaults (14-day window; child-safety + terrorist
@@ -290,6 +306,8 @@ impl Engine {
             signer,
             local_signer,
             replication_config: None,
+            disk_pressure_config: None,
+            disk_pressure_state: None,
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         })
@@ -343,6 +361,8 @@ impl Engine {
             signer,
             local_signer: None,
             replication_config: None,
+            disk_pressure_config: None,
+            disk_pressure_state: None,
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         })
@@ -402,6 +422,8 @@ impl Engine {
             // v3.4.0 (#123) — cohabitation views do NOT spawn a
             // second sweeper; the singleton owns the JoinHandle.
             replication_config: None,
+            disk_pressure_config: None,
+            disk_pressure_state: None,
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         }
@@ -426,6 +448,8 @@ impl Engine {
             signer,
             local_signer,
             replication_config: None,
+            disk_pressure_config: None,
+            disk_pressure_state: None,
             #[cfg(feature = "cirisnode")]
             multimedia_config: Arc::new(std::sync::RwLock::new(None)),
         }
@@ -465,6 +489,77 @@ impl Engine {
     ) -> Self {
         self.replication_config = Some(cfg);
         self
+    }
+
+    /// v6.8.0 (CIRISPersist#148) — opt-in constructor that composes a
+    /// [`CacheMode`](crate::federation::CacheMode) preset onto a
+    /// freshly-built Engine. The preset is folded onto the default
+    /// [`ReplicationConfig`](crate::federation::ReplicationConfig) via
+    /// [`CacheMode::apply_to`](crate::federation::CacheMode::apply_to)
+    /// (Proxy → small budget + aggressive sweep; Cache → standard;
+    /// Server → unbounded + idle sweeper).
+    pub async fn with_cache_mode(
+        signer: Arc<LocalSigner>,
+        dsn: &str,
+        mode: crate::federation::CacheMode,
+    ) -> Result<Self, EngineError> {
+        let cfg = mode.apply_to(crate::federation::ReplicationConfig::default());
+        Self::with_replication_config(signer, dsn, cfg).await
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — install / replace the disk-pressure
+    /// operator config on this Engine view. Carried so the eviction
+    /// sweeper's force-evict-proxy-first classification can consult the
+    /// local/family predicate. Consumes `self` (Arc clones; cheap).
+    pub fn with_disk_pressure_config_shared(
+        mut self,
+        cfg: Arc<crate::federation::DiskPressureConfig>,
+    ) -> Self {
+        self.disk_pressure_config = Some(cfg);
+        self
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — snapshot of the installed
+    /// disk-pressure config, if any.
+    pub fn disk_pressure_config(&self) -> Option<Arc<crate::federation::DiskPressureConfig>> {
+        self.disk_pressure_config.clone()
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — install the live disk-pressure
+    /// snapshot receiver (fed by the background monitor loop). The
+    /// proxy-accept / proxy-serve enforcement paths read it cheaply.
+    /// Consumes `self` (cheap — a watch receiver clone).
+    pub fn with_disk_pressure_state_shared(
+        mut self,
+        rx: tokio::sync::watch::Receiver<crate::federation::DiskPressureSnapshot>,
+    ) -> Self {
+        self.disk_pressure_state = Some(rx);
+        self
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — the current cached disk-pressure
+    /// snapshot. When no monitor is installed on this view, returns the
+    /// all-clear (`Normal`) snapshot so enforcement is a no-op.
+    pub fn current_disk_pressure(&self) -> crate::federation::DiskPressureSnapshot {
+        match &self.disk_pressure_state {
+            Some(rx) => *rx.borrow(),
+            None => crate::federation::DiskPressureSnapshot::normal(),
+        }
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — is `attesting_key_id` local-or-family
+    /// (and therefore NEVER refused / never proxy)? Uses the installed
+    /// [`DiskPressureConfig::is_family`] predicate against the local
+    /// signer alias. With no disk-pressure config installed, only the
+    /// local signer itself is treated as protected. This is the SAME
+    /// classification the force-evict-proxy-first sweep uses.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn is_local_or_family_key(&self, attesting_key_id: &str) -> bool {
+        let signer_key_id = self.signer.current_alias();
+        match &self.disk_pressure_config {
+            Some(cfg) => cfg.is_local_or_family(attesting_key_id, signer_key_id),
+            None => attesting_key_id == signer_key_id,
+        }
     }
 
     /// v3.6.0 (CIRISPersist#134) — install / replace the media-sharing
@@ -539,6 +634,34 @@ impl Engine {
     pub async fn sweep_evictions_once(
         &self,
     ) -> Result<crate::federation::SweepReport, crate::federation::BlobError> {
+        self.sweep_evictions_once_inner(false).await
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — disk-pressure variant of
+    /// [`Self::sweep_evictions_once`]. When `force_evict_proxy_first`
+    /// is set, candidates with NO local `holds_bytes` attestation
+    /// (proxy content this node merely relays) are evicted ahead of
+    /// locally-attested (local/family) content, ignoring the standard
+    /// popularity × freshness order. Local/family rows are evicted only
+    /// after all proxy rows are gone. The crit/stop/host-at-risk tiers
+    /// call this with the flag set; the standard background sweeper
+    /// (budget watermark) calls the non-forced path.
+    ///
+    /// IMPORTANT: this NEVER unconditionally drops local content — it
+    /// only re-orders eviction priority within the same target-freed
+    /// budget. Local/family rows survive until proxy is exhausted.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn sweep_evictions_once_force_proxy(
+        &self,
+    ) -> Result<crate::federation::SweepReport, crate::federation::BlobError> {
+        self.sweep_evictions_once_inner(true).await
+    }
+
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn sweep_evictions_once_inner(
+        &self,
+        force_evict_proxy_first: bool,
+    ) -> Result<crate::federation::SweepReport, crate::federation::BlobError> {
         use crate::federation::{EvictionDecay, SweepReport};
 
         let Some(cfg) = self.replication_config.clone() else {
@@ -570,16 +693,6 @@ impl Engine {
         // hitting target_freed, the next tick (or the next caller of
         // sweep_evictions_once) picks up where we left off.
         let mut candidates = self.sweep_candidates_batch(&cfg).await?;
-        // Rust-side re-rank applies on both backends. PG already ranks
-        // in SQL by full decay score; SQLite ranks by the monotone
-        // bound. Re-ranking is idempotent on PG (no-op reorder) and
-        // load-bearing on SQLite. Sorting ascending so lowest-score
-        // evicts first.
-        candidates.sort_by(|a, b| {
-            let sa = decay.score(now, a.last_accessed_at, a.access_count);
-            let sb = decay.score(now, b.last_accessed_at, b.access_count);
-            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
-        });
 
         // Lookup prior holds_bytes attestations once per cycle so we
         // don't pay an O(N) directory query for each candidate. The
@@ -619,6 +732,49 @@ impl Engine {
                 })
                 .or_insert(att);
         }
+
+        // v6.8.0 (#149): classify each candidate as proxy vs
+        // local/family using the signer's holds_bytes index. A SHA with
+        // a local holds_bytes from a key the engine considers
+        // local-or-family is PROTECTED (evict last under pressure); a
+        // SHA with no local holds_bytes (or one whose attesting key is
+        // not local/family) is PROXY (evict first under pressure).
+        let pressure_cfg = self.disk_pressure_config();
+        let is_proxy = |candidate: &crate::federation::EvictionCandidate| -> bool {
+            let holds_bytes_type =
+                crate::federation::holds_bytes_attestation_type(&candidate.sha256);
+            match holds_bytes_by_type.get(&holds_bytes_type) {
+                None => true, // no local provenance ⇒ proxy
+                Some(att) => match &pressure_cfg {
+                    Some(dp) => !dp.is_local_or_family(&att.attesting_key_id, &signer_key_id),
+                    // No disk-pressure config installed: anything WE
+                    // attested is local; treat all attested as protected.
+                    None => att.attesting_key_id != signer_key_id,
+                },
+            }
+        };
+
+        // Rust-side re-rank applies on both backends. PG already ranks
+        // in SQL by full decay score; SQLite ranks by the monotone
+        // bound. Re-ranking is idempotent on PG (no-op reorder) and
+        // load-bearing on SQLite. Sorting ascending so lowest-score
+        // evicts first. When `force_evict_proxy_first` is set (crit/stop
+        // disk-pressure tiers), proxy candidates sort entirely ahead of
+        // local/family ones regardless of decay score.
+        candidates.sort_by(|a, b| {
+            if force_evict_proxy_first {
+                let pa = is_proxy(a);
+                let pb = is_proxy(b);
+                // proxy (true) sorts before protected (false).
+                match pb.cmp(&pa) {
+                    std::cmp::Ordering::Equal => {}
+                    non_eq => return non_eq,
+                }
+            }
+            let sa = decay.score(now, a.last_accessed_at, a.access_count);
+            let sb = decay.score(now, b.last_accessed_at, b.access_count);
+            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let mut rows_evicted: u64 = 0;
         let mut withdraws_emitted: u64 = 0;
@@ -1247,6 +1403,21 @@ impl Engine {
         attestation_id: uuid::Uuid,
     ) -> Result<(), crate::federation::BlobError> {
         use crate::federation::BlobStorage;
+
+        // v6.8.0 (CIRISPersist#149) — proactive disk-pressure gate on the
+        // proxy-ACCEPT path. At the stop tier (or tighter) we refuse to
+        // ACCEPT new federation-proxied content (attesting key neither
+        // the local signer nor family). Local + family writes are NEVER
+        // refused — local content is the operator's own data. Reads the
+        // cached snapshot (no statvfs per write).
+        let pressure = self.current_disk_pressure();
+        if pressure.refuses_proxy_writes && !self.is_local_or_family_key(attesting_key_id) {
+            return Err(crate::federation::BlobError::DiskPressureProxyRefused {
+                operation: "accept",
+                tier: pressure.tier.label(),
+            });
+        }
+
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {
@@ -1649,6 +1820,77 @@ impl Engine {
             BackendDispatch::Sqlite(arc) => {
                 read_for_viewer(arc.as_ref(), at_rest_sha256, viewer_key_id).await
             }
+        }
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — serve blob bytes to a federation
+    /// PEER, with the proactive disk-pressure gate on the proxy-SERVE
+    /// path. At the stop tier (or tighter) we refuse to SERVE
+    /// federation-proxied content to peers while still serving local +
+    /// family content.
+    ///
+    /// Proxy classification (the SAME local-truth rule the
+    /// force-evict-proxy sweep uses): a blob is PROXY when NONE of its
+    /// local `holds_bytes` attesters
+    /// ([`list_local_holders`](crate::federation::BlobStorage::list_local_holders))
+    /// is local-or-family. A blob with at least one local/family holder
+    /// is protected (served even under pressure). A blob with NO local
+    /// holders at all is treated as proxy (we relay it; shed first).
+    ///
+    /// On refusal returns
+    /// [`BlobError::DiskPressureProxyRefused`](crate::federation::BlobError::DiskPressureProxyRefused)
+    /// (`operation: "serve"`) — a PERMANENT signal: the peer should
+    /// fetch from another holder. On the happy path returns the bytes
+    /// via [`get_blob`](crate::federation::BlobStorage::get_blob)
+    /// ([`BlobError::NotHeld`] when absent).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn serve_blob_to_peer(
+        &self,
+        sha256: &[u8; 32],
+        _requesting_peer_key_id: &str,
+    ) -> Result<crate::federation::BlobBody, crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+
+        let pressure = self.current_disk_pressure();
+        if pressure.refuses_proxy_serves {
+            // Classify: is this proxy content (no local/family holder)?
+            let local_holders = self.list_local_holders(sha256).await?;
+            let is_protected = local_holders.iter().any(|k| self.is_local_or_family_key(k));
+            if !is_protected {
+                return Err(crate::federation::BlobError::DiskPressureProxyRefused {
+                    operation: "serve",
+                    tier: pressure.tier.label(),
+                });
+            }
+        }
+
+        let body = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.get_blob(sha256).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.get_blob(sha256).await?,
+        };
+        body.ok_or_else(|| crate::federation::BlobError::NotHeld {
+            sha256_hex: hex::encode(sha256),
+        })
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — local-truth holder query for a SHA
+    /// (delegates to the backend's
+    /// [`list_local_holders`](crate::federation::BlobStorage::list_local_holders)).
+    /// Used by [`serve_blob_to_peer`](Self::serve_blob_to_peer) for the
+    /// proxy-vs-local/family classification.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn list_local_holders(
+        &self,
+        sha256: &[u8; 32],
+    ) -> Result<Vec<String>, crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.list_local_holders(sha256).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.list_local_holders(sha256).await,
         }
     }
 
@@ -4912,6 +5154,393 @@ mod tests {
             empty_holder_count as u64 >= report.rows_evicted,
             "evicted blobs must have list_holders return empty after withdraws"
         );
+    }
+
+    // ─── v6.8.0 (CIRISPersist#149) — disk-pressure force-evict-proxy ───
+
+    /// Seed `n` PROXY blobs: bytes + a `holds_bytes` attestation by a
+    /// PEER key (not the local signer). Because the sweeper indexes only
+    /// the LOCAL signer's holds_bytes, these classify as proxy. Returns
+    /// the SHAs.
+    #[cfg(feature = "sqlite")]
+    async fn seed_proxy_blobs(engine: &Engine, peer_key: &str, n: usize) -> Vec<[u8; 32]> {
+        use crate::federation::{BlobBody, BlobStorage, FederationDirectory, PutBlobAttestation};
+        let sq = engine.sqlite_backend().expect("sqlite");
+        // Peer key must exist (FK on the holds_bytes attestation).
+        sq.put_public_key(sweeper_test_key(peer_key))
+            .await
+            .expect("seed peer key");
+        let mut shas = Vec::with_capacity(n);
+        for i in 0..n {
+            // Distinct payloads from the local seed (offset the fill byte).
+            let bytes = vec![0x80u8 + i as u8; 1024];
+            let sha = {
+                use sha2::{Digest, Sha256};
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&Sha256::digest(&bytes));
+                out
+            };
+            sq.put_blob(
+                &sha,
+                BlobBody::Inline(bytes),
+                None,
+                PutBlobAttestation {
+                    attesting_key_id: peer_key.to_string(),
+                    attestation_id: uuid::Uuid::new_v4().to_string(),
+                    original_content_hash_hex: "ab".repeat(32),
+                    scrub_signature_classical: "c2ln".to_string(),
+                    scrub_signature_pqc: None,
+                    scrub_key_id: peer_key.to_string(),
+                    scrub_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .expect("put_blob proxy");
+            shas.push(sha);
+        }
+        shas
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — `sweep_evictions_once_force_proxy`
+    /// evicts proxy-attested rows BEFORE local/family rows, even when
+    /// the proxy rows are HOTTER (higher access_count). The standard
+    /// sweep would keep the hot proxy rows; the force-proxy variant
+    /// drops them first to protect local content under disk pressure.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn force_evict_proxy_first_protects_local_sqlite() {
+        use crate::federation::BlobStorage;
+        // Budget tiny so exactly the proxy rows must be shed. 3 local +
+        // 3 proxy = 6 KiB. Watermark 50% of 4 KiB = 2 KiB → must free
+        // ~4 KiB → ≈ 4 rows. Force-proxy MUST take the 3 proxy first,
+        // then one local; the 2 hot-local rows survive.
+        let cfg = crate::federation::ReplicationConfig {
+            storage_budget_bytes: 4 * 1024,
+            steady_state_utilization: 0.5,
+            eviction_decay_half_life_days: 365.0,
+            ..Default::default()
+        };
+        // 3 local blobs (via local signer holds_bytes).
+        let (engine, local_shas) = sweeper_seed_blobs(cfg, 3).await;
+        // Install a disk-pressure config whose family predicate matches
+        // nobody (so the peer is pure federation/proxy).
+        let dp = std::sync::Arc::new(crate::federation::DiskPressureConfig {
+            monitor_path: std::path::PathBuf::from("/x"),
+            ..Default::default()
+        });
+        let engine = engine.with_disk_pressure_config_shared(dp);
+        // 3 proxy blobs (via peer key holds_bytes).
+        let proxy_shas = seed_proxy_blobs(&engine, "peer-relay-key", 3).await;
+
+        let sq = engine.sqlite_backend().expect("sqlite");
+        // Make the PROXY blobs HOT (high access_count) — under the
+        // standard order they'd survive; force-proxy must override.
+        for sha in &proxy_shas {
+            for _ in 0..20 {
+                let _ = sq.get_blob(sha).await.unwrap();
+            }
+        }
+        // Local blobs stay cold (low access_count).
+
+        let report = engine
+            .sweep_evictions_once_force_proxy()
+            .await
+            .expect("force-proxy sweep");
+        assert!(report.rows_evicted > 0, "must evict under pressure");
+
+        // All 3 proxy blobs must be gone (evicted first despite being hot).
+        let mut proxy_present = 0usize;
+        for sha in &proxy_shas {
+            if sq.has_blob(sha).await.unwrap() {
+                proxy_present += 1;
+            }
+        }
+        assert_eq!(
+            proxy_present, 0,
+            "force-evict-proxy-first must shed ALL proxy rows before local"
+        );
+
+        // At least 2 of the 3 local blobs must survive (proxy shed
+        // first frees most of the target before local is touched).
+        let mut local_present = 0usize;
+        for sha in &local_shas {
+            if sq.has_blob(sha).await.unwrap() {
+                local_present += 1;
+            }
+        }
+        assert!(
+            local_present >= 2,
+            "local/family content must be protected; only {local_present}/3 survived"
+        );
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — the STANDARD (non-forced) sweep keeps
+    /// HOT proxy rows (no special proxy handling) — proving the
+    /// force-proxy path is what changes the order, not the seed setup.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn standard_sweep_keeps_hot_proxy_sqlite() {
+        use crate::federation::BlobStorage;
+        let cfg = crate::federation::ReplicationConfig {
+            storage_budget_bytes: 4 * 1024,
+            steady_state_utilization: 0.5,
+            eviction_decay_half_life_days: 365.0,
+            ..Default::default()
+        };
+        let (engine, _local) = sweeper_seed_blobs(cfg, 3).await;
+        let proxy_shas = seed_proxy_blobs(&engine, "peer-relay-key", 3).await;
+        let sq = engine.sqlite_backend().expect("sqlite");
+        // Make proxy blobs HOT.
+        for sha in &proxy_shas {
+            for _ in 0..20 {
+                let _ = sq.get_blob(sha).await.unwrap();
+            }
+        }
+        let report = engine.sweep_evictions_once().await.expect("standard sweep");
+        assert!(report.rows_evicted > 0);
+        // Standard order: hot rows survive regardless of proxy status —
+        // at least one hot proxy row remains.
+        let mut proxy_present = 0usize;
+        for sha in &proxy_shas {
+            if sq.has_blob(sha).await.unwrap() {
+                proxy_present += 1;
+            }
+        }
+        assert!(
+            proxy_present > 0,
+            "standard sweep should keep HOT proxy rows (no proxy-first ordering)"
+        );
+    }
+
+    // ─── v6.8.0 (CIRISPersist#149) — proactive disk-pressure ENFORCEMENT ───
+
+    /// Build a disk-pressure config whose family predicate matches
+    /// `"family-key"`, plus a `StubFreeBytes`-driven monitor, and attach
+    /// both (config + live snapshot receiver) to `engine`. Returns the
+    /// reconfigured engine, the stub (to drive tiers), and the monitor
+    /// (to `poll_once` after each stub change).
+    #[cfg(feature = "sqlite")]
+    fn attach_disk_pressure(
+        engine: Engine,
+        initial_free_bytes: u64,
+    ) -> (
+        Engine,
+        std::sync::Arc<crate::federation::StubFreeBytes>,
+        std::sync::Arc<crate::federation::DiskPressureMonitor>,
+    ) {
+        let fam: crate::federation::FamilyPredicate =
+            std::sync::Arc::new(|k: &str| k == "family-key");
+        let cfg = std::sync::Arc::new(crate::federation::DiskPressureConfig {
+            monitor_path: std::path::PathBuf::from("/x"),
+            is_family: Some(fam),
+            ..Default::default()
+        });
+        let stub = std::sync::Arc::new(crate::federation::StubFreeBytes::new(initial_free_bytes));
+        let monitor = std::sync::Arc::new(crate::federation::DiskPressureMonitor::with_source(
+            (*cfg).clone(),
+            stub.clone(),
+        ));
+        monitor.poll_once();
+        let engine = engine
+            .with_disk_pressure_config_shared(cfg)
+            .with_disk_pressure_state_shared(monitor.subscribe());
+        (engine, stub, monitor)
+    }
+
+    const TWO_GIB: u64 = 2 * 1024 * 1024 * 1024;
+    const FOUR_HUNDRED_MIB: u64 = 400 * 1024 * 1024;
+
+    /// Seed a `federation_keys` row for `key_id` so a proxy/family
+    /// `attesting_key_id` FK resolves.
+    #[cfg(feature = "sqlite")]
+    async fn seed_key(engine: &Engine, key_id: &str) {
+        use crate::federation::FederationDirectory;
+        let sq = engine.sqlite_backend().expect("sqlite");
+        sq.put_public_key(sweeper_test_key(key_id))
+            .await
+            .expect("seed key");
+    }
+
+    fn blob_for(fill: u8) -> ([u8; 32], Vec<u8>) {
+        let bytes = vec![fill; 256];
+        use sha2::{Digest, Sha256};
+        let mut sha = [0u8; 32];
+        sha.copy_from_slice(&Sha256::digest(&bytes));
+        (sha, bytes)
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — at the STOP tier a PROXY write is
+    /// refused (typed `DiskPressureProxyRefused`) while LOCAL + FAMILY
+    /// writes still succeed.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn stop_tier_refuses_proxy_write_allows_local_family_sqlite() {
+        use crate::federation::{BlobBody, BlobError};
+        let cfg = crate::federation::ReplicationConfig::default();
+        // Reuse the seeded local-signer engine (signer = test-engine-steward).
+        let (engine, _shas) = sweeper_seed_blobs(cfg, 0).await;
+        seed_key(&engine, "family-key").await;
+        seed_key(&engine, "stranger-key").await;
+        // Start above warn (Normal), then drop to stop.
+        let (engine, stub, monitor) = attach_disk_pressure(engine, TWO_GIB);
+
+        // Sanity: below stop, a proxy write succeeds.
+        let (sha_a, body_a) = blob_for(1);
+        engine
+            .put_blob_signing(
+                &sha_a,
+                BlobBody::Inline(body_a),
+                None,
+                "stranger-key",
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("proxy write below stop tier should succeed");
+
+        // Drop to STOP tier (400 MiB free <= 500 MiB stop threshold).
+        stub.set(FOUR_HUNDRED_MIB);
+        monitor.poll_once();
+        assert_eq!(
+            engine.current_disk_pressure().tier,
+            crate::federation::PressureTier::Stop
+        );
+
+        // PROXY write now refused with the typed error.
+        let (sha_b, body_b) = blob_for(2);
+        let err = engine
+            .put_blob_signing(
+                &sha_b,
+                BlobBody::Inline(body_b),
+                None,
+                "stranger-key",
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect_err("proxy write at stop tier must be refused");
+        match err {
+            BlobError::DiskPressureProxyRefused { operation, tier } => {
+                assert_eq!(operation, "accept");
+                assert_eq!(tier, "stop");
+            }
+            other => panic!("expected DiskPressureProxyRefused, got {other:?}"),
+        }
+
+        // LOCAL write (attester == local signer) still succeeds.
+        let (sha_c, body_c) = blob_for(3);
+        engine
+            .put_blob_signing(
+                &sha_c,
+                BlobBody::Inline(body_c),
+                None,
+                "test-engine-steward",
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("local write must never be refused");
+
+        // FAMILY write still succeeds.
+        let (sha_d, body_d) = blob_for(4);
+        engine
+            .put_blob_signing(
+                &sha_d,
+                BlobBody::Inline(body_d),
+                None,
+                "family-key",
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("family write must never be refused");
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — at the STOP tier a PROXY serve is
+    /// refused while a LOCAL serve still returns bytes. Below stop, the
+    /// proxy serve succeeds.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn stop_tier_refuses_proxy_serve_allows_local_sqlite() {
+        use crate::federation::BlobError;
+        let cfg = crate::federation::ReplicationConfig::default();
+        let (engine, local_shas) = sweeper_seed_blobs(cfg, 1).await; // local blob (local holds_bytes)
+        let local_sha = local_shas[0];
+        // A proxy blob: holds_bytes by a peer (not local/family).
+        let proxy_shas = seed_proxy_blobs(&engine, "peer-relay-key", 1).await;
+        let proxy_sha = proxy_shas[0];
+
+        let (engine, stub, monitor) = attach_disk_pressure(engine, TWO_GIB);
+
+        // Below stop: proxy serve succeeds.
+        engine
+            .serve_blob_to_peer(&proxy_sha, "some-peer")
+            .await
+            .expect("proxy serve below stop tier should succeed");
+
+        // Drop to STOP.
+        stub.set(FOUR_HUNDRED_MIB);
+        monitor.poll_once();
+        assert!(engine.current_disk_pressure().refuses_proxy_serves);
+
+        // PROXY serve refused.
+        let err = engine
+            .serve_blob_to_peer(&proxy_sha, "some-peer")
+            .await
+            .expect_err("proxy serve at stop tier must be refused");
+        match err {
+            BlobError::DiskPressureProxyRefused { operation, tier } => {
+                assert_eq!(operation, "serve");
+                assert_eq!(tier, "stop");
+            }
+            other => panic!("expected DiskPressureProxyRefused, got {other:?}"),
+        }
+
+        // LOCAL serve still returns bytes (local holds_bytes ⇒ protected).
+        engine
+            .serve_blob_to_peer(&local_sha, "some-peer")
+            .await
+            .expect("local serve must never be refused");
+    }
+
+    /// v6.8.0 (CIRISPersist#149) — below the stop tier (warn/crit), both
+    /// proxy writes and proxy serves succeed (no enforcement until stop).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn below_stop_tier_proxy_write_and_serve_succeed_sqlite() {
+        use crate::federation::BlobBody;
+        let cfg = crate::federation::ReplicationConfig::default();
+        let (engine, _shas) = sweeper_seed_blobs(cfg, 0).await;
+        seed_key(&engine, "stranger-key").await;
+        // Start at CRIT (1 GiB free <= 1 GiB crit, > 500 MiB stop):
+        // crit force-evicts proxy but does NOT refuse writes/serves.
+        let one_gib = 1024 * 1024 * 1024;
+        let (engine, _stub, _monitor) = attach_disk_pressure(engine, one_gib);
+        assert_eq!(
+            engine.current_disk_pressure().tier,
+            crate::federation::PressureTier::Crit
+        );
+        assert!(!engine.current_disk_pressure().refuses_proxy_writes);
+
+        // Proxy WRITE succeeds at crit.
+        let (sha_a, body_a) = blob_for(7);
+        engine
+            .put_blob_signing(
+                &sha_a,
+                BlobBody::Inline(body_a),
+                None,
+                "stranger-key",
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("proxy write at crit tier should succeed");
+
+        // Proxy SERVE succeeds at crit.
+        engine
+            .serve_blob_to_peer(&sha_a, "some-peer")
+            .await
+            .expect("proxy serve at crit tier should succeed");
     }
 
     // ── v4.6.0 (CIRISPersist#171, CEG §10.1.5) — attestation_promote:

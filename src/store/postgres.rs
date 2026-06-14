@@ -6575,6 +6575,10 @@ impl PostgresBackend {
                 size_bytes: size_bytes.max(0) as u64,
                 access_count: access_count.max(0) as u64,
                 last_accessed_at,
+                // v6.8.0 (#149): provenance resolved Engine-side from
+                // the signer's holds_bytes index (no attesting_key_id
+                // column on federation_blobs).
+                attesting_key_id: None,
             });
         }
         Ok(out)
@@ -15953,7 +15957,8 @@ mod tests {
             )
             .await
             .unwrap();
-        row.get::<_, bool>("p")
+        row.try_get::<_, bool>("p")
+            .expect("timescaledb probe column")
     }
 
     /// CIRISPersist#196 test helper — force-materialize the

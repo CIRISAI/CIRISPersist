@@ -91,6 +91,15 @@ pub struct EvictionCandidate {
     /// Wall-clock of the most recent read hit (or first_seen_at for
     /// never-read rows).
     pub last_accessed_at: chrono::DateTime<chrono::Utc>,
+    /// v6.8.0 (CIRISPersist#149) — the `attesting_key_id` of the
+    /// most-recent `holds_bytes` attestation this engine emitted for
+    /// the SHA, when known. Used by the disk-pressure
+    /// force-evict-proxy-first hint to classify a candidate as
+    /// local/family (protected) vs federation/proxy (evict first).
+    /// `None` ⇒ provenance unknown; treated as proxy under pressure
+    /// (fail-toward-eviction is safe: an unattributed blob we can
+    /// re-fetch is the right thing to shed first).
+    pub attesting_key_id: Option<String>,
 }
 
 /// v3.4.0 (CIRISPersist#123) — outcome of one sweep cycle.
