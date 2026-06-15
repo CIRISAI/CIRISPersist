@@ -5,6 +5,18 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.9.0] — 2026-06-14
+
+### Added — GDPR Art. 17 trace-erasure primitive (CIRISPersist#222)
+
+`Engine::delete_traces_for_agent_id_hash(agent_id_hash) -> ErasureSummary` — absorbed from CIRISLens#8 as CIRISServer's fabric node takes over the trace corpus and needs right-to-erasure (DSAR). Distinct from the existing per-signing-key `delete_traces_for_agent` (#15): this erases the agent's **entire** corpus across **all** signing keys, in one atomic transaction:
+
+- **hard-delete** `cirislens.trace_events` (every row for `agent_id_hash`) + `cirislens.trace_llm_calls` (cascaded by `trace_id` — LLM call rows carry no `agent_id_hash` per the V001 schema);
+- **tombstone** (not delete) the derived `cirislens_derived.detection_events`. Detections are substrate-derived analytics, not the subject's personal data (operator decision, #222), so the PII linkage (`trace_id`, `body_sha256`, `canonical_bytes`) is NULLed and an `erased_at` marker stamped — the detector/severity/cohort_cell analytics survive, the subject linkage is severed. `detection_events` has **no** `agent_id_hash` column; the linkage is `trace_id` (+ `body_sha256` / `canonical_bytes`), so the tombstone targets `trace_id IN (erased agent's traces)`;
+- **audit** via a `hard_case:trace_erasure` row (V075 `hard_case_events`) emitted *inside* the erasure transaction — no audit-without-erasure, no erasure-without-audit. `target_key_id` = the erased `agent_id_hash`; `detail` carries the per-table counts.
+
+**Idempotent** — a second call finds nothing, returns all-zero counts (`Ok`, never an error; a not-found is not an error for erasure), and emits no new audit row. **Migration V080** (both dialects): adds the `erased_at` tombstone column and relaxes `trace_id` / `body_sha256` / `canonical_bytes` to NULLABLE (SQLite via the standard table-rebuild dance). All three backends (postgres / sqlite / memory — memory has no derived storage so tombstone count is always 0); exposed on the PyO3 wheel `Engine`. Full feature set + sqlite + memory + live-PG green; no-backend `-D warnings` clean. Pin `ciris-persist>=6.9.0,<7`.
+
 ## [6.8.2] — 2026-06-14
 
 ### Changed — CIRISVerify 5.4.0 → 5.6.0 (security-audit remediation re-pin)

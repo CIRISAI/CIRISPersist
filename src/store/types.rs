@@ -337,6 +337,42 @@ pub struct DeleteSummary {
     pub deleted_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// v6.9.0 (CIRISPersist#222) — Result of
+/// [`Engine::delete_traces_for_agent_id_hash`](crate::Engine::delete_traces_for_agent_id_hash)
+/// — the GDPR Art. 17 / DSAR full-erasure primitive.
+///
+/// Unlike [`DeleteSummary`] (the per-signing-key DSAR primitive), this
+/// erases the agent's ENTIRE trace corpus across ALL signing keys, and
+/// cascades to the derived `detection_events` by **tombstoning** (not
+/// deleting): the detection analytics are substrate-derived, not the
+/// subject's personal data, so the PII linkage (`trace_id`,
+/// `body_sha256`, `canonical_bytes`) is NULLed and an `erased_at` marker
+/// stamped, while the detector/severity/cohort_cell rows survive.
+///
+/// All three operations — the two hard deletes, the tombstone update, and
+/// the `hard_case:trace_erasure` audit emit — happen in a single
+/// transaction. **Idempotent**: a second call finds no rows and returns
+/// all-zero counts (`Ok`, never an error — a not-found is not an error
+/// for erasure).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ErasureSummary {
+    /// Rows hard-deleted from `cirislens.trace_events` (every row where
+    /// `agent_id_hash` matches, across all signing keys).
+    pub trace_events: u64,
+    /// Rows hard-deleted from `cirislens.trace_llm_calls` (joined by
+    /// `trace_id` from the erased trace_events set — V001 LLM call rows
+    /// carry no `agent_id_hash`).
+    pub trace_llm_calls: u64,
+    /// Rows TOMBSTONED in `cirislens_derived.detection_events` — derived
+    /// from the erased agent's traces (matched by `trace_id`), with the
+    /// PII linkage NULLed and `erased_at` stamped. NOT hard-deleted.
+    /// Always 0 on the memory backend (no derived-schema storage) and on
+    /// backends with no detection rows for the agent.
+    pub detection_events_tombstoned: u64,
+    /// Wall-clock when the erasure transaction committed.
+    pub erased_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Phase 2 stub — agent audit-log entry shape (FSD §4.1).
 ///
 /// Carried as a placeholder type so the Backend trait surface can

@@ -58,6 +58,17 @@ pub mod kind {
     /// `subject_key_id` = the excluded occurrence; `detail` carries the
     /// scope + the count of blobs they were excluded from.
     pub const RECIPIENT_EXCLUDED: &str = "recipient_excluded";
+    /// GDPR Art. 17 / DSAR (CIRISPersist#222, v6.9.0) — persist erased an
+    /// agent's full trace corpus via
+    /// [`Engine::delete_traces_for_agent_id_hash`](crate::Engine::delete_traces_for_agent_id_hash):
+    /// hard-deleted `trace_events` + `trace_llm_calls`, tombstoned the
+    /// derived `detection_events`. `target_key_id` carries the erased
+    /// `agent_id_hash`; `detail` carries the per-table counts
+    /// (`trace_events`, `trace_llm_calls`, `detection_events_tombstoned`).
+    /// Recorded INSIDE the erasure transaction so the audit row commits
+    /// atomically with the deletes (no audit-without-erasure, no
+    /// erasure-without-audit).
+    pub const TRACE_ERASURE: &str = "trace_erasure";
 }
 
 /// A recorded `hard_case:*` observability event.

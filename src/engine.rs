@@ -948,6 +948,36 @@ impl Engine {
         }
     }
 
+    /// v6.9.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR **full erasure**
+    /// of an agent's trace corpus, keyed on `agent_id_hash` alone (all
+    /// signing keys).
+    ///
+    /// In one atomic transaction the backend hard-deletes the agent's
+    /// `trace_events` + `trace_llm_calls`, **tombstones** the derived
+    /// `detection_events` (NULLs the PII linkage + stamps `erased_at` —
+    /// the analytics survive, the subject linkage is severed), and emits
+    /// a `hard_case:trace_erasure` audit row. Returns an
+    /// [`ErasureSummary`](crate::store::types::ErasureSummary) with the
+    /// per-table counts.
+    ///
+    /// **Idempotent**: a second call returns all-zero counts (`Ok`); a
+    /// not-found is never an error. Persist owns the atomic substrate
+    /// erasure; the caller (CIRISServer's absorbed-lens slice) owns the
+    /// DSAR-request authority + signature verification.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn delete_traces_for_agent_id_hash(
+        &self,
+        agent_id_hash: &str,
+    ) -> Result<crate::store::types::ErasureSummary, crate::store::Error> {
+        use crate::store::Backend;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.delete_traces_for_agent_id_hash(agent_id_hash).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.delete_traces_for_agent_id_hash(agent_id_hash).await,
+        }
+    }
+
     /// v3.4.0 (CIRISPersist#123) — build, sign, and persist a
     /// `withdraws` attestation that retracts a prior `holds_bytes`
     /// emission. The canonical envelope is produced via

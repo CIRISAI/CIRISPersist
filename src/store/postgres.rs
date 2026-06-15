@@ -1218,6 +1218,116 @@ impl Backend for PostgresBackend {
         })
     }
 
+    async fn delete_traces_for_agent_id_hash(
+        &self,
+        agent_id_hash: &str,
+    ) -> Result<super::types::ErasureSummary, Error> {
+        let erased_at = chrono::Utc::now();
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin erasure tx: {e}")))?;
+
+        // Step 1: collect the agent's trace_ids across ALL signing keys
+        // (full Art. 17 erasure — not key-scoped). Both the trace_llm_calls
+        // cascade and the detection_events tombstone key off these.
+        let trace_ids: Vec<String> = tx
+            .query(
+                "SELECT DISTINCT trace_id FROM cirislens.trace_events \
+                 WHERE agent_id_hash = $1",
+                &[&agent_id_hash],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("collect trace_ids: {e}")))?
+            .into_iter()
+            .map(|row| row.safe_get_with::<String, _, _, _>(0, Error::Backend))
+            .collect::<Result<_, _>>()?;
+
+        // Step 2: TOMBSTONE the derived detection_events for those traces
+        // (V080) — NULL the PII linkage, stamp erased_at. NOT a delete.
+        // Only rows not already tombstoned are counted (idempotent
+        // re-run touches nothing). Done BEFORE the trace_events delete so
+        // the trace_id set is still resolvable here for symmetry; the
+        // tombstone reads its own table by trace_id so ordering is moot,
+        // but keeping it inside the txn is what guarantees atomicity.
+        let detection_events_tombstoned = if trace_ids.is_empty() {
+            0u64
+        } else {
+            tx.execute(
+                "UPDATE cirislens_derived.detection_events \
+                 SET trace_id = NULL, body_sha256 = NULL, \
+                     canonical_bytes = NULL, erased_at = $2 \
+                 WHERE trace_id = ANY($1::text[]) AND erased_at IS NULL",
+                &[&trace_ids, &erased_at],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("tombstone detection_events: {e}")))?
+        };
+
+        // Step 3: hard-delete the LLM call rows joined by trace_id.
+        let trace_llm_calls = if trace_ids.is_empty() {
+            0u64
+        } else {
+            tx.execute(
+                "DELETE FROM cirislens.trace_llm_calls \
+                 WHERE trace_id = ANY($1::text[])",
+                &[&trace_ids],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("delete trace_llm_calls: {e}")))?
+        };
+
+        // Step 4: hard-delete the trace_events rows for the agent.
+        let trace_events = tx
+            .execute(
+                "DELETE FROM cirislens.trace_events WHERE agent_id_hash = $1",
+                &[&agent_id_hash],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("delete trace_events: {e}")))?;
+
+        // Step 5: emit the `hard_case:trace_erasure` audit row INSIDE the
+        // txn (atomic with the erasure). Emit only when something was
+        // erased, so an idempotent re-run stays a clean no-op.
+        if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let kind = crate::federation::hard_case::kind::TRACE_ERASURE;
+            let detail = serde_json::json!({
+                "agent_id_hash": agent_id_hash,
+                "trace_events": trace_events,
+                "trace_llm_calls": trace_llm_calls,
+                "detection_events_tombstoned": detection_events_tombstoned,
+            });
+            let target: Option<&str> = Some(agent_id_hash);
+            let subject: Option<&str> = None;
+            tx.execute(
+                "INSERT INTO cirislens.hard_case_events \
+                    (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (event_id) DO NOTHING",
+                &[&event_id, &kind, &target, &subject, &detail, &erased_at],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("emit trace_erasure audit: {e}")))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit erasure tx: {e}")))?;
+
+        Ok(super::types::ErasureSummary {
+            trace_events,
+            trace_llm_calls,
+            detection_events_tombstoned,
+            erased_at,
+        })
+    }
+
     async fn fetch_trace_events_page(
         &self,
         after_event_id: i64,
@@ -12543,6 +12653,196 @@ mod tests {
         assert_eq!(got.detector, event.detector);
         assert_eq!(got.severity, DetectionSeverity::Warning);
         assert_eq!(got.conformity_variant, ConformityVariant::Numeric);
+    }
+
+    /// v6.9.0 (CIRISPersist#222) — full Art. 17 erasure on PG: hard-
+    /// delete the agent's trace_events + trace_llm_calls across all keys,
+    /// TOMBSTONE the derived detection_events (PII NULLed, erased_at set,
+    /// row retained), emit the audit row, idempotent. Self-isolating:
+    /// uuid-suffixed agent_id_hash + trace_ids so a reused PG is safe.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn erasure_tombstones_detections_and_hard_deletes_traces_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        use crate::derived::{ConformityVariant, DerivedSchema, DetectionEvent, DetectionSeverity};
+        use crate::federation::{hard_case, FederationDirectory, HardCaseFilter};
+
+        let suffix = uuid_like();
+        let agent = format!("erase-agent-{suffix}");
+        let trace_a = format!("trace-A-{suffix}");
+        let trace_b = format!("trace-B-{suffix}");
+        let trace_unrelated = format!("trace-Z-{suffix}");
+
+        // Two traces for the target agent (distinct keys to prove the
+        // all-keys scope), one unrelated agent's trace.
+        let mk_event = |trace_id: &str, agent_id: &str, key: &str| TraceEventRow {
+            trace_id: trace_id.to_owned(),
+            thought_id: format!("th-{suffix}"),
+            task_id: None,
+            step_point: None,
+            event_type: ReasoningEventType::ThoughtStart,
+            attempt_index: 0,
+            ts: chrono::Utc::now(),
+            agent_name: None,
+            agent_id_hash: agent_id.to_owned(),
+            cognitive_state: None,
+            trace_level: crate::schema::TraceLevel::Generic,
+            payload: serde_json::Map::new(),
+            cost_llm_calls: None,
+            cost_tokens: None,
+            cost_usd: None,
+            signature: "AAAA".into(),
+            signing_key_id: key.to_owned(),
+            signature_verified: true,
+            verification_source: crate::store::VerificationSource::Persist,
+            schema_version: "2.7.0".into(),
+            pii_scrubbed: false,
+            original_content_hash: None,
+            scrub_signature: None,
+            scrub_key_id: None,
+            scrub_timestamp: None,
+            agent_role: None,
+            agent_template: None,
+            deployment_domain: None,
+            deployment_type: None,
+            deployment_region: None,
+            deployment_trust_mode: None,
+            cohort_scope: "federation".to_string(),
+            cohort_target_id: None,
+        };
+        let other_agent = format!("other-agent-{suffix}");
+        backend
+            .insert_trace_events_batch(&[
+                mk_event(&trace_a, &agent, "key1"),
+                mk_event(&trace_b, &agent, "key2"),
+                mk_event(&trace_unrelated, &other_agent, "key1"),
+            ])
+            .await
+            .unwrap();
+
+        // Detections: one derived from trace_a (tombstoned), one from
+        // the unrelated trace (must survive).
+        let det_a = uuid::Uuid::new_v4();
+        let det_z = uuid::Uuid::new_v4();
+        let mk_det = |id: uuid::Uuid, trace_id: &str| DetectionEvent {
+            detection_id: id,
+            trace_id: trace_id.to_owned(),
+            body_sha256: vec![0xAB; 32],
+            detector: "manifold_conformity_outlier".into(),
+            severity: DetectionSeverity::Warning,
+            cohort_cell: serde_json::json!({"deployment_domain": "legal"}),
+            conformity_variant: ConformityVariant::Numeric,
+            conformity_payload: serde_json::json!({"score": 3.1}),
+            lens_core_version: "0.1.0".into(),
+            ratchet_calibration_version: 1,
+            canonical_bytes: format!("canon-{trace_id}").into_bytes(),
+            ed25519_sig: vec![0x01; 64],
+            ml_dsa_65_sig: vec![0x02; 3309],
+            signing_key_id: "lens-core-test:1".into(),
+            ts: chrono::Utc::now(),
+        };
+        backend
+            .put_detection_event(mk_det(det_a, &trace_a))
+            .await
+            .unwrap();
+        backend
+            .put_detection_event(mk_det(det_z, &trace_unrelated))
+            .await
+            .unwrap();
+
+        let summary = backend
+            .delete_traces_for_agent_id_hash(&agent)
+            .await
+            .unwrap();
+        assert_eq!(summary.trace_events, 2, "both keys' traces hard-deleted");
+        assert_eq!(summary.detection_events_tombstoned, 1);
+
+        // Traces gone.
+        assert!(backend
+            .fetch_trace_events_page(0, 100, Some(&agent))
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Tombstone survives as a row with NULLed PII + erased_at set.
+        let client = backend.get_client().await.unwrap();
+        let tomb_row = client
+            .query_one(
+                "SELECT trace_id, body_sha256, canonical_bytes, erased_at \
+                 FROM cirislens_derived.detection_events WHERE detection_id = $1",
+                &[&det_a],
+            )
+            .await
+            .unwrap();
+        let tomb_trace: Option<String> = tomb_row
+            .safe_get_with::<Option<String>, _, _, _>("trace_id", Error::Backend)
+            .unwrap();
+        let tomb_body: Option<Vec<u8>> = tomb_row
+            .safe_get_with::<Option<Vec<u8>>, _, _, _>("body_sha256", Error::Backend)
+            .unwrap();
+        let tomb_canon: Option<Vec<u8>> = tomb_row
+            .safe_get_with::<Option<Vec<u8>>, _, _, _>("canonical_bytes", Error::Backend)
+            .unwrap();
+        let tomb_erased: Option<chrono::DateTime<chrono::Utc>> = tomb_row
+            .safe_get_with::<Option<chrono::DateTime<chrono::Utc>>, _, _, _>(
+                "erased_at",
+                Error::Backend,
+            )
+            .unwrap();
+        assert!(tomb_trace.is_none(), "trace_id NULLed");
+        assert!(tomb_body.is_none(), "body_sha256 NULLed");
+        assert!(tomb_canon.is_none(), "canonical_bytes NULLed");
+        assert!(tomb_erased.is_some(), "erased_at stamped");
+
+        // Unrelated detection untouched.
+        let z_row = client
+            .query_one(
+                "SELECT trace_id, erased_at FROM cirislens_derived.detection_events \
+                 WHERE detection_id = $1",
+                &[&det_z],
+            )
+            .await
+            .unwrap();
+        let z_trace: Option<String> = z_row
+            .safe_get_with::<Option<String>, _, _, _>("trace_id", Error::Backend)
+            .unwrap();
+        let z_erased: Option<chrono::DateTime<chrono::Utc>> = z_row
+            .safe_get_with::<Option<chrono::DateTime<chrono::Utc>>, _, _, _>(
+                "erased_at",
+                Error::Backend,
+            )
+            .unwrap();
+        assert_eq!(z_trace.as_deref(), Some(trace_unrelated.as_str()));
+        assert!(z_erased.is_none(), "unrelated detection not tombstoned");
+
+        // Audit row emitted, scoped to this agent.
+        let events = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(hard_case::kind::TRACE_ERASURE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        let mine: Vec<_> = events
+            .into_iter()
+            .filter(|e| e.target_key_id.as_deref() == Some(agent.as_str()))
+            .collect();
+        assert_eq!(mine.len(), 1, "exactly one audit row for this agent");
+        assert_eq!(mine[0].detail["detection_events_tombstoned"], 1);
+
+        // Idempotent: second erasure is a clean all-zero no-op.
+        let summary2 = backend
+            .delete_traces_for_agent_id_hash(&agent)
+            .await
+            .unwrap();
+        assert_eq!(summary2.trace_events, 0);
+        assert_eq!(summary2.detection_events_tombstoned, 0);
     }
 
     /// Conflict on same detection_id with DIFFERENT canonical_bytes

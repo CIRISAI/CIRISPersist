@@ -19,8 +19,8 @@ use std::future::Future;
 use ed25519_dalek::VerifyingKey;
 
 use super::types::{
-    AuditEntry, ClaimParams, DeleteSummary, GraphNode, ServiceCorrelation, Task, TraceEventRow,
-    TraceLlmCallRow,
+    AuditEntry, ClaimParams, DeleteSummary, ErasureSummary, GraphNode, ServiceCorrelation, Task,
+    TraceEventRow, TraceLlmCallRow,
 };
 use super::Error;
 
@@ -172,6 +172,41 @@ pub trait Backend: Send + Sync {
         signature_key_id: &str,
         include_federation_key: bool,
     ) -> impl Future<Output = Result<DeleteSummary, Error>> + Send;
+
+    /// v6.9.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR **full erasure** of
+    /// an agent's trace corpus, keyed on `agent_id_hash` ALONE (across all
+    /// signing keys — contrast [`delete_traces_for_agent`](Self::delete_traces_for_agent),
+    /// which scopes to one signing key for the per-key DSAR).
+    ///
+    /// In a single transaction:
+    /// - HARD-delete every `trace_events` row where `agent_id_hash`
+    ///   matches.
+    /// - HARD-delete every `trace_llm_calls` row joined by `trace_id`
+    ///   from that erased set (LLM call rows carry no `agent_id_hash` per
+    ///   the V001 schema; the `trace_id` bridge is the only linkage).
+    /// - TOMBSTONE — not delete — every `detection_events` row derived
+    ///   from those traces (matched by `trace_id`): NULL the PII-linkage
+    ///   columns (`trace_id`, `body_sha256`, `canonical_bytes`) and stamp
+    ///   `erased_at` (V080). The derived analytics survive; the subject
+    ///   linkage is severed. Operator decision per CIRISPersist#222:
+    ///   detections are substrate-derived, not the subject's personal
+    ///   data.
+    /// - EMIT a `hard_case:trace_erasure` audit row (V075
+    ///   `hard_case_events`) inside the SAME transaction, so the audit
+    ///   record commits atomically with the erasure — persist's
+    ///   self-emission audit surface for destructive ops.
+    ///
+    /// **Idempotent**: a second call finds no matching rows and returns a
+    /// [`ErasureSummary`] with all counts zero. A not-found is NEVER an
+    /// error here.
+    ///
+    /// Authority is NOT validated against any signing-key proof — that is
+    /// the caller's (CIRISServer's absorbed-lens slice) DSAR-orchestration
+    /// responsibility. Persist owns the atomic substrate erasure.
+    fn delete_traces_for_agent_id_hash(
+        &self,
+        agent_id_hash: &str,
+    ) -> impl Future<Output = Result<ErasureSummary, Error>> + Send;
 
     /// v0.3.5 (CIRISLens#8 ASK 3) — Page-cursor read primitive for
     /// analytical streaming. Returns up to `limit` `trace_events` rows

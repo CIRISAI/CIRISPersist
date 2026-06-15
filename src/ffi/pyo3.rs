@@ -6937,6 +6937,75 @@ impl PyEngine {
         })
     }
 
+    /// v6.9.0 (CIRISPersist#222) — GDPR Art. 17 / DSAR **full erasure**
+    /// of an agent's trace corpus, keyed on `agent_id_hash` alone (all
+    /// signing keys). Unlike `delete_traces_for_agent` (per-signing-key),
+    /// this erases the agent's ENTIRE corpus and tombstones the derived
+    /// detections.
+    ///
+    /// In one atomic transaction: hard-deletes `trace_events` +
+    /// `trace_llm_calls`, TOMBSTONES the derived `detection_events`
+    /// (NULLs the PII linkage + stamps `erased_at`), and emits a
+    /// `hard_case:trace_erasure` audit row. Returns a dict:
+    ///
+    /// ```text
+    /// {
+    ///   "trace_events":                 int,
+    ///   "trace_llm_calls":              int,
+    ///   "detection_events_tombstoned":  int,
+    ///   "erased_at":                    str,  # ISO-8601 UTC
+    /// }
+    /// ```
+    ///
+    /// **Idempotent**: a second call returns all-zero counts; a not-found
+    /// is NOT raised as an error. Persist owns the atomic substrate
+    /// erasure; the caller owns the DSAR-request authority + signature
+    /// verification.
+    fn delete_traces_for_agent_id_hash<'py>(
+        &self,
+        py: Python<'py>,
+        agent_id_hash: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let agent_id_hash = agent_id_hash.to_owned();
+
+            let summary = py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .delete_traces_for_agent_id_hash(&agent_id_hash)
+                            .await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .delete_traces_for_agent_id_hash(&agent_id_hash)
+                            .await
+                    })
+                }
+            });
+            let summary = summary.map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+
+            let dict = PyDict::new(py);
+            dict.set_item("trace_events", summary.trace_events)?;
+            dict.set_item("trace_llm_calls", summary.trace_llm_calls)?;
+            dict.set_item(
+                "detection_events_tombstoned",
+                summary.detection_events_tombstoned,
+            )?;
+            dict.set_item("erased_at", summary.erased_at.to_rfc3339())?;
+            Ok(dict)
+        })
+    }
+
     /// v0.3.5 (CIRISLens#8 ASK 3) — Page-cursor read primitive for
     /// analytical streaming. Returns up to `limit` `trace_events` rows
     /// where `event_id > after_event_id`, ordered ascending by

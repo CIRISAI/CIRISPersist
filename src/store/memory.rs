@@ -571,6 +571,75 @@ impl Backend for MemoryBackend {
         })
     }
 
+    async fn delete_traces_for_agent_id_hash(
+        &self,
+        agent_id_hash: &str,
+    ) -> Result<super::types::ErasureSummary, Error> {
+        let erased_at = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+
+        // Full erasure: every trace_events row for this agent_id_hash,
+        // across all signing keys. trace_llm_calls cascade joins by
+        // trace_id (V001 — LLM call rows carry no agent_id_hash).
+        let target_trace_ids: HashSet<String> = state
+            .events
+            .values()
+            .filter(|(_, row)| row.agent_id_hash == agent_id_hash)
+            .map(|(_, row)| row.trace_id.clone())
+            .collect();
+
+        let events_before = state.events.len();
+        state
+            .events
+            .retain(|_, (_, row)| row.agent_id_hash != agent_id_hash);
+        let trace_events = (events_before - state.events.len()) as u64;
+
+        let llm_before = state.llm_calls.len();
+        state
+            .llm_calls
+            .retain(|row| !target_trace_ids.contains(&row.trace_id));
+        let trace_llm_calls = (llm_before - state.llm_calls.len()) as u64;
+
+        // detection_events tombstone: the memory backend has no
+        // cirislens_derived storage (DerivedSchema put paths return
+        // NotImplemented), so there is nothing to tombstone. Always 0;
+        // the postgres/sqlite backends carry the real tombstone path.
+        let detection_events_tombstoned = 0u64;
+
+        // Audit emit — record a `hard_case:trace_erasure` row, mirroring
+        // the durable hard_case_events surface (atomic with the deletes
+        // since the whole op holds the single state lock). Emit only when
+        // something was actually erased, so an idempotent re-run stays a
+        // clean no-op.
+        if trace_events > 0 || trace_llm_calls > 0 {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let detail = serde_json::json!({
+                "agent_id_hash": agent_id_hash,
+                "trace_events": trace_events,
+                "trace_llm_calls": trace_llm_calls,
+                "detection_events_tombstoned": detection_events_tombstoned,
+            });
+            state.federation_hard_case_events.insert(
+                event_id.clone(),
+                crate::federation::hard_case::HardCaseEvent {
+                    event_id,
+                    kind: crate::federation::hard_case::kind::TRACE_ERASURE.to_owned(),
+                    target_key_id: Some(agent_id_hash.to_owned()),
+                    subject_key_id: None,
+                    detail,
+                    emitted_at: erased_at,
+                },
+            );
+        }
+
+        Ok(super::types::ErasureSummary {
+            trace_events,
+            trace_llm_calls,
+            detection_events_tombstoned,
+            erased_at,
+        })
+    }
+
     async fn fetch_trace_events_page(
         &self,
         after_event_id: i64,
@@ -4250,6 +4319,105 @@ mod tests {
         let remaining = backend.snapshot_llm_calls();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].trace_id, "trace-k2-t1");
+    }
+
+    /// v6.9.0 (CIRISPersist#222) — full Art. 17 erasure deletes the
+    /// agent's traces across ALL signing keys (contrast the per-key
+    /// `delete_traces_for_agent`), cascades LLM calls by trace_id,
+    /// emits a `hard_case:trace_erasure` audit row, and is idempotent.
+    #[tokio::test]
+    async fn erasure_deletes_all_keys_cascades_and_audits() {
+        use crate::federation::{hard_case, FederationDirectory, HardCaseFilter};
+        use crate::store::Backend;
+        let backend = MemoryBackend::new();
+        // agent-A under two keys + an unrelated agent-B.
+        backend
+            .insert_trace_events_batch(&[
+                dsar_fixture_row("agent-A", "key1", "A-k1"),
+                dsar_fixture_row("agent-A", "key2", "A-k2"),
+                dsar_fixture_row("agent-B", "key1", "B-k1"),
+            ])
+            .await
+            .unwrap();
+        for trace_id in ["trace-A-k1", "trace-A-k2", "trace-B-k1"] {
+            backend
+                .insert_trace_llm_calls_batch(&[TraceLlmCallRow {
+                    trace_id: trace_id.into(),
+                    thought_id: "th".into(),
+                    task_id: None,
+                    parent_event_id: None,
+                    parent_event_type: ReasoningEventType::ThoughtStart,
+                    parent_attempt_index: 0,
+                    attempt_index: 0,
+                    ts: "2026-04-30T00:00:00Z".parse().unwrap(),
+                    duration_ms: 0.0,
+                    handler_name: "h".into(),
+                    service_name: "s".into(),
+                    model: None,
+                    base_url: None,
+                    response_model: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    prompt_bytes: None,
+                    completion_bytes: None,
+                    cost_usd: None,
+                    status: crate::schema::LlmCallStatus::Ok,
+                    error_class: None,
+                    attempt_count: None,
+                    retry_count: None,
+                    prompt_hash: None,
+                    prompt: None,
+                    response_text: None,
+                }])
+                .await
+                .unwrap();
+        }
+
+        // Erase agent-A: both keys' traces (2) + their 2 LLM calls.
+        let summary = backend
+            .delete_traces_for_agent_id_hash("agent-A")
+            .await
+            .unwrap();
+        assert_eq!(summary.trace_events, 2, "both keys' traces");
+        assert_eq!(summary.trace_llm_calls, 2);
+        // Memory backend has no derived storage — nothing to tombstone.
+        assert_eq!(summary.detection_events_tombstoned, 0);
+
+        // agent-B survives untouched.
+        let remaining = backend.snapshot_events();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].agent_id_hash, "agent-B");
+        assert_eq!(backend.snapshot_llm_calls().len(), 1);
+
+        // Audit: exactly one hard_case:trace_erasure row for agent-A.
+        let events = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(hard_case::kind::TRACE_ERASURE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].target_key_id.as_deref(), Some("agent-A"));
+        assert_eq!(events[0].detail["trace_events"], 2);
+        assert_eq!(events[0].detail["trace_llm_calls"], 2);
+
+        // Idempotent: a second erasure returns all-zero and emits NO
+        // new audit row (clean no-op).
+        let summary2 = backend
+            .delete_traces_for_agent_id_hash("agent-A")
+            .await
+            .unwrap();
+        assert_eq!(summary2.trace_events, 0);
+        assert_eq!(summary2.trace_llm_calls, 0);
+        let events2 = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(hard_case::kind::TRACE_ERASURE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(events2.len(), 1, "idempotent re-run emits no new audit");
     }
 
     /// v0.3.5 (CIRISLens#8 ASK 3) — fetch_trace_events_page returns

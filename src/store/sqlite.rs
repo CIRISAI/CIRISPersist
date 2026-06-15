@@ -825,6 +825,100 @@ impl Backend for SqliteBackend {
         Ok(summary)
     }
 
+    async fn delete_traces_for_agent_id_hash(
+        &self,
+        agent_id_hash: &str,
+    ) -> Result<super::types::ErasureSummary, Error> {
+        let erased_at = chrono::Utc::now();
+        let erased_s = erased_at.to_rfc3339();
+        let agent = agent_id_hash.to_owned();
+        let conn = self.conn.clone();
+        let summary = (move || -> Result<super::types::ErasureSummary, rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+
+            // Step 1: collect the agent's trace_ids across ALL signing
+            // keys (full Art. 17 erasure — not key-scoped).
+            let trace_ids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT DISTINCT trace_id FROM trace_events WHERE agent_id_hash = ?1",
+                )?;
+                let rows = stmt.query_map([&agent], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+
+            // Step 2: TOMBSTONE derived detection_events (V080) — NULL
+            // the PII linkage, stamp erased_at. NOT a delete. sqlite has
+            // no array params; iterate per trace_id. Only un-tombstoned
+            // rows are touched (idempotent re-run = no-op).
+            let mut detection_events_tombstoned = 0u64;
+            if !trace_ids.is_empty() {
+                let mut stmt = tx.prepare(
+                    "UPDATE cirislens_derived_detection_events \
+                     SET trace_id = NULL, body_sha256 = NULL, \
+                         canonical_bytes = NULL, erased_at = ?2 \
+                     WHERE trace_id = ?1 AND erased_at IS NULL",
+                )?;
+                for tid in &trace_ids {
+                    detection_events_tombstoned +=
+                        stmt.execute(rusqlite::params![tid, &erased_s])? as u64;
+                }
+            }
+
+            // Step 3: hard-delete LLM call rows joined by trace_id.
+            let mut trace_llm_calls = 0u64;
+            if !trace_ids.is_empty() {
+                let mut stmt = tx.prepare("DELETE FROM trace_llm_calls WHERE trace_id = ?1")?;
+                for tid in &trace_ids {
+                    trace_llm_calls += stmt.execute([tid])? as u64;
+                }
+            }
+
+            // Step 4: hard-delete the trace_events rows for the agent.
+            let trace_events = tx.execute(
+                "DELETE FROM trace_events WHERE agent_id_hash = ?1",
+                [&agent],
+            )? as u64;
+
+            // Step 5: emit the `hard_case:trace_erasure` audit row inside
+            // the txn (atomic). Emit only when something was erased.
+            if trace_events > 0 || trace_llm_calls > 0 || detection_events_tombstoned > 0 {
+                let event_id = uuid::Uuid::new_v4().to_string();
+                let detail = serde_json::json!({
+                    "agent_id_hash": agent,
+                    "trace_events": trace_events,
+                    "trace_llm_calls": trace_llm_calls,
+                    "detection_events_tombstoned": detection_events_tombstoned,
+                })
+                .to_string();
+                tx.execute(
+                    "INSERT INTO hard_case_events \
+                        (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT(event_id) DO NOTHING",
+                    rusqlite::params![
+                        event_id,
+                        crate::federation::hard_case::kind::TRACE_ERASURE,
+                        Some(&agent),
+                        None::<String>,
+                        detail,
+                        erased_s,
+                    ],
+                )?;
+            }
+
+            tx.commit()?;
+            Ok(super::types::ErasureSummary {
+                trace_events,
+                trace_llm_calls,
+                detection_events_tombstoned,
+                erased_at,
+            })
+        })()
+        .map_err(|e| Error::Backend(format!("erasure tx: {e}")))?;
+        Ok(summary)
+    }
+
     async fn fetch_trace_events_page(
         &self,
         after_event_id: i64,
@@ -20256,6 +20350,115 @@ mod tests {
             signing_key_id: "key-ratchet".to_owned(),
             inserted_at: Utc.with_ymd_and_hms(2026, 5, 9, 9, 5, 0).unwrap(),
         }
+    }
+
+    /// v6.9.0 (CIRISPersist#222) — full Art. 17 erasure: hard-delete the
+    /// agent's trace_events + trace_llm_calls, TOMBSTONE (not delete) the
+    /// derived detection_events for those traces, audit, idempotent.
+    #[tokio::test]
+    async fn erasure_tombstones_detections_and_hard_deletes_traces() {
+        use crate::federation::{hard_case, FederationDirectory, HardCaseFilter};
+        use crate::store::Backend;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // Two traces for the target agent; fixture_event_row stamps
+        // agent_id_hash="deadbeef". Distinct trace_ids "tr-A" / "tr-B".
+        let mut ev_a = fixture_event_row("tr-A", 0);
+        let mut ev_b = fixture_event_row("tr-B", 0);
+        ev_a.agent_id_hash = "deadbeef".to_owned();
+        ev_b.agent_id_hash = "deadbeef".to_owned();
+        backend
+            .insert_trace_events_batch(&[ev_a, ev_b])
+            .await
+            .unwrap();
+
+        // A detection derived from tr-A (will be tombstoned) and one
+        // derived from an UNRELATED trace tr-Z (must survive intact).
+        let det_a = uuid::Uuid::new_v4();
+        let det_z = uuid::Uuid::new_v4();
+        backend
+            .put_detection_event(de_fixture(det_a, "tr-A", b"canon-A"))
+            .await
+            .unwrap();
+        backend
+            .put_detection_event(de_fixture(det_z, "tr-Z", b"canon-Z"))
+            .await
+            .unwrap();
+
+        let summary = backend
+            .delete_traces_for_agent_id_hash("deadbeef")
+            .await
+            .unwrap();
+        assert_eq!(summary.trace_events, 2, "both traces hard-deleted");
+        assert_eq!(
+            summary.detection_events_tombstoned, 1,
+            "only the tr-A detection tombstoned"
+        );
+
+        // Traces are GONE (hard delete).
+        assert!(backend
+            .fetch_trace_events_page(0, 100, Some("deadbeef"))
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Detections still EXIST (tombstone, not delete): 2 rows. The
+        // tr-A row has its PII linkage NULLed + erased_at stamped; the
+        // tr-Z row is untouched. get_detection_events filters NULL
+        // trace_id out of the trace_id-keyed query, so query the raw
+        // table to prove the tombstone row survives.
+        let (total, tombstoned, surviving_z): (i64, i64, i64) = {
+            let conn = backend.conn.lock();
+            let total: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM cirislens_derived_detection_events",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let tombstoned: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM cirislens_derived_detection_events \
+                     WHERE erased_at IS NOT NULL AND trace_id IS NULL \
+                       AND body_sha256 IS NULL AND canonical_bytes IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let surviving_z: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM cirislens_derived_detection_events \
+                     WHERE trace_id = 'tr-Z' AND erased_at IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (total, tombstoned, surviving_z)
+        };
+        assert_eq!(total, 2, "tombstone keeps the row — no hard delete");
+        assert_eq!(tombstoned, 1, "tr-A detection PII NULLed + erased_at set");
+        assert_eq!(surviving_z, 1, "unrelated detection untouched");
+
+        // Audit row emitted.
+        let events = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(hard_case::kind::TRACE_ERASURE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail["detection_events_tombstoned"], 1);
+
+        // Idempotent: second erasure is a clean all-zero no-op, and the
+        // already-tombstoned detection is NOT re-counted.
+        let summary2 = backend
+            .delete_traces_for_agent_id_hash("deadbeef")
+            .await
+            .unwrap();
+        assert_eq!(summary2.trace_events, 0);
+        assert_eq!(summary2.detection_events_tombstoned, 0);
     }
 
     #[tokio::test]
