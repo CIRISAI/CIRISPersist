@@ -3,10 +3,11 @@
 //! # Mission alignment (MISSION.md §2 — `store/`)
 //!
 //! Same Backend trait surface as the in-memory and (Phase 2) SQLite
-//! backends. Postgres-specific bits — TimescaleDB hypertables,
-//! `ON CONFLICT DO NOTHING` on the dedup index, `BIGSERIAL` returns
-//! the inserted PK for parent-FK linkage — live behind the trait, not
-//! through it.
+//! backends. Postgres-specific bits — `ON CONFLICT DO NOTHING` on the
+//! dedup index, `BIGSERIAL` returns the inserted PK for parent-FK linkage
+//! — live behind the trait, not through it. (CIRISPersist#222: the
+//! substrate is fully backend-agnostic — plain PostgreSQL + SQLite, ZERO
+//! TimescaleDB. The §E scoring rollup is a plain table on both backends.)
 //!
 //! Implementation notes:
 //!
@@ -68,6 +69,14 @@ pub fn embedded_lens_migration_count() -> usize {
 /// boot contention serializes on the *same* lock id (the whole point
 /// of the v0.1.5 fix). THREAT_MODEL.md AV-26.
 const MIGRATION_LOCK_ID: i64 = 0x6369_7269_7370_7372_i64;
+
+/// CIRISPersist#222 — transaction-scoped advisory lock id serializing
+/// concurrent `refresh_factor_rollup` runs (the lazy refresh-on-read for
+/// the plain scoring rollup). A `pg_try_advisory_xact_lock` so a reader
+/// that loses the race skips the refresh rather than blocking — the rollup
+/// is tolerant of being one tail-window stale. Distinct from
+/// `MIGRATION_LOCK_ID`; the low bytes spell `"rllup"` for greppability.
+const ROLLUP_REFRESH_LOCK_ID: i64 = 0x7263_6972_736c_7570_i64;
 
 /// Postgres-backed [`Backend`] impl.
 pub struct PostgresBackend {
@@ -1047,7 +1056,19 @@ impl Backend for PostgresBackend {
         // apply documenting total_wall_us + applied_count +
         // applied_versions. See `crate::store::migration_timing`.
         let migration_started = std::time::Instant::now();
+        // CIRISPersist#222 — V079 was neutralized in place (its old body
+        // created a TimescaleDB continuous aggregate; the replacement is the
+        // plain V081 rollup table). A database that applied the ORIGINAL
+        // V079 (a timescale CI image) carries the old checksum in
+        // schema_history; without `set_abort_divergent(false)`, refinery's
+        // default would abort the boot on the checksum mismatch. The old
+        // V079 already ran there and will not re-run; V081 tears down the
+        // CAGG it left behind. `abort_missing` stays at its default (true)
+        // so an accidentally deleted migration still fails loudly.
+        // `set_abort_divergent` consumes `self`, so it must precede the
+        // borrowing `set_migration_table_name`.
         let report_result = embedded::migrations::runner()
+            .set_abort_divergent(false)
             .set_migration_table_name("ciris_persist_schema_history")
             .run_async(&mut lock_client)
             .await;
@@ -10880,24 +10901,24 @@ impl crate::read::ReadEngine for PostgresBackend {
             return Ok(scoring::reorder_scoring_to_input(hit, agent_id_hashes));
         }
 
-        // CIRISPersist#196 — fast path: sum the TimescaleDB continuous
-        // aggregate when the caller's scope is fully covered by the rollup
+        // CIRISPersist#196 / #222 — fast path: sum the PLAIN rollup table
+        // when the caller's scope is fully covered by the rollup
         // (Unauthenticated → broad-tiers only, all materialized) AND the
-        // rollup exists (TimescaleDB present + V079 applied). Sub-second
-        // (sum of ≈109k small buckets) vs the O(agents × traces) direct
-        // aggregation. Authenticated callers (self/family admission) and
-        // pure-Postgres / pre-V079 deployments fall through to the exact
-        // direct compute below — NO functionality is pg-only; the rollup
-        // is purely an acceleration.
+        // rollup exists (V081 applied — true on every plain-PG deployment,
+        // no TimescaleDB). Sub-second (sum of small buckets) vs the
+        // O(agents × traces) direct aggregation. Authenticated callers
+        // (self/family admission) and baseline calls fall through to the
+        // exact direct compute below. The same fast path is wired on SQLite
+        // (see src/store/sqlite.rs) — no pg/sqlite asymmetry.
         let mut out = Vec::with_capacity(agent_id_hashes.len());
         // The rollup fast path is for the FLEET SWEEP (multi-agent). A
         // single-agent call is the detail path (`aggregate_scoring_factors`
         // routes through batch-of-one) and needs the full per-trace fields
         // — recovery_events / coherence_decay_series / drift / gaps /
-        // identity_changes — which the scalar rollup does not carry; it
-        // also wants up-to-the-second data (no CAGG refresh lag). So
+        // identity_changes — which the scalar rollup does not carry. So
         // batch-of-one keeps the exact direct compute; only `len > 1`
-        // takes the rollup.
+        // takes the rollup. (The lazy refresh-on-read folds current ingest
+        // before the sum, so the rollup is not refresh-lagged.)
         if agent_id_hashes.len() > 1
             && baseline_window.is_none()
             && Self::scope_fully_covered_by_rollup(&scope)
@@ -11359,12 +11380,12 @@ impl PostgresBackend {
     /// AV-43: aggregates return computed statistics. Smallest-window
     /// callers apply k-anonymity at their layer based on `trace_count`.
     ///
-    /// CIRISPersist#196 — is the caller's scope FULLY covered by the
-    /// `trace_events_factor_rollup_1h` continuous aggregate?
+    /// CIRISPersist#196 / #222 — is the caller's scope FULLY covered by the
+    /// plain `trace_events_factor_rollup_1h` rollup table?
     ///
     /// The rollup materializes only public-eligible rows
     /// (`cohort_scope NOT IN ('self','family')`, the CEG §10.1.4
-    /// structural-invisibility filter baked into the CAGG). An
+    /// structural-invisibility filter applied at refresh). An
     /// [`Unauthenticated`](crate::scope::CallerScope::Unauthenticated)
     /// caller's admissible set is exactly the broad belonging-tiers, all
     /// of which ARE materialized — so the rollup yields the complete
@@ -11375,7 +11396,7 @@ impl PostgresBackend {
     /// rows it belongs to — neither is materialized — so the rollup would
     /// UNDERCOUNT. Those callers fall through to the direct
     /// `aggregate_scoring_factors_uncached` raw-`trace_events` aggregation
-    /// (correct, just not CAGG-fast). This keeps the §10.1.4 invariant
+    /// (correct, just not rollup-fast). This keeps the §10.1.4 invariant
     /// structural (a self/family bucket is never materialized, so it can
     /// never leak through the fast path) without ever returning a wrong
     /// number to an authenticated caller.
@@ -11383,13 +11404,12 @@ impl PostgresBackend {
         matches!(scope, crate::scope::CallerScope::Unauthenticated)
     }
 
-    /// CIRISPersist#196 — does `cirislens.trace_events_factor_rollup_1h`
-    /// exist in this database? Pure-Postgres deployments (no TimescaleDB,
-    /// FSD §7 #7) never have it (V079 no-ops there); a TimescaleDB
-    /// deployment that hasn't yet run the V079 schedule also reads as
-    /// present-but-empty (the CAGG row exists). One cheap catalog probe;
-    /// a NULL/absent `timescaledb_information` view (no extension) is
-    /// treated as "no rollup".
+    /// CIRISPersist#196 / #222 — does `cirislens.trace_events_factor_rollup_1h`
+    /// exist in this database? Post-#222 the rollup is a PLAIN TABLE created
+    /// by V081 on every Postgres deployment (no TimescaleDB), so this is
+    /// effectively always true after migrations run. The probe is retained
+    /// defensively (a pre-V081 DB mid-upgrade, or a hand-built schema, may
+    /// not have it) and stays valid with or without TimescaleDB installed.
     async fn factor_rollup_present(&self) -> Result<bool, crate::read::Error> {
         let client = self
             .pool
@@ -11409,6 +11429,195 @@ impl PostgresBackend {
         row.safe_get::<bool, _>("present")
     }
 
+    /// CIRISPersist#222 — incrementally refresh the plain rollup table.
+    ///
+    /// Re-aggregates `cirislens.trace_events` into
+    /// `trace_events_factor_rollup_1h` for every hour-bucket touching
+    /// `[since, now]` via an idempotent UPSERT
+    /// (`INSERT … SELECT … GROUP BY … ON CONFLICT DO UPDATE`). Driven
+    /// lazily from [`aggregate_scoring_factors_rollup_batch`] (the
+    /// sum-on-read fast path) so the fleet sweep only ever re-folds the
+    /// trailing tail: the watermark in `trace_events_factor_rollup_meta`
+    /// records the high-water `ts` already folded, and each refresh
+    /// re-does `[watermark - 1h, now]` (the trailing partial bucket is
+    /// recomputed, never double-counted — the UPSERT REPLACES the bucket
+    /// row with the full recomputed aggregate, it does not add to it).
+    ///
+    /// The whole refresh runs in ONE transaction (advisory-locked so two
+    /// readers don't duplicate the work), so a failure rolls back cleanly
+    /// and the watermark only advances on commit. Plain Postgres + plain
+    /// SQL — NO TimescaleDB. The §10.1.4 filter (`cohort_scope NOT IN
+    /// ('self','family')`) is applied at materialization so self/family
+    /// buckets are never written.
+    ///
+    /// `since` bounds the re-aggregation window cheaply; `None` re-folds
+    /// from the stored watermark (or all-time on first run).
+    async fn refresh_factor_rollup(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), crate::read::Error> {
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("pool: {e}")))?;
+
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("rollup refresh begin: {e}")))?;
+
+        // Serialize concurrent refreshers on a transaction-scoped advisory
+        // lock (auto-released at COMMIT/ROLLBACK) so two batch reads don't
+        // both re-fold the tail. A non-blocking try-lock: if another
+        // refresher holds it, skip — the rollup is at most one tail-window
+        // stale, which the sum-on-read tolerates.
+        let got_lock: bool = tx
+            .query_one("SELECT pg_try_advisory_xact_lock($1) AS l", &[&ROLLUP_REFRESH_LOCK_ID])
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("rollup refresh lock: {e}")))?
+            .safe_get("l")?;
+        if !got_lock {
+            // Another refresher is in flight; let it own the write.
+            return Ok(());
+        }
+
+        // Determine the re-fold floor: explicit `since`, else the stored
+        // watermark minus one hour (recompute the trailing partial bucket),
+        // else all-time (first run / NULL watermark).
+        let lo: Option<chrono::DateTime<chrono::Utc>> = match since {
+            Some(s) => Some(s),
+            None => {
+                let wm: Option<chrono::DateTime<chrono::Utc>> = tx
+                    .query_one(
+                        "SELECT last_refreshed_ts FROM cirislens.trace_events_factor_rollup_meta WHERE id = TRUE",
+                        &[],
+                    )
+                    .await
+                    .map_err(|e| crate::read::Error::Backend(format!("rollup watermark read: {e}")))?
+                    .safe_get("last_refreshed_ts")?;
+                wm.map(|w| w - chrono::Duration::hours(1))
+            }
+        };
+
+        // UPSERT the recomputed buckets. The SELECT pre-collapses per
+        // trace_id (so retried CONSCIENCE_RESULT events count once) inside
+        // each (bucket, agent, domain, scope, target) group, mirroring the
+        // direct path's per-trace BOOL_OR semantics. Counts only (numerator
+        // + denominator), divided once on read.
+        //
+        // The lo bound is applied to the SOURCE rows; we delete + rewrite
+        // whole buckets in range so a partial trailing bucket is fully
+        // recomputed (idempotent: re-running yields the same bucket rows).
+        let lo_pred = if lo.is_some() { "WHERE te.ts >= $1" } else { "" };
+        let sql = format!(
+            "INSERT INTO cirislens.trace_events_factor_rollup_1h ( \
+                bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
+                cohort_target_id, trace_count, \
+                csdma_sum, csdma_n, k_eff_sum, k_eff_n, \
+                correlation_risk_sum, correlation_risk_n, \
+                override_trace_count, fragility_trace_count, \
+                conscience_fail_trace_count, entropy_fail_trace_count, \
+                coherence_fail_trace_count, optimization_veto_fail_trace_count, \
+                epistemic_humility_fail_trace_count, \
+                audit_seq_trace_count, audit_sig_trace_count) \
+             SELECT \
+                date_trunc('hour', te.ts) AS bucket_start, \
+                te.agent_id_hash, te.deployment_domain, te.cohort_scope, \
+                te.cohort_target_id, \
+                COUNT(DISTINCT te.trace_id)::bigint, \
+                COALESCE(SUM((te.payload->>'csdma_plausibility_score')::float8),0)::float8, \
+                COUNT((te.payload->>'csdma_plausibility_score'))::bigint, \
+                COALESCE(SUM((te.payload->>'idma_k_eff')::float8),0)::float8, \
+                COUNT((te.payload->>'idma_k_eff'))::bigint, \
+                COALESCE(SUM((te.payload->>'idma_correlation_risk')::float8),0)::float8, \
+                COUNT((te.payload->>'idma_correlation_risk'))::bigint, \
+                COUNT(DISTINCT te.trace_id) FILTER ( \
+                    WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                      AND (te.payload->>'action_was_overridden')::bool)::bigint, \
+                COUNT(DISTINCT te.trace_id) FILTER ( \
+                    WHERE (te.payload->>'idma_fragility_flag')::bool)::bigint, \
+                COUNT(DISTINCT te.trace_id) FILTER ( \
+                    WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                      AND (te.payload->>'conscience_passed')::bool = false)::bigint, \
+                COUNT(DISTINCT te.trace_id) FILTER ( \
+                    WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                      AND (te.payload->>'entropy_passed')::bool = false)::bigint, \
+                COUNT(DISTINCT te.trace_id) FILTER ( \
+                    WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                      AND (te.payload->>'coherence_passed')::bool = false)::bigint, \
+                COUNT(DISTINCT te.trace_id) FILTER ( \
+                    WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                      AND (te.payload->>'optimization_veto_passed')::bool = false)::bigint, \
+                COUNT(DISTINCT te.trace_id) FILTER ( \
+                    WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                      AND (te.payload->>'epistemic_humility_passed')::bool = false)::bigint, \
+                COUNT(DISTINCT te.trace_id) FILTER ( \
+                    WHERE te.audit_sequence_number IS NOT NULL)::bigint, \
+                COUNT(DISTINCT te.trace_id) FILTER ( \
+                    WHERE te.audit_signature IS NOT NULL)::bigint \
+             FROM cirislens.trace_events te \
+             {lo_pred} \
+             {self_family_gate} \
+             GROUP BY date_trunc('hour', te.ts), te.agent_id_hash, \
+                      te.deployment_domain, te.cohort_scope, te.cohort_target_id \
+             ON CONFLICT (bucket_start, COALESCE(agent_id_hash,''), \
+                          COALESCE(deployment_domain,''), COALESCE(cohort_scope,''), \
+                          COALESCE(cohort_target_id,'')) \
+             DO UPDATE SET \
+                trace_count = EXCLUDED.trace_count, \
+                csdma_sum = EXCLUDED.csdma_sum, csdma_n = EXCLUDED.csdma_n, \
+                k_eff_sum = EXCLUDED.k_eff_sum, k_eff_n = EXCLUDED.k_eff_n, \
+                correlation_risk_sum = EXCLUDED.correlation_risk_sum, \
+                correlation_risk_n = EXCLUDED.correlation_risk_n, \
+                override_trace_count = EXCLUDED.override_trace_count, \
+                fragility_trace_count = EXCLUDED.fragility_trace_count, \
+                conscience_fail_trace_count = EXCLUDED.conscience_fail_trace_count, \
+                entropy_fail_trace_count = EXCLUDED.entropy_fail_trace_count, \
+                coherence_fail_trace_count = EXCLUDED.coherence_fail_trace_count, \
+                optimization_veto_fail_trace_count = EXCLUDED.optimization_veto_fail_trace_count, \
+                epistemic_humility_fail_trace_count = EXCLUDED.epistemic_humility_fail_trace_count, \
+                audit_seq_trace_count = EXCLUDED.audit_seq_trace_count, \
+                audit_sig_trace_count = EXCLUDED.audit_sig_trace_count",
+            lo_pred = lo_pred,
+            // §10.1.4 — never materialize self/family. AND-joined when a lo
+            // bound exists, else it is the leading WHERE.
+            self_family_gate = if lo.is_some() {
+                "AND te.cohort_scope NOT IN ('self','family')"
+            } else {
+                "WHERE te.cohort_scope NOT IN ('self','family')"
+            },
+        );
+
+        if let Some(lo_ts) = lo {
+            tx.execute(sql.as_str(), &[&lo_ts])
+                .await
+                .map_err(|e| crate::read::Error::Backend(format!("rollup upsert: {e}")))?;
+        } else {
+            tx.execute(sql.as_str(), &[])
+                .await
+                .map_err(|e| crate::read::Error::Backend(format!("rollup upsert: {e}")))?;
+        }
+
+        // Advance the watermark to the max ts we just folded (now()-bounded
+        // is unnecessary: the SELECT already covered everything >= lo).
+        tx.execute(
+            "UPDATE cirislens.trace_events_factor_rollup_meta \
+             SET last_refreshed_ts = ( \
+                 SELECT COALESCE(MAX(ts), last_refreshed_ts, NOW()) \
+                 FROM cirislens.trace_events) \
+             WHERE id = TRUE",
+            &[],
+        )
+        .await
+        .map_err(|e| crate::read::Error::Backend(format!("rollup watermark advance: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| crate::read::Error::Backend(format!("rollup refresh commit: {e}")))?;
+        Ok(())
+    }
+
     /// CIRISPersist#196 — sum-of-buckets read over
     /// `trace_events_factor_rollup_1h` for the requested agents + window.
     ///
@@ -11418,7 +11627,7 @@ impl PostgresBackend {
     /// **bucket-summable scalar factors** are populated from the rollup:
     /// `trace_count`, `conscience_overrides`, `audit_chain_total`,
     /// `audit_signed_total`, and `unsafe_action_rate` is left 0.0 (NOT
-    /// rollup-derivable — see V079 header). The per-trace-sequenced /
+    /// rollup-derivable — see the refresh routine + V081). The per-trace-sequenced /
     /// baseline-dependent fields (`recovery_events`,
     /// `coherence_decay_series`, `audit_chain_gaps`, `identity_changes`,
     /// `drift_z_score`, `calibration_error`) are left at their empty/None
@@ -11437,6 +11646,13 @@ impl PostgresBackend {
         std::collections::HashMap<String, crate::read::ScoringFactorAggregate>,
         crate::read::Error,
     > {
+        // CIRISPersist#222 — lazy refresh-on-read: fold any trace_events
+        // that arrived since the watermark into the plain rollup before we
+        // sum it, so the fast-path answer reflects current ingest. The
+        // refresh re-aggregates only the trailing tail (watermark - 1h →
+        // now) and is advisory-locked + transaction-safe + idempotent.
+        self.refresh_factor_rollup(None).await?;
+
         let client = self
             .pool
             .get()
@@ -11446,10 +11662,10 @@ impl PostgresBackend {
         // Sum the per-bucket numerators + denominator across the window,
         // grouped by agent. Rates / means are divided ONCE here from the
         // summed components (never averaging pre-divided per-bucket rates).
-        // The rollup already excludes self/family rows (CAGG WHERE), so no
+        // The rollup already excludes self/family rows (refresh-upsert WHERE), so no
         // scope predicate is needed for the Unauthenticated fast path; we
         // additionally constrain to the public-federatable scopes
-        // defensively in case a future CAGG edit widens materialization.
+        // defensively in case a future refresh edit widens materialization.
         let sql = "SELECT \
                 agent_id_hash, \
                 SUM(trace_count)::bigint AS trace_count, \
@@ -15943,45 +16159,27 @@ mod tests {
         assert!(agg.drift_z_score.is_none());
     }
 
-    /// CIRISPersist#196 test helper — is TimescaleDB installed on the
-    /// test DB? The lead's :5433 is `timescale/timescaledb:latest-pg16`,
-    /// so the CAGG-backed tests run there; a plain-Postgres test DB skips
-    /// them (the rollup is a PG-only acceleration; the methods still work
-    /// via direct aggregation, exercised by the non-CAGG tests).
-    async fn timescaledb_present(backend: &PostgresBackend) -> bool {
-        let client = backend.pool.get().await.unwrap();
-        let row = client
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname='timescaledb') AS p",
-                &[],
-            )
-            .await
-            .unwrap();
-        row.try_get::<_, bool>("p")
-            .expect("timescaledb probe column")
-    }
-
-    /// CIRISPersist#196 test helper — force-materialize the
-    /// `trace_events_factor_rollup_1h` continuous aggregate so a read sees
-    /// just-inserted rows (the automatic policy's `end_offset => 1h`
-    /// excludes the most-recent hour, and the schedule is async). A full
-    /// `(NULL, NULL)` refresh materializes everything regardless of the
-    /// policy window.
+    /// CIRISPersist#222 test helper — force the plain rollup to fold all
+    /// current `trace_events` so a read sees just-inserted rows. Drives the
+    /// production incremental refresh with an all-time floor (`since` far in
+    /// the past) so the trailing-tail watermark optimization doesn't skip
+    /// the just-inserted rows in a freshly-migrated test DB. Plain SQL — no
+    /// TimescaleDB.
     async fn refresh_factor_rollup(backend: &PostgresBackend) {
-        let client = backend.pool.get().await.unwrap();
-        client
-            .batch_execute(
-                "CALL refresh_continuous_aggregate('cirislens.trace_events_factor_rollup_1h', NULL, NULL);",
-            )
+        backend
+            .refresh_factor_rollup(Some(
+                chrono::Utc::now() - chrono::Duration::days(3650),
+            ))
             .await
-            .expect("refresh continuous aggregate");
+            .expect("refresh plain factor rollup");
     }
 
     /// CIRISPersist#196 — the rollup fast path (Unauthenticated →
     /// fully-rollup-covered) returns the SAME scalar factors the direct
     /// aggregation does. Proves the sum-of-buckets read is exact for the
     /// bucket-summable factors (trace_count, conscience_overrides,
-    /// audit totals). Requires the timescaledb image.
+    /// audit totals). Runs on PLAIN postgres:16 (no TimescaleDB) — the
+    /// rollup is now a plain table, no extension gate.
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn read_section_e_factor_rollup_matches_direct() {
@@ -15991,10 +16189,6 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        if !timescaledb_present(&backend).await {
-            eprintln!("skipping: TimescaleDB not installed (CAGG test needs timescale image)");
-            return;
-        }
 
         use crate::read::ReadEngine;
         let suffix = uuid_like();
@@ -16093,7 +16287,7 @@ mod tests {
     /// rollup MUST NOT expose cohort_scope ∈ {self, family} rows. Insert a
     /// `self` trace and a `federation` trace for the same agent; the
     /// Unauthenticated rollup read counts ONLY the federation trace.
-    /// Requires the timescaledb image.
+    /// Runs on PLAIN postgres:16 (no TimescaleDB).
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn read_section_e_factor_rollup_excludes_self_family() {
@@ -16103,10 +16297,6 @@ mod tests {
         };
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
-        if !timescaledb_present(&backend).await {
-            eprintln!("skipping: TimescaleDB not installed (CAGG test needs timescale image)");
-            return;
-        }
 
         use crate::read::ReadEngine;
         let suffix = uuid_like();
@@ -16253,9 +16443,7 @@ mod tests {
                 .await;
             }
         }
-        if timescaledb_present(&backend).await {
-            refresh_factor_rollup(&backend).await;
-        }
+        refresh_factor_rollup(&backend).await;
 
         let window = crate::read::TimeWindow {
             since: now - chrono::Duration::hours(1),

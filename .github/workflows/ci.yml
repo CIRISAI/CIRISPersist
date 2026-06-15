@@ -48,7 +48,12 @@ jobs:
           - { name: telemetry,  features: "postgres server pyo3 sqlite telemetry" }
     services:
       postgres:
-        image: timescale/timescaledb:latest-pg16
+        # CIRISPersist#222 — PLAIN postgres:16, NOT timescaledb. The
+        # substrate is fully backend-agnostic (plain PostgreSQL + SQLite,
+        # zero TimescaleDB); the agnostic path is what CI must verify. The
+        # scoring rollup is a plain table refreshed by an idempotent upsert,
+        # so the rollup tests run (not skip) here against the plain table.
+        image: postgres:16
         env:
           POSTGRES_USER: ciris
           POSTGRES_PASSWORD: ciris

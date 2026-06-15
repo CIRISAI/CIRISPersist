@@ -8170,13 +8170,16 @@ fn sqlite_row_to_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::federa
 //
 // SQLite backend — full parity with the Postgres `ReadEngine` impl so
 // sovereign-mode deployments (Raspberry Pi, iOS) get the observability
-// read API. The Postgres impl leans on TimescaleDB continuous
-// aggregates for the §E/§F analytics; SQLite has no continuous-
-// aggregate machinery, so those primitives run as raw-window queries
-// over `trace_events` — the same logical computation, expressed
-// in single-statement SQL plus Rust-side statistics where SQLite
-// lacks an aggregate (it has no `STDDEV` / `VAR_SAMP`, so divergence
-// / temporal-drift variance is computed in Rust from per-group
+// read API. Post-#222 there is NO TimescaleDB anywhere — the §E scoring
+// rollup is a PLAIN table (`trace_events_factor_rollup_1h`) on BOTH
+// backends, refreshed by the same idempotent upsert and summed on read
+// for the sub-second fleet sweep. SQLite gets the identical fast-path
+// capability as Postgres; the only dialect difference is the hour-bucket
+// SQL (`strftime` vs `date_trunc`). Other §E/§F primitives run as
+// raw-window queries over `trace_events` — the same logical computation,
+// expressed in single-statement SQL plus Rust-side statistics where
+// SQLite lacks an aggregate (it has no `STDDEV` / `VAR_SAMP`, so
+// divergence / temporal-drift variance is computed in Rust from per-group
 // means).
 //
 // Dialect translations vs. the Postgres impl:
@@ -10754,17 +10757,57 @@ impl crate::read::ReadEngine for SqliteBackend {
             return Ok(scoring::reorder_scoring_to_input(hit, agent_id_hashes));
         }
 
+        // CIRISPersist#222 — rollup fast path, WIRED IDENTICALLY to
+        // Postgres (no pg/sqlite asymmetry). The fleet sweep (len > 1,
+        // no baseline, Unauthenticated scope fully covered by the public
+        // rollup, rollup table present) sums the plain
+        // `trace_events_factor_rollup_1h` buckets — sub-second — instead of
+        // the O(agents × traces) direct aggregation. Single-agent / detail
+        // / authenticated / baseline calls fall through to the exact direct
+        // compute below, same as Postgres. The bucketing dialect differs
+        // (strftime vs date_trunc); the capability does not.
         let mut out = Vec::with_capacity(agent_id_hashes.len());
-        for aid in agent_id_hashes {
-            out.push(
-                self.aggregate_scoring_factors_uncached(
-                    aid,
-                    window,
-                    baseline_window,
-                    scope.clone(),
-                )
-                .await?,
-            );
+        if agent_id_hashes.len() > 1
+            && baseline_window.is_none()
+            && Self::scope_fully_covered_by_rollup(&scope)
+            && self.factor_rollup_present().await?
+        {
+            let mut by_agent = self
+                .aggregate_scoring_factors_rollup_batch(agent_id_hashes, window)
+                .await?;
+            for aid in agent_id_hashes {
+                out.push(by_agent.remove(aid).unwrap_or_else(|| {
+                    crate::read::ScoringFactorAggregate {
+                        agent_id_hash: aid.clone(),
+                        window,
+                        trace_count: 0,
+                        identity_changes: 0,
+                        conscience_overrides: 0,
+                        audit_chain_total: 0,
+                        audit_chain_gaps: 0,
+                        audit_signed_total: 0,
+                        recovery_events: Vec::new(),
+                        drift_z_score: None,
+                        calibration_error: None,
+                        unsafe_action_rate: 0.0,
+                        coherence_decay_series: Vec::new(),
+                        evaluated_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+                        cache_hit: false,
+                    }
+                }));
+            }
+        } else {
+            for aid in agent_id_hashes {
+                out.push(
+                    self.aggregate_scoring_factors_uncached(
+                        aid,
+                        window,
+                        baseline_window,
+                        scope.clone(),
+                    )
+                    .await?,
+                );
+            }
         }
         let size = scoring::estimate_size(&out);
         cache.store(key, out.clone(), size);
@@ -10782,12 +10825,14 @@ impl crate::read::ReadEngine for SqliteBackend {
         // CIRISPersist#197 — same compose-over-batch shape as Postgres so
         // the stream shares the scoring-factors cache + abort semantics.
         //
-        // PERF: there is NO TimescaleDB continuous aggregate on sqlite (the
-        // #196 rollup is PG-only), so the underlying batch here is the
-        // direct O(agents × traces) per-agent aggregation — correct, but
-        // not the sub-second CAGG fast path the Postgres+TimescaleDB
-        // Unauthenticated route gets. Streaming still lets the lens render
-        // agents as they complete instead of blocking on the whole fleet.
+        // PERF (CIRISPersist#222): SQLite now has the SAME plain-rollup fast
+        // path as Postgres — the underlying batch sums the
+        // `trace_events_factor_rollup_1h` buckets (sub-second) for the
+        // fleet-sweep route (len > 1, Unauthenticated, no baseline), and
+        // falls through to the direct O(agents × traces) compute only for
+        // the detail / authenticated / baseline routes (exactly as
+        // Postgres). No pg/sqlite asymmetry; the only difference is the
+        // hour-bucket dialect (strftime vs date_trunc).
         let aggs = self
             .aggregate_scoring_factors_batch(&agent_id_hashes, window, baseline_window, scope)
             .await?;
@@ -11465,6 +11510,313 @@ impl SqliteBackend {
                 .map_err(sqlite_read_err("scoring_ingest_watermark query"))?
                 .flatten();
             Ok(w.map(|s| parse_rfc3339(&s).timestamp_millis()).unwrap_or(0))
+        })()
+    }
+
+    /// CIRISPersist#196 / #222 — is the caller's scope FULLY covered by the
+    /// plain `trace_events_factor_rollup_1h` rollup? Symmetric with the
+    /// Postgres `scope_fully_covered_by_rollup`: the rollup materializes
+    /// only public-eligible rows (`cohort_scope NOT IN ('self','family')`,
+    /// the CEG §10.1.4 structural-invisibility filter applied at refresh),
+    /// so an [`Unauthenticated`](crate::scope::CallerScope::Unauthenticated)
+    /// caller (admissible set = the broad belonging-tiers, all materialized)
+    /// gets the complete answer from the rollup. Authenticated callers
+    /// additionally admit self/family (never materialized) so they fall
+    /// through to the direct compute — same rule on both backends.
+    fn scope_fully_covered_by_rollup(scope: &crate::scope::CallerScope) -> bool {
+        matches!(scope, crate::scope::CallerScope::Unauthenticated)
+    }
+
+    /// CIRISPersist#222 — does the plain rollup table exist? V081 creates it
+    /// on every SQLite deployment, so this is effectively always true after
+    /// migrations; probed defensively for a pre-V081 / hand-built schema.
+    async fn factor_rollup_present(&self) -> Result<bool, crate::read::Error> {
+        let conn = self.conn.clone();
+        (move || -> Result<bool, crate::read::Error> {
+            let conn = conn.lock();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'trace_events_factor_rollup_1h'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(sqlite_read_err("factor_rollup_present probe"))?;
+            Ok(n > 0)
+        })()
+    }
+
+    /// CIRISPersist#222 — incrementally refresh the plain rollup table
+    /// (SQLite). Mirror of the Postgres `refresh_factor_rollup`: an
+    /// idempotent UPSERT (`INSERT … SELECT … GROUP BY … ON CONFLICT DO
+    /// UPDATE`) re-aggregating `trace_events` into
+    /// `trace_events_factor_rollup_1h` for buckets touching `[lo, now]`,
+    /// wrapped in one transaction, advancing the watermark on commit.
+    ///
+    /// The ONLY dialect difference from Postgres is the hour-bucket SQL:
+    /// `strftime('%Y-%m-%dT%H:00:00Z', ts)` (degraded form of
+    /// `date_trunc('hour', ts)` — same capability, no `time_bucket()`).
+    /// `BOOL_OR`/`FILTER` → `MAX(CASE …)` + `COUNT(DISTINCT … CASE …)`
+    /// per the SQLite read-impl translation table. §10.1.4 self/family
+    /// filter is applied at materialization.
+    async fn refresh_factor_rollup(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), crate::read::Error> {
+        let since_text = since.map(|s| s.to_rfc3339());
+        let conn = self.conn.clone();
+        (move || -> Result<(), crate::read::Error> {
+            let mut conn = conn.lock();
+            let tx = conn
+                .transaction()
+                .map_err(sqlite_read_err("rollup refresh begin"))?;
+
+            // Re-fold floor: explicit `since`, else watermark - 1h, else
+            // all-time (first run). SQLite stores ts as RFC3339 TEXT;
+            // datetime(..., '-1 hour') keeps it RFC3339-comparable.
+            let lo: Option<String> = match since_text {
+                Some(s) => Some(s),
+                None => {
+                    let wm: Option<String> = tx
+                        .query_row(
+                            "SELECT last_refreshed_ts FROM trace_events_factor_rollup_meta WHERE id = 1",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(sqlite_read_err("rollup watermark read"))?
+                        .flatten();
+                    // Shift back one hour to recompute the trailing partial
+                    // bucket. parse → subtract → re-emit RFC3339.
+                    wm.map(|w| (parse_rfc3339(&w) - chrono::Duration::hours(1)).to_rfc3339())
+                }
+            };
+
+            // Whole-bucket recompute. The inner per_trace CTE collapses
+            // each trace_id to per-trace booleans (retried CONSCIENCE_RESULT
+            // events count once), then the outer GROUP BY folds to the
+            // bucket grain. ON CONFLICT REPLACES the bucket aggregate
+            // (idempotent — never additive).
+            let lo_pred = if lo.is_some() {
+                "AND te.ts >= ?1"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "INSERT INTO trace_events_factor_rollup_1h ( \
+                    bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
+                    cohort_target_id, trace_count, \
+                    csdma_sum, csdma_n, k_eff_sum, k_eff_n, \
+                    correlation_risk_sum, correlation_risk_n, \
+                    override_trace_count, fragility_trace_count, \
+                    conscience_fail_trace_count, entropy_fail_trace_count, \
+                    coherence_fail_trace_count, optimization_veto_fail_trace_count, \
+                    epistemic_humility_fail_trace_count, \
+                    audit_seq_trace_count, audit_sig_trace_count) \
+                 WITH per_trace AS ( \
+                    SELECT \
+                       strftime('%Y-%m-%dT%H:00:00Z', te.ts) AS bucket_start, \
+                       te.agent_id_hash AS agent_id_hash, \
+                       te.deployment_domain AS deployment_domain, \
+                       te.cohort_scope AS cohort_scope, \
+                       te.cohort_target_id AS cohort_target_id, \
+                       te.trace_id AS trace_id, \
+                       AVG(CASE WHEN json_extract(te.payload,'$.csdma_plausibility_score') \
+                           IS NOT NULL THEN json_extract(te.payload,'$.csdma_plausibility_score') END) \
+                           AS csdma_val, \
+                       AVG(CASE WHEN json_extract(te.payload,'$.idma_k_eff') \
+                           IS NOT NULL THEN json_extract(te.payload,'$.idma_k_eff') END) \
+                           AS k_eff_val, \
+                       AVG(CASE WHEN json_extract(te.payload,'$.idma_correlation_risk') \
+                           IS NOT NULL THEN json_extract(te.payload,'$.idma_correlation_risk') END) \
+                           AS corr_val, \
+                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                           AND json_extract(te.payload,'$.action_was_overridden')=1 THEN 1 ELSE 0 END) \
+                           AS overridden, \
+                       MAX(CASE WHEN json_extract(te.payload,'$.idma_fragility_flag')=1 THEN 1 ELSE 0 END) \
+                           AS fragile, \
+                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                           AND json_extract(te.payload,'$.conscience_passed')=0 THEN 1 ELSE 0 END) \
+                           AS conscience_fail, \
+                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                           AND json_extract(te.payload,'$.entropy_passed')=0 THEN 1 ELSE 0 END) \
+                           AS entropy_fail, \
+                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                           AND json_extract(te.payload,'$.coherence_passed')=0 THEN 1 ELSE 0 END) \
+                           AS coherence_fail, \
+                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                           AND json_extract(te.payload,'$.optimization_veto_passed')=0 THEN 1 ELSE 0 END) \
+                           AS optimization_veto_fail, \
+                       MAX(CASE WHEN te.event_type='CONSCIENCE_RESULT' \
+                           AND json_extract(te.payload,'$.epistemic_humility_passed')=0 THEN 1 ELSE 0 END) \
+                           AS epistemic_humility_fail, \
+                       MAX(CASE WHEN te.audit_sequence_number IS NOT NULL THEN 1 ELSE 0 END) \
+                           AS has_audit_seq, \
+                       MAX(CASE WHEN te.audit_signature IS NOT NULL THEN 1 ELSE 0 END) \
+                           AS has_audit_sig, \
+                       MAX(CASE WHEN json_extract(te.payload,'$.csdma_plausibility_score') \
+                           IS NOT NULL THEN 1 ELSE 0 END) AS has_csdma, \
+                       MAX(CASE WHEN json_extract(te.payload,'$.idma_k_eff') \
+                           IS NOT NULL THEN 1 ELSE 0 END) AS has_k_eff, \
+                       MAX(CASE WHEN json_extract(te.payload,'$.idma_correlation_risk') \
+                           IS NOT NULL THEN 1 ELSE 0 END) AS has_corr \
+                    FROM trace_events te \
+                    WHERE te.cohort_scope NOT IN ('self','family') {lo_pred} \
+                    GROUP BY bucket_start, te.agent_id_hash, te.deployment_domain, \
+                             te.cohort_scope, te.cohort_target_id, te.trace_id \
+                 ) \
+                 SELECT bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
+                        cohort_target_id, \
+                        COUNT(*) AS trace_count, \
+                        COALESCE(SUM(csdma_val),0), SUM(has_csdma), \
+                        COALESCE(SUM(k_eff_val),0), SUM(has_k_eff), \
+                        COALESCE(SUM(corr_val),0), SUM(has_corr), \
+                        SUM(overridden), SUM(fragile), \
+                        SUM(conscience_fail), SUM(entropy_fail), SUM(coherence_fail), \
+                        SUM(optimization_veto_fail), SUM(epistemic_humility_fail), \
+                        SUM(has_audit_seq), SUM(has_audit_sig) \
+                 FROM per_trace \
+                 GROUP BY bucket_start, agent_id_hash, deployment_domain, \
+                          cohort_scope, cohort_target_id \
+                 ON CONFLICT (bucket_start, COALESCE(agent_id_hash,''), \
+                              COALESCE(deployment_domain,''), COALESCE(cohort_scope,''), \
+                              COALESCE(cohort_target_id,'')) \
+                 DO UPDATE SET \
+                    trace_count = excluded.trace_count, \
+                    csdma_sum = excluded.csdma_sum, csdma_n = excluded.csdma_n, \
+                    k_eff_sum = excluded.k_eff_sum, k_eff_n = excluded.k_eff_n, \
+                    correlation_risk_sum = excluded.correlation_risk_sum, \
+                    correlation_risk_n = excluded.correlation_risk_n, \
+                    override_trace_count = excluded.override_trace_count, \
+                    fragility_trace_count = excluded.fragility_trace_count, \
+                    conscience_fail_trace_count = excluded.conscience_fail_trace_count, \
+                    entropy_fail_trace_count = excluded.entropy_fail_trace_count, \
+                    coherence_fail_trace_count = excluded.coherence_fail_trace_count, \
+                    optimization_veto_fail_trace_count = excluded.optimization_veto_fail_trace_count, \
+                    epistemic_humility_fail_trace_count = excluded.epistemic_humility_fail_trace_count, \
+                    audit_seq_trace_count = excluded.audit_seq_trace_count, \
+                    audit_sig_trace_count = excluded.audit_sig_trace_count"
+            );
+
+            if let Some(ref lo_ts) = lo {
+                tx.execute(&sql, rusqlite::params![lo_ts])
+                    .map_err(sqlite_read_err("rollup upsert"))?;
+            } else {
+                tx.execute(&sql, [])
+                    .map_err(sqlite_read_err("rollup upsert"))?;
+            }
+
+            // Advance watermark to max(ts).
+            tx.execute(
+                "UPDATE trace_events_factor_rollup_meta \
+                 SET last_refreshed_ts = ( \
+                     SELECT COALESCE(MAX(ts), last_refreshed_ts) FROM trace_events) \
+                 WHERE id = 1",
+                [],
+            )
+            .map_err(sqlite_read_err("rollup watermark advance"))?;
+
+            tx.commit().map_err(sqlite_read_err("rollup refresh commit"))?;
+            Ok(())
+        })()
+    }
+
+    /// CIRISPersist#222 — sum-of-buckets read over the plain rollup table
+    /// (SQLite). Mirror of the Postgres `aggregate_scoring_factors_rollup_batch`:
+    /// refreshes the trailing tail, then sums the bucket numerators +
+    /// denominator per agent across `[since, until)`, dividing once. Only
+    /// the bucket-summable scalar factors are populated (trace_count,
+    /// conscience_overrides, audit totals); the per-trace-sequenced /
+    /// baseline fields are left at defaults (the singular detail path uses
+    /// the direct compute) — identical contract to Postgres.
+    async fn aggregate_scoring_factors_rollup_batch(
+        &self,
+        agent_id_hashes: &[String],
+        window: crate::read::TimeWindow,
+    ) -> Result<
+        std::collections::HashMap<String, crate::read::ScoringFactorAggregate>,
+        crate::read::Error,
+    > {
+        // Lazy refresh-on-read (same as Postgres) so the fast path reflects
+        // current ingest before summing.
+        self.refresh_factor_rollup(None).await?;
+
+        // bucket_start is the strftime hour TEXT; window bounds are RFC3339
+        // TEXT. Both lexically ordered, so a TEXT range filter is correct.
+        let since = window.since.to_rfc3339();
+        let until = window.until.to_rfc3339();
+        let mut binds: Vec<SqlValue> = Vec::new();
+        let mut ph = Vec::new();
+        for h in agent_id_hashes {
+            binds.push(SqlValue::Text(h.clone()));
+            ph.push(format!("?{}", binds.len()));
+        }
+        let in_list = ph.join(",");
+        binds.push(SqlValue::Text(since));
+        let since_ph = binds.len();
+        binds.push(SqlValue::Text(until));
+        let until_ph = binds.len();
+
+        let sql = format!(
+            "SELECT agent_id_hash, \
+                    SUM(trace_count) AS trace_count, \
+                    SUM(override_trace_count) AS override_trace_count, \
+                    SUM(audit_seq_trace_count) AS audit_seq_trace_count, \
+                    SUM(audit_sig_trace_count) AS audit_sig_trace_count \
+             FROM trace_events_factor_rollup_1h \
+             WHERE agent_id_hash IN ({in_list}) \
+               AND bucket_start >= ?{since_ph} AND bucket_start < ?{until_ph} \
+               AND cohort_scope NOT IN ('self','family') \
+             GROUP BY agent_id_hash"
+        );
+
+        let conn = self.conn.clone();
+        let evaluated_at_unix_ms = chrono::Utc::now().timestamp_millis();
+        (move || -> Result<
+            std::collections::HashMap<String, crate::read::ScoringFactorAggregate>,
+            crate::read::Error,
+        > {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(sqlite_read_err("rollup batch prepare"))?;
+            let rows = stmt
+                .query_map(params_from_iter(binds.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>("agent_id_hash")?,
+                        row.get::<_, i64>("trace_count")?,
+                        row.get::<_, i64>("override_trace_count")?,
+                        row.get::<_, i64>("audit_seq_trace_count")?,
+                        row.get::<_, i64>("audit_sig_trace_count")?,
+                    ))
+                })
+                .map_err(sqlite_read_err("rollup batch query"))?;
+            let mut out = std::collections::HashMap::new();
+            for r in rows {
+                let (agent_id_hash, trace_count, conscience_overrides, audit_seq, audit_sig) =
+                    r.map_err(sqlite_read_err("rollup batch row"))?;
+                out.insert(
+                    agent_id_hash.clone(),
+                    crate::read::ScoringFactorAggregate {
+                        agent_id_hash,
+                        window,
+                        trace_count,
+                        identity_changes: 0,
+                        conscience_overrides,
+                        audit_chain_total: audit_seq,
+                        audit_chain_gaps: 0,
+                        audit_signed_total: audit_sig,
+                        recovery_events: Vec::new(),
+                        drift_z_score: None,
+                        calibration_error: None,
+                        unsafe_action_rate: 0.0,
+                        coherence_decay_series: Vec::new(),
+                        evaluated_at_unix_ms,
+                        cache_hit: false,
+                    },
+                );
+            }
+            Ok(out)
         })()
     }
 }
@@ -19879,6 +20231,183 @@ mod tests {
         assert_eq!(chain_unpinned.gap_count, 0);
     }
 
+    /// CIRISPersist#222 — SQLite plain-rollup fast path. Proves SQLite has
+    /// the SAME capability as Postgres (no pg/sqlite asymmetry): a fleet
+    /// sweep (len > 1, Unauthenticated, no baseline) sums the plain
+    /// `trace_events_factor_rollup_1h` buckets and the result equals the
+    /// direct per-trace aggregation on every bucket-summable factor.
+    #[tokio::test]
+    async fn re_scoring_factors_rollup_matches_direct_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // agent-h: 3 traces, 1 overridden, all with audit seq → rollup
+        // must reproduce trace_count/overrides/audit totals exactly.
+        insert_trace(
+            &backend, "rt1", None, 0, "agent-h", "Scout", "legal", true, 0.30, Some(1),
+        )
+        .await;
+        insert_trace(
+            &backend, "rt2", None, 10, "agent-h", "Scout", "legal", false, 0.40, Some(2),
+        )
+        .await;
+        insert_trace(
+            &backend, "rt3", None, 20, "agent-h", "Scout", "legal", false, 0.50, Some(3),
+        )
+        .await;
+        // Second agent so the batch len > 1 → engages the rollup fast path
+        // (batch-of-one is the detail path → direct).
+        insert_trace(
+            &backend, "rt4", None, 5, "agent-k", "Probe", "legal", false, 0.60, Some(1),
+        )
+        .await;
+
+        let window = TimeWindow::new(
+            Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 5, 2, 0, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        // Fast path: confirm it is actually present (capability check).
+        assert!(
+            backend.factor_rollup_present().await.unwrap(),
+            "V081 plain rollup table must exist on sqlite"
+        );
+
+        // Unauthenticated + len > 1 → rollup fast path.
+        let rollup = backend
+            .aggregate_scoring_factors_batch(
+                &["agent-h".to_owned(), "agent-k".to_owned()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rollup.len(), 2);
+        let r = rollup.iter().find(|a| a.agent_id_hash == "agent-h").unwrap();
+        assert_eq!(r.trace_count, 3, "rollup trace_count");
+        assert_eq!(r.conscience_overrides, 1, "rollup overrides");
+        assert_eq!(r.audit_chain_total, 3, "rollup audit seq total");
+        assert_eq!(r.audit_signed_total, 3, "rollup audit sig total");
+
+        // Direct path (batch-of-one routes through the per-trace compute)
+        // must agree on every summable factor.
+        let direct = backend
+            .aggregate_scoring_factors(
+                "agent-h",
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.trace_count, direct.trace_count);
+        assert_eq!(r.conscience_overrides, direct.conscience_overrides);
+        assert_eq!(r.audit_chain_total, direct.audit_chain_total);
+        assert_eq!(r.audit_signed_total, direct.audit_signed_total);
+    }
+
+    /// CIRISPersist#222 — SQLite §10.1.4 structural invisibility: the
+    /// public rollup must NOT expose cohort_scope ∈ {self, family}. A self
+    /// trace and a federation trace for one agent → the Unauthenticated
+    /// rollup read counts ONLY the federation trace. Same invariant as the
+    /// Postgres test.
+    #[tokio::test]
+    async fn re_scoring_factors_rollup_excludes_self_family_sqlite() {
+        use crate::schema::TraceLevel;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let mk = |tid: &str, agent: &str, scope: &str| -> Vec<TraceEventRow> {
+            ["CONSCIENCE_RESULT", "ACTION_RESULT"]
+                .iter()
+                .enumerate()
+                .map(|(i, et)| TraceEventRow {
+                    trace_id: tid.to_string(),
+                    thought_id: format!("th-{tid}"),
+                    task_id: None,
+                    step_point: None,
+                    event_type: if *et == "CONSCIENCE_RESULT" {
+                        ReasoningEventType::ConscienceResult
+                    } else {
+                        ReasoningEventType::ActionResult
+                    },
+                    attempt_index: 0,
+                    ts: Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, i as u32).unwrap(),
+                    agent_name: Some(agent.to_string()),
+                    agent_id_hash: agent.to_string(),
+                    cognitive_state: Some("work".into()),
+                    trace_level: TraceLevel::Generic,
+                    payload: serde_json::json!({
+                        "conscience_passed": true,
+                        "action_was_overridden": false,
+                        "success": true
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                    cost_llm_calls: None,
+                    cost_tokens: None,
+                    cost_usd: None,
+                    signature: "AAAA".into(),
+                    signing_key_id: "test-key".into(),
+                    signature_verified: true,
+                    verification_source: crate::store::VerificationSource::Persist,
+                    schema_version: "2.7.0".into(),
+                    pii_scrubbed: false,
+                    original_content_hash: None,
+                    scrub_signature: None,
+                    scrub_key_id: None,
+                    scrub_timestamp: None,
+                    agent_role: None,
+                    agent_template: None,
+                    deployment_domain: Some("invis-d".into()),
+                    deployment_type: None,
+                    deployment_region: None,
+                    deployment_trust_mode: None,
+                    cohort_scope: scope.to_string(),
+                    cohort_target_id: if scope == "self" {
+                        Some(agent.to_string())
+                    } else {
+                        None
+                    },
+                })
+                .collect()
+        };
+        backend
+            .insert_trace_events_batch(&mk("inv-fed", "agent-h", "federation"))
+            .await
+            .unwrap();
+        backend
+            .insert_trace_events_batch(&mk("inv-self", "agent-h", "self"))
+            .await
+            .unwrap();
+        backend
+            .insert_trace_events_batch(&mk("inv-fed2", "agent-k", "federation"))
+            .await
+            .unwrap();
+
+        let window = TimeWindow::new(
+            Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 5, 2, 0, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let rollup = backend
+            .aggregate_scoring_factors_batch(
+                &["agent-h".to_owned(), "agent-k".to_owned()],
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        let r = rollup.iter().find(|a| a.agent_id_hash == "agent-h").unwrap();
+        assert_eq!(
+            r.trace_count, 1,
+            "self/family row must NOT appear in the public rollup (CEG §10.1.4)"
+        );
+    }
+
     #[tokio::test]
     async fn re_scoring_factors_drift_with_baseline() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
@@ -19936,9 +20465,10 @@ mod tests {
     }
 
     /// CIRISPersist#197 — sqlite streaming path: emits one aggregate per
-    /// non-empty agent (over the direct aggregation — there is NO CAGG on
-    /// sqlite), tallies skipped, and aborts on callback `false`. Proves
-    /// the method is functional on sqlite (no `Err("not implemented")`).
+    /// non-empty agent (over the rollup fast path, or the direct compute
+    /// for detail routes), tallies skipped, and aborts on callback
+    /// `false`. Proves the method is functional on sqlite (no
+    /// `Err("not implemented")`).
     #[tokio::test]
     async fn re_scoring_factors_stream_sqlite() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
