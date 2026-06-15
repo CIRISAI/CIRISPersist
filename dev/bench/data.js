@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781546591695,
+  "lastUpdate": 1781567928528,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -31091,6 +31091,240 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 510453,
             "range": "± 1746",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "1599c126e946c6f094de5555b20f4612601cc060",
+          "message": "v7.2.0 — trace-tier hybrid hard cut: per-trace envelope carries + verifies ML-DSA-65 (#225)\n\nThe CEWP \"store at scale\" crux. v7.1.0 (#224) made the storage SCRUB sig\nhybrid; this makes the PRODUCER's per-trace envelope sig hybrid. Driver:\nCEG 1.0-RC7 §10.1.5.1.1 + the CIRISVerify#75 hard cut. Threat = HNDL\nforge-later against the durable/replicated/posterity trace corpus: a\nCRQC-era adversary who breaks Ed25519 could mint backdated traces under\nany historical key (content-addressing is no defense — they hash their\nown forgery). The corpus outlives the classical primitive, so the\nper-trace testimony signature MUST be post-quantum.\n\n- V083 (both dialects): trace_events gains signature_ml_dsa_65 +\n  pubkey_ml_dsa_65 + pqc_key_id, all NULLABLE (gate enforces presence,\n  not a NOT NULL). Partial index trace_events_pqc_key. Full pg/sqlite\n  parity, no TimescaleDB.\n- Ingest hard cut: VerifyMode::Full now verifies BOTH halves via\n  verify_hybrid (HybridPolicy::Strict); verify_trace_hybrid replaces the\n  Ed25519-only verify_trace. Classical-only Full traces REJECTED at\n  admission (Verify(HybridRequired)) — no require_hybrid:false posture.\n  Verify-before-mutation (AV-9) preserved; dedup not moved ahead.\n- Producer: CompleteTrace gains canonical-safe wire fields\n  (serde skip_serializing_if → byte-identical classical canonical).\n  Producer PQC pubkey rides the envelope, bound into the verify.\n- Legacy 2.7.legacy / TrustPreVerified import stays exempt (provenance\n  only). Hard cut applies to new federation writes.\n- Re-pin CIRISVerify 5.6.0 → 5.7.0 (6 tags) for #75 coherence.\n\nBREAKING (ingest contract): VerifyMode::Full now rejects classical-only\nper-trace sigs. Fleet producers co-bump to emit the hybrid half.\n\nCrypto reused (verify_hybrid / HybridVerifier), none rolled.\nGate green: clippy -D warnings + no-backend + plain postgres:16 + sqlite\n(lib 1224, hard_cut 2, all integration suites; 0 failed).\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-06-15T18:33:43-05:00",
+          "tree_id": "41da5506ad5aa7174bbe977d17c63f6019b8b1dc",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/1599c126e946c6f094de5555b20f4612601cc060"
+        },
+        "date": 1781567926891,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 45675948,
+            "range": "± 20445",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2171338,
+            "range": "± 222750",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 34,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 181,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 506,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 577,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1992,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 79,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 244,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1080,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 27088,
+            "range": "± 1254",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 67469,
+            "range": "± 2120",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 225497,
+            "range": "± 10378",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 8999,
+            "range": "± 411",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 10032,
+            "range": "± 359",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 14825,
+            "range": "± 2866",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 25604,
+            "range": "± 1032",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1826528,
+            "range": "± 4670",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 6464301,
+            "range": "± 36089",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 401386,
+            "range": "± 4736",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1192689,
+            "range": "± 13816",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 64990391,
+            "range": "± 528317",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 2285200,
+            "range": "± 51792",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 11227727,
+            "range": "± 156993",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 163835971,
+            "range": "± 852515",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 5834637,
+            "range": "± 211300",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 29374645,
+            "range": "± 358098",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 125998,
+            "range": "± 7240",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 121049,
+            "range": "± 6514",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 9565,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 64726,
+            "range": "± 395",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 606474,
+            "range": "± 2390",
             "unit": "ns/iter"
           }
         ]
