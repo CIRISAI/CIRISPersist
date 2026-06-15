@@ -47,7 +47,9 @@ fn agent_with_registered_key(backend: &MemoryBackend, key_id: &str, seed: u8) ->
 }
 
 /// Build a signed CompleteTrace + serialize as a batch envelope.
-fn build_signed_batch(
+/// v7.2.0 (#225): hybrid-signed (Ed25519 + ML-DSA-65) so the Full-mode
+/// trace-tier hard cut admits.
+async fn build_signed_batch(
     sk: &SigningKey,
     key_id: &str,
     agent_id_hash: &str,
@@ -86,12 +88,29 @@ fn build_signed_batch(
         cohort_target_id: None,
         signature: String::new(),
         signature_key_id: key_id.into(),
+        signature_ml_dsa_65: None,
+        pubkey_ml_dsa_65: None,
+        pqc_key_id: None,
     };
     let payload = canonical_payload_value(&trace);
     let bytes = PythonJsonDumpsCanonicalizer
         .canonicalize_value(&payload)
         .unwrap();
-    trace.signature = BASE64.encode(sk.sign(&bytes).to_bytes());
+    let ed_sig = sk.sign(&bytes).to_bytes();
+    // Hybrid half: ML-DSA-65 over (canonical || classical_sig).
+    {
+        use ciris_keyring::{MlDsa65SoftwareSigner, PqcSigner};
+        let mldsa = MlDsa65SoftwareSigner::from_seed_bytes(&[0x77; 32], "qa-mldsa").unwrap();
+        let mut bound = Vec::with_capacity(bytes.len() + ed_sig.len());
+        bound.extend_from_slice(&bytes);
+        bound.extend_from_slice(&ed_sig);
+        let pqc_sig = mldsa.sign(&bound).await.unwrap();
+        let pqc_pk = mldsa.public_key().await.unwrap();
+        trace.signature = BASE64.encode(ed_sig);
+        trace.signature_ml_dsa_65 = Some(BASE64.encode(&pqc_sig));
+        trace.pubkey_ml_dsa_65 = Some(BASE64.encode(&pqc_pk));
+        trace.pqc_key_id = Some("qa-mldsa".to_owned());
+    }
 
     let trace_json = serde_json::to_value(&trace).unwrap();
     let envelope = serde_json::json!({
@@ -140,7 +159,8 @@ async fn high_volume_concurrent_agents() {
                 &format!("trace-{a_idx:02}-{b:04}"),
                 &format!("th-{a_idx:02}-{b:04}"),
                 COMPONENTS_PER_BATCH,
-            );
+            )
+            .await;
             let backend = backend.clone();
             let signer = signer.clone();
             let signer_key_id = signer_key_id.clone();
@@ -289,7 +309,8 @@ async fn av9_cross_agent_dedup() {
     let sk_a = agent_with_registered_key(&backend, "agent-A", 0xAA);
     let sk_b = agent_with_registered_key(&backend, "agent-B", 0xBB);
 
-    let bytes_a = build_signed_batch(&sk_a, "agent-A", "hash-A", "trace-collide", "th-collide", 1);
+    let bytes_a =
+        build_signed_batch(&sk_a, "agent-A", "hash-A", "trace-collide", "th-collide", 1).await;
     let bytes_b = build_signed_batch(
         &sk_b,
         "agent-B",
@@ -297,7 +318,8 @@ async fn av9_cross_agent_dedup() {
         "trace-collide", // SAME trace_id
         "th-collide",    // SAME thought_id
         1,
-    );
+    )
+    .await;
 
     let pipeline = IngestPipeline {
         backend: &backend,
@@ -340,7 +362,8 @@ async fn av24_sign_verify_round_trip_all_rows() {
             &format!("trace-{b:04}"),
             &format!("th-{b:04}"),
             COMPONENTS,
-        );
+        )
+        .await;
         let backend = backend.clone();
         let signer = signer.clone();
         let signer_key_id = signer_key_id.clone();
@@ -421,7 +444,8 @@ async fn av19_graceful_shutdown_under_load() {
             &format!("trace-{i:04}"),
             &format!("th-{i:04}"),
             4,
-        );
+        )
+        .await;
         // Must allow a brief yield — queue is size DEFAULT_QUEUE_DEPTH
         // so this should never block; sanity on the API.
         let _ = handle
@@ -484,12 +508,31 @@ async fn av17_attempt_index_out_of_range() {
         cohort_target_id: None,
         signature: String::new(),
         signature_key_id: "agent-av17".into(),
+        signature_ml_dsa_65: None,
+        pubkey_ml_dsa_65: None,
+        pqc_key_id: None,
     };
     let payload = canonical_payload_value(&trace);
     let canon = PythonJsonDumpsCanonicalizer
         .canonicalize_value(&payload)
         .unwrap();
-    trace.signature = BASE64.encode(sk.sign(&canon).to_bytes());
+    // v7.2.0 (#225) — hybrid-sign so the trace passes the Full-mode
+    // verify gate and reaches decompose, where the AV-17 attempt-index
+    // out-of-range check fires (verify is step 2, decompose is later).
+    let ed_sig = sk.sign(&canon).to_bytes();
+    {
+        use ciris_keyring::{MlDsa65SoftwareSigner, PqcSigner};
+        let mldsa = MlDsa65SoftwareSigner::from_seed_bytes(&[0x77; 32], "qa-mldsa").unwrap();
+        let mut bound = Vec::with_capacity(canon.len() + ed_sig.len());
+        bound.extend_from_slice(&canon);
+        bound.extend_from_slice(&ed_sig);
+        let pqc_sig = mldsa.sign(&bound).await.unwrap();
+        let pqc_pk = mldsa.public_key().await.unwrap();
+        trace.signature = BASE64.encode(ed_sig);
+        trace.signature_ml_dsa_65 = Some(BASE64.encode(&pqc_sig));
+        trace.pubkey_ml_dsa_65 = Some(BASE64.encode(&pqc_pk));
+        trace.pqc_key_id = Some("qa-mldsa".to_owned());
+    }
     let envelope = serde_json::json!({
         "events": [{ "event_type": "complete_trace", "trace_level": "generic",
                      "trace": serde_json::to_value(&trace).unwrap() }],

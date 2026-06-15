@@ -1111,6 +1111,9 @@ mod tests {
             cohort_target_id: None,
             signature: "AAAA".into(),
             signature_key_id: "ciris-agent-key:dead".into(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
         BatchEnvelope {
             events: vec![crate::schema::BatchEvent::CompleteTrace {

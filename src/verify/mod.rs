@@ -66,6 +66,26 @@ pub enum Error {
     /// arm fails loud instead of silently returning Ok().
     #[error("unsupported schema version for verify dispatch: {0}")]
     UnsupportedSchemaVersion(String),
+
+    /// v7.2.0 (CIRISPersist#225) — the trace-tier hybrid hard cut: a
+    /// [`VerifyMode::Full`](crate::ingest::VerifyMode) trace was
+    /// classical-only (no `signature_ml_dsa_65`) and is REJECTED at
+    /// admission. CEG 1.0-RC7 §10.1.5.1.1 + CIRISVerify#75 — no
+    /// classical-only on new federation writes; the durable, replicated,
+    /// kept-for-posterity corpus must be post-quantum against HNDL
+    /// forge-later. The `2.7.legacy` pre-verified import carve-out
+    /// (`VerifyMode::TrustPreVerified`) never reaches this gate.
+    #[error("hybrid required: classical-only trace rejected at admission (trace-tier hard cut)")]
+    HybridRequired,
+
+    /// v7.2.0 (CIRISPersist#225) — the hybrid (Ed25519 + ML-DSA-65)
+    /// verify of a Full-mode trace failed for a reason other than the
+    /// missing-PQC-half hard cut: a malformed/wrong-length PQC signature
+    /// or pubkey, a PQC sig present without its pubkey, or a
+    /// cryptographic mismatch on either half. Carries the stable token
+    /// from [`crate::verify::hybrid::VerifyError::kind`].
+    #[error("hybrid verify failed: {0}")]
+    HybridVerify(String),
 }
 
 impl Error {
@@ -79,6 +99,8 @@ impl Error {
             Error::InvalidSignature(_) => "verify_invalid_signature",
             Error::Internal(_) => "verify_internal",
             Error::UnsupportedSchemaVersion(_) => "verify_unsupported_schema_version",
+            Error::HybridRequired => "verify_hybrid_required",
+            Error::HybridVerify(_) => "verify_hybrid_failed",
         }
     }
 }

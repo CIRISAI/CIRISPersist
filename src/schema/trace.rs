@@ -327,6 +327,54 @@ pub struct CompleteTrace {
     pub signature: String,
     /// Key identifier for verification lookup.
     pub signature_key_id: String,
+
+    /// v7.2.0 (CIRISPersist#225) — the producer's ML-DSA-65 half of the
+    /// per-trace envelope signature: base64 (standard) ML-DSA-65
+    /// signature over the SAME canonical bytes the Ed25519
+    /// [`signature`](Self::signature) covers. The [`verify_hybrid`]
+    /// primitive binds the PQC sig to the classical one (it signs
+    /// `canonical || classical_sig`), so the two halves cannot be
+    /// stripped or recombined.
+    ///
+    /// `None` carries two distinct meanings, disambiguated by the
+    /// ingest [`VerifyMode`](crate::ingest::VerifyMode):
+    /// - In [`VerifyMode::Full`](crate::ingest::VerifyMode::Full) (new
+    ///   federation writes) a `None` here is a **classical-only trace
+    ///   and is REJECTED at admission** — the trace-tier hard cut. No
+    ///   `require_hybrid: false` posture.
+    /// - In [`VerifyMode::TrustPreVerified`](crate::ingest::VerifyMode::TrustPreVerified)
+    ///   (the `2.7.legacy` import carve-out) a `None` is legitimate: the
+    ///   original 1.9.x Ed25519 sig is provenance only (already imported
+    ///   pre-verified, not re-verifiable). Persist does not re-run verify
+    ///   in that mode, so the gate does not apply.
+    ///
+    /// **Canonical-bytes-safe (MISSION §3, anti-pattern #6).** Like
+    /// [`cohort_scope`](Self::cohort_scope), this field is NOT part of
+    /// the signed canonical bytes — the canonicalizer reconstructs from
+    /// a fixed field allowlist that excludes it. The `serde(default,
+    /// skip_serializing_if)` pair keeps the serialized JSON byte-
+    /// identical for every producer that omits it (the signature itself
+    /// is over the classical canonical, so adding the column cannot
+    /// change any existing trace's signed bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_ml_dsa_65: Option<String>,
+    /// v7.2.0 (CIRISPersist#225) — the producer's ML-DSA-65 public key,
+    /// base64 (standard) 1952-byte raw key, asserted on the envelope.
+    /// The Ed25519 pubkey is resolved from `accord_public_keys` by
+    /// [`signature_key_id`](Self::signature_key_id); that directory is
+    /// Ed25519-only, so the PQC pubkey rides the envelope and is bound
+    /// into the hybrid verify. A forged pubkey fails the signature
+    /// check — asserting a pubkey here cannot by itself confer trust.
+    /// `None` together with [`signature_ml_dsa_65`](Self::signature_ml_dsa_65)
+    /// (both-or-neither, enforced by `verify_hybrid`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pubkey_ml_dsa_65: Option<String>,
+    /// v7.2.0 (CIRISPersist#225) — the producer's ML-DSA-65 key
+    /// identifier (provenance; may differ from the Ed25519
+    /// [`signature_key_id`](Self::signature_key_id)). Stored verbatim;
+    /// not load-bearing for verify (the bound hybrid signature is).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pqc_key_id: Option<String>,
 }
 
 /// v4.0 (CIRISPersist#160) — default `cohort_scope` for a trace whose
@@ -771,6 +819,9 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: "k".into(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
         let canon_default = crate::verify::ed25519::canonical_payload_value(&base);
 

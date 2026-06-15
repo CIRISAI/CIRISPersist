@@ -89,6 +89,9 @@ fn bench_event(
         scrub_timestamp: None,
         cohort_scope: "federation".to_string(),
         cohort_target_id: None,
+        signature_ml_dsa_65: None,
+        pubkey_ml_dsa_65: None,
+        pqc_key_id: None,
     }
 }
 

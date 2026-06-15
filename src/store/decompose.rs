@@ -179,6 +179,20 @@ pub fn decompose(trace: &CompleteTrace) -> Result<Decomposed, Error> {
             // resolution (never trusting a caller-supplied self-target).
             cohort_scope: trace.cohort_scope.clone(),
             cohort_target_id: trace.cohort_target_id.clone(),
+            // v7.2.0 (CIRISPersist#225) — the producer's per-trace
+            // ML-DSA-65 hybrid half, carried verbatim from the
+            // CompleteTrace envelope onto every decomposed row (same
+            // per-trace-constant shape as the classical `signature`
+            // above). The ingest gate (`verify_complete_trace_hybrid`)
+            // has already rejected a Full-mode classical-only trace
+            // before decompose runs, so by the time these land they are
+            // either a verified hybrid (both halves Some) or a
+            // legitimately-exempt classical-only row (legacy /
+            // pre-verified carve-out, both halves None). decompose does
+            // not verify — it copies the verified-or-exempt envelope.
+            signature_ml_dsa_65: trace.signature_ml_dsa_65.clone(),
+            pubkey_ml_dsa_65: trace.pubkey_ml_dsa_65.clone(),
+            pqc_key_id: trace.pqc_key_id.clone(),
         };
         events.push(event_row);
 
@@ -416,6 +430,9 @@ mod tests {
             cohort_target_id: None,
             signature: "AAAA".into(),
             signature_key_id: "ciris-agent-key:dead".into(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         }
     }
 

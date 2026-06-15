@@ -5,6 +5,29 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [7.2.0] — 2026-06-15
+
+### Added — the trace-tier hybrid hard cut: per-trace envelope signature carries + verifies ML-DSA-65 (CIRISPersist#225)
+
+v7.1.0 (#224) made the storage **scrub** signature hybrid for hardware nodes. This release makes the **producer's per-trace envelope** signature hybrid — the actual CEWP "store at scale" crux. Driver: CEG 1.0-RC7 §10.1.5.1.1 + the hard cut on CIRISVerify#75. The threat is **Harvest-Now-Decrypt-Later forge-later**: the trace corpus is durable, content-addressed, replicated, and kept for posterity, so a CRQC-era adversary who breaks Ed25519 could mint backdated traces under any historical key and inject them into the permanent record (content-addressing is no defense — they hash their own forgery). The corpus outlives the classical primitive, so the per-trace testimony signature must be post-quantum.
+
+- **Schema (V083, both dialects):** `trace_events` gains `signature_ml_dsa_65 TEXT` + `pubkey_ml_dsa_65 TEXT` + `pqc_key_id TEXT`, all **NULLABLE** (the migration + legacy/classical rows don't break; the gate, not a NOT NULL, enforces presence for new Full writes). Mirrors the federation key split (`scrub_signature_classical` + `scrub_signature_pqc`, V004). The full per-trace `HybridSignature` is stored and round-trips on both backends. Partial index `trace_events_pqc_key` (hybrid rows only).
+- **Ingest gate (the hard cut):** on `VerifyMode::Full`, `IngestPipeline::verify_complete_trace` now verifies **both** halves via the existing `verify_hybrid` primitive (`HybridPolicy::Strict`) — `verify_trace_hybrid` replaces the Ed25519-only `verify_trace`. A Full-mode classical-only trace (missing the ML-DSA-65 half) is **REJECTED at admission** (`Verify(HybridRequired)`, token `verify_hybrid_required`) — not warned. **No `require_hybrid: false` posture.** Verify-before-mutation ordering is unchanged: the hybrid gate is step 2, strictly before scrub/decompose/insert; dedup is NOT moved ahead of verify (that would be an AV-9 suppression/probe oracle).
+- **Producer signing:** `CompleteTrace` gains canonical-bytes-safe wire fields `signature_ml_dsa_65` / `pubkey_ml_dsa_65` / `pqc_key_id` (`serde(default, skip_serializing_if)` — omitting producers' JSON stays byte-identical, and the classical canonical allowlist is unchanged so no existing trace's signed bytes move). The producer's ML-DSA-65 pubkey rides the envelope (the `federation_keys` directory the Ed25519 key resolves from is Ed25519-only) and is bound into the hybrid verify — a forged PQC pubkey fails the signature check and cannot confer trust. Persist's test fixtures now emit hybrid.
+- **Legacy carve-out:** the `2.7.legacy` import path (`receive_and_persist_pre_verified` / `VerifyMode::TrustPreVerified`) stays **exempt** — it carries the original 1.9.x Ed25519 sig as provenance only (imported pre-verified, not re-verifiable). The hard-cut gate applies to **new federation writes** only.
+
+### ⚠️ BREAKING (ingest contract) — semver flag for the lead
+
+"Reject classical-only at admission" **tightens what `VerifyMode::Full` accepts**: a batch admitted at v7.1.0 (classical-only per-trace sig) is now rejected unless it carries the ML-DSA-65 half. This is a breaking ingest-contract change for any Full-mode producer not yet emitting hybrid. Shipped here as **7.2.0** per the issue title; **the lead may prefer 8.0** if the ingest-contract break warrants a major. The fleet producers (agent/server) co-bump to emit the hybrid half; the `2.7.legacy` corpus is exempt, so historical imports are unaffected.
+
+### Scale / throughput notes (honestly flagged)
+
+- **Corpus/bandwidth ~50×:** the per-trace sig grows ~64 B → ~3.4 KB hybrid, persisted **and** replicated, against the L0/L1 storage budgets (256 GB / 1 TB). Accepted price of HNDL-completeness; flagged for storage budgeting.
+- **Batch verify:** the throughput lever is the per-batch verify loop (verify-before-mutation preserved). The pinned `ciris-crypto` (`v5.7.0`) `HybridVerifier` exposes **no batch verify API** — neither an Ed25519 `verify_batch` nor an ML-DSA-65 batch — so verification is **per-sig**, adding ML-DSA-65 verify (~50–100 µs) per trace on top of Ed25519 and lowering the per-core ingest ceiling at massive scale. **FLAGGED:** a true SIMD/batch verify is blocked on a `ciris-crypto` primitive (a later co-bump); dedup-first is explicitly NOT the lever.
+
+### Tests
+The cut is proven on all three backends. Lib (MemoryBackend): valid hybrid admitted + both halves stored, classical-only **rejected** at admission (the hard cut), `TrustPreVerified` legacy classical-only **admitted** (carve-out), stored hybrid **verifies both halves on read**. `tests/trace_hybrid_hard_cut.rs` mirrors (a)-(e) on Postgres + SQLite via one shared body (NO pg/sqlite asymmetry; V083 round-trip). Full feature set clippy `-D warnings` + no-backend `-D warnings` + plain `postgres:16` + sqlite green; zero TimescaleDB. Crypto is reused (`verify_hybrid` / `HybridVerifier`), none rolled. Pin `ciris-persist>=7.2.0,<8`.
+
 ## [7.1.0] — 2026-06-15
 
 ### Added — hybrid signing with a hardware-sealed classical key: `with_hardware_signer_hybrid` (CIRISPersist#224)

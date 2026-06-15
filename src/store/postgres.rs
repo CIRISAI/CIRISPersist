@@ -662,8 +662,9 @@ impl Backend for PostgresBackend {
                             original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
                             agent_role, agent_template, deployment_domain, \
                             deployment_type, deployment_region, deployment_trust_mode, \
-                            verification_source, cohort_scope, cohort_target_id";
-        const N_COLS: usize = 36;
+                            verification_source, cohort_scope, cohort_target_id, \
+                            signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id";
+        const N_COLS: usize = 39;
 
         let mut sql = String::with_capacity(2048);
         sql.push_str("INSERT INTO cirislens.trace_events (");
@@ -761,6 +762,12 @@ impl Backend for PostgresBackend {
             // records the (scope, target) the §4.3 read-gate filters on.
             params.push(Box::new(row.cohort_scope.clone()));
             params.push(Box::new(row.cohort_target_id.clone()));
+            // v7.2.0 per-trace ML-DSA-65 hybrid columns (V083, #225).
+            // The producer's PQC half of the per-trace envelope sig; the
+            // ingest gate rejected Full-mode classical-only before this.
+            params.push(Box::new(row.signature_ml_dsa_65.clone()));
+            params.push(Box::new(row.pubkey_ml_dsa_65.clone()));
+            params.push(Box::new(row.pqc_key_id.clone()));
         }
         // THREAT_MODEL.md AV-9: dedup-key target now includes
         // agent_id_hash so a malicious agent reusing another agent's
@@ -1375,7 +1382,8 @@ impl Backend for PostgresBackend {
                             scrub_key_id, scrub_timestamp, agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
                             deployment_trust_mode, verification_source, \
-                            cohort_scope, cohort_target_id \
+                            cohort_scope, cohort_target_id, \
+                            signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id \
                      FROM cirislens.trace_events \
                      WHERE event_id > $1 AND agent_id_hash = $2 \
                      ORDER BY event_id ASC LIMIT $3",
@@ -1394,7 +1402,8 @@ impl Backend for PostgresBackend {
                             scrub_key_id, scrub_timestamp, agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
                             deployment_trust_mode, verification_source, \
-                            cohort_scope, cohort_target_id \
+                            cohort_scope, cohort_target_id, \
+                            signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id \
                      FROM cirislens.trace_events \
                      WHERE event_id > $1 \
                      ORDER BY event_id ASC LIMIT $2",
@@ -8377,6 +8386,12 @@ fn pg_row_to_event_row(row: tokio_postgres::Row) -> Result<(i64, TraceEventRow),
             // §4.3 scope target.
             cohort_scope: row.safe_get_with("cohort_scope", Error::Backend)?,
             cohort_target_id: row.safe_get_with("cohort_target_id", Error::Backend)?,
+            // v7.2.0 per-trace ML-DSA-65 hybrid columns (V083, #225).
+            // Nullable: classical-only legacy / pre-verified rows read
+            // back None; hybrid rows round-trip both halves.
+            signature_ml_dsa_65: row.safe_get_with("signature_ml_dsa_65", Error::Backend)?,
+            pubkey_ml_dsa_65: row.safe_get_with("pubkey_ml_dsa_65", Error::Backend)?,
+            pqc_key_id: row.safe_get_with("pqc_key_id", Error::Backend)?,
         },
     ))
 }
@@ -9039,7 +9054,8 @@ impl crate::read::ReadEngine for PostgresBackend {
                         scrub_key_id, scrub_timestamp, agent_role, agent_template, \
                         deployment_domain, deployment_type, deployment_region, \
                         deployment_trust_mode, verification_source, \
-                        cohort_scope, cohort_target_id \
+                        cohort_scope, cohort_target_id, \
+                        signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id \
                  FROM cirislens.trace_events \
                  WHERE trace_id = $1 \
                  ORDER BY ts ASC",
@@ -12790,6 +12806,9 @@ mod tests {
             deployment_trust_mode: None,
             cohort_scope: "federation".to_string(),
             cohort_target_id: None,
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
 
         let r1 = backend
@@ -12937,6 +12956,9 @@ mod tests {
             deployment_trust_mode: None,
             cohort_scope: "federation".to_string(),
             cohort_target_id: None,
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
         let other_agent = format!("other-agent-{suffix}");
         backend
@@ -13289,6 +13311,9 @@ mod tests {
                 deployment_trust_mode: Some("federated_peer".into()),
                 cohort_scope: "federation".to_string(),
                 cohort_target_id: None,
+                signature_ml_dsa_65: None,
+                pubkey_ml_dsa_65: None,
+                pqc_key_id: None,
             }
         };
 
@@ -13916,6 +13941,9 @@ mod tests {
                 deployment_trust_mode: Some("federated_peer".into()),
                 cohort_scope: "federation".to_string(),
                 cohort_target_id: None,
+                signature_ml_dsa_65: None,
+                pubkey_ml_dsa_65: None,
+                pqc_key_id: None,
             }
         };
 
@@ -14980,6 +15008,9 @@ mod tests {
             deployment_trust_mode: Some("federated_peer".into()),
             cohort_scope: "federation".to_string(),
             cohort_target_id: None,
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
         backend.insert_trace_events_batch(&[row]).await.unwrap();
     }
@@ -16162,6 +16193,9 @@ mod tests {
             deployment_trust_mode: None,
             cohort_scope: "federation".to_string(),
             cohort_target_id: None,
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
         // Insert seqs 1,2,5,6 — single gap (3,4 missing).
         backend
@@ -16666,6 +16700,9 @@ mod tests {
                     } else {
                         None
                     },
+                    signature_ml_dsa_65: None,
+                    pubkey_ml_dsa_65: None,
+                    pqc_key_id: None,
                 })
                 .collect()
         };
@@ -23530,6 +23567,9 @@ mod tests {
                 deployment_trust_mode: None,
                 cohort_scope: "federation".to_string(),
                 cohort_target_id: None,
+                signature_ml_dsa_65: None,
+                pubkey_ml_dsa_65: None,
+                pqc_key_id: None,
             }
         };
         vec![

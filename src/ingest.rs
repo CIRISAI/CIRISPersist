@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use crate::schema::{BatchEnvelope, BatchEvent, CompleteTrace, Error as SchemaError};
 use crate::scrub::{ScrubError, Scrubber};
 use crate::store::{Backend, Error as StoreError, InsertReport};
-use crate::verify::{canonical::Canonicalizer, ed25519::verify_trace, Error as VerifyError};
+use crate::verify::{canonical::Canonicalizer, Error as VerifyError};
 
 /// What the ingest pipeline did with one `events[]` body.
 ///
@@ -803,9 +803,47 @@ where
                 trace.trace_schema_version.as_str(),
             ),
         );
-        match verify_trace(trace, canon, &key) {
-            Ok(()) => Ok(()),
-            Err(VerifyError::SignatureMismatch) => {
+        // v7.2.0 (CIRISPersist#225) — the trace-tier hybrid HARD CUT.
+        // This method only runs for VerifyMode::Full (the
+        // TrustPreVerified / `2.7.legacy` carve-out skips step 2 entirely
+        // upstream in `receive_and_persist_with`). We verify BOTH halves
+        // via `verify_trace_hybrid` under `HybridPolicy::Strict`: a
+        // classical-only trace (`signature_ml_dsa_65 == None`) is
+        // REJECTED AT ADMISSION — no `require_hybrid: false` posture
+        // (CEG 1.0-RC7 §10.1.5.1.1 + CIRISVerify#75; HNDL forge-later on
+        // the durable, replicated, kept-for-posterity corpus).
+        //
+        // The Ed25519 pubkey came from `accord_public_keys`
+        // (`lookup_public_key` above); that directory is Ed25519-only, so
+        // the producer's ML-DSA-65 pubkey rides the trace envelope
+        // (`trace.pubkey_ml_dsa_65`) and is bound into the hybrid verify.
+        //
+        // Ordering invariant (MISSION §4, AV-9): this is step 2,
+        // verify-before-mutation; it MUST NOT be reordered behind dedup
+        // (dedup-first would be a suppression/probe oracle). The
+        // throughput lever is the per-batch verify loop, NOT dedup-first.
+        let ed25519_pubkey_b64 = BASE64.encode(key.to_bytes());
+        match crate::verify::ed25519::verify_trace_hybrid(
+            trace,
+            canon,
+            &ed25519_pubkey_b64,
+            crate::verify::HybridPolicy::Strict,
+        ) {
+            Ok(_outcome) => Ok(()),
+            Err(crate::verify::HybridVerifyError::HybridPendingRejected) => {
+                // The hard cut: a Full-mode trace arrived classical-only.
+                tracing::warn!(
+                    envelope_signer_id = %key_id,
+                    wire_body_sha256 = %body_sha256,
+                    trace_id = %trace.trace_id,
+                    "ciris-persist: verify_hybrid_required — Full-mode classical-only trace REJECTED at admission (#225 trace-tier hard cut)"
+                );
+                Err(IngestError::Verify(VerifyError::HybridRequired))
+            }
+            Err(e) => {
+                // Cryptographic mismatch on a half, or a malformed PQC
+                // field. Emit the same canonical-shape diagnostic the
+                // Ed25519-only path emitted, plus the hybrid error token.
                 let diag =
                     crate::verify::ed25519::canonical_payload_sha256s(trace, self.canonicalizer)
                         .ok();
@@ -813,16 +851,18 @@ where
                 tracing::warn!(
                     envelope_signer_id = %key_id,
                     wire_body_sha256 = %body_sha256,
+                    hybrid_error = %e.kind(),
                     canonical_9field_sha256 = ?diag.as_ref().map(|d| &d.nine_field_sha256),
                     canonical_2field_sha256 = ?diag.as_ref().map(|d| &d.two_field_sha256),
                     canonical_9field_bytes_len = ?diag.as_ref().map(|d| d.nine_field_bytes.len()),
                     canonical_2field_bytes_len = ?diag.as_ref().map(|d| d.two_field_bytes.len()),
                     signature_b64_prefix = %sig_b64_prefix,
-                    "ciris-persist: verify_signature_mismatch — both canonical forms tried, neither verified"
+                    "ciris-persist: verify_hybrid_failed — hybrid (Ed25519 + ML-DSA-65) verify rejected the trace"
                 );
-                Err(IngestError::Verify(VerifyError::SignatureMismatch))
+                Err(IngestError::Verify(VerifyError::HybridVerify(
+                    e.kind().to_owned(),
+                )))
             }
-            Err(other) => Err(IngestError::Verify(other)),
         }
     }
 }
@@ -833,7 +873,7 @@ mod tests {
     use crate::schema::SchemaVersion;
     use crate::scrub::NullScrubber;
     use crate::store::{decompose, MemoryBackend};
-    use crate::verify::{ed25519::canonical_payload_value, PythonJsonDumpsCanonicalizer};
+    use crate::verify::PythonJsonDumpsCanonicalizer;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
@@ -854,7 +894,40 @@ mod tests {
         (Box::new(signer) as Box<dyn HardwareSigner>, key_id)
     }
 
-    fn make_signed_batch_bytes() -> (Vec<u8>, String, ed25519_dalek::VerifyingKey) {
+    /// v7.2.0 (CIRISPersist#225) — hybrid-sign a trace's canonical bytes
+    /// for the test fixtures, so they satisfy the Full-mode hybrid hard
+    /// cut. Produces the Ed25519 sig (over `canonical`) plus the
+    /// producer's ML-DSA-65 half (the `verify_hybrid` bound input
+    /// `canonical || ed25519_sig`) and the asserted ML-DSA-65 pubkey.
+    /// Mutates `trace` in place: sets `signature`, `signature_ml_dsa_65`,
+    /// `pubkey_ml_dsa_65`, `pqc_key_id`. Deterministic seeds.
+    async fn hybrid_sign_trace(trace: &mut CompleteTrace, ed_sk: &SigningKey) {
+        use ciris_keyring::PqcSigner;
+        let canonical =
+            crate::verify::ed25519::canonical_bytes_for_trace(trace, &PythonJsonDumpsCanonicalizer)
+                .expect("canonicalize for hybrid test signing");
+
+        // Classical half.
+        let ed_sig = ed_sk.sign(&canonical);
+        let ed_sig_bytes = ed_sig.to_bytes();
+
+        // PQC half over the bound input (canonical || classical_sig).
+        let mldsa =
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&[0x77; 32], "test-mldsa")
+                .expect("ml-dsa seed");
+        let mut bound = Vec::with_capacity(canonical.len() + ed_sig_bytes.len());
+        bound.extend_from_slice(&canonical);
+        bound.extend_from_slice(&ed_sig_bytes);
+        let pqc_sig = mldsa.sign(&bound).await.expect("ml-dsa sign");
+        let pqc_pk = mldsa.public_key().await.expect("ml-dsa pk");
+
+        trace.signature = BASE64.encode(ed_sig_bytes);
+        trace.signature_ml_dsa_65 = Some(BASE64.encode(&pqc_sig));
+        trace.pubkey_ml_dsa_65 = Some(BASE64.encode(&pqc_pk));
+        trace.pqc_key_id = Some("test-mldsa".to_owned());
+    }
+
+    async fn make_signed_batch_bytes() -> (Vec<u8>, String, ed25519_dalek::VerifyingKey) {
         let sk = SigningKey::from_bytes(&[0x42; 32]);
         let key_id = "ciris-agent-key:test";
 
@@ -902,13 +975,12 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.into(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
-        let payload = canonical_payload_value(&trace);
-        let bytes = PythonJsonDumpsCanonicalizer
-            .canonicalize_value(&payload)
-            .unwrap();
-        let sig = sk.sign(&bytes);
-        trace.signature = BASE64.encode(sig.to_bytes());
+        // v7.2.0 (#225) — hybrid-sign so the Full-mode hard cut admits.
+        hybrid_sign_trace(&mut trace, &sk).await;
 
         let trace_json = serde_json::to_value(&trace).unwrap();
         let envelope = serde_json::json!({
@@ -935,7 +1007,7 @@ mod tests {
     /// (`canonical_payload_value`), the same Ed25519 signature verifies
     /// regardless of the cohort values — proving the canonical-bytes
     /// invariant end-to-end through the ingest path.
-    fn make_signed_batch_bytes_with_cohort(
+    async fn make_signed_batch_bytes_with_cohort(
         cohort_scope: &str,
         cohort_target_id: Option<&str>,
     ) -> (Vec<u8>, String, ed25519_dalek::VerifyingKey) {
@@ -967,14 +1039,15 @@ mod tests {
             cohort_target_id: cohort_target_id.map(str::to_owned),
             signature: String::new(),
             signature_key_id: key_id.into(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
         // Sign over the canonical allowlist — cohort fields excluded.
-        let payload = canonical_payload_value(&trace);
-        let bytes = PythonJsonDumpsCanonicalizer
-            .canonicalize_value(&payload)
-            .unwrap();
-        let sig = sk.sign(&bytes);
-        trace.signature = BASE64.encode(sig.to_bytes());
+        // v7.2.0 (#225) — hybrid-sign so the Full-mode hard cut admits;
+        // the cohort fields are still outside the signed canonical, so
+        // both halves verify regardless of the cohort values.
+        hybrid_sign_trace(&mut trace, &sk).await;
 
         let trace_json = serde_json::to_value(&trace).unwrap();
         let envelope = serde_json::json!({
@@ -1003,7 +1076,8 @@ mod tests {
     #[tokio::test]
     async fn cohort_community_target_round_trips() {
         let (bytes, key_id, vkey) =
-            make_signed_batch_bytes_with_cohort("community", Some("community-key:lens-alpha"));
+            make_signed_batch_bytes_with_cohort("community", Some("community-key:lens-alpha"))
+                .await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
 
@@ -1043,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn write_gate_refuses_non_member_community_zero_writes() {
         let (bytes, key_id, vkey) =
-            make_signed_batch_bytes_with_cohort("community", Some("community-key:not-mine"));
+            make_signed_batch_bytes_with_cohort("community", Some("community-key:not-mine")).await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
 
@@ -1083,7 +1157,7 @@ mod tests {
     #[tokio::test]
     async fn write_gate_admits_member_community_persists() {
         let (bytes, key_id, vkey) =
-            make_signed_batch_bytes_with_cohort("community", Some("community-key:mine"));
+            make_signed_batch_bytes_with_cohort("community", Some("community-key:mine")).await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
 
@@ -1121,7 +1195,7 @@ mod tests {
         // Caller tries to claim someone else's identity as the self
         // target — the substrate must ignore it and stamp the signer.
         let (bytes, key_id, vkey) =
-            make_signed_batch_bytes_with_cohort("self", Some("victim-identity-forged"));
+            make_signed_batch_bytes_with_cohort("self", Some("victim-identity-forged")).await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
 
@@ -1166,7 +1240,7 @@ mod tests {
     async fn cohort_absent_defaults_to_federation() {
         // make_signed_batch_bytes builds a federation/None trace whose
         // JSON omits the cohort keys (skip_serializing_if).
-        let (bytes, key_id, vkey) = make_signed_batch_bytes();
+        let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
         // Confirm the wire body really has no cohort keys.
         let body = String::from_utf8(bytes.clone()).unwrap();
         assert!(
@@ -1206,7 +1280,7 @@ mod tests {
         // Mission category §4: end-to-end across schema + verify +
         // scrub (null) + decompose + backend (memory). Every layer
         // must succeed with mission-aligned outcome counts.
-        let (bytes, key_id, vkey) = make_signed_batch_bytes();
+        let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
 
@@ -1301,7 +1375,7 @@ mod tests {
     async fn idempotent_replay() {
         // Mission category §4 "Idempotency": replaying the same batch
         // bytes results in 0 inserts + N conflicts the second time.
-        let (bytes, key_id, vkey) = make_signed_batch_bytes();
+        let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
         let backend = MemoryBackend::new();
         backend.add_public_key(&key_id, vkey);
 
@@ -1372,7 +1446,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_signing_key_rejected() {
-        let (bytes, key_id, _vkey) = make_signed_batch_bytes();
+        let (bytes, key_id, _vkey) = make_signed_batch_bytes().await;
         let backend = MemoryBackend::new();
         // No key registered → verify must reject with UnknownKey.
         let (signer, signer_key_id) = make_test_signer().await;
@@ -1396,7 +1470,7 @@ mod tests {
     async fn signature_mismatch_rejected_no_writes() {
         // Mission constraint (MISSION.md §3 anti-pattern #2): unverified
         // bytes never touch persistence.
-        let (bytes, key_id, _vkey) = make_signed_batch_bytes();
+        let (bytes, key_id, _vkey) = make_signed_batch_bytes().await;
         // Wire a *different* key for the same key_id.
         let other_sk = SigningKey::from_bytes(&[0x99; 32]);
         let backend = MemoryBackend::new();
@@ -1411,10 +1485,15 @@ mod tests {
             signer_key_id: &signer_key_id,
         };
         let err = pipeline.receive_and_persist(&bytes).await.unwrap_err();
-        assert!(matches!(
-            err,
-            IngestError::Verify(VerifyError::SignatureMismatch)
-        ));
+        // v7.2.0 (#225): the fixture is now hybrid-signed (both halves
+        // present), but the directory advertises a DIFFERENT Ed25519 key,
+        // so the classical half of the bound hybrid verify fails. The
+        // hard-cut gate surfaces this as HybridVerify (a crypto mismatch
+        // on a half), not the legacy Ed25519-only SignatureMismatch.
+        assert!(
+            matches!(err, IngestError::Verify(VerifyError::HybridVerify(_))),
+            "got {err:?}"
+        );
         assert!(
             backend.snapshot_events().is_empty(),
             "rejected traces must produce zero rows"
@@ -1429,7 +1508,7 @@ mod tests {
     /// persist here proves the `lookup_public_key` was bypassed.
     #[tokio::test]
     async fn skip_verify_persists_without_directory_lookup() {
-        let (bytes, key_id, _vkey) = make_signed_batch_bytes();
+        let (bytes, key_id, _vkey) = make_signed_batch_bytes().await;
         let backend = MemoryBackend::new();
         // Intentionally register NO public key: a `Full`-mode ingest
         // would fail at step 2 with `UnknownKey`.
@@ -1498,7 +1577,7 @@ mod tests {
     /// every trace and still rejects a bad signature with zero writes.
     #[tokio::test]
     async fn full_mode_unchanged_still_rejects_bad_signature() {
-        let (bytes, key_id, _vkey) = make_signed_batch_bytes();
+        let (bytes, key_id, _vkey) = make_signed_batch_bytes().await;
         // Register a *different* key for the same key_id → mismatch.
         let other_sk = SigningKey::from_bytes(&[0x99; 32]);
         let backend = MemoryBackend::new();
@@ -1513,22 +1592,26 @@ mod tests {
             signer_key_id: &signer_key_id,
         };
 
-        // Explicit `Full` mode rejects the bad signature.
+        // Explicit `Full` mode rejects the bad signature. v7.2.0 (#225):
+        // the hybrid-signed fixture's classical half doesn't match the
+        // wrong key the directory advertises → HybridVerify (crypto
+        // mismatch on a half), the hard-cut gate's wrapping of the legacy
+        // Ed25519-only SignatureMismatch.
         let err = pipeline
             .receive_and_persist_with(&bytes, VerifyMode::Full)
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            IngestError::Verify(VerifyError::SignatureMismatch)
-        ));
+        assert!(
+            matches!(err, IngestError::Verify(VerifyError::HybridVerify(_))),
+            "got {err:?}"
+        );
         // The `receive_and_persist` convenience (Full-by-default)
         // behaves identically.
         let err2 = pipeline.receive_and_persist(&bytes).await.unwrap_err();
-        assert!(matches!(
-            err2,
-            IngestError::Verify(VerifyError::SignatureMismatch)
-        ));
+        assert!(
+            matches!(err2, IngestError::Verify(VerifyError::HybridVerify(_))),
+            "got {err2:?}"
+        );
         assert!(
             backend.snapshot_events().is_empty(),
             "Full mode still writes zero rows for a bad signature"
@@ -1583,15 +1666,16 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.into(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
-        // Sign over the 2.7.9 canonical (per-component agent_id_hash
+        // Hybrid-sign the 2.7.9 canonical (per-component agent_id_hash
         // included; deployment_profile in the envelope alpha-position).
-        let canonical = crate::verify::ed25519::canonical_payload_value_v279(&trace);
-        let bytes = PythonJsonDumpsCanonicalizer
-            .canonicalize_value(&canonical)
-            .unwrap();
-        let sig = sk.sign(&bytes);
-        trace.signature = BASE64.encode(sig.to_bytes());
+        // v7.2.0 (#225): MUST be hybrid so it passes the Full-mode hard
+        // cut and reaches decompose — proving the schema reject lands at
+        // decompose, strictly AFTER the verify gate (ordering invariant).
+        hybrid_sign_trace(&mut trace, &sk).await;
 
         let trace_json = serde_json::to_value(&trace).unwrap();
         let envelope = serde_json::json!({
@@ -1707,9 +1791,283 @@ mod tests {
             cohort_target_id: None,
             signature: "AAAA".into(),
             signature_key_id: "k".into(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
         let d1 = decompose(&trace).unwrap();
         let d2 = decompose(&trace).unwrap();
         assert_eq!(d1, d2);
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // v7.2.0 (CIRISPersist#225) — the trace-tier hybrid hard cut.
+    // CEG 1.0-RC7 §10.1.5.1.1 + CIRISVerify#75. These four tests prove
+    // the cut against the MemoryBackend; the PG + SQLite mirror lives in
+    // tests/trace_hybrid_hard_cut.rs (both backends, V083 round-trip).
+    // ───────────────────────────────────────────────────────────────
+
+    /// (a) A Full-mode trace with a VALID hybrid signature is ADMITTED,
+    /// both halves are STORED, and the row round-trips.
+    #[tokio::test]
+    async fn full_mode_hybrid_trace_admitted_and_both_halves_stored() {
+        let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
+        let backend = MemoryBackend::new();
+        backend.add_public_key(&key_id, vkey);
+
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+
+        let summary = pipeline
+            .receive_and_persist(&bytes)
+            .await
+            .expect("valid hybrid trace MUST be admitted under the hard cut");
+        assert_eq!(
+            summary.signatures_verified, 1,
+            "persist verified the hybrid"
+        );
+        assert_eq!(summary.trace_events_inserted, 2);
+
+        let snap = backend.snapshot_events();
+        assert_eq!(snap.len(), 2);
+        for row in &snap {
+            assert!(
+                row.signature_ml_dsa_65.is_some(),
+                "the ML-DSA-65 half MUST be stored on every row"
+            );
+            assert!(
+                row.pubkey_ml_dsa_65.is_some(),
+                "the producer ML-DSA-65 pubkey MUST be stored"
+            );
+            assert_eq!(row.pqc_key_id.as_deref(), Some("test-mldsa"));
+            assert!(!row.signature.is_empty(), "classical half still stored");
+        }
+    }
+
+    /// (b) A Full-mode CLASSICAL-ONLY trace is REJECTED at admission —
+    /// the hard cut. No `require_hybrid: false` posture. Zero rows land.
+    #[tokio::test]
+    async fn full_mode_classical_only_trace_rejected_at_admission() {
+        // Build a classical-only (Ed25519-only) signed trace — exactly
+        // the pre-#225 shape. It must be REJECTED, not warned.
+        let sk = SigningKey::from_bytes(&[0x42; 32]);
+        let key_id = "ciris-agent-key:classical-only";
+        let mut trace = CompleteTrace {
+            trace_id: "trace-classical-only".into(),
+            thought_id: "th-1".into(),
+            task_id: None,
+            agent_id_hash: "deadbeef".into(),
+            started_at: "2026-04-30T00:15:53.123456Z".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012Z".parse().unwrap(),
+            trace_level: crate::schema::TraceLevel::Generic,
+            trace_schema_version: SchemaVersion::parse("2.7.0").unwrap(),
+            components: vec![crate::schema::TraceComponent {
+                component_type: crate::schema::ComponentType::Observation,
+                event_type: crate::schema::ReasoningEventType::ThoughtStart,
+                timestamp: "2026-04-30T00:15:53.123Z".parse().unwrap(),
+                data: {
+                    let mut m = serde_json::Map::new();
+                    m.insert("attempt_index".into(), 0.into());
+                    m
+                },
+                agent_id_hash: None,
+            }],
+            deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
+            signature: String::new(),
+            signature_key_id: key_id.into(),
+            // The hard cut: NO ML-DSA-65 half.
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
+        };
+        let canonical = crate::verify::ed25519::canonical_bytes_for_trace(
+            &trace,
+            &PythonJsonDumpsCanonicalizer,
+        )
+        .unwrap();
+        trace.signature = BASE64.encode(sk.sign(&canonical).to_bytes());
+
+        let envelope = serde_json::json!({
+            "events": [{
+                "event_type": "complete_trace",
+                "trace_level": "generic",
+                "trace": serde_json::to_value(&trace).unwrap(),
+            }],
+            "batch_timestamp": "2026-04-30T15:00:00+00:00",
+            "consent_timestamp": "2025-01-01T00:00:00Z",
+            "trace_level": "generic",
+            "trace_schema_version": "2.7.0",
+        });
+
+        let backend = MemoryBackend::new();
+        backend.add_public_key(key_id, sk.verifying_key());
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+
+        let err = pipeline
+            .receive_and_persist(envelope.to_string().as_bytes())
+            .await
+            .expect_err("a Full-mode classical-only trace MUST be rejected (the hard cut)");
+        assert!(
+            matches!(err, IngestError::Verify(VerifyError::HybridRequired)),
+            "the classical-only reject MUST be the HybridRequired hard cut, got {err:?}"
+        );
+        assert_eq!(err.kind(), "verify_hybrid_required");
+        assert!(
+            backend.snapshot_events().is_empty(),
+            "a rejected classical-only trace MUST write zero rows (verify-before-mutation)"
+        );
+    }
+
+    /// (c) A `TrustPreVerified` (legacy / `2.7.legacy`) classical-only
+    /// import is ADMITTED — the carve-out. Historical provenance imports
+    /// are attested by import provenance, not re-admitted against the
+    /// hybrid gate; the hard cut applies to NEW federation writes only.
+    #[tokio::test]
+    async fn legacy_pre_verified_classical_only_import_admitted() {
+        // Same classical-only shape as (b), but imported under
+        // VerifyMode::TrustPreVerified — the gate MUST NOT fire.
+        let sk = SigningKey::from_bytes(&[0x42; 32]);
+        let key_id = "ciris-agent-key:legacy-import";
+        let mut trace = CompleteTrace {
+            trace_id: "trace-legacy-import".into(),
+            thought_id: "th-1".into(),
+            task_id: None,
+            agent_id_hash: "deadbeef".into(),
+            started_at: "2026-04-30T00:15:53.123456Z".parse().unwrap(),
+            completed_at: "2026-04-30T00:16:12.789012Z".parse().unwrap(),
+            trace_level: crate::schema::TraceLevel::Generic,
+            // The legacy provenance dialect.
+            trace_schema_version: serde_json::from_str("\"2.7.legacy\"").unwrap(),
+            components: vec![crate::schema::TraceComponent {
+                component_type: crate::schema::ComponentType::Observation,
+                event_type: crate::schema::ReasoningEventType::ThoughtStart,
+                timestamp: "2026-04-30T00:15:53.123Z".parse().unwrap(),
+                data: {
+                    let mut m = serde_json::Map::new();
+                    m.insert("attempt_index".into(), 0.into());
+                    m
+                },
+                agent_id_hash: None,
+            }],
+            deployment_profile: None,
+            cohort_scope: "federation".into(),
+            cohort_target_id: None,
+            signature: String::new(),
+            signature_key_id: key_id.into(),
+            // Classical-only — the original 1.9.x Ed25519 sig as
+            // provenance. No PQC half, and that is LEGITIMATE here.
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
+        };
+        let canonical = crate::verify::ed25519::canonical_bytes_for_trace(
+            &trace,
+            &PythonJsonDumpsCanonicalizer,
+        )
+        .unwrap();
+        trace.signature = BASE64.encode(sk.sign(&canonical).to_bytes());
+
+        let envelope = serde_json::json!({
+            "events": [{
+                "event_type": "complete_trace",
+                "trace_level": "generic",
+                "trace": serde_json::to_value(&trace).unwrap(),
+            }],
+            "batch_timestamp": "2026-04-30T15:00:00+00:00",
+            "consent_timestamp": "2025-01-01T00:00:00Z",
+            "trace_level": "generic",
+            "trace_schema_version": "2.7.legacy",
+        });
+
+        let backend = MemoryBackend::new();
+        // Intentionally register NO key — TrustPreVerified skips lookup
+        // AND the hybrid gate; a clean persist proves the carve-out.
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+
+        let summary = pipeline
+            .receive_and_persist_with(
+                envelope.to_string().as_bytes(),
+                VerifyMode::TrustPreVerified,
+            )
+            .await
+            .expect("legacy pre-verified classical-only import MUST be admitted (carve-out)");
+        assert_eq!(summary.trace_events_inserted, 1);
+        let snap = backend.snapshot_events();
+        assert_eq!(snap.len(), 1);
+        // Honest row state: classical-only (no PQC half), attributed to
+        // Edge — the import provenance, not a persist hybrid verify.
+        assert!(snap[0].signature_ml_dsa_65.is_none());
+        assert_eq!(
+            snap[0].verification_source,
+            crate::store::VerificationSource::Edge
+        );
+    }
+
+    /// (d) The stored hybrid signature VERIFIES (both halves) on read.
+    /// Pull the persisted row back, reconstruct the canonical bytes, and
+    /// re-run `verify_hybrid` in Strict mode against the stored halves.
+    #[tokio::test]
+    async fn stored_hybrid_signature_verifies_both_halves_on_read() {
+        let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
+        let backend = MemoryBackend::new();
+        backend.add_public_key(&key_id, vkey);
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+        pipeline.receive_and_persist(&bytes).await.expect("admit");
+
+        // Reconstruct the producer's CompleteTrace from the wire so the
+        // canonical bytes match what was signed, then verify_hybrid
+        // against the halves stored on the row.
+        let env: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope json");
+        let trace_json = &env["events"][0]["trace"];
+        let trace: CompleteTrace = serde_json::from_value(trace_json.clone()).expect("trace");
+
+        let snap = backend.snapshot_events();
+        let row = &snap[0];
+        let ed25519_pubkey_b64 = BASE64.encode(vkey.to_bytes());
+        let canonical = crate::verify::ed25519::canonical_bytes_for_trace(
+            &trace,
+            &PythonJsonDumpsCanonicalizer,
+        )
+        .unwrap();
+        let outcome = crate::verify::verify_hybrid(
+            &canonical,
+            &row.signature,
+            row.signature_ml_dsa_65.as_deref(),
+            &ed25519_pubkey_b64,
+            row.pubkey_ml_dsa_65.as_deref(),
+            crate::verify::HybridPolicy::Strict,
+            None,
+        )
+        .expect("the STORED hybrid signature must verify both halves on read");
+        assert_eq!(outcome, crate::verify::VerifyOutcome::HybridVerified);
     }
 }

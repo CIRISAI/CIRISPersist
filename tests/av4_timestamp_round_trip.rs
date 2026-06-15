@@ -40,13 +40,15 @@ fn test_signer() -> Box<dyn HardwareSigner> {
 /// defaults), and use the wire timestamps verbatim as the
 /// canonical input — same way the Python agent builds its
 /// signature input per TRACE_WIRE_FORMAT.md §8.
-fn build_signed_trace_with_wire_timestamps(
+async fn build_signed_trace_with_wire_timestamps(
     sk: &SigningKey,
     key_id: &str,
     started_at: &str,
     completed_at: &str,
     component_timestamp: &str,
 ) -> Vec<u8> {
+    use ciris_keyring::{MlDsa65SoftwareSigner, PqcSigner};
+
     // Build the canonical payload as a serde_json::Value with
     // *string* timestamps — the same way agent code does, and the
     // same way persist's canonical_payload_value now does.
@@ -72,7 +74,18 @@ fn build_signed_trace_with_wire_timestamps(
     let bytes = PythonJsonDumpsCanonicalizer
         .canonicalize_value(&canonical)
         .unwrap();
-    let sig = sk.sign(&bytes);
+    let ed_sig = sk.sign(&bytes).to_bytes();
+
+    // v7.2.0 (#225) — hybrid: ML-DSA-65 over the bound input
+    // (canonical || classical_sig), so the Full-mode trace-tier hard
+    // cut admits. AV-4 is a canonicalization-bytes regression test;
+    // the hybrid half rides the same canonical bytes.
+    let mldsa = MlDsa65SoftwareSigner::from_seed_bytes(&[0x77; 32], "av4-mldsa").unwrap();
+    let mut bound = Vec::with_capacity(bytes.len() + ed_sig.len());
+    bound.extend_from_slice(&bytes);
+    bound.extend_from_slice(&ed_sig);
+    let pqc_sig = mldsa.sign(&bound).await.unwrap();
+    let pqc_pk = mldsa.public_key().await.unwrap();
 
     // Build the wire-format trace + envelope. The trace JSON needs
     // signature + signature_key_id added; fields are in any order
@@ -93,8 +106,11 @@ fn build_signed_trace_with_wire_timestamps(
             "event_type": "THOUGHT_START",
             "timestamp": component_timestamp,
         }],
-        "signature": BASE64.encode(sig.to_bytes()),
+        "signature": BASE64.encode(ed_sig),
         "signature_key_id": key_id,
+        "signature_ml_dsa_65": BASE64.encode(&pqc_sig),
+        "pubkey_ml_dsa_65": BASE64.encode(&pqc_pk),
+        "pqc_key_id": "av4-mldsa",
     });
 
     let envelope = serde_json::json!({
@@ -141,7 +157,8 @@ async fn av4_zero_microseconds_no_fraction_verifies() {
         "2026-04-30T00:15:53+00:00",
         "2026-04-30T00:16:12+00:00",
         "2026-04-30T00:15:53+00:00",
-    );
+    )
+    .await;
     let inserted = run(&bytes, "agent-av4", &sk)
         .await
         .expect("AV-4 (zero micros) MUST verify post-v0.1.8");
@@ -161,7 +178,8 @@ async fn av4_six_digit_microseconds_verifies() {
         "2026-04-30T00:15:53.123456+00:00",
         "2026-04-30T00:16:12.789012+00:00",
         "2026-04-30T00:15:53.123456+00:00",
-    );
+    )
+    .await;
     let inserted = run(&bytes, "agent-av4", &sk)
         .await
         .expect("six-digit microseconds must verify");
@@ -179,7 +197,8 @@ async fn av4_z_suffix_form_verifies() {
         "2026-04-30T00:15:53.123456Z",
         "2026-04-30T00:16:12.789012Z",
         "2026-04-30T00:15:53.123456Z",
-    );
+    )
+    .await;
     let inserted = run(&bytes, "agent-av4", &sk)
         .await
         .expect("Z-suffix form must verify");
@@ -198,7 +217,8 @@ async fn av4_three_digit_milliseconds_verifies() {
         "2026-04-30T00:15:53.123+00:00",
         "2026-04-30T00:16:12.789+00:00",
         "2026-04-30T00:15:53.123+00:00",
-    );
+    )
+    .await;
     let inserted = run(&bytes, "agent-av4", &sk)
         .await
         .expect("millisecond-precision form must verify");
@@ -218,7 +238,8 @@ async fn av4_tampered_timestamp_still_rejected() {
         "2026-04-30T00:15:53+00:00",
         "2026-04-30T00:16:12+00:00",
         "2026-04-30T00:15:53+00:00",
-    );
+    )
+    .await;
     // Corrupt the bytes: change started_at to a different valid
     // wire timestamp. Since we're rewriting JSON, do this by
     // round-tripping through Value.

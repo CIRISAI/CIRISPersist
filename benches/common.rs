@@ -73,6 +73,9 @@ pub fn build_signed_batch(
         signature_key_id: key_id.into(),
         cohort_scope: "federation".into(),
         cohort_target_id: None,
+        signature_ml_dsa_65: None,
+        pubkey_ml_dsa_65: None,
+        pqc_key_id: None,
     };
     let payload = canonical_payload_value(&trace);
     let bytes = PythonJsonDumpsCanonicalizer

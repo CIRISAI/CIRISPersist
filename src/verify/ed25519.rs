@@ -509,6 +509,90 @@ where
     Err(Error::SignatureMismatch)
 }
 
+/// v7.2.0 (CIRISPersist#225) — reconstruct the canonical bytes the
+/// producer signed for `trace`, dispatching by the trace's SIGNED
+/// `trace_schema_version` (the same deterministic, self-authenticating
+/// dispatch [`verify_trace`] uses). Shared by the Ed25519-only path and
+/// the hybrid path so BOTH halves of a hybrid signature are checked
+/// against byte-identical canonical input.
+///
+/// `trace_schema_version` is part of the signed canonical bytes, so the
+/// dispatch key is attacker-uncontrollable: a forged version that flips
+/// the canonical shape changes the bytes → signature mismatch, never a
+/// check bypass (#176 / #174 §6).
+pub fn canonical_bytes_for_trace<C>(
+    trace: &CompleteTrace,
+    canonicalizer: &C,
+) -> Result<Vec<u8>, Error>
+where
+    C: Canonicalizer + ?Sized,
+{
+    let wire = trace.trace_schema_version.as_str();
+    let canonical = match wire {
+        "2.7.0" => canonical_payload_value(trace),
+        "2.7.9" => canonical_payload_value_v279(trace),
+        "3.0.0" => canonical_payload_value_v279(trace),
+        "2.7.legacy" => canonical_payload_value_legacy(trace),
+        other => return Err(Error::UnsupportedSchemaVersion(other.to_owned())),
+    };
+    canonicalizer.canonicalize_value(&canonical)
+}
+
+/// v7.2.0 (CIRISPersist#225) — the trace-tier hybrid hard-cut verify.
+///
+/// Verifies the producer's **hybrid** per-trace envelope signature:
+/// BOTH the Ed25519 half ([`CompleteTrace::signature`]) AND the
+/// ML-DSA-65 half ([`CompleteTrace::signature_ml_dsa_65`]) over the
+/// byte-identical canonical bytes (via [`canonical_bytes_for_trace`]).
+/// Delegates the actual crypto to [`crate::verify::hybrid::verify_hybrid`]
+/// — this rolls NO new crypto (MISSION §1.4); it is the trace-tier
+/// re-use of the same hybrid primitive the federation tier
+/// (`federation/rooting.rs`) already verifies through.
+///
+/// # The hard cut (CEG 1.0-RC7 §10.1.5.1.1 + CIRISVerify#75)
+///
+/// `policy` is **always** [`HybridPolicy::Strict`] at the call site for
+/// new federation writes — a classical-only trace (`signature_ml_dsa_65
+/// == None`) is REJECTED at admission with
+/// [`crate::verify::hybrid::VerifyError::HybridPendingRejected`]. No
+/// `require_hybrid: false` posture exists: the durable, replicated,
+/// kept-for-posterity trace corpus outlives the classical primitive, so
+/// a forge-later (HNDL) adversary who breaks Ed25519 must not be able to
+/// mint backdated traces. The legacy `2.7.legacy` pre-verified import
+/// path does NOT reach this gate (it runs under
+/// [`VerifyMode::TrustPreVerified`](crate::ingest::VerifyMode), which
+/// skips re-verify entirely — the carve-out).
+///
+/// `ed25519_pubkey_b64` is the producer's Ed25519 key resolved from the
+/// `accord_public_keys` directory (by `signature_key_id`). The
+/// `accord_public_keys` directory is Ed25519-only, so the producer's
+/// ML-DSA-65 pubkey is taken from the trace envelope
+/// ([`CompleteTrace::pubkey_ml_dsa_65`]) and bound into the hybrid
+/// verify — a forged PQC pubkey fails the signature check and cannot by
+/// itself confer trust.
+pub fn verify_trace_hybrid<C>(
+    trace: &CompleteTrace,
+    canonicalizer: &C,
+    ed25519_pubkey_b64: &str,
+    policy: crate::verify::hybrid::HybridPolicy,
+) -> Result<crate::verify::hybrid::VerifyOutcome, crate::verify::hybrid::VerifyError>
+where
+    C: Canonicalizer + ?Sized,
+{
+    use crate::verify::hybrid::{verify_hybrid, VerifyError};
+    let canonical_bytes = canonical_bytes_for_trace(trace, canonicalizer)
+        .map_err(|e| VerifyError::Crypto(format!("canonicalize: {e}")))?;
+    verify_hybrid(
+        &canonical_bytes,
+        &trace.signature,
+        trace.signature_ml_dsa_65.as_deref(),
+        ed25519_pubkey_b64,
+        trace.pubkey_ml_dsa_65.as_deref(),
+        policy,
+        None,
+    )
+}
+
 /// v4.6 (CIRISPersist#171 / #176 / CEG §0.9) — map a trace's **signed**
 /// `trace_schema_version` to its canonicalization version (the #176
 /// signed-epoch version gate). The JCS flip is a **major-version** era
@@ -623,6 +707,9 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
         // Sign the canonical bytes of the unsigned trace.
         let payload = canonical_payload_value(&trace_unsigned);
@@ -708,6 +795,9 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
         let payload = canonical_payload_value(&trace_unsigned);
         let bytes = PythonJsonDumpsCanonicalizer
@@ -776,6 +866,9 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
 
         // Sign the LEGACY 2-field form:
@@ -846,6 +939,9 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
 
         // Sign the LEGACY 2-field canonical form (which doesn't
@@ -929,6 +1025,9 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
 
         // Sign legacy form, then mutate trace_level (which IS in
@@ -990,6 +1089,9 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
 
         let payload = canonical_payload_value_v279(&trace_unsigned);
@@ -1055,6 +1157,9 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: key_id.to_owned(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
 
         // The gate MUST route 3.0.0 to JCS.
@@ -1138,6 +1243,9 @@ mod tests {
                 cohort_target_id: None,
                 signature: String::new(),
                 signature_key_id: "k".into(),
+                signature_ml_dsa_65: None,
+                pubkey_ml_dsa_65: None,
+                pqc_key_id: None,
             }
         }
         let no_inject = build(None);
@@ -1314,6 +1422,9 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: "k".into(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
         let payload = canonical_payload_value_v279(&trace);
         let bytes = PythonJsonDumpsCanonicalizer
@@ -1371,6 +1482,9 @@ mod tests {
                 cohort_target_id: None,
                 signature: String::new(),
                 signature_key_id: "k".into(),
+                signature_ml_dsa_65: None,
+                pubkey_ml_dsa_65: None,
+                pqc_key_id: None,
             }
         }
         let no_profile = build(None);

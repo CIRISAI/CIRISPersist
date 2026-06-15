@@ -3251,12 +3251,37 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: agent_key_id.into(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
+        // v7.2.0 (#225) — hybrid-sign so the Full-mode trace-tier hard
+        // cut admits: Ed25519 over canonical + ML-DSA-65 over the bound
+        // input (canonical || classical_sig), plus the asserted PQC
+        // pubkey. canonical_payload_value still computes the classical
+        // canonical the agent signs.
         let payload = canonical_payload_value(&trace);
         let canonical = PythonJsonDumpsCanonicalizer
             .canonicalize_value(&payload)
             .unwrap();
-        trace.signature = B64.encode(agent_sk.sign(&canonical).to_bytes());
+        let ed_sig = agent_sk.sign(&canonical).to_bytes();
+        {
+            use ciris_keyring::PqcSigner as _;
+            let mldsa = ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+                &[0x77; 32],
+                "engine-89-mldsa",
+            )
+            .unwrap();
+            let mut bound = Vec::with_capacity(canonical.len() + ed_sig.len());
+            bound.extend_from_slice(&canonical);
+            bound.extend_from_slice(&ed_sig);
+            let pqc_sig = mldsa.sign(&bound).await.unwrap();
+            let pqc_pk = mldsa.public_key().await.unwrap();
+            trace.signature = B64.encode(ed_sig);
+            trace.signature_ml_dsa_65 = Some(B64.encode(&pqc_sig));
+            trace.pubkey_ml_dsa_65 = Some(B64.encode(&pqc_pk));
+            trace.pqc_key_id = Some("engine-89-mldsa".to_owned());
+        }
 
         let trace_json = serde_json::to_value(&trace).unwrap();
         let envelope = serde_json::json!({
@@ -3431,6 +3456,9 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: agent_key_id.into(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
         let payload = canonical_payload_value(&trace);
         let canonical = PythonJsonDumpsCanonicalizer
@@ -3780,6 +3808,9 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: agent_key_id.clone(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
         let payload = canonical_payload_value(&trace);
         let canonical = PythonJsonDumpsCanonicalizer

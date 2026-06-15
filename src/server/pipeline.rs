@@ -588,6 +588,9 @@ mod tests {
             cohort_target_id: None,
             signature: String::new(),
             signature_key_id: AGENT_KEY_ID.into(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
         let payload = canonical_payload_value(&trace);
         let bytes = PythonJsonDumpsCanonicalizer

@@ -446,11 +446,12 @@ impl Backend for SqliteBackend {
                 original_content_hash, scrub_signature, scrub_key_id, scrub_timestamp, \
                 agent_role, agent_template, deployment_domain, \
                 deployment_type, deployment_region, deployment_trust_mode, \
-                verification_source, cohort_scope, cohort_target_id\
+                verification_source, cohort_scope, cohort_target_id, \
+                signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id\
                 ) VALUES (\
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
-                ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36\
+                ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39\
                 ) ON CONFLICT (agent_id_hash, trace_id, thought_id, event_type, \
                 attempt_index, ts) DO NOTHING";
 
@@ -491,7 +492,7 @@ impl Backend for SqliteBackend {
 
                     let attempt_index_i64 = i64::from(row.attempt_index);
 
-                    let params: [SqlValue; 36] = [
+                    let params: [SqlValue; 39] = [
                         SqlValue::Text(row.trace_id.clone()),
                         SqlValue::Text(row.thought_id.clone()),
                         opt_text(row.task_id.as_deref()),
@@ -539,6 +540,12 @@ impl Backend for SqliteBackend {
                         // pipeline resolved the self-target already).
                         SqlValue::Text(row.cohort_scope.clone()),
                         opt_text(row.cohort_target_id.as_deref()),
+                        // v7.2.0 per-trace ML-DSA-65 hybrid columns
+                        // (V083, #225). Producer PQC half; the ingest
+                        // gate rejected Full-mode classical-only first.
+                        opt_text(row.signature_ml_dsa_65.as_deref()),
+                        opt_text(row.pubkey_ml_dsa_65.as_deref()),
+                        opt_text(row.pqc_key_id.as_deref()),
                     ];
 
                     let n = stmt.execute(params_from_iter(params.iter()))?;
@@ -938,7 +945,8 @@ impl Backend for SqliteBackend {
                         scrub_key_id, scrub_timestamp, agent_role, agent_template, \
                         deployment_domain, deployment_type, deployment_region, \
                         deployment_trust_mode, verification_source, \
-                        cohort_scope, cohort_target_id";
+                        cohort_scope, cohort_target_id, \
+                        signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id";
             let (sql, rows) = match agent {
                 Some(h) => {
                     let sql = format!(
@@ -7492,6 +7500,12 @@ fn sqlite_row_to_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Tr
             // 'federation'; target is nullable. Round-trip both back.
             cohort_scope: row.get("cohort_scope")?,
             cohort_target_id: row.get("cohort_target_id")?,
+            // v7.2.0 per-trace ML-DSA-65 hybrid columns (V083, #225).
+            // Nullable: classical-only legacy / pre-verified rows read
+            // back None; hybrid rows round-trip both halves.
+            signature_ml_dsa_65: row.get("signature_ml_dsa_65")?,
+            pubkey_ml_dsa_65: row.get("pubkey_ml_dsa_65")?,
+            pqc_key_id: row.get("pqc_key_id")?,
         },
     ))
 }
@@ -8929,7 +8943,8 @@ impl crate::read::ReadEngine for SqliteBackend {
                             scrub_timestamp, agent_role, agent_template, \
                             deployment_domain, deployment_type, deployment_region, \
                             deployment_trust_mode, verification_source, \
-                        cohort_scope, cohort_target_id";
+                        cohort_scope, cohort_target_id, \
+                        signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id";
             let event_rows: Vec<(i64, TraceEventRow)> = {
                 let sql = format!(
                     "SELECT {cols} FROM trace_events \
@@ -12410,6 +12425,9 @@ mod tests {
             deployment_trust_mode: None,
             cohort_scope: "federation".to_string(),
             cohort_target_id: None,
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         }
     }
 
@@ -19153,6 +19171,9 @@ mod tests {
             deployment_trust_mode: None,
             cohort_scope: "federation".to_string(),
             cohort_target_id: None,
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         }
     }
 
@@ -20501,6 +20522,9 @@ mod tests {
                     } else {
                         None
                     },
+                    signature_ml_dsa_65: None,
+                    pubkey_ml_dsa_65: None,
+                    pqc_key_id: None,
                 })
                 .collect()
         };

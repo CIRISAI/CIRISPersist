@@ -3339,6 +3339,9 @@ mod tests {
             deployment_trust_mode: None,
             cohort_scope: "federation".to_string(),
             cohort_target_id: None,
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         }
     }
 
@@ -3499,6 +3502,9 @@ mod tests {
             cohort_target_id: None,
             signature: "AAAA".into(),
             signature_key_id: "ciris-agent-key:dead".into(),
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         };
 
         let d = decompose(&trace).expect("decompose ok");
@@ -4192,6 +4198,9 @@ mod tests {
             deployment_trust_mode: None,
             cohort_scope: "federation".to_string(),
             cohort_target_id: None,
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
         }
     }
 
@@ -4445,6 +4454,9 @@ mod tests {
                 deployment_trust_mode: None,
                 cohort_scope: "federation".to_string(),
                 cohort_target_id: None,
+                signature_ml_dsa_65: None,
+                pubkey_ml_dsa_65: None,
+                pqc_key_id: None,
             };
             backend.insert_trace_events_batch(&[row]).await.unwrap();
         }

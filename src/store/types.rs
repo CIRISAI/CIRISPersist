@@ -227,6 +227,31 @@ pub struct TraceEventRow {
     /// broad belonging-tiers (`affiliations` / `species` / `biosphere`
     /// / `federation`).
     pub cohort_target_id: Option<String>,
+
+    // ─── v7.2.0 per-trace ML-DSA-65 hybrid columns (CIRISPersist#225,
+    // V083). The producer's post-quantum half of the per-trace envelope
+    // signature — the trace-tier hybrid hard cut against HNDL
+    // forge-later. Mirrors the federation key split
+    // (`scrub_signature_classical` + `scrub_signature_pqc`,
+    // KeyRecord/V004). All NULLABLE: classical pre-#225 rows + the
+    // `2.7.legacy` pre-verified carve-out write `None`; presence for
+    // new Full-mode writes is enforced by the ingest gate, not a column
+    // constraint.
+    /// Base64 (standard) ML-DSA-65 producer signature over the SAME
+    /// canonical bytes the Ed25519 [`signature`](Self::signature)
+    /// covers. `verify_hybrid` binds it to the classical sig (it signs
+    /// `canonical || classical`). `None` = classical-only row (legacy /
+    /// pre-#225 / pre-verified carve-out).
+    pub signature_ml_dsa_65: Option<String>,
+    /// Base64 (standard) producer ML-DSA-65 public key (1952 raw
+    /// bytes), asserted on the trace envelope. The Ed25519 pubkey is
+    /// resolved from `accord_public_keys` by `signing_key_id`; that
+    /// directory is Ed25519-only, so the PQC pubkey rides the envelope
+    /// and is bound into the hybrid verify.
+    pub pubkey_ml_dsa_65: Option<String>,
+    /// The producer's ML-DSA-65 key identifier (provenance; may differ
+    /// from the Ed25519 `signing_key_id`).
+    pub pqc_key_id: Option<String>,
 }
 
 /// A row landing on `cirislens.trace_llm_calls`
