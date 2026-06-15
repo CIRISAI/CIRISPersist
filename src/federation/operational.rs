@@ -703,7 +703,7 @@ pub(crate) mod test_support {
         pub fn new(id: &str) -> Self {
             Self {
                 key_id: id.to_string(),
-                ed: Ed25519Signer::random(),
+                ed: Ed25519Signer::random().expect("test rng healthy"),
                 mldsa: MlDsa65Signer::new().unwrap(),
             }
         }

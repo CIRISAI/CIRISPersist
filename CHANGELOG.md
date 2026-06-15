@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [6.8.2] — 2026-06-14
+
+### Changed — CIRISVerify 5.4.0 → 5.6.0 (security-audit remediation re-pin)
+
+All six verify pins flip together (`ciris-verify-core` / `ciris-crypto` / `ciris-keyring` + tpm/ios/android target tables) → single `ciris_crypto` in the graph for the persist+verify-in-one-process consumers. 5.6.0 is the consolidated security-audit release: license-signature verification fail-closed (#72), real TPM2 seal/unseal under the SRK + honest `is_hardware_backed()` (#73), RNG fail-secure latch extended to keygen — **`Ed25519Signer::random()` / `P256Signer::random()` now return `Result`** propagating `RngHealthCheckFailed` (#74), and `compute_destination_hash` (§5.6.8.8.1.1) shared producer↔consumer (#28). **Near-additive on persist's side** — the only call-site change is one test fixture (`Ed25519Signer::random().expect(…)` for the new `Result`); no production-code change. Full feature set + sqlite + live-PG green. Pin `ciris-persist>=6.8.2,<7`.
+
 ## [6.8.1] — 2026-06-14
 
 ### Fixed — no-backend build (`-D warnings`) for the disk-pressure test helpers
