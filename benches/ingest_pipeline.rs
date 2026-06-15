@@ -39,14 +39,18 @@ fn ingest_pipeline_sweep(c: &mut Criterion) {
         // identical batches to keep the variable isolated to
         // component count. To avoid dedup short-circuit we rebuild
         // the backend each iteration.
-        let bytes = common::build_signed_batch(
+        // The pipeline runs `VerifyMode::Full`, so the per-trace hybrid
+        // hard cut (#225) requires the ML-DSA-65 half — a classical-only
+        // batch is rejected at admission. Build a hybrid batch (async
+        // PQC sign driven on the bench runtime).
+        let bytes = runtime.block_on(common::build_signed_batch_hybrid(
             &sk,
             "agent-bench",
             "hash-bench",
             "trace-bench-fixed",
             "th-bench-fixed",
             n_components,
-        );
+        ));
 
         group.throughput(Throughput::Elements(n_components as u64));
         group.bench_with_input(

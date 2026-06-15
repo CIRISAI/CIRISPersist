@@ -9,7 +9,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner};
+use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ed25519_dalek::{Signer as _, SigningKey};
 
 use ciris_persist::schema::{
@@ -28,16 +28,16 @@ pub fn make_signing_key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 
-/// Build a signed CompleteTrace + serialize as a batch envelope.
-/// Same shape as `tests/qa_harness.rs::build_signed_batch`.
-pub fn build_signed_batch(
-    sk: &SigningKey,
+/// Build an unsigned CompleteTrace fixture (n components, deterministic
+/// shape). Shared by the classical + hybrid batch builders so the two
+/// can't drift.
+fn build_unsigned_trace(
     key_id: &str,
     agent_id_hash: &str,
     trace_id: &str,
     thought_id: &str,
     n_components: usize,
-) -> Vec<u8> {
+) -> CompleteTrace {
     let mut components = Vec::with_capacity(n_components);
     for i in 0..n_components {
         let mut data = serde_json::Map::new();
@@ -58,7 +58,7 @@ pub fn build_signed_batch(
         });
     }
 
-    let mut trace = CompleteTrace {
+    CompleteTrace {
         trace_id: trace_id.into(),
         thought_id: thought_id.into(),
         task_id: Some("task-bench".into()),
@@ -76,20 +76,80 @@ pub fn build_signed_batch(
         signature_ml_dsa_65: None,
         pubkey_ml_dsa_65: None,
         pqc_key_id: None,
-    };
-    let payload = canonical_payload_value(&trace);
-    let bytes = PythonJsonDumpsCanonicalizer
-        .canonicalize_value(&payload)
-        .unwrap();
-    trace.signature = BASE64.encode(sk.sign(&bytes).to_bytes());
+    }
+}
 
-    let trace_json = serde_json::to_value(&trace).unwrap();
-    let envelope = serde_json::json!({
+/// Wrap a (signed) trace as a single-event batch envelope.
+fn envelope_bytes(trace: &CompleteTrace) -> Vec<u8> {
+    let trace_json = serde_json::to_value(trace).unwrap();
+    serde_json::json!({
         "events": [{ "event_type": "complete_trace", "trace_level": "generic", "trace": trace_json }],
         "batch_timestamp": "2026-05-01T00:00:00Z",
         "consent_timestamp": "2025-01-01T00:00:00Z",
         "trace_level": "generic",
         "trace_schema_version": "2.7.0",
-    });
-    envelope.to_string().into_bytes()
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Build a classical (Ed25519-only) signed CompleteTrace + serialize as
+/// a batch envelope. For benches that DON'T run the Full-mode ingest
+/// gate (dedup-key extraction, queue enqueue) — the per-trace hybrid
+/// hard cut (#225) is not exercised on these paths.
+/// Same shape as `tests/qa_harness.rs::build_signed_batch`.
+pub fn build_signed_batch(
+    sk: &SigningKey,
+    key_id: &str,
+    agent_id_hash: &str,
+    trace_id: &str,
+    thought_id: &str,
+    n_components: usize,
+) -> Vec<u8> {
+    let mut trace = build_unsigned_trace(key_id, agent_id_hash, trace_id, thought_id, n_components);
+    let payload = canonical_payload_value(&trace);
+    let bytes = PythonJsonDumpsCanonicalizer
+        .canonicalize_value(&payload)
+        .unwrap();
+    trace.signature = BASE64.encode(sk.sign(&bytes).to_bytes());
+    envelope_bytes(&trace)
+}
+
+/// Build a HYBRID (Ed25519 + ML-DSA-65) signed batch — the shape the
+/// trace-tier hard cut (#225) requires for `VerifyMode::Full` admission.
+/// The PQC half signs the bound input `canonical || ed25519_sig` and the
+/// producer's ML-DSA-65 pubkey rides the envelope, mirroring the lib
+/// fixture `ingest::tests::hybrid_sign_trace`. Async because the
+/// `PqcSigner` API is async; bench call sites drive it via `block_on`.
+pub async fn build_signed_batch_hybrid(
+    sk: &SigningKey,
+    key_id: &str,
+    agent_id_hash: &str,
+    trace_id: &str,
+    thought_id: &str,
+    n_components: usize,
+) -> Vec<u8> {
+    let mut trace = build_unsigned_trace(key_id, agent_id_hash, trace_id, thought_id, n_components);
+    let payload = canonical_payload_value(&trace);
+    let canonical = PythonJsonDumpsCanonicalizer
+        .canonicalize_value(&payload)
+        .unwrap();
+
+    // Classical half.
+    let ed_sig = sk.sign(&canonical).to_bytes();
+
+    // PQC half over the bound input (canonical || classical_sig).
+    let mldsa =
+        MlDsa65SoftwareSigner::from_seed_bytes(&[0x77; 32], "bench-mldsa").expect("ml-dsa seed");
+    let mut bound = Vec::with_capacity(canonical.len() + ed_sig.len());
+    bound.extend_from_slice(&canonical);
+    bound.extend_from_slice(&ed_sig);
+    let pqc_sig = mldsa.sign(&bound).await.expect("ml-dsa sign");
+    let pqc_pk = mldsa.public_key().await.expect("ml-dsa pk");
+
+    trace.signature = BASE64.encode(ed_sig);
+    trace.signature_ml_dsa_65 = Some(BASE64.encode(&pqc_sig));
+    trace.pubkey_ml_dsa_65 = Some(BASE64.encode(&pqc_pk));
+    trace.pqc_key_id = Some("bench-mldsa".to_owned());
+    envelope_bytes(&trace)
 }
