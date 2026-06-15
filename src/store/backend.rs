@@ -18,10 +18,7 @@ use std::future::Future;
 
 use ed25519_dalek::VerifyingKey;
 
-use super::types::{
-    AuditEntry, ClaimParams, DeleteSummary, ErasureSummary, GraphNode, ServiceCorrelation, Task,
-    TraceEventRow, TraceLlmCallRow,
-};
+use super::types::{DeleteSummary, ErasureSummary, TraceEventRow, TraceLlmCallRow};
 use super::Error;
 
 /// Persistence Backend trait — the load-bearing abstraction.
@@ -236,50 +233,20 @@ pub trait Backend: Send + Sync {
         agent_id_hash: Option<&str>,
     ) -> impl Future<Output = Result<Vec<(i64, TraceEventRow)>, Error>> + Send;
 
-    // ─── Phase 2 — agent signed-events + TSDB (FSD §4) ─────────────
-
-    /// Append an entry to the agent's `audit_log`. Phase 2 surface;
-    /// default returns `NotImplemented` until the agent flips to
-    /// the crate.
-    fn append_audit_entry(
-        &self,
-        _entry: &AuditEntry,
-    ) -> impl Future<Output = Result<i64, Error>> + Send {
-        async { Err(Error::NotImplemented("append_audit_entry (Phase 2)")) }
-    }
-
-    /// Record a service correlation (TSDB row). Phase 2 surface.
-    fn record_correlation(
-        &self,
-        _c: &ServiceCorrelation,
-    ) -> impl Future<Output = Result<(), Error>> + Send {
-        async { Err(Error::NotImplemented("record_correlation (Phase 2)")) }
-    }
-
-    // ─── Phase 3 — runtime state, memory graph, governance ─────────
-
-    /// Upsert a task (FSD §5.1). Phase 3 surface.
-    fn upsert_task(&self, _t: &Task) -> impl Future<Output = Result<(), Error>> + Send {
-        async { Err(Error::NotImplemented("upsert_task (Phase 3)")) }
-    }
-
-    /// `try_claim_shared_task` race-claim (FSD §5.6).
-    /// Returns `(task, was_created)` matching the existing Python
-    /// signature. Phase 3 surface.
-    fn try_claim_shared_task(
-        &self,
-        _params: ClaimParams<'_>,
-    ) -> impl Future<Output = Result<(Task, bool), Error>> + Send {
-        async { Err(Error::NotImplemented("try_claim_shared_task (Phase 3)")) }
-    }
-
-    /// Add a graph node (FSD §5.1).
-    /// Phase 3 surface; the encryption boundary stays *above* the
-    /// persistence layer — this method receives ciphertext as opaque
-    /// JSONB (FSD §5.7).
-    fn add_graph_node(&self, _n: &GraphNode) -> impl Future<Output = Result<(), Error>> + Send {
-        async { Err(Error::NotImplemented("add_graph_node (Phase 3)")) }
-    }
+    // ─── Phase 2 / 3 surfaces (audit, correlations, tasks, graph) ──
+    //
+    // v7.0.0 (CEWP-ready): the former `append_audit_entry` /
+    // `record_correlation` / `upsert_task` / `try_claim_shared_task` /
+    // `add_graph_node` default-`NotImplemented` stubs are REMOVED. They
+    // were vestigial scaffolding from the original monolithic-`Backend`
+    // design; the capabilities ship on both backends via the dedicated
+    // per-capability service traits — `audit::AuditService`,
+    // `correlations::CorrelationsService`, `tasks::TasksService`, and the
+    // `cirisgraph` surface — each with full PostgreSQL + SQLite parity. No
+    // backend ever overrode the `Backend`-trait versions; nothing called
+    // them through `Backend`. Removing them ends the naming collision that
+    // forced UFCS at the call sites and stops the trait advertising
+    // "NotImplemented" for capabilities that are, in fact, implemented.
 
     /// v4.0 (CIRISPersist#160, FSD §4.4) — resolve the IDENTITY a
     /// signing/occurrence key speaks for, for the trace-ingest

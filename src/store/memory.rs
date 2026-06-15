@@ -3529,26 +3529,10 @@ mod tests {
         backend.run_migrations().await.unwrap();
     }
 
-    /// Phase 2/3 surfaces return `NotImplemented`, not panic
-    /// (MISSION.md §3 anti-pattern #4).
-    #[tokio::test]
-    async fn phase_2_surfaces_return_not_implemented() {
-        let backend = MemoryBackend::new();
-        let entry = super::super::types::AuditEntry {
-            sequence_number: 1,
-            previous_hash: "00".into(),
-            entry_hash: "01".into(),
-            signature: "AAAA".into(),
-            signing_key_id: "k".into(),
-            timestamp: "2026-04-30T00:00:00Z".parse().unwrap(),
-            event_type: "test".into(),
-            event_summary: "test".into(),
-            agent_id: "agent".into(),
-            payload: serde_json::Value::Null,
-        };
-        let err = backend.append_audit_entry(&entry).await.unwrap_err();
-        assert!(matches!(err, Error::NotImplemented(_)));
-    }
+    // (v7.0.0: the `phase_2_surfaces_return_not_implemented` test was
+    // removed with the vestigial `Backend` Phase-2/3 stubs — those
+    // capabilities ship via the per-capability service traits with full
+    // pg/sqlite parity; see `store::backend`.)
 
     // ─── FederationDirectory tests ─────────────────────────────────
 

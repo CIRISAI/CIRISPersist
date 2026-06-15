@@ -5,7 +5,22 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [6.9.0] — 2026-06-14
+## [7.0.0] — 2026-06-15 — CEWP-ready
+
+The substrate cut for the **CIRIS Epistemic Web Platform** (CEWP) launch. CEWP routes signed claims, files, streaming, and messaging **directly between devices over a post-quantum mesh — with no data centers**; `ciris-persist` is the durable data substrate each node carries (federation directory, distributed trust + attestations, consent, blobs, transport bindings). "No data centers" makes **SQLite a first-class deployment** (phones, Pi-class, sovereign nodes), not a fallback — so this release makes the substrate genuinely **device-agnostic**: no TimescaleDB anywhere, and **strict pg/sqlite parity** (every capability present on both backends, degraded where it must be but never absent).
+
+### Changed (BREAKING) — removed the vestigial `Backend` Phase-2/3 stubs (major)
+
+The `Backend` trait's `append_audit_entry` / `record_correlation` / `upsert_task` / `try_claim_shared_task` / `add_graph_node` default methods (which returned `NotImplemented`) are **removed**. They were scaffolding from the original monolithic-trait design; the capabilities ship — with full PostgreSQL + SQLite parity — via the dedicated service traits `audit::AuditService`, `correlations::CorrelationsService`, `tasks::TasksService`, and the `cirisgraph` surface. No backend ever overrode the `Backend` versions and nothing called them through `Backend`; removing them ends the UFCS naming collision and stops the trait advertising "NotImplemented" for implemented capabilities. A `Backend`-trait change is a breaking API change → **semver major**. The major also acts as the downstream coordination firewall: edge / server / lens-core / node-core opt into the device-agnostic substrate deliberately with `>=7,<8` (their `<7` pins exclude 7.0 until they do).
+
+### Changed — TimescaleDB purged; scoring rollup is now backend-agnostic (CIRISPersist#196, sharpens v6.8.x)
+
+v6.8.x's #196 scoring accelerator was a **TimescaleDB continuous aggregate** — a PG-only fast path that no-ops on plain Postgres and never existed on SQLite, so on the actual CEWP (plain-PG / SQLite) deployment the fleet sweep silently fell back to the ~65s direct aggregation. That's the pg/sqlite asymmetry this release eliminates:
+
+- The rollup is now a **plain `cirislens.trace_events_factor_rollup_1h` TABLE on BOTH backends** (V081, both dialects), bucketed via `date_trunc('hour', ts)` on PG and `strftime`/epoch-hour on SQLite — **no `time_bucket()`, no continuous aggregate, no `dblink`**. Maintained by an idempotent watermark upsert (`refresh_factor_rollup`, txn-wrapped, §10.1.4 self/family filtered at materialization), refreshed lazily on the batch read. `aggregate_scoring_factors_batch` / `_stream` sum buckets — **sub-second fleet sweep on plain PG AND SQLite**, identical capability, only the bucketing dialect differs.
+- **V082** converts an existing `trace_events` hypertable to a plain table (data-preserving; a clean no-op on plain PG — the CEWP path). The immutable shipped migrations **V001** (hypertable guard) and **V079** (the old CAGG) are left untouched — both are guarded by `IF EXISTS pg_extension timescaledb` so they no-op on plain PG, and are superseded at runtime (V082 / V081's CAGG-teardown). Migration checksums stay intact; refinery's divergence + missing detection stay at their strict defaults — no integrity weakening.
+- **CI's Postgres service is now plain `postgres:16`** (was timescaledb-implied), so the agnostic path is what gets verified; the rollup tests run on plain PG (no longer skipped) and on SQLite.
+- Net: **zero live TimescaleDB** (the only residue is dormant, guarded DDL in the two immutable shipped migrations); `grep` over `src/` is TimescaleDB-free.
 
 ### Added — GDPR Art. 17 trace-erasure primitive (CIRISPersist#222)
 
@@ -15,7 +30,7 @@ threat-model citations because this crate's audit story is the point.
 - **tombstone** (not delete) the derived `cirislens_derived.detection_events`. Detections are substrate-derived analytics, not the subject's personal data (operator decision, #222), so the PII linkage (`trace_id`, `body_sha256`, `canonical_bytes`) is NULLed and an `erased_at` marker stamped — the detector/severity/cohort_cell analytics survive, the subject linkage is severed. `detection_events` has **no** `agent_id_hash` column; the linkage is `trace_id` (+ `body_sha256` / `canonical_bytes`), so the tombstone targets `trace_id IN (erased agent's traces)`;
 - **audit** via a `hard_case:trace_erasure` row (V075 `hard_case_events`) emitted *inside* the erasure transaction — no audit-without-erasure, no erasure-without-audit. `target_key_id` = the erased `agent_id_hash`; `detail` carries the per-table counts.
 
-**Idempotent** — a second call finds nothing, returns all-zero counts (`Ok`, never an error; a not-found is not an error for erasure), and emits no new audit row. **Migration V080** (both dialects): adds the `erased_at` tombstone column and relaxes `trace_id` / `body_sha256` / `canonical_bytes` to NULLABLE (SQLite via the standard table-rebuild dance). All three backends (postgres / sqlite / memory — memory has no derived storage so tombstone count is always 0); exposed on the PyO3 wheel `Engine`. Full feature set + sqlite + memory + live-PG green; no-backend `-D warnings` clean. Pin `ciris-persist>=6.9.0,<7`.
+**Idempotent** — a second call finds nothing, returns all-zero counts (`Ok`, never an error; a not-found is not an error for erasure), and emits no new audit row. **Migration V080** (both dialects): adds the `erased_at` tombstone column and relaxes `trace_id` / `body_sha256` / `canonical_bytes` to NULLABLE (SQLite via the standard table-rebuild dance). All three backends (postgres / sqlite / memory — memory has no derived storage so tombstone count is always 0); exposed on the PyO3 wheel `Engine`. Full feature set + sqlite + memory + live-PG green; no-backend `-D warnings` clean. Pin `ciris-persist>=7.0.0,<8`.
 
 ## [6.8.2] — 2026-06-14
 
