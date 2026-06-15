@@ -2030,20 +2030,36 @@ impl Engine {
         use crate::federation::LocalIdentityAggregate;
 
         // ── Signing role — Ed25519 required, ML-DSA-65 optional. ──
-        let signer = self.local_signer.as_ref().ok_or_else(|| {
-            crate::federation::BlobError::Backend(
-                "local_identity_aggregate: no local signing key configured (the signing role is \
-                 mandatory — construct the Engine with local_key_id + local_key_path)"
-                    .to_string(),
-            )
-        })?;
-        let key_id = signer.key_id().to_string();
-        let pqc_key_id = signer.pqc_key_id().map(str::to_owned);
-        let ed25519_pubkey_b64 = signer.public_key_b64();
-        let ml_dsa_65_pubkey_b64 = signer
-            .pqc_public_key_b64()
-            .await
-            .map_err(|e| crate::federation::BlobError::Backend(format!("ml-dsa-65 pubkey: {e}")))?;
+        // v7.1.0 (CIRISPersist#223): an Engine built with
+        // `with_hardware_signer` (classical-only) has `local_signer: None`
+        // — the signing key is the sealed `Arc<dyn HardwareSigner>` reachable
+        // via `self.signer`. Fall back to it so a hardware-custodied node can
+        // still produce its six-key aggregate (CIRISServer's `/v1/identity`)
+        // instead of erroring. The Ed25519 pubkey is read from the seal (never
+        // the private key); a classical-only HW signer carries no ML-DSA half.
+        // (A `with_hardware_signer_hybrid` engine populates `local_signer`, so
+        // it takes the `Some` arm and surfaces its PQC half — #224.)
+        let (key_id, pqc_key_id, ed25519_pubkey_b64, ml_dsa_65_pubkey_b64) = match self
+            .local_signer
+            .as_ref()
+        {
+            Some(signer) => (
+                signer.key_id().to_string(),
+                signer.pqc_key_id().map(str::to_owned),
+                signer.public_key_b64(),
+                signer.pqc_public_key_b64().await.map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("ml-dsa-65 pubkey: {e}"))
+                })?,
+            ),
+            None => {
+                use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                let hw = &self.signer;
+                let pk = hw.public_key().await.map_err(|e| {
+                    crate::federation::BlobError::Backend(format!("hardware ed25519 pubkey: {e}"))
+                })?;
+                (hw.current_alias().to_string(), None, B64.encode(&pk), None)
+            }
+        };
 
         // ── Content-KEM role — persist-minted + sealed (stable). ──
         let content = match &self.backend {
@@ -4113,6 +4129,43 @@ mod tests {
         assert!(
             agg.ml_dsa_65_pubkey_b64.is_some(),
             "ML-DSA-65 signing pubkey present (PQC half configured)"
+        );
+    }
+
+    /// v7.1.0 (CIRISPersist#223) — a CLASSICAL-ONLY hardware engine
+    /// (`with_hardware_signer`, `local_signer: None`) now produces its
+    /// six-key aggregate via the `HardwareSigner` fallback instead of
+    /// erroring. This is the fix for CIRISServer's `/v1/identity` returning
+    /// content-KEM = null: content-KEM is persist-minted (populated); the
+    /// ML-DSA signing half is None (a classical-only HW signer has no PQC).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn classical_only_hardware_engine_surfaces_aggregate() {
+        let classical = hw_classical("hw-classical-agg");
+        let hw_pubkey_b64 = {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            B64.encode(classical.public_key().await.expect("hw pubkey"))
+        };
+        let engine = Engine::with_hardware_signer(classical, "sqlite::memory:")
+            .await
+            .expect("construct classical-only hardware engine");
+
+        let agg = engine
+            .local_identity_aggregate(None, None)
+            .await
+            .expect("#223: classical-only hardware aggregate must not error");
+
+        assert_eq!(
+            agg.ed25519_pubkey_b64, hw_pubkey_b64,
+            "Ed25519 signing pubkey is the sealed hardware key's"
+        );
+        assert!(
+            agg.ml_dsa_65_pubkey_b64.is_none(),
+            "no PQC half for a classical-only hardware signer"
+        );
+        assert!(
+            agg.content_x25519_pubkey_b64.is_some() && agg.content_ml_kem_768_pubkey_b64.is_some(),
+            "content-KEM is persist-minted + populated (the /v1/identity null fix)"
         );
     }
 
