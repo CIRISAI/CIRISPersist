@@ -19746,7 +19746,9 @@ fn local_signer_err_to_py(e: crate::signing::LocalSignerError) -> PyErr {
         LocalSignerError::SeedLength { .. }
         | LocalSignerError::PqcConfigInconsistent
         | LocalSignerError::PqcNotConfigured => PyValueError::new_err(format!("{e}")),
-        LocalSignerError::PqcSign(_) => PyRuntimeError::new_err(format!("{e}")),
+        LocalSignerError::PqcSign(_) | LocalSignerError::ClassicalSign(_) => {
+            PyRuntimeError::new_err(format!("{e}"))
+        }
     }
 }
 

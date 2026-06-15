@@ -368,6 +368,71 @@ impl Engine {
         })
     }
 
+    /// v7.1.0 (CIRISPersist#224) — construct a fresh Engine (connect + run
+    /// migrations, like [`Engine::with_signer`]) whose federation signing
+    /// identity is **hybrid with a hardware-sealed classical key**: the
+    /// Ed25519 half is custodied by `classical` (a TPM / Secure-Enclave /
+    /// StrongBox key reached through [`HardwareSigner`]) and the
+    /// ML-DSA-65 half is supplied by `pqc`.
+    ///
+    /// This closes the last Ed25519-only path for a hardware-custodied
+    /// node: unlike [`Engine::with_hardware_signer`] (classical-only —
+    /// `sign_hybrid` returns [`SignError::LocalSignerUnavailable`]) and
+    /// unlike [`Engine::with_signer_arcs`] (hybrid but with a **plaintext**
+    /// Ed25519, defeating custody), an Engine built here produces a real
+    /// [`ciris_crypto::HybridSignature`] — Ed25519 from the
+    /// [`HardwareSigner`], ML-DSA-65 from the [`PqcSigner`] — so the
+    /// storage-tier scrub signature (the produce/promote path that calls
+    /// [`Engine::sign_hybrid`]) is hybrid **without ever unsealing the
+    /// Ed25519 key**.
+    ///
+    /// The `LocalSigner` is composed via
+    /// [`LocalSigner::from_hardware_parts`] (reads + caches the classical
+    /// pubkey via the async [`HardwareSigner::public_key`]) and stored as
+    /// `local_signer: Some(..)`; `signer` is the same hardware classical
+    /// `Arc` (as in [`Engine::with_signer`], where `signer` is the
+    /// classical-signing identity). The `key_id` is read from
+    /// [`HardwareSigner::current_alias`].
+    ///
+    /// When `pqc` is `None`, the Engine behaves like a non-PQC
+    /// [`Engine::with_signer`]: [`Engine::sign_hybrid`] returns
+    /// [`SignError::LocalSigner(LocalSignerError::PqcNotConfigured)`](crate::signing::LocalSignerError::PqcNotConfigured).
+    pub async fn with_hardware_signer_hybrid(
+        classical: Arc<dyn HardwareSigner>,
+        pqc: Option<Arc<dyn ciris_keyring::PqcSigner>>,
+        pqc_key_id: Option<String>,
+        dsn: &str,
+    ) -> Result<Self, EngineError> {
+        let key_id = classical.current_alias().to_owned();
+        // Compose the LocalSigner with the SEALED classical half + the
+        // PQC half. `from_hardware_parts` reads the classical pubkey once
+        // (async) and caches it; the Ed25519 private key is never read.
+        let local = Arc::new(
+            crate::signing::LocalSigner::from_hardware_parts(
+                classical.clone(),
+                key_id,
+                pqc,
+                pqc_key_id,
+            )
+            .await?,
+        );
+        let backend = build_backend(dsn).await?;
+        Ok(Engine {
+            backend,
+            // `signer` is the hardware classical itself — same shape as
+            // the other ctors (the classical-signing federation identity).
+            signer: classical,
+            // `local_signer` carries the hybrid-composition surface so
+            // `Engine::sign_hybrid` composes the sealed-classical hybrid.
+            local_signer: Some(local),
+            replication_config: None,
+            disk_pressure_config: None,
+            disk_pressure_state: None,
+            #[cfg(feature = "cirisnode")]
+            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
+        })
+    }
+
     /// Borrow the public [`BackendDispatch`] enum the Engine
     /// composes. Consumers `match` on the variant and call the
     /// concrete backend's trait methods (`FederationDirectory`,
@@ -2950,6 +3015,13 @@ pub enum EngineError {
     /// connect / open / migrate.
     #[error("store: {0}")]
     Store(#[from] StoreError),
+
+    /// v7.1.0 (CIRISPersist#224) — composing the local signing identity
+    /// failed during [`Engine::with_hardware_signer_hybrid`] (e.g. the
+    /// hardware classical signer's public key could not be read, or it
+    /// wasn't a 32-byte Ed25519 key).
+    #[error("local signer: {0}")]
+    LocalSigner(#[from] crate::signing::LocalSignerError),
 }
 
 #[cfg(test)]
@@ -3882,6 +3954,165 @@ mod tests {
         assert!(
             matches!(err, SignError::LocalSignerUnavailable),
             "got: {err:?}"
+        );
+    }
+
+    // ── v7.1.0 (CIRISPersist#224) — hybrid hardware signer:
+    //    with_hardware_signer_hybrid composes a real HybridSignature
+    //    (Ed25519 from the sealed HardwareSigner + ML-DSA-65 from the
+    //    PqcSigner) without unsealing the classical key. ──────────────
+
+    /// Fixture: a software [`HardwareSigner`] standing in for a sealed
+    /// classical key (TPM/SE). `Ed25519SoftwareSigner` is the
+    /// test-available `HardwareSigner` whose `algorithm()` is Ed25519;
+    /// production passes a real sealed signer from
+    /// `ciris_keyring::get_platform_signer`.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn hw_classical(alias: &str) -> Arc<dyn HardwareSigner> {
+        let seed = [0x24u8; 32];
+        Arc::new(
+            ciris_keyring::Ed25519SoftwareSigner::from_bytes(&seed, alias.to_owned())
+                .expect("ed25519 sw signer"),
+        )
+    }
+
+    /// Fixture: an ML-DSA-65 `PqcSigner` (software) for the PQC half.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn pqc_half() -> Arc<dyn ciris_keyring::PqcSigner> {
+        Arc::new(
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&[0x71u8; 32], "hw-hybrid-pqc")
+                .expect("ml-dsa-65 seed"),
+        )
+    }
+
+    /// THE DELIVERABLE: a `with_hardware_signer_hybrid` Engine built from
+    /// a (software) `HardwareSigner` classical half + an ML-DSA-65
+    /// `PqcSigner` produces a real `HybridSignature` whose Ed25519 half
+    /// verifies against the *hardware signer's* public key (proving the
+    /// sealed classical never had to be unsealed) AND whose ML-DSA-65
+    /// half verifies — i.e. the sealed-classical hybrid path composes a
+    /// valid hybrid signature.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn with_hardware_signer_hybrid_composes_valid_hybrid_sig() {
+        use ciris_crypto::{Ed25519Verifier, HybridVerifier, MlDsa65Verifier};
+
+        let classical = hw_classical("hw-hybrid-steward");
+        // The pubkey the sealed classical exposes — sign_hybrid must use
+        // exactly this in the HybridSignature's classical half.
+        let hw_pubkey = classical.public_key().await.expect("hw pubkey");
+
+        let engine = Engine::with_hardware_signer_hybrid(
+            classical.clone(),
+            Some(pqc_half()),
+            Some("hw-hybrid-pqc".to_owned()),
+            "sqlite::memory:",
+        )
+        .await
+        .expect("construct hybrid-hardware engine");
+
+        let message = b"storage-tier scrub canonical bytes";
+        let sig = engine
+            .sign_hybrid(message)
+            .await
+            .expect("hybrid sign with sealed classical");
+
+        // The classical half carries the hardware signer's pubkey — the
+        // sealed key was never unsealed into a plaintext SigningKey.
+        assert_eq!(
+            sig.classical.public_key, hw_pubkey,
+            "hybrid classical pubkey must be the hardware signer's"
+        );
+        assert_eq!(
+            sig.classical.algorithm,
+            ciris_crypto::ClassicalAlgorithm::Ed25519
+        );
+        assert_eq!(sig.pqc.algorithm, ciris_crypto::PqcAlgorithm::MlDsa65);
+
+        // Both halves verify (HybridVerifier rebuilds the data||classical
+        // binding, exactly matching sign_hybrid's composition).
+        let verifier = HybridVerifier::new(Ed25519Verifier, MlDsa65Verifier::new());
+        assert!(
+            verifier.verify(message, &sig).expect("verify hybrid"),
+            "sealed-classical hybrid signature must verify (both halves)"
+        );
+
+        // Independent Ed25519-half check against the hardware pubkey.
+        use ed25519_dalek::Verifier as _;
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(
+            hw_pubkey
+                .as_slice()
+                .try_into()
+                .expect("32-byte ed25519 pubkey"),
+        )
+        .expect("verifying key");
+        let ed_sig = ed25519_dalek::Signature::from_slice(&sig.classical.signature)
+            .expect("64-byte ed25519 sig");
+        vk.verify(message, &ed_sig)
+            .expect("Ed25519 half verifies against the hardware signer's pubkey");
+    }
+
+    /// A `with_hardware_signer_hybrid` Engine built WITHOUT a PQC half
+    /// matches `with_signer`'s no-PQC semantics: `sign_hybrid` surfaces
+    /// the LocalSigner's own `PqcNotConfigured` (not
+    /// `LocalSignerUnavailable` — the LocalSigner IS present, it just has
+    /// no PQC identity).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn with_hardware_signer_hybrid_without_pqc_returns_pqc_not_configured() {
+        let engine = Engine::with_hardware_signer_hybrid(
+            hw_classical("hw-hybrid-nopqc"),
+            None,
+            None,
+            "sqlite::memory:",
+        )
+        .await
+        .expect("construct hybrid-hardware engine without pqc");
+
+        let err = engine
+            .sign_hybrid(b"any message")
+            .await
+            .expect_err("no PQC configured");
+        match err {
+            SignError::LocalSigner(crate::signing::LocalSignerError::PqcNotConfigured) => {}
+            other => panic!("expected SignError::LocalSigner(PqcNotConfigured), got {other:?}"),
+        }
+    }
+
+    /// #224 + #223 — `local_identity_aggregate` surfaces the full
+    /// signing role (Ed25519 + ML-DSA-65) for a hardware-signed Engine,
+    /// reading the sealed classical's pubkey through the cached
+    /// classical public key (the #223 six-key-aggregate consequence of
+    /// the hybrid-hardware ctor).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn hardware_hybrid_engine_surfaces_signing_role_in_aggregate() {
+        let classical = hw_classical("hw-hybrid-agg");
+        let hw_pubkey_b64 = {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            B64.encode(classical.public_key().await.expect("hw pubkey"))
+        };
+        let engine = Engine::with_hardware_signer_hybrid(
+            classical,
+            Some(pqc_half()),
+            Some("hw-hybrid-pqc".to_owned()),
+            "sqlite::memory:",
+        )
+        .await
+        .expect("construct hybrid-hardware engine");
+
+        let agg = engine
+            .local_identity_aggregate(None, None)
+            .await
+            .expect("aggregate for a hardware-signed engine");
+
+        assert_eq!(
+            agg.ed25519_pubkey_b64, hw_pubkey_b64,
+            "aggregate's Ed25519 signing pubkey is the sealed hardware key's"
+        );
+        assert!(
+            agg.ml_dsa_65_pubkey_b64.is_some(),
+            "ML-DSA-65 signing pubkey present (PQC half configured)"
         );
     }
 

@@ -137,6 +137,93 @@ pub enum LocalSignerError {
     /// Underlying ML-DSA-65 sign / public_key call failed.
     #[error("PQC sign: {0}")]
     PqcSign(String),
+
+    /// v7.1.0 (CIRISPersist#224) — the classical half of an Ed25519
+    /// signature failed. For a hardware-custodied classical
+    /// ([`ClassicalSigner::Hardware`]) the seal is preserved; the
+    /// signature is produced by the [`HardwareSigner`] and any error
+    /// (key absent, HSM I/O, user-auth) is surfaced here. Also covers
+    /// the structural case where the synchronous
+    /// [`LocalSigner::sign_ed25519`] hot-path is called on a hardware
+    /// classical signer (whose `sign` is async): use
+    /// [`LocalSigner::sign_hybrid`] instead.
+    #[error("classical (Ed25519) sign: {0}")]
+    ClassicalSign(String),
+}
+
+/// v7.1.0 (CIRISPersist#224) — the classical (Ed25519) half of a
+/// [`LocalSigner`], either a plaintext in-process key or a
+/// hardware-custodied key reached through the
+/// [`ciris_keyring::HardwareSigner`] trait.
+///
+/// # Why an enum
+///
+/// Hybrid signing (Ed25519 + ML-DSA-65) structurally needs *some*
+/// Ed25519 signer. Historically `LocalSigner` held a plaintext
+/// `ed25519_dalek::SigningKey`, which defeats hardware custody (TPM /
+/// Secure-Enclave): the sealed key would have to be unsealed into
+/// process memory to compose the hybrid signature. This enum lets the
+/// classical half be EITHER plaintext (the software-identity path) OR a
+/// sealed [`HardwareSigner`] (the custody-preserving path used by
+/// [`crate::Engine::with_hardware_signer_hybrid`]) — so a
+/// hardware-custodied node gets 100% PQC (full hybrid sig) while the
+/// Ed25519 key never leaves the secure hardware.
+///
+/// Both variants cache the 32-byte Ed25519 public key at construction
+/// (the `HardwareSigner::public_key` read is async; capturing it once
+/// keeps [`LocalSigner::public_key_b64`] a synchronous accessor — its
+/// existing contract, exercised on hot paths across `federation::emit`
+/// / `federation::read`).
+enum ClassicalSigner {
+    /// Plaintext in-process Ed25519 key (the software-identity path —
+    /// [`LocalSigner::from_config`] / [`LocalSigner::from_parts`]).
+    Plaintext(SigningKey),
+    /// Sealed hardware-custodied Ed25519 key, reached via the
+    /// [`HardwareSigner`] trait. The private key never enters this
+    /// process.
+    Hardware {
+        /// The hardware signer; its `sign` is the only classical-sign
+        /// path for this variant.
+        signer: Arc<dyn HardwareSigner>,
+        /// 32-byte Ed25519 public key, captured once at construction
+        /// (async `HardwareSigner::public_key` read) so the
+        /// synchronous public-key accessors keep their contract.
+        public_key: [u8; 32],
+    },
+}
+
+impl ClassicalSigner {
+    /// 32-byte Ed25519 public key (plaintext: derived; hardware:
+    /// cached from the ctor-time `HardwareSigner::public_key` read).
+    fn public_key_bytes(&self) -> [u8; 32] {
+        match self {
+            ClassicalSigner::Plaintext(sk) => sk.verifying_key().to_bytes(),
+            ClassicalSigner::Hardware { public_key, .. } => *public_key,
+        }
+    }
+
+    /// Ed25519-sign `message`, returning the 64-byte signature.
+    ///
+    /// Async because the hardware path dispatches through
+    /// [`HardwareSigner::sign`] (HSM I/O). The plaintext path is
+    /// in-process and resolves immediately.
+    async fn sign(&self, message: &[u8]) -> Result<[u8; 64], LocalSignerError> {
+        match self {
+            ClassicalSigner::Plaintext(sk) => Ok(sk.sign(message).to_bytes()),
+            ClassicalSigner::Hardware { signer, .. } => {
+                let sig = signer
+                    .sign(message)
+                    .await
+                    .map_err(|e| LocalSignerError::ClassicalSign(format!("{e}")))?;
+                sig.as_slice().try_into().map_err(|_| {
+                    LocalSignerError::ClassicalSign(format!(
+                        "hardware signer returned {} bytes, expected 64 (Ed25519)",
+                        sig.len()
+                    ))
+                })
+            }
+        }
+    }
 }
 
 /// Local identity signer — Rust-public surface for federation
@@ -147,7 +234,7 @@ pub enum LocalSignerError {
 /// shared across worker tasks. All sign methods take `&self`
 /// (signing key isn't mutated).
 pub struct LocalSigner {
-    signing_key: SigningKey,
+    classical: ClassicalSigner,
     key_id: String,
     pqc_signer: Option<Arc<dyn PqcSigner>>,
     pqc_key_id: Option<String>,
@@ -226,7 +313,7 @@ impl LocalSigner {
         );
 
         Ok(Self {
-            signing_key,
+            classical: ClassicalSigner::Plaintext(signing_key),
             key_id: cfg.key_id.clone(),
             pqc_signer,
             pqc_key_id: pqc_key_id_out,
@@ -244,17 +331,77 @@ impl LocalSigner {
         pqc_key_id: Option<String>,
     ) -> Self {
         Self {
-            signing_key,
+            classical: ClassicalSigner::Plaintext(signing_key),
             key_id,
             pqc_signer,
             pqc_key_id,
         }
     }
 
+    /// v7.1.0 (CIRISPersist#224) — construct a [`LocalSigner`] whose
+    /// classical (Ed25519) half is a **sealed hardware-custodied key**
+    /// reached through the [`HardwareSigner`] trait, rather than a
+    /// plaintext in-process key. The Ed25519 private key never enters
+    /// this process; signatures are produced inside the secure
+    /// hardware (TPM / Secure-Enclave / StrongBox).
+    ///
+    /// Reads the classical public key once (async
+    /// [`HardwareSigner::public_key`]) and caches it so the
+    /// synchronous public-key accessors
+    /// ([`Self::public_key_b64`]) keep their contract. This is the
+    /// building block behind
+    /// [`crate::Engine::with_hardware_signer_hybrid`]: it composes a
+    /// real hybrid signature (Ed25519 from the `HardwareSigner` +
+    /// ML-DSA-65 from the `PqcSigner`) while preserving hardware
+    /// custody of the classical key.
+    pub async fn from_hardware_parts(
+        classical: Arc<dyn HardwareSigner>,
+        key_id: String,
+        pqc_signer: Option<Arc<dyn PqcSigner>>,
+        pqc_key_id: Option<String>,
+    ) -> Result<Self, LocalSignerError> {
+        let pk_bytes = classical
+            .public_key()
+            .await
+            .map_err(|e| LocalSignerError::ClassicalSign(format!("hardware public_key: {e}")))?;
+        let public_key: [u8; 32] = pk_bytes.as_slice().try_into().map_err(|_| {
+            LocalSignerError::ClassicalSign(format!(
+                "hardware signer public key is {} bytes, expected 32 (Ed25519)",
+                pk_bytes.len()
+            ))
+        })?;
+        Ok(Self {
+            classical: ClassicalSigner::Hardware {
+                signer: classical,
+                public_key,
+            },
+            key_id,
+            pqc_signer,
+            pqc_key_id,
+        })
+    }
+
     /// Ed25519 sign canonical bytes. Returns the 64-byte signature.
     /// Hot-path; no async. Mirrors PyO3 `engine.local_sign(message)`.
+    ///
+    /// v7.1.0 (CIRISPersist#224): this synchronous accessor signs only
+    /// for the plaintext classical half. A hardware-custodied classical
+    /// ([`ClassicalSigner::Hardware`]) signs through the async
+    /// [`HardwareSigner`] trait, so it returns
+    /// [`LocalSignerError::ClassicalSign`] here — use
+    /// [`Self::sign_hybrid`] (the deliverable path for a hardware-hybrid
+    /// signer). The software-identity callers that use this hot path
+    /// (`federation::emit` trust grants, the secrets client) always hold
+    /// a plaintext signer.
     pub fn sign_ed25519(&self, message: &[u8]) -> Result<[u8; 64], LocalSignerError> {
-        Ok(self.signing_key.sign(message).to_bytes())
+        match &self.classical {
+            ClassicalSigner::Plaintext(sk) => Ok(sk.sign(message).to_bytes()),
+            ClassicalSigner::Hardware { .. } => Err(LocalSignerError::ClassicalSign(
+                "synchronous sign_ed25519 is unavailable for a hardware-custodied classical key \
+                 (its HardwareSigner::sign is async); use sign_hybrid"
+                    .to_string(),
+            )),
+        }
     }
 
     /// ML-DSA-65 sign canonical bytes. Returns the 3309-byte
@@ -294,7 +441,10 @@ impl LocalSigner {
             .as_ref()
             .ok_or(LocalSignerError::PqcNotConfigured)?;
 
-        let classical_sig = self.signing_key.sign(message).to_bytes();
+        // v7.1.0 (#224): the Ed25519 half dispatches on the classical
+        // signer — plaintext signs in-process, hardware signs through
+        // the sealed HardwareSigner (custody preserved, never unsealed).
+        let classical_sig = self.classical.sign(message).await?;
         let mut bound = Vec::with_capacity(message.len() + classical_sig.len());
         bound.extend_from_slice(message);
         bound.extend_from_slice(&classical_sig);
@@ -313,7 +463,7 @@ impl LocalSigner {
             classical: TaggedClassicalSignature {
                 algorithm: ClassicalAlgorithm::Ed25519,
                 signature: classical_sig.to_vec(),
-                public_key: self.signing_key.verifying_key().to_bytes().to_vec(),
+                public_key: self.classical.public_key_bytes().to_vec(),
             },
             pqc: TaggedPqcSignature {
                 algorithm: PqcAlgorithm::MlDsa65,
@@ -338,7 +488,7 @@ impl LocalSigner {
     /// chars). Suitable for publishing to the registry / federation
     /// directory as `pubkey_ed25519_base64`.
     pub fn public_key_b64(&self) -> String {
-        B64.encode(self.signing_key.verifying_key().to_bytes())
+        B64.encode(self.classical.public_key_bytes())
     }
 
     /// Local ML-DSA-65 public key, base64 standard alphabet
@@ -367,11 +517,24 @@ impl LocalSigner {
         self.pqc_signer.clone()
     }
 
-    /// Internal accessor for PyO3 wrapper. Same forward-wiring note
-    /// as `pqc_signer`.
-    #[allow(dead_code)]
-    pub(crate) fn signing_key(&self) -> &SigningKey {
-        &self.signing_key
+    /// v7.1.0 (CIRISPersist#224) — 32-byte Ed25519 public key (raw).
+    /// Plaintext: derived; hardware: the ctor-cached
+    /// [`HardwareSigner::public_key`] read. Internal accessor used by
+    /// [`LocalSignerHardwareAdapter`].
+    pub(crate) fn classical_public_key_bytes(&self) -> [u8; 32] {
+        self.classical.public_key_bytes()
+    }
+
+    /// v7.1.0 (CIRISPersist#224) — async Ed25519 sign that dispatches on
+    /// the classical half (plaintext in-process, or sealed hardware).
+    /// Internal accessor used by [`LocalSignerHardwareAdapter`] so the
+    /// adapter works regardless of which classical variant backs the
+    /// `LocalSigner`.
+    pub(crate) async fn sign_ed25519_async(
+        &self,
+        message: &[u8],
+    ) -> Result<[u8; 64], LocalSignerError> {
+        self.classical.sign(message).await
     }
 }
 
@@ -427,13 +590,16 @@ impl ciris_keyring::HardwareSigner for LocalSignerHardwareAdapter {
     }
 
     async fn public_key(&self) -> Result<Vec<u8>, ciris_keyring::KeyringError> {
-        Ok(self.inner.signing_key().verifying_key().to_bytes().to_vec())
+        Ok(self.inner.classical_public_key_bytes().to_vec())
     }
 
     async fn sign(&self, data: &[u8]) -> Result<Vec<u8>, ciris_keyring::KeyringError> {
         // The only HardwareSigner method IngestPipeline exercises.
+        // v7.1.0 (#224): dispatch via the async classical accessor so
+        // the adapter wraps either classical variant.
         self.inner
-            .sign_ed25519(data)
+            .sign_ed25519_async(data)
+            .await
             .map(|sig| sig.to_vec())
             .map_err(|e| ciris_keyring::KeyringError::SigningFailed {
                 reason: format!("local-signer adapter: {e}"),
