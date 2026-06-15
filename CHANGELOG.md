@@ -5,6 +5,30 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [7.1.0] — 2026-06-15
+
+### Added — hybrid signing with a hardware-sealed classical key: `with_hardware_signer_hybrid` (CIRISPersist#224)
+
+Completes the PQC surface for hardware-custodied nodes: **100% hybrid signing (Ed25519 + ML-DSA-65) while the classical Ed25519 key stays sealed in the TPM/SE** — previously a node had to choose hardware custody (classical-only sigs) *or* hybrid PQC (plaintext Ed25519), never both.
+
+```rust
+pub async fn with_hardware_signer_hybrid(
+    classical: Arc<dyn HardwareSigner>,   // sealed Ed25519 (custody preserved)
+    pqc: Option<Arc<dyn PqcSigner>>,      // ML-DSA-65
+    pqc_key_id: Option<String>,
+    dsn: &str,
+) -> Result<Self, EngineError>
+```
+
+`LocalSigner`'s classical half is generalized to an internal `ClassicalSigner { Plaintext(SigningKey) | Hardware { signer, public_key } }`; the 32-byte Ed25519 pubkey is read from the seal **once** at construction and cached (so `public_key_b64()` stays a sync accessor). `sign_hybrid` composes the Ed25519 half via `HardwareSigner::sign` (sealed key never unsealed) + the ML-DSA-65 half via `PqcSigner::sign` → a real `ciris_crypto::HybridSignature` — so the **storage-tier scrub signature is now hybrid for a hardware node** (the `attestation_promote` path). `with_hardware_signer` (classical-only) and `with_signer*` (plaintext hybrid) are unchanged — purely additive. Test proves the composed hybrid sig verifies on both halves and that the classical half carries the hardware pubkey (no unseal).
+
+### Fixed — `local_identity_aggregate` works for a hardware-signed Engine (CIRISPersist#223)
+
+`local_identity_aggregate` hard-required `local_signer`, so it **errored** for any `with_hardware_signer` (classical-only, `local_signer: None`) Engine — leaving CIRISServer's `GET /v1/identity` unable to fill the content-KEM halves (`content_x25519` / `content_ml_kem_768` returned `null`). It now falls back to the sealed `HardwareSigner` for the signing role (Ed25519 pubkey read from the seal; no ML-DSA half for a classical-only signer); content-KEM is persist-minted and signer-agnostic, so a hardware node returns the **complete six-key aggregate**. (A `with_hardware_signer_hybrid` Engine populates `local_signer`, so it surfaces its PQC half too.)
+
+### Tests
+Both new ctors + the aggregate fallback covered, all backends; the hybrid-sig-verifies test runs against a software `HardwareSigner` + `MlDsa65SoftwareSigner`. Full feature set + sqlite + plain `postgres:16` (1463+ lib tests) + no-backend `-D warnings` green; zero TimescaleDB. Pin `ciris-persist>=7.1.0,<8`.
+
 ## [7.0.0] — 2026-06-15 — CEWP-ready
 
 The substrate cut for the **CIRIS Epistemic Web Platform** (CEWP) launch. CEWP routes signed claims, files, streaming, and messaging **directly between devices over a post-quantum mesh — with no data centers**; `ciris-persist` is the durable data substrate each node carries (federation directory, distributed trust + attestations, consent, blobs, transport bindings). "No data centers" makes **SQLite a first-class deployment** (phones, Pi-class, sovereign nodes), not a fallback — so this release makes the substrate genuinely **device-agnostic**: no TimescaleDB anywhere, and **strict pg/sqlite parity** (every capability present on both backends, degraded where it must be but never absent).

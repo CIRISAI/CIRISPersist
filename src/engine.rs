@@ -6245,24 +6245,37 @@ mod tests {
         assert_local_identity_aggregate_conformance(&engine).await;
     }
 
-    /// No local signer → the signing role is mandatory → error (not a
-    /// silently-empty aggregate).
+    /// v7.1.0 (CIRISPersist#223) — `local_signer: None` (a `from_shared`
+    /// cohabitation view, or a classical-only `with_hardware_signer`) NO
+    /// LONGER errors: `local_identity_aggregate` falls back to the engine's
+    /// `signer` (the `Arc<dyn HardwareSigner>`) for the Ed25519 signing role,
+    /// so the node still produces its six-key aggregate. (Was: "signing role
+    /// mandatory → error" — that invariant is intentionally removed.)
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn local_identity_aggregate_requires_signing_role() {
-        // `from_shared` yields an Engine with `local_signer: None` (the
-        // cohabitation-view path) — the no-signing-role case.
+    async fn local_identity_aggregate_falls_back_to_signer_without_local() {
         let signed = Engine::with_signer(pqc_signer("local-id"), "sqlite::memory:")
             .await
             .expect("construct engine");
+        // The Ed25519 pubkey the fallback resolves from the signer adapter.
+        let ed_pubkey_b64 = {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            B64.encode(signed.signer().public_key().await.expect("signer pubkey"))
+        };
+        // from_shared drops the LocalSigner (local_signer: None) but keeps the
+        // signer adapter — the #223 fallback path.
         let engine = Engine::from_shared(signed.backend().clone(), signed.signer().clone());
-        let err = engine
+        let agg = engine
             .local_identity_aggregate(None, None)
             .await
-            .expect_err("no signer → error");
+            .expect("#223: aggregate falls back to the signer, no error");
+        assert_eq!(
+            agg.ed25519_pubkey_b64, ed_pubkey_b64,
+            "Ed25519 signing pubkey resolved from the engine's signer"
+        );
         assert!(
-            matches!(err, crate::federation::BlobError::Backend(ref m) if m.contains("signing")),
-            "got: {err:?}"
+            agg.content_x25519_pubkey_b64.is_some() && agg.content_ml_kem_768_pubkey_b64.is_some(),
+            "content-KEM minted + populated"
         );
     }
 
