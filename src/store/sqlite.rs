@@ -3009,6 +3009,151 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_hard_case_events: {e}")))
     }
 
+    // ─── v8.2.0 (CEG 1.0-RC11 §19.1) — WholenessWitness corpus. ─────
+
+    async fn put_wholeness_witness(
+        &self,
+        witness: &ciris_verify_core::holonomic::WholenessWitness,
+        sig_ed25519_b64: &str,
+        sig_ml_dsa_65_b64: Option<&str>,
+        pqc_key_id: &str,
+        ed25519_pubkey_b64: &str,
+        ml_dsa_65_pubkey_b64: Option<&str>,
+        disclosed_leaves: Option<&[Vec<u8>]>,
+    ) -> Result<(), crate::federation::Error> {
+        // Verify-BEFORE-persist (N3 / RC8 / AV-9): full hybrid-PQC gate +
+        // WW-2 namespace guard + optional leaf/root recompute. On any
+        // failure NOTHING is written.
+        let stored = crate::witness::admit_witness(
+            witness,
+            sig_ed25519_b64,
+            sig_ml_dsa_65_b64,
+            pqc_key_id,
+            ed25519_pubkey_b64,
+            ml_dsa_65_pubkey_b64,
+            disclosed_leaves,
+        )?;
+        let claim_namespaces_text =
+            serde_json::to_string(&stored.claim_namespaces).map_err(|e| {
+                crate::federation::Error::Backend(format!("serialize claim_namespaces: {e}"))
+            })?;
+        let admitted_at = chrono::Utc::now().to_rfc3339();
+        let k = crate::witness::WITNESS_CORPUS_K as i64;
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            // Idempotent on (peer_id, epoch_id, observed_at_unix_ms).
+            tx.execute(
+                "INSERT INTO wholeness_witness_corpus \
+                 (peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, \
+                  leaf_count, witness_version, signature, signature_ml_dsa_65, pqc_key_id, \
+                  admitted_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+                 ON CONFLICT (peer_id, epoch_id, observed_at_unix_ms) DO NOTHING",
+                rusqlite::params![
+                    stored.peer_id,
+                    stored.epoch_id as i64,
+                    stored.observed_at_unix_ms as i64,
+                    claim_namespaces_text,
+                    stored.merkle_root_hex,
+                    i64::from(stored.leaf_count),
+                    i64::from(stored.witness_version),
+                    stored.signature,
+                    stored.signature_ml_dsa_65,
+                    stored.pqc_key_id,
+                    admitted_at,
+                ],
+            )?;
+            // Prune to the last-K by observed_at (keep newest); delete the
+            // oldest rows beyond the cap.
+            tx.execute(
+                "DELETE FROM wholeness_witness_corpus \
+                 WHERE peer_id = ?1 AND observed_at_unix_ms IN ( \
+                   SELECT observed_at_unix_ms FROM ( \
+                     SELECT observed_at_unix_ms, ROW_NUMBER() OVER ( \
+                       ORDER BY observed_at_unix_ms DESC, epoch_id DESC) AS rn \
+                     FROM wholeness_witness_corpus WHERE peer_id = ?1 \
+                   ) WHERE rn > ?2 )",
+                rusqlite::params![stored.peer_id, k],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("put_wholeness_witness: {e}")))
+    }
+
+    async fn list_wholeness_witnesses_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<crate::witness::StoredWitness>, crate::federation::Error> {
+        let peer_id = peer_id.to_owned();
+        let conn = self.conn.clone();
+        (move || -> Result<Vec<crate::witness::StoredWitness>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, \
+                    leaf_count, witness_version, signature, signature_ml_dsa_65, pqc_key_id \
+                 FROM wholeness_witness_corpus WHERE peer_id = ?1 \
+                 ORDER BY observed_at_unix_ms DESC, epoch_id DESC",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![peer_id], |row| {
+                    let claim_namespaces_text: String = row.get(3)?;
+                    let claim_namespaces: Vec<String> =
+                        serde_json::from_str(&claim_namespaces_text).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                    let epoch_id: i64 = row.get(1)?;
+                    let observed: i64 = row.get(2)?;
+                    let leaf_count: i64 = row.get(5)?;
+                    let witness_version: i64 = row.get(6)?;
+                    Ok(crate::witness::StoredWitness {
+                        peer_id: row.get(0)?,
+                        epoch_id: epoch_id as u64,
+                        claim_namespaces,
+                        merkle_root_hex: row.get(4)?,
+                        leaf_count: leaf_count as u32,
+                        observed_at_unix_ms: observed as u64,
+                        witness_version: witness_version as u16,
+                        signature: row.get(7)?,
+                        signature_ml_dsa_65: row.get(8)?,
+                        pqc_key_id: row.get(9)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_wholeness_witnesses_for_peer: {e}"))
+        })
+    }
+
+    async fn last_witness_epoch_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<u64>, crate::federation::Error> {
+        let peer_id = peer_id.to_owned();
+        let conn = self.conn.clone();
+        (move || -> Result<Option<u64>, rusqlite::Error> {
+            let conn = conn.lock();
+            let max: Option<i64> = conn
+                .query_row(
+                    "SELECT MAX(epoch_id) FROM wholeness_witness_corpus WHERE peer_id = ?1",
+                    rusqlite::params![peer_id],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+            Ok(max.map(|v| v as u64))
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("last_witness_epoch_for_peer: {e}")))
+    }
+
     async fn list_consent_revocations(
         &self,
         since: Option<chrono::DateTime<chrono::Utc>>,

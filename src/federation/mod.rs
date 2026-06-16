@@ -1535,6 +1535,121 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
+    // ── §19.1 WholenessWitness corpus (CIRISPersist#228 items 1–2) ──
+
+    /// v8.2.0 (CEG 1.0-RC11 §19.1 / N3 / RC8) — admit a WholenessWitness
+    /// to the corpus, **PQC-verified-BEFORE-persist**. Runs the full
+    /// [`crate::witness::admit_witness`] gate (hybrid-PQC over the §19.1
+    /// canonical preimage + the WW-2 namespace guard + the optional
+    /// leaf/root recompute) BEFORE any row is durable; on any failure
+    /// NOTHING is written (verify-before-mutation, AV-9). A
+    /// classical-only / missing-ML-DSA-65 witness is the §19.0 hard cut
+    /// ([`Error::WitnessAdmit`] with the `witness_admit_hybrid_required`
+    /// token) — store-then-quarantine is non-conformant.
+    ///
+    /// `disclosed_leaves`, when `Some`, are re-hashed and the resulting
+    /// root must equal `witness.merkle_root`. The producer keys
+    /// (`ed25519_pubkey_b64` / `ml_dsa_65_pubkey_b64`) are the signing
+    /// peer's verifying keys.
+    ///
+    /// On success the corpus is pruned to the last
+    /// [`WITNESS_CORPUS_K`](crate::witness::WITNESS_CORPUS_K) witnesses
+    /// for the peer (by `observed_at_unix_ms`). Idempotent on
+    /// `(peer_id, epoch_id, observed_at_unix_ms)`.
+    #[allow(clippy::too_many_arguments)]
+    async fn put_wholeness_witness(
+        &self,
+        witness: &ciris_verify_core::holonomic::WholenessWitness,
+        sig_ed25519_b64: &str,
+        sig_ml_dsa_65_b64: Option<&str>,
+        pqc_key_id: &str,
+        ed25519_pubkey_b64: &str,
+        ml_dsa_65_pubkey_b64: Option<&str>,
+        disclosed_leaves: Option<&[Vec<u8>]>,
+    ) -> Result<(), Error> {
+        let _ = (
+            witness,
+            sig_ed25519_b64,
+            sig_ml_dsa_65_b64,
+            pqc_key_id,
+            ed25519_pubkey_b64,
+            ml_dsa_65_pubkey_b64,
+            disclosed_leaves,
+        );
+        Err(Error::Backend(
+            "put_wholeness_witness not implemented for this backend".into(),
+        ))
+    }
+
+    /// v8.2.0 (§19.1) — the verified witnesses currently stored for
+    /// `peer_id`, newest first (by `observed_at_unix_ms`). Capped at the
+    /// last-K the corpus retains. Every row already passed the ingest
+    /// gate (no in-band `verified` flag — F-5).
+    async fn list_wholeness_witnesses_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<crate::witness::StoredWitness>, Error> {
+        let _ = peer_id;
+        Err(Error::Backend(
+            "list_wholeness_witnesses_for_peer not implemented for this backend".into(),
+        ))
+    }
+
+    /// v8.2.0 (§19.1 N4 anti-rollback / eclipse guard) — the highest
+    /// `epoch_id` persist has accepted from `peer_id`, or `None` if it
+    /// has never accepted a witness from the peer. Feeds
+    /// [`crate::witness::accept_if_monotonic`] so a stale/replayed epoch
+    /// is rejected before a peer's witness is acted on as newer.
+    async fn last_witness_epoch_for_peer(&self, peer_id: &str) -> Result<Option<u64>, Error> {
+        let _ = peer_id;
+        Err(Error::Backend(
+            "last_witness_epoch_for_peer not implemented for this backend".into(),
+        ))
+    }
+
+    /// v8.2.0 (§19.1 N4 / WW→§10.1.6 subordination, CIRISPersist#228
+    /// item 2) — classify the **verified** corpus set for `peer_id` and
+    /// take the §19.1 action. Default impl composing
+    /// [`list_wholeness_witnesses_for_peer`](Self::list_wholeness_witnesses_for_peer),
+    /// [`crate::witness::classify_stored`], and (on equivocation)
+    /// [`record_hard_case`](Self::record_hard_case):
+    ///
+    /// - **Equivocation** → emit a `hard_case:witness_equivocation` per
+    ///   proof (idempotent) and RETAIN the pair; NEVER reconcile (N4,
+    ///   non-repudiable). Returns
+    ///   [`WitnessReconcileAction::Equivocation`].
+    /// - **Divergent** → returns
+    ///   [`WitnessReconcileAction::TriggerQuorumMerge`]. The witness is a
+    ///   divergence DETECTOR: the caller fulfils the directive by
+    ///   re-running the EXISTING §10.1.6 quorum-merge resolver
+    ///   ([`operational::resolve_monotonic_quorum`] for `partner_record`,
+    ///   the `revision` anti-rollback for `revocation`/`org_membership`)
+    ///   over the stored rows. The witness root NEVER enters that
+    ///   resolution — there is no "reconstitute from any fragment" path,
+    ///   so a revoked key cannot be resurrected.
+    /// - **Consistent** → [`WitnessReconcileAction::NoAction`].
+    ///
+    /// This method classifies + surfaces; it deliberately does NOT call
+    /// the merge itself (the witness must not decide it). `now` stamps an
+    /// emitted equivocation event.
+    async fn reconcile_peer_witnesses(
+        &self,
+        peer_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::witness::WitnessReconcileAction, Error> {
+        let stored = self.list_wholeness_witnesses_for_peer(peer_id).await?;
+        let action = crate::witness::classify_stored(&stored)?;
+        if let crate::witness::WitnessReconcileAction::Equivocation(proofs) = &action {
+            for proof in proofs {
+                // Retain + surface; NEVER reconcile (N4). Idempotent on
+                // the deterministic event_id.
+                self.record_hard_case(crate::witness::equivocation_hard_case(proof, now))
+                    .await?;
+            }
+        }
+        Ok(action)
+    }
+
     /// CEG §8.1.11.1 — effective consent stance of subject `s` over
     /// target Contribution `T` at `now`. Default impl over
     /// [`list_attestations_for`](Self::list_attestations_for): the latest
@@ -2164,6 +2279,18 @@ pub enum Error {
         target_attestation_id: String,
     },
 
+    /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228 item 1 / #229 item 1)
+    /// — a WholenessWitness was REJECTED at the verify-before-persist
+    /// gate: the §19.0 PQC-mandatory hard cut (classical-only / missing
+    /// or invalid ML-DSA-65 half), a WW-2 namespace violation
+    /// (names self/anonymous), a leaf/root mismatch, or a malformed
+    /// key/signature/version. Carries the
+    /// [`crate::witness::WitnessAdmitError`] — its `kind()` token is
+    /// preserved via [`Error::kind`]. Verify-before-mutation (AV-9):
+    /// nothing was written.
+    #[error("wholeness witness admission rejected: {0}")]
+    WitnessAdmit(#[from] crate::witness::WitnessAdmitError),
+
     /// Backend-level error (DB connection, serialization, etc.).
     /// String-typed because each backend has its own error tree.
     #[error("backend: {0}")]
@@ -2211,6 +2338,7 @@ impl Error {
             Error::PartnerRecordRollback { .. } => "federation_partner_record_rollback",
             Error::SetSemanticsUnsorted(_) => "federation_set_semantics_unsorted",
             Error::WithdrawsNotAdmitted { .. } => "federation_withdraws_not_admitted",
+            Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",
         }
     }

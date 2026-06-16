@@ -140,6 +140,12 @@ struct State {
     /// pressure/decay evict (by `retention_priority DESC`). Parity with
     /// the postgres/sqlite `content_symbols` table (V084).
     fountain_symbols: HashMap<String, HashMap<u32, crate::fountain::FountainSymbolV1>>,
+    /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228) — WholenessWitness
+    /// corpus, keyed by `peer_id`, inner vec the last-K verified witnesses
+    /// (newest last). Parity with the postgres/sqlite
+    /// `wholeness_witness_corpus` table (V085). Every entry already passed
+    /// the verify-before-persist gate (no in-band `verified` flag — F-5).
+    wholeness_witnesses: HashMap<String, Vec<crate::witness::StoredWitness>>,
 }
 
 impl Default for MemoryBackend {
@@ -173,6 +179,7 @@ impl Default for MemoryBackend {
                 federation_hard_case_events: HashMap::new(),
                 fountain_manifests: HashMap::new(),
                 fountain_symbols: HashMap::new(),
+                wholeness_witnesses: HashMap::new(),
             }),
         }
     }
@@ -1524,6 +1531,76 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .then_with(|| b.event_id.cmp(&a.event_id))
         });
         Ok(rows)
+    }
+
+    // ─── v8.2.0 (CEG 1.0-RC11 §19.1) — WholenessWitness corpus.
+
+    async fn put_wholeness_witness(
+        &self,
+        witness: &ciris_verify_core::holonomic::WholenessWitness,
+        sig_ed25519_b64: &str,
+        sig_ml_dsa_65_b64: Option<&str>,
+        pqc_key_id: &str,
+        ed25519_pubkey_b64: &str,
+        ml_dsa_65_pubkey_b64: Option<&str>,
+        disclosed_leaves: Option<&[Vec<u8>]>,
+    ) -> Result<(), crate::federation::Error> {
+        // Verify-BEFORE-persist (N3 / RC8 / AV-9): full hybrid-PQC gate +
+        // WW-2 namespace guard + optional leaf/root recompute. On any
+        // failure NOTHING is written.
+        let stored = crate::witness::admit_witness(
+            witness,
+            sig_ed25519_b64,
+            sig_ml_dsa_65_b64,
+            pqc_key_id,
+            ed25519_pubkey_b64,
+            ml_dsa_65_pubkey_b64,
+            disclosed_leaves,
+        )?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        let bucket = state
+            .wholeness_witnesses
+            .entry(stored.peer_id.clone())
+            .or_default();
+        // Idempotent on (peer_id, epoch_id, observed_at_unix_ms).
+        if !bucket.iter().any(|w| {
+            w.epoch_id == stored.epoch_id && w.observed_at_unix_ms == stored.observed_at_unix_ms
+        }) {
+            bucket.push(stored);
+        }
+        // Prune to the last-K by observed_at (newest kept).
+        bucket.sort_by_key(|w| w.observed_at_unix_ms);
+        if bucket.len() > crate::witness::WITNESS_CORPUS_K {
+            let drop_n = bucket.len() - crate::witness::WITNESS_CORPUS_K;
+            bucket.drain(0..drop_n);
+        }
+        Ok(())
+    }
+
+    async fn list_wholeness_witnesses_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<crate::witness::StoredWitness>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .wholeness_witnesses
+            .get(peer_id)
+            .cloned()
+            .unwrap_or_default();
+        // Newest first (parity with the SQL backends' ORDER BY DESC).
+        rows.sort_by_key(|w| std::cmp::Reverse(w.observed_at_unix_ms));
+        Ok(rows)
+    }
+
+    async fn last_witness_epoch_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<u64>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .wholeness_witnesses
+            .get(peer_id)
+            .and_then(|b| b.iter().map(|w| w.epoch_id).max()))
     }
 
     // ─── v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8.1) — location proofs.

@@ -20322,6 +20322,12 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         | crate::federation::Error::OperationalAuthority(_)
         | crate::federation::Error::PartnerRecordRollback { .. }
         | crate::federation::Error::SetSemanticsUnsorted(_) => PyValueError::new_err(kind),
+        // v8.2.0 (CEG 1.0-RC11 §19.1) — a WholenessWitness admission
+        // rejection (the §19.0 PQC-mandatory hard cut, a WW-2 namespace
+        // violation, a leaf/root mismatch, a malformed key/sig/version) is
+        // caller-side malformed-content / authorization failure;
+        // ValueError (4xx).
+        crate::federation::Error::WitnessAdmit(_) => PyValueError::new_err(kind),
         // Server-fault → RuntimeError (5xx).
         crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
     }

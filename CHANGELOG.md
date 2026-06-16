@@ -5,6 +5,39 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [8.2.0] — 2026-06-16
+
+### Changed — re-pin CIRISVerify v5.8.0 → v5.9.0 (§19 conformance-vector freeze proven)
+
+All six verify-crate pins flipped together (verify-core / crypto / keyring + the tpm/ios/android target tables) so the graph resolves to one `ciris_crypto`. v5.9.0 proves the §19.6 cross-impl conformance freeze green vs CIRISEdge v4.1.2 — the §19 holonomic verifiers (`verify_witness`, `compare_witnesses`, `compute_merkle_root`, `retention_decision`, `holding_claim_counts_toward_rarity`, `verify_bound_hybrid`) are frozen + cross-impl-proven, so persist wires the byte-exact gates this cut (no longer speculative).
+
+### Added — §19.1 WholenessWitness corpus + verify-before-persist gate + WW→quorum-merge subordination (CEG 1.0-RC11 §19; CIRISPersist#228 items 1–2 / #229 item 1)
+
+persist is the §19 **store + the WW-2 leaf-walk owner + the divergence→§10.1.6 router**. The holonomic verifiers themselves (Merkle construction, the PQC bound-hybrid gate, the equivocation classifier) are FROZEN in `ciris_verify_core::holonomic` (v5.9.0) — persist CALLS them and never re-rolls Merkle/preimage/signature logic.
+
+- **Schema (V085, both dialects, full parity):** `wholeness_witness_corpus(peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, leaf_count, witness_version, signature, signature_ml_dsa_65, pqc_key_id, admitted_at)` — PK `(peer_id, epoch_id, observed_at_unix_ms)`, index `wholeness_witness_corpus_peer_recency (peer_id, observed_at_unix_ms DESC)`. Stores the last-K (`WITNESS_CORPUS_K = 8`) VERIFIED witnesses per peer; the store prunes to K. `claim_namespaces` is JSONB on PG / JSON-as-TEXT on SQLite; the ML-DSA-65 half is `NOT NULL`-by-construction (a classical-only witness never reaches a row). **No `verified` column** (§19.0 F-5 — a verdict is recomputed at the gate, never read from the wire). **Zero TimescaleDB** (operator directive): plain `postgres:16` + sqlite, ordinary table + index.
+- **Verify-before-persist (N3 / RC8 / §10.1.5.1.1) — `FederationDirectory::put_wholeness_witness(...)`:** before any row is durable, calls `ciris_verify_core::holonomic::verify_witness` (the hybrid PQC gate over the §19.1 binary length-prefixed BE domain-separated preimage — NOT JCS — + the WW-2 namespace guard + the optional disclosed-leaf/root recompute). A witness missing/with an invalid ML-DSA-65 half is REJECTED at the gate (`Error::WitnessAdmit` → token `witness_admit_hybrid_required`, the #225-style hard-cut error shape) — **store-then-quarantine is non-conformant**, nothing is written on reject (verify-before-mutation, AV-9). On success the corpus is pruned to the last-K per peer; idempotent on the PK.
+- **WW-2 leaf filter (persist's responsibility) — `witness::build_local_witness(...)`:** persist owns "gather all CEG envelopes a peer holds" → it FILTERS OUT anonymous-tier AND `cohort_scope: self` rows (and any leaf whose namespace itself names self/anonymous) BEFORE computing the root, and `claim_namespaces` is drawn from the survivors so it provably never names anonymous/self. A naive sweep would re-attribute deniable/self-private content to a stable peer_id — this guard prevents it.
+- **WW→§10.1.6 quorum-merge subordination (the security-critical part) — `FederationDirectory::reconcile_peer_witnesses(...)` + `witness::classify_stored`:** over the VERIFIED corpus set, `compare_witnesses` →
+  - **Equivocation** → RETAIN + emit `hard_case:witness_equivocation` (reusing the #146 `record_hard_case` emitter, idempotent on a deterministic `event_id`), **NEVER reconcile** (N4, non-repudiable — the pair is not deleted/merged).
+  - **Divergent** → returns the directive `WitnessReconcileAction::TriggerQuorumMerge` (carries NO winner, NO root). The witness is a divergence DETECTOR that TRIGGERS the EXISTING V058 R1/Q1 quorum-merge for `revocation`/`partner_record`/`org_membership` (`QUORUM_MERGE_SUBJECT_KINDS`); the caller fulfils it by re-running `operational::resolve_monotonic_quorum` / the `revision` anti-rollback over the stored rows. The witness root **never enters that resolution** — there is NO "reconstitute from any fragment" path, so a revoked key cannot be resurrected. The witness MUST NOT decide the merge or replace `monotonic_quorum`/`revision`.
+  - **Consistent** → no action.
+- **Anti-rollback eclipse guard (N4) — `witness::accept_if_monotonic` + `FederationDirectory::last_witness_epoch_for_peer`:** before acting on a peer's witness as newer, the per-peer `epoch_id` must strictly advance the last accepted epoch; a stale/replayed epoch is rejected.
+
+### Added — §19.3 fountain retention-decision wiring (N5/N6; CIRISPersist#228 items 4–5)
+
+- **N5 — `Engine::evict_fountain_content_by_consent(...)` + `fountain::resolve_retention_action`:** resolves the subject's consent stance (`resolve_consent_state`), maps it onto the verify-core `ConsentState`, and drives `ciris_verify_core::holonomic::retention_decision(consent, is_rare)`. `ConsentState::Revoked` (→ `Withdrawn` → `RetentionDecision::EvictEligible`) routes to the v8.1.0 `evict_fountain_content_hard_delete` path (drops ALL symbols regardless of `retention_priority`/`is_rare` — revocation overrides rarity, already structurally guaranteed; now driven by the verify-core verdict). `RetainRare`/`RetainNonRare` → no eviction here. persist treats `retention_priority` / `is_rare` as opaque.
+- **N6 — `fountain::holding_claim_counts(possession_proven)`:** thin pass-through to `holding_claim_counts_toward_rarity` — an unverified/unchallenged holding claim MUST NOT lower another peer's retention priority (rarity is not a forgeable force-evict channel).
+
+### Tests
+
+`tests/wholeness_witness.rs` (both durable backends + memory): (a) valid hybrid witness admitted+stored; (b) classical-only → REJECTED, zero rows; (c) WW-2 self/anonymous leaves filtered out of the root, claim_namespaces excludes self/anonymous; (d) Equivocation → `hard_case:witness_equivocation` emitted + both witnesses retained (idempotent re-scan); (e) Divergent → `TriggerQuorumMerge` ONLY, then the EXISTING `resolve_monotonic_quorum` keeps the REVOKED record (a revoked key is NOT resurrected; the witness does not decide the merge); (f) anti-rollback rejects a stale/replayed epoch; (g) `retention_decision` Withdrawn → HardDelete routing (revocation overrides rarity) + N6 unverified-claim gate. Plus the module unit tests in `src/witness/` + `src/fountain/retention.rs`.
+
+### Excluded (NOT in this cut)
+
+- **`SignedRelayCapacity` / `verify_relay_capacity` (N8) and the recursive-bootstrap `SignedClaim` / `recursive_trust_bootstrap` gates** are EDGE topology-scoring / admission surfaces (CIRISEdge#144), **NOT persist ingest** — deliberately not wired here.
+- **The §19.7 inter-object aggregation pyramid** (RC12 noise-floor model) is a follow-on — **CIRISPersist#230**, not this cut.
+
 ## [8.1.0] — 2026-06-16
 
 ### Changed — re-pin CIRISVerify v5.7.0 → v5.8.0 (CEG 1.0-RC11 §19 holonomic substrate)

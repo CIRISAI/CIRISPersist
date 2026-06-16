@@ -118,6 +118,7 @@ pub mod tickets;
 pub mod verify;
 #[cfg(feature = "cirislens_wa_cert")]
 pub mod wa_cert;
+pub mod witness;
 
 /// v4.12.1 (CIRISPersist#189) — verify-style embedded version literal for
 /// the agent Trust-page / bundle-refresh integrity check.

@@ -3355,6 +3355,196 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_hard_case_event).collect()
     }
 
+    // ─── v8.2.0 (CEG 1.0-RC11 §19.1) — WholenessWitness corpus. ─────
+
+    async fn put_wholeness_witness(
+        &self,
+        witness: &ciris_verify_core::holonomic::WholenessWitness,
+        sig_ed25519_b64: &str,
+        sig_ml_dsa_65_b64: Option<&str>,
+        pqc_key_id: &str,
+        ed25519_pubkey_b64: &str,
+        ml_dsa_65_pubkey_b64: Option<&str>,
+        disclosed_leaves: Option<&[Vec<u8>]>,
+    ) -> Result<(), crate::federation::Error> {
+        // Verify-BEFORE-persist (N3 / RC8 / AV-9): full hybrid-PQC gate +
+        // WW-2 namespace guard + optional leaf/root recompute. On any
+        // failure NOTHING is written.
+        let stored = crate::witness::admit_witness(
+            witness,
+            sig_ed25519_b64,
+            sig_ml_dsa_65_b64,
+            pqc_key_id,
+            ed25519_pubkey_b64,
+            ml_dsa_65_pubkey_b64,
+            disclosed_leaves,
+        )?;
+        let claim_namespaces_json = serde_json::Value::Array(
+            stored
+                .claim_namespaces
+                .iter()
+                .map(|n| serde_json::Value::String(n.clone()))
+                .collect(),
+        );
+        let epoch_id = i64::try_from(stored.epoch_id).map_err(|_| {
+            crate::federation::Error::Backend("witness epoch_id exceeds i64".into())
+        })?;
+        let observed = i64::try_from(stored.observed_at_unix_ms).map_err(|_| {
+            crate::federation::Error::Backend("witness observed_at_unix_ms exceeds i64".into())
+        })?;
+        let leaf_count = i64::from(stored.leaf_count);
+        let witness_version = i32::from(stored.witness_version);
+        let k = crate::witness::WITNESS_CORPUS_K as i64;
+
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("begin witness tx: {e}")))?;
+        // Idempotent on (peer_id, epoch_id, observed_at_unix_ms).
+        tx.execute(
+            "INSERT INTO cirislens.wholeness_witness_corpus \
+             (peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, \
+              leaf_count, witness_version, signature, signature_ml_dsa_65, pqc_key_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+             ON CONFLICT (peer_id, epoch_id, observed_at_unix_ms) DO NOTHING",
+            &[
+                &stored.peer_id,
+                &epoch_id,
+                &observed,
+                &claim_namespaces_json,
+                &stored.merkle_root_hex,
+                &leaf_count,
+                &witness_version,
+                &stored.signature,
+                &stored.signature_ml_dsa_65,
+                &stored.pqc_key_id,
+            ],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("insert wholeness_witness_corpus: {e}"))
+        })?;
+        // Prune to the last-K by observed_at (keep newest).
+        tx.execute(
+            "DELETE FROM cirislens.wholeness_witness_corpus \
+             WHERE peer_id = $1 AND (epoch_id, observed_at_unix_ms) IN ( \
+               SELECT epoch_id, observed_at_unix_ms FROM ( \
+                 SELECT epoch_id, observed_at_unix_ms, ROW_NUMBER() OVER ( \
+                   ORDER BY observed_at_unix_ms DESC, epoch_id DESC) AS rn \
+                 FROM cirislens.wholeness_witness_corpus WHERE peer_id = $1 \
+               ) ranked WHERE ranked.rn > $2 )",
+            &[&stored.peer_id, &k],
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("prune wholeness_witness_corpus: {e}"))
+        })?;
+        tx.commit()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("commit witness tx: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_wholeness_witnesses_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<crate::witness::StoredWitness>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT peer_id, epoch_id, observed_at_unix_ms, claim_namespaces, merkle_root, \
+                    leaf_count, witness_version, signature, signature_ml_dsa_65, pqc_key_id \
+                 FROM cirislens.wholeness_witness_corpus WHERE peer_id = $1 \
+                 ORDER BY observed_at_unix_ms DESC, epoch_id DESC",
+                &[&peer_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_wholeness_witnesses_for_peer: {e}"))
+            })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let peer_id: String =
+                row.safe_get_with("peer_id", crate::federation::Error::Backend)?;
+            let epoch_id: i64 = row.safe_get_with("epoch_id", crate::federation::Error::Backend)?;
+            let observed: i64 =
+                row.safe_get_with("observed_at_unix_ms", crate::federation::Error::Backend)?;
+            let claim_namespaces_json: serde_json::Value =
+                row.safe_get_with("claim_namespaces", crate::federation::Error::Backend)?;
+            let claim_namespaces: Vec<String> = serde_json::from_value(claim_namespaces_json)
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("deserialize claim_namespaces: {e}"))
+                })?;
+            let merkle_root_hex: String =
+                row.safe_get_with("merkle_root", crate::federation::Error::Backend)?;
+            let leaf_count: i64 =
+                row.safe_get_with("leaf_count", crate::federation::Error::Backend)?;
+            let witness_version: i32 =
+                row.safe_get_with("witness_version", crate::federation::Error::Backend)?;
+            let signature: String =
+                row.safe_get_with("signature", crate::federation::Error::Backend)?;
+            let signature_ml_dsa_65: String =
+                row.safe_get_with("signature_ml_dsa_65", crate::federation::Error::Backend)?;
+            let pqc_key_id: String =
+                row.safe_get_with("pqc_key_id", crate::federation::Error::Backend)?;
+            out.push(crate::witness::StoredWitness {
+                peer_id,
+                epoch_id: u64::try_from(epoch_id).map_err(|_| {
+                    crate::federation::Error::Backend("witness epoch_id out of u64 range".into())
+                })?,
+                claim_namespaces,
+                merkle_root_hex,
+                leaf_count: u32::try_from(leaf_count).map_err(|_| {
+                    crate::federation::Error::Backend("witness leaf_count out of u32 range".into())
+                })?,
+                observed_at_unix_ms: u64::try_from(observed).map_err(|_| {
+                    crate::federation::Error::Backend("witness observed_at out of u64 range".into())
+                })?,
+                witness_version: u16::try_from(witness_version).map_err(|_| {
+                    crate::federation::Error::Backend("witness_version out of u16 range".into())
+                })?,
+                signature,
+                signature_ml_dsa_65,
+                pqc_key_id,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn last_witness_epoch_for_peer(
+        &self,
+        peer_id: &str,
+    ) -> Result<Option<u64>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row = client
+            .query_one(
+                "SELECT MAX(epoch_id) AS max_epoch FROM cirislens.wholeness_witness_corpus \
+                 WHERE peer_id = $1",
+                &[&peer_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("last_witness_epoch_for_peer: {e}"))
+            })?;
+        let max: Option<i64> = row.safe_get_with("max_epoch", crate::federation::Error::Backend)?;
+        max.map(|v| {
+            u64::try_from(v).map_err(|_| {
+                crate::federation::Error::Backend("witness epoch_id out of u64 range".into())
+            })
+        })
+        .transpose()
+    }
+
     async fn list_consent_revocations(
         &self,
         since: Option<chrono::DateTime<chrono::Utc>>,

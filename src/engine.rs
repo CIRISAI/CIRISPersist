@@ -1165,6 +1165,67 @@ impl Engine {
             .await
     }
 
+    /// v8.2.0 (CEG 1.0-RC11 §19.3 / CIRISPersist#228 items 4–5) — the
+    /// **consent-driven retention decision** (N5). Resolve the subject's
+    /// consent stance over the content (§8.1.11.1), run it through the
+    /// FROZEN verify-core
+    /// [`retention_decision`](ciris_verify_core::holonomic::retention_decision),
+    /// and route the verdict:
+    ///
+    /// - `ConsentState::Revoked` (→ `Withdrawn` → `EvictEligible`) →
+    ///   [`evict_fountain_content_hard_delete`](Self::evict_fountain_content_hard_delete)
+    ///   — drop ALL symbols regardless of `retention_priority` /
+    ///   `is_rare`. Revocation overrides rarity (the §8.1.11.3
+    ///   deletion-SLA always wins); this routing is structurally
+    ///   guaranteed by the separate hard-delete path. Returns the rows
+    ///   dropped.
+    /// - otherwise (RetainRare / RetainNonRare) → no eviction here
+    ///   (the content stays under the opaque tier ordering, which the
+    ///   disk-pressure / decay triggers drive). Returns `Ok(0)`.
+    ///
+    /// `target_key_id` / `subject_key_id` identify the consent record
+    /// (`resolve_consent_state`); `content_id` / `corpus_kind` identify
+    /// the fountain content; `is_rare` is the edge's opaque rarity signal
+    /// (passed through unmodified — persist does not interpret it beyond
+    /// the verdict). `now` resolves consent at a point in time.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn evict_fountain_content_by_consent(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+        target_key_id: &str,
+        subject_key_id: &str,
+        is_rare: bool,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, crate::store::Error> {
+        use crate::federation::FederationDirectory;
+        let consent = {
+            let r = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    b.resolve_consent_state(target_key_id, subject_key_id, now)
+                        .await
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    b.resolve_consent_state(target_key_id, subject_key_id, now)
+                        .await
+                }
+            };
+            r.map_err(|e| crate::store::Error::Backend(format!("resolve_consent_state: {e}")))?
+        };
+        // N5: the FROZEN verify-core verdict decides. Withdrawn/revoked →
+        // HardDelete regardless of rarity (revocation overrides rarity).
+        let action = crate::fountain::resolve_retention_action(consent, is_rare);
+        if action.is_hard_delete() {
+            self.evict_fountain_content_hard_delete(content_id, corpus_kind)
+                .await
+        } else {
+            Ok(0)
+        }
+    }
+
     /// v3.4.0 (CIRISPersist#123) — build, sign, and persist a
     /// `withdraws` attestation that retracts a prior `holds_bytes`
     /// emission. The canonical envelope is produced via
