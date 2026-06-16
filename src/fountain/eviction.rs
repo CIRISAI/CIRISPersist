@@ -16,6 +16,19 @@
 //!      FULL Consensual-Evolution stream scheduling integration (per-
 //!      content_id consent clock → tier) is an explicit documented
 //!      follow-on and is intentionally NOT built here.
+//!
+//! **Revocation overrides rarity (CEG 1.0-RC11 §19 / CIRISPersist#228
+//! N5).** A withdrawn / `consent:state:revoked` content_id is HardDelete
+//! — handled by a SEPARATE path
+//! ([`crate::store::Backend::evict_fountain_content_hard_delete`]) that
+//! drops every symbol unconditionally and **never consults
+//! `retention_priority`**. This is structural, not a comparison: the
+//! tier/keep-count path here is the ONLY consumer of `retention_priority`
+//! (and of any future swarm rarity reweight packed into its top bits), so
+//! a high rarity score cannot reach — let alone resurrect — a revoked
+//! content. The §8.1.11.3 deletion-SLA always wins. Rarity reweight, when
+//! it lands, reorders WHICH symbols survive within a non-revoked
+//! content's keep-count; it can never raise a revoked content's survival.
 
 use crate::federation::replication::disk_pressure::PressureTier;
 

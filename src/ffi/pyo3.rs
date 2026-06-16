@@ -7224,6 +7224,47 @@ impl PyEngine {
         })
     }
 
+    /// v8.1.0 (CEG 1.0-RC11 §19 / CIRISPersist#228 N5) — revocation
+    /// HardDelete: drop ALL symbols for a withdrawn / revoked content_id,
+    /// leaving the manifest as `EnvelopeOnly` provenance. Never consults
+    /// `retention_priority` — revocation overrides rarity (§8.1.11.3
+    /// deletion-SLA). Returns the symbol rows dropped.
+    fn evict_fountain_content_hard_delete(
+        &self,
+        py: Python<'_>,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> PyResult<u64> {
+        self.ensure_usable()?;
+        let content_id = content_id.to_owned();
+        let corpus_kind = corpus_kind.to_owned();
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .evict_fountain_content_hard_delete(&content_id, &corpus_kind)
+                            .await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .evict_fountain_content_hard_delete(&content_id, &corpus_kind)
+                            .await
+                    })
+                }
+            })
+            .map_err(fountain_store_err_to_py)
+        })
+    }
+
     /// v8.0.0 (CIRISPersist#227) — typed degraded read of a fountain
     /// content unit, JSON-over-FFI. Returns a JSON string:
     ///

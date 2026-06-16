@@ -5,6 +5,24 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [8.1.0] — 2026-06-16
+
+### Changed — re-pin CIRISVerify v5.7.0 → v5.8.0 (CEG 1.0-RC11 §19 holonomic substrate)
+
+CIRISVerify v5.8.0 ships the `ciris_verify_core::holonomic` module — the cross-impl verifiers for CEG 1.0-RC11 §19 (WholenessWitness, recursive bootstrap, fountain holding-claims, ALM relay-capacity) and §10.5.8 A/V chunks. All six verify-crate pins flipped together (verify-core / crypto / keyring + the tpm/ios/android target tables) so the graph resolves to one `ciris_crypto`. Additive — clean build + full gate. Adoption: CIRISPersist#229 (store/ingest §19 verifier gates) + #228 (RC11 §19 conformance).
+
+### Added — N5: revocation/consent overrides rarity (CEG 1.0-RC11 §19 / CIRISPersist#228)
+
+`Engine`/`Backend::evict_fountain_content_hard_delete(content_id, corpus_kind)` — the §8.1.11.3 deletion-SLA path for a withdrawn / `consent:state:revoked` content_id: drops **every** symbol row unconditionally, leaving the manifest as the always-retained `EnvelopeOnly` provenance. Returns the symbol rows dropped; unknown content ⇒ `Ok(0)`.
+
+- **The invariant (N5):** this is a SEPARATE path from `evict_fountain_content_to_tier` that **never consults `retention_priority`**. The tier/keep-count path is the only consumer of `retention_priority` (and of any future swarm rarity reweight packed into its top bits), so a high rarity score cannot reach — let alone resurrect — a revoked content. Revocation is a content-level dominating signal, not a value competing inside the priority byte. #228 flagged this as a latent bug in the v8.0.0 (#227) design, which wires both the disk-pressure and consent-decay triggers to the same priority ordering; the dominating mechanism + the precedence test land here, ahead of any rarity reweight.
+- **Test:** `tests/fountain_content.rs` assertion (i), both backends — a fresh content whose source symbols carry the keep-longest priority (what high rarity would set) is fully dropped by `hard_delete` → `EnvelopeOnly`; the manifest survives.
+- The trigger that calls this on revoke rides with the consent-decay scheduling follow-on; the mechanism + invariant are enforced now. FFI: `Engine.evict_fountain_content_hard_delete`, both backends.
+
+### Still gated (CEG RC11 §19 conformance, NOT in this cut)
+
+The §19 verifier *wiring* at the ingest gate (WholenessWitness corpus + WW→§10.1.6 quorum-merge subordination + holding-claim/relay-capacity/bootstrap gates, CIRISPersist#229/#228 items 1–2) signs a **binary length-prefixed BE domain-separated preimage (NOT JCS)** whose exact field sets are byte-frozen by **CIRISEdge#143** (`SignedClaim` owner-binding fields) + the **CIRISVerify#57** conformance vectors. The invariant *enforcement* is stable; the byte-exact gates are wired when the vectors freeze (no speculative byte-pinning).
+
 ## [8.0.0] — 2026-06-16
 
 ### Added — the fountain-coded content primitive (store-and-evict half): `FountainContentV1` (CIRISPersist#227)

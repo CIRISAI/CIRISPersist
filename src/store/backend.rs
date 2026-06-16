@@ -375,6 +375,30 @@ pub trait Backend: Send + Sync {
         tier: crate::fountain::FountainTier,
     ) -> impl Future<Output = Result<u64, Error>> + Send;
 
+    /// v8.1.0 (CEG 1.0-RC11 §19 / CIRISPersist#228 N5 — revocation
+    /// overrides rarity) — **HardDelete** every symbol row for
+    /// `(content_id, corpus_kind)` unconditionally, leaving the manifest
+    /// as the always-retained `EnvelopeOnly` provenance ("existed with
+    /// signature X"). Returns the number of symbol rows dropped.
+    ///
+    /// This is the §8.1.11.3 deletion-SLA path for a withdrawn /
+    /// `consent:state:revoked` content_id, and it is DELIBERATELY a
+    /// separate path from
+    /// [`evict_fountain_content_to_tier`](Self::evict_fountain_content_to_tier):
+    /// it never consults `retention_priority` (nor any future swarm
+    /// rarity reweight packed into that byte). Revocation is a
+    /// content-level dominating signal, NOT a value that competes inside
+    /// the priority ordering — so a high rarity score can never resurrect
+    /// a revoked content. The trigger that calls this on revoke rides
+    /// with the consent-decay scheduling follow-on; the dominating
+    /// mechanism + the precedence invariant live here now. Unknown
+    /// content ⇒ `Ok(0)` no-op.
+    fn evict_fountain_content_hard_delete(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> impl Future<Output = Result<u64, Error>> + Send;
+
     /// v8.0.0 (CIRISPersist#227) — typed degraded read. Counts present
     /// symbols and classifies vs the manifest thresholds:
     /// `present >= n_source` ⇒ `Full`; `[min_viable, n_source)` ⇒

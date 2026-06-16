@@ -1111,6 +1111,36 @@ impl Engine {
         }
     }
 
+    /// v8.1.0 (CEG 1.0-RC11 §19 / CIRISPersist#228 N5) — **revocation
+    /// HardDelete**: drop ALL symbols for a withdrawn /
+    /// `consent:state:revoked` content_id, leaving the manifest as
+    /// `EnvelopeOnly` provenance. A separate path from
+    /// [`evict_fountain_content_to_tier`](Self::evict_fountain_content_to_tier)
+    /// that never consults `retention_priority` — so rarity reweight can
+    /// never resurrect a revoked content (revocation overrides rarity;
+    /// the §8.1.11.3 deletion-SLA always wins). Returns the symbol rows
+    /// dropped.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn evict_fountain_content_hard_delete(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<u64, crate::store::Error> {
+        use crate::store::Backend;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                b.evict_fountain_content_hard_delete(content_id, corpus_kind)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                b.evict_fountain_content_hard_delete(content_id, corpus_kind)
+                    .await
+            }
+        }
+    }
+
     /// v8.0.0 (CIRISPersist#227) — the **DiskPressure trigger**: evict a
     /// content unit to the tier the Engine's CURRENT disk-pressure
     /// snapshot maps to (#149 `PressureTier` →

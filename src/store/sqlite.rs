@@ -1102,6 +1102,35 @@ impl Backend for SqliteBackend {
         Ok(evicted)
     }
 
+    async fn evict_fountain_content_hard_delete(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<u64, Error> {
+        // Manifest stays (EnvelopeOnly provenance); unknown content ⇒ no-op.
+        if self
+            .fountain_manifest_row(content_id, corpus_kind)
+            .await?
+            .is_none()
+        {
+            return Ok(0);
+        }
+        let content_id = content_id.to_owned();
+        let conn = self.conn.clone();
+        let dropped = (move || -> Result<u64, rusqlite::Error> {
+            let conn = conn.lock();
+            // Drop ALL symbols — never consults retention_priority (N5:
+            // revocation dominates rarity; the §8.1.11.3 deletion-SLA wins).
+            let n = conn.execute(
+                "DELETE FROM content_symbols WHERE content_id = ?1",
+                rusqlite::params![content_id],
+            )?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| Error::Backend(format!("evict_fountain_content_hard_delete: {e}")))?;
+        Ok(dropped)
+    }
+
     async fn get_fountain_content(
         &self,
         content_id: &str,

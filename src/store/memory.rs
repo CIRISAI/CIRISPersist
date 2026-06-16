@@ -746,6 +746,29 @@ impl Backend for MemoryBackend {
         Ok(evicted)
     }
 
+    async fn evict_fountain_content_hard_delete(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<u64, Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        // Manifest stays (EnvelopeOnly provenance); unknown content ⇒ no-op.
+        if !state
+            .fountain_manifests
+            .contains_key(&(content_id.to_owned(), corpus_kind.to_owned()))
+        {
+            return Ok(0);
+        }
+        // Drop ALL symbols — never consults retention_priority (N5:
+        // revocation dominates rarity; the §8.1.11.3 deletion-SLA wins).
+        let dropped = state
+            .fountain_symbols
+            .remove(content_id)
+            .map(|b| b.len() as u64)
+            .unwrap_or(0);
+        Ok(dropped)
+    }
+
     async fn get_fountain_content(
         &self,
         content_id: &str,

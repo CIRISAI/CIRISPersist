@@ -1541,6 +1541,32 @@ impl Backend for PostgresBackend {
         Ok(rows)
     }
 
+    async fn evict_fountain_content_hard_delete(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<u64, Error> {
+        // Manifest stays (EnvelopeOnly provenance); unknown content ⇒ no-op.
+        if self
+            .fountain_manifest_row(content_id, corpus_kind)
+            .await?
+            .is_none()
+        {
+            return Ok(0);
+        }
+        let client = self.get_client().await?;
+        // Drop ALL symbols — never consults retention_priority (N5:
+        // revocation overrides rarity; the §8.1.11.3 deletion-SLA wins).
+        let rows = client
+            .execute(
+                "DELETE FROM cirislens.content_symbols WHERE content_id = $1",
+                &[&content_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("hard_delete content_symbols: {e}")))?;
+        Ok(rows)
+    }
+
     async fn get_fountain_content(
         &self,
         content_id: &str,

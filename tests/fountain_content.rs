@@ -293,6 +293,51 @@ async fn run_fountain_assertions<B: Backend>(backend: &B, suffix: &str) {
         .await
         .unwrap()
         .is_some());
+
+    // (i) N5 (CEG 1.0-RC11 §19 / #228): revocation HardDelete overrides
+    //     rarity. A FRESH content whose source symbols carry the
+    //     keep-longest retention_priority (exactly what a high rarity
+    //     score would set to protect content) is still fully dropped by
+    //     the revocation path — `evict_fountain_content_hard_delete` never
+    //     consults retention_priority, so no rarity reweight can resurrect
+    //     a revoked content. The §8.1.11.3 deletion-SLA always wins.
+    let rcid = format!("c-revoke-{suffix}");
+    let (rman, rsyms) =
+        build_manifest_and_symbols(&rcid, n_source, k_repair, symbol_size, true).await;
+    backend
+        .put_fountain_content(&rman, &rsyms)
+        .await
+        .expect("(i) admit revocable content");
+    assert!(
+        matches!(
+            backend.get_fountain_content(&rcid, corpus).await.unwrap(),
+            Some(FountainContent::Full { .. })
+        ),
+        "(i) full before revoke"
+    );
+    let dropped = backend
+        .evict_fountain_content_hard_delete(&rcid, corpus)
+        .await
+        .expect("(i) hard delete");
+    assert_eq!(
+        dropped,
+        u64::from(total),
+        "(i) HardDelete drops ALL symbols regardless of retention_priority"
+    );
+    let revoked = backend
+        .get_fountain_content(&rcid, corpus)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(revoked, FountainContent::EnvelopeOnly { .. }),
+        "(i) revoked content → EnvelopeOnly regardless of priority/rarity, got {revoked:?}"
+    );
+    assert_eq!(
+        revoked.present(),
+        0,
+        "(i) zero symbols survive revocation HardDelete"
+    );
 }
 
 #[tokio::test]
