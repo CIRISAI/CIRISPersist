@@ -1,20 +1,20 @@
 //! §19.7 inter-object aggregation — the **forever-memory** storage half
-//! (CEG 1.0-RC12 §19.7 / CIRISPersist#230, v8.3.0).
+//! (CEG 1.0-RC14 §19.7 / CIRISPersist#230, v8.4.0).
 //!
 //! §19.7 reframes retirement as ONE pressure-driven monotonic fidelity
 //! descent toward a **noise floor** (the individual-recoverability
 //! boundary). Two mechanical degradation operators ride that one axis:
 //!
-//!   * **Operator 1 — intra-object fade** (already shipped, v8.0–8.2):
-//!     drop symbols by `retention_priority` down to a per-tier keep-count
+//!   * **Operator 1 — intra-object fade** (shipped v8.0–8.2): drop symbols
+//!     by `retention_priority` down to a per-tier keep-count
 //!     ([`super::eviction::FountainTier`]); the manifest survives.
-//!   * **Operator 2 — inter-object aggregation** (THIS cut, the substantive
-//!     §19.7 addition): N source items → 1 composite (codec-side tile /
-//!     downsample / statistical composite), recursed into a **mipmap
-//!     pyramid** → **O(log T)** forever-memory. Each source's contribution
-//!     sits BELOW the noise floor (individually unrecoverable), but the
-//!     collective **blur** (the composite) persists forever — **descent
-//!     never terminates at zero**.
+//!   * **Operator 2 — inter-object aggregation** (v8.3, gated v8.4): N
+//!     source items → 1 composite (codec-side tile / downsample /
+//!     statistical composite), recursed into a **mipmap pyramid** →
+//!     **O(log T)** forever-memory. Each source's contribution sits BELOW
+//!     the noise floor (individually unrecoverable), but the collective
+//!     **blur** (the composite) persists forever — **descent never
+//!     terminates at zero**.
 //!
 //! # persist is codec-free; this is the OPAQUE-bytes firewall
 //! The N→1 resampling compute is codec-side (edge — CIRISEdge#133/#134);
@@ -24,27 +24,46 @@
 //! it rides the EXISTING #225 hybrid-manifest admit gate
 //! ([`super::admit::check_admission_via_envelope`]) unchanged.
 //!
-//! **The §19.7 aggregation WIRE SHAPE is NOT yet frozen** (ratification is
-//! in parallel: CIRISRegistry §19.7 absorption extending #85, CIRISVerify
-//! §19.7 verifiers ~v5.10.0, an edge ratification issue). So persist
-//! stores the aggregation wire payload as **OPAQUE bytes**
-//! ([`AggregationMetaV1::aggregation_meta`]) plus only the few navigation
-//! scalars persist itself needs (level / fan-in / source corpus /
-//! commitment). persist NEVER parses `aggregation_meta`. This keeps the
-//! immutable V086 migration robust to whatever the §19.7 contract
-//! finalizes — the wire-churn firewall.
+//! # v8.4.0 — the §19.7 CONFORM step (closes the #230 residual)
+//! v8.3.0 stored `aggregation_meta` **opaque** because the §19.7 wire shape
+//! was not yet frozen. CEG RC14 / CIRISRegistry#89 froze §19.7.1/.1.1/.3 and
+//! CIRISVerify v5.10.0 ships the `holonomic::aggregation` verifiers. persist
+//! now CONSUMES them (the second-impl conformance role):
 //!
-//! # Freeze-gated follow-ons (NOT in this cut — see CHANGELOG / #230)
-//!   * Field-level / byte-exact verification of `aggregation_meta` and the
-//!     `member_commitment` Merkle root — lands with the §19.7 verifiers
-//!     (CIRISVerify v5.10.0). persist STORES the commitment + opaque meta;
-//!     it does NOT verify them here.
-//!   * Mapping persist's tiers + hard_delete onto a verify-exposed
-//!     `EjectionVerdict` — v5.9.0 exposes only `RetentionDecision`. Until
-//!     verify exposes it, persist uses its OWN internal [`EjectionVerdict`]
-//!     framing (below).
+//!   * **Store-path admission gate (§19.7.1, §10.1.5.1.1 PQC-mandatory).**
+//!     `put_aggregated_tier` parses the §19.7.1 wire fields persist receives
+//!     ALONGSIDE the opaque bytes ([`AggregationMetaVerifyInputsV1`]) into the
+//!     verify-core wire [`ciris_verify_core::holonomic::AggregationMetaV1`],
+//!     resolves the aggregator hybrid pubkeys off the composite manifest
+//!     envelope (the aggregator IS the composite's producer; same convention
+//!     as [`super::admit::check_admission_via_envelope`]), and calls
+//!     [`ciris_verify_core::holonomic::verify_aggregation_meta`]. A
+//!     missing/invalid ML-DSA-65 half is REJECTED **before** any write
+//!     (verify-before-mutation; never store-then-quarantine). The
+//!     `aggregation_meta` STORAGE column stays opaque BYTEA/BLOB — the V086
+//!     schema is unchanged. The verification inputs are admission-only; they
+//!     are NOT persisted.
+//!   * **Descent integrity (§19.7.1.1).** `descend_aggregated_sources`
+//!     re-derives the committed `member_commitment` from the caller-supplied
+//!     source member set via
+//!     [`ciris_verify_core::holonomic::verify_member_commitment`] BEFORE
+//!     descending — a forged member set cannot drive eviction. The descent
+//!     order is the canonical
+//!     [`ciris_verify_core::holonomic::descend_order`].
+//!   * **EjectionVerdict alignment (§19.7.3).** persist's internal verdict
+//!     enum is removed; persist re-exports and drives
+//!     [`ciris_verify_core::holonomic::ejection_verdict`] directly
+//!     (`Withdrawn → EjectHardDelete`, capacity pressure → `EjectToTier`,
+//!     else `Keep`). This is the canonical superset of the v8.2.0
+//!     `retention_decision` path (they agree: revocation → hard-delete).
 
 use serde::{Deserialize, Serialize};
+
+pub use ciris_verify_core::holonomic::aggregation::descend_order;
+pub use ciris_verify_core::holonomic::{
+    ejection_verdict, member_commitment, verify_aggregation_meta, verify_member_commitment,
+    AggregationMetaVerification, EjectionVerdict,
+};
 
 /// `corpus_kind` prefix for an aggregate composite: a composite folding
 /// `"trace"` sources has `corpus_kind = "aggregate:trace"`.
@@ -57,14 +76,151 @@ pub fn aggregate_corpus_kind(source_corpus_kind: &str) -> String {
     format!("{AGGREGATE_CORPUS_PREFIX}{source_corpus_kind}")
 }
 
+/// The §19.7.1 normative wire fields + the bound-hybrid signature persist
+/// receives ALONGSIDE the opaque `aggregation_meta` so it can run the
+/// PQC-mandatory store-path gate ([`verify_aggregation_meta`]) at admission.
+///
+/// These are **admission-only verification inputs** — persist does NOT
+/// persist them (the storage column [`AggregationMetaV1::aggregation_meta`]
+/// stays opaque BYTEA/BLOB; the V086 schema is unchanged). They reconstruct
+/// the verify-core wire [`ciris_verify_core::holonomic::AggregationMetaV1`]
+/// whose §19.7.1 canonical preimage the aggregator signed. The aggregator
+/// hybrid pubkeys are NOT carried here — they are resolved off the composite
+/// manifest envelope (`pubkey_ed25519` / `pubkey_ml_dsa_65`), bound into the
+/// verify so a forged pubkey fails the signature (the same argument
+/// [`super::admit::check_admission_via_envelope`] makes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggregationMetaVerifyInputsV1 {
+    /// §19.7.1 schema version (`1`).
+    pub version: u32,
+    /// The root content this pyramid is for (the §19.7.1 wire field; need
+    /// NOT equal persist's navigation `aggregate_content_id`).
+    pub content_id: String,
+    /// `"trace" | "blob" | "av_chunk" | …` (the §19.7.1 wire field).
+    pub corpus_kind: String,
+    /// §19.7.1 tier (`0` = source granularity; higher = more aggregated).
+    pub tier: u32,
+    /// Opaque codec id, e.g. `"raptorq-pyramid-v1"`.
+    pub aggregation_algorithm_id: String,
+    /// N members aggregated into this tier (the descent fan-in).
+    pub source_count: u32,
+    /// §19.7.1.1 Merkle root over the source member ids — base16 (hex) of the
+    /// raw 32 bytes. Mirrors the stored
+    /// [`AggregationMetaV1::member_commitment`] (which is the SAME hex value).
+    pub member_commitment_hex: String,
+    /// What survives below the floor (codec-specific, canonical).
+    pub noise_floor_descriptor: String,
+    /// Ed25519 signature over the §19.7.1 preimage — base64.
+    pub sig_ed25519_b64: String,
+    /// ML-DSA-65 signature over `preimage ‖ ed25519_sig` — base64. The
+    /// PQC-mandatory half: empty/absent ⇒ rejected at the gate.
+    pub sig_ml_dsa_65_b64: String,
+}
+
+impl AggregationMetaVerifyInputsV1 {
+    /// Reconstruct the verify-core wire shape whose §19.7.1 canonical
+    /// preimage the aggregator signed. Errors if `member_commitment_hex` is
+    /// not 32 bytes of hex (a malformed commitment).
+    pub fn to_verify_meta(
+        &self,
+    ) -> Result<ciris_verify_core::holonomic::AggregationMetaV1, AggregationMetaError> {
+        let mc = decode_member_commitment_hex(&self.member_commitment_hex)?;
+        Ok(ciris_verify_core::holonomic::AggregationMetaV1 {
+            version: self.version,
+            content_id: self.content_id.clone(),
+            corpus_kind: self.corpus_kind.clone(),
+            tier: self.tier,
+            aggregation_algorithm_id: self.aggregation_algorithm_id.clone(),
+            source_count: self.source_count,
+            member_commitment: mc,
+            noise_floor_descriptor: self.noise_floor_descriptor.clone(),
+        })
+    }
+}
+
+/// Why the §19.7.1 store-path admission gate rejected an aggregation meta.
+/// Stable `kind()` tokens for telemetry / PyO3 sanitization (mirrors the
+/// fountain-admit tokens). PQC-mandatory: a missing/invalid ML-DSA-65 half is
+/// `HybridRequired` and the tier is NEVER persisted.
+#[derive(Debug, thiserror::Error)]
+pub enum AggregationMetaError {
+    /// The §19.7.1 bound-hybrid signature failed to verify against the
+    /// aggregator pubkeys (a half mismatched, the ML-DSA-65 half was
+    /// missing/invalid, a malformed key/sig, or the meta did not match the
+    /// signed preimage). §10.1.5.1.1: rejected BEFORE persistence.
+    #[error("aggregation_meta §19.7.1 bound-hybrid verify failed (PQC-mandatory)")]
+    HybridRequired,
+    /// The composite manifest envelope did not carry the aggregator's
+    /// `pubkey_ed25519` / `pubkey_ml_dsa_65` needed to verify the meta.
+    #[error("aggregation_meta verify: composite manifest envelope missing aggregator {0}")]
+    MissingAggregatorPubkey(&'static str),
+    /// A base64 / base16 verification input failed to decode.
+    #[error("aggregation_meta verify: malformed verification input ({0})")]
+    MalformedInput(&'static str),
+    /// The stored navigation `member_commitment` did not equal the §19.7.1
+    /// wire `member_commitment` (the two MUST be the same root — else persist
+    /// would store a commitment the signature does not cover).
+    #[error("aggregation_meta verify: stored member_commitment != signed §19.7.1 commitment")]
+    MemberCommitmentMismatch,
+}
+
+impl AggregationMetaError {
+    /// Stable string-token for telemetry / structured logging.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::HybridRequired => "aggregation_meta_hybrid_required",
+            Self::MissingAggregatorPubkey(_) => "aggregation_meta_missing_pubkey",
+            Self::MalformedInput(_) => "aggregation_meta_invalid",
+            Self::MemberCommitmentMismatch => "aggregation_meta_member_commitment",
+        }
+    }
+}
+
+/// Decode a 32-byte member-commitment hex string into the raw root verify-core
+/// expects. Public so the engine's §19.7.1.1 descent-integrity gate can rebuild
+/// the verify-core meta from the stored navigation commitment.
+pub fn aggregation_member_commitment_from_hex(hex: &str) -> Result<[u8; 32], AggregationMetaError> {
+    decode_member_commitment_hex(hex)
+}
+
+/// Decode a 32-byte member-commitment hex string into the raw root verify-core
+/// expects.
+fn decode_member_commitment_hex(hex: &str) -> Result<[u8; 32], AggregationMetaError> {
+    let bytes = hex_decode(hex).ok_or(AggregationMetaError::MalformedInput(
+        "member_commitment_hex not hex",
+    ))?;
+    bytes
+        .try_into()
+        .map_err(|_| AggregationMetaError::MalformedInput("member_commitment_hex not 32 bytes"))
+}
+
+/// Minimal lowercase/uppercase hex decode (no extra dep — the codec-dep rule).
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let hi = (b[i] as char).to_digit(16)?;
+        let lo = (b[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
 /// The §19.7 aggregation provenance persist records for a composite — the
-/// few navigation scalars persist needs PLUS the opaque wire payload.
+/// few navigation scalars persist needs, the opaque wire payload, AND (v8.4.0)
+/// the §19.7.1 verification inputs that drive the store-path gate.
 ///
 /// One record per composite (keyed by the composite's
 /// [`aggregate_content_id`](Self::aggregate_content_id) =
-/// `FountainManifestV1::content_id`). persist STORES `member_commitment`
-/// and `aggregation_meta`; it does NOT verify them this cut (§19.7-freeze-
-/// gated — see the module docs).
+/// `FountainManifestV1::content_id`). persist STORES `member_commitment` +
+/// `aggregation_meta` (opaque); it VERIFIES the §19.7.1 bound-hybrid signature
+/// over [`verification`](Self::verification) at admission and never persists
+/// those inputs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregationMetaV1 {
     /// The composite's `FountainContentV1` content_id (PK; one aggregation
@@ -81,19 +237,98 @@ pub struct AggregationMetaV1 {
     pub fan_in: u64,
     /// Merkle root (hex) over the folded source content_ids — proves
     /// membership WITHOUT storing N ids and WITHOUT making any source
-    /// individually recoverable. persist STORES it; it does NOT verify it
-    /// this cut (§19.7-freeze-gated, CIRISVerify v5.10.0).
+    /// individually recoverable. STORED; equals the §19.7.1
+    /// [`AggregationMetaVerifyInputsV1::member_commitment_hex`] (checked at
+    /// admission).
     pub member_commitment: String,
-    /// **OPAQUE** §19.7 aggregation wire payload. persist NEVER parses
-    /// this — it is stored byte-for-byte (BYTEA on PG / BLOB on SQLite).
-    /// This is the wire-churn firewall: whatever the §19.7 contract
+    /// **OPAQUE** §19.7 aggregation wire payload. persist NEVER parses this —
+    /// it is stored byte-for-byte (BYTEA on PG / BLOB on SQLite). The
+    /// wire-churn firewall (V086 unchanged): whatever the §19.7 contract
     /// finalizes lives here without a migration change.
     #[serde(with = "crate::fountain::aggregation::meta_bytes_b64")]
     pub aggregation_meta: Vec<u8>,
+    /// v8.4.0 (§19.7.1) — the canonical wire fields + bound-hybrid signature
+    /// persist verifies at admission (PQC-mandatory store-path gate). NOT
+    /// persisted (the storage column stays opaque).
+    pub verification: AggregationMetaVerifyInputsV1,
 }
 
-/// The stored aggregation record (read shape) — [`AggregationMetaV1`] plus
-/// persist's `aggregated_at_unix_ms` stamp.
+impl AggregationMetaV1 {
+    /// Run the §19.7.1 PQC-mandatory store-path gate (§10.1.5.1.1):
+    ///
+    /// 1. the stored navigation `member_commitment` (hex) MUST equal the
+    ///    §19.7.1 wire commitment (else persist would store a root the
+    ///    signature does not cover);
+    /// 2. reconstruct the verify-core wire meta and verify its bound-hybrid
+    ///    signature over the §19.7.1 canonical preimage against the aggregator
+    ///    pubkeys (resolved off the composite manifest envelope). A
+    ///    missing/invalid ML-DSA-65 half is rejected.
+    ///
+    /// On `Ok(())` the meta is admissible and the caller may persist. On
+    /// `Err`, NOTHING is written (verify-before-mutation).
+    pub fn verify_for_admission(
+        &self,
+        manifest: &super::types::FountainManifestV1,
+    ) -> Result<(), AggregationMetaError> {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+
+        // (1) Stored navigation commitment MUST match the signed §19.7.1 one.
+        //     Compare case-insensitively (both are hex of the same 32 bytes).
+        if !self
+            .member_commitment
+            .eq_ignore_ascii_case(&self.verification.member_commitment_hex)
+        {
+            return Err(AggregationMetaError::MemberCommitmentMismatch);
+        }
+
+        // (2) Aggregator pubkeys ride the composite manifest envelope (the
+        //     aggregator IS the composite's producer). Bound into the verify —
+        //     a forged pubkey fails the signature.
+        let ed_pub_b64 = manifest
+            .envelope
+            .get("pubkey_ed25519")
+            .and_then(|v| v.as_str())
+            .ok_or(AggregationMetaError::MissingAggregatorPubkey(
+                "pubkey_ed25519",
+            ))?;
+        let mldsa_pub_b64 = manifest
+            .envelope
+            .get("pubkey_ml_dsa_65")
+            .and_then(|v| v.as_str())
+            // PQC-mandatory: absent PQC pubkey ⇒ cannot verify the mandatory
+            // half ⇒ reject (never accept classical-only).
+            .ok_or(AggregationMetaError::HybridRequired)?;
+
+        let ed_pub = BASE64
+            .decode(ed_pub_b64)
+            .map_err(|_| AggregationMetaError::MalformedInput("pubkey_ed25519 base64"))?;
+        let mldsa_pub = BASE64
+            .decode(mldsa_pub_b64)
+            .map_err(|_| AggregationMetaError::MalformedInput("pubkey_ml_dsa_65 base64"))?;
+        let sig_ed = BASE64
+            .decode(&self.verification.sig_ed25519_b64)
+            .map_err(|_| AggregationMetaError::MalformedInput("sig_ed25519 base64"))?;
+        // An empty PQC sig is the hard-cut classical-only signal — reject
+        // before even decoding (mirrors the #225 fountain hard cut).
+        if self.verification.sig_ml_dsa_65_b64.is_empty() {
+            return Err(AggregationMetaError::HybridRequired);
+        }
+        let sig_mldsa = BASE64
+            .decode(&self.verification.sig_ml_dsa_65_b64)
+            .map_err(|_| AggregationMetaError::MalformedInput("sig_ml_dsa_65 base64"))?;
+
+        let verify_meta = self.verification.to_verify_meta()?;
+        match verify_aggregation_meta(&verify_meta, &sig_ed, &sig_mldsa, &ed_pub, &mldsa_pub) {
+            AggregationMetaVerification::HybridVerified => Ok(()),
+            AggregationMetaVerification::Failed => Err(AggregationMetaError::HybridRequired),
+        }
+    }
+}
+
+/// The stored aggregation record (read shape) — the persisted columns plus
+/// persist's `aggregated_at_unix_ms` stamp. NOTE: the §19.7.1 verification
+/// inputs are admission-only and are NOT part of the stored record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregationRecordV1 {
     /// See [`AggregationMetaV1::aggregate_content_id`].
@@ -139,58 +374,140 @@ pub(crate) mod meta_bytes_b64 {
     }
 }
 
-/// §19.7 noise-floor framing (persist-INTERNAL until CIRISVerify exposes
-/// its own `EjectionVerdict`; v5.9.0 exposes only `RetentionDecision`).
-///
-/// §19.7 unifies persist's discrete eviction tiers + hard_delete as STOPS
-/// on the ONE pressure-driven descent axis toward the noise floor (the
-/// individual-recoverability boundary). This enum names the verdict shape
-/// §19.3/§19.7 describe so persist's descent orchestration can speak it
-/// internally; when verify exposes the canonical type, persist maps onto
-/// it (the residual tracked in #230). It does NOT depend on a verify
-/// `EjectionVerdict` — there is none in v5.9.0.
+/// v8.4.0 (§19.7.3) — route verify-core's [`EjectionVerdict`] onto a persist
+/// eviction action. The verdict (driven by
+/// [`ejection_verdict`]`(consent, under_capacity_pressure)`) is canonical;
+/// for [`EjectionVerdict::EjectToTier`] persist supplies the concrete target
+/// [`FountainTier`](super::eviction::FountainTier) (the verify-core verdict is
+/// tier-agnostic — WHICH tier is persist's storage decision).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EjectionVerdict {
-    /// Above the floor / no pressure — retain at the current fidelity.
+pub enum EjectionAction {
+    /// Above the floor / no pressure — retain at current fidelity (no-op).
     Keep,
-    /// A downward step on the descent axis — degrade to a tighter tier
-    /// (operator-1 intra-object fade) via
-    /// [`super::eviction::FountainTier`].
+    /// One downward step — degrade to the target tier (operator-1 fade) via
+    /// [`crate::store::Backend::evict_fountain_content_to_tier`].
     EjectToTier(super::eviction::FountainTier),
-    /// Forced below the floor — drop every still-recoverable symbol
-    /// (`evict_fountain_content_hard_delete`). The manifest survives as
-    /// `EnvelopeOnly` provenance; the collective gist (any composite this
-    /// source folded into) is untouched — descent never terminates at zero.
+    /// Forced below the floor — drop every still-recoverable symbol via
+    /// [`crate::store::Backend::evict_fountain_content_hard_delete`]. The
+    /// manifest survives as `EnvelopeOnly`; any composite this source folded
+    /// into is untouched (descent never terminates at zero).
     EjectHardDelete,
 }
 
-impl EjectionVerdict {
+impl EjectionAction {
     /// Stable string-token (telemetry / logs).
     pub fn label(&self) -> &'static str {
         match self {
-            EjectionVerdict::Keep => "keep",
-            EjectionVerdict::EjectToTier(_) => "eject_to_tier",
-            EjectionVerdict::EjectHardDelete => "eject_hard_delete",
+            EjectionAction::Keep => "keep",
+            EjectionAction::EjectToTier(_) => "eject_to_tier",
+            EjectionAction::EjectHardDelete => "eject_hard_delete",
         }
     }
 
-    /// Map a descent target onto the verdict. The §19.7 descent
-    /// orchestration uses this to pick the operator for one downward step:
-    /// `None` ⇒ forced below the floor (`EjectHardDelete`); `Some(tier)` ⇒
-    /// step to that tier (`EjectToTier`); `Full` is the no-pressure
-    /// `Keep`-equivalent (full fidelity retained, nothing dropped).
-    pub fn for_target_tier(tier: Option<super::eviction::FountainTier>) -> EjectionVerdict {
-        match tier {
-            None => EjectionVerdict::EjectHardDelete,
-            Some(super::eviction::FountainTier::Full) => EjectionVerdict::Keep,
-            Some(t) => EjectionVerdict::EjectToTier(t),
+    /// Resolve the persist action from the canonical §19.7.3
+    /// [`ejection_verdict`] plus the persist-side target tier used when the
+    /// verdict is a tier-shed. A `Keep`/`EjectHardDelete` verdict ignores
+    /// `target_tier`; `EjectToTier` with `target_tier = None` (or `Full`) is a
+    /// no-op `Keep` (nothing dropped — full fidelity retained).
+    #[must_use]
+    pub fn from_verdict(
+        verdict: EjectionVerdict,
+        target_tier: Option<super::eviction::FountainTier>,
+    ) -> EjectionAction {
+        match verdict {
+            EjectionVerdict::Keep => EjectionAction::Keep,
+            EjectionVerdict::EjectHardDelete => EjectionAction::EjectHardDelete,
+            EjectionVerdict::EjectToTier => match target_tier {
+                None | Some(super::eviction::FountainTier::Full) => EjectionAction::Keep,
+                Some(t) => EjectionAction::EjectToTier(t),
+            },
         }
     }
+}
+
+/// v8.4.0 (CEG 1.0-RC14 §19.7 / CIRISPersist#230) — §19.7 descent
+/// orchestration over a backend, gated on the §19.7.1.1 descent-integrity
+/// check and driven by the canonical §19.7.3 verdict. The single shared
+/// implementation the engine dispatch and the FFI dispatch both call (so the
+/// gate is byte-identical across PG / SQLite).
+///
+/// 1. **§19.7.1.1 descent integrity.** Load the stored aggregation record for
+///    `aggregate_content_id`; the caller-supplied source content_ids MUST
+///    re-derive its committed `member_commitment`
+///    ([`verify_member_commitment`]) — a forged member set is REJECTED
+///    ([`AggregationMetaError::MemberCommitmentMismatch`]) and cannot drive
+///    eviction. Sources descend in the canonical [`descend_order`].
+/// 2. **§19.7.3 verdict.** Per-source step = [`ejection_verdict`]`(consent,
+///    under_capacity_pressure)` mapped onto a persist [`EjectionAction`]
+///    (`EjectToTier` uses `target_tier`). The composite (collective blur) is
+///    NEVER touched — descent never terminates at zero. Returns total symbol
+///    rows evicted.
+pub async fn descend_aggregated_sources_on_backend<B: crate::store::Backend>(
+    backend: &B,
+    aggregate_content_id: &str,
+    sources: &[(String, String)],
+    consent: ciris_verify_core::holonomic::ConsentState,
+    under_capacity_pressure: bool,
+    target_tier: Option<super::eviction::FountainTier>,
+) -> Result<u64, crate::store::Error> {
+    let record = backend
+        .get_aggregation(aggregate_content_id)
+        .await?
+        .ok_or_else(|| {
+            crate::store::Error::Backend(format!(
+                "descend: no aggregation record for {aggregate_content_id}"
+            ))
+        })?;
+    let member_ids: Vec<String> = sources.iter().map(|(id, _)| id.clone()).collect();
+    let verify_meta = ciris_verify_core::holonomic::AggregationMetaV1 {
+        version: 1,
+        content_id: aggregate_content_id.to_owned(),
+        corpus_kind: record.source_corpus_kind.clone(),
+        tier: 0,
+        aggregation_algorithm_id: String::new(),
+        source_count: member_ids.len() as u32,
+        member_commitment: aggregation_member_commitment_from_hex(&record.member_commitment)
+            .map_err(crate::store::Error::AggregationMetaRejected)?,
+        noise_floor_descriptor: String::new(),
+    };
+    if !verify_member_commitment(&verify_meta, &member_ids) {
+        return Err(crate::store::Error::AggregationMetaRejected(
+            AggregationMetaError::MemberCommitmentMismatch,
+        ));
+    }
+
+    let verdict = ejection_verdict(consent, under_capacity_pressure);
+    let action = EjectionAction::from_verdict(verdict, target_tier);
+    let ordered = descend_order(&member_ids);
+    let corpus_of: std::collections::HashMap<&str, &str> = sources
+        .iter()
+        .map(|(id, corpus)| (id.as_str(), corpus.as_str()))
+        .collect();
+
+    let mut total = 0u64;
+    for content_id in &ordered {
+        let corpus_kind = corpus_of[content_id.as_str()];
+        total += match action {
+            EjectionAction::Keep => 0,
+            EjectionAction::EjectToTier(tier) => {
+                backend
+                    .evict_fountain_content_to_tier(content_id, corpus_kind, tier)
+                    .await?
+            }
+            EjectionAction::EjectHardDelete => {
+                backend
+                    .evict_fountain_content_hard_delete(content_id, corpus_kind)
+                    .await?
+            }
+        };
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ciris_verify_core::holonomic::ConsentState;
 
     #[test]
     fn aggregate_corpus_kind_prefixes_and_nests() {
@@ -202,41 +519,46 @@ mod tests {
     }
 
     #[test]
-    fn opaque_meta_roundtrips_non_utf8_via_b64() {
-        // Arbitrary non-JSON / non-UTF-8 bytes — persist never parses it.
-        let raw = vec![0x00u8, 0xFF, 0x01, 0xFE, 0x80, 0x7F];
-        let m = AggregationMetaV1 {
-            aggregate_content_id: "agg-1".into(),
-            source_corpus_kind: "trace".into(),
-            aggregation_level: 1,
-            fan_in: 3,
-            member_commitment: "deadbeef".into(),
-            aggregation_meta: raw.clone(),
-        };
-        let json = serde_json::to_string(&m).unwrap();
-        let back: AggregationMetaV1 = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.aggregation_meta, raw, "opaque bytes round-trip exact");
-        assert_eq!(back, m);
+    fn hex_decode_round_trips_and_rejects_bad() {
+        assert_eq!(hex_decode("00ff7f"), Some(vec![0x00, 0xff, 0x7f]));
+        assert_eq!(hex_decode("AABB"), Some(vec![0xaa, 0xbb]));
+        assert_eq!(hex_decode("0"), None, "odd length");
+        assert_eq!(hex_decode("zz"), None, "non-hex");
     }
 
     #[test]
-    fn ejection_verdict_target_mapping() {
+    fn ejection_action_maps_verdict_plus_tier() {
         use super::super::eviction::FountainTier;
+        // §19.7.3: revoked → hard delete regardless of target tier.
         assert_eq!(
-            EjectionVerdict::for_target_tier(None),
-            EjectionVerdict::EjectHardDelete
+            EjectionAction::from_verdict(
+                ejection_verdict(ConsentState::Withdrawn, true),
+                Some(FountainTier::T3)
+            ),
+            EjectionAction::EjectHardDelete
+        );
+        // Capacity pressure on a live item → tier-shed to the persist target.
+        assert_eq!(
+            EjectionAction::from_verdict(
+                ejection_verdict(ConsentState::Active, true),
+                Some(FountainTier::T3)
+            ),
+            EjectionAction::EjectToTier(FountainTier::T3)
+        );
+        // No pressure → keep.
+        assert_eq!(
+            EjectionAction::from_verdict(ejection_verdict(ConsentState::Active, false), None),
+            EjectionAction::Keep
+        );
+        // Tier-shed with a None/Full target degrades to a no-op Keep.
+        assert_eq!(
+            EjectionAction::from_verdict(EjectionVerdict::EjectToTier, None),
+            EjectionAction::Keep
         );
         assert_eq!(
-            EjectionVerdict::for_target_tier(Some(FountainTier::Full)),
-            EjectionVerdict::Keep
+            EjectionAction::from_verdict(EjectionVerdict::EjectToTier, Some(FountainTier::Full)),
+            EjectionAction::Keep
         );
-        assert_eq!(
-            EjectionVerdict::for_target_tier(Some(FountainTier::T3)),
-            EjectionVerdict::EjectToTier(FountainTier::T3)
-        );
-        assert_eq!(
-            EjectionVerdict::EjectHardDelete.label(),
-            "eject_hard_delete"
-        );
+        assert_eq!(EjectionAction::EjectHardDelete.label(), "eject_hard_delete");
     }
 }

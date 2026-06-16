@@ -78,6 +78,16 @@ pub enum Error {
     #[error("fountain integrity: {0}")]
     FountainIntegrity(String),
 
+    /// v8.4.0 (§19.7.1 / CIRISPersist#230) — an aggregation tier's
+    /// `aggregation_meta` failed the PQC-mandatory store-path gate
+    /// (§10.1.5.1.1): the §19.7.1 bound-hybrid signature did not verify, the
+    /// ML-DSA-65 half was missing/invalid, the aggregator pubkeys were absent,
+    /// or the stored commitment did not match the signed one. Carries the
+    /// [`crate::fountain::AggregationMetaError`] (its `kind()` is preserved via
+    /// [`Error::kind`]). Verify-before-mutation: NOTHING was written.
+    #[error("aggregation meta rejected: {0}")]
+    AggregationMetaRejected(#[from] crate::fountain::AggregationMetaError),
+
     /// Migration phase error. v0.1.5: the `sqlstate` is extracted from
     /// the underlying tokio-postgres error chain when available so
     /// lens-side callers can distinguish 40P01 (deadlock detected),
@@ -116,6 +126,7 @@ impl Error {
             Error::Migration { .. } => "store_migration",
             Error::FountainAdmit(e) => e.kind(),
             Error::FountainIntegrity(_) => "fountain_integrity",
+            Error::AggregationMetaRejected(e) => e.kind(),
         }
     }
 }

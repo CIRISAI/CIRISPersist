@@ -1298,51 +1298,70 @@ impl Engine {
         }
     }
 
-    /// v8.3.0 (CEG 1.0-RC12 §19.7 / CIRISPersist#230) — **descent
-    /// orchestration** for a completed fold. After N sources fold into a
-    /// level-`L` composite, each source's gist now lives BELOW the noise
-    /// floor (its detail is in the composite). This composes the EXISTING
-    /// eviction primitives to descend the `sources`:
+    /// v8.4.0 (CEG 1.0-RC14 §19.7 / CIRISPersist#230) — **descent
+    /// orchestration** for a completed fold, gated on §19.7.1.1 descent
+    /// integrity. After N sources fold into the `aggregate_content_id`
+    /// composite, each source's gist lives BELOW the noise floor (its detail
+    /// is now in the composite). The descent is driven by the canonical
+    /// §19.7.3 verdict and the §19.7.1.1 member-commitment gate:
     ///
-    /// - `target_tier = Some(tier)` ⇒ each source is degraded to that tier
-    ///   ([`Self::evict_fountain_content_to_tier`]); its manifest survives.
-    /// - `target_tier = None` ⇒ the floor: each source is hard-deleted
-    ///   ([`Self::evict_fountain_content_hard_delete`]); its manifest
-    ///   survives as `EnvelopeOnly` ("existed; folded into the aggregate").
+    /// 1. **Descent-integrity gate (§19.7.1.1).** Load the stored aggregation
+    ///    record for `aggregate_content_id` and call
+    ///    [`verify_member_commitment`](crate::fountain::verify_member_commitment)
+    ///    over the caller-supplied source content_ids: the provided source set
+    ///    MUST re-derive the committed `member_commitment` byte-for-byte. A
+    ///    forged member set (one that does not match the commitment) is
+    ///    REJECTED — it cannot drive eviction. Sources are then descended in
+    ///    the canonical
+    ///    [`descend_order`](crate::fountain::descend_order).
+    /// 2. **Verdict (§19.7.3).** The per-source step is the canonical
+    ///    [`ejection_verdict`](crate::fountain::ejection_verdict)`(consent,
+    ///    under_capacity_pressure)`: `Withdrawn → EjectHardDelete` (the §19.3
+    ///    N5 fastest descent, never tier-shed), capacity pressure →
+    ///    `EjectToTier` (degrade to `target_tier`), else `Keep` (no-op). For a
+    ///    tier-shed, `target_tier = None`/`Full` is a no-op `Keep`.
     ///
-    /// The §19.7 noise-floor framing: each step is an
-    /// [`EjectionVerdict`](crate::fountain::EjectionVerdict) on the ONE
-    /// descent axis (aging < scheduled < eviction < revocation pressure
-    /// ladder). The composite (the collective blur) is NEVER touched by
-    /// this — **descent does not terminate at zero**; the blur persists
-    /// forever. Returns the total symbol rows evicted across all sources.
-    ///
-    /// Field-level verification of the fold's `aggregation_meta` /
-    /// `member_commitment` is a §19.7-freeze-gated follow-on (CIRISVerify
-    /// v5.10.0); this orchestration is the ungated storage descent.
+    /// The composite (the collective blur) is NEVER touched — **descent does
+    /// not terminate at zero**. Returns total symbol rows evicted across all
+    /// sources. Reconciles with the v8.2.0
+    /// [`evict_fountain_content_by_consent`](Self::evict_fountain_content_by_consent)
+    /// path: both route a revoked subject to the hard-delete primitive (no
+    /// double logic — the verdict decides).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn descend_aggregated_sources(
         &self,
+        aggregate_content_id: &str,
         sources: &[(String, String)],
+        consent: ciris_verify_core::holonomic::ConsentState,
+        under_capacity_pressure: bool,
         target_tier: Option<crate::fountain::FountainTier>,
     ) -> Result<u64, crate::store::Error> {
-        let verdict = crate::fountain::EjectionVerdict::for_target_tier(target_tier);
-        let mut total = 0u64;
-        for (content_id, corpus_kind) in sources {
-            total += match verdict {
-                // Keep (Full / no pressure): nothing to evict.
-                crate::fountain::EjectionVerdict::Keep => 0,
-                crate::fountain::EjectionVerdict::EjectToTier(tier) => {
-                    self.evict_fountain_content_to_tier(content_id, corpus_kind, tier)
-                        .await?
-                }
-                crate::fountain::EjectionVerdict::EjectHardDelete => {
-                    self.evict_fountain_content_hard_delete(content_id, corpus_kind)
-                        .await?
-                }
-            };
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::fountain::descend_aggregated_sources_on_backend(
+                    b.as_ref(),
+                    aggregate_content_id,
+                    sources,
+                    consent,
+                    under_capacity_pressure,
+                    target_tier,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::fountain::descend_aggregated_sources_on_backend(
+                    b.as_ref(),
+                    aggregate_content_id,
+                    sources,
+                    consent,
+                    under_capacity_pressure,
+                    target_tier,
+                )
+                .await
+            }
         }
-        Ok(total)
     }
 
     /// v3.4.0 (CIRISPersist#123) — build, sign, and persist a

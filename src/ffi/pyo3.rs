@@ -7472,23 +7472,51 @@ impl PyEngine {
             .map_err(|e| PyRuntimeError::new_err(format!("encode aggregation records: {e}")))
     }
 
-    /// v8.3.0 (CEG 1.0-RC12 §19.7 / CIRISPersist#230) — descent
-    /// orchestration for a completed fold, JSON-over-FFI. `sources_json`
-    /// decodes to a list of `[content_id, corpus_kind]` pairs; `target_tier`
-    /// is one of `"full" | "t2" | "t3" | "t4" | "t5"` (degrade each source
-    /// to that tier) or `null` (the floor — hard-delete each source). Each
-    /// source descends while its manifest survives (`EnvelopeOnly` at the
-    /// floor); the composite is NEVER touched — descent never terminates at
+    /// v8.4.0 (CEG 1.0-RC14 §19.7 / CIRISPersist#230) — descent
+    /// orchestration for a completed fold, JSON-over-FFI, gated on §19.7.1.1
+    /// descent integrity and driven by the §19.7.3 verdict.
+    ///
+    /// `aggregate_content_id` is the composite the sources folded into (its
+    /// stored `member_commitment` is the gate). `sources_json` decodes to a
+    /// list of `[content_id, corpus_kind]` pairs; the source content_ids MUST
+    /// re-derive the stored commitment or the descent is REJECTED
+    /// (`aggregation_meta_member_commitment`). `consent` is one of
+    /// `"active" | "withdrawn" | "unknown"` and `under_capacity_pressure` is
+    /// the §19.7.3 pressure flag — together they pick the canonical verdict
+    /// (`withdrawn → hard-delete`, pressure → tier-shed, else keep).
+    /// `target_tier` (`"full" | "t2".."t5"` or `null`) is the tier used on a
+    /// tier-shed. The composite is NEVER touched — descent never terminates at
     /// zero. Returns the total symbol rows evicted.
+    #[pyo3(signature = (
+        aggregate_content_id,
+        sources_json,
+        consent,
+        under_capacity_pressure,
+        target_tier=None,
+    ))]
     fn descend_aggregated_sources(
         &self,
         py: Python<'_>,
+        aggregate_content_id: &str,
         sources_json: &str,
+        consent: &str,
+        under_capacity_pressure: bool,
         target_tier: Option<&str>,
     ) -> PyResult<u64> {
         self.ensure_usable()?;
+        let aggregate_content_id = aggregate_content_id.to_owned();
         let sources: Vec<(String, String)> = serde_json::from_str(sources_json)
             .map_err(|e| PyValueError::new_err(format!("decode sources_json: {e}")))?;
+        let consent_state = match consent {
+            "active" => ciris_verify_core::holonomic::ConsentState::Active,
+            "withdrawn" => ciris_verify_core::holonomic::ConsentState::Withdrawn,
+            "unknown" => ciris_verify_core::holonomic::ConsentState::Unknown,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown consent {other:?} — one of active|withdrawn|unknown"
+                )))
+            }
+        };
         let tier = match target_tier {
             None => None,
             Some("full") => Some(crate::fountain::FountainTier::Full),
@@ -7507,14 +7535,32 @@ impl PyEngine {
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
-                    runtime
-                        .block_on(async move { descend_sources(&*backend, &sources, tier).await })
+                    runtime.block_on(async move {
+                        descend_sources(
+                            &*backend,
+                            &aggregate_content_id,
+                            &sources,
+                            consent_state,
+                            under_capacity_pressure,
+                            tier,
+                        )
+                        .await
+                    })
                 }
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(sq) => {
                     let backend = sq.clone();
-                    runtime
-                        .block_on(async move { descend_sources(&*backend, &sources, tier).await })
+                    runtime.block_on(async move {
+                        descend_sources(
+                            &*backend,
+                            &aggregate_content_id,
+                            &sources,
+                            consent_state,
+                            under_capacity_pressure,
+                            tier,
+                        )
+                        .await
+                    })
                 }
             })
             .map_err(fountain_store_err_to_py)
@@ -20012,46 +20058,17 @@ fn fountain_store_err_to_py(e: crate::store::Error) -> PyErr {
     use crate::store::Error;
     tracing::warn!(error = %e, kind = e.kind(), "fountain store error");
     match e {
-        Error::FountainAdmit(_) | Error::FountainIntegrity(_) | Error::Schema(_) => {
-            PyValueError::new_err(e.kind())
-        }
+        Error::FountainAdmit(_)
+        | Error::FountainIntegrity(_)
+        | Error::AggregationMetaRejected(_)
+        | Error::Schema(_) => PyValueError::new_err(e.kind()),
         Error::NotImplemented(_) | Error::Backend(_) | Error::Migration { .. } => {
             PyRuntimeError::new_err(format!("{e}"))
         }
     }
 }
 
-/// v8.3.0 (CEG 1.0-RC12 §19.7 / CIRISPersist#230) — §19.7 descent
-/// orchestration over a generic backend: degrade each source to
-/// `target_tier` (or hard-delete at the floor when `None`). Composes the
-/// EXISTING eviction primitives; the composite (collective blur) is never
-/// touched — descent never terminates at zero. Returns total symbols
-/// evicted. Free helper so the FFI dispatch (which holds a backend, not an
-/// `Engine`) can call the same logic both backends share.
-async fn descend_sources<B: crate::store::Backend>(
-    backend: &B,
-    sources: &[(String, String)],
-    target_tier: Option<crate::fountain::FountainTier>,
-) -> Result<u64, crate::store::Error> {
-    let verdict = crate::fountain::EjectionVerdict::for_target_tier(target_tier);
-    let mut total = 0u64;
-    for (content_id, corpus_kind) in sources {
-        total += match verdict {
-            crate::fountain::EjectionVerdict::Keep => 0,
-            crate::fountain::EjectionVerdict::EjectToTier(tier) => {
-                backend
-                    .evict_fountain_content_to_tier(content_id, corpus_kind, tier)
-                    .await?
-            }
-            crate::fountain::EjectionVerdict::EjectHardDelete => {
-                backend
-                    .evict_fountain_content_hard_delete(content_id, corpus_kind)
-                    .await?
-            }
-        };
-    }
-    Ok(total)
-}
+use crate::fountain::descend_aggregated_sources_on_backend as descend_sources;
 
 /// v1.5.0 Phase I — Bridge [`crate::federation::backfill::BackfillError`]
 /// → `PyErr` at the FFI boundary. Emit-side failures route through

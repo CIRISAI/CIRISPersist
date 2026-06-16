@@ -25,11 +25,73 @@ use ciris_keyring::{MlDsa65SoftwareSigner, PqcSigner};
 use ed25519_dalek::{Signer as _, SigningKey};
 
 use ciris_persist::fountain::{
-    aggregate_corpus_kind, symbol_sha256_hex, AggregationMetaV1, FountainContent,
-    FountainManifestV1, FountainSymbolV1, MANIFEST_VERSION_V1,
+    aggregate_corpus_kind, member_commitment, symbol_sha256_hex, AggregationMetaV1,
+    AggregationMetaVerifyInputsV1, FountainContent, FountainManifestV1, FountainSymbolV1,
+    MANIFEST_VERSION_V1,
 };
 use ciris_persist::store::{Backend, Error as StoreError};
 use ciris_persist::verify::PythonJsonDumpsCanonicalizer;
+use ciris_verify_core::holonomic::{ConsentState, EjectionVerdict};
+
+/// Build the §19.7.1 verification inputs (the wire fields + a valid
+/// bound-hybrid signature) for an aggregation tier. The aggregator IS the
+/// composite's producer, so it signs with the SAME deterministic keys
+/// [`producer_pubkeys`] puts on the composite envelope. `member_ids` derive the
+/// member_commitment via the verify-core construction; returns the inputs and
+/// the member-commitment hex (so the stored navigation column matches).
+async fn signed_verify_inputs(
+    member_ids: &[String],
+    tamper: bool,
+    drop_pqc: bool,
+) -> (AggregationMetaVerifyInputsV1, String) {
+    let (ed_sk, _ed_pk_b64, mldsa) = producer_pubkeys();
+    let commitment = member_commitment(member_ids);
+    let commitment_hex = hex_lower(&commitment);
+    let meta = ciris_verify_core::holonomic::AggregationMetaV1 {
+        version: 1,
+        content_id: "content-root-agg".to_owned(),
+        corpus_kind: "trace".to_owned(),
+        tier: 2,
+        aggregation_algorithm_id: "raptorq-pyramid-v1".to_owned(),
+        source_count: member_ids.len() as u32,
+        member_commitment: commitment,
+        noise_floor_descriptor: "mean+stddev".to_owned(),
+    };
+    let preimage = meta.signing_preimage();
+    let ed_sig = ed_sk.sign(&preimage).to_bytes();
+    let mut bound = preimage.clone();
+    bound.extend_from_slice(&ed_sig);
+    let pqc_sig = mldsa.sign(&bound).await.unwrap();
+
+    // tamper: claim a different tier than what was signed → preimage diverges.
+    let signed_tier = if tamper { 99 } else { meta.tier };
+    let inputs = AggregationMetaVerifyInputsV1 {
+        version: meta.version,
+        content_id: meta.content_id.clone(),
+        corpus_kind: meta.corpus_kind.clone(),
+        tier: signed_tier,
+        aggregation_algorithm_id: meta.aggregation_algorithm_id.clone(),
+        source_count: meta.source_count,
+        member_commitment_hex: commitment_hex.clone(),
+        noise_floor_descriptor: meta.noise_floor_descriptor.clone(),
+        sig_ed25519_b64: BASE64.encode(ed_sig),
+        sig_ml_dsa_65_b64: if drop_pqc {
+            String::new()
+        } else {
+            BASE64.encode(&pqc_sig)
+        },
+    };
+    (inputs, commitment_hex)
+}
+
+/// Lowercase hex of raw bytes (test-local; no extra dep).
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
 
 /// Deterministic producer Ed25519 + ML-DSA-65 keys.
 fn producer_pubkeys() -> (SigningKey, String, MlDsa65SoftwareSigner) {
@@ -145,18 +207,23 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
     .await;
     // Opaque §19.7 wire payload — arbitrary bytes persist never parses.
     let opaque_meta = vec![0x01u8, 0x02, 0x03, 0xAA, 0xBB];
+    // §19.7.1 verification inputs with a VALID bound-hybrid signature; the
+    // stored navigation member_commitment MUST equal the signed §19.7.1 one.
+    let member_ids: Vec<String> = (0..3).map(|i| format!("member-{i}")).collect();
+    let (verif, commitment_hex) = signed_verify_inputs(&member_ids, false, false).await;
     let agg = AggregationMetaV1 {
         aggregate_content_id: agg_cid.clone(),
         source_corpus_kind: source_corpus.to_owned(),
         aggregation_level: 1,
         fan_in: 3,
-        member_commitment: "feedface".to_owned(),
+        member_commitment: commitment_hex.clone(),
         aggregation_meta: opaque_meta.clone(),
+        verification: verif,
     };
     backend
         .put_aggregated_tier(&manifest, &symbols, &agg, 1_000)
         .await
-        .expect("(a) valid composite + aggregation MUST be admitted");
+        .expect("(a) valid composite + valid §19.7.1 meta MUST be admitted");
 
     // The composite is a FountainContentV1 — readable as Full.
     let composite = backend
@@ -179,7 +246,7 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
     assert_eq!(rec.source_corpus_kind, source_corpus);
     assert_eq!(rec.aggregation_level, 1);
     assert_eq!(rec.fan_in, 3);
-    assert_eq!(rec.member_commitment, "feedface");
+    assert_eq!(rec.member_commitment, commitment_hex);
     assert_eq!(rec.aggregated_at_unix_ms, 1_000);
     assert_eq!(
         rec.aggregation_meta, opaque_meta,
@@ -198,13 +265,15 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
         false, // classical-only
     )
     .await;
+    let (verif_b, commitment_b) = signed_verify_inputs(&member_ids, false, false).await;
     let agg_bad = AggregationMetaV1 {
         aggregate_content_id: bad_cid.clone(),
         source_corpus_kind: source_corpus.to_owned(),
         aggregation_level: 1,
         fan_in: 3,
-        member_commitment: "00".to_owned(),
+        member_commitment: commitment_b,
         aggregation_meta: vec![0xFF],
+        verification: verif_b,
     };
     let err = backend
         .put_aggregated_tier(&m_bad, &s_bad, &agg_bad, 2_000)
@@ -233,8 +302,101 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
         "(b) rejected composite wrote ZERO content_aggregation rows"
     );
 
-    // ── (c) descend_aggregated_sources: fold 3 sources → descend them to
-    //        the floor (hard_delete) → each reads EnvelopeOnly; the
+    // ── (b2) §19.7.1 store-path gate: a valid composite manifest but a
+    //         PQC-MISSING aggregation_meta → REJECTED at admission
+    //         (aggregation_meta_hybrid_required), ZERO rows. The PQC-mandatory
+    //         §10.1.5.1.1 gate — never store-then-quarantine.
+    let pqcmiss_cid = format!("agg-pqcmiss-{suffix}");
+    let (m_ok, s_ok) = build_manifest_and_symbols(
+        &pqcmiss_cid,
+        &composite_corpus,
+        n_source,
+        k_repair,
+        symbol_size,
+        true, // composite manifest is fully hybrid — only the META lacks PQC
+    )
+    .await;
+    let (verif_nopqc, commitment_nopqc) = signed_verify_inputs(&member_ids, false, true).await;
+    let agg_nopqc = AggregationMetaV1 {
+        aggregate_content_id: pqcmiss_cid.clone(),
+        source_corpus_kind: source_corpus.to_owned(),
+        aggregation_level: 1,
+        fan_in: 3,
+        member_commitment: commitment_nopqc,
+        aggregation_meta: vec![0xAB],
+        verification: verif_nopqc,
+    };
+    let err = backend
+        .put_aggregated_tier(&m_ok, &s_ok, &agg_nopqc, 2_500)
+        .await
+        .expect_err("(b2) PQC-missing aggregation_meta MUST be rejected (store-path gate)");
+    assert_eq!(
+        err.kind(),
+        "aggregation_meta_hybrid_required",
+        "(b2) PQC-mandatory store-path token"
+    );
+    assert!(
+        backend
+            .get_fountain_content(&pqcmiss_cid, &composite_corpus)
+            .await
+            .unwrap()
+            .is_none(),
+        "(b2) PQC-missing meta wrote ZERO content_manifest rows (verify-before-mutation)"
+    );
+    assert!(
+        backend
+            .get_aggregation(&pqcmiss_cid)
+            .await
+            .unwrap()
+            .is_none(),
+        "(b2) PQC-missing meta wrote ZERO content_aggregation rows"
+    );
+
+    // ── (b3) §19.7.1 store-path gate: TAMPERED meta — the signed preimage
+    //         claims a different tier than the verification inputs assert, so
+    //         the bound-hybrid signature does not match → REJECTED, ZERO rows.
+    let tamper_cid = format!("agg-tamper-{suffix}");
+    let (m_t, s_t) = build_manifest_and_symbols(
+        &tamper_cid,
+        &composite_corpus,
+        n_source,
+        k_repair,
+        symbol_size,
+        true,
+    )
+    .await;
+    let (verif_t, commitment_t) = signed_verify_inputs(&member_ids, true, false).await;
+    let agg_t = AggregationMetaV1 {
+        aggregate_content_id: tamper_cid.clone(),
+        source_corpus_kind: source_corpus.to_owned(),
+        aggregation_level: 1,
+        fan_in: 3,
+        member_commitment: commitment_t,
+        aggregation_meta: vec![0xCD],
+        verification: verif_t,
+    };
+    let err = backend
+        .put_aggregated_tier(&m_t, &s_t, &agg_t, 2_700)
+        .await
+        .expect_err("(b3) tampered aggregation_meta MUST be rejected (sig != preimage)");
+    assert_eq!(
+        err.kind(),
+        "aggregation_meta_hybrid_required",
+        "(b3) tampered meta token"
+    );
+    assert!(
+        backend
+            .get_aggregation(&tamper_cid)
+            .await
+            .unwrap()
+            .is_none(),
+        "(b3) tampered meta wrote ZERO content_aggregation rows"
+    );
+
+    // ── (c) descent integrity (§19.7.1.1) + verdict (§19.7.3): fold 3 sources
+    //        into a composite whose member_commitment is over the source ids.
+    //        A FORGED source set is REJECTED; the MATCHING set descends to the
+    //        floor (Withdrawn → hard-delete) → each reads EnvelopeOnly; the
     //        AGGREGATE is untouched (blur persists).
     let mut source_ids = Vec::new();
     for i in 0..3 {
@@ -248,20 +410,76 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
             .expect("(c) admit source");
         source_ids.push((scid, source_corpus.to_owned()));
     }
-    // Descend to the FLOOR (None ⇒ hard-delete each source).
-    let verdict = ciris_persist::fountain::EjectionVerdict::for_target_tier(None);
+    // The fold's composite commits to EXACTLY these source content_ids.
+    let fold_cid = format!("agg-fold-{suffix}");
+    let fold_member_ids: Vec<String> = source_ids.iter().map(|(id, _)| id.clone()).collect();
+    let (fold_verif, fold_commitment) = signed_verify_inputs(&fold_member_ids, false, false).await;
+    let (fm, fs) = build_manifest_and_symbols(
+        &fold_cid,
+        &composite_corpus,
+        n_source,
+        k_repair,
+        symbol_size,
+        true,
+    )
+    .await;
+    let fold_agg = AggregationMetaV1 {
+        aggregate_content_id: fold_cid.clone(),
+        source_corpus_kind: source_corpus.to_owned(),
+        aggregation_level: 1,
+        fan_in: 3,
+        member_commitment: fold_commitment,
+        aggregation_meta: vec![0x42],
+        verification: fold_verif,
+    };
+    backend
+        .put_aggregated_tier(&fm, &fs, &fold_agg, 1_500)
+        .await
+        .expect("(c) admit fold composite");
+
+    // (c-forged) a source set NOT matching the commitment is REJECTED — a
+    // forged member set can't drive eviction (§19.7.1.1).
+    let forged: Vec<(String, String)> = vec![(format!("EVIL-{suffix}"), source_corpus.to_owned())];
+    let forged_err = ciris_persist::fountain::descend_aggregated_sources_on_backend(
+        backend,
+        &fold_cid,
+        &forged,
+        ConsentState::Withdrawn,
+        false,
+        None,
+    )
+    .await
+    .expect_err("(c) a forged member set MUST be rejected (descent integrity)");
     assert_eq!(
-        verdict,
-        ciris_persist::fountain::EjectionVerdict::EjectHardDelete,
-        "(c) None target maps to the floor verdict"
+        forged_err.kind(),
+        "aggregation_meta_member_commitment",
+        "(c) forged-set descent token"
     );
-    let mut total_evicted = 0u64;
+    // The sources are untouched by the rejected descent.
     for (cid, corpus) in &source_ids {
-        total_evicted += backend
-            .evict_fountain_content_hard_delete(cid, corpus)
+        let read = backend
+            .get_fountain_content(cid, corpus)
             .await
-            .expect("(c) descend source to floor");
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(read, FountainContent::Full { .. }),
+            "(c) forged-set rejection leaves sources Full (verify-before-mutation)"
+        );
     }
+
+    // (c-matching) the MATCHING source set descends. Withdrawn → hard-delete
+    // (the §19.7.3 N5 verdict — never tier-shed).
+    let total_evicted = ciris_persist::fountain::descend_aggregated_sources_on_backend(
+        backend,
+        &fold_cid,
+        &source_ids,
+        ConsentState::Withdrawn,
+        false,
+        None,
+    )
+    .await
+    .expect("(c) matching source set descends");
     assert_eq!(
         total_evicted,
         u64::from(total) * 3,
@@ -308,13 +526,15 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
             true,
         )
         .await;
+        let (v, c) = signed_verify_inputs(&member_ids, false, false).await;
         let a = AggregationMetaV1 {
             aggregate_content_id: cid.clone(),
             source_corpus_kind: source_corpus.to_owned(),
             aggregation_level: 2,
             fan_in: 4,
-            member_commitment: "abcd".to_owned(),
+            member_commitment: c,
             aggregation_meta: vec![0x10],
+            verification: v,
         };
         backend
             .put_aggregated_tier(&m, &s, &a, ts)
@@ -366,13 +586,15 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
     )
     .await;
     let raw_meta: Vec<u8> = vec![0x00, 0xFF, 0x80, 0x7F, 0xFE, 0x01, 0x00, 0xC0, 0x80];
+    let (raw_v, raw_c) = signed_verify_inputs(&member_ids, false, false).await;
     let raw_agg = AggregationMetaV1 {
         aggregate_content_id: raw_cid.clone(),
         source_corpus_kind: source_corpus.to_owned(),
         aggregation_level: 3,
         fan_in: 9,
-        member_commitment: "ff00".to_owned(),
+        member_commitment: raw_c,
         aggregation_meta: raw_meta.clone(),
+        verification: raw_v,
     };
     backend
         .put_aggregated_tier(&rm, &rs, &raw_agg, 9_000)
@@ -382,6 +604,34 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
     assert_eq!(
         back.aggregation_meta, raw_meta,
         "(e) arbitrary non-UTF-8 opaque bytes round-trip unchanged (never parsed)"
+    );
+
+    // ── (f) §19.7.3 EjectionVerdict alignment (verify-core's verdict drives
+    //        the persist action): Withdrawn → hard-delete regardless of
+    //        pressure; capacity pressure on a live item → tier-shed; else Keep.
+    use ciris_persist::fountain::{ejection_verdict, EjectionAction, FountainTier};
+    assert_eq!(
+        ejection_verdict(ConsentState::Withdrawn, false),
+        EjectionVerdict::EjectHardDelete,
+        "(f) revoked → hard delete (N5)"
+    );
+    assert_eq!(
+        ejection_verdict(ConsentState::Withdrawn, true),
+        EjectionVerdict::EjectHardDelete,
+        "(f) revoked under pressure → still hard delete (never tier-shed)"
+    );
+    assert_eq!(
+        EjectionAction::from_verdict(
+            ejection_verdict(ConsentState::Active, true),
+            Some(FountainTier::T3)
+        ),
+        EjectionAction::EjectToTier(FountainTier::T3),
+        "(f) live + pressure → tier-shed to the persist target"
+    );
+    assert_eq!(
+        EjectionAction::from_verdict(ejection_verdict(ConsentState::Active, false), None),
+        EjectionAction::Keep,
+        "(f) live + no pressure → keep"
     );
 }
 

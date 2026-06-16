@@ -815,14 +815,19 @@ impl Backend for MemoryBackend {
         agg: &crate::fountain::AggregationMetaV1,
         aggregated_at_unix_ms: i64,
     ) -> Result<(), Error> {
-        // Verify-before-mutation (AV-9): the composite goes through the
-        // EXISTING #225 fountain admit gate FIRST — classical-only REJECTED
-        // (hard cut), nothing written on reject. aggregation_meta is OPAQUE.
+        // Verify-before-mutation (AV-9): BOTH gates run BEFORE any write.
+        //   (i)  the EXISTING #225 fountain admit gate — classical-only
+        //        composite manifest REJECTED (hard cut).
+        //   (ii) v8.4.0 §19.7.1 PQC-mandatory store-path gate (§10.1.5.1.1):
+        //        verify the aggregation_meta bound-hybrid signature against the
+        //        aggregator pubkeys on the composite envelope. The STORAGE
+        //        column stays OPAQUE — verification inputs are admission-only.
         crate::fountain::check_admission_via_envelope(
             manifest,
             symbols,
             &crate::verify::PythonJsonDumpsCanonicalizer,
         )?;
+        agg.verify_for_admission(manifest)?;
 
         let mut state = self.state.lock().expect("memory backend lock");
         // (a) composite manifest (idempotent) + symbols.

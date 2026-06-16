@@ -1614,16 +1614,22 @@ impl Backend for PostgresBackend {
         agg: &crate::fountain::AggregationMetaV1,
         aggregated_at_unix_ms: i64,
     ) -> Result<(), Error> {
-        // Verify-before-mutation (AV-9): the composite goes through the
-        // EXISTING #225 fountain admit gate FIRST — classical-only
-        // composite manifest REJECTED, the same hard cut. On any failure
-        // NOTHING is written (neither the composite nor the aggregation
-        // row). aggregation_meta is OPAQUE — never parsed.
+        // Verify-before-mutation (AV-9): BOTH gates run BEFORE any write; on
+        // any failure NOTHING is persisted (neither the composite nor the
+        // aggregation row).
+        //   (i)  the composite goes through the EXISTING #225 fountain admit
+        //        gate — classical-only composite manifest REJECTED (hard cut).
+        //   (ii) v8.4.0 §19.7.1 PQC-mandatory store-path gate (§10.1.5.1.1):
+        //        verify the aggregation_meta bound-hybrid signature against the
+        //        aggregator pubkeys on the composite envelope; a missing/invalid
+        //        ML-DSA-65 half is rejected. The STORAGE aggregation_meta column
+        //        stays OPAQUE — the verification inputs are admission-only.
         crate::fountain::check_admission_via_envelope(
             manifest,
             symbols,
             &crate::verify::PythonJsonDumpsCanonicalizer,
         )?;
+        agg.verify_for_admission(manifest)?;
 
         let symbol_hashes_json = serde_json::Value::Array(
             manifest
