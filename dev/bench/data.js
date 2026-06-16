@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781631739836,
+  "lastUpdate": 1781640293693,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -32099,6 +32099,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 343517,
             "range": "± 5003",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "0d12e232339f604a77e8ffc030eef0bccd7d5e8e",
+          "message": "v8.2.0 — §19 WholenessWitness corpus + verify-before-persist gate + WW→quorum-merge subordination + retention_decision/N6\n\nCEG 1.0-RC11 §19 (CIRISPersist#228 items 1-2,4-5 / #229 item 1). verify pin v5.9.0.\n\n- V085 (both backends): wholeness_witness_corpus, last-K per peer, no `verified` column (F-5), zero TimescaleDB.\n- put_wholeness_witness: PQC-verify-BEFORE-persist via verify_witness (hybrid gate + WW-2 namespace guard); classical-only → hard cut, zero rows on reject (AV-9).\n- build_local_witness: WW-2 leaf filter (drops anonymous-tier + cohort_scope:self) before compute_merkle_root.\n- reconcile_peer_witnesses: compare_witnesses → Equivocation retains + emits hard_case:witness_equivocation (never reconciles, N4); Divergent → TriggerQuorumMerge directive (witness does NOT decide — caller re-runs the EXISTING V058 resolve_monotonic_quorum/revision; no fragment-pick, no revoked-key resurrection); Consistent → no-op.\n- accept_if_monotonic + last_witness_epoch_for_peer: per-peer epoch anti-rollback (eclipse guard).\n- evict_fountain_content_by_consent + resolve_retention_action: retention_decision drives Withdrawn → hard_delete (revocation overrides rarity). N6 holding_claim_counts gate.\n- Excluded (edge-owned, CIRISEdge#144): SignedRelayCapacity/N8 + recursive-bootstrap SignedClaim. §19.7 aggregation = #230 follow-on.\n\nGate (plain postgres:16 + sqlite): clippy -D clean, fmt --check clean, nextest --all-targets 1306 passed / 0 failed.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-06-16T14:32:28-05:00",
+          "tree_id": "7e9d45e43356990f32c4bdd6711740ce1824ea9e",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/0d12e232339f604a77e8ffc030eef0bccd7d5e8e"
+        },
+        "date": 1781640291683,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 45673041,
+            "range": "± 18772",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2275500,
+            "range": "± 74475",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 9311,
+            "range": "± 77",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 12825,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 19864,
+            "range": "± 45",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 53086,
+            "range": "± 347",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 33,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 179,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 507,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 578,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1992,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 77,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 242,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1046,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 26931,
+            "range": "± 475",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 66527,
+            "range": "± 2473",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 224533,
+            "range": "± 6739",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 8579,
+            "range": "± 1400",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 10050,
+            "range": "± 680",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 14752,
+            "range": "± 697",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 24943,
+            "range": "± 1079",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1850090,
+            "range": "± 6439",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 6215732,
+            "range": "± 48279",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 370600,
+            "range": "± 4524",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1112335,
+            "range": "± 13304",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 62051343,
+            "range": "± 1271655",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 2128273,
+            "range": "± 28486",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 10680986,
+            "range": "± 151631",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 156032935,
+            "range": "± 3122139",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 5724088,
+            "range": "± 255224",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 28306901,
+            "range": "± 564411",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 126617,
+            "range": "± 4867",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 117930,
+            "range": "± 4972",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 9150,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 61357,
+            "range": "± 263",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 572113,
+            "range": "± 3326",
             "unit": "ns/iter"
           }
         ]
