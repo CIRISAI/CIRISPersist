@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781644360712,
+  "lastUpdate": 1781653587770,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -32615,6 +32615,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 553892,
             "range": "± 1970",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric Moore",
+            "username": "emooreatx"
+          },
+          "distinct": true,
+          "id": "7b40aae71cc17683f5cfb9553f1d484d267f1970",
+          "message": "v8.4.0 — §19.7 conform: verify_aggregation_meta store-path gate + member_commitment descent integrity + EjectionVerdict + conformance vectors (closes #230)\n\nConsume CIRISVerify v5.10.0's holonomic::aggregation verifiers + reproduce\nthe §19.7 conformance vectors (the second-impl role), closing the\nfreeze-gated residual on CIRISPersist#230.\n\n- verify_aggregation_meta store-path gate (§19.7.1, §10.1.5.1.1\n  PQC-mandatory): put_aggregated_tier verifies the §19.7.1 bound-hybrid\n  signature BEFORE persistence; missing/invalid ML-DSA-65 half rejected,\n  zero rows. Aggregator pubkeys resolved off the composite manifest\n  envelope. Storage column stays opaque BYTEA/BLOB — V086 unchanged.\n- verify_member_commitment descent integrity (§19.7.1.1): a forged source\n  member set cannot drive eviction; canonical descend_order.\n- EjectionVerdict alignment (§19.7.3): persist's internal enum removed;\n  drives verify-core ejection_verdict; EjectionAction carries the tier.\n- §19.7 conformance vectors reproduced byte-for-byte\n  (tests/conformance_vectors_v19_7.rs + copied vectors).\n- Re-pin CIRISVerify v5.9.0 → v5.10.0 (all six pins together).\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-06-16T18:15:51-05:00",
+          "tree_id": "8cbcd2771fedd0d6110228b7035c2a2c06e85428",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/7b40aae71cc17683f5cfb9553f1d484d267f1970"
+        },
+        "date": 1781653585808,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40420262,
+            "range": "± 35720",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 3084436,
+            "range": "± 195966",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 9606,
+            "range": "± 226",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 13307,
+            "range": "± 379",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 20862,
+            "range": "± 158",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 55844,
+            "range": "± 266",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 38,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 214,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 523,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 599,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2069,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 84,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 253,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1107,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 32022,
+            "range": "± 1200",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 74604,
+            "range": "± 1671",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 240756,
+            "range": "± 6392",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 10207,
+            "range": "± 652",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 12160,
+            "range": "± 673",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 19247,
+            "range": "± 1270",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 38247,
+            "range": "± 2161",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 2176430,
+            "range": "± 10613",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 4633869,
+            "range": "± 33541",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 254517,
+            "range": "± 7648",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 884238,
+            "range": "± 21993",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 46485270,
+            "range": "± 225793",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1518216,
+            "range": "± 59695",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 8409138,
+            "range": "± 175213",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 117128816,
+            "range": "± 1547772",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 3885113,
+            "range": "± 182669",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 21472692,
+            "range": "± 416469",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 87569,
+            "range": "± 4409",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 81879,
+            "range": "± 4292",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 7079,
+            "range": "± 35",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 46331,
+            "range": "± 216",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 430950,
+            "range": "± 1172",
             "unit": "ns/iter"
           }
         ]
