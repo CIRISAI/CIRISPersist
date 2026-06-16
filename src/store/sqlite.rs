@@ -991,6 +991,161 @@ impl Backend for SqliteBackend {
             Ok(rows)
         })()
     }
+
+    // ─── v8.0.0 — fountain content primitive (CIRISPersist#227) ─────
+
+    async fn put_fountain_content(
+        &self,
+        manifest: &crate::fountain::FountainManifestV1,
+        symbols: &[crate::fountain::FountainSymbolV1],
+    ) -> Result<(), Error> {
+        // Verify-before-mutation (AV-9): the full admission gate runs
+        // first; on any failure NOTHING is written.
+        crate::fountain::check_admission_via_envelope(
+            manifest,
+            symbols,
+            &crate::verify::PythonJsonDumpsCanonicalizer,
+        )?;
+
+        let symbol_hashes_text = serde_json::to_string(&manifest.symbol_hashes)
+            .map_err(|e| Error::Backend(format!("serialize symbol_hashes: {e}")))?;
+        let envelope_text = serde_json::to_string(&manifest.envelope)
+            .map_err(|e| Error::Backend(format!("serialize envelope: {e}")))?;
+        let admitted_at = chrono::Utc::now().to_rfc3339();
+        let manifest = manifest.clone();
+        let symbols = symbols.to_vec();
+        let conn = self.conn.clone();
+
+        (move || -> Result<(), rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            // Manifest: idempotent (ON CONFLICT DO NOTHING). Never evicted.
+            tx.execute(
+                "INSERT INTO content_manifest (\
+                 content_id, corpus_kind, manifest_version, n_source, k_repair, \
+                 symbol_size, original_content_length, min_viable_symbols, \
+                 symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id, \
+                 admitted_at) VALUES \
+                 (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) \
+                 ON CONFLICT (content_id, corpus_kind) DO NOTHING",
+                rusqlite::params![
+                    manifest.content_id,
+                    manifest.corpus_kind,
+                    i64::from(manifest.manifest_version),
+                    i64::from(manifest.n_source),
+                    i64::from(manifest.k_repair),
+                    i64::from(manifest.symbol_size),
+                    manifest.original_content_length as i64,
+                    i64::from(manifest.min_viable_symbols),
+                    symbol_hashes_text,
+                    envelope_text,
+                    manifest.signature,
+                    manifest.signature_ml_dsa_65,
+                    manifest.pqc_key_id,
+                    admitted_at,
+                ],
+            )?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO content_symbols \
+                     (content_id, symbol_id, retention_priority, symbol_bytes) \
+                     VALUES (?1,?2,?3,?4) \
+                     ON CONFLICT (content_id, symbol_id) DO UPDATE SET \
+                       retention_priority = excluded.retention_priority, \
+                       symbol_bytes = excluded.symbol_bytes",
+                )?;
+                for sym in &symbols {
+                    stmt.execute(rusqlite::params![
+                        sym.content_id,
+                        i64::from(sym.symbol_id),
+                        i64::from(sym.retention_priority),
+                        sym.symbol_bytes,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })()
+        .map_err(|e| Error::Backend(format!("put_fountain_content: {e}")))?;
+        Ok(())
+    }
+
+    async fn evict_fountain_content_to_tier(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+        tier: crate::fountain::FountainTier,
+    ) -> Result<u64, Error> {
+        let Some(manifest) = self.fountain_manifest_row(content_id, corpus_kind).await? else {
+            return Ok(0);
+        };
+        let keep = tier.keep_count(&manifest) as i64;
+        let content_id = content_id.to_owned();
+        let conn = self.conn.clone();
+        let evicted = (move || -> Result<u64, rusqlite::Error> {
+            let conn = conn.lock();
+            // Keep the lowest retention_priority (keep-longest), symbol_id
+            // ASC tie-break; evict the rest.
+            let n = conn.execute(
+                "DELETE FROM content_symbols \
+                 WHERE content_id = ?1 AND symbol_id IN ( \
+                   SELECT symbol_id FROM ( \
+                     SELECT symbol_id, ROW_NUMBER() OVER ( \
+                       ORDER BY retention_priority ASC, symbol_id ASC) AS rn \
+                     FROM content_symbols WHERE content_id = ?1 \
+                   ) WHERE rn > ?2 )",
+                rusqlite::params![content_id, keep],
+            )?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| Error::Backend(format!("evict_fountain_content_to_tier: {e}")))?;
+        Ok(evicted)
+    }
+
+    async fn get_fountain_content(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<Option<crate::fountain::FountainContent>, Error> {
+        let Some(manifest) = self.fountain_manifest_row(content_id, corpus_kind).await? else {
+            return Ok(None);
+        };
+        let content_id_owned = content_id.to_owned();
+        let conn = self.conn.clone();
+        let symbols =
+            (move || -> Result<Vec<crate::fountain::FountainSymbolV1>, rusqlite::Error> {
+                let conn = conn.lock();
+                let mut stmt = conn.prepare(
+                    "SELECT content_id, symbol_id, retention_priority, symbol_bytes \
+                 FROM content_symbols WHERE content_id = ?1 ORDER BY symbol_id ASC",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![content_id_owned], |row| {
+                        let cid: String = row.get(0)?;
+                        let sym_id: i64 = row.get(1)?;
+                        let priority: i64 = row.get(2)?;
+                        let bytes: Vec<u8> = row.get(3)?;
+                        Ok((cid, sym_id, priority, bytes))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut out = Vec::with_capacity(rows.len());
+                for (cid, sym_id, priority, bytes) in rows {
+                    out.push(crate::fountain::FountainSymbolV1 {
+                        content_id: cid,
+                        symbol_id: u32::try_from(sym_id)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, sym_id))?,
+                        retention_priority: u8::try_from(priority)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, priority))?,
+                        symbol_bytes: bytes,
+                    });
+                }
+                Ok(out)
+            })()
+            .map_err(|e| Error::Backend(format!("read content_symbols: {e}")))?;
+        Ok(Some(super::memory::assemble_fountain_content(
+            manifest, symbols,
+        )?))
+    }
 }
 
 // ─── Pipeline read+write surface (v1.5.8, CIRISPersist#57) ─────────
@@ -1009,6 +1164,95 @@ impl Backend for SqliteBackend {
 // JSONB→serde_json::Value decode. Wire shape matches PG byte-for-byte.
 
 impl SqliteBackend {
+    /// v8.0.0 (CIRISPersist#227) — read the `content_manifest` row for
+    /// `(content_id, corpus_kind)` back into a
+    /// [`FountainManifestV1`](crate::fountain::FountainManifestV1).
+    /// Shared by the fountain evict + read trait methods. `Ok(None)` when
+    /// there is no manifest.
+    async fn fountain_manifest_row(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<Option<crate::fountain::FountainManifestV1>, Error> {
+        let content_id = content_id.to_owned();
+        let corpus_kind = corpus_kind.to_owned();
+        let conn = self.conn.clone();
+        // Raw row carrier — avoids a 13-tuple closure return (clippy
+        // `type_complexity`). Field-for-field with the SELECT below.
+        struct RawManifestRow {
+            content_id: String,
+            corpus_kind: String,
+            manifest_version: i64,
+            n_source: i64,
+            k_repair: i64,
+            symbol_size: i64,
+            original_content_length: i64,
+            min_viable: i64,
+            symbol_hashes_text: String,
+            envelope_text: String,
+            signature: String,
+            signature_ml_dsa_65: String,
+            pqc_key_id: String,
+        }
+        let row = (move || -> Result<Option<RawManifestRow>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT content_id, corpus_kind, manifest_version, n_source, k_repair, \
+                 symbol_size, original_content_length, min_viable_symbols, \
+                 symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id \
+                 FROM content_manifest WHERE content_id = ?1 AND corpus_kind = ?2",
+                rusqlite::params![content_id, corpus_kind],
+                |r| {
+                    Ok(RawManifestRow {
+                        content_id: r.get(0)?,
+                        corpus_kind: r.get(1)?,
+                        manifest_version: r.get(2)?,
+                        n_source: r.get(3)?,
+                        k_repair: r.get(4)?,
+                        symbol_size: r.get(5)?,
+                        original_content_length: r.get(6)?,
+                        min_viable: r.get(7)?,
+                        symbol_hashes_text: r.get(8)?,
+                        envelope_text: r.get(9)?,
+                        signature: r.get(10)?,
+                        signature_ml_dsa_65: r.get(11)?,
+                        pqc_key_id: r.get(12)?,
+                    })
+                },
+            )
+            .optional()
+        })()
+        .map_err(|e| Error::Backend(format!("read content_manifest: {e}")))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let symbol_hashes: Vec<String> = serde_json::from_str(&row.symbol_hashes_text)
+            .map_err(|e| Error::Backend(format!("parse symbol_hashes: {e}")))?;
+        let envelope: serde_json::Value = serde_json::from_str(&row.envelope_text)
+            .map_err(|e| Error::Backend(format!("parse envelope: {e}")))?;
+        Ok(Some(crate::fountain::FountainManifestV1 {
+            content_id: row.content_id,
+            corpus_kind: row.corpus_kind,
+            manifest_version: u16::try_from(row.manifest_version)
+                .map_err(|_| Error::Backend("manifest_version out of u16 range".into()))?,
+            n_source: u32::try_from(row.n_source)
+                .map_err(|_| Error::Backend("n_source out of u32 range".into()))?,
+            k_repair: u32::try_from(row.k_repair)
+                .map_err(|_| Error::Backend("k_repair out of u32 range".into()))?,
+            symbol_size: u32::try_from(row.symbol_size)
+                .map_err(|_| Error::Backend("symbol_size out of u32 range".into()))?,
+            original_content_length: u64::try_from(row.original_content_length)
+                .map_err(|_| Error::Backend("original_content_length out of u64 range".into()))?,
+            min_viable_symbols: u32::try_from(row.min_viable)
+                .map_err(|_| Error::Backend("min_viable_symbols out of u32 range".into()))?,
+            symbol_hashes,
+            envelope,
+            signature: row.signature,
+            signature_ml_dsa_65: row.signature_ml_dsa_65,
+            pqc_key_id: row.pqc_key_id,
+        }))
+    }
+
     /// v1.5.8 (CIRISPersist#57) — SQLite parity for `read_features`.
     /// Read typed [`Features`] for a `(trace_id, thought_id)` pair from
     /// `trace_events.extracted_features` (V023 column).

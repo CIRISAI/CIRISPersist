@@ -69,6 +69,7 @@ pub mod federation;
 #[cfg(feature = "cirislens_feedback_mappings")]
 pub mod feedback_mappings;
 pub mod ffi;
+pub mod fountain;
 #[cfg(feature = "cirisgraph")]
 pub mod graph;
 #[cfg(feature = "cirisincident")]

@@ -1415,6 +1415,169 @@ impl Backend for PostgresBackend {
 
         rows.into_iter().map(pg_row_to_event_row).collect()
     }
+
+    // ─── v8.0.0 — fountain content primitive (CIRISPersist#227) ─────
+
+    async fn put_fountain_content(
+        &self,
+        manifest: &crate::fountain::FountainManifestV1,
+        symbols: &[crate::fountain::FountainSymbolV1],
+    ) -> Result<(), Error> {
+        // Verify-before-mutation (AV-9): the full admission gate runs
+        // first; on any failure NOTHING is written.
+        crate::fountain::check_admission_via_envelope(
+            manifest,
+            symbols,
+            &crate::verify::PythonJsonDumpsCanonicalizer,
+        )?;
+
+        let symbol_hashes_json = serde_json::Value::Array(
+            manifest
+                .symbol_hashes
+                .iter()
+                .map(|h| serde_json::Value::String(h.clone()))
+                .collect(),
+        );
+        let manifest_version = i32::from(manifest.manifest_version);
+        let n_source = i64::from(manifest.n_source);
+        let k_repair = i64::from(manifest.k_repair);
+        let symbol_size = i64::from(manifest.symbol_size);
+        let original_content_length = i64::try_from(manifest.original_content_length)
+            .map_err(|_| Error::Backend("original_content_length exceeds i64".into()))?;
+        let min_viable = i64::from(manifest.min_viable_symbols);
+
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin fountain tx: {e}")))?;
+
+        // Manifest: idempotent insert (ON CONFLICT DO NOTHING on the
+        // (content_id, corpus_kind) PK). Never evicted.
+        tx.execute(
+            "INSERT INTO cirislens.content_manifest \
+             (content_id, corpus_kind, manifest_version, n_source, k_repair, \
+              symbol_size, original_content_length, min_viable_symbols, \
+              symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+             ON CONFLICT (content_id, corpus_kind) DO NOTHING",
+            &[
+                &manifest.content_id,
+                &manifest.corpus_kind,
+                &manifest_version,
+                &n_source,
+                &k_repair,
+                &symbol_size,
+                &original_content_length,
+                &min_viable,
+                &symbol_hashes_json,
+                &manifest.envelope,
+                &manifest.signature,
+                &manifest.signature_ml_dsa_65,
+                &manifest.pqc_key_id,
+            ],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("insert content_manifest: {e}")))?;
+
+        // Symbols: upsert by (content_id, symbol_id).
+        for sym in symbols {
+            let symbol_id = i64::from(sym.symbol_id);
+            let retention_priority = i16::from(sym.retention_priority);
+            tx.execute(
+                "INSERT INTO cirislens.content_symbols \
+                 (content_id, symbol_id, retention_priority, symbol_bytes) \
+                 VALUES ($1,$2,$3,$4) \
+                 ON CONFLICT (content_id, symbol_id) DO UPDATE SET \
+                   retention_priority = EXCLUDED.retention_priority, \
+                   symbol_bytes = EXCLUDED.symbol_bytes",
+                &[
+                    &sym.content_id,
+                    &symbol_id,
+                    &retention_priority,
+                    &sym.symbol_bytes,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert content_symbols: {e}")))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit fountain tx: {e}")))?;
+        Ok(())
+    }
+
+    async fn evict_fountain_content_to_tier(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+        tier: crate::fountain::FountainTier,
+    ) -> Result<u64, Error> {
+        // Need the manifest's params to compute the keep-count.
+        let Some(manifest) = self.fountain_manifest_row(content_id, corpus_kind).await? else {
+            return Ok(0);
+        };
+        let keep = tier.keep_count(&manifest) as i64;
+
+        let client = self.get_client().await?;
+        // Evict everything OUTSIDE the keep set: order by
+        // retention_priority ASC (keep-longest first), symbol_id ASC for
+        // a deterministic tie-break, keep the first `keep`, delete the
+        // rest. The DELETE uses a window over the same ORDER BY.
+        let rows = client
+            .execute(
+                "DELETE FROM cirislens.content_symbols \
+                 WHERE content_id = $1 AND symbol_id IN ( \
+                   SELECT symbol_id FROM ( \
+                     SELECT symbol_id, ROW_NUMBER() OVER ( \
+                       ORDER BY retention_priority ASC, symbol_id ASC) AS rn \
+                     FROM cirislens.content_symbols WHERE content_id = $1 \
+                   ) ranked WHERE ranked.rn > $2 )",
+                &[&content_id, &keep],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("evict content_symbols: {e}")))?;
+        Ok(rows)
+    }
+
+    async fn get_fountain_content(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<Option<crate::fountain::FountainContent>, Error> {
+        let Some(manifest) = self.fountain_manifest_row(content_id, corpus_kind).await? else {
+            return Ok(None);
+        };
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT content_id, symbol_id, retention_priority, symbol_bytes \
+                 FROM cirislens.content_symbols WHERE content_id = $1 \
+                 ORDER BY symbol_id ASC",
+                &[&content_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("read content_symbols: {e}")))?;
+        let mut symbols = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let sym_id: i64 = row.safe_get_with("symbol_id", Error::Backend)?;
+            let priority: i16 = row.safe_get_with("retention_priority", Error::Backend)?;
+            let bytes: Vec<u8> = row.safe_get_with("symbol_bytes", Error::Backend)?;
+            let cid: String = row.safe_get_with("content_id", Error::Backend)?;
+            symbols.push(crate::fountain::FountainSymbolV1 {
+                content_id: cid,
+                symbol_id: u32::try_from(sym_id)
+                    .map_err(|_| Error::Backend("symbol_id out of u32 range".into()))?,
+                retention_priority: u8::try_from(priority)
+                    .map_err(|_| Error::Backend("retention_priority out of u8 range".into()))?,
+                symbol_bytes: bytes,
+            });
+        }
+        Ok(Some(super::memory::assemble_fountain_content(
+            manifest, symbols,
+        )?))
+    }
 }
 
 // ─── Pipeline read surface (v0.6.0-α5, CIRISPersist#19) ───────────
@@ -1427,6 +1590,73 @@ impl Backend for PostgresBackend {
 // embedded pipeline emerges.
 
 impl PostgresBackend {
+    /// v8.0.0 (CIRISPersist#227) — read the `content_manifest` row for
+    /// `(content_id, corpus_kind)` back into a
+    /// [`FountainManifestV1`](crate::fountain::FountainManifestV1).
+    /// Shared by the fountain evict + read trait methods. `Ok(None)` when
+    /// there is no manifest.
+    async fn fountain_manifest_row(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<Option<crate::fountain::FountainManifestV1>, Error> {
+        let client = self.get_client().await?;
+        let Some(row) = client
+            .query_opt(
+                "SELECT content_id, corpus_kind, manifest_version, n_source, k_repair, \
+                 symbol_size, original_content_length, min_viable_symbols, \
+                 symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id \
+                 FROM cirislens.content_manifest \
+                 WHERE content_id = $1 AND corpus_kind = $2",
+                &[&content_id, &corpus_kind],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("read content_manifest: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let manifest_version: i32 = row.safe_get_with("manifest_version", Error::Backend)?;
+        let n_source: i64 = row.safe_get_with("n_source", Error::Backend)?;
+        let k_repair: i64 = row.safe_get_with("k_repair", Error::Backend)?;
+        let symbol_size: i64 = row.safe_get_with("symbol_size", Error::Backend)?;
+        let original_content_length: i64 =
+            row.safe_get_with("original_content_length", Error::Backend)?;
+        let min_viable: i64 = row.safe_get_with("min_viable_symbols", Error::Backend)?;
+        let symbol_hashes_json: serde_json::Value =
+            row.safe_get_with("symbol_hashes", Error::Backend)?;
+        let symbol_hashes: Vec<String> = symbol_hashes_json
+            .as_array()
+            .ok_or_else(|| Error::Backend("symbol_hashes not a JSON array".into()))?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| Error::Backend("symbol_hashes element not a string".into()))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Some(crate::fountain::FountainManifestV1 {
+            content_id: row.safe_get_with("content_id", Error::Backend)?,
+            corpus_kind: row.safe_get_with("corpus_kind", Error::Backend)?,
+            manifest_version: u16::try_from(manifest_version)
+                .map_err(|_| Error::Backend("manifest_version out of u16 range".into()))?,
+            n_source: u32::try_from(n_source)
+                .map_err(|_| Error::Backend("n_source out of u32 range".into()))?,
+            k_repair: u32::try_from(k_repair)
+                .map_err(|_| Error::Backend("k_repair out of u32 range".into()))?,
+            symbol_size: u32::try_from(symbol_size)
+                .map_err(|_| Error::Backend("symbol_size out of u32 range".into()))?,
+            original_content_length: u64::try_from(original_content_length)
+                .map_err(|_| Error::Backend("original_content_length out of u64 range".into()))?,
+            min_viable_symbols: u32::try_from(min_viable)
+                .map_err(|_| Error::Backend("min_viable_symbols out of u32 range".into()))?,
+            symbol_hashes,
+            envelope: row.safe_get_with("envelope", Error::Backend)?,
+            signature: row.safe_get_with("signature", Error::Backend)?,
+            signature_ml_dsa_65: row.safe_get_with("signature_ml_dsa_65", Error::Backend)?,
+            pqc_key_id: row.safe_get_with("pqc_key_id", Error::Backend)?,
+        }))
+    }
+
     /// v0.6.0-α5 (CIRISPersist#19) — read typed [`Features`] for a
     /// `(trace_id, thought_id)` pair from
     /// `cirislens.trace_events.extracted_features` (V009 column).

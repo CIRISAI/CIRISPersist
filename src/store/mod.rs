@@ -61,6 +61,23 @@ pub enum Error {
     #[error("backend: {0}")]
     Backend(String),
 
+    /// v8.0.0 (CIRISPersist#227) — a fountain content admission was
+    /// rejected (the #225 hybrid hard cut on the manifest, a per-symbol
+    /// SHA-256 mismatch, or a structural-invariant violation). Carries
+    /// the [`crate::fountain::FountainAdmitError`] — its `kind()` token
+    /// is preserved via [`Error::kind`]. Verify-before-mutation (AV-9):
+    /// nothing was written.
+    #[error("fountain admission rejected: {0}")]
+    FountainAdmit(#[from] crate::fountain::FountainAdmitError),
+
+    /// v8.0.0 (CIRISPersist#227) — a fountain content INTEGRITY error
+    /// surfaced on READ: a stored symbol's SHA-256 no longer matches the
+    /// signed `symbol_hashes`. This is corruption, not graceful
+    /// degradation; the read fails loudly rather than returning
+    /// unauthenticated bytes.
+    #[error("fountain integrity: {0}")]
+    FountainIntegrity(String),
+
     /// Migration phase error. v0.1.5: the `sqlstate` is extracted from
     /// the underlying tokio-postgres error chain when available so
     /// lens-side callers can distinguish 40P01 (deadlock detected),
@@ -97,6 +114,8 @@ impl Error {
             Error::NotImplemented(_) => "store_not_implemented",
             Error::Backend(_) => "store_backend",
             Error::Migration { .. } => "store_migration",
+            Error::FountainAdmit(e) => e.kind(),
+            Error::FountainIntegrity(_) => "fountain_integrity",
         }
     }
 }

@@ -1043,6 +1043,98 @@ impl Engine {
         }
     }
 
+    // ─── v8.0.0 — fountain content primitive (CIRISPersist#227) ─────
+
+    /// v8.0.0 (CIRISPersist#227) — admit a fountain-coded content unit
+    /// (manifest + N+K symbols). Verify-before-mutation: the #225 hybrid
+    /// verify on the manifest + per-symbol SHA-256 auth run first; on any
+    /// failure NOTHING is written. Dispatches to the backend's
+    /// [`Backend::put_fountain_content`](crate::store::Backend::put_fountain_content).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_fountain_content(
+        &self,
+        manifest: &crate::fountain::FountainManifestV1,
+        symbols: &[crate::fountain::FountainSymbolV1],
+    ) -> Result<(), crate::store::Error> {
+        use crate::store::Backend;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.put_fountain_content(manifest, symbols).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.put_fountain_content(manifest, symbols).await,
+        }
+    }
+
+    /// v8.0.0 (CIRISPersist#227) — typed degraded read of a fountain
+    /// content unit. `Ok(None)` when no manifest exists. Dispatches to
+    /// [`Backend::get_fountain_content`](crate::store::Backend::get_fountain_content).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn get_fountain_content(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<Option<crate::fountain::FountainContent>, crate::store::Error> {
+        use crate::store::Backend;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.get_fountain_content(content_id, corpus_kind).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.get_fountain_content(content_id, corpus_kind).await,
+        }
+    }
+
+    /// v8.0.0 (CIRISPersist#227) — evict a content unit's symbols down to
+    /// the given [`FountainTier`](crate::fountain::FountainTier) keep-
+    /// count (highest `retention_priority` first). The manifest is never
+    /// touched. The persist-owned eviction mechanism both the
+    /// DiskPressure and the consent-decay triggers call. Returns the
+    /// number of symbol rows evicted.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn evict_fountain_content_to_tier(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+        tier: crate::fountain::FountainTier,
+    ) -> Result<u64, crate::store::Error> {
+        use crate::store::Backend;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                b.evict_fountain_content_to_tier(content_id, corpus_kind, tier)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                b.evict_fountain_content_to_tier(content_id, corpus_kind, tier)
+                    .await
+            }
+        }
+    }
+
+    /// v8.0.0 (CIRISPersist#227) — the **DiskPressure trigger**: evict a
+    /// content unit to the tier the Engine's CURRENT disk-pressure
+    /// snapshot maps to (#149 `PressureTier` →
+    /// [`FountainTier::from_pressure`](crate::fountain::FountainTier::from_pressure)).
+    /// When no disk-pressure monitor is installed on this Engine view the
+    /// snapshot is `normal` ⇒ `Full` ⇒ a no-op keep-everything.
+    ///
+    /// The **consent-decay trigger** calls
+    /// [`evict_fountain_content_to_tier`](Self::evict_fountain_content_to_tier)
+    /// directly with the consent-clock's tier; FULL Consensual-Evolution
+    /// stream scheduling is a documented follow-on (see CHANGELOG
+    /// [8.0.0]).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn evict_fountain_content_for_disk_pressure(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<u64, crate::store::Error> {
+        let snapshot = self.current_disk_pressure();
+        let tier = crate::fountain::FountainTier::from_pressure(snapshot.tier);
+        self.evict_fountain_content_to_tier(content_id, corpus_kind, tier)
+            .await
+    }
+
     /// v3.4.0 (CIRISPersist#123) — build, sign, and persist a
     /// `withdraws` attestation that retracts a prior `holds_bytes`
     /// emission. The canonical envelope is produced via

@@ -7122,6 +7122,182 @@ impl PyEngine {
         })
     }
 
+    /// v8.0.0 (CIRISPersist#227) — admit a fountain-coded content unit
+    /// (manifest + N+K symbols), JSON-over-FFI. `manifest_json` decodes
+    /// to a `FountainManifestV1`; `symbols_json` to a list of
+    /// `FountainSymbolV1` (`symbol_bytes` is a JSON array of byte values,
+    /// the serde default for `Vec<u8>`).
+    ///
+    /// Verify-before-mutation: the #225 hybrid verify on the manifest +
+    /// per-symbol SHA-256 auth run first; on any failure NOTHING is
+    /// written and a `ValueError` carrying the stable error token is
+    /// raised (`fountain_admit_hybrid_required` for the classical-only
+    /// hard cut, etc.). The producer Ed25519 + ML-DSA-65 pubkeys are
+    /// asserted on the manifest envelope (`pubkey_ed25519` /
+    /// `pubkey_ml_dsa_65`), bound into the hybrid verify.
+    fn put_fountain_content(
+        &self,
+        py: Python<'_>,
+        manifest_json: &str,
+        symbols_json: &str,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        let manifest: crate::fountain::FountainManifestV1 = serde_json::from_str(manifest_json)
+            .map_err(|e| PyValueError::new_err(format!("decode manifest_json: {e}")))?;
+        let symbols: Vec<crate::fountain::FountainSymbolV1> = serde_json::from_str(symbols_json)
+            .map_err(|e| PyValueError::new_err(format!("decode symbols_json: {e}")))?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend.put_fountain_content(&manifest, &symbols).await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend.put_fountain_content(&manifest, &symbols).await
+                    })
+                }
+            })
+            .map_err(fountain_store_err_to_py)
+        })
+    }
+
+    /// v8.0.0 (CIRISPersist#227) — evict a content unit's symbols to a
+    /// named fountain tier (`"full" | "t2" | "t3" | "t4" | "t5"`),
+    /// dropping by `retention_priority DESC`. The manifest is never
+    /// touched. Returns the number of symbol rows evicted. The
+    /// persist-owned eviction mechanism both the DiskPressure and the
+    /// consent-decay triggers call.
+    fn evict_fountain_content_to_tier(
+        &self,
+        py: Python<'_>,
+        content_id: &str,
+        corpus_kind: &str,
+        tier: &str,
+    ) -> PyResult<u64> {
+        self.ensure_usable()?;
+        let tier = match tier {
+            "full" => crate::fountain::FountainTier::Full,
+            "t2" => crate::fountain::FountainTier::T2,
+            "t3" => crate::fountain::FountainTier::T3,
+            "t4" => crate::fountain::FountainTier::T4,
+            "t5" => crate::fountain::FountainTier::T5,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown fountain tier {other:?} — one of full|t2|t3|t4|t5"
+                )))
+            }
+        };
+        let content_id = content_id.to_owned();
+        let corpus_kind = corpus_kind.to_owned();
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .evict_fountain_content_to_tier(&content_id, &corpus_kind, tier)
+                            .await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .evict_fountain_content_to_tier(&content_id, &corpus_kind, tier)
+                            .await
+                    })
+                }
+            })
+            .map_err(fountain_store_err_to_py)
+        })
+    }
+
+    /// v8.0.0 (CIRISPersist#227) — typed degraded read of a fountain
+    /// content unit, JSON-over-FFI. Returns a JSON string:
+    ///
+    /// ```text
+    /// {"state":"full"|"partial"|"envelope_only",
+    ///  "present":<u32>, "n_source":<u32>, "min_viable_symbols":<u32>,
+    ///  "manifest":{...FountainManifestV1...},
+    ///  "symbols":[{...FountainSymbolV1...}, ...]}   # absent for envelope_only
+    /// ```
+    ///
+    /// Each present symbol's SHA-256 is re-verified against the signed
+    /// `symbol_hashes` on read; a mismatch raises a `ValueError`
+    /// (`fountain_integrity`) rather than returning unauthenticated
+    /// bytes. Returns `None` when no manifest exists. persist reports
+    /// availability vs thresholds; it never claims a reconstruction
+    /// probability (the consumer's codec maps `present/n_source`).
+    fn get_fountain_content(
+        &self,
+        py: Python<'_>,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        let content_id = content_id.to_owned();
+        let corpus_kind = corpus_kind.to_owned();
+        let content = catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .get_fountain_content(&content_id, &corpus_kind)
+                            .await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .get_fountain_content(&content_id, &corpus_kind)
+                            .await
+                    })
+                }
+            })
+            .map_err(fountain_store_err_to_py)
+        })?;
+        let Some(content) = content else {
+            return Ok(None);
+        };
+        let manifest = content.manifest();
+        let (state, symbols): (&str, Option<&[crate::fountain::FountainSymbolV1]>) = match &content
+        {
+            crate::fountain::FountainContent::Full { symbols, .. } => ("full", Some(symbols)),
+            crate::fountain::FountainContent::Partial { symbols, .. } => ("partial", Some(symbols)),
+            crate::fountain::FountainContent::EnvelopeOnly { .. } => ("envelope_only", None),
+        };
+        let mut view = serde_json::json!({
+            "state": state,
+            "present": content.present(),
+            "n_source": manifest.n_source,
+            "min_viable_symbols": manifest.min_viable_symbols,
+            "manifest": manifest,
+        });
+        if let Some(symbols) = symbols {
+            view["symbols"] = serde_json::to_value(symbols)
+                .map_err(|e| PyRuntimeError::new_err(format!("encode symbols: {e}")))?;
+        }
+        Ok(Some(view.to_string()))
+    }
+
     /// v0.3.6 (CIRISPersist#14) — Hybrid Ed25519 + ML-DSA-65 verify
     /// for arbitrary canonical bytes. CIRISEdge OQ-11 day-1 posture
     /// unblocker.
@@ -19600,6 +19776,25 @@ fn federation_read_err_to_py(e: crate::federation::read::ReadError) -> PyErr {
     match e {
         ReadError::Audit(inner) => audit_err_to_py(inner),
         ReadError::NotFound(_) => PyKeyError::new_err(format!("{e}")),
+    }
+}
+
+/// v8.0.0 (CIRISPersist#227) — Bridge a [`crate::store::Error`] from the
+/// fountain put/evict/read path → `PyErr`. Admission rejections + the
+/// read integrity error are caller-fault / permanent (`ValueError` with
+/// the stable `kind()` token — don't retry); backend / migration errors
+/// are transient-shaped (`RuntimeError`). Same error-token discipline as
+/// the rest of the PyO3 surface.
+fn fountain_store_err_to_py(e: crate::store::Error) -> PyErr {
+    use crate::store::Error;
+    tracing::warn!(error = %e, kind = e.kind(), "fountain store error");
+    match e {
+        Error::FountainAdmit(_) | Error::FountainIntegrity(_) | Error::Schema(_) => {
+            PyValueError::new_err(e.kind())
+        }
+        Error::NotImplemented(_) | Error::Backend(_) | Error::Migration { .. } => {
+            PyRuntimeError::new_err(format!("{e}"))
+        }
     }
 }
 

@@ -131,6 +131,15 @@ struct State {
     /// `event_id` (idempotent insert = no-op on conflict). Parity with the
     /// postgres/sqlite `hard_case_events` table (V075).
     federation_hard_case_events: HashMap<String, crate::federation::hard_case::HardCaseEvent>,
+    /// v8.0.0 (CIRISPersist#227) — fountain `content_manifest` rows,
+    /// keyed by the `(content_id, corpus_kind)` PK. NEVER evicted.
+    /// Parity with the postgres/sqlite `content_manifest` table (V084).
+    fountain_manifests: HashMap<(String, String), crate::fountain::FountainManifestV1>,
+    /// v8.0.0 (CIRISPersist#227) — fountain `content_symbols` rows, keyed
+    /// by `content_id`, inner map keyed by `symbol_id`. The rows
+    /// pressure/decay evict (by `retention_priority DESC`). Parity with
+    /// the postgres/sqlite `content_symbols` table (V084).
+    fountain_symbols: HashMap<String, HashMap<u32, crate::fountain::FountainSymbolV1>>,
 }
 
 impl Default for MemoryBackend {
@@ -162,6 +171,8 @@ impl Default for MemoryBackend {
                 blackhole_rules: HashMap::new(),
                 transport_destinations: HashMap::new(),
                 federation_hard_case_events: HashMap::new(),
+                fountain_manifests: HashMap::new(),
+                fountain_symbols: HashMap::new(),
             }),
         }
     }
@@ -659,6 +670,147 @@ impl Backend for MemoryBackend {
         rows.truncate(limit.max(0) as usize);
         Ok(rows)
     }
+
+    // ─── v8.0.0 — fountain content primitive (CIRISPersist#227) ─────
+
+    async fn put_fountain_content(
+        &self,
+        manifest: &crate::fountain::FountainManifestV1,
+        symbols: &[crate::fountain::FountainSymbolV1],
+    ) -> Result<(), Error> {
+        // Verify-before-mutation (AV-9): the full admission gate runs
+        // first; on any failure NOTHING is written. Byte-identical gate
+        // across all three backends via `check_admission_via_envelope`.
+        crate::fountain::check_admission_via_envelope(
+            manifest,
+            symbols,
+            &crate::verify::PythonJsonDumpsCanonicalizer,
+        )?;
+
+        let mut state = self.state.lock().expect("memory backend lock");
+        let key = (manifest.content_id.clone(), manifest.corpus_kind.clone());
+        // Manifest: insert-if-absent (idempotent re-admit = no-op on the
+        // manifest, mirroring ON CONFLICT DO NOTHING).
+        state
+            .fountain_manifests
+            .entry(key)
+            .or_insert_with(|| manifest.clone());
+        // Symbols: upsert by symbol_id (idempotent).
+        let bucket = state
+            .fountain_symbols
+            .entry(manifest.content_id.clone())
+            .or_default();
+        for sym in symbols {
+            bucket.insert(sym.symbol_id, sym.clone());
+        }
+        Ok(())
+    }
+
+    async fn evict_fountain_content_to_tier(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+        tier: crate::fountain::FountainTier,
+    ) -> Result<u64, Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let Some(manifest) = state
+            .fountain_manifests
+            .get(&(content_id.to_owned(), corpus_kind.to_owned()))
+            .cloned()
+        else {
+            return Ok(0);
+        };
+        let keep = tier.keep_count(&manifest) as usize;
+        let Some(bucket) = state.fountain_symbols.get_mut(content_id) else {
+            return Ok(0);
+        };
+        if bucket.len() <= keep {
+            return Ok(0);
+        }
+        // Sort present symbols by the eviction order — keep the lowest
+        // retention_priority (keep-longest); evict highest first. Tie-
+        // break on symbol_id DESC so the order is deterministic.
+        let mut present: Vec<(u32, u8)> = bucket
+            .iter()
+            .map(|(id, s)| (*id, s.retention_priority))
+            .collect();
+        // Ascending by (priority, symbol_id): the first `keep` are kept.
+        present.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        let evict_ids: Vec<u32> = present.iter().skip(keep).map(|(id, _)| *id).collect();
+        let mut evicted = 0u64;
+        for id in evict_ids {
+            if bucket.remove(&id).is_some() {
+                evicted += 1;
+            }
+        }
+        Ok(evicted)
+    }
+
+    async fn get_fountain_content(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<Option<crate::fountain::FountainContent>, Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let Some(manifest) = state
+            .fountain_manifests
+            .get(&(content_id.to_owned(), corpus_kind.to_owned()))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let mut symbols: Vec<crate::fountain::FountainSymbolV1> = state
+            .fountain_symbols
+            .get(content_id)
+            .map(|b| b.values().cloned().collect())
+            .unwrap_or_default();
+        symbols.sort_by_key(|s| s.symbol_id);
+        drop(state);
+        Ok(Some(assemble_fountain_content(manifest, symbols)?))
+    }
+}
+
+/// v8.0.0 (CIRISPersist#227) — shared read assembler: re-verify each
+/// present symbol's SHA-256 against the signed `symbol_hashes`, then
+/// classify present-count vs the manifest thresholds into the typed
+/// [`FountainContent`](crate::fountain::FountainContent). Used by every
+/// backend's `get_fountain_content` so the read contract (authenticated
+/// partials, Full/Partial/EnvelopeOnly boundary) is byte-identical.
+pub(crate) fn assemble_fountain_content(
+    manifest: crate::fountain::FountainManifestV1,
+    symbols: Vec<crate::fountain::FountainSymbolV1>,
+) -> Result<crate::fountain::FountainContent, Error> {
+    use crate::fountain::{FountainContent, FountainReadClass};
+    // Per-symbol hash re-auth on read (authenticated partials).
+    for sym in &symbols {
+        let idx = sym.symbol_id as usize;
+        let Some(expected) = manifest.symbol_hashes.get(idx) else {
+            return Err(Error::FountainIntegrity(format!(
+                "symbol_id {} has no signed hash (symbol_hashes len {})",
+                sym.symbol_id,
+                manifest.symbol_hashes.len()
+            )));
+        };
+        let got = crate::fountain::symbol_sha256_hex(&sym.symbol_bytes);
+        if &got != expected {
+            return Err(Error::FountainIntegrity(format!(
+                "stored symbol {} sha256 {} != signed hash {}",
+                sym.symbol_id, got, expected
+            )));
+        }
+    }
+    let present = symbols.len() as u32;
+    Ok(
+        match FountainContent::classify(present, manifest.n_source, manifest.min_viable_symbols) {
+            FountainReadClass::Full => FountainContent::Full { manifest, symbols },
+            FountainReadClass::Partial => FountainContent::Partial {
+                manifest,
+                symbols,
+                present,
+            },
+            FountainReadClass::EnvelopeOnly => FountainContent::EnvelopeOnly { manifest },
+        },
+    )
 }
 
 // ─── FederationDirectory impl (v0.2.0) ─────────────────────────────

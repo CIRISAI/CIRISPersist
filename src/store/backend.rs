@@ -310,6 +310,87 @@ pub trait Backend: Send + Sync {
     ) -> impl Future<Output = Result<Vec<String>, Error>> + Send {
         async { Ok(Vec::new()) }
     }
+
+    // ─── v8.0.0 — fountain content primitive (CIRISPersist#227) ─────
+    //
+    // The store-and-evict half of the `FountainContentV1` contract.
+    // persist is store-and-evict-ONLY: opaque symbol bytes, zero codec
+    // crates. Three methods, full PG/SQLite/memory parity:
+    //   * put_fountain_content — verify-before-mutation admit (the #225
+    //     hybrid verify on the manifest + per-symbol SHA-256 auth), then
+    //     transactional insert of manifest + symbols.
+    //   * evict_fountain_content_to_tier — tier × priority eviction; the
+    //     mechanism both the DiskPressure (#149) and the consent-decay
+    //     triggers call.
+    //   * get_fountain_content — typed degraded read with per-symbol
+    //     hash re-auth.
+    // See `crate::fountain` for the structs + the admission/eviction
+    // logic the three backends share.
+
+    /// v8.0.0 (CIRISPersist#227) — admit a fountain-coded content unit:
+    /// verify the manifest's hybrid signature (`HybridPolicy::Strict` —
+    /// classical-only REJECTED, the #225 hard cut) over the LOCKED
+    /// canonical bytes, verify every provided symbol's SHA-256 against
+    /// the signed `symbol_hashes`, validate structure
+    /// (`symbol_hashes.len() == n_source + k_repair`, in-range, no dups),
+    /// and ONLY THEN insert the manifest + symbols in one transaction
+    /// (AV-9 verify-before-mutation).
+    ///
+    /// On any admission failure NOTHING is written; the error carries the
+    /// stable [`crate::fountain::FountainAdmitError`] token. The producer
+    /// Ed25519 + ML-DSA-65 pubkeys are asserted on the manifest envelope
+    /// (`pubkey_ed25519` / `pubkey_ml_dsa_65`), bound into the hybrid
+    /// verify (a forged pubkey fails the signature — it cannot grant
+    /// trust by itself).
+    ///
+    /// Idempotent on `(content_id, corpus_kind)`: re-admitting the same
+    /// content (manifest ON CONFLICT DO NOTHING; symbols upserted) is
+    /// safe.
+    fn put_fountain_content(
+        &self,
+        manifest: &crate::fountain::FountainManifestV1,
+        symbols: &[crate::fountain::FountainSymbolV1],
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// v8.0.0 (CIRISPersist#227) — evict a content unit's symbols down to
+    /// the per-tier keep-count, dropping by `retention_priority DESC`
+    /// (highest-priority-value first) within the `content_id`. The
+    /// manifest is NEVER touched. Returns the number of symbol rows
+    /// evicted.
+    ///
+    /// This is the persist-owned eviction MECHANISM both orthogonal
+    /// triggers call: the DiskPressure (#149) sweeper maps a
+    /// [`crate::federation::DiskPressureSnapshot`] tier to a
+    /// [`crate::fountain::FountainTier`] via
+    /// [`FountainTier::from_pressure`](crate::fountain::FountainTier::from_pressure);
+    /// the consent-decay trigger (full Consensual-Evolution scheduling is
+    /// a documented follow-on) calls it directly.
+    ///
+    /// A no-op (returns `Ok(0)`) when the content_id is unknown or
+    /// already at/below the keep-count.
+    fn evict_fountain_content_to_tier(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+        tier: crate::fountain::FountainTier,
+    ) -> impl Future<Output = Result<u64, Error>> + Send;
+
+    /// v8.0.0 (CIRISPersist#227) — typed degraded read. Counts present
+    /// symbols and classifies vs the manifest thresholds:
+    /// `present >= n_source` ⇒ `Full`; `[min_viable, n_source)` ⇒
+    /// `Partial { present }`; `< min_viable` (incl. 0) ⇒ `EnvelopeOnly`
+    /// (the manifest always survives). Each present symbol's SHA-256 is
+    /// re-verified against the signed `symbol_hashes` on read
+    /// (authenticated partials — memory fades but can't be falsified);
+    /// a mismatch is a substrate-integrity error, not a degraded read.
+    ///
+    /// Returns `Ok(None)` when there is no manifest for
+    /// `(content_id, corpus_kind)`.
+    fn get_fountain_content(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> impl Future<Output = Result<Option<crate::fountain::FountainContent>, Error>> + Send;
 }
 
 /// Report of a batch insert.

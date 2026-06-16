@@ -5,6 +5,33 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [8.0.0] — 2026-06-16
+
+### Added — the fountain-coded content primitive (store-and-evict half): `FountainContentV1` (CIRISPersist#227)
+
+A storage-layer **content primitive** any corpus opts into: the envelope/payload split promoted to a substrate boundary. A small, signed, ALWAYS-retained **manifest** plus N+K opaque fountain **symbols**; persist owns store/evict/read; the edge/consumer codec owns reconstruction. **persist links ZERO codec crates** — no raptorq/rav1e/dav1d/opus; the symbol bytes are opaque. Contract RATIFIED + LOCKED on CIRISPersist#227 / CIRISEdge#133 (V1-frozen; additive changes get a `FountainManifestV2` + a new migration, never a V1 mutation).
+
+- **Schema (V084, both dialects, full parity):**
+  - `content_manifest(content_id, corpus_kind, manifest_version, n_source, k_repair, symbol_size, original_content_length, min_viable_symbols, symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id, admitted_at)` — PK `(content_id, corpus_kind)`. **NEVER evicted** (the always-retained Layer-1 provenance). `symbol_hashes`/`envelope` are JSONB on PG / JSON-as-TEXT on SQLite; `signature_ml_dsa_65` + `pqc_key_id` are `NOT NULL` (the hard cut — no classical-only manifests).
+  - `content_symbols(content_id, symbol_id, retention_priority, symbol_bytes)` — PK `(content_id, symbol_id)`. `symbol_bytes` BYTEA / BLOB. Index `content_symbols_evict (content_id, retention_priority)` for the eviction ORDER BY. The rows pressure/decay evict.
+  - **Zero TimescaleDB** (operator directive): plain `postgres:16` + sqlite; ordinary tables + indexes, no hypertable/CAGG/time_bucket/chunk policy.
+- **Admission gate — `Engine`/`Backend::put_fountain_content(manifest, symbols)` (verify-before-mutation, AV-9):** (1) verify the manifest hybrid signature via the existing `verify_hybrid` primitive (`HybridPolicy::Strict`) over the LOCKED canonical bytes `(content_id, corpus_kind, manifest_version, n_source, k_repair, symbol_size, original_content_length, min_viable_symbols, symbol_hashes, envelope)` using the same `PythonJsonDumpsCanonicalizer` the trace path uses — **classical-only (missing ML-DSA-65) → REJECT** (`fountain_admit_hybrid_required`), mirroring the #225 trace-tier hard cut; (2) verify each provided symbol's SHA-256 == `symbol_hashes[symbol_id]` — any mismatch rejects the WHOLE admission (`fountain_admit_symbol_hash`); (3) validate `symbol_hashes.len() == n_source + k_repair`, in-range symbol_ids, no dups. **Only then** insert manifest + symbols transactionally. The producer Ed25519 + ML-DSA-65 pubkeys are asserted on the manifest envelope (`pubkey_ed25519` / `pubkey_ml_dsa_65`) and bound into the hybrid verify (a forged pubkey fails the signature). No crypto is rolled — `verify_hybrid` / `HybridVerifier` reused.
+- **Eviction — tier × priority, persist-owned (`evict_fountain_content_to_tier(content_id, corpus_kind, tier)`):** keep-count targets per tier, evicting `ORDER BY retention_priority DESC` (highest first) within a content_id; the manifest is never touched. Full = keep `n_source + k_repair`; T2 = keep `n_source` (drop repair, still lossless); T3 = keep `[min_viable, n_source)` (partial); T4 = keep `min_viable`; T5 = keep `0` (EnvelopeOnly). The **DiskPressure trigger** (#149) maps `PressureTier` → `FountainTier` via `FountainTier::from_pressure` (`Engine::evict_fountain_content_for_disk_pressure`).
+- **Read — `get_fountain_content -> FountainContent::{Full | Partial{present} | EnvelopeOnly}`:** counts present symbols and classifies vs the manifest thresholds (`present >= n_source` ⇒ Full; `[min_viable, n_source)` ⇒ Partial; `< min_viable` ⇒ EnvelopeOnly — the manifest always survives). Each present symbol's SHA-256 is **re-verified against the signed `symbol_hashes` on read** (authenticated partials — memory fades but can't be falsified; a mismatch is a loud `fountain_integrity` error, not a degraded read). persist reports availability vs thresholds; it **never claims a reconstruction probability** (the consumer's codec maps `present/n_source`).
+- **FFI:** PyO3 `Engine.put_fountain_content(manifest_json, symbols_json)` / `Engine.evict_fountain_content_to_tier(content_id, corpus_kind, tier)` / `Engine.get_fountain_content(content_id, corpus_kind) -> json`, JSON-over-FFI, both backends.
+
+### Follow-on (explicitly NOT in this cut)
+
+- **Consent-decay scheduling:** this release exposes the eviction **mechanism** as a callable; FULL **Consensual-Evolution Protocol** stream scheduling (per-content_id consent clock — TEMPORARY 14-day, 90-day pattern decay — driving the tier down independent of disk) is a documented follow-on. The mechanism is ready; the consent-stream wiring is not built here.
+- **Codec / corpus adoption:** real raptorq symbols + trace/blob corpus opt-in land at the CIRISEdge v3.9.0 integration step (CIRISEdge#133). This cut is built + tested against SYNTHETIC N+K random-byte symbols with a real hybrid-signed manifest.
+
+### ⚠️ MAJOR — additive store surface, cut as major-as-firewall (per repo pattern)
+
+The fountain surface is purely **additive** (new module, new tables, new methods; existing `trace_events` content is untouched — this is the NEW primitive only). It is cut as **8.0.0** following the repo's major-as-firewall pattern (the same convention #225 flagged): a new substrate primitive that introduces probabilistic/degraded reads as a typed outcome is a substrate-semantics addition worth the major bump + clean downstream pin. Pin `ciris-persist>=8.0.0,<9`.
+
+### Tests
+Proven on both durable backends (`tests/fountain_content.rs`, one shared body — NO pg/sqlite asymmetry; postgres gated on `CIRIS_PERSIST_TEST_PG_URL`, uuid-suffixed content_ids; sqlite in-memory): (a) valid hybrid manifest + N+K symbols admitted + all stored; (b) classical-only manifest REJECTED, zero rows; (c) symbol-hash mismatch REJECTED (AV-9), zero rows; (d) read full → `Full`; (e) evict T2 → still `Full` (lossless), repair gone by priority DESC; (f) evict T3 → `Partial{present}`; (g) evict T5 → `EnvelopeOnly`, manifest intact, zero symbols; (h) DiskPressure tier → keep-count mapping. Plus lib unit tests for the read-class boundary, the tier→keep-count logic, and the priority-DESC eviction order. Full feature set clippy `-D warnings` + no-backend `-D warnings` + plain `postgres:16` + sqlite green; verify pins held at `v5.7.0`.
+
 ## [7.2.0] — 2026-06-15
 
 ### Added — the trace-tier hybrid hard cut: per-trace envelope signature carries + verifies ML-DSA-65 (CIRISPersist#225)
