@@ -1175,6 +1175,169 @@ impl Backend for SqliteBackend {
             manifest, symbols,
         )?))
     }
+
+    // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
+
+    async fn put_aggregated_tier(
+        &self,
+        manifest: &crate::fountain::FountainManifestV1,
+        symbols: &[crate::fountain::FountainSymbolV1],
+        agg: &crate::fountain::AggregationMetaV1,
+        aggregated_at_unix_ms: i64,
+    ) -> Result<(), Error> {
+        // Verify-before-mutation (AV-9): the composite goes through the
+        // EXISTING #225 fountain admit gate FIRST — classical-only REJECTED
+        // (hard cut). On any failure NOTHING is written. aggregation_meta
+        // is OPAQUE — never parsed.
+        crate::fountain::check_admission_via_envelope(
+            manifest,
+            symbols,
+            &crate::verify::PythonJsonDumpsCanonicalizer,
+        )?;
+
+        let symbol_hashes_text = serde_json::to_string(&manifest.symbol_hashes)
+            .map_err(|e| Error::Backend(format!("serialize symbol_hashes: {e}")))?;
+        let envelope_text = serde_json::to_string(&manifest.envelope)
+            .map_err(|e| Error::Backend(format!("serialize envelope: {e}")))?;
+        let admitted_at = chrono::Utc::now().to_rfc3339();
+        let aggregation_level = i64::try_from(agg.aggregation_level)
+            .map_err(|_| Error::Backend("aggregation_level exceeds i64".into()))?;
+        let fan_in =
+            i64::try_from(agg.fan_in).map_err(|_| Error::Backend("fan_in exceeds i64".into()))?;
+        let manifest = manifest.clone();
+        let symbols = symbols.to_vec();
+        let agg = agg.clone();
+        let conn = self.conn.clone();
+
+        (move || -> Result<(), rusqlite::Error> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            // (a) composite manifest (idempotent) + symbols.
+            tx.execute(
+                "INSERT INTO content_manifest (\
+                 content_id, corpus_kind, manifest_version, n_source, k_repair, \
+                 symbol_size, original_content_length, min_viable_symbols, \
+                 symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id, \
+                 admitted_at) VALUES \
+                 (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) \
+                 ON CONFLICT (content_id, corpus_kind) DO NOTHING",
+                rusqlite::params![
+                    manifest.content_id,
+                    manifest.corpus_kind,
+                    i64::from(manifest.manifest_version),
+                    i64::from(manifest.n_source),
+                    i64::from(manifest.k_repair),
+                    i64::from(manifest.symbol_size),
+                    manifest.original_content_length as i64,
+                    i64::from(manifest.min_viable_symbols),
+                    symbol_hashes_text,
+                    envelope_text,
+                    manifest.signature,
+                    manifest.signature_ml_dsa_65,
+                    manifest.pqc_key_id,
+                    admitted_at,
+                ],
+            )?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO content_symbols \
+                     (content_id, symbol_id, retention_priority, symbol_bytes) \
+                     VALUES (?1,?2,?3,?4) \
+                     ON CONFLICT (content_id, symbol_id) DO UPDATE SET \
+                       retention_priority = excluded.retention_priority, \
+                       symbol_bytes = excluded.symbol_bytes",
+                )?;
+                for sym in &symbols {
+                    stmt.execute(rusqlite::params![
+                        sym.content_id,
+                        i64::from(sym.symbol_id),
+                        i64::from(sym.retention_priority),
+                        sym.symbol_bytes,
+                    ])?;
+                }
+            }
+            // (b) aggregation provenance row (opaque aggregation_meta BLOB).
+            tx.execute(
+                "INSERT INTO content_aggregation (\
+                 aggregate_content_id, source_corpus_kind, aggregation_level, fan_in, \
+                 member_commitment, aggregation_meta, aggregated_at_unix_ms) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7) \
+                 ON CONFLICT (aggregate_content_id) DO NOTHING",
+                rusqlite::params![
+                    agg.aggregate_content_id,
+                    agg.source_corpus_kind,
+                    aggregation_level,
+                    fan_in,
+                    agg.member_commitment,
+                    agg.aggregation_meta,
+                    aggregated_at_unix_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })()
+        .map_err(|e| Error::Backend(format!("put_aggregated_tier: {e}")))?;
+        Ok(())
+    }
+
+    async fn get_aggregation(
+        &self,
+        aggregate_content_id: &str,
+    ) -> Result<Option<crate::fountain::AggregationRecordV1>, Error> {
+        let aggregate_content_id = aggregate_content_id.to_owned();
+        let conn = self.conn.clone();
+        let row = (move || -> Result<Option<RawAggregationRow>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT aggregate_content_id, source_corpus_kind, aggregation_level, fan_in, \
+                 member_commitment, aggregation_meta, aggregated_at_unix_ms \
+                 FROM content_aggregation WHERE aggregate_content_id = ?1",
+                rusqlite::params![aggregate_content_id],
+                Self::raw_aggregation_row,
+            )
+            .optional()
+        })()
+        .map_err(|e| Error::Backend(format!("read content_aggregation: {e}")))?;
+        row.map(Self::aggregation_record_from_raw).transpose()
+    }
+
+    async fn list_aggregations_at_level(
+        &self,
+        level: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::fountain::AggregationRecordV1>, Error> {
+        let limit = limit.max(0);
+        let conn = self.conn.clone();
+        let rows = (move || -> Result<Vec<RawAggregationRow>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT aggregate_content_id, source_corpus_kind, aggregation_level, fan_in, \
+                 member_commitment, aggregation_meta, aggregated_at_unix_ms \
+                 FROM content_aggregation WHERE aggregation_level = ?1 \
+                 ORDER BY aggregated_at_unix_ms ASC, aggregate_content_id ASC LIMIT ?2",
+            )?;
+            let out = stmt
+                .query_map(rusqlite::params![level, limit], Self::raw_aggregation_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(out)
+        })()
+        .map_err(|e| Error::Backend(format!("list content_aggregation: {e}")))?;
+        rows.into_iter()
+            .map(Self::aggregation_record_from_raw)
+            .collect()
+    }
+}
+
+/// v8.3.0 (CIRISPersist#230) — raw `content_aggregation` row carrier
+/// (avoids a tuple closure return; `aggregation_meta` stays opaque bytes).
+struct RawAggregationRow {
+    aggregate_content_id: String,
+    source_corpus_kind: String,
+    aggregation_level: i64,
+    fan_in: i64,
+    member_commitment: String,
+    aggregation_meta: Vec<u8>,
+    aggregated_at_unix_ms: i64,
 }
 
 // ─── Pipeline read+write surface (v1.5.8, CIRISPersist#57) ─────────
@@ -1280,6 +1443,38 @@ impl SqliteBackend {
             signature_ml_dsa_65: row.signature_ml_dsa_65,
             pqc_key_id: row.pqc_key_id,
         }))
+    }
+
+    /// v8.3.0 (CIRISPersist#230) — `content_aggregation` rusqlite row →
+    /// [`RawAggregationRow`]. `aggregation_meta` is read as opaque bytes.
+    fn raw_aggregation_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawAggregationRow> {
+        Ok(RawAggregationRow {
+            aggregate_content_id: r.get(0)?,
+            source_corpus_kind: r.get(1)?,
+            aggregation_level: r.get(2)?,
+            fan_in: r.get(3)?,
+            member_commitment: r.get(4)?,
+            aggregation_meta: r.get(5)?,
+            aggregated_at_unix_ms: r.get(6)?,
+        })
+    }
+
+    /// v8.3.0 (CIRISPersist#230) — [`RawAggregationRow`] →
+    /// [`AggregationRecordV1`](crate::fountain::AggregationRecordV1).
+    fn aggregation_record_from_raw(
+        row: RawAggregationRow,
+    ) -> Result<crate::fountain::AggregationRecordV1, Error> {
+        Ok(crate::fountain::AggregationRecordV1 {
+            aggregate_content_id: row.aggregate_content_id,
+            source_corpus_kind: row.source_corpus_kind,
+            aggregation_level: u64::try_from(row.aggregation_level)
+                .map_err(|_| Error::Backend("aggregation_level out of u64 range".into()))?,
+            fan_in: u64::try_from(row.fan_in)
+                .map_err(|_| Error::Backend("fan_in out of u64 range".into()))?,
+            member_commitment: row.member_commitment,
+            aggregation_meta: row.aggregation_meta,
+            aggregated_at_unix_ms: row.aggregated_at_unix_ms,
+        })
     }
 
     /// v1.5.8 (CIRISPersist#57) — SQLite parity for `read_features`.

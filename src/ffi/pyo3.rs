@@ -7339,6 +7339,188 @@ impl PyEngine {
         Ok(Some(view.to_string()))
     }
 
+    /// v8.3.0 (CEG 1.0-RC12 §19.7 / CIRISPersist#230) — admit an aggregate
+    /// composite + record its §19.7 aggregation provenance, JSON-over-FFI.
+    /// `manifest_json` / `symbols_json` are the composite's
+    /// `FountainContentV1` (same shape as `put_fountain_content`);
+    /// `agg_json` decodes to an `AggregationMetaV1` whose `aggregation_meta`
+    /// is a **base64 string** (the opaque §19.7 wire payload persist never
+    /// parses).
+    ///
+    /// Verify-before-mutation: the composite reuses the EXISTING #225
+    /// hybrid admit gate (classical-only composite REJECTED, hard cut);
+    /// nothing is written on reject. `member_commitment` + `aggregation_meta`
+    /// are stored but NOT verified this cut (§19.7-freeze-gated). One
+    /// transaction. `aggregated_at_unix_ms` stamps the fold.
+    fn put_aggregated_tier(
+        &self,
+        py: Python<'_>,
+        manifest_json: &str,
+        symbols_json: &str,
+        agg_json: &str,
+        aggregated_at_unix_ms: i64,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        let manifest: crate::fountain::FountainManifestV1 = serde_json::from_str(manifest_json)
+            .map_err(|e| PyValueError::new_err(format!("decode manifest_json: {e}")))?;
+        let symbols: Vec<crate::fountain::FountainSymbolV1> = serde_json::from_str(symbols_json)
+            .map_err(|e| PyValueError::new_err(format!("decode symbols_json: {e}")))?;
+        let agg: crate::fountain::AggregationMetaV1 = serde_json::from_str(agg_json)
+            .map_err(|e| PyValueError::new_err(format!("decode agg_json: {e}")))?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .put_aggregated_tier(&manifest, &symbols, &agg, aggregated_at_unix_ms)
+                            .await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend
+                            .put_aggregated_tier(&manifest, &symbols, &agg, aggregated_at_unix_ms)
+                            .await
+                    })
+                }
+            })
+            .map_err(fountain_store_err_to_py)
+        })
+    }
+
+    /// v8.3.0 (CIRISPersist#230) — read a composite's aggregation record,
+    /// JSON-over-FFI. Returns a JSON string with the
+    /// [`AggregationRecordV1`](crate::fountain::AggregationRecordV1) shape
+    /// (`aggregation_meta` as a base64 string — opaque bytes), or `None`
+    /// when there is no aggregation record. The O(log T) pyramid-walk read.
+    fn get_aggregation(
+        &self,
+        py: Python<'_>,
+        aggregate_content_id: &str,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        let aggregate_content_id = aggregate_content_id.to_owned();
+        let record = catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend.get_aggregation(&aggregate_content_id).await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend.get_aggregation(&aggregate_content_id).await
+                    })
+                }
+            })
+            .map_err(fountain_store_err_to_py)
+        })?;
+        match record {
+            Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
+                PyRuntimeError::new_err(format!("encode aggregation record: {e}"))
+            })?)),
+            None => Ok(None),
+        }
+    }
+
+    /// v8.3.0 (CIRISPersist#230) — list aggregation records at a pyramid
+    /// `level`, capped at `limit`, ordered by recency then id (the
+    /// O(log T) level-walk). Returns a JSON array of
+    /// [`AggregationRecordV1`](crate::fountain::AggregationRecordV1)
+    /// (`aggregation_meta` as base64 strings — opaque).
+    fn list_aggregations_at_level(
+        &self,
+        py: Python<'_>,
+        level: i64,
+        limit: i64,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let records = catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend.list_aggregations_at_level(level, limit).await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::store::Backend;
+                        backend.list_aggregations_at_level(level, limit).await
+                    })
+                }
+            })
+            .map_err(fountain_store_err_to_py)
+        })?;
+        serde_json::to_string(&records)
+            .map_err(|e| PyRuntimeError::new_err(format!("encode aggregation records: {e}")))
+    }
+
+    /// v8.3.0 (CEG 1.0-RC12 §19.7 / CIRISPersist#230) — descent
+    /// orchestration for a completed fold, JSON-over-FFI. `sources_json`
+    /// decodes to a list of `[content_id, corpus_kind]` pairs; `target_tier`
+    /// is one of `"full" | "t2" | "t3" | "t4" | "t5"` (degrade each source
+    /// to that tier) or `null` (the floor — hard-delete each source). Each
+    /// source descends while its manifest survives (`EnvelopeOnly` at the
+    /// floor); the composite is NEVER touched — descent never terminates at
+    /// zero. Returns the total symbol rows evicted.
+    fn descend_aggregated_sources(
+        &self,
+        py: Python<'_>,
+        sources_json: &str,
+        target_tier: Option<&str>,
+    ) -> PyResult<u64> {
+        self.ensure_usable()?;
+        let sources: Vec<(String, String)> = serde_json::from_str(sources_json)
+            .map_err(|e| PyValueError::new_err(format!("decode sources_json: {e}")))?;
+        let tier = match target_tier {
+            None => None,
+            Some("full") => Some(crate::fountain::FountainTier::Full),
+            Some("t2") => Some(crate::fountain::FountainTier::T2),
+            Some("t3") => Some(crate::fountain::FountainTier::T3),
+            Some("t4") => Some(crate::fountain::FountainTier::T4),
+            Some("t5") => Some(crate::fountain::FountainTier::T5),
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown target_tier {other:?} — one of full|t2|t3|t4|t5 or null (floor)"
+                )))
+            }
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime
+                        .block_on(async move { descend_sources(&*backend, &sources, tier).await })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime
+                        .block_on(async move { descend_sources(&*backend, &sources, tier).await })
+                }
+            })
+            .map_err(fountain_store_err_to_py)
+        })
+    }
+
     /// v0.3.6 (CIRISPersist#14) — Hybrid Ed25519 + ML-DSA-65 verify
     /// for arbitrary canonical bytes. CIRISEdge OQ-11 day-1 posture
     /// unblocker.
@@ -19837,6 +20019,38 @@ fn fountain_store_err_to_py(e: crate::store::Error) -> PyErr {
             PyRuntimeError::new_err(format!("{e}"))
         }
     }
+}
+
+/// v8.3.0 (CEG 1.0-RC12 §19.7 / CIRISPersist#230) — §19.7 descent
+/// orchestration over a generic backend: degrade each source to
+/// `target_tier` (or hard-delete at the floor when `None`). Composes the
+/// EXISTING eviction primitives; the composite (collective blur) is never
+/// touched — descent never terminates at zero. Returns total symbols
+/// evicted. Free helper so the FFI dispatch (which holds a backend, not an
+/// `Engine`) can call the same logic both backends share.
+async fn descend_sources<B: crate::store::Backend>(
+    backend: &B,
+    sources: &[(String, String)],
+    target_tier: Option<crate::fountain::FountainTier>,
+) -> Result<u64, crate::store::Error> {
+    let verdict = crate::fountain::EjectionVerdict::for_target_tier(target_tier);
+    let mut total = 0u64;
+    for (content_id, corpus_kind) in sources {
+        total += match verdict {
+            crate::fountain::EjectionVerdict::Keep => 0,
+            crate::fountain::EjectionVerdict::EjectToTier(tier) => {
+                backend
+                    .evict_fountain_content_to_tier(content_id, corpus_kind, tier)
+                    .await?
+            }
+            crate::fountain::EjectionVerdict::EjectHardDelete => {
+                backend
+                    .evict_fountain_content_hard_delete(content_id, corpus_kind)
+                    .await?
+            }
+        };
+    }
+    Ok(total)
 }
 
 /// v1.5.0 Phase I — Bridge [`crate::federation::backfill::BackfillError`]

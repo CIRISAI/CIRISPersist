@@ -146,6 +146,12 @@ struct State {
     /// `wholeness_witness_corpus` table (V085). Every entry already passed
     /// the verify-before-persist gate (no in-band `verified` flag — F-5).
     wholeness_witnesses: HashMap<String, Vec<crate::witness::StoredWitness>>,
+    /// v8.3.0 (CEG 1.0-RC12 §19.7 / CIRISPersist#230) — §19.7 inter-object
+    /// aggregation records, keyed by the composite's `aggregate_content_id`
+    /// (the PK). Parity with the postgres/sqlite `content_aggregation`
+    /// table (V086). `aggregation_meta` is OPAQUE bytes persist never
+    /// parses.
+    content_aggregations: HashMap<String, crate::fountain::AggregationRecordV1>,
 }
 
 impl Default for MemoryBackend {
@@ -180,6 +186,7 @@ impl Default for MemoryBackend {
                 fountain_manifests: HashMap::new(),
                 fountain_symbols: HashMap::new(),
                 wholeness_witnesses: HashMap::new(),
+                content_aggregations: HashMap::new(),
             }),
         }
     }
@@ -797,6 +804,92 @@ impl Backend for MemoryBackend {
         symbols.sort_by_key(|s| s.symbol_id);
         drop(state);
         Ok(Some(assemble_fountain_content(manifest, symbols)?))
+    }
+
+    // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
+
+    async fn put_aggregated_tier(
+        &self,
+        manifest: &crate::fountain::FountainManifestV1,
+        symbols: &[crate::fountain::FountainSymbolV1],
+        agg: &crate::fountain::AggregationMetaV1,
+        aggregated_at_unix_ms: i64,
+    ) -> Result<(), Error> {
+        // Verify-before-mutation (AV-9): the composite goes through the
+        // EXISTING #225 fountain admit gate FIRST — classical-only REJECTED
+        // (hard cut), nothing written on reject. aggregation_meta is OPAQUE.
+        crate::fountain::check_admission_via_envelope(
+            manifest,
+            symbols,
+            &crate::verify::PythonJsonDumpsCanonicalizer,
+        )?;
+
+        let mut state = self.state.lock().expect("memory backend lock");
+        // (a) composite manifest (idempotent) + symbols.
+        let key = (manifest.content_id.clone(), manifest.corpus_kind.clone());
+        state
+            .fountain_manifests
+            .entry(key)
+            .or_insert_with(|| manifest.clone());
+        let bucket = state
+            .fountain_symbols
+            .entry(manifest.content_id.clone())
+            .or_default();
+        for sym in symbols {
+            bucket.insert(sym.symbol_id, sym.clone());
+        }
+        // (b) aggregation provenance row (opaque aggregation_meta;
+        // idempotent on aggregate_content_id).
+        state
+            .content_aggregations
+            .entry(agg.aggregate_content_id.clone())
+            .or_insert_with(|| crate::fountain::AggregationRecordV1 {
+                aggregate_content_id: agg.aggregate_content_id.clone(),
+                source_corpus_kind: agg.source_corpus_kind.clone(),
+                aggregation_level: agg.aggregation_level,
+                fan_in: agg.fan_in,
+                member_commitment: agg.member_commitment.clone(),
+                aggregation_meta: agg.aggregation_meta.clone(),
+                aggregated_at_unix_ms,
+            });
+        Ok(())
+    }
+
+    async fn get_aggregation(
+        &self,
+        aggregate_content_id: &str,
+    ) -> Result<Option<crate::fountain::AggregationRecordV1>, Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .content_aggregations
+            .get(aggregate_content_id)
+            .cloned())
+    }
+
+    async fn list_aggregations_at_level(
+        &self,
+        level: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::fountain::AggregationRecordV1>, Error> {
+        let level_u64 = match u64::try_from(level) {
+            Ok(l) => l,
+            // A negative level can never match a stored (u64) level.
+            Err(_) => return Ok(Vec::new()),
+        };
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<crate::fountain::AggregationRecordV1> = state
+            .content_aggregations
+            .values()
+            .filter(|r| r.aggregation_level == level_u64)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.aggregated_at_unix_ms
+                .cmp(&b.aggregated_at_unix_ms)
+                .then_with(|| a.aggregate_content_id.cmp(&b.aggregate_content_id))
+        });
+        rows.truncate(limit.max(0) as usize);
+        Ok(rows)
     }
 }
 

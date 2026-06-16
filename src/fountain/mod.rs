@@ -32,14 +32,23 @@
 //! - [`admit`] — the verify-before-mutation admission gate (#225 hybrid
 //!   verify on the manifest + per-symbol SHA-256 auth).
 //! - [`eviction`] — the tier × keep-count policy + the #149 mapping.
+//! - [`aggregation`] — §19.7 inter-object aggregation (operator 2): the
+//!   forever-memory pyramid metadata persist records for a composite
+//!   (opaque `aggregation_meta` + navigation scalars) + the internal
+//!   noise-floor `EjectionVerdict` framing. v8.3.0 (CIRISPersist#230).
 
 pub mod admit;
+pub mod aggregation;
 pub mod eviction;
 pub mod retention;
 pub mod types;
 
 pub use admit::{
     check_admission, check_admission_via_envelope, symbol_sha256_hex, FountainAdmitError,
+};
+pub use aggregation::{
+    aggregate_corpus_kind, AggregationMetaV1, AggregationRecordV1, EjectionVerdict,
+    AGGREGATE_CORPUS_PREFIX,
 };
 pub use eviction::FountainTier;
 pub use retention::{

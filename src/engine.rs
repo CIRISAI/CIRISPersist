@@ -1226,6 +1226,125 @@ impl Engine {
         }
     }
 
+    // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
+
+    /// v8.3.0 (CEG 1.0-RC12 §19.7 / CIRISPersist#230) — admit an aggregate
+    /// composite (a `FountainContentV1`) + record its §19.7 aggregation
+    /// provenance in ONE transaction. The composite reuses the EXISTING
+    /// #225 hybrid-manifest admit gate (classical-only REJECTED, hard cut);
+    /// verify-before-mutation means nothing is written if the composite
+    /// admit fails. `agg.aggregation_meta` is stored OPAQUE (persist never
+    /// parses it — the §19.7 wire-shape firewall) and `agg.member_commitment`
+    /// is stored but NOT verified this cut (§19.7-freeze-gated). Dispatches
+    /// to [`Backend::put_aggregated_tier`](crate::store::Backend::put_aggregated_tier).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_aggregated_tier(
+        &self,
+        manifest: &crate::fountain::FountainManifestV1,
+        symbols: &[crate::fountain::FountainSymbolV1],
+        agg: &crate::fountain::AggregationMetaV1,
+        aggregated_at_unix_ms: i64,
+    ) -> Result<(), crate::store::Error> {
+        use crate::store::Backend;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                b.put_aggregated_tier(manifest, symbols, agg, aggregated_at_unix_ms)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                b.put_aggregated_tier(manifest, symbols, agg, aggregated_at_unix_ms)
+                    .await
+            }
+        }
+    }
+
+    /// v8.3.0 (CIRISPersist#230) — read a composite's aggregation record
+    /// (opaque `aggregation_meta` as bytes). `Ok(None)` when none. The
+    /// O(log T) pyramid-walk point read. Dispatches to
+    /// [`Backend::get_aggregation`](crate::store::Backend::get_aggregation).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn get_aggregation(
+        &self,
+        aggregate_content_id: &str,
+    ) -> Result<Option<crate::fountain::AggregationRecordV1>, crate::store::Error> {
+        use crate::store::Backend;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.get_aggregation(aggregate_content_id).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.get_aggregation(aggregate_content_id).await,
+        }
+    }
+
+    /// v8.3.0 (CIRISPersist#230) — list the aggregation records at a
+    /// pyramid `level`, ordered by recency then id, capped at `limit` —
+    /// the level-walk for the O(log T) forever-memory navigation.
+    /// Dispatches to
+    /// [`Backend::list_aggregations_at_level`](crate::store::Backend::list_aggregations_at_level).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn list_aggregations_at_level(
+        &self,
+        level: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::fountain::AggregationRecordV1>, crate::store::Error> {
+        use crate::store::Backend;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.list_aggregations_at_level(level, limit).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.list_aggregations_at_level(level, limit).await,
+        }
+    }
+
+    /// v8.3.0 (CEG 1.0-RC12 §19.7 / CIRISPersist#230) — **descent
+    /// orchestration** for a completed fold. After N sources fold into a
+    /// level-`L` composite, each source's gist now lives BELOW the noise
+    /// floor (its detail is in the composite). This composes the EXISTING
+    /// eviction primitives to descend the `sources`:
+    ///
+    /// - `target_tier = Some(tier)` ⇒ each source is degraded to that tier
+    ///   ([`Self::evict_fountain_content_to_tier`]); its manifest survives.
+    /// - `target_tier = None` ⇒ the floor: each source is hard-deleted
+    ///   ([`Self::evict_fountain_content_hard_delete`]); its manifest
+    ///   survives as `EnvelopeOnly` ("existed; folded into the aggregate").
+    ///
+    /// The §19.7 noise-floor framing: each step is an
+    /// [`EjectionVerdict`](crate::fountain::EjectionVerdict) on the ONE
+    /// descent axis (aging < scheduled < eviction < revocation pressure
+    /// ladder). The composite (the collective blur) is NEVER touched by
+    /// this — **descent does not terminate at zero**; the blur persists
+    /// forever. Returns the total symbol rows evicted across all sources.
+    ///
+    /// Field-level verification of the fold's `aggregation_meta` /
+    /// `member_commitment` is a §19.7-freeze-gated follow-on (CIRISVerify
+    /// v5.10.0); this orchestration is the ungated storage descent.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn descend_aggregated_sources(
+        &self,
+        sources: &[(String, String)],
+        target_tier: Option<crate::fountain::FountainTier>,
+    ) -> Result<u64, crate::store::Error> {
+        let verdict = crate::fountain::EjectionVerdict::for_target_tier(target_tier);
+        let mut total = 0u64;
+        for (content_id, corpus_kind) in sources {
+            total += match verdict {
+                // Keep (Full / no pressure): nothing to evict.
+                crate::fountain::EjectionVerdict::Keep => 0,
+                crate::fountain::EjectionVerdict::EjectToTier(tier) => {
+                    self.evict_fountain_content_to_tier(content_id, corpus_kind, tier)
+                        .await?
+                }
+                crate::fountain::EjectionVerdict::EjectHardDelete => {
+                    self.evict_fountain_content_hard_delete(content_id, corpus_kind)
+                        .await?
+                }
+            };
+        }
+        Ok(total)
+    }
+
     /// v3.4.0 (CIRISPersist#123) — build, sign, and persist a
     /// `withdraws` attestation that retracts a prior `holds_bytes`
     /// emission. The canonical envelope is produced via

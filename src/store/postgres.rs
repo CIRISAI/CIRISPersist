@@ -1604,6 +1604,165 @@ impl Backend for PostgresBackend {
             manifest, symbols,
         )?))
     }
+
+    // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
+
+    async fn put_aggregated_tier(
+        &self,
+        manifest: &crate::fountain::FountainManifestV1,
+        symbols: &[crate::fountain::FountainSymbolV1],
+        agg: &crate::fountain::AggregationMetaV1,
+        aggregated_at_unix_ms: i64,
+    ) -> Result<(), Error> {
+        // Verify-before-mutation (AV-9): the composite goes through the
+        // EXISTING #225 fountain admit gate FIRST — classical-only
+        // composite manifest REJECTED, the same hard cut. On any failure
+        // NOTHING is written (neither the composite nor the aggregation
+        // row). aggregation_meta is OPAQUE — never parsed.
+        crate::fountain::check_admission_via_envelope(
+            manifest,
+            symbols,
+            &crate::verify::PythonJsonDumpsCanonicalizer,
+        )?;
+
+        let symbol_hashes_json = serde_json::Value::Array(
+            manifest
+                .symbol_hashes
+                .iter()
+                .map(|h| serde_json::Value::String(h.clone()))
+                .collect(),
+        );
+        let manifest_version = i32::from(manifest.manifest_version);
+        let n_source = i64::from(manifest.n_source);
+        let k_repair = i64::from(manifest.k_repair);
+        let symbol_size = i64::from(manifest.symbol_size);
+        let original_content_length = i64::try_from(manifest.original_content_length)
+            .map_err(|_| Error::Backend("original_content_length exceeds i64".into()))?;
+        let min_viable = i64::from(manifest.min_viable_symbols);
+        let aggregation_level = i64::try_from(agg.aggregation_level)
+            .map_err(|_| Error::Backend("aggregation_level exceeds i64".into()))?;
+        let fan_in =
+            i64::try_from(agg.fan_in).map_err(|_| Error::Backend("fan_in exceeds i64".into()))?;
+        let agg_meta: &[u8] = &agg.aggregation_meta;
+
+        let mut client = self.get_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| Error::Backend(format!("begin aggregation tx: {e}")))?;
+
+        // (a) The composite manifest (idempotent) + its symbols.
+        tx.execute(
+            "INSERT INTO cirislens.content_manifest \
+             (content_id, corpus_kind, manifest_version, n_source, k_repair, \
+              symbol_size, original_content_length, min_viable_symbols, \
+              symbol_hashes, envelope, signature, signature_ml_dsa_65, pqc_key_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+             ON CONFLICT (content_id, corpus_kind) DO NOTHING",
+            &[
+                &manifest.content_id,
+                &manifest.corpus_kind,
+                &manifest_version,
+                &n_source,
+                &k_repair,
+                &symbol_size,
+                &original_content_length,
+                &min_viable,
+                &symbol_hashes_json,
+                &manifest.envelope,
+                &manifest.signature,
+                &manifest.signature_ml_dsa_65,
+                &manifest.pqc_key_id,
+            ],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("insert composite content_manifest: {e}")))?;
+
+        for sym in symbols {
+            let symbol_id = i64::from(sym.symbol_id);
+            let retention_priority = i16::from(sym.retention_priority);
+            tx.execute(
+                "INSERT INTO cirislens.content_symbols \
+                 (content_id, symbol_id, retention_priority, symbol_bytes) \
+                 VALUES ($1,$2,$3,$4) \
+                 ON CONFLICT (content_id, symbol_id) DO UPDATE SET \
+                   retention_priority = EXCLUDED.retention_priority, \
+                   symbol_bytes = EXCLUDED.symbol_bytes",
+                &[
+                    &sym.content_id,
+                    &symbol_id,
+                    &retention_priority,
+                    &sym.symbol_bytes,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert composite content_symbols: {e}")))?;
+        }
+
+        // (b) The aggregation provenance row (opaque aggregation_meta).
+        tx.execute(
+            "INSERT INTO cirislens.content_aggregation \
+             (aggregate_content_id, source_corpus_kind, aggregation_level, fan_in, \
+              member_commitment, aggregation_meta, aggregated_at_unix_ms) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7) \
+             ON CONFLICT (aggregate_content_id) DO NOTHING",
+            &[
+                &agg.aggregate_content_id,
+                &agg.source_corpus_kind,
+                &aggregation_level,
+                &fan_in,
+                &agg.member_commitment,
+                &agg_meta,
+                &aggregated_at_unix_ms,
+            ],
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("insert content_aggregation: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| Error::Backend(format!("commit aggregation tx: {e}")))?;
+        Ok(())
+    }
+
+    async fn get_aggregation(
+        &self,
+        aggregate_content_id: &str,
+    ) -> Result<Option<crate::fountain::AggregationRecordV1>, Error> {
+        let client = self.get_client().await?;
+        let Some(row) = client
+            .query_opt(
+                "SELECT aggregate_content_id, source_corpus_kind, aggregation_level, fan_in, \
+                 member_commitment, aggregation_meta, aggregated_at_unix_ms \
+                 FROM cirislens.content_aggregation WHERE aggregate_content_id = $1",
+                &[&aggregate_content_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("read content_aggregation: {e}")))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self::aggregation_record_from_row(&row)?))
+    }
+
+    async fn list_aggregations_at_level(
+        &self,
+        level: i64,
+        limit: i64,
+    ) -> Result<Vec<crate::fountain::AggregationRecordV1>, Error> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT aggregate_content_id, source_corpus_kind, aggregation_level, fan_in, \
+                 member_commitment, aggregation_meta, aggregated_at_unix_ms \
+                 FROM cirislens.content_aggregation WHERE aggregation_level = $1 \
+                 ORDER BY aggregated_at_unix_ms ASC, aggregate_content_id ASC LIMIT $2",
+                &[&level, &limit.max(0)],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("list content_aggregation: {e}")))?;
+        rows.iter().map(Self::aggregation_record_from_row).collect()
+    }
 }
 
 // ─── Pipeline read surface (v0.6.0-α5, CIRISPersist#19) ───────────
@@ -1681,6 +1840,27 @@ impl PostgresBackend {
             signature_ml_dsa_65: row.safe_get_with("signature_ml_dsa_65", Error::Backend)?,
             pqc_key_id: row.safe_get_with("pqc_key_id", Error::Backend)?,
         }))
+    }
+
+    /// v8.3.0 (CIRISPersist#230) — decode a `content_aggregation` row into
+    /// an [`AggregationRecordV1`](crate::fountain::AggregationRecordV1).
+    /// `aggregation_meta` comes back as opaque bytes (never parsed).
+    fn aggregation_record_from_row(
+        row: &tokio_postgres::Row,
+    ) -> Result<crate::fountain::AggregationRecordV1, Error> {
+        let aggregation_level: i64 = row.safe_get_with("aggregation_level", Error::Backend)?;
+        let fan_in: i64 = row.safe_get_with("fan_in", Error::Backend)?;
+        Ok(crate::fountain::AggregationRecordV1 {
+            aggregate_content_id: row.safe_get_with("aggregate_content_id", Error::Backend)?,
+            source_corpus_kind: row.safe_get_with("source_corpus_kind", Error::Backend)?,
+            aggregation_level: u64::try_from(aggregation_level)
+                .map_err(|_| Error::Backend("aggregation_level out of u64 range".into()))?,
+            fan_in: u64::try_from(fan_in)
+                .map_err(|_| Error::Backend("fan_in out of u64 range".into()))?,
+            member_commitment: row.safe_get_with("member_commitment", Error::Backend)?,
+            aggregation_meta: row.safe_get_with("aggregation_meta", Error::Backend)?,
+            aggregated_at_unix_ms: row.safe_get_with("aggregated_at_unix_ms", Error::Backend)?,
+        })
     }
 
     /// v0.6.0-α5 (CIRISPersist#19) — read typed [`Features`] for a

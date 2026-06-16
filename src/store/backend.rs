@@ -415,6 +415,62 @@ pub trait Backend: Send + Sync {
         content_id: &str,
         corpus_kind: &str,
     ) -> impl Future<Output = Result<Option<crate::fountain::FountainContent>, Error>> + Send;
+
+    // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
+    //
+    // The forever-memory storage half of operator 2. persist is
+    // codec-free: the N→1 resampling is edge-side; persist stores the
+    // composite (a FountainContentV1, via the EXISTING #225 admit gate) +
+    // records the aggregation provenance. The §19.7 wire payload is OPAQUE
+    // bytes (`aggregation_meta`) persist never parses — the wire-churn
+    // firewall (the §19.7 contract is not yet frozen).
+
+    /// v8.3.0 (CEG 1.0-RC12 §19.7 / CIRISPersist#230) — admit an aggregate
+    /// composite + record its aggregation provenance, in ONE transaction:
+    ///
+    /// 1. Admit the composite via the EXISTING fountain admit path
+    ///    ([`Self::put_fountain_content`] / `check_admission_via_envelope`
+    ///    — the #225 hybrid-manifest verify + per-symbol SHA-256; a
+    ///    classical-only composite manifest is REJECTED, the same hard
+    ///    cut). Verify-before-mutation (AV-9): nothing is written if the
+    ///    composite admit fails.
+    /// 2. Insert the `content_aggregation` row.
+    ///
+    /// `manifest.content_id` MUST equal `agg.aggregate_content_id` and
+    /// `manifest.corpus_kind` MUST be
+    /// `"aggregate:<agg.source_corpus_kind>"`. The composite is PQC-verified
+    /// (it's a FountainContentV1). `agg.member_commitment` +
+    /// `agg.aggregation_meta` are STORED (opaque); persist does NOT verify
+    /// them this cut (§19.7-freeze-gated, CIRISVerify v5.10.0).
+    ///
+    /// Idempotent on `aggregate_content_id` (the row is `ON CONFLICT DO
+    /// NOTHING`; the composite reuses the fountain idempotency).
+    fn put_aggregated_tier(
+        &self,
+        manifest: &crate::fountain::FountainManifestV1,
+        symbols: &[crate::fountain::FountainSymbolV1],
+        agg: &crate::fountain::AggregationMetaV1,
+        aggregated_at_unix_ms: i64,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// v8.3.0 (CIRISPersist#230) — read the aggregation record for a
+    /// composite content_id (the opaque `aggregation_meta` comes back as
+    /// raw bytes). `Ok(None)` when there is no aggregation record. The
+    /// O(log T) pyramid-walk point read.
+    fn get_aggregation(
+        &self,
+        aggregate_content_id: &str,
+    ) -> impl Future<Output = Result<Option<crate::fountain::AggregationRecordV1>, Error>> + Send;
+
+    /// v8.3.0 (CIRISPersist#230) — list the aggregation records at a
+    /// pyramid level, ordered by `aggregated_at_unix_ms ASC` then
+    /// `aggregate_content_id ASC` (deterministic), capped at `limit`. The
+    /// level-walk for the O(log T) forever-memory navigation.
+    fn list_aggregations_at_level(
+        &self,
+        level: i64,
+        limit: i64,
+    ) -> impl Future<Output = Result<Vec<crate::fountain::AggregationRecordV1>, Error>> + Send;
 }
 
 /// Report of a batch insert.
