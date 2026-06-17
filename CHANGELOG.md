@@ -5,6 +5,16 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [8.5.0] — 2026-06-16
+
+### Added — `pub fn ffi::pyo3::register` cross-crate registration hook (CIRISPersist#231)
+
+PyO3 0.29 emits a `#[pyfunction]`/`#[pymodule]`'s registration glue with the annotated item's own visibility, so the free `reset_engine` function (and the `ciris_persist` module body) were unreachable from another crate — forcing the agent to keep a standalone `ciris_persist` wheel just for `reset_engine`, reintroducing the two-registry hazard the CIRISServer one-wheel (CIRISServer#4 / the #109 cross-wheel type-identity bug class) exists to remove.
+
+- New `pub fn register(py, m: &Bound<PyModule>) -> PyResult<()>` under `ffi::pyo3` adds `Engine`, the scoring-stream + reconsider-DoS-guard classes, the full typed exception hierarchy, `__version__` / `SUPPORTED_SCHEMA_VERSIONS`, and `reset_engine` to a **caller-provided** module. CIRISServer's `mod python` calls it on the `ciris_server.persist` submodule → one `.so`, one PyO3 type registry.
+- The `#[pymodule] ciris_persist` standalone-wheel entry point now **delegates to `register`** (single source of truth — both paths register an identical surface). Mirrors `ciris-lens-core`'s `pub fn register`.
+- Purely additive: no wire/behavior change; the standalone wheel is byte-equivalent. Unblocks the one-wheel re-export so the agent can drop its standalone persist wheel. Closes #231.
+
 ## [8.4.0] — 2026-06-16
 
 ### Changed — re-pin CIRISVerify v5.9.0 → v5.10.0 (§19.7 verifiers + conformance vectors)

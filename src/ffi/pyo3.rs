@@ -23287,8 +23287,19 @@ impl ScoringFactorStream {
     }
 }
 
-#[pymodule]
-fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+/// v8.5.0 (CIRISPersist#231) — the cross-crate registration hook for the
+/// CIRISServer one-wheel re-export (CIRISServer#4). Adds `Engine`, the
+/// scoring-stream + reconsider-DoS-guard classes, the typed exception
+/// hierarchy, `__version__` / `SUPPORTED_SCHEMA_VERSIONS`, and the free
+/// `reset_engine` function to a **caller-provided** module. CIRISServer's
+/// `mod python` calls this on its `ciris_server.persist` submodule so one
+/// `.so` hosts one PyO3 type registry — killing the CIRISPersist#109
+/// cross-wheel type-identity hazard the one-wheel exists to remove.
+///
+/// Mirrors `ciris-lens-core`'s `pub fn register`. The `#[pymodule]` entry
+/// point below (the standalone `ciris_persist` wheel) simply delegates
+/// here, so the two paths register an identical surface.
+pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEngine>()?;
     m.add_class::<ScoringFactorStream>()?;
     // v3.8.0 (CIRISPersist#151) — register the stateful
@@ -23351,6 +23362,15 @@ fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(pyo3::wrap_pyfunction!(install_panic_logger, m)?)?;
     }
     Ok(())
+}
+
+/// The standalone `ciris_persist` wheel entry point. Delegates to
+/// [`register`] so the standalone wheel and the CIRISServer one-wheel
+/// re-export (CIRISPersist#231 / CIRISServer#4) expose the identical
+/// surface from a single source of truth.
+#[pymodule]
+fn ciris_persist(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    register(py, m)
 }
 
 /// v3.12.x (CIRISPersist#156) — diagnostic counter exposed to Python.
