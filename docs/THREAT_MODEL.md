@@ -1,14 +1,34 @@
 # CIRISPersist Threat Model
 
-**Status:** v0.4.0 — adds federation directory (v0.2.0), hybrid
-Ed25519+ML-DSA-65 PQC posture (v0.2.0), 2.7.9 wire-format
-extensions (v0.3.0–v0.3.4), per-key DSAR primitive (v0.3.6),
+**Status:** v8.5.0 (CEG 1.0-RC17 — §19 / §19.7 holonomic
+substrate). Earlier surface preserved verbatim: federation
+directory (v0.2.0), hybrid Ed25519+ML-DSA-65 PQC posture (v0.2.0),
+2.7.9 wire-format extensions (v0.3.0–v0.3.4), per-key DSAR + the
 `verify_hybrid` arbitrary-canonical-bytes surface (v0.3.6),
-edge outbound queue durable substrate (v0.4.0), full verify
-surface exposed (v0.4.0), accord_public_keys dual-read fallback
-retired (v0.4.0).
+outbound queue / read primitives / panic isolation (v0.4.0–v0.5.3),
+graph/audit/TSDB/incident substrates (v0.8.x), cohort_scope
+read/write gates (v4.0). The v7.2.0–v8.5.0 cut adds the **store-path
+PQC hard cut** (#225) and the **holonomic / forever-memory**
+substrate (#227–#231): the fountain content primitive, the §19.1
+WholenessWitness corpus + divergence router, and the §19.7
+aggregation pyramid — §3.14, AV-59..AV-66.
 **v0.1.2 baseline** (AV-1..AV-26) preserved verbatim;
-v0.2.0–v0.3.6 attack surface in §3.7..§3.10 (AV-28..AV-39).
+v0.2.0–v0.3.6 attack surface in §3.7..§3.10 (AV-28..AV-39);
+holonomic surface in §3.14 (AV-59..AV-66).
+**RC17 compliance:** persist is COMPLIANT and rolls no §19 crypto —
+it calls verify-core's `compute_merkle_root` / `verify_witness` /
+`verify_aggregation_meta` / `verify_member_commitment` /
+`ejection_verdict`. The §19.1 Merkle scheme was **frozen at RC15**
+(NO RFC-6962 `0x00`/`0x01` prefix); CVE-2012-2459 odd-node
+malleability is non-exploitable here (every witness /
+`member_commitment` root is mandatorily hybrid-signed,
+`member_commitment` is verified by full source-id-list recomputation
+not partial inclusion proofs, and reconciliation is between
+accountable signed equivocation-checked peers — see §3.14). Persist
+inherits this and does not roll Merkle. The additive
+`EjectAggregatedTierOnly { tier }` `EjectionVerdict` variant
+(RC16/RC17) is a tracked follow-on pending a verify-core exposure
+(v5.10.0 does not expose it yet), NOT a current gap.
 Updated each minor release.
 **Audience:** lens / edge / registry / partner-site integrators,
 federation peers, security reviewers.
@@ -203,13 +223,20 @@ The adversary is assumed to NOT have:
 
 ## 3. Attack Vectors
 
-Thirty-nine attack vectors organized by adversary goal. AV-1..AV-26
+Sixty-six attack vectors organized by adversary goal. AV-1..AV-26
 are the v0.1.x baseline (preserved verbatim from the v0.1.2 doc).
 AV-27 covers v0.1.7..v0.1.9 keyring-storage hardening. AV-28..AV-39
 cover the v0.2.0..v0.3.6 surface (federation directory, hybrid PQC,
 cross-shape injection, cohort identity, per-key DSAR,
-`verify_hybrid` arbitrary-canonical-bytes). Each AV lists the
-attack, the primary mitigation, the secondary mitigation, and the
+`verify_hybrid` arbitrary-canonical-bytes). AV-40..AV-58 cover the
+v0.4.0..v4.0 surface (outbound queue, legacy schema, read primitives,
+panic isolation, §6.1/§7.0/§10.1.2 composition gates, graph/audit/TSDB/
+incident substrates, cohort_scope read/write gates). AV-59..AV-66
+(§3.14) cover the v7.2.0..v8.5.0 holonomic / forever-memory surface
+(store-path PQC hard cut, WholenessWitness equivocation /
+divergence-router / anti-rollback / WW-2 leaf filter, aggregation-meta
+and member-commitment integrity, rarity-vs-revocation). Each AV lists
+the attack, the primary mitigation, the secondary mitigation, and the
 residual risk.
 
 ### 3.1 Forgery — adversary wants their bytes counted as real evidence
@@ -1673,6 +1700,263 @@ The precedence still resolves correctly (latest `RECANTS` wins);
 the audit-chain growth is bounded by per-key emission rate caps
 (AV-46 mitigation 3).
 
+### 3.14 Holonomic substrate & store-path PQC (CEG §19 / §19.7, v7.2.0–v8.5.0)
+
+The §19 holonomic / forever-memory substrate (#225, #227–#231) adds a
+durable, replicated, kept-for-posterity content corpus, a WholenessWitness
+divergence-detection corpus, and a §19.7 aggregation pyramid. Its threat
+surface is dominated by two classes: **harvest-now-decrypt-later (HNDL)
+forge-later** against a corpus that outlives the classical primitive, and
+**reconciliation / divergence-router abuse** where a forged or stale witness
+tries to drive the merge it is only supposed to *detect*. The §19 verifiers
+themselves are frozen in `ciris_verify_core::holonomic` (verify v5.10.0);
+persist **calls** them (`verify_witness`, `compare_witnesses`,
+`verify_aggregation_meta`, `verify_member_commitment`, `ejection_verdict`,
+`compute_merkle_root`) and re-rolls no Merkle / preimage / signature logic.
+The §19.1 Merkle scheme was **frozen at CEG 1.0-RC15** with no RFC-6962
+`0x00`/`0x01` leaf/node prefix; the CVE-2012-2459 odd-node-duplication
+malleability is non-exploitable in this construction's uses because (1) every
+witness and `member_commitment` root is **mandatorily hybrid-signed** — no
+consumer relies on an unsigned root, (2) `member_commitment` is verified by
+**full source-id-list recomputation**, never by partial inclusion proofs
+against a bare root, and (3) §19.1 reconciliation is between accountable,
+signed, equivocation-checked peers. Persist **inherits** this frozen scheme;
+it does not roll Merkle and adopts no prefix.
+
+#### AV-59: HNDL forge-later on the durable trace corpus
+
+**Attack**: a CRQC-era adversary who has broken Ed25519 mints a backdated
+`CompleteTrace` under any historical key id and injects it into the
+permanent, content-addressed, replicated trace corpus. Content-addressing is
+no defense — the adversary hashes their own forgery. The corpus is kept for
+posterity, so it outlives the classical primitive.
+
+**Mitigation v7.2.0 (#225, the hard cut)**: on `VerifyMode::Full`,
+`IngestPipeline::verify_complete_trace` verifies **both** signature halves
+via `verify_hybrid` (`HybridPolicy::Strict`) — `verify_trace_hybrid` replaces
+the Ed25519-only `verify_trace`. A Full-mode classical-only trace (missing
+the ML-DSA-65 half) is **rejected at admission** (`Verify(HybridRequired)`,
+token `verify_hybrid_required`) — not warned. There is **no
+`require_hybrid: false` posture**. This is the store-path PQC mandate of CEG
+§10.1.5.1.1. The producer's ML-DSA-65 pubkey rides the envelope and is bound
+into the hybrid verify, so a forged PQC pubkey fails the signature.
+
+**Secondary**: verify-before-mutation ordering is unchanged — the hybrid gate
+is step 2, strictly before scrub/decompose/insert; dedup is NOT moved ahead
+of verify (that would be an AV-9 suppression/probe oracle). The same hard cut
+applies to fountain manifests (`fountain_admit_hybrid_required`) and to
+aggregation meta (AV-65).
+
+**Residual**: the `2.7.legacy` import path (`VerifyMode::TrustPreVerified`)
+is exempt — it carries the original 1.9.x Ed25519 sig as provenance only
+(imported pre-verified, not re-verifiable). The hard cut applies to new
+federation writes only. Corpus/bandwidth cost rises ~50× (per-trace sig
+~64 B → ~3.4 KB hybrid); accepted as the price of HNDL-completeness.
+
+#### AV-60: WholenessWitness equivocation (two signed roots, one peer)
+
+**Attack**: a peer signs two *different* WholenessWitness roots for the same
+epoch — claiming two incompatible views of what it holds — to later
+repudiate one of them or to confuse reconciliation.
+
+**Mitigation v8.2.0 (#228/#229)**: over the verified corpus,
+`reconcile_peer_witnesses` + `witness::classify_stored` run
+`compare_witnesses`; an **Equivocation** verdict **RETAINS both witnesses**
+and emits `hard_case:witness_equivocation` (reusing the #146
+`record_hard_case` emitter, idempotent on a deterministic `event_id`). The
+pair is **NEVER reconciled, merged, or deleted** (§19 N4, non-repudiable) —
+the equivocation is preserved as durable accountable evidence, not resolved
+away.
+
+**Secondary**: only **verified** witnesses enter the corpus
+(`put_wholeness_witness` runs the PQC gate before any row is durable, AV-62),
+so an equivocation is always between two signatures the peer provably made;
+the re-scan is idempotent (no duplicate hard_case rows).
+
+**Residual**: persist records and flags the equivocation; *acting* on it
+(de-rating the peer, federation-governance response) is a downstream
+consumer's policy over the `hard_case` stream — the substrate detects and
+preserves, it does not adjudicate.
+
+#### AV-61: Witness divergence escalated to drive the quorum-merge
+
+**Attack**: an adversary submits a witness whose root *diverges* from a
+peer's and attempts to have that witness **decide** the resulting merge —
+e.g. supply a "winning" root or a fragment that resurrects a revoked key or
+replaces the `monotonic_quorum` / `revision` outcome. This is the worst-case
+bug class: the divergence *detector* being mistaken for a divergence
+*resolver*.
+
+**Mitigation v8.2.0 (#228/#229, security-critical)**: a **Divergent**
+verdict returns only the directive `WitnessReconcileAction::TriggerQuorumMerge`,
+which **carries NO winner and NO root**. The witness triggers the
+**pre-existing V058 R1/Q1 quorum-merge** for `revocation` / `partner_record` /
+`org_membership` (`QUORUM_MERGE_SUBJECT_KINDS`); the caller fulfils it by
+re-running `operational::resolve_monotonic_quorum` / the `revision`
+anti-rollback over the **stored rows**. The witness root **never enters that
+resolution** — there is **no "reconstitute from any fragment" path**, so a
+revoked key cannot be resurrected, and the witness cannot replace
+`monotonic_quorum` / `revision`.
+
+**Secondary**: the divergence path is structurally subordinate by
+construction — the directive type *cannot* carry a root, so a caller cannot
+accidentally let a witness decide a merge. Regression-tested
+(`tests/wholeness_witness.rs` (e)): Divergent → `TriggerQuorumMerge` only,
+then `resolve_monotonic_quorum` keeps the **REVOKED** record (a revoked key
+is not resurrected).
+
+**Residual**: the merge correctness rests on the V058 quorum-merge resolvers
+(their own threat surface), not on the witness — which is the intended
+trust boundary. The witness only *signals* that a merge should run.
+
+#### AV-62: Witness anti-rollback / eclipse (stale signed witness replay)
+
+**Attack**: an adversary captures a peer's older, validly-signed witness and
+replays it as if current — an eclipse/rollback attempt to make the peer's
+stale view of its holdings authoritative again.
+
+**Mitigation v8.2.0 (#228/#229)**: `witness::accept_if_monotonic` +
+`FederationDirectory::last_witness_epoch_for_peer` enforce a **strict-epoch
+monotonic guard** — before a peer's witness is acted on as newer, its
+`epoch_id` MUST strictly advance the last accepted epoch for that peer; a
+stale or replayed epoch is rejected (§19 N4). Separately,
+`put_wholeness_witness` runs **`verify_witness` PQC-before-persist** (N3 /
+§10.1.5.1.1): a missing/invalid ML-DSA-65 half is rejected at the gate
+(`Error::WitnessAdmit`, token `witness_admit_hybrid_required`) and **nothing
+is written** — store-then-quarantine is non-conformant (verify-before-mutation,
+AV-9).
+
+**Secondary**: the corpus is pruned to the last-K (`WITNESS_CORPUS_K = 8`)
+verified witnesses per peer, idempotent on the PK
+`(peer_id, epoch_id, observed_at_unix_ms)`; there is **no `verified` column**
+(§19.0 F-5) — the verdict is recomputed at the gate, never read from the wire.
+
+**Residual**: the monotonic guard is per-peer epoch ordering; it does not
+defend against a peer that legitimately re-signs an honest stale view at a
+*new* epoch (that is the peer's own correctness concern, surfaced via the
+divergence path AV-61, not a replay).
+
+#### AV-63: WW-2 deniable-content re-attribution
+
+**Attack**: a naive "gather every CEG envelope this peer holds" sweep would
+fold **anonymous-tier** or `cohort_scope: self` rows into the signed,
+federating WholenessWitness root — re-attributing deniable / self-private
+content to a stable, accountable `peer_id` and leaking it through
+`claim_namespaces`.
+
+**Mitigation v8.2.0 (#228/#229)**: `witness::build_local_witness`
+(persist's responsibility — persist owns the leaf walk) **FILTERS OUT**
+anonymous-tier rows, `cohort_scope: self` rows, and any leaf whose namespace
+itself names self/anonymous **BEFORE** computing the Merkle root; the
+witness's `claim_namespaces` is drawn only from the survivors, so it
+**provably never names anonymous/self** (WW-2 namespace guard, re-checked by
+`verify_witness` at admission).
+
+**Secondary**: the namespace guard is enforced on **both** sides — persist
+builds clean and `verify_witness` rejects a witness whose namespaces name
+self/anonymous, so a hand-crafted malicious witness is also rejected at the
+gate (AV-62).
+
+**Residual**: the filter operates on the persist-side classification of a
+row's tier/`cohort_scope`; correct tagging at write time is the AV-57/AV-58
+write-side surface (a row mis-tagged non-self at write would not be filtered
+— but that mis-tag is itself the AV-58 vector, gated separately).
+
+#### AV-64: Forged `aggregation_meta` on the store path
+
+**Attack**: an adversary submits a `put_aggregated_tier` call with a tampered
+or unsigned `aggregation_meta` (wrong `member_commitment`, fabricated descent
+fields, or a classical-only signature) to plant a forged §19.7 composite in
+the forever-memory pyramid.
+
+**Mitigation v8.4.0 (#230)**: `put_aggregated_tier` runs the **§19.7.1
+bound-hybrid gate at admission, BEFORE persistence** (verify-before-mutation;
+never store-then-quarantine). Persist reconstructs the verify-core wire
+`AggregationMetaV1` from the §19.7.1 normative fields + the bound-hybrid
+signature (`AggregationMetaVerifyInputsV1`), resolves the aggregator hybrid
+pubkeys off the composite manifest envelope (`pubkey_ed25519` /
+`pubkey_ml_dsa_65`, bound into the verify), and calls
+`ciris_verify_core::holonomic::verify_aggregation_meta`. A **missing/invalid
+ML-DSA-65 half is REJECTED** (`aggregation_meta_hybrid_required`, the same
+store-path PQC mandate as AV-59, §10.1.5.1.1); a tampered meta
+(sig ≠ §19.7.1 preimage) rejects (`aggregation_meta_invalid`); both leave
+**ZERO rows**. The composite manifest still rides the existing #225 hybrid
+admit gate in the same transaction.
+
+**Secondary**: the storage column stays **opaque** BYTEA/BLOB (V086 unchanged
+across the §19.7 freeze — the wire-churn firewall); the verification inputs
+are **admission-only and are never persisted**, so a stored row cannot carry
+unverified meta that a later read would trust.
+
+**Residual**: the new `EjectAggregatedTierOnly { tier }` `EjectionVerdict`
+variant (CEG RC16/RC17) is an additive future item — verify v5.10.0's enum
+does not yet expose it — so the tier-granular single-stratum shed is a
+tracked follow-on, **not a current gap** (persist drives the existing
+`EjectToTier` / `EjectHardDelete` verdicts today).
+
+#### AV-65: Forged aggregation source set (descent integrity)
+
+**Attack**: an adversary calls `descend_aggregated_sources` with a forged set
+of source `content_id`s — one that does not re-derive the committed
+`member_commitment` — to drive eviction/descent of items that were never
+members of the composite (using descent as a force-evict channel).
+
+**Mitigation v8.4.0 (#230)**: `descend_aggregated_sources` loads the stored
+aggregation record and calls **`verify_member_commitment` over the
+caller-supplied source `content_id`s BEFORE descending** — a forged member
+set (one that does not re-derive the committed `member_commitment`) is
+**REJECTED** and cannot drive eviction. Sources descend in the canonical
+`descend_order` (§19.7.2 lexicographic member-id order), so a returned list
+re-derives the parent's `member_commitment` byte-for-byte. This is the
+§19.1 Merkle scheme's intended use: **full source-id-list recomputation,
+never a partial inclusion proof** against a bare root — which is exactly why
+the RC15 no-RFC-6962-prefix freeze leaves CVE-2012-2459 odd-node malleability
+non-exploitable here.
+
+**Secondary**: the `member_commitment` is mandatorily hybrid-signed as part
+of the composite manifest (AV-64), so the committed root an adversary must
+re-derive is itself authenticated; a forged member set fails recomputation
+against a root it cannot forge.
+
+**Residual**: descent integrity is a function of the committed member list;
+it does not attest *why* a given member was aggregated (the N→1 resampling
+compute is edge-side, CIRISEdge#133/#134) — persist verifies membership, not
+the codec's resampling fidelity.
+
+#### AV-66: Rarity-driven retention resurrecting revoked content
+
+**Attack**: an adversary inflates a `content_id`'s rarity / `retention_priority`
+(e.g. via the swarm rarity reweight packed into the priority byte's top bits)
+so that a **revoked / withdrawn** content survives eviction — using rarity as
+a channel to keep individually-recoverable content that consent has
+withdrawn (the §19.3 N5 erasure-vs-rarity tension).
+
+**Mitigation v8.1.0 / v8.2.0 (#228, N5)**:
+`evict_fountain_content_hard_delete` is a **SEPARATE path that never consults
+`retention_priority`** — it drops **every** symbol row unconditionally,
+leaving the manifest as the always-retained `EnvelopeOnly` provenance. The
+tier/keep-count path (`evict_fountain_content_to_tier`) is the *only* consumer
+of `retention_priority` (and of any future swarm rarity reweight), so a high
+rarity score **cannot reach — let alone resurrect — a revoked content**.
+`evict_fountain_content_by_consent` + `fountain::resolve_retention_action`
+drive `ciris_verify_core::holonomic::retention_decision` / `ejection_verdict`:
+a `Withdrawn` subject (→ `EjectHardDelete`) routes to the hard-delete path
+regardless of `is_rare`. **Revocation overrides rarity — by construction, not
+by comparison** (revocation is a content-level dominating signal, never a
+value competing inside the priority byte).
+
+**Secondary**: N6 — `fountain::holding_claim_counts`
+(`holding_claim_counts_toward_rarity`) gates rarity on a possession-proven
+holding claim, so an **unverified/unchallenged** holding claim cannot lower
+another peer's retention priority (rarity is not a forgeable force-evict
+channel either).
+
+**Residual**: hard-delete drops individually-recoverable symbols but the
+manifest (and any collective composite the content was folded into, AV-65)
+persist as `EnvelopeOnly` / below-the-noise-floor blur — §19.3 N5 requires
+**not individually recoverable**, not destruction of the collective gist
+(this is by design — "fades but cannot be falsified", §19.7).
+
 ---
 
 ## 4. Mitigation Matrix
@@ -1737,6 +2021,14 @@ the audit-chain growth is bounded by per-key emission rate caps
 | AV-56 | Incident correlation_keys abuse (unbounded JSONB array exhausts GIN index, or single-key bloat masks attacker-controlled identifiers in operator-facing UI) | v0.8.3 `record_incident` validates `correlation_keys` at the trait surface BEFORE any SQL fires: rejects when `len > MAX_CORRELATION_KEYS = 32` or when any single key's byte-length exceeds `MAX_CORRELATION_KEY_BYTES = 256`. Empty strings also rejected (no implicit "match-anything" key). GIN index on `correlation_keys` JSONB column serves the reverse-lookup path; bounded element count keeps index entries small. | Bounded inputs map to predictable GIN-index growth (`O(incidents × MAX_CORRELATION_KEYS)` worst case); operators sizing storage can plan deterministically. | **✓ Mitigated v0.8.3** | CIRISPersist#37 |
 | AV-57 | Read-side cohort_scope escalation via caller-asserted admission (a reader forges `CallerScope::Authenticated { admission: { identity/families/communities = everything } }` to read self/family/community content it isn't a member of) | v4.0 `CallerAdmission` has NO public constructor — the sole way to obtain one is the substrate-side `build_caller_admission(engine, occurrence_key_id)`, which resolves identity / families / communities deterministically from `federation_identity_occurrences` / `federation_families` / `federation_communities`. The PyO3 boundary accepts only an `occurrence_key_id` string; no admission fields cross it. The §4.3 read predicate is pure target-membership: a row is admitted iff its `cohort_target_id` ∈ the reader's substrate-resolved sets — so a forged set cannot be constructed to begin with, and even the "shared cohort with emitter" leak class is eliminated (target-membership, not emitter-join). | Boundary auth (proving the caller controls the occurrence key's private key) is the caller-environment's responsibility (Ed25519 challenge / authenticated channel); persist trusts the boundary on key ownership and enforces visibility from what the chain admitted. Defense in depth: CIRISEdge#48-A re-checks cohort_scope at egress; joint `cohort_scope_double_miss_total` is the alert. | **✓ Mitigated v4.0** (closed by construction — private constructor + substrate-only builder) | CIRISPersist#160 |
 | AV-58 | Write-side cohort_scope downgrade (a writer stamps a broader `cohort_scope` / a `cohort_target_id` for a cohort it isn't a member of — e.g. tags `community: C` it isn't in, or `federation` on self content — to broaden visibility) | v4.0 `DimensionAdmissionPolicy::check_write_cohort_scope` (§4.6) runs AFTER the verify gate, BEFORE persist (zero-writes-on-refusal, mirroring `signature_mismatch_rejected_no_writes`): a writer claiming `(family\|community, target)` must have that target ∈ its substrate-resolved admission, else `ScopeRefusalReason::No{Family,Community}Membership`. `self` targets are substrate-stamped from the verified signer (never caller-supplied); broad tiers carry no target. Wired into trace ingest + `put_attestation`. | Symmetric to AV-57 (same `CallerAdmission`, opposite direction). Edge pre-ingest verification is Layer 2; joint `cohort_scope_write_double_miss_total` is the alert. Attestations carry `cohort_scope` but no `cohort_target_id` column in v4.0, so family/community attestation writes are refused (no provable target) — a named follow-up column would relax this. | **✓ Mitigated v4.0** (verify→gate→persist; set-membership) | CIRISPersist#160 |
+| AV-59 | HNDL forge-later on the durable trace corpus (backdated trace minted by a CRQC adversary who broke Ed25519) | v7.2.0 `verify_trace_hybrid` hard cut: `VerifyMode::Full` verifies BOTH halves via `verify_hybrid`(`Strict`); classical-only rejected at admission (`verify_hybrid_required`), no `require_hybrid: false` posture (store-path PQC, §10.1.5.1.1). | Verify-before-mutation step 2, before scrub/insert; dedup not moved ahead of verify; same cut on fountain manifests + aggregation meta. | **✓ Mitigated v7.2.0** (`2.7.legacy` import exempt as provenance-only) | CIRISPersist#225 |
+| AV-60 | WholenessWitness equivocation (two signed roots, one peer) | v8.2.0 `reconcile_peer_witnesses`/`classify_stored` run `compare_witnesses`; Equivocation RETAINS both + emits `hard_case:witness_equivocation` (idempotent), NEVER reconciled (§19 N4, non-repudiable). | Only verified witnesses enter the corpus (AV-62 PQC gate); re-scan idempotent. | **✓ Mitigated v8.2.0** (detect + preserve; consumer adjudicates) | CIRISPersist#228 |
+| AV-61 | Witness divergence escalated to drive the quorum-merge (witness supplies a winning root / resurrects a revoked key) | v8.2.0 Divergent → `WitnessReconcileAction::TriggerQuorumMerge` carrying NO winner / NO root; triggers the EXISTING V058 quorum-merge over stored rows (`resolve_monotonic_quorum` / `revision`); the witness root NEVER enters resolution — no fragment-pick, no revoked-key resurrection. | Directive type structurally cannot carry a root; tested (Divergent keeps the REVOKED record). | **✓ Mitigated v8.2.0** (witness = detector, not resolver) | CIRISPersist#228/#229 |
+| AV-62 | Witness anti-rollback / eclipse (stale signed witness replay) | v8.2.0 `accept_if_monotonic` + `last_witness_epoch_for_peer` strict-epoch monotonic guard (epoch MUST strictly advance, §19 N4); `put_wholeness_witness` runs `verify_witness` PQC-before-persist (`witness_admit_hybrid_required`), zero rows on reject (no store-then-quarantine). | Corpus pruned to last-K (8) verified per peer; no `verified` column (§19.0 F-5 — verdict recomputed at the gate). | **✓ Mitigated v8.2.0** | CIRISPersist#228/#229 |
+| AV-63 | WW-2 deniable-content re-attribution (self/anonymous rows swept into a signed federating root) | v8.2.0 `build_local_witness` FILTERS OUT anonymous-tier + `cohort_scope: self` + self/anonymous-namespaced leaves BEFORE the Merkle root; `claim_namespaces` drawn only from survivors (provably never names self/anonymous); `verify_witness` re-checks the namespace guard at admission. | Enforced on both sides (build clean + verify rejects); upstream tagging is the AV-57/58 surface. | **✓ Mitigated v8.2.0** | CIRISPersist#228/#229 |
+| AV-64 | Forged `aggregation_meta` on the store path (tampered/unsigned §19.7 composite meta) | v8.4.0 `put_aggregated_tier` runs `verify_aggregation_meta` (§19.7.1 bound-hybrid) BEFORE persist; missing/invalid ML-DSA-65 → `aggregation_meta_hybrid_required` (store-path PQC §10.1.5.1.1), tampered → `aggregation_meta_invalid`; zero rows; composite manifest also rides the #225 admit gate in one tx. | Storage column stays opaque BYTEA/BLOB (V086 unchanged across freeze — wire-churn firewall); verify inputs admission-only, never persisted. | **✓ Mitigated v8.4.0** (`EjectAggregatedTierOnly` = additive follow-on pending verify exposure) | CIRISPersist#230 |
+| AV-65 | Forged aggregation source set (descent as a force-evict channel) | v8.4.0 `descend_aggregated_sources` runs `verify_member_commitment` over the caller's source ids BEFORE descending — a set that doesn't re-derive the committed `member_commitment` is REJECTED; canonical `descend_order` (§19.7.2 lexicographic). Full source-id-list recomputation, never a partial inclusion proof (the §19.1 RC15-freeze CVE-2012-2459 non-exploitability rationale). | `member_commitment` is hybrid-signed in the composite manifest (AV-64) — the root to re-derive is itself authenticated. | **✓ Mitigated v8.4.0** | CIRISPersist#230 |
+| AV-66 | Rarity-driven retention resurrecting revoked content (N5) | v8.1.0/v8.2.0 `evict_fountain_content_hard_delete` is a SEPARATE path that NEVER consults `retention_priority` — drops all symbols, manifest stays `EnvelopeOnly`; `resolve_retention_action` drives `retention_decision`/`ejection_verdict` (Withdrawn → `EjectHardDelete` regardless of `is_rare`). Revocation overrides rarity by construction, not by comparison. | N6 `holding_claim_counts` gates rarity on possession-proven claims (unverified claim can't lower another peer's priority). | **✓ Mitigated v8.1.0/v8.2.0** | CIRISPersist#228 |
 
 ---
 

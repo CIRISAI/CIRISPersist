@@ -6,10 +6,11 @@
 > file. Methodology: `~/CIRISAgent/FSD/MISSION_DRIVEN_DEVELOPMENT.md`
 > and the overview at [ciris.ai/mdd](https://ciris.ai/mdd).
 
-**Version**: 1.1
-**Status**: Active — current as of `main` at **v3.0.0**
-(Coherence Epistemic Graph 0.2 substrate conformance)
-**Date**: 2026-05-28
+**Version**: 1.2
+**Status**: Active — current as of `main` at **v8.5.0**
+(Coherence Epistemic Graph 1.0-RC17 — §19 / §19.7 holonomic
+forever-memory substrate conformance)
+**Date**: 2026-06-16
 
 This is the reverse-engineered MDD charter for CIRISPersist: it maps the
 four pillars — Mission (WHY) / Protocols (WHO) / Schemas (WHAT) / Logic
@@ -218,6 +219,68 @@ it's the reviewer-discipline the namespace + admission gate already
 embody. Naming it here keeps future reviewers from drifting back
 toward the Cartesian default through a sequence of individually-
 reasonable-looking gate additions.
+
+### 1.8 Holonomic substrate / forever-memory (CEG §19 / §19.7, 1.0)
+
+v8.0.0–v8.5.0 (CEG 1.0-RC11→RC17, CIRISPersist#225/#227–#231) bring the
+**holonomic / forever-memory** substrate online. The mission frame is the
+single most load-bearing idea in §19.7, and persist is built to embody it
+rather than route around it:
+
+- **One retirement operator, not many.** Revocation, capacity-eviction,
+  scheduled expiry, and natural aging are *the same operation at different
+  rates* — a monotonic, pressure-driven descent of an item's fidelity
+  toward a **noise floor** (the individual-recoverability boundary).
+  Revocation is the fastest descent (forced immediately below the floor +
+  purge of every still-recoverable tier); aging is the slowest. Persist
+  speaks this one axis: `evict_fountain_content_to_tier` is a downward step,
+  `evict_fountain_content_hard_delete` is the forced descent below the floor,
+  and the verify-core `ejection_verdict` decides which (`src/fountain/`).
+  There is no separate "delete" primitive competing with "evict".
+- **Graceful degradation; the floor does double duty.** The same floor is
+  *both* the privacy boundary (a revoked item MUST be individually
+  unrecoverable at every retained tier) *and* the durability floor (the
+  collective blur sits below it, forever). Descent **never terminates at
+  zero** — a sufficiently-aggregated composite ("a picture of a thousand
+  pictures") is already-erased-by-degradation, so the collective gist
+  persists as O(log T) forever-memory while no source is individually
+  recoverable. Reads degrade as a *typed* outcome
+  (`FountainContent::{Full | Partial | EnvelopeOnly}`), never a silent lie.
+- **"Memory fades but cannot be falsified."** Fidelity decays along the
+  descent; *authenticity does not*. The signed manifest / aggregation
+  envelope is the incorruptible anchor that survives every tier, and a
+  surviving partial stays authenticated — each present symbol's SHA-256 is
+  re-checked against the signed `symbol_hashes` on read, so a degraded read
+  is still a *true* read or a loud error (the §1.6 fail-honest stance,
+  applied to memory). This is the corpus-durability promise of §1.2 carried
+  all the way down the descent: the corpus may *forget*, but it cannot be
+  made to *lie*.
+- **Persist's role — store / evict + witness-corpus + the WW→quorum-merge
+  owner.** Persist owns the §19.1 `wholeness_witness_corpus` store (the
+  verify-before-persist PQC gate, the WW-2 self/anonymous leaf filter, the
+  strict-epoch anti-rollback guard) and is the **divergence router**, not a
+  decider: a WholenessWitness is a divergence *detector* carrying no winner
+  and no root. An **equivocation** (two signed roots from one peer) is
+  retained and flagged `hard_case:witness_equivocation` and **never
+  reconciled** (N4, non-repudiable). A **divergence** merely *triggers* the
+  pre-existing V058 quorum-merge over the stored rows — the witness root
+  never enters that resolution, so there is no "reconstitute from any
+  fragment" path and a revoked key is never resurrected. The witness MUST
+  NOT decide the merge or replace `monotonic_quorum` / `revision`.
+- **The Registry → Verify → Persist family pattern.** This whole surface is
+  cut as a *three-repo lockstep* and the discipline is mission-load-bearing:
+  **CEG (CIRISRegistry) locks** the normative wire shape and the freeze (§19
+  ratified at RC11, §19.7 promoted to 1.0 at RC16); **CIRISVerify proves**
+  it — it ships the verifiers (`verify_witness`, `verify_aggregation_meta`,
+  `verify_member_commitment`, `ejection_verdict`, `compute_merkle_root`) and
+  the cross-impl conformance vectors; **CIRISPersist conforms** — it is the
+  *second implementation*, consuming verify-core's verifiers and reproducing
+  the §19.7 conformance vectors byte-for-byte (`tests/conformance_vectors_v19_7.rs`).
+  Persist rolls no §19 crypto and re-rolls no Merkle. The wire-churn firewall
+  is the same discipline as §3's canonical-bytes mandate: where the §19.7
+  shape was unfrozen, persist shipped the storage column (`aggregation_meta`)
+  as **opaque bytes** so the contract could finalize without a migration —
+  the column was byte-unchanged across the freeze (V086).
 
 ---
 

@@ -2,8 +2,12 @@
 
 One embeddable Rust crate behind every stateful surface a CIRIS federation
 node needs — the signed reasoning-trace log, the hash-chained audit log, the
-memory graph, time-series telemetry, secrets-at-rest, and federation trust
-state. Postgres **or** SQLite; in-process via PyO3 **or** over HTTP.
+memory graph, time-series telemetry, secrets-at-rest, federation trust state,
+and the CEG §19 holonomic / forever-memory substrate (fountain content,
+WholenessWitness, aggregation tiers). Postgres **or** SQLite; in-process via
+PyO3 **or** over HTTP.
+
+**Current:** v8.5.0 · CIRISVerify pin **v5.10.0** · CEG **§19 / §19.7 (1.0)**.
 
 ## What it is
 
@@ -24,6 +28,9 @@ The backend is chosen at `Engine` construction by DSN scheme
 | `telemetry` | metric writes + TSDB rollup |
 | `secrets` | federated SecretsService — AES-256-GCM at rest, hardware-backed master key |
 | `cirisnode` | CIRISNodeCore federation-consensus substrate |
+| `fountain` | fountain-coded content primitive — signed manifest + N+K opaque symbols, tier eviction, authenticated partial reads (CEG §19.3) |
+| `wholeness_witness` | §19.1 WholenessWitness corpus — divergence detector that routes to the existing quorum-merge (CEG §19) |
+| `content_aggregation` | §19.7 forever-memory aggregation tier — N→1 composites, opaque `aggregation_meta`, descent-integrity (CEG §19.7) |
 | `sequence` / `occurrence` | atomic per-identity counters + endpoint-liveness registry |
 | lens substrates | tasks, thoughts, correlations, tickets, deferral reports, WA certs, … |
 
@@ -34,14 +41,29 @@ The backend is chosen at `Engine` construction by DSN scheme
   schemas — so sovereign-mode (Pi / iOS) deployments are not second-class.
 - **In-process cohabitation.** `Engine` is a process-singleton: a CIRIS 3.0
   process hosting the agent + NodeCore + LensCore shares one runtime, one
-  pool, one identity — see [docs/COHABITATION.md](docs/COHABITATION.md).
+  pool, one identity — see [docs/COHABITATION.md](docs/COHABITATION.md). The
+  public `ffi::pyo3::register(py, m)` hook (#231) lets a host wheel re-export
+  the whole persist surface into its own module — one `.so`, one PyO3 type
+  registry (CIRISServer one-wheel).
 - **Hardware-backed secrets.** The secrets master key is derived — via
   CIRISVerify — from a seed sealed by the platform TPM / Keystore / Secure
   Enclave where one exists, with an honest software fallback where it does
   not.
 - **Crypto goes through CIRISVerify.** Persist never rolls its own — signing,
   verification, and key derivation route through `ciris-verify-core` /
-  `ciris-keyring`.
+  `ciris-keyring` (pinned **v5.10.0**, all six crates flipped in lockstep).
+  The §19 holonomic gates (`verify_witness`, `compare_witnesses`,
+  `verify_aggregation_meta`, `verify_member_commitment`, `ejection_verdict`,
+  `compute_merkle_root`) are all verify-core calls — persist never re-rolls
+  Merkle / preimage / signature logic.
+- **Holonomic / forever-memory substrate (CEG §19 / §19.7, 1.0).** Persist
+  is the store + WholenessWitness-corpus owner + the divergence→quorum-merge
+  router. A withdrawn `content_id` is hard-deleted regardless of rarity
+  (revocation overrides rarity); a witness equivocation is retained and
+  flagged `hard_case:witness_equivocation`, never reconciled. Memory fades
+  along one pressure-driven descent but cannot be falsified — the signed
+  envelope/manifest is the incorruptible anchor and partials stay
+  authenticated against the signed per-symbol hashes.
 - **Deliberately not:** no embedded graph DB engine (Postgres / SQLite
   recursive CTEs instead); not a daemon (a library, not a service);
   horizontal sharding is out of scope.
@@ -66,7 +88,7 @@ current numbers:
 | Embedded persistence | ORMs — sqlx, Diesel; per-service DBs | one API, Postgres + SQLite at 100% parity — **at parity** |
 | Audit log | Trillian, Rekor, AWS QLDB | RFC 6962 Merkle + post-quantum-signed tree heads — **ahead of typical** |
 | Crypto-at-rest | ring, OpenSSL (~3–6 GiB/s AES-GCM) | ~9.5 GiB/s AES-256-GCM via CIRISVerify — **ahead** |
-| Post-quantum | mostly classical | hybrid Ed25519 + ML-DSA-65 throughout — **ahead** |
+| Post-quantum | mostly classical | hybrid Ed25519 + ML-DSA-65 throughout; Full-mode traces + fountain manifests + aggregation meta reject classical-only at ingest (HNDL hard cut, CEG §10.1.5.1.1) — **ahead** |
 | Analytics | DuckDB, ClickHouse (columnar) | row store + query-shaped covering indexes ("poor-man's column store") — **at parity for the fixed query set**; ~2–5× behind a columnar engine on raw ad-hoc scan |
 | Horizontal scale | sharded DB services | a library, not a service — **behind** (deployment shape, not algorithm) |
 
