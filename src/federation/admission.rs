@@ -1076,6 +1076,26 @@ pub fn check_consensus_protocol_form(consensus_protocol: &str) -> Result<(), Err
 /// either a bare string OR a JSON array of strings (set-containment).
 pub const DELEGATION_SCOPE_CONSENT_REVOCATION: &str = "consent_revocation";
 
+/// v8.7.0 (CIRISPersist#232, CEG 1.0-RC19 §11.10 / §3.2.3 rule-(3);
+/// CIRISRegistry#90) — the `moderate` delegated-duty scope. A
+/// `delegates_to` chain bearing this token authorizes the delegate to
+/// emit a [`ModerationEvent`](crate::cirisnode::ModerationEvent) on the
+/// delegator's behalf, and ONLY then. Same wire-shape acceptance as
+/// [`DELEGATION_SCOPE_CONSENT_REVOCATION`] (bare string OR array-set).
+pub const DELEGATION_SCOPE_MODERATE: &str = "moderate";
+
+/// v8.7.0 (CIRISPersist#232, CEG §11.10 / §11.4; CIRISRegistry#90) — the
+/// `takedown` delegated-duty scope. A `delegates_to` chain bearing this
+/// token authorizes the delegate to emit a `takedown_notice` Contribution
+/// on the delegator's behalf, and ONLY then.
+pub const DELEGATION_SCOPE_TAKEDOWN: &str = "takedown";
+
+/// v8.7.0 (CIRISPersist#232, CEG §11.10; CIRISRegistry#90) — the `review`
+/// delegated-duty scope. A `delegates_to` chain bearing this token
+/// authorizes the delegate to emit a report → `scores` (reconsideration)
+/// attestation on the delegator's behalf, and ONLY then.
+pub const DELEGATION_SCOPE_REVIEW: &str = "review";
+
 /// v6.7.0 (CIRISPersist#146 Ask 6, CEG 1.0-RC5 §5.6.8.14) — the reserved
 /// `scores` dimension prefix for a **canonical-binding** claim. A bare
 /// `scores` on `identity:canonical_binding:{H}` with `attesting_key_id =
@@ -1131,20 +1151,22 @@ async fn canonical_binding_hashes_for(
 /// authority (a pathological chain is refused, not silently admitted).
 pub const MAX_WITHDRAWS_DELEGATION_DEPTH: usize = 16;
 
-/// True iff a `delegates_to` envelope's `scope` field contains the
-/// `consent_revocation` token. Accepts both wire shapes:
+/// v8.7.0 (CIRISPersist#232) — true iff a `delegates_to` envelope's
+/// `scope` field contains `scope_token`. Accepts both wire shapes:
 ///
 /// - `"scope": "consent_revocation"` (bare string), and
 /// - `"scope": ["retain", "consent_revocation"]` (array — set).
 ///
 /// A delegation with no `scope`, or a `scope` that omits the token,
-/// does NOT confer proxy revocation authority (returns `false`).
-fn delegation_scope_grants_consent_revocation(envelope: &serde_json::Value) -> bool {
+/// does NOT confer the duty (returns `false`). This is the single
+/// scope-containment predicate behind every delegated-duty walk
+/// (`consent_revocation` / `moderate` / `takedown` / `review`); the
+/// scope token is the only thing that varies — the bare-string-OR-set
+/// acceptance is identical for all four (§11.10 mirrors §3.2.3 rule-3).
+fn delegation_scope_grants(envelope: &serde_json::Value, scope_token: &str) -> bool {
     match envelope.get("scope") {
-        Some(serde_json::Value::String(s)) => s == DELEGATION_SCOPE_CONSENT_REVOCATION,
-        Some(serde_json::Value::Array(arr)) => arr
-            .iter()
-            .any(|v| v.as_str() == Some(DELEGATION_SCOPE_CONSENT_REVOCATION)),
+        Some(serde_json::Value::String(s)) => s == scope_token,
+        Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some(scope_token)),
         _ => false,
     }
 }
@@ -1180,6 +1202,39 @@ async fn issuer_reaches_target_via_consent_revocation_delegation(
     targets: &std::collections::HashSet<String>,
     max_depth: usize,
 ) -> Result<bool, Error> {
+    issuer_reaches_target_via_scoped_delegation(
+        directory,
+        issuer,
+        targets,
+        DELEGATION_SCOPE_CONSENT_REVOCATION,
+        max_depth,
+    )
+    .await
+}
+
+/// v8.7.0 (CIRISPersist#232, CEG §11.10 / §3.2.3 rule-(3)) — the
+/// scope-parameterized generalization of
+/// [`issuer_reaches_target_via_consent_revocation_delegation`]. Does
+/// `issuer` reach any key in `targets` via a `delegates_to` chain where
+/// **every edge on the path carries `scope_token`**?
+///
+/// This is the single reachability primitive behind ALL delegated-duty
+/// admission: `consent_revocation` (the §3.2.3 proxy revocation half) AND
+/// the §11.10 `moderate` / `takedown` / `review` duties. It re-uses the
+/// `build_delegation_graph` BFS shape (queue + visited cycle-guard +
+/// depth cap) but filters edges by scope-containment for the requested
+/// `scope_token`, so a `delegates_to` granting only a DIFFERENT scope
+/// (e.g. a `consent_revocation`-only edge probed for `takedown`) is NOT
+/// traversable — this is the load-bearing scope-isolation property
+/// (CIRISRegistry#90: "and only then"). Cycle-guarded on the granter key
+/// and bounded by [`MAX_WITHDRAWS_DELEGATION_DEPTH`].
+async fn issuer_reaches_target_via_scoped_delegation(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+    targets: &std::collections::HashSet<String>,
+    scope_token: &str,
+    max_depth: usize,
+) -> Result<bool, Error> {
     use std::collections::{HashSet, VecDeque};
     let effective_depth = max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH);
     if effective_depth == 0 {
@@ -1199,11 +1254,11 @@ async fn issuer_reaches_target_via_consent_revocation_delegation(
             if r.attestation_type != attestation_type::DELEGATES_TO {
                 continue;
             }
-            if !delegation_scope_grants_consent_revocation(&r.attestation_envelope) {
+            if !delegation_scope_grants(&r.attestation_envelope, scope_token) {
                 continue;
             }
-            // A consent_revocation-scoped delegation edge to a target
-            // subject is sufficient — proxy authority established.
+            // A scope-bearing delegation edge to a target key is
+            // sufficient — delegated duty established along the path.
             if targets.contains(&r.attested_key_id) {
                 return Ok(true);
             }
@@ -1445,6 +1500,139 @@ pub async fn check_withdraws_admission(
     }
     let rule = resolve_withdraws_admission_rule(directory, &row.attesting_key_id, &target).await?;
     Ok(Some(rule))
+}
+
+// ─── v8.7.0 — §11.10 delegated-duty admission (moderate/takedown/review) ─
+
+/// v8.7.0 (CIRISPersist#232, CEG 1.0-RC19 §11.10) — the envelope/payload
+/// field naming the **principal on whose behalf** a moderation / takedown
+/// / review primitive is emitted (the duty-holder / delegator). Read off
+/// the emission envelope (the `scores` `attestation_envelope`) or the
+/// cirisnode payload (`ModerationEvent` / `takedown_notice`).
+///
+/// **Semantics.** ABSENT or equal to the signer ⇒ an as-self emission
+/// (the signer holds the duty directly; §11.10 admit clause (a)). PRESENT
+/// and distinct from the signer ⇒ the signer is acting as a delegate and
+/// MUST reach the named principal via a live scoped `delegates_to` chain
+/// (clause (b)); otherwise the emission is rejected.
+///
+/// **Wire-shape note (CIRISRegistry#90 does not pin the field NAME).**
+/// `#90` pins the SCOPE vocabulary + the duty-holder relation, not the
+/// envelope key. Persist uses `on_behalf_of` (mirroring the existing
+/// `act_on_behalf` scope vocabulary). If CEG/CIRISServer#15 lock a
+/// different key, this single const is the one place to flip it.
+pub const DELEGATED_DUTY_ON_BEHALF_OF_FIELD: &str = "on_behalf_of";
+
+/// v8.7.0 (CIRISPersist#232, CEG §11.10) — reserved `scores` dimension
+/// prefix for a **moderation** report attestation. A `scores` row on a
+/// `moderation:*` dimension is the federation-attestation image of a
+/// moderation report; its emission is gated by the [`moderate`]
+/// delegated-duty scope.
+///
+/// [`moderate`]: DELEGATION_SCOPE_MODERATE
+pub const MODERATION_DIMENSION_PREFIX: &str = "moderation:";
+
+/// v8.7.0 (CIRISPersist#232, CEG §11.10) — reserved `scores` dimension
+/// prefix for a **reconsideration / review** report attestation. A
+/// `scores` row on a `reconsideration:*` dimension is the report→`scores`
+/// path named by CIRISRegistry#90; its emission is gated by the
+/// [`review`] delegated-duty scope.
+///
+/// [`review`]: DELEGATION_SCOPE_REVIEW
+pub const RECONSIDERATION_DIMENSION_PREFIX: &str = "reconsideration:";
+
+/// v8.7.0 (CIRISPersist#232, CEG §11.10 / §3.2.3 rule-(3)) — the
+/// generalized delegated-duty admit-iff gate, mirroring the
+/// `consent_revocation` proxy rule exactly.
+///
+/// For an emission of a moderation / takedown / review primitive,
+/// **admit IFF** `signer`:
+///   (a) holds the duty as-self — `on_behalf_of` is `None`, empty, or
+///       equal to `signer` (a participant exercising the duty directly);
+///       OR
+///   (b) reaches the named `on_behalf_of` principal via a live
+///       `delegates_to` chain where every edge bears `scope_token`
+///       (validated against the depth-capped delegation walk —
+///       [`issuer_reaches_target_via_scoped_delegation`]).
+///
+/// Otherwise reject with [`Error::DelegatedScopeUnauthorized`] (stable
+/// `kind()` token `federation_delegated_scope_unauthorized`).
+///
+/// This is the structural form of CIRISRegistry#90's "delegate-signed,
+/// delegator-traceable up the `delegates_to` chain, on the delegator's
+/// behalf, **and only then**". The `scope_token` is the only thing that
+/// varies across the three duties — the scope-isolation property (a
+/// `consent_revocation`-only delegation cannot drive a `takedown`) falls
+/// out of the per-token edge filter in the walk.
+pub async fn check_delegated_duty_admission(
+    directory: &dyn super::FederationDirectory,
+    signer: &str,
+    on_behalf_of: Option<&str>,
+    scope_token: &str,
+) -> Result<(), Error> {
+    // Clause (a): as-self. Absent / empty / self-referential principal
+    // is a direct exercise of the duty — no delegation required.
+    let principal = match on_behalf_of {
+        None => return Ok(()),
+        Some(p) if p.is_empty() || p == signer => return Ok(()),
+        Some(p) => p,
+    };
+    // Clause (b): live scoped delegation chain signer →* principal.
+    let mut targets = std::collections::HashSet::new();
+    targets.insert(principal.to_owned());
+    if issuer_reaches_target_via_scoped_delegation(
+        directory,
+        signer,
+        &targets,
+        scope_token,
+        MAX_WITHDRAWS_DELEGATION_DEPTH,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    Err(Error::DelegatedScopeUnauthorized {
+        signer: signer.to_string(),
+        on_behalf_of: principal.to_string(),
+        scope: scope_token.to_string(),
+    })
+}
+
+/// v8.7.0 (CIRISPersist#232, CEG §11.10) — `put_attestation` entry point
+/// for the **report → `scores`** half of the delegated-duty gate. A
+/// no-op (`Ok(())`) for any attestation that is not a `scores` row on a
+/// `moderation:*` or `reconsideration:*` dimension; for those it resolves
+/// the governing scope (`moderate` / `review`) and runs
+/// [`check_delegated_duty_admission`] with the row's `attesting_key_id`
+/// as the signer and the envelope's `on_behalf_of` as the principal.
+///
+/// Verify-before-mutation (AV-9): runs alongside `check_withdraws_admission`
+/// BEFORE the row is hashed + INSERTed — a rejected emission leaves no
+/// trace. Mirrors exactly how/where the consent_revocation gate is wired
+/// into the put_attestation path on every backend.
+pub async fn check_delegated_duty_scores_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::SCORES {
+        return Ok(());
+    }
+    let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
+        return Ok(());
+    };
+    let scope_token = if dimension.starts_with(MODERATION_DIMENSION_PREFIX) {
+        DELEGATION_SCOPE_MODERATE
+    } else if dimension.starts_with(RECONSIDERATION_DIMENSION_PREFIX) {
+        DELEGATION_SCOPE_REVIEW
+    } else {
+        return Ok(());
+    };
+    let on_behalf_of = row
+        .attestation_envelope
+        .get(DELEGATED_DUTY_ON_BEHALF_OF_FIELD)
+        .and_then(|v| v.as_str());
+    check_delegated_duty_admission(directory, &row.attesting_key_id, on_behalf_of, scope_token)
+        .await
 }
 
 #[cfg(test)]

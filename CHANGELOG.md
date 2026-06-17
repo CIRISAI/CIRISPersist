@@ -5,6 +5,23 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [8.7.0] — 2026-06-17
+
+### Added — enforce `moderate` / `takedown` / `review` delegated-duty scopes in admission (CEG 1.0-RC19 §11.10 / §3.2.3 rule-(3); closes #232)
+
+The moderation / child-safety chain's spine — "accountability ships ahead of capability." Until now `federation/admission.rs` enforced delegated-scope semantics for **`consent_revocation` only**; the act-on-behalf moderation scopes were recommended/open-vocab with no teeth. v8.7.0 gives them teeth, mirroring the proven `consent_revocation` rule exactly. Refs CIRISRegistry#90 (CEG names the scopes), CIRISServer#15 (fabric UX).
+
+- **Generalized scoped-delegation walk.** The `consent_revocation`-specific scope-containment predicate and depth-capped delegation BFS are now **scope-parameterized**: `delegation_scope_grants(envelope, scope_token)` (accepts BOTH wire shapes — bare `"scope":"x"` string AND `"scope":["x","y"]` array-set) and `issuer_reaches_target_via_scoped_delegation(.., scope_token, max_depth)` serve all four duties from one implementation. The `consent_revocation` walk is re-expressed in terms of the generalized fn — behavior byte-identical, no regression (the existing §3.2.3 withdraws tests pass unchanged).
+- **The §11.10 admit-iff gate** (`check_delegated_duty_admission`). For a moderation/takedown/review emission on a principal's behalf: **admit IFF** the signer (a) holds the duty as-self — the `on_behalf_of` principal is absent / empty / equals the signer; OR (b) reaches the named principal via a live `delegates_to` chain where **every edge bears the governing scope** (validated against the depth-capped graph). Reject otherwise. The per-token edge filter is what gives **scope isolation** — a `consent_revocation`-scoped delegation cannot drive a `takedown` ("and only then").
+- **Scope → primitive mapping (CEG RC19 #90), wired at each emission/admission point:**
+  - `moderate` → `ModerationEvent` — gated in `cirisnode::{postgres,sqlite}::put_moderation_event` (signer = `accuser_id`).
+  - `takedown` → `takedown_notice` Contribution — gated in `cirisnode::{postgres,sqlite}::put_contribution` (signer = `author_id`).
+  - `review` → report `scores` on a `reconsideration:*` (and the `moderation:*`) dimension — gated in `put_attestation` on all three federation backends (memory / sqlite / postgres) via `check_delegated_duty_scores_admission` (signer = `attesting_key_id`).
+- **Typed errors, stable `kind()` tokens.** `federation::Error::DelegatedScopeUnauthorized` (`federation_delegated_scope_unauthorized`) for the `scores` path; `cirisnode::Error::DelegatedScopeUnauthorized` (`cirisnode_delegated_scope_unauthorized`) for the cirisnode primitives. Both map to PyValueError (4xx) — caller-side authorization failure. Verify-before-mutation: a rejected emission leaves no trace (runs alongside the `withdraws` gate, BEFORE row-hash + INSERT).
+- **Wire-shape note.** CIRISRegistry#90 pins the SCOPE vocabulary + the duty-holder relation, not the envelope key naming the principal. Persist reads `on_behalf_of` (single const `DELEGATED_DUTY_ON_BEHALF_OF_FIELD` — one place to flip if CEG/CIRISServer#15 lock a different key). An absent `on_behalf_of` is an as-self emission (no delegation required).
+- **Tests (both backends where stateful), for EACH of moderate/takedown/review:** (a) as-self ADMITTED; (b) live scoped delegate ADMITTED; (c) neither duty nor delegation REJECTED (correct token); (d) **scope isolation** — a different-scope (`consent_revocation`-only) delegation REJECTED; (e) chain beyond `MAX_DELEGATION_DEPTH` REJECTED. `review`/`moderation` `scores` matrix on the memory backend; `moderate`/`takedown` cirisnode matrix on the SQLite backend. The `consent_revocation` / `withdraws` gate tests pass UNCHANGED.
+- **No new structural primitive, no migration, no verify re-pin** — rides the locked 1+4 and verify v5.11.0 (#90 adds a `delegated_scope` vocabulary + enforcement, nothing on the wire-type count).
+
 ## [8.6.0] — 2026-06-16
 
 ### Changed — re-pin CIRISVerify v5.10.0 → v5.11.0 (§19.7.3 `EjectAggregatedTierOnly`)

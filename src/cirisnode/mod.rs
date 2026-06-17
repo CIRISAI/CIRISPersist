@@ -153,6 +153,21 @@ pub enum Error {
     #[error("internal: {0}")]
     Internal(String),
 
+    /// v8.7.0 (CIRISPersist#232, CEG 1.0-RC19 §11.10 / §3.2.3 rule-(3);
+    /// CIRISRegistry#90) — a moderation / takedown primitive
+    /// (`ModerationEvent` / `takedown_notice`) emission was refused: the
+    /// signer neither holds the duty as-self (the `on_behalf_of` principal
+    /// is absent or names the signer) NOR reaches the named principal via a
+    /// live `delegates_to` chain bearing the governing scope (`moderate` /
+    /// `takedown`). The row is not stored. This is the cirisnode-surface
+    /// image of [`crate::federation::Error::DelegatedScopeUnauthorized`] —
+    /// the §11.10 child-safety / "takedown isn't a coup" gate. Distinct
+    /// from [`Error::NotAuthorized`] so consumers can pattern-match the
+    /// delegated-duty rejection deterministically (stable `kind()` token
+    /// `cirisnode_delegated_scope_unauthorized`).
+    #[error("delegated-duty emission not admitted: {0}")]
+    DelegatedScopeUnauthorized(String),
+
     /// v2.1 (CIRISPersist#101) — the constitutional asymmetry
     /// (FSD §4.5) was violated: either `AccordCarrier` priority was
     /// claimed under a non-HumanityAccord authority class, or a
@@ -182,11 +197,75 @@ impl Error {
             Error::Backend(_) => "cirisnode_backend",
             Error::NotImplemented(_) => "cirisnode_not_implemented",
             Error::Internal(_) => "cirisnode_internal",
+            Error::DelegatedScopeUnauthorized(_) => "cirisnode_delegated_scope_unauthorized",
             Error::FederationAnnouncementAuthorityMismatch(_) => {
                 "cirisnode_federation_announcement_authority_mismatch"
             }
         }
     }
+}
+
+/// v8.7.0 (CIRISPersist#232, CEG 1.0-RC19 §11.10) — run the
+/// delegated-duty admit-iff gate for a cirisnode primitive
+/// (`ModerationEvent` / `takedown_notice`) and translate a federation
+/// rejection into the cirisnode-surface
+/// [`Error::DelegatedScopeUnauthorized`].
+///
+/// `signer` is the emission's verified author (`accuser_id` for a
+/// `ModerationEvent`, `author_id` for a `takedown_notice` Contribution).
+/// `on_behalf_of` is the principal the emission claims to act for (read
+/// off the payload's
+/// [`on_behalf_of`](crate::federation::admission::DELEGATED_DUTY_ON_BEHALF_OF_FIELD)
+/// field; `None`/empty/self ⇒ as-self). `scope_token` is `moderate` or
+/// `takedown`. Delegates to
+/// [`crate::federation::admission::check_delegated_duty_admission`] so the
+/// scope-isolation + depth-cap properties are identical to the
+/// `consent_revocation` / report-`scores` paths.
+///
+/// A federation [`Backend`](crate::federation::Error::Backend) error from
+/// the directory walk maps to [`Error::Backend`]; the authority rejection
+/// maps to [`Error::DelegatedScopeUnauthorized`]; any other federation
+/// error is surfaced as [`Error::Internal`] (none are expected here).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub async fn check_delegated_duty_or_reject(
+    directory: &dyn crate::federation::FederationDirectory,
+    signer: &str,
+    on_behalf_of: Option<&str>,
+    scope_token: &str,
+) -> Result<(), Error> {
+    match crate::federation::admission::check_delegated_duty_admission(
+        directory,
+        signer,
+        on_behalf_of,
+        scope_token,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(crate::federation::Error::DelegatedScopeUnauthorized {
+            signer,
+            on_behalf_of,
+            scope,
+        }) => Err(Error::DelegatedScopeUnauthorized(format!(
+            "signer {signer} holds neither the {scope} duty as-self nor a live \
+             {scope}-scoped delegates_to chain reaching {on_behalf_of} (CEG §11.10)"
+        ))),
+        Err(crate::federation::Error::Backend(e)) => Err(Error::Backend(e)),
+        Err(e) => Err(Error::Internal(format!(
+            "delegated-duty gate unexpected federation error: {e}"
+        ))),
+    }
+}
+
+/// v8.7.0 (CIRISPersist#232) — extract the `on_behalf_of` principal from a
+/// cirisnode primitive's JSONB payload. `None` when the field is absent or
+/// not a string ⇒ an as-self emission. Mirrors the field-name convention
+/// pinned by
+/// [`DELEGATED_DUTY_ON_BEHALF_OF_FIELD`](crate::federation::admission::DELEGATED_DUTY_ON_BEHALF_OF_FIELD).
+pub fn payload_on_behalf_of(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get(crate::federation::admission::DELEGATED_DUTY_ON_BEHALF_OF_FIELD)
+        .and_then(|v| v.as_str())
 }
 
 #[cfg(test)]

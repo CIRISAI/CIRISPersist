@@ -146,6 +146,22 @@ impl NodeCoreService for PostgresBackend {
         // payloads land Error::InvalidArgument up-front.
         let takedown =
             super::media_sharing::extract_takedown_notice_payload(subject_kind, &env.payload)?;
+        // v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate for
+        // the `takedown_notice` primitive. PostgresBackend IS the
+        // FederationDirectory, so `self` walks the delegates_to graph.
+        // Admit IFF the author holds the `takedown` duty as-self or
+        // reaches the payload's `on_behalf_of` principal via a live
+        // `takedown`-scoped delegation chain. Runs BEFORE the INSERT — a
+        // rejected emission leaves no trace.
+        if takedown.is_some() {
+            super::check_delegated_duty_or_reject(
+                self,
+                &env.author_id,
+                super::payload_on_behalf_of(&env.payload),
+                crate::federation::admission::DELEGATION_SCOPE_TAKEDOWN,
+            )
+            .await?;
+        }
         let key_grant =
             super::media_sharing::extract_key_grant_payload(subject_kind, &env.payload)?;
         let media_content_sha256: Option<String> = takedown
@@ -332,6 +348,18 @@ impl NodeCoreService for PostgresBackend {
 
     async fn put_moderation_event(&self, event: ModerationEvent) -> Result<(), Error> {
         super::verify::verify_envelope_signed(&event, &event.signature, &event.accuser_id)?;
+        // v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate for
+        // the `ModerationEvent` primitive. Admit IFF the accuser (signer)
+        // holds the `moderate` duty as-self or reaches the payload's
+        // `on_behalf_of` principal via a live `moderate`-scoped delegation
+        // chain. Runs AFTER signature verify, BEFORE INSERT.
+        super::check_delegated_duty_or_reject(
+            self,
+            &event.accuser_id,
+            super::payload_on_behalf_of(&event.payload),
+            crate::federation::admission::DELEGATION_SCOPE_MODERATE,
+        )
+        .await?;
         let id = parse_id(&event.moderation_id)?;
         let client = self
             .pool()

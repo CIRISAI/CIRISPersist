@@ -2279,6 +2279,37 @@ pub enum Error {
         target_attestation_id: String,
     },
 
+    /// v8.7.0 (CIRISPersist#232, CEG 1.0-RC19 §11.10 / §3.2.3 rule-(3);
+    /// CIRISRegistry#90). A moderation / takedown / review primitive
+    /// emission was refused: the `signer` neither holds the duty as-self
+    /// (the `on_behalf_of` principal is absent or names the signer) NOR
+    /// reaches the named principal via a live `delegates_to` chain bearing
+    /// the governing `scope` (`moderate` / `takedown` / `review`). The row
+    /// is not stored. This is the §11.10 "delegate-signed, delegator-
+    /// traceable, on the delegator's behalf, and only then" gate — the
+    /// child-safety chain's scope-isolation property (a
+    /// `consent_revocation`-scoped delegation cannot drive a `takedown`).
+    /// Distinct from [`Error::InvalidArgument`] so consumers can pattern-
+    /// match the authority rejection deterministically (stable `kind()`
+    /// token `federation_delegated_scope_unauthorized`). See
+    /// [`admission::check_delegated_duty_admission`].
+    #[error(
+        "delegated-duty emission by signer {signer:?} on behalf of \
+         {on_behalf_of:?} is not admitted: signer holds neither the \
+         {scope:?} duty as-self nor a live {scope:?}-scoped delegates_to \
+         chain reaching the principal (CEG §11.10)"
+    )]
+    DelegatedScopeUnauthorized {
+        /// The signer (`attesting_key_id` / `author_id` / `accuser_id`)
+        /// of the refused emission.
+        signer: String,
+        /// The principal the emission claimed to act on behalf of.
+        on_behalf_of: String,
+        /// The governing delegated-duty scope token (`moderate` /
+        /// `takedown` / `review`).
+        scope: String,
+    },
+
     /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228 item 1 / #229 item 1)
     /// — a WholenessWitness was REJECTED at the verify-before-persist
     /// gate: the §19.0 PQC-mandatory hard cut (classical-only / missing
@@ -2338,6 +2369,7 @@ impl Error {
             Error::PartnerRecordRollback { .. } => "federation_partner_record_rollback",
             Error::SetSemanticsUnsorted(_) => "federation_set_semantics_unsorted",
             Error::WithdrawsNotAdmitted { .. } => "federation_withdraws_not_admitted",
+            Error::DelegatedScopeUnauthorized { .. } => "federation_delegated_scope_unauthorized",
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",
         }

@@ -1052,6 +1052,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             row.withdraws_admission_rule = Some(rule);
         }
 
+        // v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate for
+        // the report→`scores` half (moderation:* / reconsideration:*).
+        // A no-op for any non-matching row; for a moderation/review report
+        // it admits IFF the signer holds the duty as-self or reaches the
+        // `on_behalf_of` principal via a live scoped delegates_to chain.
+        // Runs BEFORE the state lock for the same deadlock reason as the
+        // withdraws gate (the walk calls list_attestations_by on self).
+        crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
+
         let mut state = self.state.lock().expect("memory backend lock");
         // FK enforcement parity with postgres: both attesting_key_id
         // and attested_key_id must exist in federation_keys.
@@ -5090,6 +5099,264 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), "federation_withdraws_not_admitted");
         assert!(backend.get_attestation("w-bad").await.unwrap().is_none());
+    }
+
+    // ── v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate
+    // on the report→`scores` path (review / moderation dimensions),
+    // memory-backend (3-backend parity with sqlite + postgres). The gate
+    // shares `check_delegated_duty_scores_admission` across all three, so
+    // this exercises the load-bearing scope-isolation + depth-cap + as-self
+    // + scoped-delegate matrix the issue's tests (a)-(e) require.
+
+    /// Build a memory-backend `scores` report on `dimension`, signed by
+    /// `signer`, declaring an optional `on_behalf_of` principal.
+    fn fix_scores_report(
+        id: &str,
+        signer: &str,
+        dimension: &str,
+        on_behalf_of: Option<&str>,
+    ) -> Attestation {
+        let mut a = fix_attestation(id, signer, signer, signer);
+        // attestation_type stays SCORES (the fix_attestation default).
+        let mut env = serde_json::json!({
+            "id": id,
+            "dimension": dimension,
+            "score": 1.0,
+            "confidence": 0.9,
+        });
+        if let Some(p) = on_behalf_of {
+            env["on_behalf_of"] = serde_json::Value::String(p.to_owned());
+        }
+        a.attestation_envelope = env;
+        a
+    }
+
+    #[tokio::test]
+    async fn memory_delegated_duty_scores_review_matrix() {
+        let backend = MemoryBackend::new();
+        for k in ["holder", "delegate", "deep", "rando", "modkey"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+
+        // (a) duty-holder as-self (on_behalf_of == signer) → ADMITTED.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "r-self",
+                    "holder",
+                    "reconsideration:case42:v1",
+                    Some("holder"),
+                ),
+            })
+            .await
+            .expect("as-self review admitted");
+        assert!(backend.get_attestation("r-self").await.unwrap().is_some());
+
+        // also: absent on_behalf_of is as-self → ADMITTED.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "r-noprincipal",
+                    "holder",
+                    "reconsideration:case42:v1",
+                    None,
+                ),
+            })
+            .await
+            .expect("absent principal is as-self");
+
+        // (b) delegate on a live `review`-scoped chain → ADMITTED.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "d-review",
+                    "delegate",
+                    "holder",
+                    serde_json::json!(["message_io", "review"]),
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "r-delegate",
+                    "delegate",
+                    "reconsideration:case42:v1",
+                    Some("holder"),
+                ),
+            })
+            .await
+            .expect("scoped-delegate review admitted");
+        assert!(backend
+            .get_attestation("r-delegate")
+            .await
+            .unwrap()
+            .is_some());
+
+        // (c) neither duty nor any delegation → REJECTED (correct token).
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "r-rando",
+                    "rando",
+                    "reconsideration:case42:v1",
+                    Some("holder"),
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
+        assert!(
+            backend.get_attestation("r-rando").await.unwrap().is_none(),
+            "rejected emission leaves no trace"
+        );
+
+        // (d) scope isolation — a `consent_revocation`-only delegation
+        // MUST NOT drive a `review` (the load-bearing child-safety prop).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "d-wrongscope",
+                    "modkey",
+                    "holder",
+                    serde_json::json!(["consent_revocation"]),
+                ),
+            })
+            .await
+            .unwrap();
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "r-wrongscope",
+                    "modkey",
+                    "reconsideration:case42:v1",
+                    Some("holder"),
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
+        assert!(backend
+            .get_attestation("r-wrongscope")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_delegated_duty_scores_moderation_dimension_uses_moderate_scope() {
+        // A `moderation:*` scores dimension is gated by the `moderate`
+        // scope; a `review`-scoped delegation does NOT satisfy it (scope
+        // isolation across the two scores dimensions).
+        let backend = MemoryBackend::new();
+        for k in ["holder", "delegate"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        // `review`-scoped delegation → cannot drive a `moderation:*` report.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "d-rev",
+                    "delegate",
+                    "holder",
+                    serde_json::json!(["review"]),
+                ),
+            })
+            .await
+            .unwrap();
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "m-wrongscope",
+                    "delegate",
+                    "moderation:rogue_action:v1",
+                    Some("holder"),
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
+
+        // `moderate`-scoped delegation → ADMITTED.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "d-mod",
+                    "delegate",
+                    "holder",
+                    serde_json::json!(["moderate"]),
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "m-ok",
+                    "delegate",
+                    "moderation:rogue_action:v1",
+                    Some("holder"),
+                ),
+            })
+            .await
+            .expect("moderate-scoped delegate admitted");
+    }
+
+    #[tokio::test]
+    async fn memory_delegated_duty_scores_depth_cap_rejects() {
+        // (e) a delegation chain deeper than MAX_DELEGATION_DEPTH is
+        // refused — the depth cap is honored.
+        let backend = MemoryBackend::new();
+        let depth = crate::federation::admission::MAX_WITHDRAWS_DELEGATION_DEPTH;
+        // Build keys k0..=k(depth+1). signer = k0, principal = k(depth+1).
+        let n = depth + 2;
+        let keys: Vec<String> = (0..n).map(|i| format!("k{i}")).collect();
+        for k in &keys {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        // Chain k0 -> k1 -> ... -> k(n-1), every edge `review`-scoped.
+        // Length n-1 edges > depth cap, so k0 cannot reach k(n-1).
+        for i in 0..(n - 1) {
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: fix_delegates_to(
+                        &format!("d{i}"),
+                        &keys[i],
+                        &keys[i + 1],
+                        serde_json::json!(["review"]),
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "r-toodeep",
+                    &keys[0],
+                    "reconsideration:case42:v1",
+                    Some(&keys[n - 1]),
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
     }
 
     // ── v3.1.0 (CIRISPersist#117) — peer-mutation surface ──────────
