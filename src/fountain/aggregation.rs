@@ -392,6 +392,17 @@ pub enum EjectionAction {
     /// manifest survives as `EnvelopeOnly`; any composite this source folded
     /// into is untouched (descent never terminates at zero).
     EjectHardDelete,
+    /// v8.6.0 (§19.7.3, verify v5.11.0 / CEG RC16) — shed **exactly one**
+    /// pyramid stratum: the tier-`u32` [`AggregationMetaV1`] composite, leaving
+    /// BOTH the finer (lower-level) AND coarser (higher-level) composites
+    /// intact. The tier-granular form of [`EjectionAction::EjectToTier`] — it
+    /// sheds ONE intermediate stratum rather than degrading a source object.
+    /// Mechanically this hard-deletes the tier-`u32` composite's symbols
+    /// (manifest survives as `EnvelopeOnly` provenance) via
+    /// [`evict_aggregated_tier_on_backend`]. Composes with hard-delete: a tier
+    /// already below the noise floor is unreachable, so this never resurrects
+    /// erased content. Carries the stratum tier index.
+    EjectAggregatedTierOnly(u32),
 }
 
 impl EjectionAction {
@@ -401,6 +412,7 @@ impl EjectionAction {
             EjectionAction::Keep => "keep",
             EjectionAction::EjectToTier(_) => "eject_to_tier",
             EjectionAction::EjectHardDelete => "eject_hard_delete",
+            EjectionAction::EjectAggregatedTierOnly(_) => "eject_aggregated_tier_only",
         }
     }
 
@@ -421,6 +433,13 @@ impl EjectionAction {
                 None | Some(super::eviction::FountainTier::Full) => EjectionAction::Keep,
                 Some(t) => EjectionAction::EjectToTier(t),
             },
+            // v8.6.0 (§19.7.3): the tier-granular stratum-shed. The verdict
+            // carries WHICH pyramid stratum to shed; persist sheds that exact
+            // composite (`target_tier` is irrelevant — it is a stratum index,
+            // not a fidelity tier).
+            EjectionVerdict::EjectAggregatedTierOnly { tier } => {
+                EjectionAction::EjectAggregatedTierOnly(tier)
+            }
         }
     }
 }
@@ -499,9 +518,64 @@ pub async fn descend_aggregated_sources_on_backend<B: crate::store::Backend>(
                     .evict_fountain_content_hard_delete(content_id, corpus_kind)
                     .await?
             }
+            // v8.6.0 (§19.7.3): a stratum-shed targets a COMPOSITE, not the
+            // per-source descent driven here — it is the dedicated
+            // [`evict_aggregated_tier_on_backend`] entry point. The
+            // source-fold descent never sheds a pyramid stratum, so this is a
+            // no-op on this path (the verdict mapping cannot reach it: the
+            // source-descent verdict is `ejection_verdict(consent, pressure)`,
+            // which only yields Keep / EjectToTier / EjectHardDelete).
+            EjectionAction::EjectAggregatedTierOnly(_) => 0,
         };
     }
     Ok(total)
+}
+
+/// v8.6.0 (§19.7.3 / verify v5.11.0 / CEG RC16) — execute an
+/// [`EjectionAction::EjectAggregatedTierOnly`]: shed **exactly one** pyramid
+/// stratum — the tier-`tier` `content_aggregation` composite — leaving BOTH the
+/// finer (lower-level) AND coarser (higher-level) composites' symbols intact.
+///
+/// The tier-granular form of `EjectToTier`: rather than degrading a source
+/// object or the whole item, it drops the SYMBOLS of the ONE composite at
+/// `aggregation_level == tier`, leaving that composite's manifest as the
+/// always-retained `EnvelopeOnly` provenance ("this stratum existed with
+/// signature X"). It composes existing primitives — it is effectively
+/// `evict_fountain_content_hard_delete` on the tier-`tier` composite's
+/// `aggregate_content_id`:
+///
+/// 1. **Resolve the stratum.** Load the stored aggregation record for
+///    `aggregate_content_id` ([`crate::store::Backend::get_aggregation`]).
+///    Unknown composite ⇒ `Ok(0)` no-op (composes with hard-delete: a stratum
+///    already erased / below the floor is unreachable — this never resurrects
+///    erased content).
+/// 2. **Stratum guard.** The resolved composite's `aggregation_level` MUST
+///    equal the requested `tier`; otherwise the caller named a stratum at the
+///    wrong level and NOTHING is shed (`Ok(0)`) — we never shed a different
+///    level than asked.
+/// 3. **Shed exactly that composite.** Hard-delete the tier-`tier` composite's
+///    symbols via [`crate::store::Backend::evict_fountain_content_hard_delete`]
+///    on `aggregate_content_id` with `corpus_kind = "aggregate:<source>"`
+///    ([`aggregate_corpus_kind`]). Composites at other levels are SEPARATE
+///    `content_aggregation` rows with their OWN `aggregate_content_id`s and are
+///    never touched. Returns the number of symbol rows shed.
+pub async fn evict_aggregated_tier_on_backend<B: crate::store::Backend>(
+    backend: &B,
+    aggregate_content_id: &str,
+    tier: u32,
+) -> Result<u64, crate::store::Error> {
+    let Some(record) = backend.get_aggregation(aggregate_content_id).await? else {
+        // Unknown / already-erased stratum — no-op. Never resurrects content.
+        return Ok(0);
+    };
+    // Stratum guard: only shed if the composite is actually at the named tier.
+    if record.aggregation_level != u64::from(tier) {
+        return Ok(0);
+    }
+    let corpus_kind = aggregate_corpus_kind(&record.source_corpus_kind);
+    backend
+        .evict_fountain_content_hard_delete(aggregate_content_id, &corpus_kind)
+        .await
 }
 
 #[cfg(test)]

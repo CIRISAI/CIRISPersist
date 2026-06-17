@@ -1364,6 +1364,50 @@ impl Engine {
         }
     }
 
+    /// v8.6.0 (§19.7.3 / verify v5.11.0 / CEG RC16) — execute an
+    /// [`EjectAggregatedTierOnly`](crate::fountain::EjectionAction::EjectAggregatedTierOnly):
+    /// shed **exactly one** pyramid stratum — the tier-`tier`
+    /// `content_aggregation` composite — leaving BOTH the finer (lower-level)
+    /// AND coarser (higher-level) composites intact. The tier-granular form of
+    /// `EjectToTier`.
+    ///
+    /// `aggregate_content_id` names the tier-`tier` composite; its stored
+    /// `aggregation_level` MUST equal `tier` or NOTHING is shed (`Ok(0)`).
+    /// Mechanically hard-deletes that ONE composite's symbols (its manifest
+    /// survives as `EnvelopeOnly` provenance) via
+    /// [`evict_aggregated_tier_on_backend`](crate::fountain::evict_aggregated_tier_on_backend).
+    /// Composites at other levels are separate rows and are never touched.
+    /// Composes with hard-delete: an unknown / already-erased stratum is a
+    /// no-op — this never resurrects erased content. Returns the symbol rows
+    /// shed.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn evict_aggregated_tier(
+        &self,
+        aggregate_content_id: &str,
+        tier: u32,
+    ) -> Result<u64, crate::store::Error> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::fountain::evict_aggregated_tier_on_backend(
+                    b.as_ref(),
+                    aggregate_content_id,
+                    tier,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::fountain::evict_aggregated_tier_on_backend(
+                    b.as_ref(),
+                    aggregate_content_id,
+                    tier,
+                )
+                .await
+            }
+        }
+    }
+
     /// v3.4.0 (CIRISPersist#123) — build, sign, and persist a
     /// `withdraws` attestation that retracts a prior `holds_bytes`
     /// emission. The canonical envelope is produced via

@@ -633,6 +633,151 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
         EjectionAction::Keep,
         "(f) live + no pressure → keep"
     );
+
+    // ── (g) §19.7.3 tier-granular stratum-shed (v8.6.0, verify v5.11.0):
+    //        build a 3-level pyramid (tiers 0/1/2 content_aggregation
+    //        composites, each with its OWN symbols). evict_aggregated_tier(.., 1)
+    //        sheds EXACTLY the tier-1 composite's symbols (reads EnvelopeOnly)
+    //        while tier-0 AND tier-2 composites stay intact (read Full); the
+    //        tier-1 manifest survives.
+    let mut pyramid_cids: Vec<(u32, String)> = Vec::with_capacity(3);
+    for level in 0u32..=2 {
+        let cid = format!("pyramid-t{level}-{suffix}");
+        let (m, s) = build_manifest_and_symbols(
+            &cid,
+            &composite_corpus,
+            n_source,
+            k_repair,
+            symbol_size,
+            true,
+        )
+        .await;
+        // Each stratum has its own member set + valid §19.7.1 meta.
+        let members: Vec<String> = (0..3)
+            .map(|i| format!("g-t{level}-m{i}-{suffix}"))
+            .collect();
+        let (gverif, gcommit) = signed_verify_inputs(&members, false, false).await;
+        let a = AggregationMetaV1 {
+            aggregate_content_id: cid.clone(),
+            source_corpus_kind: source_corpus.to_owned(),
+            aggregation_level: u64::from(level),
+            fan_in: 3,
+            member_commitment: gcommit,
+            aggregation_meta: vec![0x10 + level as u8],
+            verification: gverif,
+        };
+        backend
+            .put_aggregated_tier(&m, &s, &a, 20_000 + i64::from(level))
+            .await
+            .expect("(g) pyramid stratum admitted");
+        pyramid_cids.push((level, cid));
+    }
+    // Pre-condition: all three strata read Full.
+    for (level, cid) in &pyramid_cids {
+        let read = backend
+            .get_fountain_content(cid, &composite_corpus)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(read, FountainContent::Full { .. }),
+            "(g) tier-{level} composite starts Full"
+        );
+    }
+    let tier1_cid = pyramid_cids[1].1.clone();
+
+    use ciris_persist::fountain::evict_aggregated_tier_on_backend;
+
+    // Stratum-guard: a wrong-level request sheds NOTHING (no-op).
+    let wrong = evict_aggregated_tier_on_backend(backend, &tier1_cid, 2)
+        .await
+        .expect("(g) wrong-level request runs");
+    assert_eq!(wrong, 0, "(g) wrong tier (2 vs stored 1) sheds nothing");
+    assert!(
+        matches!(
+            backend
+                .get_fountain_content(&tier1_cid, &composite_corpus)
+                .await
+                .unwrap()
+                .unwrap(),
+            FountainContent::Full { .. }
+        ),
+        "(g) wrong-level no-op left tier-1 Full"
+    );
+
+    // Shed EXACTLY the tier-1 stratum.
+    let shed = evict_aggregated_tier_on_backend(backend, &tier1_cid, 1)
+        .await
+        .expect("(g) tier-1 stratum-shed runs");
+    assert!(shed > 0, "(g) tier-1 stratum-shed dropped its symbols");
+
+    // tier-1 composite now reads EnvelopeOnly; its manifest survives.
+    let t1_read = backend
+        .get_fountain_content(&tier1_cid, &composite_corpus)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(t1_read, FountainContent::EnvelopeOnly { .. }),
+        "(g) shed tier-1 composite reads EnvelopeOnly (symbols gone, manifest survives)"
+    );
+    assert!(
+        backend.get_aggregation(&tier1_cid).await.unwrap().is_some(),
+        "(g) tier-1 aggregation manifest/record survives the stratum-shed"
+    );
+
+    // tier-0 (finer) AND tier-2 (coarser) composites stay intact.
+    for (level, cid) in &pyramid_cids {
+        if *level == 1 {
+            continue;
+        }
+        let read = backend
+            .get_fountain_content(cid, &composite_corpus)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(read, FountainContent::Full { .. }),
+            "(g) tier-{level} composite intact after shedding tier-1 (finer+coarser untouched)"
+        );
+    }
+
+    // Composes with hard-delete: re-shedding the already-erased stratum is a
+    // no-op (never resurrects erased content); unknown composite → 0.
+    let reshed = evict_aggregated_tier_on_backend(backend, &tier1_cid, 1)
+        .await
+        .unwrap();
+    assert_eq!(reshed, 0, "(g) re-shed already-erased stratum is a no-op");
+    let unknown = evict_aggregated_tier_on_backend(backend, &format!("nope-{suffix}"), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        unknown, 0,
+        "(g) unknown composite → no-op (no resurrection)"
+    );
+
+    // ── (h) §19.7.3 verdict mapping for the new variant: verify-core's
+    //        EjectAggregatedTierOnly { tier } → EjectionAction::
+    //        EjectAggregatedTierOnly(tier), carrying the right tier; target_tier
+    //        is irrelevant (it's a stratum index, not a fidelity tier).
+    assert_eq!(
+        EjectionAction::from_verdict(EjectionVerdict::EjectAggregatedTierOnly { tier: 1 }, None,),
+        EjectionAction::EjectAggregatedTierOnly(1),
+        "(h) variant maps tier-for-tier with target_tier=None"
+    );
+    assert_eq!(
+        EjectionAction::from_verdict(
+            EjectionVerdict::EjectAggregatedTierOnly { tier: 7 },
+            Some(FountainTier::T3),
+        ),
+        EjectionAction::EjectAggregatedTierOnly(7),
+        "(h) stratum index is preserved, target_tier ignored"
+    );
+    assert_eq!(
+        EjectionAction::EjectAggregatedTierOnly(1).label(),
+        "eject_aggregated_tier_only",
+        "(h) stable telemetry label"
+    );
 }
 
 #[tokio::test]

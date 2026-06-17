@@ -7567,6 +7567,47 @@ impl PyEngine {
         })
     }
 
+    /// v8.6.0 (§19.7.3 / verify v5.11.0 / CEG RC16) — execute an
+    /// `EjectAggregatedTierOnly` stratum-shed, JSON-over-FFI. Shed **exactly
+    /// one** pyramid stratum — the tier-`tier` `content_aggregation` composite
+    /// named by `aggregate_content_id` — leaving BOTH the finer (lower-level)
+    /// AND coarser (higher-level) composites intact.
+    ///
+    /// The composite's stored `aggregation_level` MUST equal `tier` or NOTHING
+    /// is shed (returns `0`). Mechanically hard-deletes that ONE composite's
+    /// symbols (its manifest survives as `EnvelopeOnly` provenance); composites
+    /// at other levels are separate and never touched. Composes with
+    /// hard-delete: an unknown / already-erased stratum returns `0` — this never
+    /// resurrects erased content. Returns the symbol rows shed.
+    fn evict_aggregated_tier(
+        &self,
+        py: Python<'_>,
+        aggregate_content_id: &str,
+        tier: u32,
+    ) -> PyResult<u64> {
+        self.ensure_usable()?;
+        let aggregate_content_id = aggregate_content_id.to_owned();
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        evict_agg_tier(&*backend, &aggregate_content_id, tier).await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        evict_agg_tier(&*backend, &aggregate_content_id, tier).await
+                    })
+                }
+            })
+            .map_err(fountain_store_err_to_py)
+        })
+    }
+
     /// v0.3.6 (CIRISPersist#14) — Hybrid Ed25519 + ML-DSA-65 verify
     /// for arbitrary canonical bytes. CIRISEdge OQ-11 day-1 posture
     /// unblocker.
@@ -20069,6 +20110,7 @@ fn fountain_store_err_to_py(e: crate::store::Error) -> PyErr {
 }
 
 use crate::fountain::descend_aggregated_sources_on_backend as descend_sources;
+use crate::fountain::evict_aggregated_tier_on_backend as evict_agg_tier;
 
 /// v1.5.0 Phase I — Bridge [`crate::federation::backfill::BackfillError`]
 /// → `PyErr` at the FFI boundary. Emit-side failures route through

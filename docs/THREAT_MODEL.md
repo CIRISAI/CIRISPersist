@@ -27,8 +27,10 @@ not partial inclusion proofs, and reconciliation is between
 accountable signed equivocation-checked peers — see §3.14). Persist
 inherits this and does not roll Merkle. The additive
 `EjectAggregatedTierOnly { tier }` `EjectionVerdict` variant
-(RC16/RC17) is a tracked follow-on pending a verify-core exposure
-(v5.10.0 does not expose it yet), NOT a current gap.
+(RC16) is **consumed as of v8.6.0** (verify-core v5.11.0 exposes it):
+persist drives the tier-granular pyramid-stratum evict
+(`evict_aggregated_tier`) — shed exactly one stratum, finer + coarser
+tiers intact, composes with hard-delete (never resurrects erased content).
 Updated each minor release.
 **Audience:** lens / edge / registry / partner-site integrators,
 federation peers, security reviewers.
@@ -1888,11 +1890,17 @@ across the §19.7 freeze — the wire-churn firewall); the verification inputs
 are **admission-only and are never persisted**, so a stored row cannot carry
 unverified meta that a later read would trust.
 
-**Residual**: the new `EjectAggregatedTierOnly { tier }` `EjectionVerdict`
-variant (CEG RC16/RC17) is an additive future item — verify v5.10.0's enum
-does not yet expose it — so the tier-granular single-stratum shed is a
-tracked follow-on, **not a current gap** (persist drives the existing
-`EjectToTier` / `EjectHardDelete` verdicts today).
+**§19.7.3 complete (v8.6.0)**: the `EjectAggregatedTierOnly { tier }`
+`EjectionVerdict` variant (CEG RC16) is now **consumed** — verify-core
+v5.11.0 exposes it and persist drives the tier-granular single-stratum shed
+(`evict_aggregated_tier(aggregate_content_id, tier)` →
+`EjectionAction::EjectAggregatedTierOnly(tier)`): it sheds exactly the
+tier-`tier` composite's symbols (manifest survives `EnvelopeOnly`) while the
+finer (lower-level) AND coarser (higher-level) composites stay intact. It
+composes with hard-delete — a stratum already below the floor is unreachable,
+so it **never resurrects erased content**. The full §19.7.3 ejection surface
+(`Keep` / `EjectToTier` / `EjectAggregatedTierOnly` / `EjectHardDelete`) is
+now driven from verify-core.
 
 #### AV-65: Forged aggregation source set (descent integrity)
 
@@ -2026,7 +2034,7 @@ persist as `EnvelopeOnly` / below-the-noise-floor blur — §19.3 N5 requires
 | AV-61 | Witness divergence escalated to drive the quorum-merge (witness supplies a winning root / resurrects a revoked key) | v8.2.0 Divergent → `WitnessReconcileAction::TriggerQuorumMerge` carrying NO winner / NO root; triggers the EXISTING V058 quorum-merge over stored rows (`resolve_monotonic_quorum` / `revision`); the witness root NEVER enters resolution — no fragment-pick, no revoked-key resurrection. | Directive type structurally cannot carry a root; tested (Divergent keeps the REVOKED record). | **✓ Mitigated v8.2.0** (witness = detector, not resolver) | CIRISPersist#228/#229 |
 | AV-62 | Witness anti-rollback / eclipse (stale signed witness replay) | v8.2.0 `accept_if_monotonic` + `last_witness_epoch_for_peer` strict-epoch monotonic guard (epoch MUST strictly advance, §19 N4); `put_wholeness_witness` runs `verify_witness` PQC-before-persist (`witness_admit_hybrid_required`), zero rows on reject (no store-then-quarantine). | Corpus pruned to last-K (8) verified per peer; no `verified` column (§19.0 F-5 — verdict recomputed at the gate). | **✓ Mitigated v8.2.0** | CIRISPersist#228/#229 |
 | AV-63 | WW-2 deniable-content re-attribution (self/anonymous rows swept into a signed federating root) | v8.2.0 `build_local_witness` FILTERS OUT anonymous-tier + `cohort_scope: self` + self/anonymous-namespaced leaves BEFORE the Merkle root; `claim_namespaces` drawn only from survivors (provably never names self/anonymous); `verify_witness` re-checks the namespace guard at admission. | Enforced on both sides (build clean + verify rejects); upstream tagging is the AV-57/58 surface. | **✓ Mitigated v8.2.0** | CIRISPersist#228/#229 |
-| AV-64 | Forged `aggregation_meta` on the store path (tampered/unsigned §19.7 composite meta) | v8.4.0 `put_aggregated_tier` runs `verify_aggregation_meta` (§19.7.1 bound-hybrid) BEFORE persist; missing/invalid ML-DSA-65 → `aggregation_meta_hybrid_required` (store-path PQC §10.1.5.1.1), tampered → `aggregation_meta_invalid`; zero rows; composite manifest also rides the #225 admit gate in one tx. | Storage column stays opaque BYTEA/BLOB (V086 unchanged across freeze — wire-churn firewall); verify inputs admission-only, never persisted. | **✓ Mitigated v8.4.0** (`EjectAggregatedTierOnly` = additive follow-on pending verify exposure) | CIRISPersist#230 |
+| AV-64 | Forged `aggregation_meta` on the store path (tampered/unsigned §19.7 composite meta) | v8.4.0 `put_aggregated_tier` runs `verify_aggregation_meta` (§19.7.1 bound-hybrid) BEFORE persist; missing/invalid ML-DSA-65 → `aggregation_meta_hybrid_required` (store-path PQC §10.1.5.1.1), tampered → `aggregation_meta_invalid`; zero rows; composite manifest also rides the #225 admit gate in one tx. | Storage column stays opaque BYTEA/BLOB (V086 unchanged across freeze — wire-churn firewall); verify inputs admission-only, never persisted. | **✓ Mitigated v8.4.0** (`EjectAggregatedTierOnly` tier-granular stratum-shed consumed v8.6.0 — verify v5.11.0) | CIRISPersist#230 |
 | AV-65 | Forged aggregation source set (descent as a force-evict channel) | v8.4.0 `descend_aggregated_sources` runs `verify_member_commitment` over the caller's source ids BEFORE descending — a set that doesn't re-derive the committed `member_commitment` is REJECTED; canonical `descend_order` (§19.7.2 lexicographic). Full source-id-list recomputation, never a partial inclusion proof (the §19.1 RC15-freeze CVE-2012-2459 non-exploitability rationale). | `member_commitment` is hybrid-signed in the composite manifest (AV-64) — the root to re-derive is itself authenticated. | **✓ Mitigated v8.4.0** | CIRISPersist#230 |
 | AV-66 | Rarity-driven retention resurrecting revoked content (N5) | v8.1.0/v8.2.0 `evict_fountain_content_hard_delete` is a SEPARATE path that NEVER consults `retention_priority` — drops all symbols, manifest stays `EnvelopeOnly`; `resolve_retention_action` drives `retention_decision`/`ejection_verdict` (Withdrawn → `EjectHardDelete` regardless of `is_rare`). Revocation overrides rarity by construction, not by comparison. | N6 `holding_claim_counts` gates rarity on possession-proven claims (unverified claim can't lower another peer's priority). | **✓ Mitigated v8.1.0/v8.2.0** | CIRISPersist#228 |
 

@@ -5,6 +5,20 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [8.6.0] — 2026-06-16
+
+### Changed — re-pin CIRISVerify v5.10.0 → v5.11.0 (§19.7.3 `EjectAggregatedTierOnly`)
+
+All six verify-crate pins flipped together (verify-core / crypto / keyring + the tpm/ios/android target tables) so the graph resolves to one `ciris_crypto`. v5.11.0 / CEG RC16 adds the 4th `EjectionVerdict` variant `EjectAggregatedTierOnly { tier: u32 }` (§19.7.3) — the tier-granular form of `EjectToTier` that sheds exactly ONE intermediate pyramid stratum.
+
+### Added — §19.7.3 conform completion: consume `EjectAggregatedTierOnly { tier }` → tier-granular pyramid-stratum evict (CIRISPersist v8.6.0)
+
+The §19.7.3 ejection surface is now complete: persist consumes the new verify-core verdict variant and implements the tier-granular stratum-shed it names.
+
+- **`EjectionAction::EjectAggregatedTierOnly(u32)` (the compile-required arm).** `from_verdict` now maps `EjectionVerdict::EjectAggregatedTierOnly { tier } => EjectionAction::EjectAggregatedTierOnly(tier)` (label `"eject_aggregated_tier_only"`). The verdict carries WHICH stratum to shed (a tier index, not a fidelity tier — `target_tier` is irrelevant for it).
+- **`evict_aggregated_tier(aggregate_content_id, tier)` (engine + FFI + shared `evict_aggregated_tier_on_backend`).** Sheds **exactly one** pyramid stratum — the tier-`tier` `content_aggregation` composite — leaving BOTH the finer (lower-level) AND coarser (higher-level) composites' symbols intact. It composes existing eviction primitives: resolve the composite via `get_aggregation`, guard that its `aggregation_level == tier` (else `Ok(0)` — never shed a different level than asked), then drop that ONE composite's symbols via `evict_fountain_content_hard_delete` on its `aggregate_content_id` with `corpus_kind = "aggregate:<source>"`. The tier-`tier` manifest survives as `EnvelopeOnly` provenance. **Composes with hard-delete:** an unknown / already-erased stratum is a no-op (`Ok(0)`) — this **never resurrects erased content**. No new Backend method, no migration; the V086 schema is UNCHANGED. The source-fold descent path (`descend_aggregated_sources_on_backend`) treats the stratum-shed action as a no-op (it targets composites, not sources — the dedicated entry point drives it).
+- **Tests:** `tests/aggregation_tier.rs` extended on BOTH backends — a 3-level pyramid (tiers 0/1/2 composites with symbols); `evict_aggregated_tier(.., 1)` sheds the tier-1 composite's symbols (reads `EnvelopeOnly`) while tier-0 AND tier-2 composites' symbols stay **intact** and the tier-1 manifest survives; plus the verdict mapping `EjectionVerdict::EjectAggregatedTierOnly { tier } → EjectionAction::EjectAggregatedTierOnly(tier)`. PG test ids uuid-suffixed; all cross-run/global-listing asserts scoped to the run suffix with generous limits.
+
 ## [8.5.0] — 2026-06-16
 
 ### Added — `pub fn ffi::pyo3::register` cross-crate registration hook (CIRISPersist#231)
