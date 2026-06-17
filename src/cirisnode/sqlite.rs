@@ -275,11 +275,13 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         if takedown.is_some() {
             let directory =
                 crate::store::sqlite::SqliteBackend::from_conn_handle(self.conn.clone());
-            let (subjects, community_id) = super::payload_target_descriptor(&env.payload);
+            // v8.7.2: authority over the SIGNED content provenance — the
+            // payload's declared subjects are advisory/routing-only.
+            let (content_sha256, community_id) = super::payload_target_descriptor(&env.payload);
             super::check_moderation_or_reject(
                 &directory,
                 &env.author_id,
-                &subjects,
+                &content_sha256,
                 &community_id,
                 crate::federation::admission::DELEGATION_SCOPE_TAKEDOWN,
                 "takedown_notice",
@@ -514,11 +516,13 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         {
             let directory =
                 crate::store::sqlite::SqliteBackend::from_conn_handle(self.conn.clone());
-            let (subjects, community_id) = super::payload_target_descriptor(&event.payload);
+            // v8.7.2: authority over the SIGNED content provenance — the
+            // payload's declared subjects are advisory/routing-only.
+            let (content_sha256, community_id) = super::payload_target_descriptor(&event.payload);
             super::check_moderation_or_reject(
                 &directory,
                 &event.accuser_id,
-                &subjects,
+                &content_sha256,
                 &community_id,
                 crate::federation::admission::DELEGATION_SCOPE_MODERATE,
                 "moderation_event",
@@ -1908,7 +1912,7 @@ mod tests {
     /// attestation) + rollback on phantom target.
     #[tokio::test]
     async fn cirisnode_sqlite_round_trip_full_lifecycle() {
-        let (_b, backend) = fresh_backend().await;
+        let (b, backend) = fresh_backend().await;
 
         let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32]);
         let voter_key = ed25519_dalek::SigningKey::from_bytes(&[0xB2; 32]);
@@ -2078,15 +2082,26 @@ mod tests {
         assert!(el.is_active);
 
         // 11. put_moderation_event
+        // v8.7.2 (#233 follow-on): the accuser's subject-self authority now
+        // resolves over the SIGNED content provenance, not the payload. Seed
+        // an establishing scores attestation binding `mod_sha` with signed
+        // subjects=[author] so the as-self path admits (this lifecycle test
+        // exercises storage, not the moderation authority gate).
+        let mod_sha = fixture_sha_hex_sqlite(0xab);
+        seed_fed_key(&b, &author).await;
+        seed_establishing_content(&b, "est-lifecycle", &author, &mod_sha, &[&author]).await;
         let moderation_id = Uuid::new_v4();
         let mut mod_event = ModerationEvent {
             moderation_id: moderation_id.to_string(),
             target_contributor: voter.clone(),
             accuser_id: author.clone(),
-            // v8.7.1 (#233): accuser self-declares as a subject so the
-            // §11.10 gate admits via the as-self path (this lifecycle test
-            // exercises storage, not the moderation authority gate).
-            payload: serde_json::json!({"violation": "test", "subject_key_ids": [author.clone()]}),
+            // The payload `subject_key_ids` is advisory/routing-only; the
+            // `content_sha256` drives subject_of authority resolution.
+            payload: serde_json::json!({
+                "violation": "test",
+                "subject_key_ids": [author.clone()],
+                "content_sha256": mod_sha,
+            }),
             filed_at: Utc::now(),
             signature: HybridSignature {
                 ed25519: String::new(),
@@ -2884,11 +2899,13 @@ mod tests {
             asserted_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::days(30),
         };
-        // v8.7.1 (#233): the §11.10 gate now requires the author to be a
-        // duty-holder over the target. These tests exercise takedown
-        // storage/listing mechanics, not the moderation gate, so the
-        // author self-declares as a subject of the target content (as-self
-        // admit path — no key seeding / community needed).
+        // v8.7.2 (#233 follow-on): the §11.10 gate requires the author to
+        // be a duty-holder over the SIGNED content provenance. The payload
+        // `subject_key_ids` is now advisory/routing-only — it no longer
+        // admits. Storage/listing-mechanics tests using this helper must
+        // seed an establishing `scores` attestation binding `sha_hex` with
+        // signed subjects=[author] (see `seed_establishing_content`). The
+        // advisory field is left set for routing parity.
         let mut payload_json = serde_json::to_value(&payload).unwrap();
         payload_json["subject_key_ids"] = serde_json::json!([author.clone()]);
         let mut env = ContributionEnvelope {
@@ -2962,9 +2979,14 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_takedown_notice_admits_via_put_contribution() {
-        let (_b, cn) = fresh_backend().await;
+        let (b, cn) = fresh_backend().await;
         let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF1; 32]);
+        let author = pubkey_b64(&author_key);
         let sha_hex = fixture_sha_hex_sqlite(0x70);
+        // v8.7.2: author must be a SIGNED subject of the establishing
+        // content for the as-self takedown path to admit.
+        seed_fed_key(&b, &author).await;
+        seed_establishing_content(&b, "est-admit", &author, &sha_hex, &[&author]).await;
         let env = build_takedown_contribution_sqlite(
             &author_key,
             &sha_hex,
@@ -3014,10 +3036,16 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_list_takedowns_for_returns_only_matching_sha() {
-        let (_b, cn) = fresh_backend().await;
+        let (b, cn) = fresh_backend().await;
         let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF5; 32]);
+        let author = pubkey_b64(&author_key);
         let sha_a = fixture_sha_hex_sqlite(0x10);
         let sha_b = fixture_sha_hex_sqlite(0x20);
+        // v8.7.2: author is the SIGNED subject of both target contents so
+        // the as-self takedown path admits over each.
+        seed_fed_key(&b, &author).await;
+        seed_establishing_content(&b, "est-a", &author, &sha_a, &[&author]).await;
+        seed_establishing_content(&b, "est-b", &author, &sha_b, &[&author]).await;
         cn.put_contribution(build_takedown_contribution_sqlite(
             &author_key,
             &sha_a,
@@ -3637,13 +3665,61 @@ mod tests {
             .unwrap();
     }
 
-    /// Build a signed `ModerationEvent` from `signer_key`, declaring the
-    /// target's `subject_key_ids` + `community_id` in the payload.
+    /// v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10) — seed a
+    /// content-ESTABLISHING federation `scores` attestation that binds
+    /// `content_sha256` in its envelope `evidence_refs` and carries the
+    /// SIGNED `subject_key_ids`. This is what `subject_of_content` resolves
+    /// over — the producer's signed subject set behind the hash, NOT a
+    /// later takedown/moderation payload's self-declared subjects.
+    async fn seed_establishing_content(
+        backend: &SqliteBackend,
+        id: &str,
+        producer: &str,
+        content_sha256: &str,
+        subjects: &[&str],
+    ) {
+        use crate::federation::FederationDirectory;
+        let att = crate::federation::types::Attestation {
+            attestation_id: id.into(),
+            attesting_key_id: producer.into(),
+            attested_key_id: producer.into(),
+            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+            weight: None,
+            asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": "content:established:v1",
+                "evidence_refs": [content_sha256],
+            }),
+            original_content_hash: "abc123".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: producer.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: subjects.iter().map(|s| s.to_string()).collect(),
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
+        };
+        backend
+            .put_attestation(crate::federation::types::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+    }
+
+    /// Build a signed `ModerationEvent` from `signer_key`. `subjects` is
+    /// the payload's (now advisory/routing-only) declared subject set;
+    /// `content_sha256` is the target content hash that drives
+    /// `subject_of` authority resolution.
     fn build_moderation_event(
         signer_key: &ed25519_dalek::SigningKey,
         target: &str,
         subjects: &[&str],
         community_id: Option<&str>,
+        content_sha256: Option<&str>,
     ) -> ModerationEvent {
         let accuser = pubkey_b64(signer_key);
         let mut payload = serde_json::json!({
@@ -3652,6 +3728,9 @@ mod tests {
         });
         if let Some(c) = community_id {
             payload["community_id"] = serde_json::Value::String(c.to_owned());
+        }
+        if let Some(h) = content_sha256 {
+            payload["content_sha256"] = serde_json::Value::String(h.to_owned());
         }
         let mut ev = ModerationEvent {
             moderation_id: Uuid::new_v4().to_string(),
@@ -3669,8 +3748,17 @@ mod tests {
         ev
     }
 
-    /// Build a signed `takedown_notice` Contribution from `signer_key`,
-    /// declaring the target's `subject_key_ids` + `community_id`.
+    /// The content hash every `build_takedown_notice` targets — the
+    /// establishing `scores` attestation must bind THIS hash for
+    /// subject-self to resolve (v8.7.2).
+    fn takedown_content_sha() -> String {
+        fixture_sha_hex_sqlite(0x70)
+    }
+
+    /// Build a signed `takedown_notice` Contribution from `signer_key`.
+    /// `subjects` is the payload's (now advisory/routing-only) declared
+    /// subject set; authority resolves over [`takedown_content_sha`] via
+    /// `subject_of_content`.
     fn build_takedown_notice(
         signer_key: &ed25519_dalek::SigningKey,
         subjects: &[&str],
@@ -3678,7 +3766,7 @@ mod tests {
     ) -> ContributionEnvelope {
         let author = pubkey_b64(signer_key);
         let mut payload = serde_json::json!({
-            "content_sha256": fixture_sha_hex_sqlite(0x70),
+            "content_sha256": takedown_content_sha(),
             "claimant_key_id": author,
             "legal_basis": "ncmec_csam",
             "jurisdiction": "US",
@@ -3755,12 +3843,19 @@ mod tests {
         }
         seed_community(&b, "comm-mod", &founder).await;
 
-        // (a) as-self subject → ADMITTED.
+        // v8.7.2: seed the content-ESTABLISHING scores attestation binding
+        // `sha` with SIGNED subjects = [subject]. subject-self authority
+        // now resolves over THIS, not the moderation payload's declaration.
+        let sha = fixture_sha_hex_sqlite(0x9a);
+        seed_establishing_content(&b, "est-mod", &subject, &sha, &[&subject]).await;
+
+        // (a) as-self subject (signed in the establishing content) → ADMITTED.
         cn.put_moderation_event(build_moderation_event(
             &subject_key,
             "target",
             &[&subject],
             None,
+            Some(&sha),
         ))
         .await
         .expect("(a) as-self subject moderation admitted");
@@ -3779,16 +3874,19 @@ mod tests {
             "target",
             &[&subject],
             None,
+            Some(&sha),
         ))
         .await
         .expect("(b1) subject-delegated moderation admitted");
 
         // (b2) named-moderator (community founder, owner-bound) → ADMIT.
+        // No establishing content needed — community-scoped duty.
         cn.put_moderation_event(build_moderation_event(
             &founder_key,
             "target",
             &[],
             Some("comm-mod"),
+            None,
         ))
         .await
         .expect("(b2) named-moderator (founder) moderation admitted");
@@ -3800,6 +3898,7 @@ mod tests {
                 "target",
                 &[&subject],
                 None,
+                Some(&sha),
             ))
             .await
             .unwrap_err();
@@ -3807,7 +3906,13 @@ mod tests {
 
         // (c2) NOTHING — no subjects, no community → REJECTED (bypass guard).
         let err = cn
-            .put_moderation_event(build_moderation_event(&rando_key, "target", &[], None))
+            .put_moderation_event(build_moderation_event(
+                &rando_key,
+                "target",
+                &[],
+                None,
+                None,
+            ))
             .await
             .unwrap_err();
         assert_eq!(
@@ -3831,6 +3936,120 @@ mod tests {
                 "target",
                 &[&subject],
                 None,
+                Some(&sha),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "cirisnode_delegated_scope_unauthorized");
+    }
+
+    /// v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10; CIRISRegistry#96)
+    /// — the self-declaration SPOOF is closed: a signer who self-declares
+    /// `subject_key_ids=[self]` in the moderation payload but is NOT in the
+    /// establishing content's SIGNED subjects and is NOT a named-mod is
+    /// REJECTED. THE regression guard — payload self-declaration no longer
+    /// admits.
+    #[tokio::test]
+    async fn sqlite_moderation_payload_self_declaration_spoof_rejected() {
+        let (b, cn) = fresh_backend().await;
+        let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0xe1; 32]);
+        let real_subject_key = ed25519_dalek::SigningKey::from_bytes(&[0xe2; 32]);
+        let attacker = pubkey_b64(&attacker_key);
+        let real_subject = pubkey_b64(&real_subject_key);
+        seed_fed_key(&b, &attacker).await;
+        seed_user_key(&b, &real_subject).await;
+
+        // Establishing content's SIGNED subjects = [real_subject], NOT attacker.
+        let sha = fixture_sha_hex_sqlite(0xb1);
+        seed_establishing_content(&b, "est-spoof", &real_subject, &sha, &[&real_subject]).await;
+
+        // Attacker self-declares subject_key_ids=[attacker] in the payload.
+        // Pre-v8.7.2 this admitted (payload trust). Now: REJECT — attacker
+        // is not in the signed subjects and is not a named-mod.
+        let err = cn
+            .put_moderation_event(build_moderation_event(
+                &attacker_key,
+                "target",
+                &[&attacker],
+                None,
+                Some(&sha),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "cirisnode_delegated_scope_unauthorized",
+            "payload self-declaration must NOT admit (spoof closed)"
+        );
+
+        // The REAL signed subject still admits as-self over the same content.
+        cn.put_moderation_event(build_moderation_event(
+            &real_subject_key,
+            "target",
+            &[&real_subject],
+            None,
+            Some(&sha),
+        ))
+        .await
+        .expect("real signed subject admits as-self");
+    }
+
+    /// v8.7.2 — fail-secure: no establishing attestation locally held ⇒
+    /// subject-self FAILS (undetermined subject_of); the named-mod path (b)
+    /// still ADMITs a real named-mod; a non-authority signer REJECTs.
+    #[tokio::test]
+    async fn sqlite_moderation_fail_secure_no_establishing_content() {
+        let (b, cn) = fresh_backend().await;
+        let subject_key = ed25519_dalek::SigningKey::from_bytes(&[0xf1; 32]);
+        let founder_key = ed25519_dalek::SigningKey::from_bytes(&[0xf2; 32]);
+        let rando_key = ed25519_dalek::SigningKey::from_bytes(&[0xf3; 32]);
+        let subject = pubkey_b64(&subject_key);
+        let founder = pubkey_b64(&founder_key);
+        let rando = pubkey_b64(&rando_key);
+        seed_user_key(&b, &subject).await;
+        seed_user_key(&b, &founder).await;
+        seed_fed_key(&b, &rando).await;
+        seed_community(&b, "comm-fs", &founder).await;
+
+        // No establishing content for this sha — subject_of is undetermined.
+        let sha = fixture_sha_hex_sqlite(0xc2);
+
+        // subject-self FAILS (nothing locally binds the hash to a subject).
+        let err = cn
+            .put_moderation_event(build_moderation_event(
+                &subject_key,
+                "target",
+                &[&subject],
+                None,
+                Some(&sha),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "cirisnode_delegated_scope_unauthorized",
+            "fail-secure: undetermined subject_of must REJECT subject-self"
+        );
+
+        // named-mod path (b) still ADMITs a real owner-bound founder.
+        cn.put_moderation_event(build_moderation_event(
+            &founder_key,
+            "target",
+            &[&subject],
+            Some("comm-fs"),
+            Some(&sha),
+        ))
+        .await
+        .expect("named-mod still admits under fail-secure subject_of");
+
+        // a non-authority signer still REJECTs.
+        let err = cn
+            .put_moderation_event(build_moderation_event(
+                &rando_key,
+                "target",
+                &[&subject],
+                Some("comm-fs"),
+                Some(&sha),
             ))
             .await
             .unwrap_err();
@@ -3851,7 +4070,13 @@ mod tests {
             seed_fed_key(&b, k).await;
         }
 
-        // (a) as-self subject → ADMITTED.
+        // v8.7.2: the establishing scores attestation binds the takedown's
+        // target hash with SIGNED subjects = [subject]. subject-self
+        // authority resolves over THIS, not the takedown payload.
+        let td_sha = takedown_content_sha();
+        seed_establishing_content(&b, "est-td", &subject, &td_sha, &[&subject]).await;
+
+        // (a) as-self subject (signed in the establishing content) → ADMITTED.
         cn.put_contribution(build_takedown_notice(&subject_key, &[&subject], None))
             .await
             .expect("(a) as-self subject takedown admitted");
@@ -3925,6 +4150,10 @@ mod tests {
             )
             .await;
         }
+        // v8.7.2: bind chain_ids[0] as a SIGNED subject of td_sha so it is a
+        // duty-holder root the walk starts from — otherwise the rejection
+        // would be "not a duty-holder", not the depth-cap we want to assert.
+        seed_establishing_content(&b, "est-depth", &chain_ids[0], &td_sha, &[&chain_ids[0]]).await;
         // signer = the too-deep tail; root (subject) = chain_ids[0].
         let err = cn
             .put_contribution(build_takedown_notice(

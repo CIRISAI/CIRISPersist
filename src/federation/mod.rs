@@ -388,6 +388,42 @@ pub trait FederationDirectory: Send + Sync {
         Ok(chain)
     }
 
+    /// v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10;
+    /// CIRISRegistry#96) — the content-establishing `scores`
+    /// attestations that bind `content_sha256`: federation-tier `scores`
+    /// rows whose envelope `evidence_refs` array contains the hex
+    /// `content_sha256`. These are the attestations whose producer signed
+    /// the content's `subject_key_ids` INSIDE the attestation — the
+    /// signed subject set behind the hash (NOT a later third party's
+    /// self-declaration).
+    ///
+    /// Returns an empty vector when no establishing attestation is
+    /// locally held (the fail-secure case: an undetermined `subject_of`
+    /// means the subject-self admission clause FAILS — see
+    /// [`super::admission::subject_of_content`]).
+    ///
+    /// # Why a separate method (not [`Self::lookup_trusted_publisher_chain`])
+    ///
+    /// `lookup_trusted_publisher_chain` is the publisher-vouch chain: it
+    /// is scoped to `trusted_publisher`-type keys AND `content_rating:*`
+    /// dimensions. Content PROVENANCE is broader — the establishing
+    /// `scores` Contribution may be issued by any key on any dimension; it
+    /// is identified solely by binding the hash in `evidence_refs`. So the
+    /// subject resolution scans `evidence_refs` without the publisher /
+    /// dimension restriction.
+    ///
+    /// # Default impl rationale
+    ///
+    /// No default — the trait has no "all attestations" enumerator, so
+    /// each backend supplies the indexed / `json_extract` query directly.
+    /// The hex shape is validated by the caller
+    /// ([`super::admission::subject_of_content`]); backends MAY assume a
+    /// well-formed lowercase hex-64 `content_sha256`.
+    async fn attestations_binding_content(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<Attestation>, Error>;
+
     // ── Revocations ────────────────────────────────────────────────
 
     /// Insert a new revocation row. Append-only — revocations of an

@@ -2232,6 +2232,54 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))
     }
 
+    async fn attestations_binding_content(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        // v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10) — the
+        // content-establishing `scores` rows that bind `content_sha256`
+        // in their envelope `evidence_refs` array. SQLite has no native
+        // JSON-array `contains`, so the SQL prefilters to federation-tier
+        // `scores` rows whose envelope mentions the hash via a substring
+        // LIKE (cheap, false-positive-tolerant), then the exact
+        // `evidence_refs` set-membership is confirmed in Rust against the
+        // parsed envelope. No new index — the V054 index is on
+        // `cirisnode_contributions.media_content_sha256`, a different
+        // table; this scan is over `federation_attestations`.
+        let conn = self.conn.clone();
+        let sha = content_sha256.to_owned();
+        let like = format!("%{sha}%");
+        (move || -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                        subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                     FROM federation_attestations \
+                     WHERE attestation_type = 'scores' AND tier = 'federation' \
+                        AND attestation_envelope LIKE ?1 \
+                     ORDER BY asserted_at DESC",
+            )?;
+            let rows = stmt.query_map([&like], sqlite_row_to_attestation)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })()
+        .map(|atts| {
+            atts.into_iter()
+                .filter(|a| {
+                    crate::federation::admission::envelope_binds_content(
+                        &a.attestation_envelope,
+                        &sha,
+                    )
+                })
+                .collect()
+        })
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("attestations_binding_content: {e}"))
+        })
+    }
+
     async fn put_revocation(
         &self,
         revocation: crate::federation::SignedRevocation,

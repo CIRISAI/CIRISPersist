@@ -155,11 +155,13 @@ impl NodeCoreService for PostgresBackend {
         // scoped chain. Absence ⇒ REJECT. Runs BEFORE the INSERT — a
         // rejected emission leaves no trace.
         if takedown.is_some() {
-            let (subjects, community_id) = super::payload_target_descriptor(&env.payload);
+            // v8.7.2: authority over the SIGNED content provenance — the
+            // payload's declared subjects are advisory/routing-only.
+            let (content_sha256, community_id) = super::payload_target_descriptor(&env.payload);
             super::check_moderation_or_reject(
                 self,
                 &env.author_id,
-                &subjects,
+                &content_sha256,
                 &community_id,
                 crate::federation::admission::DELEGATION_SCOPE_TAKEDOWN,
                 "takedown_notice",
@@ -358,11 +360,13 @@ impl NodeCoreService for PostgresBackend {
         // community's named moderators) or is reached by an owner-bound
         // duty-holder via a live `moderate`-scoped chain. Absence ⇒ REJECT.
         // Runs AFTER signature verify, BEFORE INSERT.
-        let (subjects, community_id) = super::payload_target_descriptor(&event.payload);
+        // v8.7.2: authority over the SIGNED content provenance — the
+        // payload's declared subjects are advisory/routing-only.
+        let (content_sha256, community_id) = super::payload_target_descriptor(&event.payload);
         super::check_moderation_or_reject(
             self,
             &event.accuser_id,
-            &subjects,
+            &content_sha256,
             &community_id,
             crate::federation::admission::DELEGATION_SCOPE_MODERATE,
             "moderation_event",
@@ -2493,6 +2497,205 @@ mod tests {
         hex::encode(bytes)
     }
 
+    // ── v8.7.2 (#233 follow-on, CEG RC27 §11.10) — PG §11.10 moderation
+    // gate seeding helpers (parity with the sqlite matrix). `key_id` =
+    // pubkey_b64 (matches the cirisnode signer surface).
+
+    /// Seed a `federation_keys` row for `key_id` with the given
+    /// `identity_type`.
+    async fn seed_key_pg(backend: &PostgresBackend, key_id: &str, identity_type: &str) {
+        use crate::federation::FederationDirectory;
+        let rec = crate::federation::types::KeyRecord {
+            key_id: key_id.into(),
+            pubkey_ed25519_base64: key_id.into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: identity_type.into(),
+            identity_ref: key_id.into(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": key_id }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        // Tolerate an exact-content idempotent re-seed on a reused PG (the
+        // lead's local docker DB persists across runs); a genuine
+        // wrong-content conflict is impossible here because every test uses
+        // a globally-unique signing-key seed (so key_id is unique per test).
+        match backend
+            .put_public_key(crate::federation::types::SignedKeyRecord { record: rec })
+            .await
+        {
+            Ok(()) | Err(crate::federation::Error::Conflict(_)) => {}
+            Err(e) => panic!("seed_key_pg: {e}"),
+        }
+    }
+
+    async fn seed_fed_key_pg(backend: &PostgresBackend, key_id: &str) {
+        seed_key_pg(
+            backend,
+            key_id,
+            crate::federation::types::identity_type::PRIMITIVE,
+        )
+        .await;
+    }
+
+    async fn seed_user_key_pg(backend: &PostgresBackend, key_id: &str) {
+        seed_key_pg(
+            backend,
+            key_id,
+            crate::federation::types::identity_type::USER,
+        )
+        .await;
+    }
+
+    /// Seed the content-ESTABLISHING federation `scores` attestation binding
+    /// `content_sha256` in `evidence_refs` with SIGNED `subject_key_ids`.
+    async fn seed_establishing_content_pg(
+        backend: &PostgresBackend,
+        producer: &str,
+        content_sha256: &str,
+        subjects: &[&str],
+    ) {
+        use crate::federation::FederationDirectory;
+        let att = crate::federation::types::Attestation {
+            attestation_id: Uuid::new_v4().to_string(),
+            attesting_key_id: producer.into(),
+            attested_key_id: producer.into(),
+            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+            weight: None,
+            asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": "content:established:v1",
+                "evidence_refs": [content_sha256],
+            }),
+            original_content_hash: "abc123".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: producer.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: subjects.iter().map(|s| s.to_string()).collect(),
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
+        };
+        backend
+            .put_attestation(crate::federation::types::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+    }
+
+    /// Seed a `delegates_to` edge `granter → grantee` bearing `scope`.
+    async fn seed_delegation_pg(
+        backend: &PostgresBackend,
+        granter: &str,
+        grantee: &str,
+        scope: serde_json::Value,
+    ) {
+        use crate::federation::FederationDirectory;
+        let id = Uuid::new_v4().to_string();
+        let att = crate::federation::types::Attestation {
+            attestation_id: id.clone(),
+            attesting_key_id: granter.into(),
+            attested_key_id: grantee.into(),
+            attestation_type: crate::federation::types::attestation_type::DELEGATES_TO.into(),
+            weight: None,
+            asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "references_attestation_id": id,
+                "scope": scope,
+            }),
+            original_content_hash: "abc123".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: granter.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
+        };
+        backend
+            .put_attestation(crate::federation::types::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+    }
+
+    /// Seed a community keyed by `community_id` with a `founder` member.
+    async fn seed_community_pg(backend: &PostgresBackend, community_id: &str, founder: &str) {
+        use crate::federation::FederationDirectory;
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: crate::federation::types::Community {
+                    community_key_id: community_id.into(),
+                    community_name: "tc".into(),
+                    members: vec![crate::federation::types::CommunityMember {
+                        key_id: founder.into(),
+                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        role: Some("founder".into()),
+                    }],
+                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
+                        .into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Build a signed `ModerationEvent`. `subjects` is the (advisory)
+    /// payload subject set; `content_sha256` drives `subject_of` authority.
+    fn build_moderation_event_pg(
+        signer_key: &ed25519_dalek::SigningKey,
+        target: &str,
+        subjects: &[&str],
+        community_id: Option<&str>,
+        content_sha256: Option<&str>,
+    ) -> ModerationEvent {
+        let accuser = pubkey_b64(signer_key);
+        let mut payload = serde_json::json!({
+            "violation": "rogue_action",
+            "subject_key_ids": subjects,
+        });
+        if let Some(c) = community_id {
+            payload["community_id"] = serde_json::Value::String(c.to_owned());
+        }
+        if let Some(h) = content_sha256 {
+            payload["content_sha256"] = serde_json::Value::String(h.to_owned());
+        }
+        let mut ev = ModerationEvent {
+            moderation_id: Uuid::new_v4().to_string(),
+            target_contributor: target.into(),
+            accuser_id: accuser,
+            payload,
+            filed_at: Utc::now(),
+            signature: HybridSignature {
+                ed25519: String::new(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+        };
+        ev.signature = sign_envelope(&ev, signer_key);
+        ev
+    }
+
     fn build_takedown_contribution(
         author_key: &ed25519_dalek::SigningKey,
         sha_hex: &str,
@@ -2513,10 +2716,12 @@ mod tests {
             asserted_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::days(30),
         };
-        // v8.7.1 (#233): the §11.10 gate requires the author to be a
-        // duty-holder over the target. These tests exercise takedown
-        // storage/listing mechanics, not the moderation gate, so the author
-        // self-declares as a subject of the target (as-self admit path).
+        // v8.7.2 (#233 follow-on): the §11.10 gate requires the author to be
+        // a duty-holder over the SIGNED content provenance. The payload
+        // `subject_key_ids` is advisory/routing-only — it no longer admits.
+        // Storage/listing tests using this helper seed an establishing
+        // `scores` attestation binding `sha_hex` with signed subjects=[author]
+        // (`seed_establishing_content_pg`). The advisory field is left set.
         let mut payload_json = serde_json::to_value(&payload).unwrap();
         payload_json["subject_key_ids"] = serde_json::json!([author.clone()]);
         let mut env = ContributionEnvelope {
@@ -2713,7 +2918,12 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
         let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF1; 32]);
+        let author = pubkey_b64(&author_key);
         let sha_hex = fixture_sha_hex(0x70);
+        // v8.7.2: author must be a SIGNED subject of the establishing
+        // content for the as-self takedown path to admit.
+        seed_fed_key_pg(&backend, &author).await;
+        seed_establishing_content_pg(&backend, &author, &sha_hex, &[&author]).await;
         let env = build_takedown_contribution(
             &author_key,
             &sha_hex,
@@ -2796,8 +3006,13 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.unwrap();
         backend.run_migrations().await.unwrap();
         let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xF5; 32]);
+        let author = pubkey_b64(&author_key);
         let sha_a = fixture_sha_hex(0x10);
         let sha_b = fixture_sha_hex(0x20);
+        // v8.7.2: author is the SIGNED subject of both target contents.
+        seed_fed_key_pg(&backend, &author).await;
+        seed_establishing_content_pg(&backend, &author, &sha_a, &[&author]).await;
+        seed_establishing_content_pg(&backend, &author, &sha_b, &[&author]).await;
         backend
             .put_contribution(build_takedown_contribution(
                 &author_key,
@@ -2827,6 +3042,260 @@ mod tests {
         assert!(rows.iter().any(|r| {
             r.payload.get("content_sha256").and_then(|v| v.as_str()) == Some(sha_a.as_str())
         }));
+    }
+
+    // ── v8.7.2 (#233 follow-on, CEG RC27 §11.10) — PG §11.10 moderation
+    // gate matrix (parity with the sqlite matrix), bound to SIGNED content
+    // provenance via `subject_of_content`.
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_moderation_event_full_matrix() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // v8.7.2: globally-unique seed bytes (0x90-0x93) so this test's
+        // federation keys never collide with another PG test's fixed-seed
+        // keys on a reused DB (cross-type Conflict guard).
+        let subject_key = ed25519_dalek::SigningKey::from_bytes(&[0x90; 32]);
+        let delegate_key = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
+        let rando_key = ed25519_dalek::SigningKey::from_bytes(&[0x92; 32]);
+        let founder_key = ed25519_dalek::SigningKey::from_bytes(&[0x93; 32]);
+        let subject = pubkey_b64(&subject_key);
+        let delegate = pubkey_b64(&delegate_key);
+        let rando = pubkey_b64(&rando_key);
+        let founder = pubkey_b64(&founder_key);
+        seed_user_key_pg(&backend, &subject).await;
+        seed_user_key_pg(&backend, &founder).await;
+        for k in [&delegate, &rando] {
+            seed_fed_key_pg(&backend, k).await;
+        }
+        let comm = format!("comm-mod-{}", Uuid::new_v4());
+        seed_community_pg(&backend, &comm, &founder).await;
+
+        // Establishing content binds `sha` with SIGNED subjects=[subject].
+        let sha = fixture_sha_hex(0x9a);
+        seed_establishing_content_pg(&backend, &subject, &sha, &[&subject]).await;
+
+        // (a) as-self subject (signed in the establishing content) → ADMIT.
+        backend
+            .put_moderation_event(build_moderation_event_pg(
+                &subject_key,
+                "target",
+                &[&subject],
+                None,
+                Some(&sha),
+            ))
+            .await
+            .expect("(a) as-self subject moderation admitted");
+
+        // (b1) subject-delegated chain (subject → delegate, moderate) → ADMIT.
+        seed_delegation_pg(
+            &backend,
+            &subject,
+            &delegate,
+            serde_json::json!(["moderate"]),
+        )
+        .await;
+        backend
+            .put_moderation_event(build_moderation_event_pg(
+                &delegate_key,
+                "target",
+                &[&subject],
+                None,
+                Some(&sha),
+            ))
+            .await
+            .expect("(b1) subject-delegated moderation admitted");
+
+        // (b2) named-moderator (community founder, owner-bound) → ADMIT.
+        backend
+            .put_moderation_event(build_moderation_event_pg(
+                &founder_key,
+                "target",
+                &[],
+                Some(&comm),
+                None,
+            ))
+            .await
+            .expect("(b2) named-moderator (founder) moderation admitted");
+
+        // (c) no authority → REJECT.
+        let err = backend
+            .put_moderation_event(build_moderation_event_pg(
+                &rando_key,
+                "target",
+                &[&subject],
+                None,
+                Some(&sha),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "cirisnode_delegated_scope_unauthorized");
+
+        // (c2) NOTHING → REJECT (bypass guard).
+        let err = backend
+            .put_moderation_event(build_moderation_event_pg(
+                &rando_key,
+                "target",
+                &[],
+                None,
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "cirisnode_delegated_scope_unauthorized",
+            "(c2) absent principal must REJECT, not admit"
+        );
+
+        // (d) scope isolation — consent_revocation-only chain ⇏ moderate.
+        seed_delegation_pg(
+            &backend,
+            &subject,
+            &rando,
+            serde_json::json!(["consent_revocation"]),
+        )
+        .await;
+        let err = backend
+            .put_moderation_event(build_moderation_event_pg(
+                &rando_key,
+                "target",
+                &[&subject],
+                None,
+                Some(&sha),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "cirisnode_delegated_scope_unauthorized");
+    }
+
+    /// THE regression guard — payload self-declaration no longer admits.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_moderation_payload_self_declaration_spoof_rejected() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let attacker_key = ed25519_dalek::SigningKey::from_bytes(&[0xe1; 32]);
+        let real_subject_key = ed25519_dalek::SigningKey::from_bytes(&[0xe2; 32]);
+        let attacker = pubkey_b64(&attacker_key);
+        let real_subject = pubkey_b64(&real_subject_key);
+        seed_fed_key_pg(&backend, &attacker).await;
+        seed_user_key_pg(&backend, &real_subject).await;
+
+        let sha = fixture_sha_hex(0xb1);
+        seed_establishing_content_pg(&backend, &real_subject, &sha, &[&real_subject]).await;
+
+        // Attacker self-declares subject_key_ids=[attacker] in the payload.
+        let err = backend
+            .put_moderation_event(build_moderation_event_pg(
+                &attacker_key,
+                "target",
+                &[&attacker],
+                None,
+                Some(&sha),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "cirisnode_delegated_scope_unauthorized",
+            "payload self-declaration must NOT admit (spoof closed)"
+        );
+
+        // The REAL signed subject still admits as-self.
+        backend
+            .put_moderation_event(build_moderation_event_pg(
+                &real_subject_key,
+                "target",
+                &[&real_subject],
+                None,
+                Some(&sha),
+            ))
+            .await
+            .expect("real signed subject admits as-self");
+    }
+
+    /// Fail-secure: no establishing attestation ⇒ subject-self FAILS;
+    /// named-mod still ADMITs; non-authority REJECTs.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_moderation_fail_secure_no_establishing_content() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // v8.7.2: globally-unique seed bytes (0x94-0x96) — see the matrix
+        // test's note on cross-test key-collision avoidance.
+        let subject_key = ed25519_dalek::SigningKey::from_bytes(&[0x94; 32]);
+        let founder_key = ed25519_dalek::SigningKey::from_bytes(&[0x95; 32]);
+        let rando_key = ed25519_dalek::SigningKey::from_bytes(&[0x96; 32]);
+        let subject = pubkey_b64(&subject_key);
+        let founder = pubkey_b64(&founder_key);
+        let rando = pubkey_b64(&rando_key);
+        seed_user_key_pg(&backend, &subject).await;
+        seed_user_key_pg(&backend, &founder).await;
+        seed_fed_key_pg(&backend, &rando).await;
+        let comm = format!("comm-fs-{}", Uuid::new_v4());
+        seed_community_pg(&backend, &comm, &founder).await;
+
+        // No establishing content for this sha — subject_of undetermined.
+        let sha = fixture_sha_hex(0xc2);
+
+        // subject-self FAILS.
+        let err = backend
+            .put_moderation_event(build_moderation_event_pg(
+                &subject_key,
+                "target",
+                &[&subject],
+                None,
+                Some(&sha),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "cirisnode_delegated_scope_unauthorized",
+            "fail-secure: undetermined subject_of must REJECT subject-self"
+        );
+
+        // named-mod path (b) still ADMITs the owner-bound founder.
+        backend
+            .put_moderation_event(build_moderation_event_pg(
+                &founder_key,
+                "target",
+                &[&subject],
+                Some(&comm),
+                Some(&sha),
+            ))
+            .await
+            .expect("named-mod still admits under fail-secure subject_of");
+
+        // a non-authority signer still REJECTs.
+        let err = backend
+            .put_moderation_event(build_moderation_event_pg(
+                &rando_key,
+                "target",
+                &[&subject],
+                Some(&comm),
+                Some(&sha),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "cirisnode_delegated_scope_unauthorized");
     }
 
     #[tokio::test]

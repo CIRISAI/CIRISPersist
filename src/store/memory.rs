@@ -1174,6 +1174,33 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    async fn attestations_binding_content(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        // v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10) — the
+        // content-establishing `scores` rows that bind `content_sha256`
+        // in their envelope `evidence_refs` array. The in-memory scan
+        // mirrors the SQL backends' filter exactly (federation-tier
+        // `scores`, exact `evidence_refs` set-membership).
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                a.attestation_type == crate::federation::types::attestation_type::SCORES
+                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
+                    && crate::federation::admission::envelope_binds_content(
+                        &a.attestation_envelope,
+                        content_sha256,
+                    )
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        Ok(rows)
+    }
+
     async fn put_revocation(
         &self,
         revocation: crate::federation::SignedRevocation,
@@ -4303,6 +4330,61 @@ mod tests {
         let for_a = backend.list_attestations_for("k-a").await.unwrap();
         assert_eq!(for_a.len(), 1);
         assert_eq!(for_a[0].attestation_id, "att-1");
+    }
+
+    /// v8.7.2 (#233 follow-on, CEG RC27 §11.10) — `subject_of_content`
+    /// resolves the SIGNED subject set behind a content hash from the
+    /// content-establishing `scores` attestation(s) binding it via
+    /// `evidence_refs`. Memory-backend parity for the resolution.
+    #[tokio::test]
+    async fn subject_of_content_resolves_signed_subjects() {
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("producer", "producer", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let sha = "a".repeat(64);
+        let other_sha = "b".repeat(64);
+
+        // Establishing scores attestation binding `sha` with signed
+        // subjects = [subj-1, subj-2].
+        let mut est = fix_attestation("est-1", "producer", "producer", "registry-steward");
+        est.attestation_envelope = serde_json::json!({
+            "dimension": "content:established:v1",
+            "evidence_refs": [sha],
+        });
+        est.subject_key_ids = vec!["subj-1".into(), "subj-2".into()];
+        backend
+            .put_attestation(SignedAttestation { attestation: est })
+            .await
+            .unwrap();
+
+        // Resolves the signed subjects for the bound hash.
+        let subjects = crate::federation::admission::subject_of_content(&backend, &sha)
+            .await
+            .unwrap();
+        assert_eq!(subjects.len(), 2);
+        assert!(subjects.contains("subj-1") && subjects.contains("subj-2"));
+
+        // A DIFFERENT (unbound) hash → empty (fail-secure).
+        let none = crate::federation::admission::subject_of_content(&backend, &other_sha)
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+
+        // A malformed (non-hex) hash → empty.
+        let bad = crate::federation::admission::subject_of_content(&backend, "not-a-hash")
+            .await
+            .unwrap();
+        assert!(bad.is_empty());
     }
 
     #[tokio::test]

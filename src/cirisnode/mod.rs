@@ -206,18 +206,32 @@ impl Error {
     }
 }
 
-/// v8.7.1 (CIRISPersist#233, CEG RC24/RC25/RC26 §11.10) — run the FULL
-/// §11.10 moderation admit-iff gate for a cirisnode primitive
-/// (`ModerationEvent` / `takedown_notice`) and translate a federation
-/// rejection into the cirisnode-surface
+/// v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10; CIRISRegistry#96)
+/// — run the FULL §11.10 moderation admit-iff gate for a cirisnode
+/// primitive (`ModerationEvent` / `takedown_notice`) and translate a
+/// federation rejection into the cirisnode-surface
 /// [`Error::DelegatedScopeUnauthorized`].
 ///
 /// `signer` is the emission's verified author (`accuser_id` for a
 /// `ModerationEvent`, `author_id` for a `takedown_notice` Contribution).
-/// `subjects` + `community_id` are the producer-declared target descriptor
-/// (the content's subjects + the target community); this resolves the
-/// `duty_holders` (subjects ∪ the community's named moderators) and runs
-/// the gate. `duty` is `moderate` / `takedown` / `review`.
+///
+/// # v8.7.2 spoof closure — subject authority from SIGNED content provenance
+///
+/// `content_sha256` is the target content hash (from the validated
+/// takedown/moderation payload). The duty-holders' SUBJECT half is now
+/// resolved as `subject_of(content_sha256)` —
+/// [`crate::federation::admission::subject_of_content`] — the
+/// `subject_key_ids` signed INSIDE the content-establishing `scores`
+/// attestation, NOT the payload's self-declared `subject_key_ids` (which
+/// is now advisory/routing-only; see [`payload_target_descriptor`]). This
+/// closes the self-declaration spoof: a signer setting
+/// `subject_key_ids = [self]` in the payload gains no subject-self
+/// authority unless `self` is in the content's own signed subjects.
+/// Fail-secure: when no establishing attestation is locally held the
+/// subject set is empty and only the named-mod path can admit.
+///
+/// `community_id` is the producer-declared target community (whose named
+/// moderators hold the duty). `duty` is `moderate` / `takedown` / `review`.
 /// `target_descriptor` is an audit string naming the target. Admit IFF the
 /// signer is a duty-holder (as-self) or an owner-bound holder reaches the
 /// signer via a live `duty`-scoped chain; the v8.7.0 absent-⇒-admit bypass
@@ -234,14 +248,14 @@ impl Error {
 pub async fn check_moderation_or_reject(
     directory: &dyn crate::federation::FederationDirectory,
     signer: &str,
-    subjects: &[String],
+    content_sha256: &str,
     community_id: &str,
     duty: &str,
     target_descriptor: &str,
 ) -> Result<(), Error> {
     let duty_holders = match crate::federation::admission::duty_holders_for_content(
         directory,
-        subjects,
+        content_sha256,
         community_id,
         duty,
     )
@@ -280,40 +294,39 @@ pub async fn check_moderation_or_reject(
     }
 }
 
-/// v8.7.1 (CIRISPersist#233, CEG §11.10) — extract the producer-declared
-/// **target descriptor** from a cirisnode moderation/takedown payload: the
-/// target content's `subject_key_ids` (the people the content is ABOUT — a
-/// subject may take down content about themselves) and the target
-/// `community_id` (whose named moderators hold the duty). Both default to
-/// empty/absent.
+/// v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10; CIRISRegistry#96)
+/// — extract the **target descriptor** from a cirisnode moderation/takedown
+/// payload as `(content_sha256, community_id)`: the target content hash and
+/// the target `community_id` (whose named moderators hold the duty). Both
+/// default to empty/absent.
 ///
-/// **Honesty note (flagged, CIRISPersist#233).** The cirisnode payload
-/// surface (`TakedownNoticePayload` / `ModerationEvent.payload`) carries
-/// `content_sha256` / `target_contributor`, NOT a content→subjects index;
-/// persist has no `content_sha256 → subject_key_ids` lookup (the
-/// `subject_key_ids` live on the federation `scores`/content attestation,
-/// not on the cirisnode Contribution row). So the cirisnode gate resolves
-/// authority over the **producer-declared** `subject_key_ids` +
-/// `community_id` in the payload — exactly as the report→`scores` path uses
-/// the row's own `subject_key_ids` + envelope `community_id`. Persist
-/// enforces authority over the declared target; it does not re-derive the
-/// content's true subject set from the hash (no such index exists).
-pub fn payload_target_descriptor(payload: &serde_json::Value) -> (Vec<String>, String) {
-    let subjects = payload
-        .get("subject_key_ids")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+/// # v8.7.2 — subject authority is no longer payload-trusted
+///
+/// The payload's `subject_key_ids` field is now **advisory / routing-only**
+/// — it does NOT feed authority. Subject-self authority is resolved from
+/// `content_sha256` via
+/// [`crate::federation::admission::subject_of_content`] (the
+/// `subject_key_ids` signed INSIDE the content-establishing `scores`
+/// attestation), so a signer cannot self-declare
+/// `subject_key_ids = [self]` in the payload to spoof the moderation gate
+/// (the self-declaration spoof, closed). This function therefore returns
+/// the SIGNED content hash that drives `subject_of`, not the payload's
+/// declared subjects. The `content_sha256` is taken from `content_sha256`
+/// (the `takedown_notice` / `key_grant` shape); when absent (a bare
+/// `ModerationEvent` with no media hash) the empty string yields an empty
+/// `subject_of` (fail-secure — only the named-mod path can admit).
+pub fn payload_target_descriptor(payload: &serde_json::Value) -> (String, String) {
+    let content_sha256 = payload
+        .get("content_sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
     let community_id = payload
         .get("community_id")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_owned();
-    (subjects, community_id)
+    (content_sha256, community_id)
 }
 
 #[cfg(test)]

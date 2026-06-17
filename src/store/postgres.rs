@@ -2556,6 +2556,44 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_attestation).collect()
     }
 
+    async fn attestations_binding_content(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        // v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10) — the
+        // content-establishing `scores` rows that bind `content_sha256`
+        // in their envelope `evidence_refs` array. `attestation_envelope`
+        // is JSONB; the `@>` containment operator does the exact
+        // array-membership filter in-engine (`evidence_refs` is a JSON
+        // array of hex strings). No new index — the V054 index is on
+        // `cirisnode.contributions.media_content_sha256`, a different
+        // table; this scan is over `cirislens.federation_attestations`.
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let needle =
+            serde_json::Value::Array(vec![serde_json::Value::String(content_sha256.to_owned())]);
+        let rows = client
+            .query(
+                // weight::float8 AS weight — see list_attestations_for.
+                "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
+                    weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                 FROM cirislens.federation_attestations \
+                 WHERE attestation_type = 'scores' AND tier = 'federation' \
+                    AND attestation_envelope -> 'evidence_refs' @> $1 \
+                 ORDER BY asserted_at DESC",
+                &[&needle],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("attestations_binding_content: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_attestation).collect()
+    }
+
     async fn put_revocation(
         &self,
         revocation: crate::federation::SignedRevocation,

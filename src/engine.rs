@@ -6859,6 +6859,80 @@ mod tests {
         }
     }
 
+    /// v8.7.2 (#233 follow-on, CEG RC27 §11.10) — seed `producer`'s
+    /// federation key + a content-ESTABLISHING `scores` attestation binding
+    /// `sha_hex` with SIGNED subjects=[producer], through the Engine's
+    /// federation directory. The §11.10 takedown gate resolves subject-self
+    /// authority over THIS, so listing/filtering tests must establish the
+    /// content before filing takedowns (the payload's `subject_key_ids` is
+    /// advisory only).
+    #[cfg(all(feature = "sqlite", feature = "cirisnode"))]
+    async fn media_seed_establishing(engine: &Engine, producer_key: &SigningKey, sha_hex: &str) {
+        let producer = media_pubkey_b64(producer_key);
+        let dir = engine.federation_directory();
+        dir.put_public_key(crate::federation::types::SignedKeyRecord {
+            record: crate::federation::types::KeyRecord {
+                key_id: producer.clone(),
+                pubkey_ed25519_base64: producer.clone(),
+                pubkey_ml_dsa_65_base64: None,
+                algorithm: crate::federation::types::algorithm::HYBRID.into(),
+                identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+                identity_ref: producer.clone(),
+                valid_from: "2026-01-01T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "id": producer }),
+                original_content_hash: "deadbeef".into(),
+                scrub_signature_classical: "c2lnbmF0dXJl".into(),
+                scrub_signature_pqc: None,
+                scrub_key_id: producer.clone(),
+                scrub_timestamp: "2026-01-01T00:00:00Z".parse().unwrap(),
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                roles: Vec::new(),
+                attestation_evidence: None,
+            },
+        })
+        .await
+        .map_or_else(
+            |e| match e {
+                // Tolerate an idempotent re-seed on a reused PG (the
+                // PG-twin tests share the lead's docker DB across runs).
+                crate::federation::Error::Conflict(_) => {}
+                other => panic!("seed producer key: {other}"),
+            },
+            |()| {},
+        );
+        dir.put_attestation(crate::federation::types::SignedAttestation {
+            attestation: crate::federation::types::Attestation {
+                attestation_id: uuid::Uuid::new_v4().to_string(),
+                attesting_key_id: producer.clone(),
+                attested_key_id: producer.clone(),
+                attestation_type: crate::federation::types::attestation_type::SCORES.into(),
+                weight: None,
+                asserted_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                expires_at: None,
+                attestation_envelope: serde_json::json!({
+                    "dimension": "content:established:v1",
+                    "evidence_refs": [sha_hex],
+                }),
+                original_content_hash: "abc123".into(),
+                scrub_signature_classical: "c2ln".into(),
+                scrub_signature_pqc: None,
+                scrub_key_id: producer.clone(),
+                scrub_timestamp: "2026-01-01T00:00:00Z".parse().unwrap(),
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: vec![producer.clone()],
+                withdraws_admission_rule: None,
+                cohort_scope: "federation".to_string(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+                promoted_at: None,
+            },
+        })
+        .await
+        .expect("seed establishing content");
+    }
+
     /// `list_takedowns_for` returns only the target's takedowns, honours
     /// the `claimant_key_id` secondary filter, and respects the
     /// `[since, until)` window.
@@ -6876,6 +6950,11 @@ mod tests {
         let other = media_sha_hex(0x41);
         let t0 = "2026-01-01T00:00:00Z".parse().unwrap();
         let t1 = "2026-02-01T00:00:00Z".parse().unwrap();
+        // v8.7.2: establish content provenance so each filer (author) is a
+        // SIGNED subject of the content it takes down (subject-self path).
+        media_seed_establishing(&engine, &k1, &target).await;
+        media_seed_establishing(&engine, &k2, &target).await;
+        media_seed_establishing(&engine, &k1, &other).await;
         // target × claimant_a @ t0, target × claimant_b @ t1, other-target.
         media_seed(&engine, media_build_takedown(&k1, &target, &claimant_a, t0)).await;
         media_seed(&engine, media_build_takedown(&k2, &target, &claimant_b, t1)).await;
@@ -6950,6 +7029,8 @@ mod tests {
             shared,
             "2026-03-02T00:00:00Z".parse().unwrap(),
         ];
+        // v8.7.2: establish content so the filer is a signed subject.
+        media_seed_establishing(&engine, &k, &target).await;
         for ts in stamps {
             media_seed(&engine, media_build_takedown(&k, &target, &claimant, ts)).await;
         }
@@ -7121,6 +7202,10 @@ mod tests {
         );
         let t0 = "2026-01-01T00:00:00Z".parse().unwrap();
         let t1 = "2026-02-01T00:00:00Z".parse().unwrap();
+        // v8.7.2: establish content provenance so each filer is a signed
+        // subject of the content it takes down (per-run target ⇒ isolated).
+        media_seed_establishing(&engine, &k1, &target).await;
+        media_seed_establishing(&engine, &k2, &target).await;
         media_seed(&engine, media_build_takedown(&k1, &target, &claimant_a, t0)).await;
         media_seed(&engine, media_build_takedown(&k2, &target, &claimant_b, t1)).await;
         let page = engine

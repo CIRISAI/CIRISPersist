@@ -733,6 +733,22 @@ pub fn envelope_dimension(envelope: &serde_json::Value) -> Option<&str> {
     envelope.get("dimension").and_then(|v| v.as_str())
 }
 
+/// v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10) — does an
+/// attestation `envelope` bind `content_sha256`? True iff the envelope's
+/// `evidence_refs` array contains the hex string. This is the exact
+/// set-membership the [`FederationDirectory::attestations_binding_content`]
+/// backends confirm against the parsed envelope (the SQLite LIKE / PG
+/// `@>` prefilters narrow the scan; this is the authoritative check).
+///
+/// [`FederationDirectory::attestations_binding_content`]: super::FederationDirectory::attestations_binding_content
+#[must_use]
+pub fn envelope_binds_content(envelope: &serde_json::Value, content_sha256: &str) -> bool {
+    envelope
+        .get("evidence_refs")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| arr.iter().any(|r| r.as_str() == Some(content_sha256)))
+}
+
 /// v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — admission-gate
 /// validation of the producer-side `cohort_scope` field.
 ///
@@ -1906,30 +1922,116 @@ pub async fn check_moderation_admission(
     })
 }
 
-/// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §11.10) — the duty-holders of a
-/// **content target** (`takedown_notice{content_sha256}` /
-/// `moderation:*` / `reconsideration:*` over content): the content's own
-/// subjects ∪ the named moderators of the content's community.
+/// v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10; CIRISRegistry#96)
+/// — `subject_of(content_sha256)`: the SIGNED subject set behind a content
+/// hash. The §11.10 pin:
 ///
-///   `duty_holders(content) =
-///        content.subject_key_ids
+///   `subject_of(content_sha256)` ≔ the union of the `subject_key_ids`
+///   signed INSIDE the content-establishing `scores` Contribution(s) whose
+///   envelope binds `content_sha256` (via `evidence_refs`).
+///
+/// The subject set is the producer's signed assertion of who the content is
+/// ABOUT — it is NOT a value a later third party (a takedown/moderation
+/// payload) can self-declare. This is the load-bearing distinction that
+/// closes the self-declaration spoof: a signer claiming
+/// `subject_key_ids = [self]` in a takedown payload gains NO subject-self
+/// authority unless `self` appears in the content's own signed subjects.
+///
+/// # Fail-secure
+///
+/// Returns the **empty set** when no establishing attestation is locally
+/// resolvable (`subject_of` undetermined). An empty set means the
+/// subject-self admission clause `attesting_key_id ∈ subject_of(...)`
+/// cannot hold — subject-self FAILS. Absence never admits; the named-mod
+/// path (b) still applies independently
+/// ([`duty_holders_for_content`] unions the two).
+///
+/// `content_sha256` is hex-validated (lowercase hex-64) before the lookup;
+/// a malformed hash yields the empty set (it can bind no establishing
+/// attestation). The resolution is the
+/// [`FederationDirectory::attestations_binding_content`] `evidence_refs`
+/// scan — see that method for the per-backend query.
+///
+/// [`FederationDirectory::attestations_binding_content`]: super::FederationDirectory::attestations_binding_content
+pub async fn subject_of_content(
+    directory: &dyn super::FederationDirectory,
+    content_sha256: &str,
+) -> Result<std::collections::HashSet<String>, Error> {
+    // Hex-validate (lowercase hex-64) — a malformed hash can bind no
+    // establishing attestation; the empty set is the fail-secure answer.
+    if content_sha256.len() != 64
+        || !content_sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Ok(std::collections::HashSet::new());
+    }
+    let mut subjects = std::collections::HashSet::new();
+    for att in directory
+        .attestations_binding_content(content_sha256)
+        .await?
+    {
+        subjects.extend(att.subject_key_ids.iter().cloned());
+    }
+    Ok(subjects)
+}
+
+/// v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10; CIRISRegistry#96)
+/// — the duty-holders of a **content target**
+/// (`takedown_notice{content_sha256}` / `moderation:*` /
+/// `reconsideration:*` over content): the content's SIGNED subjects ∪ the
+/// named moderators of the content's community.
+///
+///   `duty_holders(content_sha256) =
+///        subject_of(content_sha256)
 ///      ∪ { K : is_named_moderator(K, community_id, duty) }`
 ///
-/// `subjects` is the content attestation's `subject_key_ids` (the people
-/// the content is ABOUT — a subject may take down content about
-/// themselves). `community_id` is the content's declared community
-/// (empty ⇒ no community moderators, only subjects). The named-moderator
-/// half resolves only the AUTHORITY ROOTS into the holder set — the
-/// per-signer walk-down is then done by [`check_moderation_admission`];
-/// here we materialize the roots (the community authority set, owner-bound)
-/// so a signer who IS a named moderator is admitted as-self.
+/// **v8.7.2 spoof closure.** The subject half is now
+/// [`subject_of_content`] — the `subject_key_ids` signed INSIDE the
+/// content-establishing `scores` attestation, resolved from
+/// `content_sha256`. It is NO LONGER the takedown/moderation payload's
+/// self-declared `subject_key_ids` (which a signer could set to
+/// `[self]` to spoof subject-self authority; that field is now
+/// advisory/routing-only). Fail-secure: when no establishing attestation
+/// is locally held, `subject_of` is empty and only the named-mod path can
+/// admit.
+///
+/// `community_id` is the content's declared community (empty ⇒ no
+/// community moderators, only subjects). The named-moderator half resolves
+/// only the AUTHORITY ROOTS into the holder set — the per-signer walk-down
+/// is then done by [`check_moderation_admission`]; here we materialize the
+/// roots (the community authority set, owner-bound) so a signer who IS a
+/// named moderator is admitted as-self.
 pub async fn duty_holders_for_content(
     directory: &dyn super::FederationDirectory,
-    subjects: &[String],
+    content_sha256: &str,
     community_id: &str,
     duty: &str,
 ) -> Result<std::collections::HashSet<String>, Error> {
-    let mut holders: std::collections::HashSet<String> = subjects.iter().cloned().collect();
+    let mut holders = subject_of_content(directory, content_sha256).await?;
+    holders.extend(named_moderator_holders(directory, community_id, duty).await?);
+    Ok(holders)
+}
+
+/// v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10) — the duty-holders
+/// of a content target whose subject set is ALREADY signed state in hand
+/// (the report→`scores` path: the row's own `subject_key_ids`, signed by
+/// the producer INSIDE the attestation being admitted). Unlike
+/// [`duty_holders_for_content`], no `subject_of_content` resolution is
+/// needed — the signed subjects are the attestation's own field, not a
+/// hash to resolve, and not a third-party payload declaration. Holders =
+/// `signed_subjects ∪ named_moderators(community_id, duty)`.
+///
+/// This is the §11.10 "already signed-state, fine" case: the scores row's
+/// `subject_key_ids` are part of the signed envelope, so feeding them is
+/// NOT the payload-self-declaration spoof the cirisnode path closes.
+pub async fn duty_holders_from_signed_subjects(
+    directory: &dyn super::FederationDirectory,
+    signed_subjects: &[String],
+    community_id: &str,
+    duty: &str,
+) -> Result<std::collections::HashSet<String>, Error> {
+    let mut holders: std::collections::HashSet<String> = signed_subjects.iter().cloned().collect();
     holders.extend(named_moderator_holders(directory, community_id, duty).await?);
     Ok(holders)
 }
@@ -2005,8 +2107,16 @@ pub async fn check_delegated_duty_scores_admission(
         .get("community_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    // v8.7.2: this is the SCORES path — the row's OWN `subject_key_ids` are
+    // signed state (the producer signed THIS attestation, subjects
+    // included), not a later third party's self-declaration. So we feed the
+    // row's signed subjects directly (NOT via `subject_of_content`, which is
+    // the cirisnode-payload path where the subjects are NOT yet signed
+    // state). This is the "already signed-state, leave it" case
+    // (CIRISRegistry#96 follow-on note).
     let duty_holders =
-        duty_holders_for_content(directory, &row.subject_key_ids, community_id, duty).await?;
+        duty_holders_from_signed_subjects(directory, &row.subject_key_ids, community_id, duty)
+            .await?;
     check_moderation_admission(
         directory,
         &row.attesting_key_id,
