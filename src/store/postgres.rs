@@ -2394,13 +2394,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             row.withdraws_admission_rule = Some(rule);
         }
 
-        // v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate for
+        // v8.7.1 (CIRISPersist#233, CEG §11.10) — FULL moderation gate for
         // the report→`scores` half (moderation:* / reconsideration:*). A
         // no-op for any non-matching row; for a moderation/review report it
-        // admits IFF the signer holds the duty as-self or reaches the
-        // `on_behalf_of` principal via a live scoped delegates_to chain.
-        // Runs AFTER the withdraws gate and BEFORE persist_row_hash +
-        // INSERT — a rejected emission leaves no trace.
+        // admits IFF the signer IS a duty-holder over the target (the row's
+        // subject_key_ids ∪ the envelope community_id's named moderators) or
+        // is reached by an owner-bound duty-holder via a live scoped
+        // delegates_to chain. Absence ⇒ REJECT. Runs AFTER the withdraws
+        // gate and BEFORE persist_row_hash + INSERT — a rejected emission
+        // leaves no trace.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
@@ -18935,6 +18937,175 @@ mod tests {
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
         }
+    }
+
+    /// v8.7.1 (CIRISPersist#233) — a `delegates_to` edge `granter →
+    /// grantee` bearing `scope` (+ optional `sub_delegation`) on the PG
+    /// backend.
+    fn pg_delegates_to(
+        granter: &str,
+        grantee: &str,
+        scope: serde_json::Value,
+        sub_delegation: bool,
+    ) -> crate::federation::Attestation {
+        let mut a = pg_scores_attestation(granter, grantee, granter, "x");
+        a.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        a.attestation_envelope = serde_json::json!({
+            "references_attestation_id": a.attestation_id,
+            "scope": scope,
+            "sub_delegation": sub_delegation,
+        });
+        a
+    }
+
+    /// v8.7.1 (CIRISPersist#233, CEG §11.10) — FULL §11.10 moderation
+    /// enforcement on the PG report→`scores` path (3-backend parity with
+    /// memory + sqlite). Exercises (a) as-self subject, (b1) subject-
+    /// delegated chain, (b2) named-moderator (community founder, owner-
+    /// bound), (c) no authority, (c2) NOTHING → REJECT (bypass guard),
+    /// (d) scope isolation. Run-scoped uuid-suffixed key ids.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_moderation_scores_full_matrix() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let suffix = uuid_like();
+        let subject = format!("subject-{suffix}");
+        let delegate = format!("delegate-{suffix}");
+        let rando = format!("rando-{suffix}");
+        let founder = format!("founder-{suffix}");
+        let comm = format!("comm-{suffix}");
+        // subject + founder are user-role (owner-bound); the rest agents.
+        for kid in [&subject, &founder, &comm] {
+            let mut k = fix_section_i_key(kid, "u", now, true);
+            k.identity_type = crate::federation::types::identity_type::USER.into();
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord { record: k })
+                .await
+                .unwrap();
+        }
+        for kid in [&delegate, &rando] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: fix_section_i_key(kid, "a", now, true),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: crate::federation::Community {
+                    community_key_id: comm.clone(),
+                    community_name: "tc".into(),
+                    members: vec![crate::federation::CommunityMember {
+                        key_id: founder.clone(),
+                        joined_at: now,
+                        role: Some("founder".into()),
+                    }],
+                    founded_at: now,
+                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
+                        .into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let dim = "reconsideration:case42:v1";
+        // Build a moderation/review report by `signer` over `subjects` +
+        // optional `community_id`.
+        let report = |signer: &str, subjects: &[&str], community: Option<&str>| {
+            let mut a = pg_scores_attestation(signer, signer, signer, dim);
+            a.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
+            if let Some(c) = community {
+                a.attestation_envelope["community_id"] = serde_json::Value::String(c.to_owned());
+            }
+            a
+        };
+
+        // (a) as-self subject → ADMIT.
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: report(&subject, &[&subject], None),
+            })
+            .await
+            .expect("(a) as-self subject admitted");
+
+        // (b1) subject-delegated chain → ADMIT.
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_delegates_to(
+                    &subject,
+                    &delegate,
+                    serde_json::json!(["review"]),
+                    false,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: report(&delegate, &[&subject], None),
+            })
+            .await
+            .expect("(b1) subject-delegated admitted");
+
+        // (b2) named-moderator (community founder, owner-bound) → ADMIT.
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: report(&founder, &[], Some(&comm)),
+            })
+            .await
+            .expect("(b2) named-moderator admitted");
+
+        // (c) no authority → REJECT.
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: report(&rando, &[&subject], None),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
+
+        // (c2) NOTHING → REJECT (bypass-closed regression guard).
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: report(&rando, &[], None),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_delegated_scope_unauthorized",
+            "(c2) absent principal must REJECT, not admit"
+        );
+
+        // (d) scope isolation — consent_revocation-only chain ⇏ review.
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_delegates_to(
+                    &subject,
+                    &rando,
+                    serde_json::json!(["consent_revocation"]),
+                    false,
+                ),
+            })
+            .await
+            .unwrap();
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: report(&rando, &[&subject], None),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
     }
 
     #[tokio::test]

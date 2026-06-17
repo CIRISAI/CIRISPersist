@@ -146,19 +146,23 @@ impl NodeCoreService for PostgresBackend {
         // payloads land Error::InvalidArgument up-front.
         let takedown =
             super::media_sharing::extract_takedown_notice_payload(subject_kind, &env.payload)?;
-        // v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate for
+        // v8.7.1 (CIRISPersist#233, CEG §11.10) — FULL moderation gate for
         // the `takedown_notice` primitive. PostgresBackend IS the
-        // FederationDirectory, so `self` walks the delegates_to graph.
-        // Admit IFF the author holds the `takedown` duty as-self or
-        // reaches the payload's `on_behalf_of` principal via a live
-        // `takedown`-scoped delegation chain. Runs BEFORE the INSERT — a
+        // FederationDirectory, so `self` walks the delegates_to + community
+        // graph. Admit IFF the author IS a duty-holder over the target
+        // (declared subjects ∪ the target community's named moderators) or
+        // is reached by an owner-bound duty-holder via a live `takedown`-
+        // scoped chain. Absence ⇒ REJECT. Runs BEFORE the INSERT — a
         // rejected emission leaves no trace.
         if takedown.is_some() {
-            super::check_delegated_duty_or_reject(
+            let (subjects, community_id) = super::payload_target_descriptor(&env.payload);
+            super::check_moderation_or_reject(
                 self,
                 &env.author_id,
-                super::payload_on_behalf_of(&env.payload),
+                &subjects,
+                &community_id,
                 crate::federation::admission::DELEGATION_SCOPE_TAKEDOWN,
+                "takedown_notice",
             )
             .await?;
         }
@@ -348,16 +352,20 @@ impl NodeCoreService for PostgresBackend {
 
     async fn put_moderation_event(&self, event: ModerationEvent) -> Result<(), Error> {
         super::verify::verify_envelope_signed(&event, &event.signature, &event.accuser_id)?;
-        // v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate for
+        // v8.7.1 (CIRISPersist#233, CEG §11.10) — FULL moderation gate for
         // the `ModerationEvent` primitive. Admit IFF the accuser (signer)
-        // holds the `moderate` duty as-self or reaches the payload's
-        // `on_behalf_of` principal via a live `moderate`-scoped delegation
-        // chain. Runs AFTER signature verify, BEFORE INSERT.
-        super::check_delegated_duty_or_reject(
+        // IS a duty-holder over the target (declared subjects ∪ the target
+        // community's named moderators) or is reached by an owner-bound
+        // duty-holder via a live `moderate`-scoped chain. Absence ⇒ REJECT.
+        // Runs AFTER signature verify, BEFORE INSERT.
+        let (subjects, community_id) = super::payload_target_descriptor(&event.payload);
+        super::check_moderation_or_reject(
             self,
             &event.accuser_id,
-            super::payload_on_behalf_of(&event.payload),
+            &subjects,
+            &community_id,
             crate::federation::admission::DELEGATION_SCOPE_MODERATE,
+            "moderation_event",
         )
         .await?;
         let id = parse_id(&event.moderation_id)?;
@@ -2505,6 +2513,12 @@ mod tests {
             asserted_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::days(30),
         };
+        // v8.7.1 (#233): the §11.10 gate requires the author to be a
+        // duty-holder over the target. These tests exercise takedown
+        // storage/listing mechanics, not the moderation gate, so the author
+        // self-declares as a subject of the target (as-self admit path).
+        let mut payload_json = serde_json::to_value(&payload).unwrap();
+        payload_json["subject_key_ids"] = serde_json::json!([author.clone()]);
         let mut env = ContributionEnvelope {
             contribution_id: Uuid::new_v4().to_string(),
             contribution_type: ContributionType::Proposal,
@@ -2514,7 +2528,7 @@ mod tests {
                 language: "en".into(),
                 subject: Some(crate::cirisnode::TAKEDOWN_NOTICE_SUBJECT_KIND.into()),
             },
-            payload: serde_json::to_value(&payload).unwrap(),
+            payload: payload_json,
             witness_set: None,
             signature: HybridSignature {
                 ed25519: String::new(),

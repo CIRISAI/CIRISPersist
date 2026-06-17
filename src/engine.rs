@@ -6763,6 +6763,12 @@ mod tests {
             asserted_at: submitted_at,
             expires_at: submitted_at + chrono::Duration::days(30),
         };
+        // v8.7.1 (#233): the §11.10 gate requires the author to be a
+        // duty-holder over the target. These tests exercise takedown
+        // listing/filtering mechanics, not the moderation gate, so the
+        // author self-declares as a subject of the target (as-self path).
+        let mut payload_json = serde_json::to_value(&payload).unwrap();
+        payload_json["subject_key_ids"] = serde_json::json!([author.clone()]);
         let mut env = ContributionEnvelope {
             contribution_id: uuid::Uuid::new_v4().to_string(),
             contribution_type: ContributionType::Proposal,
@@ -6772,7 +6778,7 @@ mod tests {
                 language: "en".into(),
                 subject: Some(crate::cirisnode::TAKEDOWN_NOTICE_SUBJECT_KIND.into()),
             },
-            payload: serde_json::to_value(&payload).unwrap(),
+            payload: payload_json,
             witness_set: None,
             signature: HybridSignature {
                 ed25519: String::new(),

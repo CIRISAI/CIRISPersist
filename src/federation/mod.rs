@@ -2279,31 +2279,38 @@ pub enum Error {
         target_attestation_id: String,
     },
 
-    /// v8.7.0 (CIRISPersist#232, CEG 1.0-RC19 §11.10 / §3.2.3 rule-(3);
-    /// CIRISRegistry#90). A moderation / takedown / review primitive
-    /// emission was refused: the `signer` neither holds the duty as-self
-    /// (the `on_behalf_of` principal is absent or names the signer) NOR
-    /// reaches the named principal via a live `delegates_to` chain bearing
-    /// the governing `scope` (`moderate` / `takedown` / `review`). The row
-    /// is not stored. This is the §11.10 "delegate-signed, delegator-
-    /// traceable, on the delegator's behalf, and only then" gate — the
-    /// child-safety chain's scope-isolation property (a
-    /// `consent_revocation`-scoped delegation cannot drive a `takedown`).
-    /// Distinct from [`Error::InvalidArgument`] so consumers can pattern-
-    /// match the authority rejection deterministically (stable `kind()`
-    /// token `federation_delegated_scope_unauthorized`). See
-    /// [`admission::check_delegated_duty_admission`].
+    /// v8.7.1 (CIRISPersist#233, CEG RC24/RC25/RC26 §11.10 / §11.11 /
+    /// §5.6.8.10; CIRISRegistry#95). A moderation / takedown / review
+    /// primitive emission was refused: the `signer` is NOT a duty-holder
+    /// over the target (it is neither a subject of the target content nor a
+    /// named moderator of the target community) AND no owner-bound
+    /// duty-holder reaches it via a live `delegates_to` chain bearing the
+    /// governing `scope` (`moderate` / `takedown` / `review`, with
+    /// `⊆`-parent attenuation + `sub_delegation`-gated deputization + depth
+    /// ≤ 5 + no `withdraws`-revoked edge). The row is not stored. This is
+    /// the §11.10 "the principal is the owner-bound chain root discovered by
+    /// walking up, and only then" gate — the child-safety scope-isolation
+    /// property (a `consent_revocation`-scoped delegation cannot drive a
+    /// `takedown`). **Absence is never an admit condition** (the v8.7.0
+    /// absent-⇒-admit bypass, closed). Distinct from
+    /// [`Error::InvalidArgument`] so consumers can pattern-match the
+    /// authority rejection deterministically (stable `kind()` token
+    /// `federation_delegated_scope_unauthorized`). See
+    /// [`admission::check_moderation_admission`].
     #[error(
-        "delegated-duty emission by signer {signer:?} on behalf of \
-         {on_behalf_of:?} is not admitted: signer holds neither the \
-         {scope:?} duty as-self nor a live {scope:?}-scoped delegates_to \
-         chain reaching the principal (CEG §11.10)"
+        "moderation emission by signer {signer:?} over target {on_behalf_of:?} \
+         is not admitted: signer is neither a {scope:?} duty-holder as-self \
+         nor reached by an owner-bound duty-holder via a live {scope:?}-scoped \
+         delegates_to chain (CEG §11.10)"
     )]
     DelegatedScopeUnauthorized {
         /// The signer (`attesting_key_id` / `author_id` / `accuser_id`)
         /// of the refused emission.
         signer: String,
-        /// The principal the emission claimed to act on behalf of.
+        /// The target descriptor the emission acted over (the content
+        /// dimension / `takedown_notice` / `moderation_event` audit string).
+        /// v8.7.0's principal-field model is gone; this names the TARGET
+        /// whose duty-holders the signer failed to be / be reached by.
         on_behalf_of: String,
         /// The governing delegated-duty scope token (`moderate` /
         /// `takedown` / `review`).

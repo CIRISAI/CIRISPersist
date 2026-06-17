@@ -1052,13 +1052,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             row.withdraws_admission_rule = Some(rule);
         }
 
-        // v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate for
+        // v8.7.1 (CIRISPersist#233, CEG §11.10) — FULL moderation gate for
         // the report→`scores` half (moderation:* / reconsideration:*).
         // A no-op for any non-matching row; for a moderation/review report
-        // it admits IFF the signer holds the duty as-self or reaches the
-        // `on_behalf_of` principal via a live scoped delegates_to chain.
-        // Runs BEFORE the state lock for the same deadlock reason as the
-        // withdraws gate (the walk calls list_attestations_by on self).
+        // it admits IFF the signer IS a duty-holder over the target (the
+        // row's subject_key_ids ∪ the envelope community_id's named
+        // moderators) or is reached by an owner-bound duty-holder via a live
+        // scoped delegates_to chain. Absence ⇒ REJECT. Runs BEFORE the state
+        // lock for the same deadlock reason as the withdraws gate (the walk
+        // calls list_attestations_by on self).
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
         let mut state = self.state.lock().expect("memory backend lock");
@@ -5101,20 +5103,32 @@ mod tests {
         assert!(backend.get_attestation("w-bad").await.unwrap().is_none());
     }
 
-    // ── v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate
-    // on the report→`scores` path (review / moderation dimensions),
-    // memory-backend (3-backend parity with sqlite + postgres). The gate
-    // shares `check_delegated_duty_scores_admission` across all three, so
-    // this exercises the load-bearing scope-isolation + depth-cap + as-self
-    // + scoped-delegate matrix the issue's tests (a)-(e) require.
+    // ── v8.7.1 (CIRISPersist#233, CEG RC24/RC25/RC26 §11.10/§11.11/
+    // §5.6.8.10) — FULL §11.10 moderation enforcement on the report→
+    // `scores` path (review / moderation dimensions), memory-backend
+    // (3-backend parity with sqlite + postgres). Replaces the v8.7.0
+    // on_behalf_of model. Exercises the full matrix: (a) as-self subject,
+    // (b1) subject-delegated chain, (b2) named-moderator, (c) no authority,
+    // (c2) nothing → REJECT (the bypass-closed guard), (d) scope isolation,
+    // (e) depth>5, (f) ⊆-parent attenuation violation, (g) deputization
+    // without sub_delegation, (h) withdraws on mid-chain edge, (i)
+    // non-owner-bound root.
+
+    /// A `user`-role key (owner-bound by clause (1) of `is_owner_bound`).
+    fn fix_user_key(key_id: &str) -> KeyRecord {
+        let mut k = fix_key(key_id, "primitive", key_id);
+        k.identity_type = crate::federation::types::identity_type::USER.into();
+        k
+    }
 
     /// Build a memory-backend `scores` report on `dimension`, signed by
-    /// `signer`, declaring an optional `on_behalf_of` principal.
+    /// `signer`, declaring the target's `subject_key_ids` + `community_id`.
     fn fix_scores_report(
         id: &str,
         signer: &str,
         dimension: &str,
-        on_behalf_of: Option<&str>,
+        subject_key_ids: &[&str],
+        community_id: Option<&str>,
     ) -> Attestation {
         let mut a = fix_attestation(id, signer, signer, signer);
         // attestation_type stays SCORES (the fix_attestation default).
@@ -5124,17 +5138,81 @@ mod tests {
             "score": 1.0,
             "confidence": 0.9,
         });
-        if let Some(p) = on_behalf_of {
-            env["on_behalf_of"] = serde_json::Value::String(p.to_owned());
+        if let Some(c) = community_id {
+            env["community_id"] = serde_json::Value::String(c.to_owned());
         }
         a.attestation_envelope = env;
+        a.subject_key_ids = subject_key_ids.iter().map(|s| (*s).to_owned()).collect();
         a
     }
 
+    /// A `delegates_to` edge with explicit `sub_delegation` flag.
+    fn fix_delegates_to_sub(
+        id: &str,
+        granter: &str,
+        grantee: &str,
+        scope: serde_json::Value,
+        sub_delegation: bool,
+    ) -> Attestation {
+        let mut d = fix_delegates_to(id, granter, grantee, scope);
+        d.attestation_envelope["sub_delegation"] = serde_json::Value::Bool(sub_delegation);
+        d
+    }
+
+    /// Register a community keyed by `community_id` with `founder` (a
+    /// `user`-role founder) in its roster under `founder_only`.
+    async fn seed_community_with_founder(
+        backend: &MemoryBackend,
+        community_id: &str,
+        founder: &str,
+    ) {
+        // The community's own key must exist in federation_keys.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key(community_id, "primitive", community_id),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: crate::federation::types::Community {
+                    community_key_id: community_id.into(),
+                    community_name: "test-community".into(),
+                    members: vec![crate::federation::types::CommunityMember {
+                        key_id: founder.into(),
+                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        role: Some("founder".into()),
+                    }],
+                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
+                        .into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .expect("seed community");
+    }
+
     #[tokio::test]
-    async fn memory_delegated_duty_scores_review_matrix() {
+    async fn memory_moderation_scores_review_full_matrix() {
         let backend = MemoryBackend::new();
-        for k in ["holder", "delegate", "deep", "rando", "modkey"] {
+        // `subject` is a user (owner-bound), the content's own subject.
+        // `delegate`/`deep` are agent keys; `founder` is the community's
+        // owner-bound authority; `rando`/`modkey` are unauthorized.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_user_key("subject"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_user_key("founder"),
+            })
+            .await
+            .unwrap();
+        for k in ["delegate", "deep", "rando", "modkey", "agentroot"] {
             backend
                 .put_public_key(SignedKeyRecord {
                     record: fix_key(k, "primitive", k),
@@ -5142,41 +5220,30 @@ mod tests {
                 .await
                 .unwrap();
         }
+        seed_community_with_founder(&backend, "comm-1", "founder").await;
 
-        // (a) duty-holder as-self (on_behalf_of == signer) → ADMITTED.
+        // (a) as-self subject → ADMIT (subject takes down content about self).
         backend
             .put_attestation(SignedAttestation {
                 attestation: fix_scores_report(
                     "r-self",
-                    "holder",
+                    "subject",
                     "reconsideration:case42:v1",
-                    Some("holder"),
-                ),
-            })
-            .await
-            .expect("as-self review admitted");
-        assert!(backend.get_attestation("r-self").await.unwrap().is_some());
-
-        // also: absent on_behalf_of is as-self → ADMITTED.
-        backend
-            .put_attestation(SignedAttestation {
-                attestation: fix_scores_report(
-                    "r-noprincipal",
-                    "holder",
-                    "reconsideration:case42:v1",
+                    &["subject"],
                     None,
                 ),
             })
             .await
-            .expect("absent principal is as-self");
+            .expect("(a) as-self subject admitted");
+        assert!(backend.get_attestation("r-self").await.unwrap().is_some());
 
-        // (b) delegate on a live `review`-scoped chain → ADMITTED.
+        // (b1) subject-delegated chain (subject → delegate, review) → ADMIT.
         backend
             .put_attestation(SignedAttestation {
                 attestation: fix_delegates_to(
-                    "d-review",
+                    "d-rev",
+                    "subject",
                     "delegate",
-                    "holder",
                     serde_json::json!(["message_io", "review"]),
                 ),
             })
@@ -5185,46 +5252,81 @@ mod tests {
         backend
             .put_attestation(SignedAttestation {
                 attestation: fix_scores_report(
-                    "r-delegate",
+                    "r-deleg",
                     "delegate",
                     "reconsideration:case42:v1",
-                    Some("holder"),
+                    &["subject"],
+                    None,
                 ),
             })
             .await
-            .expect("scoped-delegate review admitted");
-        assert!(backend
-            .get_attestation("r-delegate")
-            .await
-            .unwrap()
-            .is_some());
+            .expect("(b1) subject-delegated review admitted");
+        assert!(backend.get_attestation("r-deleg").await.unwrap().is_some());
 
-        // (c) neither duty nor any delegation → REJECTED (correct token).
+        // (b2) named-moderator: community founder (owner-bound authority)
+        // → ADMIT as-self (community-moderation case #95 unblocked).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "r-mod",
+                    "founder",
+                    "reconsideration:case42:v1",
+                    &[],
+                    Some("comm-1"),
+                ),
+            })
+            .await
+            .expect("(b2) named-moderator (founder) admitted");
+        assert!(backend.get_attestation("r-mod").await.unwrap().is_some());
+
+        // (c) no authority (rando, claims subject target) → REJECT.
         let err = backend
             .put_attestation(SignedAttestation {
                 attestation: fix_scores_report(
                     "r-rando",
                     "rando",
                     "reconsideration:case42:v1",
-                    Some("holder"),
+                    &["subject"],
+                    None,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
+        assert!(backend.get_attestation("r-rando").await.unwrap().is_none());
+
+        // (c2) NOTHING — no subjects, no community → REJECT. THE
+        // bypass-closed regression guard: absence is never an admit.
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "r-nothing",
+                    "rando",
+                    "reconsideration:case42:v1",
+                    &[],
+                    None,
                 ),
             })
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
         assert!(
-            backend.get_attestation("r-rando").await.unwrap().is_none(),
-            "rejected emission leaves no trace"
+            backend
+                .get_attestation("r-nothing")
+                .await
+                .unwrap()
+                .is_none(),
+            "(c2) absent principal must REJECT, not admit"
         );
 
-        // (d) scope isolation — a `consent_revocation`-only delegation
-        // MUST NOT drive a `review` (the load-bearing child-safety prop).
+        // (d) scope isolation — a consent_revocation-only delegation from
+        // the subject MUST NOT drive a `review`.
         backend
             .put_attestation(SignedAttestation {
                 attestation: fix_delegates_to(
                     "d-wrongscope",
+                    "subject",
                     "modkey",
-                    "holder",
                     serde_json::json!(["consent_revocation"]),
                 ),
             })
@@ -5236,7 +5338,8 @@ mod tests {
                     "r-wrongscope",
                     "modkey",
                     "reconsideration:case42:v1",
-                    Some("holder"),
+                    &["subject"],
+                    None,
                 ),
             })
             .await
@@ -5250,26 +5353,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_delegated_duty_scores_moderation_dimension_uses_moderate_scope() {
+    async fn memory_moderation_scores_moderation_dimension_uses_moderate_scope() {
         // A `moderation:*` scores dimension is gated by the `moderate`
-        // scope; a `review`-scoped delegation does NOT satisfy it (scope
-        // isolation across the two scores dimensions).
+        // scope; a `review`-scoped delegation does NOT satisfy it.
         let backend = MemoryBackend::new();
-        for k in ["holder", "delegate"] {
-            backend
-                .put_public_key(SignedKeyRecord {
-                    record: fix_key(k, "primitive", k),
-                })
-                .await
-                .unwrap();
-        }
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_user_key("subject"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("delegate", "primitive", "delegate"),
+            })
+            .await
+            .unwrap();
         // `review`-scoped delegation → cannot drive a `moderation:*` report.
         backend
             .put_attestation(SignedAttestation {
                 attestation: fix_delegates_to(
-                    "d-rev",
+                    "d-rev2",
+                    "subject",
                     "delegate",
-                    "holder",
                     serde_json::json!(["review"]),
                 ),
             })
@@ -5281,20 +5387,21 @@ mod tests {
                     "m-wrongscope",
                     "delegate",
                     "moderation:rogue_action:v1",
-                    Some("holder"),
+                    &["subject"],
+                    None,
                 ),
             })
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
 
-        // `moderate`-scoped delegation → ADMITTED.
+        // `moderate`-scoped delegation → ADMIT.
         backend
             .put_attestation(SignedAttestation {
                 attestation: fix_delegates_to(
                     "d-mod",
+                    "subject",
                     "delegate",
-                    "holder",
                     serde_json::json!(["moderate"]),
                 ),
             })
@@ -5306,7 +5413,8 @@ mod tests {
                     "m-ok",
                     "delegate",
                     "moderation:rogue_action:v1",
-                    Some("holder"),
+                    &["subject"],
+                    None,
                 ),
             })
             .await
@@ -5314,15 +5422,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_delegated_duty_scores_depth_cap_rejects() {
-        // (e) a delegation chain deeper than MAX_DELEGATION_DEPTH is
-        // refused — the depth cap is honored.
+    async fn memory_moderation_scores_depth_cap_rejects() {
+        // (e) a `review`-scoped chain deeper than the §11.10 depth cap
+        // (MAX_MODERATION_DELEGATION_DEPTH = 5) is refused.
         let backend = MemoryBackend::new();
-        let depth = crate::federation::admission::MAX_WITHDRAWS_DELEGATION_DEPTH;
-        // Build keys k0..=k(depth+1). signer = k0, principal = k(depth+1).
+        let depth = crate::federation::admission::MAX_MODERATION_DELEGATION_DEPTH;
+        // k0 (the owner-bound subject root) → k1 → ... → k(depth+1).
         let n = depth + 2;
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_user_key("k0"),
+            })
+            .await
+            .unwrap();
         let keys: Vec<String> = (0..n).map(|i| format!("k{i}")).collect();
-        for k in &keys {
+        for k in keys.iter().skip(1) {
             backend
                 .put_public_key(SignedKeyRecord {
                     record: fix_key(k, "primitive", k),
@@ -5330,33 +5444,293 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Chain k0 -> k1 -> ... -> k(n-1), every edge `review`-scoped.
-        // Length n-1 edges > depth cap, so k0 cannot reach k(n-1).
+        // Every edge `review`-scoped + sub_delegation so only the depth
+        // cap (not the deputization gate) is what rejects.
         for i in 0..(n - 1) {
             backend
                 .put_attestation(SignedAttestation {
-                    attestation: fix_delegates_to(
+                    attestation: fix_delegates_to_sub(
                         &format!("d{i}"),
                         &keys[i],
                         &keys[i + 1],
                         serde_json::json!(["review"]),
+                        true,
                     ),
                 })
                 .await
                 .unwrap();
         }
+        // The signer is the too-deep tail key; the root k0 is the subject.
         let err = backend
             .put_attestation(SignedAttestation {
                 attestation: fix_scores_report(
                     "r-toodeep",
-                    &keys[0],
+                    &keys[n - 1],
                     "reconsideration:case42:v1",
-                    Some(&keys[n - 1]),
+                    &["k0"],
+                    None,
                 ),
             })
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
+    }
+
+    #[tokio::test]
+    async fn memory_moderation_scores_attenuation_and_subdelegation() {
+        // (f) ⊆-parent attenuation violation → REJECT; (g) deputization
+        // without sub_delegation → REJECT; (h) withdraws on a mid-chain
+        // edge → downstream REJECT; (i) non-owner-bound root → REJECT (b).
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_user_key("subject"),
+            })
+            .await
+            .unwrap();
+        for k in ["mid", "leaf", "agentroot", "agdel"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+
+        // (g) deputization without sub_delegation: subject → mid (review,
+        // sub_delegation=false), mid → leaf (review). mid may exercise the
+        // duty but MUST NOT deputize leaf → leaf REJECT.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to_sub(
+                    "g-1",
+                    "subject",
+                    "mid",
+                    serde_json::json!(["review"]),
+                    false,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to_sub(
+                    "g-2",
+                    "mid",
+                    "leaf",
+                    serde_json::json!(["review"]),
+                    true,
+                ),
+            })
+            .await
+            .unwrap();
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "g-rep",
+                    "leaf",
+                    "reconsideration:case42:v1",
+                    &["subject"],
+                    None,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_delegated_scope_unauthorized",
+            "(g) deputization without sub_delegation must reject downstream"
+        );
+        // But `mid` itself (the direct delegate) IS admitted.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "g-mid",
+                    "mid",
+                    "reconsideration:case42:v1",
+                    &["subject"],
+                    None,
+                ),
+            })
+            .await
+            .expect("(g) direct delegate (mid) is admitted");
+
+        // (i) non-owner-bound root: agentroot (NOT user-role) → agdel
+        // (review). agentroot reaches agdel, but is NOT owner-bound, and is
+        // not in any community authority set → agdel REJECT under (b).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "i-1",
+                    "agentroot",
+                    "agdel",
+                    serde_json::json!(["review"]),
+                ),
+            })
+            .await
+            .unwrap();
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "i-rep",
+                    "agdel",
+                    "reconsideration:case42:v1",
+                    &["agentroot"],
+                    None,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_delegated_scope_unauthorized",
+            "(i) non-owner-bound root cannot confer a delegated duty"
+        );
+
+        // (h) withdraws on a mid-chain edge: subject → h_mid (review, sub),
+        // h_mid → h_leaf (review). subject then withdraws the subject→h_mid
+        // edge → h_leaf REJECT (downstream invalidated).
+        for k in ["h_mid", "h_leaf"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to_sub(
+                    "h-1",
+                    "subject",
+                    "h_mid",
+                    serde_json::json!(["review"]),
+                    true,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to_sub(
+                    "h-2",
+                    "h_mid",
+                    "h_leaf",
+                    serde_json::json!(["review"]),
+                    true,
+                ),
+            })
+            .await
+            .unwrap();
+        // h_leaf admitted BEFORE the withdraws.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "h-pre",
+                    "h_leaf",
+                    "reconsideration:case42:v1",
+                    &["subject"],
+                    None,
+                ),
+            })
+            .await
+            .expect("(h) chain valid before withdraws");
+        // subject withdraws the subject→h_mid edge (issuer-against-recipient).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: {
+                    let mut w = fix_attestation("h-w", "subject", "h_mid", "subject");
+                    w.attestation_type =
+                        crate::federation::types::attestation_type::WITHDRAWS.into();
+                    w.attestation_envelope =
+                        serde_json::json!({"references_attestation_id": "h-1"});
+                    w
+                },
+            })
+            .await
+            .expect("subject withdraws own delegation edge");
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "h-post",
+                    "h_leaf",
+                    "reconsideration:case42:v1",
+                    &["subject"],
+                    None,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_delegated_scope_unauthorized",
+            "(h) withdraws on mid-chain edge invalidates downstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_moderation_scores_attenuation_violation_rejects() {
+        // (f) focused: child edge scope-set NOT ⊆ parent → REJECT.
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_user_key("subject"),
+            })
+            .await
+            .unwrap();
+        for k in ["mid", "leaf"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        // subject → mid grants {review} (sub_delegation).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to_sub(
+                    "att-1",
+                    "subject",
+                    "mid",
+                    serde_json::json!(["review"]),
+                    true,
+                ),
+            })
+            .await
+            .unwrap();
+        // mid → leaf grants {review, moderate} — EXPANDS beyond parent's
+        // {review}; the review-scoped edge is present but the scope-set is
+        // not ⊆ parent → attenuation rejects the traversal to leaf.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to_sub(
+                    "att-2",
+                    "mid",
+                    "leaf",
+                    serde_json::json!(["review", "moderate"]),
+                    true,
+                ),
+            })
+            .await
+            .unwrap();
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "att-rep",
+                    "leaf",
+                    "reconsideration:case42:v1",
+                    &["subject"],
+                    None,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_delegated_scope_unauthorized",
+            "(f) child scope-set must be ⊆ parent scope-set"
+        );
     }
 
     // ── v3.1.0 (CIRISPersist#117) — peer-mutation surface ──────────

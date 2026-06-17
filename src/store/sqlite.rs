@@ -2095,13 +2095,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             row.withdraws_admission_rule = Some(rule);
         }
 
-        // v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate for
+        // v8.7.1 (CIRISPersist#233, CEG §11.10) — FULL moderation gate for
         // the report→`scores` half (moderation:* / reconsideration:*). A
         // no-op for any non-matching row; for a moderation/review report it
-        // admits IFF the signer holds the duty as-self or reaches the
-        // `on_behalf_of` principal via a live scoped delegates_to chain.
-        // Runs AFTER the withdraws gate and BEFORE persist_row_hash +
-        // INSERT — a rejected emission leaves no trace.
+        // admits IFF the signer IS a duty-holder over the target (the row's
+        // subject_key_ids ∪ the envelope community_id's named moderators) or
+        // is reached by an owner-bound duty-holder via a live scoped
+        // delegates_to chain. Absence ⇒ REJECT. Runs AFTER the withdraws
+        // gate and BEFORE persist_row_hash + INSERT — a rejected emission
+        // leaves no trace.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;

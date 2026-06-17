@@ -153,13 +153,14 @@ pub enum Error {
     #[error("internal: {0}")]
     Internal(String),
 
-    /// v8.7.0 (CIRISPersist#232, CEG 1.0-RC19 §11.10 / §3.2.3 rule-(3);
-    /// CIRISRegistry#90) — a moderation / takedown primitive
+    /// v8.7.1 (CIRISPersist#233, CEG RC24/RC25/RC26 §11.10 / §11.11 /
+    /// §5.6.8.10) — a moderation / takedown primitive
     /// (`ModerationEvent` / `takedown_notice`) emission was refused: the
-    /// signer neither holds the duty as-self (the `on_behalf_of` principal
-    /// is absent or names the signer) NOR reaches the named principal via a
-    /// live `delegates_to` chain bearing the governing scope (`moderate` /
-    /// `takedown`). The row is not stored. This is the cirisnode-surface
+    /// signer neither holds the duty as-self (it is NOT a subject of the
+    /// target content nor a named moderator of the target community) NOR is
+    /// reached by an owner-bound duty-holder via a live `delegates_to`
+    /// chain bearing the governing scope (`moderate` / `takedown`). The row
+    /// is not stored. This is the cirisnode-surface
     /// image of [`crate::federation::Error::DelegatedScopeUnauthorized`] —
     /// the §11.10 child-safety / "takedown isn't a coup" gate. Distinct
     /// from [`Error::NotAuthorized`] so consumers can pattern-match the
@@ -205,67 +206,114 @@ impl Error {
     }
 }
 
-/// v8.7.0 (CIRISPersist#232, CEG 1.0-RC19 §11.10) — run the
-/// delegated-duty admit-iff gate for a cirisnode primitive
+/// v8.7.1 (CIRISPersist#233, CEG RC24/RC25/RC26 §11.10) — run the FULL
+/// §11.10 moderation admit-iff gate for a cirisnode primitive
 /// (`ModerationEvent` / `takedown_notice`) and translate a federation
 /// rejection into the cirisnode-surface
 /// [`Error::DelegatedScopeUnauthorized`].
 ///
 /// `signer` is the emission's verified author (`accuser_id` for a
 /// `ModerationEvent`, `author_id` for a `takedown_notice` Contribution).
-/// `on_behalf_of` is the principal the emission claims to act for (read
-/// off the payload's
-/// [`on_behalf_of`](crate::federation::admission::DELEGATED_DUTY_ON_BEHALF_OF_FIELD)
-/// field; `None`/empty/self ⇒ as-self). `scope_token` is `moderate` or
-/// `takedown`. Delegates to
-/// [`crate::federation::admission::check_delegated_duty_admission`] so the
-/// scope-isolation + depth-cap properties are identical to the
-/// `consent_revocation` / report-`scores` paths.
+/// `subjects` + `community_id` are the producer-declared target descriptor
+/// (the content's subjects + the target community); this resolves the
+/// `duty_holders` (subjects ∪ the community's named moderators) and runs
+/// the gate. `duty` is `moderate` / `takedown` / `review`.
+/// `target_descriptor` is an audit string naming the target. Admit IFF the
+/// signer is a duty-holder (as-self) or an owner-bound holder reaches the
+/// signer via a live `duty`-scoped chain; the v8.7.0 absent-⇒-admit bypass
+/// is GONE (no duty-holder ⇒ REJECT). Delegates to
+/// [`crate::federation::admission::check_moderation_admission`] so the
+/// scope-isolation + attenuation + sub_delegation + depth-cap + owner-bound
+/// properties are identical to the report-`scores` path.
 ///
 /// A federation [`Backend`](crate::federation::Error::Backend) error from
 /// the directory walk maps to [`Error::Backend`]; the authority rejection
 /// maps to [`Error::DelegatedScopeUnauthorized`]; any other federation
 /// error is surfaced as [`Error::Internal`] (none are expected here).
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
-pub async fn check_delegated_duty_or_reject(
+pub async fn check_moderation_or_reject(
     directory: &dyn crate::federation::FederationDirectory,
     signer: &str,
-    on_behalf_of: Option<&str>,
-    scope_token: &str,
+    subjects: &[String],
+    community_id: &str,
+    duty: &str,
+    target_descriptor: &str,
 ) -> Result<(), Error> {
-    match crate::federation::admission::check_delegated_duty_admission(
+    let duty_holders = match crate::federation::admission::duty_holders_for_content(
+        directory,
+        subjects,
+        community_id,
+        duty,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(crate::federation::Error::Backend(e)) => return Err(Error::Backend(e)),
+        Err(e) => {
+            return Err(Error::Internal(format!(
+                "moderation duty-holder resolution unexpected federation error: {e}"
+            )))
+        }
+    };
+    match crate::federation::admission::check_moderation_admission(
         directory,
         signer,
-        on_behalf_of,
-        scope_token,
+        &duty_holders,
+        duty,
+        target_descriptor,
     )
     .await
     {
         Ok(()) => Ok(()),
         Err(crate::federation::Error::DelegatedScopeUnauthorized {
             signer,
-            on_behalf_of,
+            on_behalf_of: target,
             scope,
         }) => Err(Error::DelegatedScopeUnauthorized(format!(
-            "signer {signer} holds neither the {scope} duty as-self nor a live \
-             {scope}-scoped delegates_to chain reaching {on_behalf_of} (CEG §11.10)"
+            "signer {signer} holds neither the {scope} duty as-self over {target} nor a live \
+             {scope}-scoped delegates_to chain from an owner-bound duty-holder (CEG §11.10)"
         ))),
         Err(crate::federation::Error::Backend(e)) => Err(Error::Backend(e)),
         Err(e) => Err(Error::Internal(format!(
-            "delegated-duty gate unexpected federation error: {e}"
+            "moderation gate unexpected federation error: {e}"
         ))),
     }
 }
 
-/// v8.7.0 (CIRISPersist#232) — extract the `on_behalf_of` principal from a
-/// cirisnode primitive's JSONB payload. `None` when the field is absent or
-/// not a string ⇒ an as-self emission. Mirrors the field-name convention
-/// pinned by
-/// [`DELEGATED_DUTY_ON_BEHALF_OF_FIELD`](crate::federation::admission::DELEGATED_DUTY_ON_BEHALF_OF_FIELD).
-pub fn payload_on_behalf_of(payload: &serde_json::Value) -> Option<&str> {
-    payload
-        .get(crate::federation::admission::DELEGATED_DUTY_ON_BEHALF_OF_FIELD)
+/// v8.7.1 (CIRISPersist#233, CEG §11.10) — extract the producer-declared
+/// **target descriptor** from a cirisnode moderation/takedown payload: the
+/// target content's `subject_key_ids` (the people the content is ABOUT — a
+/// subject may take down content about themselves) and the target
+/// `community_id` (whose named moderators hold the duty). Both default to
+/// empty/absent.
+///
+/// **Honesty note (flagged, CIRISPersist#233).** The cirisnode payload
+/// surface (`TakedownNoticePayload` / `ModerationEvent.payload`) carries
+/// `content_sha256` / `target_contributor`, NOT a content→subjects index;
+/// persist has no `content_sha256 → subject_key_ids` lookup (the
+/// `subject_key_ids` live on the federation `scores`/content attestation,
+/// not on the cirisnode Contribution row). So the cirisnode gate resolves
+/// authority over the **producer-declared** `subject_key_ids` +
+/// `community_id` in the payload — exactly as the report→`scores` path uses
+/// the row's own `subject_key_ids` + envelope `community_id`. Persist
+/// enforces authority over the declared target; it does not re-derive the
+/// content's true subject set from the hash (no such index exists).
+pub fn payload_target_descriptor(payload: &serde_json::Value) -> (Vec<String>, String) {
+    let subjects = payload
+        .get("subject_key_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let community_id = payload
+        .get("community_id")
         .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    (subjects, community_id)
 }
 
 #[cfg(test)]

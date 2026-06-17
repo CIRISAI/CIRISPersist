@@ -262,23 +262,27 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         // trigger fires.
         let takedown =
             super::media_sharing::extract_takedown_notice_payload(&subject_kind, &env.payload)?;
-        // v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate for
+        // v8.7.1 (CIRISPersist#233, CEG §11.10) — FULL moderation gate for
         // the `takedown_notice` primitive. The cirisnode SQLite backend
         // shares its connection with the federation `SqliteBackend`; a
         // `from_conn_handle` view over the same conn IS the
-        // FederationDirectory the delegates_to walk needs. The walk runs
-        // BEFORE the INSERT closure takes the conn lock (no deadlock).
-        // Admit IFF the author holds the `takedown` duty as-self or reaches
-        // the payload's `on_behalf_of` principal via a live `takedown`-
-        // scoped delegation chain.
+        // FederationDirectory the delegates_to + community walks need. The
+        // walk runs BEFORE the INSERT closure takes the conn lock (no
+        // deadlock). Admit IFF the author IS a duty-holder over the target
+        // (the content's declared subjects ∪ the target community's named
+        // moderators) or is reached by an owner-bound duty-holder via a
+        // live `takedown`-scoped chain. Absence ⇒ REJECT.
         if takedown.is_some() {
             let directory =
                 crate::store::sqlite::SqliteBackend::from_conn_handle(self.conn.clone());
-            super::check_delegated_duty_or_reject(
+            let (subjects, community_id) = super::payload_target_descriptor(&env.payload);
+            super::check_moderation_or_reject(
                 &directory,
                 &env.author_id,
-                super::payload_on_behalf_of(&env.payload),
+                &subjects,
+                &community_id,
                 crate::federation::admission::DELEGATION_SCOPE_TAKEDOWN,
+                "takedown_notice",
             )
             .await?;
         }
@@ -499,21 +503,25 @@ impl NodeCoreService for SqliteNodeCoreBackend {
 
     async fn put_moderation_event(&self, event: ModerationEvent) -> Result<(), Error> {
         super::verify::verify_envelope_signed(&event, &event.signature, &event.accuser_id)?;
-        // v8.7.0 (CIRISPersist#232, CEG §11.10) — delegated-duty gate for
+        // v8.7.1 (CIRISPersist#233, CEG §11.10) — FULL moderation gate for
         // the `ModerationEvent` primitive (parity with the PG backend). A
         // `from_conn_handle` view over the shared conn is the
-        // FederationDirectory for the delegates_to walk; admit IFF the
-        // accuser holds the `moderate` duty as-self or reaches the
-        // payload's `on_behalf_of` principal via a live `moderate`-scoped
-        // delegation chain. Runs BEFORE the INSERT closure takes the lock.
+        // FederationDirectory for the delegates_to + community walks; admit
+        // IFF the accuser IS a duty-holder over the target (declared
+        // subjects ∪ the target community's named moderators) or is reached
+        // by an owner-bound duty-holder via a live `moderate`-scoped chain.
+        // Absence ⇒ REJECT. Runs BEFORE the INSERT closure takes the lock.
         {
             let directory =
                 crate::store::sqlite::SqliteBackend::from_conn_handle(self.conn.clone());
-            super::check_delegated_duty_or_reject(
+            let (subjects, community_id) = super::payload_target_descriptor(&event.payload);
+            super::check_moderation_or_reject(
                 &directory,
                 &event.accuser_id,
-                super::payload_on_behalf_of(&event.payload),
+                &subjects,
+                &community_id,
                 crate::federation::admission::DELEGATION_SCOPE_MODERATE,
+                "moderation_event",
             )
             .await?;
         }
@@ -2075,7 +2083,10 @@ mod tests {
             moderation_id: moderation_id.to_string(),
             target_contributor: voter.clone(),
             accuser_id: author.clone(),
-            payload: serde_json::json!({"violation": "test"}),
+            // v8.7.1 (#233): accuser self-declares as a subject so the
+            // §11.10 gate admits via the as-self path (this lifecycle test
+            // exercises storage, not the moderation authority gate).
+            payload: serde_json::json!({"violation": "test", "subject_key_ids": [author.clone()]}),
             filed_at: Utc::now(),
             signature: HybridSignature {
                 ed25519: String::new(),
@@ -2873,6 +2884,13 @@ mod tests {
             asserted_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::days(30),
         };
+        // v8.7.1 (#233): the §11.10 gate now requires the author to be a
+        // duty-holder over the target. These tests exercise takedown
+        // storage/listing mechanics, not the moderation gate, so the
+        // author self-declares as a subject of the target content (as-self
+        // admit path — no key seeding / community needed).
+        let mut payload_json = serde_json::to_value(&payload).unwrap();
+        payload_json["subject_key_ids"] = serde_json::json!([author.clone()]);
         let mut env = ContributionEnvelope {
             contribution_id: Uuid::new_v4().to_string(),
             contribution_type: ContributionType::Proposal,
@@ -2882,7 +2900,7 @@ mod tests {
                 language: "en".into(),
                 subject: Some(crate::cirisnode::TAKEDOWN_NOTICE_SUBJECT_KIND.into()),
             },
-            payload: serde_json::to_value(&payload).unwrap(),
+            payload: payload_json,
             witness_set: None,
             signature: HybridSignature {
                 ed25519: String::new(),
@@ -3546,17 +3564,94 @@ mod tests {
             .unwrap();
     }
 
-    /// Build a signed `ModerationEvent` from `signer_key`, optionally
-    /// declaring an `on_behalf_of` principal in the payload.
+    /// Seed a `delegates_to` edge `granter → grantee` bearing `scope`,
+    /// with an explicit `sub_delegation` flag (§11.10 deputization).
+    async fn seed_delegation_sub(
+        backend: &SqliteBackend,
+        id: &str,
+        granter: &str,
+        grantee: &str,
+        scope: serde_json::Value,
+        sub_delegation: bool,
+    ) {
+        use crate::federation::FederationDirectory;
+        let att = crate::federation::types::Attestation {
+            attestation_id: id.into(),
+            attesting_key_id: granter.into(),
+            attested_key_id: grantee.into(),
+            attestation_type: crate::federation::types::attestation_type::DELEGATES_TO.into(),
+            weight: None,
+            asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "references_attestation_id": id,
+                "scope": scope,
+                "sub_delegation": sub_delegation,
+            }),
+            original_content_hash: "abc123".into(),
+            scrub_signature_classical: "c2ln".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: granter.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
+        };
+        backend
+            .put_attestation(crate::federation::types::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+    }
+
+    /// Seed a `federation_keys` row for `key_id` with identity_type=user
+    /// (owner-bound by clause (1) of `is_owner_bound`).
+    async fn seed_user_key(backend: &SqliteBackend, key_id: &str) {
+        use crate::federation::FederationDirectory;
+        let rec = crate::federation::types::KeyRecord {
+            key_id: key_id.into(),
+            pubkey_ed25519_base64: key_id.into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::USER.into(),
+            identity_ref: key_id.into(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": key_id }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        backend
+            .put_public_key(crate::federation::types::SignedKeyRecord { record: rec })
+            .await
+            .unwrap();
+    }
+
+    /// Build a signed `ModerationEvent` from `signer_key`, declaring the
+    /// target's `subject_key_ids` + `community_id` in the payload.
     fn build_moderation_event(
         signer_key: &ed25519_dalek::SigningKey,
         target: &str,
-        on_behalf_of: Option<&str>,
+        subjects: &[&str],
+        community_id: Option<&str>,
     ) -> ModerationEvent {
         let accuser = pubkey_b64(signer_key);
-        let mut payload = serde_json::json!({ "violation": "rogue_action" });
-        if let Some(p) = on_behalf_of {
-            payload["on_behalf_of"] = serde_json::Value::String(p.to_owned());
+        let mut payload = serde_json::json!({
+            "violation": "rogue_action",
+            "subject_key_ids": subjects,
+        });
+        if let Some(c) = community_id {
+            payload["community_id"] = serde_json::Value::String(c.to_owned());
         }
         let mut ev = ModerationEvent {
             moderation_id: Uuid::new_v4().to_string(),
@@ -3575,10 +3670,11 @@ mod tests {
     }
 
     /// Build a signed `takedown_notice` Contribution from `signer_key`,
-    /// optionally declaring an `on_behalf_of` principal in the payload.
+    /// declaring the target's `subject_key_ids` + `community_id`.
     fn build_takedown_notice(
         signer_key: &ed25519_dalek::SigningKey,
-        on_behalf_of: Option<&str>,
+        subjects: &[&str],
+        community_id: Option<&str>,
     ) -> ContributionEnvelope {
         let author = pubkey_b64(signer_key);
         let mut payload = serde_json::json!({
@@ -3590,9 +3686,10 @@ mod tests {
             "claim_text": "test",
             "asserted_at": "2026-05-01T00:00:00Z",
             "expires_at": "2027-05-01T00:00:00Z",
+            "subject_key_ids": subjects,
         });
-        if let Some(p) = on_behalf_of {
-            payload["on_behalf_of"] = serde_json::Value::String(p.to_owned());
+        if let Some(c) = community_id {
+            payload["community_id"] = serde_json::Value::String(c.to_owned());
         }
         let mut env = ContributionEnvelope {
             contribution_id: Uuid::new_v4().to_string(),
@@ -3616,143 +3713,224 @@ mod tests {
         env
     }
 
+    /// Seed a community keyed by `community_id` with a `founder` member.
+    async fn seed_community(backend: &SqliteBackend, community_id: &str, founder: &str) {
+        use crate::federation::FederationDirectory;
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: crate::federation::types::Community {
+                    community_key_id: community_id.into(),
+                    community_name: "tc".into(),
+                    members: vec![crate::federation::types::CommunityMember {
+                        key_id: founder.into(),
+                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        role: Some("founder".into()),
+                    }],
+                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
+                        .into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
-    async fn sqlite_moderation_event_delegated_duty_matrix() {
+    async fn sqlite_moderation_event_full_matrix() {
         let (b, cn) = fresh_backend().await;
-        let holder_key = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]);
+        let subject_key = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]);
         let delegate_key = ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]);
         let rando_key = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
-        let holder = pubkey_b64(&holder_key);
+        let founder_key = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
+        let subject = pubkey_b64(&subject_key);
         let delegate = pubkey_b64(&delegate_key);
         let rando = pubkey_b64(&rando_key);
-        for k in [&holder, &delegate, &rando] {
+        let founder = pubkey_b64(&founder_key);
+        seed_user_key(&b, &subject).await;
+        seed_user_key(&b, &founder).await;
+        for k in [&delegate, &rando] {
             seed_fed_key(&b, k).await;
         }
+        seed_community(&b, "comm-mod", &founder).await;
 
-        // (a) duty-holder as-self (no on_behalf_of) → ADMITTED.
-        cn.put_moderation_event(build_moderation_event(&holder_key, "target", None))
-            .await
-            .expect("as-self moderation admitted");
+        // (a) as-self subject → ADMITTED.
+        cn.put_moderation_event(build_moderation_event(
+            &subject_key,
+            "target",
+            &[&subject],
+            None,
+        ))
+        .await
+        .expect("(a) as-self subject moderation admitted");
 
-        // (b) delegate on a live `moderate` chain → ADMITTED.
+        // (b1) subject-delegated chain (subject → delegate, moderate) → ADMIT.
         seed_delegation(
             &b,
             "d-mod",
+            &subject,
             &delegate,
-            &holder,
-            serde_json::json!(["message_io", "moderate"]),
+            serde_json::json!(["moderate"]),
         )
         .await;
         cn.put_moderation_event(build_moderation_event(
             &delegate_key,
             "target",
-            Some(&holder),
+            &[&subject],
+            None,
         ))
         .await
-        .expect("scoped-delegate moderation admitted");
+        .expect("(b1) subject-delegated moderation admitted");
 
-        // (c) signer with neither duty nor delegation → REJECTED.
+        // (b2) named-moderator (community founder, owner-bound) → ADMIT.
+        cn.put_moderation_event(build_moderation_event(
+            &founder_key,
+            "target",
+            &[],
+            Some("comm-mod"),
+        ))
+        .await
+        .expect("(b2) named-moderator (founder) moderation admitted");
+
+        // (c) no authority → REJECTED.
         let err = cn
-            .put_moderation_event(build_moderation_event(&rando_key, "target", Some(&holder)))
+            .put_moderation_event(build_moderation_event(
+                &rando_key,
+                "target",
+                &[&subject],
+                None,
+            ))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "cirisnode_delegated_scope_unauthorized");
 
-        // (d) scope isolation — a `consent_revocation`-only delegation
-        // MUST NOT drive a `moderate` emission.
+        // (c2) NOTHING — no subjects, no community → REJECTED (bypass guard).
+        let err = cn
+            .put_moderation_event(build_moderation_event(&rando_key, "target", &[], None))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "cirisnode_delegated_scope_unauthorized",
+            "(c2) absent principal must REJECT, not admit"
+        );
+
+        // (d) scope isolation — consent_revocation-only chain ⇏ moderate.
         seed_delegation(
             &b,
             "d-cr",
+            &subject,
             &rando,
-            &holder,
             serde_json::json!(["consent_revocation"]),
         )
         .await;
         let err = cn
-            .put_moderation_event(build_moderation_event(&rando_key, "target", Some(&holder)))
+            .put_moderation_event(build_moderation_event(
+                &rando_key,
+                "target",
+                &[&subject],
+                None,
+            ))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "cirisnode_delegated_scope_unauthorized");
     }
 
     #[tokio::test]
-    async fn sqlite_takedown_notice_delegated_duty_matrix() {
+    async fn sqlite_takedown_notice_full_matrix() {
         let (b, cn) = fresh_backend().await;
-        let holder_key = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
-        let delegate_key = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
-        let rando_key = ed25519_dalek::SigningKey::from_bytes(&[0x66; 32]);
-        let holder = pubkey_b64(&holder_key);
+        let subject_key = ed25519_dalek::SigningKey::from_bytes(&[0x4a; 32]);
+        let delegate_key = ed25519_dalek::SigningKey::from_bytes(&[0x5a; 32]);
+        let rando_key = ed25519_dalek::SigningKey::from_bytes(&[0x6a; 32]);
+        let subject = pubkey_b64(&subject_key);
         let delegate = pubkey_b64(&delegate_key);
         let rando = pubkey_b64(&rando_key);
-        for k in [&holder, &delegate, &rando] {
+        seed_user_key(&b, &subject).await;
+        for k in [&delegate, &rando] {
             seed_fed_key(&b, k).await;
         }
 
-        // (a) as-self → ADMITTED.
-        cn.put_contribution(build_takedown_notice(&holder_key, None))
+        // (a) as-self subject → ADMITTED.
+        cn.put_contribution(build_takedown_notice(&subject_key, &[&subject], None))
             .await
-            .expect("as-self takedown admitted");
+            .expect("(a) as-self subject takedown admitted");
 
-        // (b) delegate on a live `takedown` chain → ADMITTED.
+        // (b1) subject-delegated chain (subject → delegate, takedown) → ADMIT.
         seed_delegation(
             &b,
             "d-td",
+            &subject,
             &delegate,
-            &holder,
             serde_json::json!(["takedown"]),
         )
         .await;
-        cn.put_contribution(build_takedown_notice(&delegate_key, Some(&holder)))
+        cn.put_contribution(build_takedown_notice(&delegate_key, &[&subject], None))
             .await
-            .expect("scoped-delegate takedown admitted");
+            .expect("(b1) subject-delegated takedown admitted");
 
-        // (c) neither duty nor delegation → REJECTED.
+        // (c) no authority → REJECTED.
         let err = cn
-            .put_contribution(build_takedown_notice(&rando_key, Some(&holder)))
+            .put_contribution(build_takedown_notice(&rando_key, &[&subject], None))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "cirisnode_delegated_scope_unauthorized");
 
-        // (d) scope isolation — a `consent_revocation`-only delegation
-        // MUST NOT drive a `takedown` (the load-bearing child-safety prop).
+        // (c2) NOTHING → REJECTED (bypass-closed regression guard).
+        let err = cn
+            .put_contribution(build_takedown_notice(&rando_key, &[], None))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "cirisnode_delegated_scope_unauthorized",
+            "(c2) absent principal must REJECT, not admit"
+        );
+
+        // (d) scope isolation — consent_revocation-only chain ⇏ takedown.
         seed_delegation(
             &b,
             "d-cr2",
+            &subject,
             &rando,
-            &holder,
             serde_json::json!(["consent_revocation"]),
         )
         .await;
         let err = cn
-            .put_contribution(build_takedown_notice(&rando_key, Some(&holder)))
+            .put_contribution(build_takedown_notice(&rando_key, &[&subject], None))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "cirisnode_delegated_scope_unauthorized");
 
-        // (e) chain beyond MAX_DELEGATION_DEPTH → REJECTED (depth cap).
-        let depth = crate::federation::admission::MAX_WITHDRAWS_DELEGATION_DEPTH;
+        // (e) chain beyond the §11.10 depth cap (5) → REJECTED. Root k0 is
+        // the owner-bound subject; every edge takedown-scoped + sub_delegation.
+        let depth = crate::federation::admission::MAX_MODERATION_DELEGATION_DEPTH;
         let n = depth + 2;
         let chain_keys: Vec<ed25519_dalek::SigningKey> = (0..n)
             .map(|i| ed25519_dalek::SigningKey::from_bytes(&[0x80 + i as u8; 32]))
             .collect();
         let chain_ids: Vec<String> = chain_keys.iter().map(pubkey_b64).collect();
-        for k in &chain_ids {
+        seed_user_key(&b, &chain_ids[0]).await;
+        for k in chain_ids.iter().skip(1) {
             seed_fed_key(&b, k).await;
         }
         for i in 0..(n - 1) {
-            seed_delegation(
+            seed_delegation_sub(
                 &b,
                 &format!("dc{i}"),
                 &chain_ids[i],
                 &chain_ids[i + 1],
                 serde_json::json!(["takedown"]),
+                true,
             )
             .await;
         }
+        // signer = the too-deep tail; root (subject) = chain_ids[0].
         let err = cn
             .put_contribution(build_takedown_notice(
-                &chain_keys[0],
-                Some(&chain_ids[n - 1]),
+                &chain_keys[n - 1],
+                &[&chain_ids[0]],
+                None,
             ))
             .await
             .unwrap_err();

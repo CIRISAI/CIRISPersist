@@ -1171,6 +1171,80 @@ fn delegation_scope_grants(envelope: &serde_json::Value, scope_token: &str) -> b
     }
 }
 
+/// v8.7.1 (CIRISPersist#233, CEG RC24 §11.10 deputization + attenuation)
+/// — the set of scope tokens a `delegates_to` envelope's `scope` field
+/// declares, as a `HashSet`. Accepts both wire shapes (bare string OR
+/// array-of-strings) exactly as [`delegation_scope_grants`]. The §11.10
+/// `⊆`-parent attenuation check (`child.scope ⊆ parent.scope`) compares
+/// these sets along the chain. A `scope` that is neither string nor array
+/// (or absent) yields the empty set.
+fn delegation_scope_set(envelope: &serde_json::Value) -> std::collections::HashSet<String> {
+    match envelope.get("scope") {
+        Some(serde_json::Value::String(s)) => std::iter::once(s.clone()).collect(),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        _ => std::collections::HashSet::new(),
+    }
+}
+
+/// v8.7.1 (CIRISPersist#233, CEG RC24 §11.10) — does a `delegates_to`
+/// envelope grant `sub_delegation` (the right of the recipient to
+/// further-delegate the duty)? `true` only when the envelope carries
+/// `"sub_delegation": true`; absent / false / non-bool ⇒ `false`. A
+/// delegate WITHOUT `sub_delegation` is a leaf — it may exercise the duty
+/// but MUST NOT deputize anyone further (UCAN-style; §13.3 deputization
+/// gate). The root duty-holder is NOT subject to this gate (it holds the
+/// duty natively, not by delegation).
+fn delegation_grants_sub_delegation(envelope: &serde_json::Value) -> bool {
+    envelope
+        .get("sub_delegation")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// v8.7.1 (CIRISPersist#233) — per-walk policy distinguishing the two
+/// `delegates_to`-chain consumers that share
+/// [`issuer_reaches_target_via_scoped_delegation`]:
+///
+/// - **`consent_revocation`** (CEG §3.2.3) — the pre-existing proxy
+///   revocation walk. `enforce_attenuation_and_sub_delegation = false`
+///   and `skip_withdrawn_edges = false`: BYTE-IDENTICAL to the v6.4.0
+///   behavior (no `⊆`-parent attenuation, no `sub_delegation`
+///   deputization gate, no per-edge `withdraws` skip). Its delegations
+///   simply do not set those constraints, so adding the machinery behind
+///   a `false` flag cannot regress it.
+/// - **§11.10 `moderate` / `takedown` / `review`** (CEG RC24) — the new
+///   moderation-enforcement walk. Both flags `true`: each edge's scope
+///   must be `⊆` its parent edge's scope (restate-or-attenuate), a
+///   non-root node may only be reached through a parent edge that granted
+///   `sub_delegation`, and a `withdraws`-revoked edge (issuer-against-
+///   recipient, UCAN-style) invalidates everything downstream.
+#[derive(Debug, Clone, Copy)]
+struct DelegationWalkPolicy {
+    /// Enforce `child.scope ⊆ parent.scope` along the chain AND require
+    /// `sub_delegation` on the parent edge before traversing past depth 1.
+    enforce_attenuation_and_sub_delegation: bool,
+    /// Skip any `delegates_to` edge the granter has `withdraws`/`recants`-
+    /// revoked against the recipient (topology's edge-retraction model).
+    skip_withdrawn_edges: bool,
+}
+
+impl DelegationWalkPolicy {
+    /// The pre-v8.7.1 behavior — consent_revocation proxy reachability.
+    const CONSENT_REVOCATION: Self = Self {
+        enforce_attenuation_and_sub_delegation: false,
+        skip_withdrawn_edges: false,
+    };
+    /// The §11.10 moderation-duty walk — attenuation + sub_delegation +
+    /// per-edge revocation all enforced.
+    const MODERATION_DUTY: Self = Self {
+        enforce_attenuation_and_sub_delegation: true,
+        skip_withdrawn_edges: true,
+    };
+}
+
 /// v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — does `issuer` reach
 /// any key in `targets` via a `delegates_to` chain where **every edge
 /// on the path carries `consent_revocation` scope**? This is the
@@ -1208,6 +1282,7 @@ async fn issuer_reaches_target_via_consent_revocation_delegation(
         targets,
         DELEGATION_SCOPE_CONSENT_REVOCATION,
         max_depth,
+        DelegationWalkPolicy::CONSENT_REVOCATION,
     )
     .await
 }
@@ -1234,22 +1309,63 @@ async fn issuer_reaches_target_via_scoped_delegation(
     targets: &std::collections::HashSet<String>,
     scope_token: &str,
     max_depth: usize,
+    policy: DelegationWalkPolicy,
 ) -> Result<bool, Error> {
     use std::collections::{HashSet, VecDeque};
     let effective_depth = max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH);
     if effective_depth == 0 {
         return Ok(false);
     }
+    // Per-node walk state. `parent_scope` is the scope-set of the edge
+    // that reached `key` (the root `issuer` has `None` — no incoming
+    // edge); `parent_sub_delegation` is whether that incoming edge granted
+    // deputization. Under §11.10 (`enforce_attenuation_and_sub_delegation`)
+    // these gate traversal; under consent_revocation they are inert.
+    struct Node {
+        key: String,
+        depth: usize,
+        parent_scope: Option<HashSet<String>>,
+        parent_sub_delegation: bool,
+    }
     let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-    queue.push_back((issuer.to_owned(), 0));
+    let mut queue: VecDeque<Node> = VecDeque::new();
+    queue.push_back(Node {
+        key: issuer.to_owned(),
+        depth: 0,
+        parent_scope: None,
+        parent_sub_delegation: false,
+    });
     visited.insert(issuer.to_owned());
 
-    while let Some((current, depth)) = queue.pop_front() {
-        if depth >= effective_depth {
+    while let Some(node) = queue.pop_front() {
+        if node.depth >= effective_depth {
             continue;
         }
-        let rows = directory.list_attestations_by(&current).await?;
+        // §11.10 deputization gate: a NON-root granter (one reached via an
+        // incoming edge) may only further-delegate if that incoming edge
+        // granted `sub_delegation`. The root duty-holder holds the duty
+        // natively and is exempt (`parent_scope == None`).
+        if policy.enforce_attenuation_and_sub_delegation
+            && node.parent_scope.is_some()
+            && !node.parent_sub_delegation
+        {
+            continue;
+        }
+        let rows = directory.list_attestations_by(&node.key).await?;
+        // §11.10: bucket this granter's `withdraws`/`recants` retractions
+        // by recipient so a revoked edge invalidates the downstream chain
+        // (UCAN-style; topology's edge-retraction model). Inert for
+        // consent_revocation (`skip_withdrawn_edges == false`).
+        let mut retracted: HashSet<String> = HashSet::new();
+        if policy.skip_withdrawn_edges {
+            for r in &rows {
+                if r.attestation_type == attestation_type::WITHDRAWS
+                    || r.attestation_type == attestation_type::RECANTS
+                {
+                    retracted.insert(r.attested_key_id.clone());
+                }
+            }
+        }
         for r in rows {
             if r.attestation_type != attestation_type::DELEGATES_TO {
                 continue;
@@ -1257,14 +1373,36 @@ async fn issuer_reaches_target_via_scoped_delegation(
             if !delegation_scope_grants(&r.attestation_envelope, scope_token) {
                 continue;
             }
+            if policy.skip_withdrawn_edges && retracted.contains(&r.attested_key_id) {
+                continue;
+            }
+            // §11.10 `⊆`-parent attenuation: the child edge's scope-set
+            // must be a subset of the parent edge's scope-set
+            // (restate-or-attenuate, never expand). The root's first
+            // out-edge has no parent edge to attenuate against.
+            if policy.enforce_attenuation_and_sub_delegation {
+                if let Some(parent_scope) = &node.parent_scope {
+                    let child_scope = delegation_scope_set(&r.attestation_envelope);
+                    if !child_scope.is_subset(parent_scope) {
+                        continue;
+                    }
+                }
+            }
             // A scope-bearing delegation edge to a target key is
             // sufficient — delegated duty established along the path.
             if targets.contains(&r.attested_key_id) {
                 return Ok(true);
             }
-            if !visited.contains(&r.attested_key_id) && depth + 1 < effective_depth {
+            if !visited.contains(&r.attested_key_id) && node.depth + 1 < effective_depth {
                 visited.insert(r.attested_key_id.clone());
-                queue.push_back((r.attested_key_id, depth + 1));
+                queue.push_back(Node {
+                    key: r.attested_key_id,
+                    depth: node.depth + 1,
+                    parent_scope: Some(delegation_scope_set(&r.attestation_envelope)),
+                    parent_sub_delegation: delegation_grants_sub_delegation(
+                        &r.attestation_envelope,
+                    ),
+                });
             }
         }
     }
@@ -1502,26 +1640,26 @@ pub async fn check_withdraws_admission(
     Ok(Some(rule))
 }
 
-// ─── v8.7.0 — §11.10 delegated-duty admission (moderate/takedown/review) ─
-
-/// v8.7.0 (CIRISPersist#232, CEG 1.0-RC19 §11.10) — the envelope/payload
-/// field naming the **principal on whose behalf** a moderation / takedown
-/// / review primitive is emitted (the duty-holder / delegator). Read off
-/// the emission envelope (the `scores` `attestation_envelope`) or the
-/// cirisnode payload (`ModerationEvent` / `takedown_notice`).
-///
-/// **Semantics.** ABSENT or equal to the signer ⇒ an as-self emission
-/// (the signer holds the duty directly; §11.10 admit clause (a)). PRESENT
-/// and distinct from the signer ⇒ the signer is acting as a delegate and
-/// MUST reach the named principal via a live scoped `delegates_to` chain
-/// (clause (b)); otherwise the emission is rejected.
-///
-/// **Wire-shape note (CIRISRegistry#90 does not pin the field NAME).**
-/// `#90` pins the SCOPE vocabulary + the duty-holder relation, not the
-/// envelope key. Persist uses `on_behalf_of` (mirroring the existing
-/// `act_on_behalf` scope vocabulary). If CEG/CIRISServer#15 lock a
-/// different key, this single const is the one place to flip it.
-pub const DELEGATED_DUTY_ON_BEHALF_OF_FIELD: &str = "on_behalf_of";
+// ─── v8.7.1 — §11.10 FULL moderation enforcement (CEG RC24/RC25/RC26) ───
+//
+// v8.7.1 (CIRISPersist#233) REPLACES the v8.7.0 `on_behalf_of`-field model
+// entirely. RC24 §11.10 pins the principal as the chain ROOT discovered by
+// walking UP from `attesting_key_id` to an owner-bound scoped duty-holder —
+// NOT a payload field. The v8.7.0 absent/empty/self ⇒ admit path WAS the
+// bypass: CIRISServer#15 never emits `on_behalf_of` (not a spec field), so
+// every emission hit the as-self admit path and the authority check never
+// fired. The `on_behalf_of` const / `payload_on_behalf_of` /
+// `check_delegated_duty_admission(.., on_behalf_of, ..)` shape is DELETED.
+//
+// New admission (per primitive `takedown_notice` / `moderation:*` /
+// `reconsideration:*`): admit IFF
+//   (a) as-self — `attesting_key_id ∈ duty_holders(target)`, OR
+//   (b) delegated — ∃ `root ∈ duty_holders(target)` with a live
+//       scope-bearing `delegates_to` chain `root →* attesting_key_id`
+//       (every edge `scope ⊇ {duty}`, `⊆`-parent attenuation,
+//       `sub_delegation`-gated deputization, depth ≤ 5, no `withdraws`-
+//       revoked edge) AND `is_owner_bound(root)`.
+//   else REJECT. Absence is NEVER an admit condition.
 
 /// v8.7.0 (CIRISPersist#232, CEG §11.10) — reserved `scores` dimension
 /// prefix for a **moderation** report attestation. A `scores` row on a
@@ -1541,70 +1679,305 @@ pub const MODERATION_DIMENSION_PREFIX: &str = "moderation:";
 /// [`review`]: DELEGATION_SCOPE_REVIEW
 pub const RECONSIDERATION_DIMENSION_PREFIX: &str = "reconsideration:";
 
-/// v8.7.0 (CIRISPersist#232, CEG §11.10 / §3.2.3 rule-(3)) — the
-/// generalized delegated-duty admit-iff gate, mirroring the
-/// `consent_revocation` proxy rule exactly.
+/// v8.7.1 (CIRISPersist#233, CEG RC24 §11.10) — the §11.10 delegated-duty
+/// depth bound (§13.3: depth ≤ 5). Distinct from the
+/// [`MAX_WITHDRAWS_DELEGATION_DEPTH`] (16) used by the consent_revocation
+/// proxy walk — moderation chains are short by spec. The walk's
+/// `effective_depth` is `min(this, MAX_WITHDRAWS_DELEGATION_DEPTH)`, so a
+/// chain longer than 5 cannot confer a moderation duty.
+pub const MAX_MODERATION_DELEGATION_DEPTH: usize = 5;
+
+/// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §5.6.8.10) — is key `k`
+/// **owner-bound**? A moderation chain ROOT must terminate in a real human
+/// (a `user`-role identity), never a free-floating agent/service key — the
+/// §11.10 "takedown isn't a coup" anchor. True iff ANY of:
 ///
-/// For an emission of a moderation / takedown / review primitive,
-/// **admit IFF** `signer`:
-///   (a) holds the duty as-self — `on_behalf_of` is `None`, empty, or
-///       equal to `signer` (a participant exercising the duty directly);
-///       OR
-///   (b) reaches the named `on_behalf_of` principal via a live
-///       `delegates_to` chain where every edge bears `scope_token`
-///       (validated against the depth-capped delegation walk —
-///       [`issuer_reaches_target_via_scoped_delegation`]).
+///   1. `k`'s OWN `federation_keys.identity_type` set ⊇ `{user}`
+///      ([`identity_type::USER`]); OR
+///   2. [`FederationDirectory::lookup_identity_for_occurrence`]`(k)`
+///      resolves `k` to an identity whose key is `user`-role (k is a
+///      device/occurrence of a human identity); OR
+///   3. ∃ a live `delegates_to(U → k)` with `U` a `user`-role key (a human
+///      delegated to k) — checked over k's INCOMING attestations
+///      ([`FederationDirectory::list_attestations_for`]).
 ///
-/// Otherwise reject with [`Error::DelegatedScopeUnauthorized`] (stable
-/// `kind()` token `federation_delegated_scope_unauthorized`).
+/// A key whose chain to a `user` identity cannot be shown is NOT
+/// owner-bound and cannot root a moderation duty (fail-closed). Authority
+/// that the `user`-role key genuinely is a human is consumer/registry
+/// policy (§5.6.8.10 normative-honesty); persist resolves it structurally
+/// over the `federation_keys` `identity_type` set + occurrence + delegation
+/// graph that are already present.
+pub async fn is_owner_bound(
+    directory: &dyn super::FederationDirectory,
+    k: &str,
+) -> Result<bool, Error> {
+    // (1) k's own identity_type set contains `user`.
+    if let Some(rec) = directory.lookup_public_key(k).await? {
+        if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
+            return Ok(true);
+        }
+    }
+    // (2) k is an occurrence of a human identity — resolve the identity key
+    //     and check ITS identity_type set for `user`.
+    if let Some(occ) = directory.lookup_identity_for_occurrence(k).await? {
+        if let Some(id_rec) = directory.lookup_public_key(&occ.identity_key_id).await? {
+            if identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
+                return Ok(true);
+            }
+        }
+    }
+    // (3) a live `delegates_to(U → k)` with U user-role. k's INCOMING
+    //     attestations name the granter as `attesting_key_id`.
+    for r in directory.list_attestations_for(k).await? {
+        if r.attestation_type != attestation_type::DELEGATES_TO {
+            continue;
+        }
+        if let Some(granter) = directory.lookup_public_key(&r.attesting_key_id).await? {
+            if identity_type::set_contains(&granter.identity_type, identity_type::USER) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §11.11) — is key `k` a **named
+/// moderator** of community `community_id` for `duty` (`moderate` /
+/// `takedown` / `review`)? True iff a live scope-bearing `delegates_to`
+/// chain `root →* k` exists where:
+///   - every edge bears `duty` scope (the [`MODERATION_DUTY`] walk:
+///     `⊆`-parent attenuation + `sub_delegation`-gated deputization +
+///     depth ≤ 5 + no `withdraws`-revoked edge), AND
+///   - `root ∈ authority_set(community_id)` — the community's founders /
+///     `consensus_protocol` signers (resolved from the
+///     [`Community`](crate::federation::types::Community) record via
+///     [`FederationDirectory::lookup_community`]), AND
+///   - `is_owner_bound(root)`.
 ///
-/// This is the structural form of CIRISRegistry#90's "delegate-signed,
-/// delegator-traceable up the `delegates_to` chain, on the delegator's
-/// behalf, **and only then**". The `scope_token` is the only thing that
-/// varies across the three duties — the scope-isolation property (a
-/// `consent_revocation`-only delegation cannot drive a `takedown`) falls
-/// out of the per-token edge filter in the walk.
-pub async fn check_delegated_duty_admission(
+/// A zero-hop appointment (`root == k`, root directly in the authority set)
+/// is admitted — a founder IS a named moderator of their own community. The
+/// §11.11 merit auto-promotion emits the SAME appointment shape (a
+/// `delegates_to` from a community authority), so this one predicate covers
+/// both the explicit-appointment and merit-promotion cases.
+///
+/// `community_id` is the community's `community_key_id`. Returns `false`
+/// (never errors) when the community is unknown, declares no authority set,
+/// or no owner-bound authority reaches `k` — fail-closed.
+///
+/// [`MODERATION_DUTY`]: DelegationWalkPolicy::MODERATION_DUTY
+pub async fn is_named_moderator(
+    directory: &dyn super::FederationDirectory,
+    k: &str,
+    community_id: &str,
+    duty: &str,
+) -> Result<bool, Error> {
+    let authority = community_authority_set(directory, community_id).await?;
+    let target: std::collections::HashSet<String> = std::iter::once(k.to_owned()).collect();
+    for root in authority {
+        // Owner-binding of the root is REQUIRED (§11.11 → §5.6.8.10).
+        if !is_owner_bound(directory, &root).await? {
+            continue;
+        }
+        // Zero-hop: the owner-bound authority IS the named moderator.
+        if root == k {
+            return Ok(true);
+        }
+        // Walk-down from the authority root to k under the §11.10 policy.
+        if issuer_reaches_target_via_scoped_delegation(
+            directory,
+            &root,
+            &target,
+            duty,
+            MAX_MODERATION_DELEGATION_DEPTH,
+            DelegationWalkPolicy::MODERATION_DUTY,
+        )
+        .await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §11.11) — the **authority set**
+/// of community `community_id`: the keys empowered to appoint moderators.
+/// Per §8.1.13.3 + §5.6.8.9 the community record carries a member roster
+/// (`role`-tagged) and a `consensus_protocol`; the authority set is the
+/// roster members whose `role` marks them a founder / consensus signer:
+///
+///   - For `founder_only` (the default-strict protocol): members tagged
+///     [`MEMBER_ROLE_FOUNDER`].
+///   - For any OTHER `consensus_protocol` (`unanimous` / `majority` /
+///     `quorum:*` / `weighted:*` / `custom:*`): every current member is a
+///     consensus signer — the whole roster is the authority set (persist
+///     does not adjudicate the signature-count threshold here; that is the
+///     appointment ceremony's job — §5.6.8.9 normative-honesty).
+///
+/// Founders are always included regardless of protocol. Returns an empty
+/// set when the community is unknown — fail-closed (no authority ⇒ no named
+/// moderators).
+async fn community_authority_set(
+    directory: &dyn super::FederationDirectory,
+    community_id: &str,
+) -> Result<std::collections::HashSet<String>, Error> {
+    let Some(community) = directory.lookup_community(community_id).await? else {
+        return Ok(std::collections::HashSet::new());
+    };
+    let founder_only =
+        community.consensus_protocol == crate::federation::types::consensus_protocol::FOUNDER_ONLY;
+    let mut out = std::collections::HashSet::new();
+    for m in &community.members {
+        let is_founder = m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER);
+        if is_founder || !founder_only {
+            out.insert(m.key_id.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// v8.7.1 (CIRISPersist#233, CEG §5.6.8.9) — the `role` tag marking a
+/// community/family member as a founder (the §5.6.8.9 open-vocab
+/// `founder` value). Founders are always in the community authority set
+/// regardless of `consensus_protocol`.
+pub const MEMBER_ROLE_FOUNDER: &str = "founder";
+
+/// v8.7.1 (CIRISPersist#233, CEG RC24/RC25 §11.10) — the FULL §11.10
+/// admit-iff gate. Admit the moderation action IFF the `signer`
+/// (`attesting_key_id`) is authorized over the `duty_holders` of the
+/// target:
+///
+///   (a) **as-self** — `signer ∈ duty_holders` (it itself holds the duty
+///       over the target), OR
+///   (b) **delegated** — ∃ `root ∈ duty_holders` that `is_owner_bound`
+///       AND reaches `signer` via a live `duty`-scoped chain under the
+///       [`MODERATION_DUTY`] walk policy (every edge `scope ⊇ {duty}`,
+///       `⊆`-parent attenuation, `sub_delegation`-gated deputization,
+///       depth ≤ 5, no `withdraws`-revoked edge).
+///   else REJECT with [`Error::DelegatedScopeUnauthorized`] (stable
+///   `kind()` token `federation_delegated_scope_unauthorized`).
+///
+/// **Absence is never an admit condition** — `duty_holders` empty ⇒ no
+/// principal holds the duty ⇒ REJECT (the v8.7.0 bypass, closed). The
+/// per-edge scope filter gives the load-bearing scope-isolation property
+/// (a `consent_revocation`-only chain cannot drive a `takedown`).
+///
+/// `duty_holders` is the set of keys that natively hold `duty` over the
+/// specific target (resolved per-primitive by the caller —
+/// [`duty_holders_for_content`] / [`duty_holders_for_community`]). The
+/// error's `on_behalf_of` field carries the target descriptor for audit
+/// (the model no longer has a principal field).
+///
+/// [`MODERATION_DUTY`]: DelegationWalkPolicy::MODERATION_DUTY
+pub async fn check_moderation_admission(
     directory: &dyn super::FederationDirectory,
     signer: &str,
-    on_behalf_of: Option<&str>,
-    scope_token: &str,
+    duty_holders: &std::collections::HashSet<String>,
+    duty: &str,
+    target_descriptor: &str,
 ) -> Result<(), Error> {
-    // Clause (a): as-self. Absent / empty / self-referential principal
-    // is a direct exercise of the duty — no delegation required.
-    let principal = match on_behalf_of {
-        None => return Ok(()),
-        Some(p) if p.is_empty() || p == signer => return Ok(()),
-        Some(p) => p,
-    };
-    // Clause (b): live scoped delegation chain signer →* principal.
-    let mut targets = std::collections::HashSet::new();
-    targets.insert(principal.to_owned());
-    if issuer_reaches_target_via_scoped_delegation(
-        directory,
-        signer,
-        &targets,
-        scope_token,
-        MAX_WITHDRAWS_DELEGATION_DEPTH,
-    )
-    .await?
-    {
+    // (a) as-self: signer itself holds the duty over the target.
+    if duty_holders.contains(signer) {
         return Ok(());
+    }
+    // (b) delegated: an owner-bound duty-holder root reaches signer via a
+    //     live duty-scoped chain (§11.10 attenuation + sub_delegation).
+    let target: std::collections::HashSet<String> = std::iter::once(signer.to_owned()).collect();
+    for root in duty_holders {
+        if !is_owner_bound(directory, root).await? {
+            continue;
+        }
+        if issuer_reaches_target_via_scoped_delegation(
+            directory,
+            root,
+            &target,
+            duty,
+            MAX_MODERATION_DELEGATION_DEPTH,
+            DelegationWalkPolicy::MODERATION_DUTY,
+        )
+        .await?
+        {
+            return Ok(());
+        }
     }
     Err(Error::DelegatedScopeUnauthorized {
         signer: signer.to_string(),
-        on_behalf_of: principal.to_string(),
-        scope: scope_token.to_string(),
+        on_behalf_of: target_descriptor.to_string(),
+        scope: duty.to_string(),
     })
 }
 
-/// v8.7.0 (CIRISPersist#232, CEG §11.10) — `put_attestation` entry point
-/// for the **report → `scores`** half of the delegated-duty gate. A
-/// no-op (`Ok(())`) for any attestation that is not a `scores` row on a
+/// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §11.10) — the duty-holders of a
+/// **content target** (`takedown_notice{content_sha256}` /
+/// `moderation:*` / `reconsideration:*` over content): the content's own
+/// subjects ∪ the named moderators of the content's community.
+///
+///   `duty_holders(content) =
+///        content.subject_key_ids
+///      ∪ { K : is_named_moderator(K, community_id, duty) }`
+///
+/// `subjects` is the content attestation's `subject_key_ids` (the people
+/// the content is ABOUT — a subject may take down content about
+/// themselves). `community_id` is the content's declared community
+/// (empty ⇒ no community moderators, only subjects). The named-moderator
+/// half resolves only the AUTHORITY ROOTS into the holder set — the
+/// per-signer walk-down is then done by [`check_moderation_admission`];
+/// here we materialize the roots (the community authority set, owner-bound)
+/// so a signer who IS a named moderator is admitted as-self.
+pub async fn duty_holders_for_content(
+    directory: &dyn super::FederationDirectory,
+    subjects: &[String],
+    community_id: &str,
+    duty: &str,
+) -> Result<std::collections::HashSet<String>, Error> {
+    let mut holders: std::collections::HashSet<String> = subjects.iter().cloned().collect();
+    holders.extend(named_moderator_holders(directory, community_id, duty).await?);
+    Ok(holders)
+}
+
+/// v8.7.1 (CIRISPersist#233, CEG §11.10) — the duty-holders of a
+/// **community-scoped action** with no content subject (a bare
+/// `moderation:*` / `reconsideration:*` over a community): the named
+/// moderators of that community for `duty`.
+pub async fn duty_holders_for_community(
+    directory: &dyn super::FederationDirectory,
+    community_id: &str,
+    duty: &str,
+) -> Result<std::collections::HashSet<String>, Error> {
+    named_moderator_holders(directory, community_id, duty).await
+}
+
+/// Materialize the named-moderator AUTHORITY ROOTS for `community_id` /
+/// `duty` into the duty-holder set: each owner-bound member of the
+/// community authority set. (The full `is_named_moderator` relation —
+/// including delegates reached from these roots — is then enforced by
+/// [`check_moderation_admission`]'s per-signer walk-down rooted at these
+/// holders.) Empty community / no owner-bound authority ⇒ empty set.
+async fn named_moderator_holders(
+    directory: &dyn super::FederationDirectory,
+    community_id: &str,
+    _duty: &str,
+) -> Result<std::collections::HashSet<String>, Error> {
+    if community_id.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let authority = community_authority_set(directory, community_id).await?;
+    let mut holders = std::collections::HashSet::new();
+    for root in authority {
+        if is_owner_bound(directory, &root).await? {
+            holders.insert(root);
+        }
+    }
+    Ok(holders)
+}
+
+/// v8.7.1 (CIRISPersist#233, CEG RC24/RC25 §11.10) — `put_attestation`
+/// entry point for the **report → `scores`** half of the moderation gate.
+/// A no-op (`Ok(())`) for any attestation that is not a `scores` row on a
 /// `moderation:*` or `reconsideration:*` dimension; for those it resolves
-/// the governing scope (`moderate` / `review`) and runs
-/// [`check_delegated_duty_admission`] with the row's `attesting_key_id`
-/// as the signer and the envelope's `on_behalf_of` as the principal.
+/// the governing duty (`moderate` / `review`), computes the target's
+/// duty-holders from the row's `subject_key_ids` + the envelope
+/// `community_id`, and runs [`check_moderation_admission`] with the row's
+/// `attesting_key_id` as the signer.
 ///
 /// Verify-before-mutation (AV-9): runs alongside `check_withdraws_admission`
 /// BEFORE the row is hashed + INSERTed — a rejected emission leaves no
@@ -1620,19 +1993,28 @@ pub async fn check_delegated_duty_scores_admission(
     let Some(dimension) = envelope_dimension(&row.attestation_envelope) else {
         return Ok(());
     };
-    let scope_token = if dimension.starts_with(MODERATION_DIMENSION_PREFIX) {
+    let duty = if dimension.starts_with(MODERATION_DIMENSION_PREFIX) {
         DELEGATION_SCOPE_MODERATE
     } else if dimension.starts_with(RECONSIDERATION_DIMENSION_PREFIX) {
         DELEGATION_SCOPE_REVIEW
     } else {
         return Ok(());
     };
-    let on_behalf_of = row
+    let community_id = row
         .attestation_envelope
-        .get(DELEGATED_DUTY_ON_BEHALF_OF_FIELD)
-        .and_then(|v| v.as_str());
-    check_delegated_duty_admission(directory, &row.attesting_key_id, on_behalf_of, scope_token)
-        .await
+        .get("community_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let duty_holders =
+        duty_holders_for_content(directory, &row.subject_key_ids, community_id, duty).await?;
+    check_moderation_admission(
+        directory,
+        &row.attesting_key_id,
+        &duty_holders,
+        duty,
+        dimension,
+    )
+    .await
 }
 
 #[cfg(test)]
