@@ -65,7 +65,7 @@ def main() -> None:
     )
     stamp("post_engine")
 
-    kid = engine.register_federation_key("agent", "ref", None, None, None)
+    kid = engine.register_self_federation_key("agent", "ref", None, None, None)
     stamp("post_register_key")
 
     edge = init_edge_runtime(engine, idp, listen_addr="127.0.0.1:0")

@@ -289,14 +289,61 @@ class Engine:
 
     def register_federation_key(
         self,
+        signed_key_record_json: str,
+    ) -> None:
+        """v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the
+        **canonical federation-key registration admission gate**. FFI
+        mirror of the Rust `Engine.register_federation_key`.
+
+        `signed_key_record_json` is the same `SignedKeyRecord` JSON shape
+        `put_public_key` takes. Unlike `put_public_key`, this runs the
+        §5.6.8.15 gate FIRST: hybrid-verify (Ed25519 + ML-DSA-65,
+        Strict) the scrub signature over
+        `ceg_produce_canonicalize(registration_envelope)` against
+        `scrub_key_id`'s pubkeys, then `put_public_key` (which keeps its
+        accord_holder + algorithm gates). ANY verification failure ⇒ the
+        row is NOT stored (fail-secure). Because the gate is Strict, a
+        hybrid-pending (Ed25519-only) record is rejected — use
+        `put_public_key` for the soft-PQC write window.
+
+        NOTE (v8.8.0 breaking rename): in v1.5.3–v8.7.x this name was the
+        self-registration convenience helper (build + sign THIS engine's
+        own key); that helper is now `register_self_federation_key`. This
+        name now belongs to the canonical admission gate so it is
+        symmetric with the Rust API.
+
+        Raises:
+            ValueError: SignedKeyRecord JSON decode failure, or a
+                federation verification/admission error (bad/missing
+                signature, hash mismatch, unknown signer, non-hybrid).
+            RuntimeError: backend / IO error.
+        """
+
+    def deregister_federation_key(
+        self,
+        signed_revocation_json: str,
+    ) -> None:
+        """v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the
+        symmetric **deregister** path: the revocation teeth a withdrawn
+        `consent:replication` relies on. FFI mirror of the Rust
+        `Engine.deregister_federation_key`; a thin alias over the
+        existing `put_revocation` store path (same `SignedRevocation`
+        JSON shape, same trust / region / anti-rollback gates). A
+        consumer then ceases admitting the deregistered peer's rows on
+        read (`revocations_for` + the key's `valid_until`).
+        """
+
+    def register_self_federation_key(
+        self,
         identity_type: str,
         identity_ref: str,
         valid_until: str | None = None,
         registration_envelope_json: str | None = None,
         roles: list[str] | None = None,
     ) -> str:
-        """v1.5.3 — One-call helper that registers THIS engine's local
-        pubkey in the **federation directory** (`federation_keys`).
+        """v1.5.3 (renamed from `register_federation_key` in v8.8.0) —
+        One-call helper that registers THIS engine's local pubkey in the
+        **federation directory** (`federation_keys`).
 
         Composes the existing canonicalize + sign + put_public_key
         primitives so callers don't re-implement persist's canonical-bytes

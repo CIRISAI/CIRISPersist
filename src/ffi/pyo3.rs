@@ -3240,6 +3240,83 @@ impl PyEngine {
         })
     }
 
+    /// v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the
+    /// **canonical federation-key registration admission gate** over
+    /// FFI. JSON-over-FFI mirror of
+    /// [`Engine::register_federation_key`](crate::engine::Engine::register_federation_key);
+    /// the primary consumers are Rust, this is the parity surface.
+    ///
+    /// `signed_key_record_json` is the same `SignedKeyRecord` JSON
+    /// shape `put_public_key` takes. Unlike `put_public_key`, this
+    /// runs the §5.6.8.15 gate FIRST:
+    /// hybrid-verify (Ed25519 + ML-DSA-65, `Strict`) the scrub
+    /// signature over `ceg_produce_canonicalize(registration_envelope)`
+    /// against `scrub_key_id`'s pubkeys, then `put_public_key` (which
+    /// keeps its accord_holder + algorithm gates). ANY verification
+    /// failure ⇒ the row is NOT stored (fail-secure). Because the gate
+    /// is `Strict`, a hybrid-pending (Ed25519-only) record is rejected
+    /// — registration requires the full hybrid signature already
+    /// present, so there is no cold-path PQC fill-in here (use
+    /// `put_public_key` for the soft-PQC write window).
+    ///
+    /// This takes a caller-assembled, already-hybrid-signed
+    /// `SignedKeyRecord` and runs the §5.6.8.15 admission gate over it
+    /// — the FFI mirror of the canonical Rust
+    /// `Engine::register_federation_key` (Rust↔FFI symmetric). The
+    /// v1.5.3 convenience helper that builds + signs THIS engine's own
+    /// key from scratch is now `register_self_federation_key` (renamed
+    /// in v8.8.0 so this canonical admission gate can own the canonical
+    /// name).
+    fn register_federation_key(
+        &self,
+        py: Python<'_>,
+        signed_key_record_json: &str,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let record: crate::federation::SignedKeyRecord =
+                serde_json::from_str(signed_key_record_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
+                })?;
+            py.detach(|| match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        crate::federation::verify_key_registration(
+                            backend.as_ref(),
+                            &record.record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
+                        backend
+                            .put_public_key(record)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        crate::federation::verify_key_registration(
+                            backend.as_ref(),
+                            &record.record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
+                        backend
+                            .put_public_key(record)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     /// v1.5.3 — One-call helper that registers THIS engine's local
     /// pubkey as a `federation_keys` row of the specified
     /// `identity_type`. Composes the existing primitives
@@ -3277,7 +3354,7 @@ impl PyEngine {
     /// - `RuntimeError` for backend errors (pool, conflict, etc.).
     #[pyo3(signature = (identity_type, identity_ref, valid_until = None,
                         registration_envelope_json = None, roles = None))]
-    fn register_federation_key(
+    fn register_self_federation_key(
         &self,
         py: Python<'_>,
         identity_type: &str,
@@ -3953,6 +4030,23 @@ impl PyEngine {
                 }
             })
         })
+    }
+
+    /// v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the
+    /// symmetric **deregister** path over FFI. JSON-over-FFI mirror of
+    /// [`Engine::deregister_federation_key`](crate::engine::Engine::deregister_federation_key):
+    /// the revocation teeth a withdrawn `consent:replication` relies
+    /// on. Thin alias over the existing `put_revocation` store path
+    /// (same `SignedRevocation` JSON shape, same trust / region /
+    /// anti-rollback gates); composing the existing revocation
+    /// substrate rather than inventing a parallel one. A consumer then
+    /// ceases admitting the deregistered peer's rows on read.
+    fn deregister_federation_key(
+        &self,
+        py: Python<'_>,
+        signed_revocation_json: &str,
+    ) -> PyResult<()> {
+        self.put_revocation(py, signed_revocation_json)
     }
 
     /// Federation directory: list revocations targeting `revoked_key_id`.

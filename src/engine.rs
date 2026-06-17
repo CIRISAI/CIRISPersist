@@ -2599,6 +2599,83 @@ impl Engine {
         }
     }
 
+    /// v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the
+    /// **single canonical federation-key registration admission gate**.
+    ///
+    /// §5.6.8.15 (`consent:replication`) pins the normative-honesty
+    /// layering for out-of-group peering: the substrate gate that lets
+    /// peer **P**'s corpus admit granting node **G**'s replicated rows
+    /// is **G's key existing in P's `federation_keys`** (registration),
+    /// plus the §7 reserved-prefix identity rules — *not* the
+    /// `consent:replication` attestation (that is the auditable,
+    /// revocable governance record of intent, and stays CEG-side). So
+    /// the load-bearing security check for every peering is this one
+    /// operation. This method is the one canonical implementation
+    /// CIRISServer / CIRISStatus call rather than re-derive (the DRY
+    /// fix; previously `src/peer.rs` and `src/ceg.rs` reached the gate
+    /// from two sides independently).
+    ///
+    /// Order (fail-secure — BEFORE any store):
+    /// 1. [`verify_key_registration`](crate::federation::verify_key_registration)
+    ///    — hybrid-verify (Ed25519 + ML-DSA-65, `Strict`) the scrub
+    ///    signature over `ceg_produce_canonicalize(registration_envelope)`
+    ///    against **`scrub_key_id`'s** pubkeys (self-attested
+    ///    proof-of-possession when `scrub_key_id == key_id`; resolved
+    ///    from the directory for a granting-authority signature),
+    ///    cross-checking `original_content_hash`. ANY failure ⇒ typed
+    ///    [`Error`](crate::federation::Error) and the row is NOT stored.
+    /// 2. On success ⇒ [`put_public_key`](crate::federation::FederationDirectory::put_public_key),
+    ///    which keeps its own `accord_holder` hardware-attestation gate
+    ///    (§7.2 / §9.1) and `algorithm == hybrid` check — this method
+    ///    composes them, it does not weaken or duplicate them.
+    ///
+    /// Unknown / unverified ⇒ not registered ⇒ that peer's replicated
+    /// rows are not admitted. That is the whole point of §5.6.8.15.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn register_federation_key(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<(), crate::federation::Error> {
+        let directory = self.federation_directory();
+        // Verify BEFORE store. A reject returns here and never reaches
+        // put_public_key, so a rejected registration leaves no trace.
+        crate::federation::verify_key_registration(directory.as_ref(), &record.record).await?;
+        // Verified — store. put_public_key re-applies the accord_holder
+        // hardware-attestation gate + algorithm check + persist_row_hash
+        // + idempotent insert; we deliberately keep those there.
+        directory.put_public_key(record).await
+    }
+
+    /// v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the
+    /// symmetric **deregister** path: the revocation teeth a withdrawn
+    /// `consent:replication` relies on.
+    ///
+    /// §5.6.8.15 revocation (normative): on revoke, the granting node
+    /// MUST cease replicating the named prefixes **and SHOULD
+    /// deregister/expire P's directory authorization** — admission is
+    /// key-rooted, so revocation has teeth only if the directory
+    /// authorization is withdrawn here. This composes the existing
+    /// revocation substrate
+    /// ([`put_revocation`](crate::federation::FederationDirectory::put_revocation));
+    /// it does NOT invent a parallel shape. A consumer applying its
+    /// revocation policy on read (`revocations_for` + the row's
+    /// `valid_until`) then ceases admitting the deregistered peer's
+    /// rows.
+    ///
+    /// The submitted [`SignedRevocation`](crate::federation::SignedRevocation)
+    /// is the same signed-row shape the directory already stores; the
+    /// store path keeps its trust gate, region closed-set check, and
+    /// anti-rollback monotonicity. (Time-boxed peering — a key's
+    /// `valid_until` lapsing — needs no call here: it is honored on
+    /// read by the consumer's freshness policy.)
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn deregister_federation_key(
+        &self,
+        revocation: crate::federation::SignedRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        self.federation_directory().put_revocation(revocation).await
+    }
+
     /// v3.2.0 (CIRISPersist#120) — Rust-tier accessor returning an
     /// `Arc<dyn BlackholeRules>` over the Engine's underlying backend.
     ///

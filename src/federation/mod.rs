@@ -53,6 +53,13 @@ pub mod perceptual_hash;
 pub mod precedence;
 #[cfg(feature = "cirisaudit")]
 pub mod read;
+// v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the single
+// canonical federation-key registration admission gate (hybrid-verify
+// the registration + §7 reserved-prefix identity rules + fail-secure).
+// DRYs the out-of-group peering gate that CIRISServer/CIRISStatus
+// previously re-derived; `consent:replication` stays CEG-side
+// governance.
+pub mod register;
 pub mod replication;
 pub mod rooting;
 pub mod schema_resolver;
@@ -136,6 +143,7 @@ pub use perceptual_hash::{
     HashDatabaseId, HashMatchError, HashMatchResult, MatcherUnreachablePolicy,
     NullPerceptualHashMatcher, OnMatchPolicy, PerceptualHashMatcher, SharedMatcher,
 };
+pub use register::verify_key_registration;
 pub use replication::{
     aggregate_trust_score, classify_free_bytes, parse_human_bytes, withdraws_attestation_envelope,
     AdmissionGate, ByteParseError, CacheMode, DiskPressureConfig, DiskPressureMonitor,
