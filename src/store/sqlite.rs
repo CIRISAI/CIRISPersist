@@ -2106,7 +2106,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // leaves no trace.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
-        // v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — reject-agency-
+        // v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
         // on-node-key gate (parity with the postgres + memory backends). A
         // no-op for non-`delegates_to` rows; for a `delegates_to` whose
         // recipient (`attested_key_id`) resolves to a node-ONLY identity it
@@ -22705,7 +22705,7 @@ mod tests {
         assert!(e.withdrawn_by.is_none());
     }
 
-    // ── #236 CC 4.4.3.5 / CC 1.13.5 — reject-agency-on-node-key gate ───
+    // ── #236 CC 4.4.3.4.3 / CC 1.13.5 — reject-agency-on-node-key gate ───
 
     /// Build a `delegates_to` row carrying a scope SET (array wire shape)
     /// from `attesting` → `attested`. Mirrors the gate's array acceptance.

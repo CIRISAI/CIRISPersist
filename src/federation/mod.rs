@@ -2361,7 +2361,7 @@ pub enum Error {
         scope: String,
     },
 
-    /// v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5). A `delegates_to`
+    /// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5). A `delegates_to`
     /// was REFUSED because its `attested_key_id` resolves to a `node`-only
     /// [`crate::federation::types::identity_type::NODE`] identity but the
     /// delegation carries a scope that is NOT `infra:*` — i.e. an
@@ -2379,7 +2379,7 @@ pub enum Error {
     #[error(
         "delegates_to to node-only key {attested_key_id:?} carries non-infra scope(s) \
          {offending_scopes:?}: a node-role delegate may carry ONLY infra:* scopes \
-         (CC 4.4.3.5 / CC 1.13.5 — infrastructure must not have agency)"
+         (CC 4.4.3.4.3 / CC 1.13.5 — infrastructure must not have agency)"
     )]
     NodeAgencyForbidden {
         /// The `attested_key_id` (recipient) that resolved to `node`-only.

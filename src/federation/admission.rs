@@ -1205,7 +1205,7 @@ fn delegation_scope_set(envelope: &serde_json::Value) -> std::collections::HashS
     }
 }
 
-/// v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — the CC 1.13.5
+/// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the CC 1.13.5
 /// verifier: is `scopes` a delegation scope set a pure `node`-role
 /// delegate is allowed to carry?
 ///
@@ -2161,7 +2161,7 @@ pub async fn check_delegated_duty_scores_admission(
     .await
 }
 
-/// v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — the
+/// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the
 /// reject-agency-on-node-key gate: the `put_attestation` entry point that
 /// makes "infrastructure must not have agency" cryptographically enforced.
 ///
@@ -2174,7 +2174,7 @@ pub async fn check_delegated_duty_scores_admission(
 /// not a `{node,agent}` hybrid). For such a node-only recipient the
 /// delegation's [`delegation_scope_set`] MUST satisfy
 /// [`scopes_are_infra_only`]; otherwise the row is REJECTED with
-/// [`Error::NodeAgencyForbidden`] (CC 4.4.3.5) and never stored.
+/// [`Error::NodeAgencyForbidden`] (CC 4.4.3.4.3) and never stored.
 ///
 /// # Unresolved / non-node recipients (design decision)
 ///
@@ -2997,7 +2997,7 @@ mod tests {
         assert!(scopes_are_infra_only(&scope_set(&[ds::INFRA_SERVE])));
         assert!(scopes_are_infra_only(&scope_set(&[
             ds::INFRA_NETWORK_PRESENCE,
-            ds::INFRA_MEMBERSHIP,
+            ds::INFRA_JOIN_COMMUNITIES,
             ds::INFRA_SERVE,
             ds::INFRA_STORE,
             ds::INFRA_TRANSPORT,

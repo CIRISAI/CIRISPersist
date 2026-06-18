@@ -20689,7 +20689,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // as-self nor a live scoped delegation) is caller-side
         // authorization failure; ValueError (4xx).
         crate::federation::Error::DelegatedScopeUnauthorized { .. } => PyValueError::new_err(kind),
-        // v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — a refused
+        // v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — a refused
         // `delegates_to` carrying agency (or any non-infra scope) to a
         // node-only key is caller-side authorization failure; ValueError
         // (4xx). "Infrastructure must not have agency."

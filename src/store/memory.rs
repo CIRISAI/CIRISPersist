@@ -1063,7 +1063,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // calls list_attestations_by on self).
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
-        // v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — reject-agency-
+        // v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
         // on-node-key gate. A no-op for non-`delegates_to` rows; for a
         // `delegates_to` whose recipient (`attested_key_id`) resolves to a
         // node-ONLY identity it REJECTS any scope set that is not
@@ -4028,7 +4028,7 @@ mod tests {
         }
     }
 
-    // ── #236 CC 4.4.3.5 / CC 1.13.5 — reject-agency-on-node-key gate ───
+    // ── #236 CC 4.4.3.4.3 / CC 1.13.5 — reject-agency-on-node-key gate ───
 
     /// Build a `delegates_to` row from `attesting` to `attested` carrying
     /// the given scope set (array wire shape). Re-uses `fix_attestation`

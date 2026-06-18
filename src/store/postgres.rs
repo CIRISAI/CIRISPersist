@@ -2405,7 +2405,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // leaves no trace.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
-        // v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — reject-agency-
+        // v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
         // on-node-key gate (parity with the sqlite + memory backends). A
         // no-op for non-`delegates_to` rows; for a `delegates_to` whose
         // recipient (`attested_key_id`) resolves to a node-ONLY identity it
@@ -19008,7 +19008,7 @@ mod tests {
         a
     }
 
-    /// v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — reject-agency-
+    /// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
     /// on-node-key gate, PG backend (3-backend parity with memory +
     /// sqlite). Covers (a) infra-only → ADMITTED, (b) agency:* → REJECTED
     /// + not stored, (b') legacy unprefixed agency → REJECTED, (c) empty
