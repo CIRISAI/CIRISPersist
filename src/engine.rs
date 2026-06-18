@@ -3501,6 +3501,13 @@ pub enum EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The top-level `SigningKey` users are all under a backend cfg
+    // (sqlite `test_signer_no_pqc`/`with_signer_*`; `any(sqlite,postgres)`
+    // `pqc_signer`/`self_login_signer`). Gate the import to that union so
+    // the no-backend `--features server` build (`-D warnings`) doesn't see
+    // it as unused, while postgres-only / pyo3+postgres builds (the
+    // pre-push hook is `postgres,pyo3,server`) still have it.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     use ed25519_dalek::SigningKey;
 
     fn test_signer() -> Arc<LocalSigner> {
@@ -3517,6 +3524,12 @@ mod tests {
     /// the `PqcNotConfigured` / hybrid-unavailable paths. (The default
     /// `test_signer` is PQC-configured as of v9.0.0 so the eviction
     /// sweeper can hybrid-sign federation-tier withdraws.)
+    ///
+    /// Gated to `sqlite` — its only callers are the `#[cfg(feature =
+    /// "sqlite")]` `sign_hybrid_*` tests; without this gate it is dead
+    /// code under the no-backend `--features server` CI build (which runs
+    /// `-D warnings`), which is what broke the v9.0.0 darwin-aarch64 job.
+    #[cfg(feature = "sqlite")]
     fn test_signer_no_pqc() -> Arc<LocalSigner> {
         Arc::new(LocalSigner::from_parts(
             SigningKey::from_bytes(&[0x7Au8; 32]),
@@ -4450,6 +4463,9 @@ mod tests {
 
         // Migrations ran: a directory read hits a live table (Ok(None)),
         // not a "no such table" error — the differentiator from from_shared.
+        // (Irrefutable under a sqlite-only build where Sqlite is the sole
+        // BackendDispatch variant; refutable with other backends compiled.)
+        #[allow(irrefutable_let_patterns)]
         if let BackendDispatch::Sqlite(b) = engine.backend() {
             let found = crate::federation::FederationDirectory::lookup_public_key(
                 b.as_ref(),
@@ -4483,7 +4499,10 @@ mod tests {
     /// test-available `HardwareSigner` whose `algorithm()` is Ed25519;
     /// production passes a real sealed signer from
     /// `ciris_keyring::get_platform_signer`.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    // Gated to `sqlite` — all callers are the sqlite-only hardware-signer
+    // tests; the broader `any(sqlite,postgres)` gate left it dead under
+    // no-sqlite `-D warnings` builds (postgres,pyo3,server / pyo3,server).
+    #[cfg(feature = "sqlite")]
     fn hw_classical(alias: &str) -> Arc<dyn HardwareSigner> {
         let seed = [0x24u8; 32];
         Arc::new(
@@ -4493,7 +4512,11 @@ mod tests {
     }
 
     /// Fixture: an ML-DSA-65 `PqcSigner` (software) for the PQC half.
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    /// Gated to `sqlite` — both callers (`with_hardware_signer_hybrid_*`,
+    /// `hardware_hybrid_engine_*`) are `#[cfg(feature = "sqlite")]`; the
+    /// broader `any(sqlite,postgres)` gate left it dead under the
+    /// `postgres,pyo3,server` build (`-D warnings`).
+    #[cfg(feature = "sqlite")]
     fn pqc_half() -> Arc<dyn ciris_keyring::PqcSigner> {
         Arc::new(
             ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&[0x71u8; 32], "hw-hybrid-pqc")
