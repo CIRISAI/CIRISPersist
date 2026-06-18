@@ -2645,6 +2645,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
         )
         .await?;
+        // v9.0.0 (CC 3.2 / CC 3.4.7.1) — owner-binding precondition for
+        // non-infrastructure community membership. Directory reads run
+        // before the write lock below. No-op for infrastructure
+        // communities and for rosters with no node/agent members.
+        crate::federation::admission::check_community_membership_owner_binding(self, &row).await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let members_json = serde_json::to_string(&row.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
@@ -22878,6 +22883,169 @@ mod tests {
                 .unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].attestation_id, id);
+    }
+
+    // ── v9.0.0 (CC 3.2 / CC 3.4.7.1) — owner-binding precondition for
+    // non-infrastructure community membership (sqlite parity).
+
+    /// Seed the community's own key + submit a community with `members`
+    /// and optional `cohort_subkind` in policy_blob.
+    async fn put_community_ob_sqlite(
+        backend: &SqliteBackend,
+        community_id: &str,
+        members: Vec<&str>,
+        cohort_subkind: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key(community_id, community_id, community_id),
+            })
+            .await
+            .unwrap();
+        let policy = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: fed_community(
+                    community_id,
+                    "ob-test",
+                    members,
+                    crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                    policy,
+                ),
+            })
+            .await
+    }
+
+    /// UNOWNED node member of a non-infra community → REJECTED + not stored.
+    #[tokio::test]
+    async fn community_unowned_node_member_rejected_sqlite() {
+        let backend = bootstrap_node_agency_sqlite().await;
+        let err = put_community_ob_sqlite(&backend, "comm-ob-1", vec!["node-key"], None)
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::UnownedCommunityMember {
+                ref community_key_id,
+                ref member_key_id,
+                member_role,
+            } => {
+                assert_eq!(community_key_id, "comm-ob-1");
+                assert_eq!(member_key_id, "node-key");
+                assert_eq!(member_role, crate::federation::types::identity_type::NODE);
+            }
+            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+        }
+        assert_eq!(err.kind(), "federation_unowned_community_member");
+        assert!(backend
+            .lookup_community("comm-ob-1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// UNOWNED agent member → REJECTED (role reported as `agent`).
+    #[tokio::test]
+    async fn community_unowned_agent_member_rejected_sqlite() {
+        let backend = bootstrap_node_agency_sqlite().await;
+        let err = put_community_ob_sqlite(&backend, "comm-ob-2", vec!["agent-key"], None)
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::UnownedCommunityMember { member_role, .. } => {
+                assert_eq!(member_role, crate::federation::types::identity_type::AGENT);
+            }
+            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+        }
+        assert!(backend
+            .lookup_community("comm-ob-2")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// OWNER-BOUND node member (live `delegates_to(user → node, infra:*)`)
+    /// → ADMITTED.
+    #[tokio::test]
+    async fn community_owner_bound_node_member_admitted_sqlite() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = bootstrap_node_agency_sqlite().await;
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: node_delegates_to_sqlite(
+                    "owner",
+                    "node-key",
+                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                ),
+            })
+            .await
+            .unwrap();
+        put_community_ob_sqlite(&backend, "comm-ob-3", vec!["node-key"], None)
+            .await
+            .expect("owner-bound node admitted");
+        assert!(backend
+            .lookup_community("comm-ob-3")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// OWNER-BOUND agent member (live `delegates_to(user → agent)`) →
+    /// ADMITTED.
+    #[tokio::test]
+    async fn community_owner_bound_agent_member_admitted_sqlite() {
+        let backend = bootstrap_node_agency_sqlite().await;
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: delegates_to(
+                    "ob-d-agent",
+                    "owner",
+                    "agent-key",
+                    serde_json::json!(["share"]),
+                ),
+            })
+            .await
+            .unwrap();
+        put_community_ob_sqlite(&backend, "comm-ob-4", vec!["agent-key"], None)
+            .await
+            .expect("owner-bound agent admitted");
+        assert!(backend
+            .lookup_community("comm-ob-4")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// `cohort_subkind: infrastructure` → UNOWNED node admitted (carve-out).
+    #[tokio::test]
+    async fn community_infrastructure_exempts_unowned_node_sqlite() {
+        let backend = bootstrap_node_agency_sqlite().await;
+        put_community_ob_sqlite(
+            &backend,
+            "comm-ob-infra",
+            vec!["node-key"],
+            Some("infrastructure"),
+        )
+        .await
+        .expect("infrastructure community exempt");
+        assert!(backend
+            .lookup_community("comm-ob-infra")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// Pure `user`-role member → NOT over-rejected (trivially owner-bound).
+    #[tokio::test]
+    async fn community_user_member_not_over_rejected_sqlite() {
+        let backend = bootstrap_node_agency_sqlite().await;
+        put_community_ob_sqlite(&backend, "comm-ob-user", vec!["owner"], None)
+            .await
+            .expect("user member admitted");
+        assert!(backend
+            .lookup_community("comm-ob-user")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     /// #104 — delegates_to_graph BFS respects cycles + depth bound.

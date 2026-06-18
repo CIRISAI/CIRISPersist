@@ -2435,6 +2435,40 @@ pub enum Error {
         reason: String,
     },
 
+    /// v9.0.0 (CC 3.4.7.1 / CC 3.2). A `community` admission was REFUSED
+    /// because one of its roster members resolves to a `node`- or
+    /// `agent`-role identity ([`crate::federation::types::identity_type`])
+    /// that is **not owner-bound** — there is no live, unrevoked path from
+    /// the member key to a `user`-role identity
+    /// ([`admission::is_owner_bound`]). Per the CC 3.2 "owner-binding gate
+    /// for non-infrastructure membership", non-infra community membership
+    /// is an authority act that MUST root in an accountable human; a fresh,
+    /// unowned node/agent is canonical-trust-and-serve only. The gate is a
+    /// **precondition** to (not a substitute for) the community's own
+    /// `consensus_protocol` vote. `cohort_subkind: infrastructure`
+    /// communities are EXEMPT (trust + serve needs no owner). The row is
+    /// NOT stored (verify-before-mutation, AV-9). Distinct from
+    /// [`Error::InvalidArgument`] so consumers can pattern-match the
+    /// rejection deterministically (stable `kind()` token
+    /// `federation_unowned_community_member`). See
+    /// [`admission::check_community_membership_owner_binding`].
+    #[error(
+        "community {community_key_id:?} cannot admit member {member_key_id:?}: a {member_role} \
+         key MUST be owner-bound (a live delegates_to/identity_occurrence path to a user-role \
+         identity) before admission to a non-infrastructure community \
+         (CC 3.2 / CC 3.4.7.1 — non-infra membership is an authority act)"
+    )]
+    UnownedCommunityMember {
+        /// The community's `community_key_id` whose admission was refused.
+        community_key_id: String,
+        /// The roster member key that resolved to node/agent without a
+        /// live owner-binding.
+        member_key_id: String,
+        /// The offending role token (`node` or `agent`) — whichever was
+        /// present in the member's `identity_type` set.
+        member_role: &'static str,
+    },
+
     /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228 item 1 / #229 item 1)
     /// — a WholenessWitness was REJECTED at the verify-before-persist
     /// gate: the §19.0 PQC-mandatory hard cut (classical-only / missing
@@ -2496,6 +2530,7 @@ impl Error {
             Error::WithdrawsNotAdmitted { .. } => "federation_withdraws_not_admitted",
             Error::DelegatedScopeUnauthorized { .. } => "federation_delegated_scope_unauthorized",
             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
+            Error::UnownedCommunityMember { .. } => "federation_unowned_community_member",
             Error::FederationTierUnverified { .. } => "federation_federation_tier_unverified",
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",

@@ -1476,6 +1476,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             chrono::Utc::now(),
         )
         .await?;
+        // v9.0.0 (CC 3.2 / CC 3.4.7.1) — owner-binding precondition for
+        // non-infrastructure community membership. Resolves member
+        // identity_type + owner-binding via the directory (locks state
+        // itself), so it MUST run before the state lock below to avoid a
+        // re-entrant deadlock. No-op for infrastructure communities and
+        // for rosters with no node/agent members.
+        crate::federation::admission::check_community_membership_owner_binding(self, &row).await?;
         let mut state = self.state.lock().expect("memory backend lock");
         if !state.federation_keys.contains_key(&row.community_key_id) {
             return Err(crate::federation::Error::InvalidArgument(format!(
@@ -6066,6 +6073,221 @@ mod tests {
             "federation_delegated_scope_unauthorized",
             "(f) child scope-set must be ⊆ parent scope-set"
         );
+    }
+
+    // ── v9.0.0 (CC 3.2 / CC 3.4.7.1) — owner-binding precondition for
+    // non-infrastructure community membership (memory backend; 3-backend
+    // parity with sqlite + postgres). A node/agent roster member of a
+    // non-infra community MUST be owner-bound; infra communities + pure
+    // user/canonical participation are not over-rejected.
+
+    /// Submit a community `community_id` (its own key seeded) with the
+    /// given roster + optional `cohort_subkind` in policy_blob.
+    async fn put_community_with(
+        backend: &MemoryBackend,
+        community_id: &str,
+        members: Vec<crate::federation::types::CommunityMember>,
+        cohort_subkind: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key(community_id, "primitive", community_id),
+            })
+            .await
+            .unwrap();
+        let policy_blob = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: crate::federation::types::Community {
+                    community_key_id: community_id.into(),
+                    community_name: "ob-test".into(),
+                    members,
+                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
+                        .into(),
+                    policy_blob,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+    }
+
+    fn member(key_id: &str) -> crate::federation::types::CommunityMember {
+        crate::federation::types::CommunityMember {
+            key_id: key_id.into(),
+            joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            role: Some("member".into()),
+        }
+    }
+
+    /// Register a `user`-role key, a node-only key, and an agent key.
+    async fn seed_ob_keys(backend: &MemoryBackend) {
+        let mut owner = fix_key("ob-owner", "owner", "ob-owner");
+        owner.identity_type = crate::federation::types::identity_type::USER.into();
+        backend
+            .put_public_key(SignedKeyRecord { record: owner })
+            .await
+            .unwrap();
+        let mut node = fix_key("ob-node", "node", "ob-node");
+        node.identity_type = crate::federation::types::identity_type::NODE.into();
+        backend
+            .put_public_key(SignedKeyRecord { record: node })
+            .await
+            .unwrap();
+        let mut agent = fix_key("ob-agent", "agent", "ob-agent");
+        agent.identity_type = crate::federation::types::identity_type::AGENT.into();
+        backend
+            .put_public_key(SignedKeyRecord { record: agent })
+            .await
+            .unwrap();
+    }
+
+    /// An UNOWNED node member of a non-infra community → REJECTED + not
+    /// stored (the load-bearing CC 3.2 gate).
+    #[tokio::test]
+    async fn community_unowned_node_member_rejected() {
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        let err = put_community_with(&backend, "comm-ob-1", vec![member("ob-node")], None)
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::UnownedCommunityMember {
+                ref community_key_id,
+                ref member_key_id,
+                member_role,
+            } => {
+                assert_eq!(community_key_id, "comm-ob-1");
+                assert_eq!(member_key_id, "ob-node");
+                assert_eq!(member_role, crate::federation::types::identity_type::NODE);
+            }
+            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+        }
+        assert_eq!(err.kind(), "federation_unowned_community_member");
+        // Verify-before-mutation: nothing stored.
+        assert!(backend
+            .lookup_community("comm-ob-1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// An UNOWNED agent member → REJECTED (role reported as `agent`).
+    #[tokio::test]
+    async fn community_unowned_agent_member_rejected() {
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        let err = put_community_with(&backend, "comm-ob-2", vec![member("ob-agent")], None)
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::UnownedCommunityMember { member_role, .. } => {
+                assert_eq!(member_role, crate::federation::types::identity_type::AGENT);
+            }
+            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+        }
+        assert!(backend
+            .lookup_community("comm-ob-2")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// An OWNER-BOUND node member (live `delegates_to(user → node, infra:*)`)
+    /// → ADMITTED. The infra-only scope both stores the delegation (past
+    /// the node-agency gate) and satisfies `is_owner_bound` clause (3).
+    #[tokio::test]
+    async fn community_owner_bound_node_member_admitted() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        // owner (user) delegates infra:* to the node → owner-binding.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "ob-d-node",
+                    "ob-owner",
+                    "ob-node",
+                    "ob-owner",
+                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                ),
+            })
+            .await
+            .unwrap();
+        put_community_with(&backend, "comm-ob-3", vec![member("ob-node")], None)
+            .await
+            .expect("owner-bound node admitted");
+        assert!(backend
+            .lookup_community("comm-ob-3")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// An OWNER-BOUND agent member (live `delegates_to(user → agent)`) →
+    /// ADMITTED. Agent is not node-only, so the delegation needs no infra
+    /// scope to store.
+    #[tokio::test]
+    async fn community_owner_bound_agent_member_admitted() {
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "ob-d-agent",
+                    "ob-owner",
+                    "ob-agent",
+                    serde_json::json!(["share"]),
+                ),
+            })
+            .await
+            .unwrap();
+        put_community_with(&backend, "comm-ob-4", vec![member("ob-agent")], None)
+            .await
+            .expect("owner-bound agent admitted");
+        assert!(backend
+            .lookup_community("comm-ob-4")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// `cohort_subkind: infrastructure` community → an UNOWNED node member
+    /// is ADMITTED (trust + serve needs no owner — CC 3.2 carve-out).
+    #[tokio::test]
+    async fn community_infrastructure_exempts_unowned_node() {
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        put_community_with(
+            &backend,
+            "comm-ob-infra",
+            vec![member("ob-node")],
+            Some("infrastructure"),
+        )
+        .await
+        .expect("infrastructure community exempt from owner-binding");
+        assert!(backend
+            .lookup_community("comm-ob-infra")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// A pure `user`-role member (and an unresolved/non-node-agent member)
+    /// is NOT over-rejected — canonical/user participation is in scope only
+    /// for node/agent standing.
+    #[tokio::test]
+    async fn community_user_member_not_over_rejected() {
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        put_community_with(&backend, "comm-ob-user", vec![member("ob-owner")], None)
+            .await
+            .expect("user member admitted (trivially owner-bound)");
+        assert!(backend
+            .lookup_community("comm-ob-user")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     // ── v3.1.0 (CIRISPersist#117) — peer-mutation surface ──────────
