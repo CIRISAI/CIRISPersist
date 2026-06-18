@@ -1439,11 +1439,20 @@ impl Engine {
                 crate::federation::BlobError::Backend(format!("withdraws canonicalize: {e}"))
             })?;
         let original_content_hash = hex::encode(Sha256::digest(&canonical_bytes));
-        let sig_bytes =
-            self.signer.sign(&canonical_bytes).await.map_err(|e| {
-                crate::federation::BlobError::Backend(format!("withdraws sign: {e}"))
-            })?;
-        let scrub_signature_classical = B64.encode(&sig_bytes);
+        // v9.0.0 (#237, CC 5.3.2.4.3.1) — HYBRID-sign the federation-tier
+        // sweeper withdraws (Ed25519 + ML-DSA-65 bound half) so the
+        // put_attestation ingest gate admits it. Was classical-only
+        // (self.signer.sign), which the gate now correctly rejects. A
+        // non-PQC Engine cannot emit a conformant federation-tier
+        // withdraws — surface that honestly.
+        let sig = self.sign_hybrid(&canonical_bytes).await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "withdraws hybrid-sign: {e} — cannot emit a conformant federation-tier withdraws \
+                 without a hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
+            ))
+        })?;
+        let scrub_signature_classical = B64.encode(&sig.classical.signature);
+        let scrub_signature_pqc = B64.encode(&sig.pqc.signature);
         let now = chrono::Utc::now();
 
         let row = crate::federation::Attestation {
@@ -1463,10 +1472,10 @@ impl Engine {
             attestation_envelope: envelope,
             original_content_hash,
             scrub_signature_classical,
-            scrub_signature_pqc: None,
+            scrub_signature_pqc: Some(scrub_signature_pqc),
             scrub_key_id: signer_key_id.to_owned(),
             scrub_timestamp: now,
-            pqc_completed_at: None,
+            pqc_completed_at: Some(now),
             persist_row_hash: String::new(),
             // v3.7.0 (CIRISPersist#146, CEG 0.6) — legacy withdraws
             // emission path predates subject-side authority. v3.8.0
@@ -2495,17 +2504,24 @@ impl Engine {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::federation::EvictActorReport, crate::federation::BlobError> {
         use crate::federation::BlobStorage;
+        // v9.0.0 (#237, CC 5.3.2.4.3.1) — eviction emits federation-tier
+        // `withdraws`, which the ingest gate requires be hybrid-signed.
+        // That needs the LocalSigner (PQC-capable); an Engine built via
+        // `from_shared` (cohabitation accessor, no LocalSigner) cannot
+        // emit a conformant withdraws — surface that honestly rather than
+        // silently skip or downgrade.
+        let signer = self.local_signer.as_ref().ok_or_else(|| {
+            crate::federation::BlobError::Backend(
+                "evict_actor requires a LocalSigner to hybrid-sign federation-tier withdraws \
+                 (CC 5.3.2.4.3.1); this Engine has none (constructed via from_shared)"
+                    .to_string(),
+            )
+        })?;
         match &self.backend {
             #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(arc) => {
-                arc.evict_actor(attesting_key_id, &**self.signer(), now)
-                    .await
-            }
+            BackendDispatch::Postgres(arc) => arc.evict_actor(attesting_key_id, signer, now).await,
             #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(arc) => {
-                arc.evict_actor(attesting_key_id, &**self.signer(), now)
-                    .await
-            }
+            BackendDispatch::Sqlite(arc) => arc.evict_actor(attesting_key_id, signer, now).await,
         }
     }
 
@@ -3488,12 +3504,23 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     fn test_signer() -> Arc<LocalSigner> {
-        // Deterministic 32-byte seed for fixture reproducibility.
-        let seed = [0x7Au8; 32];
-        let signing_key = SigningKey::from_bytes(&seed);
+        // v9.0.0 (CC 5.3.2.4.3.1) — a PQC-configured LocalSigner keyed on
+        // "test-engine-steward" (deterministic; its Ed25519 + ML-DSA-65
+        // pubkeys match what `sweeper_test_key` registers via
+        // `tier_ingest::test_support::hybrid_pubkeys`). The eviction
+        // sweeper now hybrid-signs federation-tier withdraws, which the
+        // ingest gate requires; a non-PQC signer could not emit them.
+        crate::federation::tier_ingest::test_support::local_signer("test-engine-steward")
+    }
+
+    /// A NON-PQC LocalSigner — for the tests that specifically exercise
+    /// the `PqcNotConfigured` / hybrid-unavailable paths. (The default
+    /// `test_signer` is PQC-configured as of v9.0.0 so the eviction
+    /// sweeper can hybrid-sign federation-tier withdraws.)
+    fn test_signer_no_pqc() -> Arc<LocalSigner> {
         Arc::new(LocalSigner::from_parts(
-            signing_key,
-            "test-engine-steward".to_string(),
+            SigningKey::from_bytes(&[0x7Au8; 32]),
+            "test-engine-steward-nopqc".to_string(),
             None,
             None,
         ))
@@ -4322,7 +4349,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn sign_hybrid_without_pqc_returns_pqc_not_configured() {
-        let signer = test_signer(); // No PQC.
+        let signer = test_signer_no_pqc(); // No PQC.
         let engine = Engine::with_signer(signer, "sqlite::memory:")
             .await
             .expect("construct engine");
@@ -4376,7 +4403,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn sign_hybrid_from_shared_with_local_propagates_to_local_signer() {
-        let signer = test_signer(); // No PQC.
+        let signer = test_signer_no_pqc(); // No PQC.
         let engine_full = Engine::with_signer(signer.clone(), "sqlite::memory:")
             .await
             .expect("construct engine");
@@ -5717,11 +5744,17 @@ mod tests {
     /// self-referential so the FK constraints land cleanly.
     #[cfg(feature = "sqlite")]
     fn sweeper_test_key(key_id: &str) -> crate::federation::SignedKeyRecord {
+        // v9.0.0 (CC 5.3.2.4.3.1) — register REAL deterministic hybrid
+        // pubkeys (matching the LocalSigner `test_signer` / `local_signer`
+        // builds for the same key_id) so the federation-tier withdraws the
+        // sweeper emits verifies at the ingest gate.
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
         crate::federation::SignedKeyRecord {
             record: crate::federation::KeyRecord {
                 key_id: key_id.into(),
-                pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-                pubkey_ml_dsa_65_base64: None,
+                pubkey_ed25519_base64: ed_pk,
+                pubkey_ml_dsa_65_base64: mldsa_pk,
                 algorithm: crate::federation::types::algorithm::HYBRID.into(),
                 identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
                 identity_ref: key_id.into(),
@@ -6947,11 +6980,17 @@ mod tests {
     async fn media_seed_establishing(engine: &Engine, producer_key: &SigningKey, sha_hex: &str) {
         let producer = media_pubkey_b64(producer_key);
         let dir = engine.federation_directory();
+        // v9.0.0 (CC 5.3.2.4.3.1) — register REAL deterministic hybrid
+        // pubkeys + hybrid-sign the establishing content so the ingest
+        // gate admits it. Takedown payloads verify self-contained against
+        // their `author_id` pubkey, not this registered row.
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(&producer);
         dir.put_public_key(crate::federation::types::SignedKeyRecord {
             record: crate::federation::types::KeyRecord {
                 key_id: producer.clone(),
-                pubkey_ed25519_base64: producer.clone(),
-                pubkey_ml_dsa_65_base64: None,
+                pubkey_ed25519_base64: ed_pk,
+                pubkey_ml_dsa_65_base64: mldsa_pk,
                 algorithm: crate::federation::types::algorithm::HYBRID.into(),
                 identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
                 identity_ref: producer.clone(),
@@ -6979,6 +7018,14 @@ mod tests {
             },
             |()| {},
         );
+        let establishing_envelope = serde_json::json!({
+            "dimension": "content:established:v1",
+            "evidence_refs": [sha_hex],
+        });
+        let (och, classical, pqc) = crate::federation::tier_ingest::test_support::sign_envelope(
+            &producer,
+            &establishing_envelope,
+        );
         dir.put_attestation(crate::federation::types::SignedAttestation {
             attestation: crate::federation::types::Attestation {
                 attestation_id: uuid::Uuid::new_v4().to_string(),
@@ -6988,16 +7035,13 @@ mod tests {
                 weight: None,
                 asserted_at: "2026-01-01T00:00:00Z".parse().unwrap(),
                 expires_at: None,
-                attestation_envelope: serde_json::json!({
-                    "dimension": "content:established:v1",
-                    "evidence_refs": [sha_hex],
-                }),
-                original_content_hash: "abc123".into(),
-                scrub_signature_classical: "c2ln".into(),
-                scrub_signature_pqc: None,
+                attestation_envelope: establishing_envelope,
+                original_content_hash: och,
+                scrub_signature_classical: classical,
+                scrub_signature_pqc: pqc,
                 scrub_key_id: producer.clone(),
                 scrub_timestamp: "2026-01-01T00:00:00Z".parse().unwrap(),
-                pqc_completed_at: None,
+                pqc_completed_at: Some("2026-01-01T00:00:00Z".parse().unwrap()),
                 persist_row_hash: String::new(),
                 subject_key_ids: vec![producer.clone()],
                 withdraws_admission_rule: None,

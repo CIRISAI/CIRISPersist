@@ -1159,9 +1159,11 @@ pub trait BlobStorage: Send + Sync {
     ///
     /// 1. Resolve the actor's live holdings via [`list_held_by`].
     /// 2. For each holding's `holds_bytes` attestation: emit a
-    ///    `withdraws` attestation (signed by `signer`, canonicalized
-    ///    via [`crate::verify::canonical::PythonJsonDumpsCanonicalizer`]
-    ///    — the same #121 discipline the sweeper follows).
+    ///    `withdraws` attestation HYBRID-signed by `signer`
+    ///    (Ed25519 + ML-DSA-65), canonicalized via the CEG produce gate
+    ///    ([`crate::verify::canonical::ceg_produce_canonicalize`]) — the
+    ///    federation-tier ingest gate (CC 5.3.2.4.3.1) requires the PQC
+    ///    half, so a non-hybrid signer cannot emit a conformant withdraws.
     /// 3. Delete the corresponding `federation_blobs` row keyed on the
     ///    SHA the `holds_bytes` referenced.
     ///
@@ -1184,7 +1186,7 @@ pub trait BlobStorage: Send + Sync {
     fn evict_actor<'s>(
         &'s self,
         attesting_key_id: &'s str,
-        signer: &'s dyn ciris_keyring::HardwareSigner,
+        signer: &'s crate::signing::LocalSigner,
         now: chrono::DateTime<chrono::Utc>,
     ) -> impl Future<Output = Result<EvictActorReport, BlobError>> + Send + 's;
 }
@@ -1460,8 +1462,15 @@ pub fn holds_bytes_attestation_envelope(sha256: &[u8; 32]) -> serde_json::Value 
 ///   `attesting_key_id` and `attested_key_id` on the row; see the
 ///   note at the v3.4.0 `emit_withdraws_attestation` site for the
 ///   self-attestation FK rationale).
-/// - `signer` — `&dyn HardwareSigner` produces the
-///   `scrub_signature_classical` over the canonical envelope bytes.
+/// - `signer` — `&LocalSigner` HYBRID-signs the canonical envelope
+///   bytes (v9.0.0, CC 5.3.2.4.3.1): Ed25519 over `JCS(envelope)` +
+///   ML-DSA-65 over the bound `JCS(envelope) ‖ ed25519_sig`. A
+///   `withdraws` is a federation-tier attestation, so the
+///   `put_attestation` ingest gate
+///   ([`crate::federation::verify_federation_tier_ingest`]) REQUIRES the
+///   ML-DSA-65 half — a classical-only emission would be rejected at the
+///   gate (fail-secure). The signer's registered key must therefore
+///   carry both pubkeys.
 /// - `directory` — concrete backend that owns
 ///   `federation_attestations`. `&dyn FederationDirectory` keeps the
 ///   helper backend-agnostic.
@@ -1471,20 +1480,23 @@ pub fn holds_bytes_attestation_envelope(sha256: &[u8; 32]) -> serde_json::Value 
 /// # Errors
 ///
 /// Returns [`BlobError::Backend`] for canonicalize / sign /
-/// put_attestation failures. The caller is responsible for tallying
-/// the outcome (the v3.4.0 sweeper + v3.5.0 evict_actor both delete
-/// the corresponding blob even when this helper fails — the
-/// fail-honest contract documented on
-/// [`BlobStorage::evict_actor`]).
+/// put_attestation failures. **v9.0.0**: if `signer` has no PQC identity
+/// (`LocalSigner::sign_hybrid` ⇒ `PqcNotConfigured`) this returns a
+/// CLEAR [`BlobError::Backend`] — an engine that cannot hybrid-sign
+/// legitimately CANNOT emit a conformant federation-tier `withdraws`
+/// (CC 5.3.2.4.3.1: no classical-only fallback, no silent skip, no
+/// local-tier downgrade). The caller is responsible for tallying the
+/// outcome (the v3.4.0 sweeper + v3.5.0 evict_actor both delete the
+/// corresponding blob even when this helper fails — the fail-honest
+/// contract documented on [`BlobStorage::evict_actor`]).
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) async fn emit_withdraws_attestation_helper(
     prior: &crate::federation::Attestation,
     signer_key_id: &str,
-    signer: &dyn ciris_keyring::HardwareSigner,
+    signer: &crate::signing::LocalSigner,
     directory: &dyn crate::federation::FederationDirectory,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), BlobError> {
-    use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
@@ -1493,15 +1505,27 @@ pub(crate) async fn emit_withdraws_attestation_helper(
         &prior.attestation_id,
         &prior.attestation_type,
     );
-    let canonical_bytes = PythonJsonDumpsCanonicalizer
-        .canonicalize_value(&envelope)
+    // v9.0.0 (#237, CC 5.3.2.4.3.1) — canonicalize through the CEG
+    // PRODUCE gate (JCS post-cut, §0.9), the SAME canonical form the
+    // federation-tier ingest gate verifies (was PythonJsonDumpsCanonicalizer,
+    // which the gate's ceg_produce_canonicalize would not match).
+    let canonical_bytes = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
         .map_err(|e| BlobError::Backend(format!("withdraws canonicalize: {e}")))?;
     let original_content_hash = hex::encode(Sha256::digest(&canonical_bytes));
-    let sig_bytes = signer
-        .sign(&canonical_bytes)
-        .await
-        .map_err(|e| BlobError::Backend(format!("withdraws sign: {e}")))?;
-    let scrub_signature_classical = B64.encode(&sig_bytes);
+    // v9.0.0 — HYBRID-sign (Ed25519 + ML-DSA-65 bound half) so the
+    // federation-tier withdraws carries the PQC half the ingest gate
+    // mandates. Mirrors Engine::attestation_promote. A non-PQC signer
+    // CANNOT emit a conformant federation-tier withdraws — surface that
+    // honestly (no classical-only fallback / silent skip / local
+    // downgrade).
+    let sig = signer.sign_hybrid(&canonical_bytes).await.map_err(|e| {
+        BlobError::Backend(format!(
+            "withdraws hybrid-sign: {e} — cannot emit a conformant federation-tier withdraws \
+             without a hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
+        ))
+    })?;
+    let scrub_signature_classical = B64.encode(&sig.classical.signature);
+    let scrub_signature_pqc = B64.encode(&sig.pqc.signature);
 
     let row = crate::federation::Attestation {
         attestation_id: uuid::Uuid::new_v4().to_string(),
@@ -1517,10 +1541,10 @@ pub(crate) async fn emit_withdraws_attestation_helper(
         attestation_envelope: envelope,
         original_content_hash,
         scrub_signature_classical,
-        scrub_signature_pqc: None,
+        scrub_signature_pqc: Some(scrub_signature_pqc),
         scrub_key_id: signer_key_id.to_owned(),
         scrub_timestamp: now,
-        pqc_completed_at: None,
+        pqc_completed_at: Some(now),
         persist_row_hash: String::new(),
         // v3.7.0 (CIRISPersist#146, CEG 0.6) — evict_actor emits a
         // producer-self-revocation withdraws; subject-side authority

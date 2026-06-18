@@ -6225,18 +6225,25 @@ impl PyEngine {
             let now = chrono::DateTime::parse_from_rfc3339(now_iso)
                 .map_err(|e| PyValueError::new_err(format!("evict_actor now_iso parse: {e}")))?
                 .with_timezone(&chrono::Utc);
-            // v3.6.8 (CIRISPersist#140) — local-signer fast-path. The
-            // headless-darwin CI failure mode for `evict_actor` (Keychain
-            // not unlocked → withdraws_failed equals blobs_evicted) was
-            // the trigger; same shape as #137 for put_blob_signing.
-            let signer = self.select_signer(&actor);
+            // v9.0.0 (#237, CC 5.3.2.4.3.1) — eviction emits federation-tier
+            // `withdraws`, which the ingest gate requires be hybrid-signed.
+            // That needs the PQC-capable LocalSigner; a classical-only
+            // HardwareSigner cannot emit a conformant withdraws. Surface a
+            // clear error when no LocalSigner is configured (no silent skip /
+            // classical-only fallback / local-tier downgrade).
+            let signer = self.local_signer.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "evict_actor requires a hybrid (Ed25519 + ML-DSA-65) LocalSigner to sign \
+                     federation-tier withdraws (CC 5.3.2.4.3.1); none is configured on this engine",
+                )
+            })?;
             py.detach(move || match &self.backend {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
                         let report = backend
-                            .evict_actor(&actor, &*signer, now)
+                            .evict_actor(&actor, &signer, now)
                             .await
                             .map_err(blob_err_to_py)?;
                         serde_json::to_string(&report).map_err(|e| {
@@ -6250,7 +6257,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::BlobStorage;
                         let report = backend
-                            .evict_actor(&actor, &*signer, now)
+                            .evict_actor(&actor, &signer, now)
                             .await
                             .map_err(blob_err_to_py)?;
                         serde_json::to_string(&report).map_err(|e| {
@@ -13347,9 +13354,18 @@ impl PyEngine {
                     PyValueError::new_err(format!("process_takedown_admission now_iso parse: {e}"))
                 })?
                 .with_timezone(&chrono::Utc);
-            // v3.6.8 (CIRISPersist#138) — local-signer fast-path; the
-            // takedown handler emits withdraws signed by `signer_key_id`.
-            let signer = self.select_signer(&signer_kid);
+            // v9.0.0 (#237, CC 5.3.2.4.3.1) — the takedown handler emits
+            // federation-tier `withdraws` per holder, which the ingest gate
+            // requires be hybrid-signed. Use the PQC-capable LocalSigner;
+            // error clearly when none is configured (no classical-only
+            // fallback / silent skip / local-tier downgrade).
+            let signer = self.local_signer.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "process_takedown_admission requires a hybrid (Ed25519 + ML-DSA-65) \
+                     LocalSigner to sign federation-tier withdraws (CC 5.3.2.4.3.1); none is \
+                     configured on this engine",
+                )
+            })?;
             let cfg_snapshot = self
                 .multimedia_config
                 .read()
@@ -13364,7 +13380,7 @@ impl PyEngine {
                             crate::cirisnode::takedown_handler::process_takedown_admission_with_config(
                                 &*backend,
                                 &*backend,
-                                &*signer,
+                                &signer,
                                 &signer_kid,
                                 &notice,
                                 now,
@@ -13384,7 +13400,7 @@ impl PyEngine {
                             crate::cirisnode::takedown_handler::process_takedown_admission_with_config(
                                 &*backend,
                                 &*backend,
-                                &*signer,
+                                &signer,
                                 &signer_kid,
                                 &notice,
                                 now,
@@ -20694,6 +20710,12 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // node-only key is caller-side authorization failure; ValueError
         // (4xx). "Infrastructure must not have agency."
         crate::federation::Error::NodeAgencyForbidden { .. } => PyValueError::new_err(kind),
+        // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — a federation-tier
+        // attestation rejected at the bulk ingest gate (missing ML-DSA-65
+        // half / tampered signature / canonicalizer mismatch /
+        // unregistered attester) is caller-fault malformed-content /
+        // authorization failure; ValueError (4xx).
+        crate::federation::Error::FederationTierUnverified { .. } => PyValueError::new_err(kind),
         // v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) —
         // operational-data admission rejections are all caller-fault
         // malformed-content / authorization failures; ValueError (4xx).

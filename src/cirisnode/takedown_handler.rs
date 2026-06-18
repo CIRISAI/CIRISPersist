@@ -104,7 +104,7 @@ pub struct TakedownReport {
 pub async fn process_takedown_admission<B>(
     blob_storage: &B,
     directory: &dyn FederationDirectory,
-    signer: &dyn ciris_keyring::HardwareSigner,
+    signer: &crate::signing::LocalSigner,
     signer_key_id: &str,
     notice: &TakedownNoticePayload,
     now: DateTime<Utc>,
@@ -147,7 +147,7 @@ where
 pub async fn process_takedown_admission_with_config<B>(
     blob_storage: &B,
     directory: &dyn FederationDirectory,
-    signer: &dyn ciris_keyring::HardwareSigner,
+    signer: &crate::signing::LocalSigner,
     signer_key_id: &str,
     notice: &TakedownNoticePayload,
     now: DateTime<Utc>,
@@ -300,7 +300,6 @@ mod tests {
     use crate::store::backend::Backend;
     use crate::store::sqlite::SqliteBackend;
     use chrono::Utc;
-    use ed25519_dalek::SigningKey;
     use sha2::Digest;
 
     fn fixture_notice(basis: LegalBasis, sha: &[u8; 32]) -> TakedownNoticePayload {
@@ -321,10 +320,16 @@ mod tests {
     }
 
     fn fed_key(key_id: &str) -> KeyRecord {
+        // v9.0.0 (CC 5.3.2.4.3.1) — register REAL deterministic hybrid
+        // pubkeys (matching `test_signer`'s LocalSigner, keyed on the same
+        // key_id) so the federation-tier withdraws the takedown handler
+        // emits verifies at the ingest gate.
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
         KeyRecord {
             key_id: key_id.into(),
-            pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-            pubkey_ml_dsa_65_base64: None,
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
             algorithm: crate::federation::types::algorithm::HYBRID.into(),
             identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
             identity_ref: key_id.into(),
@@ -343,15 +348,22 @@ mod tests {
         }
     }
 
-    fn test_signer(seed: u8, alias: &str) -> std::sync::Arc<LocalSignerHardwareAdapter> {
-        let signing_key = SigningKey::from_bytes(&[seed; 32]);
-        let local = std::sync::Arc::new(LocalSigner::from_parts(
-            signing_key,
-            alias.to_owned(),
-            None,
-            None,
-        ));
-        std::sync::Arc::new(LocalSignerHardwareAdapter::new(local))
+    /// v9.0.0 (CC 5.3.2.4.3.1) — a PQC-configured LocalSigner keyed on
+    /// `alias` (deterministic; matches the pubkeys `fed_key(alias)`
+    /// registers). The takedown handler hybrid-signs the federation-tier
+    /// withdraws with this; the holder blob-seeding path wraps it in a
+    /// `LocalSignerHardwareAdapter` (classical-only is fine there — the
+    /// holds_bytes row is stored via put_blob's direct INSERT, not the
+    /// gated put_attestation). `seed` is ignored (keying is by alias now,
+    /// so signer + registered key cohere).
+    fn test_signer(_seed: u8, alias: &str) -> std::sync::Arc<LocalSigner> {
+        crate::federation::tier_ingest::test_support::local_signer(alias)
+    }
+
+    /// Wrap a test LocalSigner as a `&dyn HardwareSigner` for the
+    /// classical-only `put_blob_signing` (holds_bytes) seeding path.
+    fn blob_signer(local: &std::sync::Arc<LocalSigner>) -> LocalSignerHardwareAdapter {
+        LocalSignerHardwareAdapter::new(local.clone())
     }
 
     async fn seed_backend(actors: &[&str]) -> SqliteBackend {
@@ -371,7 +383,7 @@ mod tests {
     async fn seed_blob(
         backend: &SqliteBackend,
         actor: &str,
-        signer: &dyn ciris_keyring::HardwareSigner,
+        signer: &std::sync::Arc<LocalSigner>,
         payload: &[u8],
     ) -> [u8; 32] {
         let mut sha = [0u8; 32];
@@ -382,7 +394,7 @@ mod tests {
                 BlobBody::Inline(payload.to_vec()),
                 None,
                 actor,
-                signer,
+                &blob_signer(signer),
                 Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -414,7 +426,7 @@ mod tests {
                 BlobBody::Inline(payload.to_vec()),
                 None,
                 "holder-stale",
-                &*h,
+                &blob_signer(&h),
                 stale_ts,
                 uuid::Uuid::new_v4(),
             )
@@ -424,7 +436,7 @@ mod tests {
         let report = process_takedown_admission(
             &backend,
             &backend,
-            &*admin,
+            &admin,
             "admin-key",
             &notice,
             Utc::now(),
@@ -449,7 +461,7 @@ mod tests {
         let report = process_takedown_admission(
             &backend,
             &backend,
-            &*admin,
+            &admin,
             "admin-key",
             &notice,
             Utc::now(),
@@ -468,15 +480,15 @@ mod tests {
         let h1 = test_signer(0x21, "holder-1");
         let h2 = test_signer(0x22, "holder-2");
         let admin = test_signer(0x33, "admin-key");
-        let sha_a = seed_blob(&backend, "holder-1", &*h1, b"a-shared-payload").await;
-        let sha_b = seed_blob(&backend, "holder-2", &*h2, b"a-shared-payload").await;
+        let sha_a = seed_blob(&backend, "holder-1", &h1, b"a-shared-payload").await;
+        let sha_b = seed_blob(&backend, "holder-2", &h2, b"a-shared-payload").await;
         assert_eq!(sha_a, sha_b, "same payload → same SHA");
 
         let notice = fixture_notice(LegalBasis::DsaArticle16, &sha_a);
         let report = process_takedown_admission(
             &backend,
             &backend,
-            &*admin,
+            &admin,
             "admin-key",
             &notice,
             Utc::now(),
@@ -495,13 +507,13 @@ mod tests {
         let backend = seed_backend(&["holder-imm", "admin-key"]).await;
         let h = test_signer(0x41, "holder-imm");
         let admin = test_signer(0x42, "admin-key");
-        let sha = seed_blob(&backend, "holder-imm", &*h, b"immediate-payload").await;
+        let sha = seed_blob(&backend, "holder-imm", &h, b"immediate-payload").await;
 
         let notice = fixture_notice(LegalBasis::NcmecCsam, &sha);
         let report = process_takedown_admission(
             &backend,
             &backend,
-            &*admin,
+            &admin,
             "admin-key",
             &notice,
             Utc::now(),
@@ -521,7 +533,7 @@ mod tests {
         let backend = seed_backend(&["holder-cfg", "admin-key"]).await;
         let h = test_signer(0x71, "holder-cfg");
         let admin = test_signer(0x72, "admin-key");
-        let sha = seed_blob(&backend, "holder-cfg", &*h, b"cfg-payload").await;
+        let sha = seed_blob(&backend, "holder-cfg", &h, b"cfg-payload").await;
 
         let mut cfg = crate::cirisnode::MultimediaConfig::default();
         cfg.immediate_legal_bases.remove(&LegalBasis::NcmecCsam);
@@ -530,7 +542,7 @@ mod tests {
         let report = process_takedown_admission_with_config(
             &backend,
             &backend,
-            &*admin,
+            &admin,
             "admin-key",
             &notice,
             Utc::now(),
@@ -564,7 +576,7 @@ mod tests {
         let report = process_takedown_admission_with_config(
             &backend,
             &backend,
-            &*admin,
+            &admin,
             "admin-key",
             &notice,
             now,
@@ -588,7 +600,7 @@ mod tests {
         let backend = seed_backend(&["holder-coup", "admin-key"]).await;
         let h = test_signer(0x51, "holder-coup");
         let admin = test_signer(0x52, "admin-key");
-        let sha = seed_blob(&backend, "holder-coup", &*h, b"coup-payload").await;
+        let sha = seed_blob(&backend, "holder-coup", &h, b"coup-payload").await;
 
         // Confirm the holder's federation_keys row exists pre-takedown.
         let pre = FederationDirectory::lookup_public_key(&backend, "holder-coup")
@@ -602,7 +614,7 @@ mod tests {
         let report = process_takedown_admission(
             &backend,
             &backend,
-            &*admin,
+            &admin,
             "admin-key",
             &notice,
             Utc::now(),
@@ -630,13 +642,13 @@ mod tests {
         let backend = seed_backend(&["holder-age", "admin-key"]).await;
         let h = test_signer(0x61, "holder-age");
         let admin = test_signer(0x62, "admin-key");
-        let sha = seed_blob(&backend, "holder-age", &*h, b"age-gated-payload").await;
+        let sha = seed_blob(&backend, "holder-age", &h, b"age-gated-payload").await;
 
         let notice = fixture_notice(LegalBasis::AvmsdAgeInappropriate, &sha);
         let report = process_takedown_admission(
             &backend,
             &backend,
-            &*admin,
+            &admin,
             "admin-key",
             &notice,
             Utc::now(),

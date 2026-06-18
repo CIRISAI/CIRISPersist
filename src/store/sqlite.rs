@@ -2117,6 +2117,19 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // trace.
         crate::federation::admission::check_node_agency_admission(self, &row).await?;
 
+        // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
+        // hybrid-verify at the federation-tier bulk store/replicate
+        // ingest gate (parity with the postgres + memory backends). A
+        // no-op for local-tier rows (CC 5.3.2.2 deferred signature); for
+        // a federation-tier row it hybrid-verifies the envelope signature
+        // (Ed25519 + ML-DSA-65, Strict) against the attester's REGISTERED
+        // pubkeys. Composes with — does not replace — the trust-threshold
+        // check_federation + the node-agency gate. Runs BEFORE
+        // persist_row_hash + INSERT so a rejected row leaves no trace
+        // (verify-before-mutation, AV-9; store-then-quarantine is
+        // non-conformant per CC 5.3.2.4.3.1).
+        crate::federation::verify_federation_tier_ingest(self, &row).await?;
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
@@ -6921,7 +6934,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
     async fn evict_actor(
         &self,
         attesting_key_id: &str,
-        signer: &dyn ciris_keyring::HardwareSigner,
+        signer: &crate::signing::LocalSigner,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::federation::EvictActorReport, crate::federation::BlobError> {
         // v3.5.0 (CIRISPersist#125) — per-actor eviction.
@@ -13358,10 +13371,20 @@ mod tests {
     };
 
     fn fed_key(key_id: &str, identity_ref: &str, scrub_key_id: &str) -> KeyRecord {
+        // v9.0.0 (CC 5.3.2.4.3.1) — register REAL deterministic hybrid
+        // pubkeys for `key_id` so the federation-tier ingest gate can
+        // verify attestations signed by this key (see
+        // `tier_ingest::test_support`). put_public_key does not itself
+        // hybrid-verify the registration (that gate is
+        // `register_federation_key`), so the row's own scrub-signature
+        // fields stay placeholders; only the PUBKEYS must be real for the
+        // attestation gate.
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
         KeyRecord {
             key_id: key_id.into(),
-            pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-            pubkey_ml_dsa_65_base64: None,
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
             algorithm: crate::federation::types::algorithm::HYBRID.into(),
             identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
             identity_ref: identity_ref.into(),
@@ -13380,13 +13403,32 @@ mod tests {
         }
     }
 
+    /// v9.0.0 (CC 5.3.2.4.3.1) — (re-)sign a federation-tier test
+    /// attestation's envelope with its `attesting_key_id`'s deterministic
+    /// hybrid key, so the mandatory federation-tier ingest gate verifies
+    /// it. Call this AFTER any post-construction mutation of
+    /// `attestation_envelope` or `attesting_key_id` (the signature covers
+    /// the envelope and binds to the attester's registered key). A no-op
+    /// for local-tier rows is unnecessary — signing them is harmless and
+    /// the gate skips them. The matching pubkeys are registered via
+    /// [`fed_key`] (same deterministic seed per key_id).
+    fn resign_fed(row: &mut Attestation) {
+        let (och, classical, pqc) = crate::federation::tier_ingest::test_support::sign_envelope(
+            &row.attesting_key_id,
+            &row.attestation_envelope,
+        );
+        row.original_content_hash = och;
+        row.scrub_signature_classical = classical;
+        row.scrub_signature_pqc = pqc;
+    }
+
     fn fed_attestation(
         id: &str,
         attesting: &str,
         attested: &str,
         scrub_key_id: &str,
     ) -> Attestation {
-        Attestation {
+        let mut row = Attestation {
             attestation_id: id.into(),
             attesting_key_id: attesting.into(),
             attested_key_id: attested.into(),
@@ -13416,7 +13458,12 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
-        }
+        };
+        // v9.0.0 — sign the as-built envelope so the federation-tier
+        // ingest gate (CC 5.3.2.4.3.1) admits it. Tests that mutate the
+        // envelope afterward must call `resign_fed`.
+        resign_fed(&mut row);
+        row
     }
 
     // v3.7.0 (CIRISPersist#146, CEG 0.6) — round-trip a SignedAttestation
@@ -13479,6 +13526,7 @@ mod tests {
             "references_attestation_id": target_id,
             "withdrawal_reason": "test",
         });
+        resign_fed(&mut w); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         w
     }
 
@@ -13496,6 +13544,7 @@ mod tests {
             "references_attestation_id": id,
             "scope": scope,
         });
+        resign_fed(&mut d); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         d
     }
 
@@ -13843,6 +13892,7 @@ mod tests {
         let mut t = fed_attestation(&tid, &holder, &holder, &holder);
         t.attestation_type = holds_type.clone();
         t.attestation_envelope = crate::federation::blobs::holds_bytes_attestation_envelope(&sha);
+        resign_fed(&mut t); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation { attestation: t })
             .await
@@ -13857,6 +13907,7 @@ mod tests {
             "references_attestation_type": holds_type,
             "kind": "withdraws",
         });
+        resign_fed(&mut w); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation { attestation: w })
             .await
@@ -13997,6 +14048,7 @@ mod tests {
                 // satisfies the scores version-pin gate.
                 "dimension": "consent:partnership_grant:v1",
             });
+            resign_fed(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
             a.tier = tier.to_string();
             if tier == crate::federation::types::attestation_tier::LOCAL {
                 a.cohort_scope = crate::federation::types::cohort_scope::SELF.to_string();
@@ -14082,6 +14134,7 @@ mod tests {
             "confidence": 1.0,
             "witness_relation": "self",
         });
+        resign_fed(&mut binding); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation {
                 attestation: binding,
@@ -14126,6 +14179,7 @@ mod tests {
             let mut a = fed_attestation(id, "subject-1", "target-1", "subject-1");
             a.attestation_envelope = serde_json::json!({ "id": id, "dimension": dim });
             a.asserted_at = at.parse().unwrap();
+            resign_fed(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
             SignedAttestation { attestation: a }
         };
         let now = chrono::Utc::now();
@@ -14267,6 +14321,7 @@ mod tests {
             let mut a = fed_attestation(id, attester, "target-1", attester);
             a.attestation_envelope = serde_json::json!({ "id": id, "dimension": dim });
             a.asserted_at = at;
+            resign_fed(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
             SignedAttestation { attestation: a }
         };
         // Producer commits a 1-day deletion SLA on the target Contribution.
@@ -17279,6 +17334,7 @@ mod tests {
             "score": 1.0,
             "confidence": 0.9,
         });
+        resign_fed(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         a
     }
 
@@ -17925,7 +17981,7 @@ mod tests {
         references_attestation_id: &str,
         asserted_at: &str,
     ) -> Attestation {
-        Attestation {
+        let mut row = Attestation {
             attestation_id: id.into(),
             attesting_key_id: attester.into(),
             attested_key_id: attester.into(),
@@ -17949,7 +18005,9 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
-        }
+        };
+        resign_fed(&mut row); // v9.0.0 — sign the envelope (CC 5.3.2.4.3.1)
+        row
     }
 
     #[tokio::test]
@@ -18544,7 +18602,7 @@ mod tests {
                 BlobBody::Inline(bytes),
                 None,
                 "actor-a",
-                &*signer,
+                &blob_signer(&signer),
                 stale_ts,
                 uuid::Uuid::new_v4(),
             )
@@ -18601,7 +18659,7 @@ mod tests {
                 BlobBody::Inline(bytes.clone()),
                 None,
                 "host-a",
-                &*signer,
+                &blob_signer(&signer),
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -18630,7 +18688,7 @@ mod tests {
                 BlobBody::Inline(bytes),
                 None,
                 "host-a",
-                &*signer,
+                &blob_signer(&signer),
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -18659,7 +18717,7 @@ mod tests {
                 BlobBody::Inline(bytes),
                 None,
                 "host-a",
-                &*signer,
+                &blob_signer(&signer),
                 chrono::Utc::now(),
                 uuid::Uuid::new_v4(),
             )
@@ -18898,7 +18956,7 @@ mod tests {
     /// signals trump TTL bypass.
     #[tokio::test]
     async fn blob_list_local_holders_filters_on_withdraws() {
-        use crate::federation::types::{Attestation, SignedAttestation};
+        use crate::federation::types::SignedAttestation;
         let backend = blob_test_backend().await;
         let bytes = b"local-truth-withdrawn".to_vec();
         let sha = sha256_of(&bytes);
@@ -18925,31 +18983,16 @@ mod tests {
         });
         let withdraws_id = uuid::Uuid::new_v4().to_string();
         use crate::federation::FederationDirectory;
+        // v9.0.0 (CC 5.3.2.4.3.1) — build via fed_attestation + resign so
+        // the mandatory federation-tier ingest gate verifies the row.
+        let mut wrow = fed_attestation(&withdraws_id, "host-a", "host-a", "host-a");
+        wrow.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+        wrow.weight = None;
+        wrow.asserted_at = chrono::Utc::now();
+        wrow.attestation_envelope = withdraws_envelope;
+        resign_fed(&mut wrow);
         backend
-            .put_attestation(SignedAttestation {
-                attestation: Attestation {
-                    attestation_id: withdraws_id,
-                    attesting_key_id: "host-a".into(),
-                    attested_key_id: "host-a".into(),
-                    attestation_type: crate::federation::types::attestation_type::WITHDRAWS.into(),
-                    weight: None,
-                    asserted_at: chrono::Utc::now(),
-                    expires_at: None,
-                    attestation_envelope: withdraws_envelope,
-                    original_content_hash: "abcdef02".into(),
-                    scrub_signature_classical: "c2ln".into(),
-                    scrub_signature_pqc: None,
-                    scrub_key_id: "host-a".into(),
-                    scrub_timestamp: chrono::Utc::now(),
-                    pqc_completed_at: None,
-                    persist_row_hash: String::new(),
-                    subject_key_ids: Vec::new(),
-                    withdraws_admission_rule: None,
-                    cohort_scope: "federation".to_string(),
-                    tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
-                    promoted_at: None,
-                },
-            })
+            .put_attestation(SignedAttestation { attestation: wrow })
             .await
             .unwrap();
         // Withdraws active: list_local_holders drops the row.
@@ -19067,72 +19110,20 @@ mod tests {
 
     // ─── v3.5.0 (CIRISPersist#125) — list_held_by + evict_actor ────
 
-    /// A signer that always errors on `sign()` — used to exercise
-    /// `evict_actor`'s `withdraws_failed` path. Every other
-    /// `HardwareSigner` method delegates to a real signer so the FK
-    /// shape stays intact.
-    struct AlwaysFailingSigner {
-        inner: std::sync::Arc<crate::signing::LocalSignerHardwareAdapter>,
+    /// v9.0.0 (CC 5.3.2.4.3.1) — a PQC-configured LocalSigner keyed on
+    /// `alias` (deterministic; matches the pubkeys `fed_key(alias)`
+    /// registers) so the federation-tier withdraws `evict_actor` emits
+    /// verifies at the ingest gate.
+    fn test_signer_for(alias: &str) -> std::sync::Arc<crate::signing::LocalSigner> {
+        crate::federation::tier_ingest::test_support::local_signer(alias)
     }
 
-    #[async_trait::async_trait]
-    impl ciris_keyring::HardwareSigner for AlwaysFailingSigner {
-        fn algorithm(&self) -> ciris_keyring::ClassicalAlgorithm {
-            self.inner.algorithm()
-        }
-        fn hardware_type(&self) -> ciris_keyring::HardwareType {
-            self.inner.hardware_type()
-        }
-        async fn public_key(&self) -> Result<Vec<u8>, ciris_keyring::KeyringError> {
-            self.inner.public_key().await
-        }
-        async fn sign(&self, _data: &[u8]) -> Result<Vec<u8>, ciris_keyring::KeyringError> {
-            Err(ciris_keyring::KeyringError::SigningFailed {
-                reason: "test signer always fails".into(),
-            })
-        }
-        async fn attestation(
-            &self,
-        ) -> Result<ciris_keyring::PlatformAttestation, ciris_keyring::KeyringError> {
-            self.inner.attestation().await
-        }
-        async fn generate_key(
-            &self,
-            cfg: &ciris_keyring::KeyGenConfig,
-        ) -> Result<(), ciris_keyring::KeyringError> {
-            self.inner.generate_key(cfg).await
-        }
-        async fn key_exists(&self, alias: &str) -> Result<bool, ciris_keyring::KeyringError> {
-            self.inner.key_exists(alias).await
-        }
-        async fn delete_key(&self, alias: &str) -> Result<(), ciris_keyring::KeyringError> {
-            self.inner.delete_key(alias).await
-        }
-        fn current_alias(&self) -> &str {
-            self.inner.current_alias()
-        }
-        fn storage_descriptor(&self) -> ciris_keyring::StorageDescriptor {
-            self.inner.storage_descriptor()
-        }
-        async fn attestation_with_nonce(
-            &self,
-            nonce: Option<&[u8]>,
-        ) -> Result<ciris_keyring::PlatformAttestation, ciris_keyring::KeyringError> {
-            self.inner.attestation_with_nonce(nonce).await
-        }
-    }
-
-    fn test_signer_for(alias: &str) -> std::sync::Arc<crate::signing::LocalSignerHardwareAdapter> {
-        use crate::signing::{LocalSigner, LocalSignerHardwareAdapter};
-        use ed25519_dalek::SigningKey;
-        let signing_key = SigningKey::from_bytes(&[0x42; 32]);
-        let local = std::sync::Arc::new(LocalSigner::from_parts(
-            signing_key,
-            alias.to_owned(),
-            None,
-            None,
-        ));
-        std::sync::Arc::new(LocalSignerHardwareAdapter::new(local))
+    /// Wrap a test LocalSigner as a `&dyn HardwareSigner` for the
+    /// classical-only `put_blob_signing` (holds_bytes) seeding path.
+    fn blob_signer(
+        local: &std::sync::Arc<crate::signing::LocalSigner>,
+    ) -> crate::signing::LocalSignerHardwareAdapter {
+        crate::signing::LocalSignerHardwareAdapter::new(local.clone())
     }
 
     async fn evict_test_backend_with_actors(actors: &[&str]) -> SqliteBackend {
@@ -19154,11 +19145,12 @@ mod tests {
     async fn seed_blobs(
         backend: &SqliteBackend,
         actor: &str,
-        signer: &dyn ciris_keyring::HardwareSigner,
+        signer: &std::sync::Arc<crate::signing::LocalSigner>,
         n: usize,
         tag: &str,
     ) -> Vec<[u8; 32]> {
         use crate::federation::{BlobBody, BlobStorage};
+        let hw = blob_signer(signer);
         let mut shas = Vec::with_capacity(n);
         for i in 0..n {
             let bytes = format!("{actor}-{tag}-{i}").into_bytes();
@@ -19169,7 +19161,7 @@ mod tests {
                     BlobBody::Inline(bytes),
                     None,
                     actor,
-                    signer,
+                    &hw,
                     chrono::Utc::now(),
                     uuid::Uuid::new_v4(),
                 )
@@ -19185,8 +19177,8 @@ mod tests {
         let backend = evict_test_backend_with_actors(&["actor-a", "actor-b"]).await;
         let signer = test_signer_for("actor-a");
         let signer_b = test_signer_for("actor-b");
-        let shas_a = seed_blobs(&backend, "actor-a", &*signer, 3, "main").await;
-        let shas_b = seed_blobs(&backend, "actor-b", &*signer_b, 2, "main").await;
+        let shas_a = seed_blobs(&backend, "actor-a", &signer, 3, "main").await;
+        let shas_b = seed_blobs(&backend, "actor-b", &signer_b, 2, "main").await;
 
         use crate::federation::BlobStorage;
         let mut held_a = backend.list_held_by("actor-a").await.unwrap();
@@ -19208,7 +19200,7 @@ mod tests {
         // holds_bytes attestation, assert list_held_by(A) excludes it.
         let backend = evict_test_backend_with_actors(&["actor-a"]).await;
         let signer = test_signer_for("actor-a");
-        let shas = seed_blobs(&backend, "actor-a", &*signer, 1, "withdrawn").await;
+        let shas = seed_blobs(&backend, "actor-a", &signer, 1, "withdrawn").await;
 
         // Look up the holds_bytes attestation_id we just emitted.
         use crate::federation::FederationDirectory;
@@ -19247,12 +19239,12 @@ mod tests {
         let backend = evict_test_backend_with_actors(&["actor-a", "actor-b"]).await;
         let signer_a = test_signer_for("actor-a");
         let signer_b = test_signer_for("actor-b");
-        let shas_a = seed_blobs(&backend, "actor-a", &*signer_a, 3, "evict").await;
-        let shas_b = seed_blobs(&backend, "actor-b", &*signer_b, 2, "evict").await;
+        let shas_a = seed_blobs(&backend, "actor-a", &signer_a, 3, "evict").await;
+        let shas_b = seed_blobs(&backend, "actor-b", &signer_b, 2, "evict").await;
 
         use crate::federation::BlobStorage;
         let report = backend
-            .evict_actor("actor-a", &*signer_a, chrono::Utc::now())
+            .evict_actor("actor-a", &signer_a, chrono::Utc::now())
             .await
             .unwrap();
         assert_eq!(report.blobs_evicted, 3, "A's 3 blobs evicted");
@@ -19282,7 +19274,7 @@ mod tests {
 
         use crate::federation::BlobStorage;
         let report = backend
-            .evict_actor("actor-a", &*signer, chrono::Utc::now())
+            .evict_actor("actor-a", &signer, chrono::Utc::now())
             .await
             .unwrap();
         assert_eq!(report, crate::federation::EvictActorReport::default());
@@ -19295,11 +19287,20 @@ mod tests {
         // evicted — fail-honest contract.
         let backend = evict_test_backend_with_actors(&["actor-a"]).await;
         let real_signer = test_signer_for("actor-a");
-        let shas = seed_blobs(&backend, "actor-a", &*real_signer, 1, "partial").await;
+        let shas = seed_blobs(&backend, "actor-a", &real_signer, 1, "partial").await;
 
-        let failing = AlwaysFailingSigner {
-            inner: real_signer.clone(),
-        };
+        // v9.0.0 (CC 5.3.2.4.3.1) — a NON-PQC LocalSigner cannot
+        // hybrid-sign, so emit_withdraws_attestation_helper fails
+        // (PqcNotConfigured) → exercises the withdraws_failed fail-honest
+        // path (the blob row is still evicted). Replaces the pre-v9.0.0
+        // AlwaysFailingSigner (classical-only signers are no longer the
+        // eviction signing surface).
+        let failing = std::sync::Arc::new(crate::signing::LocalSigner::from_parts(
+            ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]),
+            "actor-a".to_owned(),
+            None,
+            None,
+        ));
         use crate::federation::BlobStorage;
         let report = backend
             .evict_actor("actor-a", &failing, chrono::Utc::now())
@@ -22109,6 +22110,7 @@ mod tests {
             "confidence": 0.9,
             "evidence_refs": [hex::encode(sha)],
         });
+        resign_fed(&mut att); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
@@ -22460,7 +22462,7 @@ mod tests {
                 serde_json::Value::Number(serde_json::Number::from_f64(0.9).unwrap()),
             );
         }
-        Attestation {
+        let att = Attestation {
             attestation_id: uuid::Uuid::new_v4().to_string(),
             attesting_key_id: attesting.into(),
             attested_key_id: attested.into(),
@@ -22481,7 +22483,13 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
-        }
+        };
+        // v9.0.0 (CC 5.3.2.4.3.1) — sign the as-built envelope so the
+        // mandatory federation-tier ingest gate admits it. Callers that
+        // mutate the envelope afterward must call `resign_fed`.
+        let mut row = att;
+        resign_fed(&mut row);
+        row
     }
 
     /// #104 — federation_directory_query returns a non-empty
@@ -22723,6 +22731,7 @@ mod tests {
         att.attestation_envelope = serde_json::json!({
             "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
         });
+        resign_fed(&mut att); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         att
     }
 
@@ -23538,8 +23547,20 @@ mod tests {
     async fn remove_peer_record_hard_with_active_attestations_rejects_sqlite() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // v9.0.0 (CC 5.3.2.4.3.1) — register peer-att-a with REAL hybrid
+        // pubkeys first so the federation-tier attestation below verifies,
+        // then add_peer_record with the matching Ed25519 pubkey (upsert-
+        // of-metadata path — pubkey matches, no conflict).
         backend
-            .add_peer_record("peer-att-a", "AAAA", "agent", None)
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("peer-att-a", "peer-att-a", "peer-att-a"),
+            })
+            .await
+            .unwrap();
+        let (peer_a_ed, _) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys("peer-att-a");
+        backend
+            .add_peer_record("peer-att-a", &peer_a_ed, "agent", None)
             .await
             .unwrap();
         backend
@@ -24619,9 +24640,31 @@ mod tests {
             use ciris_crypto::PqcSigner as _;
             B64.encode(mldsa.public_key().unwrap())
         };
-        let mut record = fed_key(key_id, key_id, key_id);
-        record.pubkey_ed25519_base64 = ed_pub_b64;
-        record.pubkey_ml_dsa_65_base64 = Some(mldsa_pub_b64);
+        // v9.0.0 — build the KeyRecord inline (NOT via `fed_key`): both
+        // pubkeys are overwritten with this producer's real hybrid keys
+        // anyway, and `fed_key` now derives ML-DSA pubkeys (a multi-KiB
+        // keygen) which, stacked on this frame's own ML-DSA signer +
+        // HybridSigner, overflowed the tokio worker stack.
+        let record = crate::federation::KeyRecord {
+            key_id: key_id.into(),
+            pubkey_ed25519_base64: ed_pub_b64,
+            pubkey_ml_dsa_65_base64: Some(mldsa_pub_b64),
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+            identity_ref: key_id.into(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": key_id }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.into(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
         backend
             .put_public_key(SignedKeyRecord { record })
             .await
@@ -25136,6 +25179,7 @@ mod tests {
             "confidence": 0.9,
             "evidence_refs": [sha_hex],
         });
+        resign_fed(&mut hit); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation { attestation: hit })
             .await
@@ -25149,6 +25193,7 @@ mod tests {
             "confidence": 0.9,
             "evidence_refs": [other_sha],
         });
+        resign_fed(&mut miss); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation { attestation: miss })
             .await
@@ -25204,6 +25249,7 @@ mod tests {
             "confidence": 0.9,
             "evidence_refs": [sha_hex],
         });
+        resign_fed(&mut att); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation { attestation: att })
             .await

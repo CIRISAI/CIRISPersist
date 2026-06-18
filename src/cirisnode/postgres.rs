@@ -2505,10 +2505,17 @@ mod tests {
     /// `identity_type`.
     async fn seed_key_pg(backend: &PostgresBackend, key_id: &str, identity_type: &str) {
         use crate::federation::FederationDirectory;
+        // v9.0.0 (CC 5.3.2.4.3.1) — real deterministic hybrid pubkeys so
+        // the federation-tier seed attestations (signed via
+        // `sign_envelope(key_id, ...)`) verify at the ingest gate.
+        // Moderation/contribution payloads verify self-contained against
+        // their `author_id` pubkey (SCHEMA.md §2.2), not this row.
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
         let rec = crate::federation::types::KeyRecord {
             key_id: key_id.into(),
-            pubkey_ed25519_base64: key_id.into(),
-            pubkey_ml_dsa_65_base64: None,
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
             algorithm: crate::federation::types::algorithm::HYBRID.into(),
             identity_type: identity_type.into(),
             identity_ref: key_id.into(),
@@ -2565,6 +2572,14 @@ mod tests {
         subjects: &[&str],
     ) {
         use crate::federation::FederationDirectory;
+        // v9.0.0 (CC 5.3.2.4.3.1) — hybrid-sign with `producer`'s
+        // deterministic key (matches `seed_key_pg`'s registered pubkeys).
+        let envelope = serde_json::json!({
+            "dimension": "content:established:v1",
+            "evidence_refs": [content_sha256],
+        });
+        let (och, classical, pqc) =
+            crate::federation::tier_ingest::test_support::sign_envelope(producer, &envelope);
         let att = crate::federation::types::Attestation {
             attestation_id: Uuid::new_v4().to_string(),
             attesting_key_id: producer.into(),
@@ -2573,16 +2588,13 @@ mod tests {
             weight: None,
             asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             expires_at: None,
-            attestation_envelope: serde_json::json!({
-                "dimension": "content:established:v1",
-                "evidence_refs": [content_sha256],
-            }),
-            original_content_hash: "abc123".into(),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
+            attestation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
             scrub_key_id: producer.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
-            pqc_completed_at: None,
+            pqc_completed_at: Some("2026-05-01T00:00:00Z".parse().unwrap()),
             persist_row_hash: String::new(),
             subject_key_ids: subjects.iter().map(|s| s.to_string()).collect(),
             withdraws_admission_rule: None,
@@ -2605,6 +2617,14 @@ mod tests {
     ) {
         use crate::federation::FederationDirectory;
         let id = Uuid::new_v4().to_string();
+        // v9.0.0 (CC 5.3.2.4.3.1) — hybrid-sign with `granter`'s
+        // deterministic key (matches the registered pubkeys).
+        let envelope = serde_json::json!({
+            "references_attestation_id": id,
+            "scope": scope,
+        });
+        let (och, classical, pqc) =
+            crate::federation::tier_ingest::test_support::sign_envelope(granter, &envelope);
         let att = crate::federation::types::Attestation {
             attestation_id: id.clone(),
             attesting_key_id: granter.into(),
@@ -2613,16 +2633,13 @@ mod tests {
             weight: None,
             asserted_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             expires_at: None,
-            attestation_envelope: serde_json::json!({
-                "references_attestation_id": id,
-                "scope": scope,
-            }),
-            original_content_hash: "abc123".into(),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
+            attestation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
             scrub_key_id: granter.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
-            pqc_completed_at: None,
+            pqc_completed_at: Some("2026-05-01T00:00:00Z".parse().unwrap()),
             persist_row_hash: String::new(),
             subject_key_ids: Vec::new(),
             withdraws_admission_rule: None,

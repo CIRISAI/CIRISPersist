@@ -86,6 +86,13 @@ pub mod stream_seal;
 // gate + storage live in the backends.
 pub mod stream_receipt;
 pub mod stream_sth;
+// v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — the PQC-mandatory
+// federation-tier ingest gate: hybrid-verify a federation-tier
+// attestation's envelope signature against the attester's REGISTERED
+// pubkeys at the bulk store/replicate path, BEFORE persist. Local-tier
+// rows are exempt (CC 5.3.2.2 deferred signature). Sibling of
+// `register::verify_key_registration`; same verify contract.
+pub mod tier_ingest;
 pub mod topology;
 pub mod trust_grant;
 pub mod types;
@@ -172,6 +179,7 @@ pub use stream_sth::{
     log_id_for_stream, parse_stream_id, recompute_and_assert_root, StreamChunkLeaf,
     STREAM_LOG_ID_PREFIX,
 };
+pub use tier_ingest::verify_federation_tier_ingest;
 pub use topology::{
     build_delegation_graph, build_trust_topology, AuditChainEntry, AuditChainProof, DelegationEdge,
     DelegationGraph, EdgeType, FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology,
@@ -2390,6 +2398,43 @@ pub enum Error {
         offending_scopes: Vec<String>,
     },
 
+    /// v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — a **federation-tier**
+    /// attestation was REJECTED at the bulk store/replicate ingest gate
+    /// because its envelope hybrid signature could not be verified
+    /// against the attesting key's REGISTERED pubkeys under the
+    /// always-on `HybridPolicy::Strict` (both Ed25519 over `JCS(envelope)`
+    /// AND ML-DSA-65 over the bound `JCS(envelope) ‖ ed25519_sig`
+    /// REQUIRED). Causes, all fail-secure (the row is NOT stored): the
+    /// classical-only / hybrid-pending case (missing ML-DSA-65 half —
+    /// the load-bearing CC 5.3.2.4.3.1 guard), a tampered / invalid
+    /// Ed25519 or ML-DSA-65 signature, a canonicalizer mismatch
+    /// (`SHA-256(JCS(envelope)) != original_content_hash`), or an
+    /// **unregistered attester** (no pubkeys to verify against). The
+    /// mandate is at the federation admission boundary only — **local-tier
+    /// rows are EXEMPT** (CC 5.3.2.2 deferred signature) and never reach
+    /// this gate. Distinct from [`Error::SignatureInvalid`] (the
+    /// registration-gate token) so consumers can pattern-match the
+    /// federation-tier ingest rejection deterministically (stable
+    /// `kind()` token `federation_federation_tier_unverified`).
+    /// Verify-before-mutation (AV-9). See
+    /// [`verify_federation_tier_ingest`](crate::federation::verify_federation_tier_ingest).
+    #[error(
+        "federation-tier attestation {attestation_id:?} (attesting_key_id={attesting_key_id:?}) \
+         rejected at the bulk ingest gate: {reason} — a federation-tier row MUST carry a \
+         valid hybrid Ed25519 + ML-DSA-65 signature verified against the attester's registered \
+         key (CC 5.3.2.4.3.1; classical-only / non-PQC producers are confined to local-tier)"
+    )]
+    FederationTierUnverified {
+        /// The rejected row's `attestation_id`.
+        attestation_id: String,
+        /// The `attesting_key_id` whose registered key the signature was
+        /// (or could not be) verified against.
+        attesting_key_id: String,
+        /// Human-readable cause (missing PQC half / bad signature /
+        /// canonicalizer mismatch / unregistered attester).
+        reason: String,
+    },
+
     /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228 item 1 / #229 item 1)
     /// — a WholenessWitness was REJECTED at the verify-before-persist
     /// gate: the §19.0 PQC-mandatory hard cut (classical-only / missing
@@ -2451,6 +2496,7 @@ impl Error {
             Error::WithdrawsNotAdmitted { .. } => "federation_withdraws_not_admitted",
             Error::DelegatedScopeUnauthorized { .. } => "federation_delegated_scope_unauthorized",
             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
+            Error::FederationTierUnverified { .. } => "federation_federation_tier_unverified",
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",
         }

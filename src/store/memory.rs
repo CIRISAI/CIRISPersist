@@ -1074,6 +1074,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // emission leaves no trace.
         crate::federation::admission::check_node_agency_admission(self, &row).await?;
 
+        // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
+        // hybrid-verify at the federation-tier bulk store/replicate
+        // ingest gate (parity with the postgres + sqlite backends). A
+        // no-op for local-tier rows (CC 5.3.2.2 deferred signature); for
+        // a federation-tier row it hybrid-verifies the envelope signature
+        // (Ed25519 + ML-DSA-65, Strict) against the attester's REGISTERED
+        // pubkeys. Composes with — does not replace — the trust-threshold
+        // check_federation + the node-agency gate. Runs BEFORE the state
+        // lock (it calls lookup_public_key on self, which acquires the
+        // lock itself) and BEFORE persist — a rejected row leaves no trace
+        // (verify-before-mutation, AV-9; store-then-quarantine is
+        // non-conformant per CC 5.3.2.4.3.1).
+        crate::federation::verify_federation_tier_ingest(self, &row).await?;
+
         let mut state = self.state.lock().expect("memory backend lock");
         // FK enforcement parity with postgres: both attesting_key_id
         // and attested_key_id must exist in federation_keys.
@@ -3947,10 +3961,15 @@ mod tests {
     };
 
     fn fix_key(key_id: &str, identity_ref: &str, scrub_key_id: &str) -> KeyRecord {
+        // v9.0.0 (CC 5.3.2.4.3.1) — register REAL deterministic hybrid
+        // pubkeys so the federation-tier ingest gate verifies attestations
+        // signed by this key (see `tier_ingest::test_support`).
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
         KeyRecord {
             key_id: key_id.into(),
-            pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-            pubkey_ml_dsa_65_base64: None,
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
             algorithm: crate::federation::types::algorithm::HYBRID.into(),
             identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
             identity_ref: identity_ref.into(),
@@ -3969,13 +3988,29 @@ mod tests {
         }
     }
 
+    /// v9.0.0 (CC 5.3.2.4.3.1) — (re-)sign a federation-tier test
+    /// attestation's envelope with its `attesting_key_id`'s deterministic
+    /// hybrid key so the mandatory federation-tier ingest gate verifies
+    /// it. Call AFTER any post-construction mutation of
+    /// `attestation_envelope` / `attesting_key_id`. Matching pubkeys are
+    /// registered via [`fix_key`].
+    fn resign_fix(row: &mut Attestation) {
+        let (och, classical, pqc) = crate::federation::tier_ingest::test_support::sign_envelope(
+            &row.attesting_key_id,
+            &row.attestation_envelope,
+        );
+        row.original_content_hash = och;
+        row.scrub_signature_classical = classical;
+        row.scrub_signature_pqc = pqc;
+    }
+
     fn fix_attestation(
         id: &str,
         attesting: &str,
         attested: &str,
         scrub_key_id: &str,
     ) -> Attestation {
-        Attestation {
+        let mut row = Attestation {
             attestation_id: id.into(),
             attesting_key_id: attesting.into(),
             attested_key_id: attested.into(),
@@ -4005,7 +4040,10 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
-        }
+        };
+        // v9.0.0 — sign the as-built envelope (CC 5.3.2.4.3.1).
+        resign_fix(&mut row);
+        row
     }
 
     fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
@@ -4046,6 +4084,7 @@ mod tests {
             "id": id,
             "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
         });
+        resign_fix(&mut att); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         att
     }
 
@@ -4444,13 +4483,21 @@ mod tests {
     #[tokio::test]
     async fn put_attestation_requires_both_keys_exist() {
         let backend = MemoryBackend::new();
-        // Neither key exists yet — should fail with InvalidArgument.
+        // Neither key exists yet — should be rejected. v9.0.0
+        // (CC 5.3.2.4.3.1): the federation-tier ingest gate fires first
+        // and rejects the UNREGISTERED attester (no pubkeys to verify the
+        // hybrid signature against) as FederationTierUnverified, before
+        // the FK-existence InvalidArgument check inside the lock. Either
+        // way the row is not stored.
         let att = fix_attestation("a-1", "registry-steward", "primitive-a", "registry-steward");
         let err = backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap_err();
-        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+        assert!(matches!(
+            err,
+            crate::federation::Error::FederationTierUnverified { .. }
+        ));
 
         // Add the keys; retry succeeds.
         backend
@@ -4559,6 +4606,7 @@ mod tests {
             "dimension": "content:established:v1",
             "evidence_refs": [sha],
         });
+        resign_fix(&mut est); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         est.subject_key_ids = vec!["subj-1".into(), "subj-2".into()];
         backend
             .put_attestation(SignedAttestation { attestation: est })
@@ -5222,7 +5270,7 @@ mod tests {
         references_attestation_id: &str,
         asserted_at: &str,
     ) -> Attestation {
-        Attestation {
+        let mut row = Attestation {
             attestation_id: id.into(),
             attesting_key_id: attester.into(),
             attested_key_id: attester.into(),
@@ -5246,7 +5294,9 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
-        }
+        };
+        resign_fix(&mut row); // v9.0.0 — sign the envelope (CC 5.3.2.4.3.1)
+        row
     }
 
     #[tokio::test]
@@ -5303,6 +5353,7 @@ mod tests {
             "references_attestation_id": target_id,
             "withdrawal_reason": "test",
         });
+        resign_fix(&mut w); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         w
     }
 
@@ -5319,6 +5370,7 @@ mod tests {
             "references_attestation_id": id,
             "scope": scope,
         });
+        resign_fix(&mut d); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         d
     }
 
@@ -5422,6 +5474,7 @@ mod tests {
             env["community_id"] = serde_json::Value::String(c.to_owned());
         }
         a.attestation_envelope = env;
+        resign_fix(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         a.subject_key_ids = subject_key_ids.iter().map(|s| (*s).to_owned()).collect();
         a
     }
@@ -5436,6 +5489,7 @@ mod tests {
     ) -> Attestation {
         let mut d = fix_delegates_to(id, granter, grantee, scope);
         d.attestation_envelope["sub_delegation"] = serde_json::Value::Bool(sub_delegation);
+        resign_fix(&mut d); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         d
     }
 
@@ -5924,6 +5978,7 @@ mod tests {
                         crate::federation::types::attestation_type::WITHDRAWS.into();
                     w.attestation_envelope =
                         serde_json::json!({"references_attestation_id": "h-1"});
+                    resign_fix(&mut w); // envelope changed → re-sign (CC 5.3.2.4.3.1)
                     w
                 },
             })
@@ -6094,63 +6149,42 @@ mod tests {
         use crate::federation::{SignedAttestation, SignedKeyRecord};
         let backend = MemoryBackend::new();
         // Add a peer + a counter-peer so we can build an attestation
-        // between them.
+        // between them. v9.0.0 (CC 5.3.2.4.3.1): the attestation below is
+        // federation-tier, so its attester (peer-att-a) must carry REAL
+        // hybrid pubkeys. Register peer-att-a via fix_key first (full
+        // hybrid pubkeys), then add_peer_record with the MATCHING Ed25519
+        // pubkey (the upsert-of-metadata path — pubkey matches, no
+        // conflict), so the peer-metadata row exists and the key can be
+        // hybrid-verified.
         backend
-            .add_peer_record("peer-att-a", "AAAA", "agent", None)
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("peer-att-a", "peer-att-a", "peer-att-a"),
+            })
             .await
             .unwrap();
-        // A second federation_keys row registered the normal way.
-        let other_key = crate::federation::KeyRecord {
-            key_id: "peer-att-b".into(),
-            pubkey_ed25519_base64: "BBBB".into(),
-            pubkey_ml_dsa_65_base64: None,
-            algorithm: crate::federation::types::algorithm::HYBRID.into(),
-            identity_type: "agent".into(),
-            identity_ref: "peer-att-b".into(),
-            valid_from: chrono::Utc::now(),
-            valid_until: None,
-            registration_envelope: serde_json::json!({"id": "peer-att-b"}),
-            original_content_hash: "00".repeat(32),
-            scrub_signature_classical: "sig".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: "peer-att-b".into(),
-            scrub_timestamp: chrono::Utc::now(),
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            roles: Vec::new(),
-            attestation_evidence: None,
-        };
+        let (peer_a_ed, _) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys("peer-att-a");
         backend
-            .put_public_key(SignedKeyRecord { record: other_key })
+            .add_peer_record("peer-att-a", &peer_a_ed, "agent", None)
+            .await
+            .unwrap();
+        // A second federation_keys row registered the normal way (with
+        // real hybrid pubkeys so it can be an attested key).
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("peer-att-b", "peer-att-b", "peer-att-b"),
+            })
             .await
             .unwrap();
         // Attestation that references peer-att-a as attesting key.
-        let att = crate::federation::Attestation {
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            attesting_key_id: "peer-att-a".into(),
-            attested_key_id: "peer-att-b".into(),
-            attestation_type: crate::federation::types::attestation_type::SCORES.into(),
-            weight: None,
-            asserted_at: chrono::Utc::now(),
-            expires_at: None,
-            attestation_envelope: serde_json::json!({
-                "dimension": "identity_binding:v1",
-                "score": 0.5,
-                "confidence": 0.9,
-            }),
-            original_content_hash: "00".repeat(32),
-            scrub_signature_classical: "sig".into(),
-            scrub_signature_pqc: None,
-            scrub_key_id: "peer-att-a".into(),
-            scrub_timestamp: chrono::Utc::now(),
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            subject_key_ids: Vec::new(),
-            withdraws_admission_rule: None,
-            cohort_scope: "federation".to_string(),
-            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
-            promoted_at: None,
-        };
+        // v9.0.0 — build via fix_attestation + resign so the mandatory
+        // federation-tier ingest gate verifies it (CC 5.3.2.4.3.1).
+        let att = fix_attestation(
+            &uuid::Uuid::new_v4().to_string(),
+            "peer-att-a",
+            "peer-att-b",
+            "peer-att-a",
+        );
         backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
@@ -6602,6 +6636,7 @@ mod tests {
         }
         let mut a = fix_attestation(id, subject, "registry-steward", "registry-steward");
         a.attestation_envelope = env;
+        resign_fix(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         a.tier = tier.to_string();
         // A local-tier row must be cohort_scope=self (the v4.0 read-gate);
         // federation rows keep the fixture default.
@@ -6774,6 +6809,7 @@ mod tests {
                 "id": id,
                 "references_attestation_id": "T-1",
             });
+            resign_fix(&mut w); // envelope changed → re-sign (CC 5.3.2.4.3.1)
             w
         };
 
@@ -6799,6 +6835,7 @@ mod tests {
             "confidence": 1.0,
             "witness_relation": "self",
         });
+        resign_fix(&mut binding); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         backend
             .put_attestation(SignedAttestation {
                 attestation: binding,
