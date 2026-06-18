@@ -1791,6 +1791,77 @@ pub async fn is_owner_bound(
     Ok(false)
 }
 
+/// v9.0.0 (CC 3.2 "owner-binding gate for non-infrastructure membership"
+/// / CC 3.4.7.1) — the community-admission precondition: a `node`- or
+/// `agent`-role roster member of a **non-infrastructure** community MUST
+/// be owner-bound ([`is_owner_bound`]) before admission. Non-infra
+/// membership is an *authority act* (standing to speak AS the group),
+/// and CC 1.13.2 requires authority to root in an accountable human — a
+/// fresh, unowned node/agent is **canonical-trust-and-serve only** until
+/// owned. This is a **precondition**, not a substitute for the community's
+/// own `consensus_protocol` vote (which still governs *whether* an owned
+/// key is admitted).
+///
+/// # Scope and the infrastructure carve-out
+///
+/// `cohort_subkind: infrastructure` communities (`ciris-canonical` /
+/// operator governance roots — resolved from `community.policy_blob`,
+/// exactly the form [`crate::federation::types::crypto_tier`] and
+/// [`crate::federation::location::geographic_constraint_cell`] read) are
+/// **EXEMPT**: a node MAY trust + serve an infrastructure community with
+/// no owner (CC 3.2 "Trust ≠ membership"). For every other community this
+/// gate runs per roster member.
+///
+/// A member key that does NOT resolve in `federation_keys`, or whose
+/// `identity_type` set contains NEITHER `node` NOR `agent` (e.g. a pure
+/// `user`/`org` member, or an unrecognized future role), is **out of
+/// scope** — the gate constrains only node/agent standing. A `user`-role
+/// member trivially satisfies `is_owner_bound` (clause 1) and is never
+/// rejected here.
+///
+/// Fail-secure: the FIRST node/agent member lacking a live owner-binding
+/// rejects the whole `put_community` with [`Error::UnownedCommunityMember`]
+/// BEFORE any row is stored (verify-before-mutation, AV-9).
+pub async fn check_community_membership_owner_binding(
+    directory: &dyn super::FederationDirectory,
+    community: &super::Community,
+) -> Result<(), Error> {
+    // Infrastructure carve-out: trust + serve needs no owner (CC 3.2).
+    let cohort_subkind = community
+        .policy_blob
+        .as_ref()
+        .and_then(|b| b.get("cohort_subkind"))
+        .and_then(|v| v.as_str());
+    if cohort_subkind == Some("infrastructure") {
+        return Ok(());
+    }
+    for member in &community.members {
+        // Resolve the member's identity_type set. An unresolved member has
+        // no node/agent standing this gate can prove — out of scope (and
+        // FK-orthogonal: put_community does not FK roster members).
+        let Some(rec) = directory.lookup_public_key(&member.key_id).await? else {
+            continue;
+        };
+        // Only node/agent members are an authority-act constraint. Report
+        // `node` first when both are present (it is the stricter framing).
+        let member_role = if identity_type::set_contains(&rec.identity_type, identity_type::NODE) {
+            identity_type::NODE
+        } else if identity_type::set_contains(&rec.identity_type, identity_type::AGENT) {
+            identity_type::AGENT
+        } else {
+            continue;
+        };
+        if !is_owner_bound(directory, &member.key_id).await? {
+            return Err(Error::UnownedCommunityMember {
+                community_key_id: community.community_key_id.clone(),
+                member_key_id: member.key_id.clone(),
+                member_role,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §11.11) — is key `k` a **named
 /// moderator** of community `community_id` for `duty` (`moderate` /
 /// `takedown` / `review`)? True iff a live scope-bearing `delegates_to`

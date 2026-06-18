@@ -20710,6 +20710,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // node-only key is caller-side authorization failure; ValueError
         // (4xx). "Infrastructure must not have agency."
         crate::federation::Error::NodeAgencyForbidden { .. } => PyValueError::new_err(kind),
+        // v9.0.0 (CC 3.2 / CC 3.4.7.1) — admitting an unowned node/agent to
+        // a non-infrastructure community is a caller-side authorization
+        // failure (non-infra membership is an authority act that must root
+        // in an owner); ValueError (4xx).
+        crate::federation::Error::UnownedCommunityMember { .. } => PyValueError::new_err(kind),
         // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — a federation-tier
         // attestation rejected at the bulk ingest gate (missing ML-DSA-65
         // half / tampered signature / canonicalizer mismatch /
