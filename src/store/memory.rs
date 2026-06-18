@@ -1609,6 +1609,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         revocation: crate::federation::SignedCommunityMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
         let mut row = revocation.community_membership_revocation;
+        // SecReview F4 — community removal is immediate for forward-secrecy;
+        // reject a future-dated effective_at BEFORE any state mutation
+        // (3-backend parity with pg + sqlite).
+        crate::federation::community_dek::reject_future_dated_community_revocation(
+            row.effective_at,
+        )?;
         let mut state = self.state.lock().expect("memory backend lock");
         for k in [&row.community_key_id, &row.removed_identity_key_id] {
             if !state.federation_keys.contains_key(k) {
@@ -4312,6 +4318,105 @@ mod tests {
         assert_eq!(stored[0].attestation_id, "d-agent");
     }
 
+    /// SecReview F1: a DUPLICATE `identity_type` token (`"node,node"` /
+    /// `"node, node"`) must NOT bypass the node-agency gate. The gate tests
+    /// the identity_type *set*, so a node-only key carrying `agency:*` is
+    /// REJECTED + not stored regardless of dup/whitespace tokens — closing
+    /// the `parse_set` non-dedup bypass (CC 1.13.5 / CC 4.4.3.4.3).
+    #[tokio::test]
+    async fn node_delegation_agency_rejected_with_duplicate_identity_type_token() {
+        use crate::federation::types::delegation_scope as ds;
+        use crate::federation::types::identity_type;
+        for (key_id, dup_ity) in [("node-dup", "node,node"), ("node-ws", "node, node")] {
+            let backend = MemoryBackend::new();
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key("registry-steward", "registry", "registry-steward"),
+                })
+                .await
+                .unwrap();
+            let mut owner = fix_key("owner", "owner", "registry-steward");
+            owner.identity_type = identity_type::USER.into();
+            backend
+                .put_public_key(SignedKeyRecord { record: owner })
+                .await
+                .unwrap();
+            // Node key whose identity_type set is exactly {node} but stored
+            // with a duplicate / whitespace token.
+            let mut node = fix_key(key_id, "node", "registry-steward");
+            node.identity_type = dup_ity.into();
+            backend
+                .put_public_key(SignedKeyRecord { record: node })
+                .await
+                .unwrap();
+            let err = backend
+                .put_attestation(SignedAttestation {
+                    attestation: fix_node_delegates_to(
+                        "d-dup",
+                        "owner",
+                        key_id,
+                        "owner",
+                        &[ds::AGENCY_ACT_ON_BEHALF],
+                    ),
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::federation::Error::NodeAgencyForbidden { .. }),
+                "{dup_ity}: a dup/whitespace node token must still hit the gate, got {err:?}"
+            );
+            assert_eq!(err.kind(), "federation_node_agency_forbidden");
+            assert!(backend
+                .list_attestations_for(key_id)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    /// SecReview F1 (negative control): a genuine `node,agent` HYBRID key is
+    /// NOT node-only, so it legitimately carries `agency:*` — the set-based
+    /// gate must still ADMIT it (no over-reject from the dedup fix).
+    #[tokio::test]
+    async fn node_agent_hybrid_carries_agency_admitted() {
+        use crate::federation::types::delegation_scope as ds;
+        use crate::federation::types::identity_type;
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let mut owner = fix_key("owner", "owner", "registry-steward");
+        owner.identity_type = identity_type::USER.into();
+        backend
+            .put_public_key(SignedKeyRecord { record: owner })
+            .await
+            .unwrap();
+        let mut hybrid = fix_key("node-agent", "hybrid", "registry-steward");
+        hybrid.identity_type = format!("{},{}", identity_type::NODE, identity_type::AGENT);
+        backend
+            .put_public_key(SignedKeyRecord { record: hybrid })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "d-hybrid",
+                    "owner",
+                    "node-agent",
+                    "owner",
+                    &[ds::AGENCY_ACT_ON_BEHALF],
+                ),
+            })
+            .await
+            .expect("a node,agent hybrid legitimately carries agency");
+        let stored = backend.list_attestations_for("node-agent").await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].attestation_id, "d-hybrid");
+    }
+
     #[tokio::test]
     async fn put_and_lookup_public_key() {
         let backend = MemoryBackend::new();
@@ -6140,10 +6245,37 @@ mod tests {
         members: Vec<crate::federation::types::CommunityMember>,
         cohort_subkind: Option<&str>,
     ) -> Result<(), crate::federation::Error> {
+        // SecReview F2: an infra carve-out is honored only when the
+        // community's own key is the `substrate_persist` authority — default
+        // the comm key to authorized exactly when infra-labeled.
+        let comm_authorized = cohort_subkind == Some("infrastructure");
+        put_community_with_authority(
+            backend,
+            community_id,
+            members,
+            cohort_subkind,
+            comm_authorized,
+        )
+        .await
+    }
+
+    /// As [`put_community_with`] but with explicit control over whether the
+    /// community's own key carries the `substrate_persist` authority
+    /// (SecReview F2 unauthorized-infra-label test).
+    async fn put_community_with_authority(
+        backend: &MemoryBackend,
+        community_id: &str,
+        members: Vec<crate::federation::types::CommunityMember>,
+        cohort_subkind: Option<&str>,
+        comm_authorized: bool,
+    ) -> Result<(), crate::federation::Error> {
+        let mut comm_key = fix_key(community_id, "primitive", community_id);
+        if comm_authorized {
+            comm_key.identity_type =
+                crate::federation::types::identity_type::SUBSTRATE_PERSIST.into();
+        }
         backend
-            .put_public_key(SignedKeyRecord {
-                record: fix_key(community_id, "primitive", community_id),
-            })
+            .put_public_key(SignedKeyRecord { record: comm_key })
             .await
             .unwrap();
         let policy_blob = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
@@ -6275,6 +6407,99 @@ mod tests {
             .is_some());
     }
 
+    /// SecReview F3: a `delegates_to(user → node)` that the granter has
+    /// WITHDRAWN no longer confers owner-binding. The node is admitted while
+    /// the delegation is live, then a second community (same owner-withdrawn
+    /// node) is REJECTED — the withdrawn edge is not "live".
+    #[tokio::test]
+    async fn community_owner_binding_withdrawn_delegation_not_live() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        // owner (user) delegates infra:* → node → owner-binding (live).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "ob-d-wd",
+                    "ob-owner",
+                    "ob-node",
+                    "ob-owner",
+                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                ),
+            })
+            .await
+            .unwrap();
+        // Live → admitted.
+        put_community_with(&backend, "comm-ob-wd-live", vec![member("ob-node")], None)
+            .await
+            .expect("owner-bound (live delegation) node admitted");
+
+        // owner WITHDRAWS the delegation edge (issuer-against-recipient: the
+        // withdraws' attested_key_id is the recipient `ob-node`).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: {
+                    let mut w = fix_attestation("ob-d-wd-w", "ob-owner", "ob-node", "ob-owner");
+                    w.attestation_type =
+                        crate::federation::types::attestation_type::WITHDRAWS.into();
+                    w.attestation_envelope =
+                        serde_json::json!({"references_attestation_id": "ob-d-wd"});
+                    resign_fix(&mut w);
+                    w
+                },
+            })
+            .await
+            .expect("owner withdraws own delegation edge");
+
+        // Withdrawn → NOT owner-bound → REJECTED.
+        let err = put_community_with(&backend, "comm-ob-wd-dead", vec![member("ob-node")], None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::Error::UnownedCommunityMember { .. }
+        ));
+        assert!(backend
+            .lookup_community("comm-ob-wd-dead")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// SecReview F3: an EXPIRED `delegates_to(user → node)` (`expires_at` in
+    /// the past) does NOT confer owner-binding — the unowned node is
+    /// REJECTED.
+    #[tokio::test]
+    async fn community_owner_binding_expired_delegation_not_live() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        let mut d = fix_node_delegates_to(
+            "ob-d-exp",
+            "ob-owner",
+            "ob-node",
+            "ob-owner",
+            &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+        );
+        d.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap()); // past
+        backend
+            .put_attestation(SignedAttestation { attestation: d })
+            .await
+            .unwrap();
+        let err = put_community_with(&backend, "comm-ob-exp", vec![member("ob-node")], None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::Error::UnownedCommunityMember { .. }
+        ));
+        assert!(backend
+            .lookup_community("comm-ob-exp")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     /// An OWNER-BOUND agent member (live `delegates_to(user → agent)`) →
     /// ADMITTED. Agent is not node-only, so the delegation needs no infra
     /// scope to store.
@@ -6324,6 +6549,41 @@ mod tests {
             .is_some());
     }
 
+    /// SecReview F2: an `infrastructure`-LABELED community whose own key is
+    /// NOT `substrate_persist` does NOT get the carve-out — owner-binding is
+    /// STILL enforced, so an UNOWNED node member is REJECTED + not stored
+    /// (fail-secure: a self-applied infra label can never skip the gate).
+    #[tokio::test]
+    async fn community_unauthorized_infra_label_still_enforces_owner_binding() {
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        let err = put_community_with_authority(
+            &backend,
+            "comm-ob-fakeinfra",
+            vec![member("ob-node")],
+            Some("infrastructure"),
+            false, // comm key is NOT substrate_persist
+        )
+        .await
+        .unwrap_err();
+        match err {
+            crate::federation::Error::UnownedCommunityMember {
+                ref member_key_id,
+                member_role,
+                ..
+            } => {
+                assert_eq!(member_key_id, "ob-node");
+                assert_eq!(member_role, crate::federation::types::identity_type::NODE);
+            }
+            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+        }
+        assert!(backend
+            .lookup_community("comm-ob-fakeinfra")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     /// A pure `user`-role member (and an unresolved/non-node-agent member)
     /// is NOT over-rejected — canonical/user participation is in scope only
     /// for node/agent standing.
@@ -6339,6 +6599,48 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// SecReview F4: a FUTURE-DATED community membership revocation
+    /// `effective_at` is REJECTED (`Error::InvalidArgument`) — community
+    /// removal is immediate for forward-secrecy; a non-future `effective_at`
+    /// is accepted AND bumps the DEK epoch. (memory parity.)
+    #[tokio::test]
+    async fn community_revocation_rejects_future_dated_effective_at() {
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await; // ob-owner (community key proxy) + ob-node exist
+        let rev = |effective_at: chrono::DateTime<chrono::Utc>| {
+            crate::federation::SignedCommunityMembershipRevocation {
+                community_membership_revocation: crate::federation::CommunityMembershipRevocation {
+                    community_key_id: "ob-owner".into(),
+                    removed_identity_key_id: "ob-node".into(),
+                    removed_at: effective_at,
+                    effective_at,
+                    reason: Some("left".into()),
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            }
+        };
+        // Future-dated (now + 30d) → REJECTED before any write.
+        let future = chrono::Utc::now() + chrono::Duration::days(30);
+        let err = backend
+            .put_community_membership_revocation(rev(future))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(_)),
+            "future-dated effective_at must be rejected, got {err:?}"
+        );
+        // No epoch bump happened (still 0).
+        assert_eq!(backend.community_dek_epoch("ob-owner"), 0);
+
+        // effective_at == now → accepted + epoch bumps to 1.
+        backend
+            .put_community_membership_revocation(rev(chrono::Utc::now()))
+            .await
+            .expect("non-future revocation accepted");
+        assert_eq!(backend.community_dek_epoch("ob-owner"), 1);
     }
 
     // ── v3.1.0 (CIRISPersist#117) — peer-mutation surface ──────────

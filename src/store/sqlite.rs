@@ -2821,6 +2821,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         revocation: crate::federation::SignedCommunityMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
         let mut row = revocation.community_membership_revocation;
+        // SecReview F4 — community removal is immediate for forward-secrecy;
+        // reject a future-dated effective_at BEFORE any write.
+        crate::federation::community_dek::reject_future_dated_community_revocation(
+            row.effective_at,
+        )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let witness = serde_json::to_string(&row.witness_set)
             .map_err(|e| crate::federation::Error::Backend(format!("witness_set encode: {e}")))?;
@@ -2832,13 +2837,19 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &row.removed_identity_key_id,
             row.effective_at,
         );
-        // Captured before the move-closure consumes `row` (CC 4.4.3.2.2
-        // rotation-on-removal, applied after the revocation lands).
-        let community_key_id_for_rotation = row.community_key_id.clone();
+        let removal_detail = serde_json::to_string(&removal_event.detail).map_err(|e| {
+            crate::federation::Error::Backend(format!("hard_case detail serialize: {e}"))
+        })?;
         let conn = self.conn.clone();
+        // SecReview F5 — INSERT + hard_case + epoch bump in ONE transaction
+        // under a single lock acquisition: a bump failure after the INSERT
+        // must NOT leave a durable un-rotated revocation. (The prior code
+        // called self.record_hard_case / self.community_dek_bump_epoch, each
+        // taking its own lock + autocommit — three separate commits.)
         (move || -> Result<(), rusqlite::Error> {
-            let conn = conn.lock();
-            conn.execute(
+            let mut conn = conn.lock();
+            let tx = conn.transaction()?;
+            tx.execute(
                 "INSERT INTO federation_community_membership_revocations (\
                     community_key_id, removed_identity_key_id, removed_at, effective_at, \
                     reason, witness_set, persist_row_hash\
@@ -2853,27 +2864,36 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.persist_row_hash,
                 ],
             )?;
-            Ok(())
+            // Idempotent on the deterministic event_id.
+            tx.execute(
+                "INSERT INTO hard_case_events \
+                    (event_id, kind, target_key_id, subject_key_id, detail, emitted_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(event_id) DO NOTHING",
+                rusqlite::params![
+                    removal_event.event_id,
+                    removal_event.kind,
+                    removal_event.target_key_id,
+                    removal_event.subject_key_id,
+                    removal_detail,
+                    removal_event.emitted_at.to_rfc3339(),
+                ],
+            )?;
+            // CC 4.4.3.2.2 rotation-on-removal: bump the community DEK epoch
+            // (epoch 0 → first bump yields 1; subsequent bumps +1). Forward-
+            // only — blobs already sealed under the old epoch keep their
+            // grants. A spurious extra bump only skips an epoch number, which
+            // is harmless (the DEK is minted lazily on next emission).
+            tx.execute(
+                "INSERT INTO federation_community_dek_epoch (community_key_id, epoch, rotated_at) \
+                 VALUES (?1, 1, datetime('now', 'subsec')) \
+                 ON CONFLICT (community_key_id) DO UPDATE SET \
+                    epoch = epoch + 1, rotated_at = datetime('now', 'subsec')",
+                rusqlite::params![row.community_key_id],
+            )?;
+            tx.commit()
         })()
         .map_err(map_revocation_sqlite_err("community_membership_revocation"))?;
-        self.record_hard_case(removal_event).await?;
-        // CC 4.4.3.2.2 rotation-on-removal: bump the community DEK epoch so
-        // the next emission seals under a fresh DEK wrapped only to the
-        // remaining members (the removed member's keys cannot unwrap it).
-        // Forward-only — blobs already sealed under the old epoch keep
-        // their grants. Idempotent at the revocation-row level (the row is
-        // PK-idempotent); a spurious extra bump only skips an epoch number,
-        // which is harmless (the DEK is minted lazily on next emission).
-        {
-            use crate::federation::blobs::BlobStorage as _;
-            self.community_dek_bump_epoch(&community_key_id_for_rotation)
-                .await
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!(
-                        "community DEK rotation-on-removal: {e}"
-                    ))
-                })?;
-        }
         Ok(())
     }
 
@@ -16378,12 +16398,38 @@ mod tests {
         members: &[(&str, &str, bool)],
         policy: Option<serde_json::Value>,
     ) -> SqliteBackend {
+        // SecReview F2: an infrastructure-labeled community is only honored
+        // when its OWN key is the `substrate_persist` governance authority.
+        // Default the comm key's authority to "authorized" exactly when the
+        // fixture is infra-labeled (keeps the authorized-carve-out tests
+        // exercising the honored path); a non-infra fixture's comm key
+        // identity_type is irrelevant to the gate.
+        let comm_is_infra = policy
+            .as_ref()
+            .and_then(|b| b.get("cohort_subkind"))
+            .and_then(|v| v.as_str())
+            == Some("infrastructure");
+        community_fixture_comm_authority(members, policy, comm_is_infra).await
+    }
+
+    /// As [`community_fixture`] but with explicit control over whether the
+    /// community's OWN key carries the `substrate_persist` governance
+    /// authority — used by the SecReview F2 unauthorized-infra-label test
+    /// (infra-labeled but `comm_authorized == false`).
+    async fn community_fixture_comm_authority(
+        members: &[(&str, &str, bool)],
+        policy: Option<serde_json::Value>,
+        comm_authorized: bool,
+    ) -> SqliteBackend {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        let mut comm_key = fed_key("comm", "comm", "comm");
+        if comm_authorized {
+            comm_key.identity_type =
+                crate::federation::types::identity_type::SUBSTRATE_PERSIST.into();
+        }
         backend
-            .put_public_key(SignedKeyRecord {
-                record: fed_key("comm", "comm", "comm"),
-            })
+            .put_public_key(SignedKeyRecord { record: comm_key })
             .await
             .unwrap();
         let mut member_idents = Vec::new();
@@ -16539,6 +16585,134 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// SecReview F2: an `infrastructure`-LABELED community whose own key is
+    /// NOT `substrate_persist` is NOT exempted — the DEK cascade STILL runs
+    /// (fail-secure: a self-applied infra label can never force content to
+    /// Commons-plaintext). The cascade succeeds + mints an epoch-0 DEK
+    /// instead of refusing.
+    #[tokio::test]
+    async fn community_dek_unauthorized_infra_label_still_cascades_sqlite() {
+        use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+        use crate::federation::BlobStorage;
+
+        // Infra-LABELED community whose own key is NOT substrate_persist
+        // (comm_authorized == false) — an UNauthorized self-labeled infra.
+        let backend = community_fixture_comm_authority(
+            &[("alice", "alice-occ", true)],
+            Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
+            false,
+        )
+        .await;
+
+        // The cascade does NOT refuse — it seals under a real DEK.
+        let result =
+            encrypt_and_cascade_community(&backend, "comm", b"not actually canonical", None)
+                .await
+                .expect("unauthorized infra label must NOT opt out of the DEK cascade");
+        assert_eq!(result.epoch, 0);
+        assert_eq!(result.granted, vec!["alice-occ".to_string()]);
+        // An epoch-0 DEK self-retention row WAS minted (cascade ran).
+        assert!(backend
+            .community_dek_get_self_retention("comm", 0)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// SecReview F4: a FUTURE-DATED community membership revocation
+    /// `effective_at` is REJECTED before any write; a non-future one is
+    /// accepted AND bumps the DEK epoch (sqlite parity).
+    #[tokio::test]
+    async fn community_revocation_rejects_future_dated_effective_at_sqlite() {
+        use crate::federation::BlobStorage;
+        let backend = community_fixture(
+            &[("alice", "alice-occ", true), ("bob", "bob-occ", true)],
+            None,
+        )
+        .await;
+        let rev = |effective: chrono::DateTime<chrono::Utc>| {
+            crate::federation::SignedCommunityMembershipRevocation {
+                community_membership_revocation: crate::federation::CommunityMembershipRevocation {
+                    community_key_id: "comm".into(),
+                    removed_identity_key_id: "bob".into(),
+                    removed_at: effective,
+                    effective_at: effective,
+                    reason: Some("left".into()),
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            }
+        };
+        let future = chrono::Utc::now() + chrono::Duration::days(30);
+        let err = backend
+            .put_community_membership_revocation(rev(future))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(_)),
+            "future-dated effective_at must be rejected, got {err:?}"
+        );
+        // No bump on rejection.
+        assert_eq!(
+            backend.community_dek_current_epoch("comm").await.unwrap(),
+            0
+        );
+        // Non-future revocation accepted → epoch bumps.
+        backend
+            .put_community_membership_revocation(rev(chrono::Utc::now()))
+            .await
+            .expect("non-future revocation accepted");
+        assert_eq!(
+            backend.community_dek_current_epoch("comm").await.unwrap(),
+            1
+        );
+    }
+
+    /// SecReview F5: INSERT + hard_case + epoch-bump are ONE transaction —
+    /// if the epoch bump fails, the revocation INSERT is rolled back (no
+    /// durable un-rotated revocation). Induce the bump failure by dropping
+    /// the epoch table out from under the call, then assert NEITHER the
+    /// revocation row NOR a hard_case event was committed.
+    #[tokio::test]
+    async fn community_revocation_atomic_on_bump_failure_sqlite() {
+        use crate::federation::hard_case::{kind, HardCaseFilter};
+        let backend = community_fixture(
+            &[("alice", "alice-occ", true), ("bob", "bob-occ", true)],
+            None,
+        )
+        .await;
+        // Drop the epoch table so the in-transaction bump statement errors.
+        backend
+            .conn_handle()
+            .lock()
+            .execute("DROP TABLE federation_community_dek_epoch", [])
+            .unwrap();
+
+        let err = backend
+            .put_community_membership_revocation(comm_revoke("bob", "2026-06-10T00:00:00Z"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::Backend(_)),
+            "bump failure should surface, got {err:?}"
+        );
+        // The revocation INSERT rolled back — no durable revocation row.
+        assert!(backend
+            .list_community_membership_revocations_for("comm")
+            .await
+            .unwrap()
+            .is_empty());
+        // And no hard_case event was committed either.
+        let events = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::COMMUNITY_MEMBERSHIP_CHANGE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert!(events.is_empty(), "hard_case must roll back with the txn");
     }
 
     /// CC 4.4.3.2.2 rotation-on-removal: removing a member bumps the epoch;
@@ -23432,6 +23606,96 @@ mod tests {
         assert_eq!(stored[0].attestation_id, id);
     }
 
+    /// SecReview F1 (sqlite parity): a DUPLICATE / whitespace node token
+    /// (`"node,node"` / `"node, node"`) must NOT bypass the node-agency
+    /// gate — `agency:*` on such a node-only key is REJECTED + not stored.
+    #[tokio::test]
+    async fn node_delegation_agency_rejected_with_duplicate_identity_type_token_sqlite() {
+        use crate::federation::types::delegation_scope as ds;
+        use crate::federation::types::identity_type;
+        for (key_id, dup_ity) in [("node-dup", "node,node"), ("node-ws", "node, node")] {
+            let backend = SqliteBackend::open_in_memory().await.unwrap();
+            backend.run_migrations().await.unwrap();
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key_with_identity_type(
+                        "owner",
+                        "owner",
+                        "owner",
+                        identity_type::USER,
+                    ),
+                })
+                .await
+                .unwrap();
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key_with_identity_type(key_id, "node", key_id, dup_ity),
+                })
+                .await
+                .unwrap();
+            let err = backend
+                .put_attestation(SignedAttestation {
+                    attestation: node_delegates_to_sqlite(
+                        "owner",
+                        key_id,
+                        &[ds::AGENCY_ACT_ON_BEHALF],
+                    ),
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::federation::Error::NodeAgencyForbidden { .. }),
+                "{dup_ity}: dup/whitespace node token must still hit the gate, got {err:?}"
+            );
+            assert!(
+                crate::federation::FederationDirectory::list_attestations_for(&backend, key_id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    /// SecReview F1 negative control (sqlite): a genuine `node,agent` hybrid
+    /// legitimately carries `agency:*` — still ADMITTED.
+    #[tokio::test]
+    async fn node_agent_hybrid_carries_agency_admitted_sqlite() {
+        use crate::federation::types::delegation_scope as ds;
+        use crate::federation::types::identity_type;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type("owner", "owner", "owner", identity_type::USER),
+            })
+            .await
+            .unwrap();
+        let hybrid_ity = format!("{},{}", identity_type::NODE, identity_type::AGENT);
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    "node-agent",
+                    "hybrid",
+                    "node-agent",
+                    &hybrid_ity,
+                ),
+            })
+            .await
+            .unwrap();
+        let att = node_delegates_to_sqlite("owner", "node-agent", &[ds::AGENCY_ACT_ON_BEHALF]);
+        let id = att.attestation_id.clone();
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .expect("a node,agent hybrid legitimately carries agency");
+        let stored =
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "node-agent")
+                .await
+                .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].attestation_id, id);
+    }
+
     // ── v9.0.0 (CC 3.2 / CC 3.4.7.1) — owner-binding precondition for
     // non-infrastructure community membership (sqlite parity).
 
@@ -23443,10 +23707,37 @@ mod tests {
         members: Vec<&str>,
         cohort_subkind: Option<&str>,
     ) -> Result<(), crate::federation::Error> {
+        // SecReview F2: an infra carve-out is honored only when the
+        // community's own key is the `substrate_persist` authority — default
+        // the comm key to authorized exactly when infra-labeled.
+        let comm_authorized = cohort_subkind == Some("infrastructure");
+        put_community_ob_sqlite_authority(
+            backend,
+            community_id,
+            members,
+            cohort_subkind,
+            comm_authorized,
+        )
+        .await
+    }
+
+    /// As [`put_community_ob_sqlite`] but with explicit control over whether
+    /// the community's own key carries the `substrate_persist` authority
+    /// (SecReview F2 unauthorized-infra-label test).
+    async fn put_community_ob_sqlite_authority(
+        backend: &SqliteBackend,
+        community_id: &str,
+        members: Vec<&str>,
+        cohort_subkind: Option<&str>,
+        comm_authorized: bool,
+    ) -> Result<(), crate::federation::Error> {
+        let mut comm_key = fed_key(community_id, community_id, community_id);
+        if comm_authorized {
+            comm_key.identity_type =
+                crate::federation::types::identity_type::SUBSTRATE_PERSIST.into();
+        }
         backend
-            .put_public_key(SignedKeyRecord {
-                record: fed_key(community_id, community_id, community_id),
-            })
+            .put_public_key(SignedKeyRecord { record: comm_key })
             .await
             .unwrap();
         let policy = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
@@ -23536,6 +23827,89 @@ mod tests {
             .is_some());
     }
 
+    /// SecReview F3: a WITHDRAWN `delegates_to(user → node)` no longer
+    /// confers owner-binding (sqlite parity) — admitted while live, REJECTED
+    /// after the granter withdraws the edge.
+    #[tokio::test]
+    async fn community_owner_binding_withdrawn_delegation_not_live_sqlite() {
+        use crate::federation::types::{attestation_type, delegation_scope as ds};
+        let backend = bootstrap_node_agency_sqlite().await;
+        let d = node_delegates_to_sqlite(
+            "owner",
+            "node-key",
+            &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+        );
+        let d_id = d.attestation_id.clone();
+        backend
+            .put_attestation(SignedAttestation { attestation: d })
+            .await
+            .unwrap();
+        put_community_ob_sqlite(&backend, "comm-ob-wd-live", vec!["node-key"], None)
+            .await
+            .expect("owner-bound (live) node admitted");
+
+        // owner withdraws the edge (issuer-against-recipient: attested = node-key).
+        let mut w = topo_attestation(
+            "owner",
+            "node-key",
+            attestation_type::WITHDRAWS,
+            None,
+            None,
+            &[],
+            None,
+            chrono::Utc::now(),
+        );
+        w.attestation_envelope = serde_json::json!({"references_attestation_id": d_id});
+        resign_fed(&mut w);
+        backend
+            .put_attestation(SignedAttestation { attestation: w })
+            .await
+            .expect("owner withdraws own delegation edge");
+
+        let err = put_community_ob_sqlite(&backend, "comm-ob-wd-dead", vec!["node-key"], None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::Error::UnownedCommunityMember { .. }
+        ));
+        assert!(backend
+            .lookup_community("comm-ob-wd-dead")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// SecReview F3: an EXPIRED `delegates_to(user → node)` does NOT confer
+    /// owner-binding (sqlite parity) — unowned node REJECTED.
+    #[tokio::test]
+    async fn community_owner_binding_expired_delegation_not_live_sqlite() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = bootstrap_node_agency_sqlite().await;
+        let mut d = node_delegates_to_sqlite(
+            "owner",
+            "node-key",
+            &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+        );
+        d.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap());
+        backend
+            .put_attestation(SignedAttestation { attestation: d })
+            .await
+            .unwrap();
+        let err = put_community_ob_sqlite(&backend, "comm-ob-exp", vec!["node-key"], None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::Error::UnownedCommunityMember { .. }
+        ));
+        assert!(backend
+            .lookup_community("comm-ob-exp")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     /// OWNER-BOUND agent member (live `delegates_to(user → agent)`) →
     /// ADMITTED.
     #[tokio::test]
@@ -23579,6 +23953,40 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// SecReview F2: an `infrastructure`-LABELED community whose own key is
+    /// NOT `substrate_persist` does NOT get the carve-out — owner-binding is
+    /// STILL enforced, so an UNOWNED node member is REJECTED + not stored
+    /// (fail-secure: a self-applied infra label can never skip the gate).
+    #[tokio::test]
+    async fn community_unauthorized_infra_label_still_enforces_owner_binding_sqlite() {
+        let backend = bootstrap_node_agency_sqlite().await;
+        let err = put_community_ob_sqlite_authority(
+            &backend,
+            "comm-ob-fakeinfra",
+            vec!["node-key"],
+            Some("infrastructure"),
+            false, // comm key is NOT substrate_persist
+        )
+        .await
+        .unwrap_err();
+        match err {
+            crate::federation::Error::UnownedCommunityMember {
+                ref member_key_id,
+                member_role,
+                ..
+            } => {
+                assert_eq!(member_key_id, "node-key");
+                assert_eq!(member_role, crate::federation::types::identity_type::NODE);
+            }
+            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+        }
+        assert!(backend
+            .lookup_community("comm-ob-fakeinfra")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// Pure `user`-role member → NOT over-rejected (trivially owner-bound).

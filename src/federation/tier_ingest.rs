@@ -410,13 +410,15 @@ mod tests {
         }
     }
 
-    /// The full CC 5.3.2.4.3.1 ingest-gate matrix, backend-agnostic.
-    async fn run_tier_ingest_matrix(engine: &Engine, tag: &str) {
-        let dir = engine.federation_directory();
+    /// The full CC 5.3.2.4.3.1 ingest-gate matrix, backend-agnostic — runs
+    /// directly against a [`FederationDirectory`] so it covers the memory
+    /// backend too (it runs there in production), not only the engine-wrapped
+    /// sqlite + postgres backends.
+    async fn run_tier_ingest_matrix(dir: &dyn FederationDirectory, tag: &str) {
         let attester = format!("ti-attester-{tag}");
         let attested = format!("ti-attested-{tag}");
-        register_hybrid_key(&*dir, &attester).await;
-        register_hybrid_key(&*dir, &attested).await;
+        register_hybrid_key(dir, &attester).await;
+        register_hybrid_key(dir, &attested).await;
 
         // (a) federation-tier with a VALID hybrid sig → ADMITTED + readable.
         let a = att(
@@ -534,13 +536,23 @@ mod tests {
         );
     }
 
+    /// QualReview (LOW): the gate runs on the MEMORY backend in production
+    /// (`put_attestation` calls `verify_federation_tier_ingest`), so test the
+    /// matrix directly against it too — no engine DSN dispatches to memory.
+    #[tokio::test]
+    async fn tier_ingest_matrix_memory() {
+        let backend = crate::store::memory::MemoryBackend::new();
+        run_tier_ingest_matrix(&backend, "memory").await;
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn tier_ingest_matrix_sqlite() {
         let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
             .await
             .expect("construct sqlite engine");
-        run_tier_ingest_matrix(&engine, "sqlite").await;
+        let dir = engine.federation_directory();
+        run_tier_ingest_matrix(&*dir, "sqlite").await;
     }
 
     #[cfg(feature = "postgres")]
@@ -554,6 +566,7 @@ mod tests {
             .await
             .expect("construct postgres engine");
         let tag = format!("pg-{}", uuid::Uuid::new_v4().simple());
-        run_tier_ingest_matrix(&engine, &tag).await;
+        let dir = engine.federation_directory();
+        run_tier_ingest_matrix(&*dir, &tag).await;
     }
 }

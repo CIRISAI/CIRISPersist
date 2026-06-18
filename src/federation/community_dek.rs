@@ -37,8 +37,11 @@
 //! member keeps what they could already read (no PCS), and receives no NEW
 //! community content. **Exposure window:** content emitted between the
 //! member's effective removal and the epoch bump — which here is zero,
-//! because the bump is transactionally part of the revocation write and
-//! every subsequent emission reads the bumped epoch. (A removed member
+//! because community membership revocation is **immediate** (a future-dated
+//! `effective_at` is rejected at write time — SecReview F4 /
+//! [`reject_future_dated_community_revocation`]), the bump is transactionally
+//! part of the revocation write, and every subsequent emission reads the
+//! bumped epoch. (A removed member
 //! retains read access only to pre-rotation blobs they were already a
 //! grantee on, which is exactly Option-A's "once shared, always shared"
 //! forward-only guarantee.)
@@ -51,12 +54,17 @@
 //!
 //! # Infrastructure opt-out (CC 4.4.3.2.1, normative)
 //!
-//! A `community` with `cohort_subkind: infrastructure` (`ciris-canonical`
-//! / governance roots) opts OUT of the DEK cascade entirely — Commons-tier
-//! plaintext, `holds_bytes`, NO DEK. The trust root must be publicly
-//! auditable. [`is_infrastructure_community`] is the check; the cascade
-//! refuses to seal an infra community's content (the caller stores it
-//! plaintext via the ordinary path).
+//! An **authorized** `community` with `cohort_subkind: infrastructure`
+//! (`ciris-canonical` / governance roots whose own key is the
+//! `substrate_persist` governance authority) opts OUT of the DEK cascade
+//! entirely — Commons-tier plaintext, `holds_bytes`, NO DEK. The trust
+//! root must be publicly auditable.
+//! [`admission::is_authorized_infrastructure_community`](crate::federation::admission::is_authorized_infrastructure_community)
+//! is the check; the cascade refuses to seal an authorized infra
+//! community's content (the caller stores it plaintext via the ordinary
+//! path). SecReview F2: a self-labeled `infrastructure` community whose key
+//! is NOT `substrate_persist` is NOT exempted — it gets the full DEK
+//! cascade, so an unauthorized label can never force content to plaintext.
 //!
 //! # v2-only (CC 4.4.3.4.1 / CC 5.2)
 //!
@@ -73,13 +81,51 @@
 
 use crate::federation::types::Community;
 
-/// True iff `community` carries `policy_blob.cohort_subkind ==
-/// "infrastructure"` — the CC 4.4.3.2.1 Commons-plaintext carve-out. Such
-/// a community opts OUT of the DEK cascade (its trust-root content must be
-/// publicly auditable, not an opaque blob). Mirrors the
-/// [`crypto_tier`](crate::federation::types::cohort_scope::crypto_tier)
-/// `Some("infrastructure")` arm and the §0.8.2 geographic-subkind read in
-/// [`location`](crate::federation::location).
+/// SecReview F4 — the small clock-skew tolerance (60s) on a community
+/// membership revocation's `effective_at`. Community removal is **immediate**
+/// for forward-secrecy (the epoch bump happens at write time), so a
+/// future-dated `effective_at` is rejected; this constant only absorbs
+/// benign clock drift between the ceremony's clock and persist's.
+pub const COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS: i64 = 60;
+
+/// SecReview F4 — reject a future-dated community membership revocation.
+///
+/// `put_community_membership_revocation` bumps the DEK epoch at write time
+/// (rotation-on-removal), but a removed member is only dropped from the wrap
+/// fan-out once `effective_at <= now` ([`orchestrate`]'s
+/// `resolve_community_members`). A future-dated `effective_at` would
+/// therefore bump the epoch immediately yet keep wrapping the "removed"
+/// member into the fresh epoch DEK until `effective_at` arrives — opening
+/// the exact exposure window the "exposure window = zero" claim denies.
+/// Community removal is immediate (no future-dating); a future `effective_at`
+/// beyond [`COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS`] is
+/// [`Error::InvalidArgument`](crate::federation::Error::InvalidArgument)
+/// BEFORE any write, on every backend.
+pub fn reject_future_dated_community_revocation(
+    effective_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), crate::federation::Error> {
+    let now = chrono::Utc::now();
+    let max_allowed = now + chrono::Duration::seconds(COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS);
+    if effective_at > max_allowed {
+        return Err(crate::federation::Error::InvalidArgument(format!(
+            "community membership revocation effective_at {effective_at} is future-dated \
+             (> now + {COMMUNITY_REVOCATION_MAX_FUTURE_SKEW_SECS}s); community removal is \
+             immediate for forward-secrecy (SecReview F4)"
+        )));
+    }
+    Ok(())
+}
+
+/// True iff `community` carries the `policy_blob.cohort_subkind ==
+/// "infrastructure"` **label**. This is the *syntactic* check only.
+///
+/// SecReview F2: the label alone does NOT confer the CC 4.4.3.2.1
+/// Commons-plaintext carve-out — honoring it additionally requires the
+/// community's own key to be the `substrate_persist` governance authority
+/// ([`admission::is_authorized_infrastructure_community`](crate::federation::admission::is_authorized_infrastructure_community),
+/// the gate the cascade actually consults). This predicate is retained for
+/// the label-presence test surface; production carve-out decisions go
+/// through the authority-gated helper.
 #[must_use]
 pub fn is_infrastructure_community(community: &Community) -> bool {
     community
@@ -100,7 +146,6 @@ pub fn is_infrastructure_community(community: &Community) -> bool {
 /// [`FederationDirectory`]: crate::federation::FederationDirectory
 /// [`BlobStorage`]: crate::federation::blobs::BlobStorage
 pub mod orchestrate {
-    use super::is_infrastructure_community;
     use crate::federation::at_rest_cascade::{
         fresh_dek, open, seal, unwrap_dek_for_persist, wrap_dek_for_persist, wrap_dek_v2,
         AtRestEnvelope, AtRestError, DEK_LEN, WRAP_ALGORITHM_V2,
@@ -175,13 +220,21 @@ pub mod orchestrate {
                 ))
             })?;
 
-        // CC 4.4.3.2.1 normative carve-out: an infrastructure community
-        // never gets a DEK. Refuse here so a mis-dispatched infra emission
-        // is a loud error, not a silent encrypt.
-        if is_infrastructure_community(&community) {
+        // CC 4.4.3.2.1 normative carve-out: an AUTHORIZED infrastructure
+        // community never gets a DEK. Refuse here so a mis-dispatched infra
+        // emission is a loud error, not a silent encrypt. SecReview F2: the
+        // Commons-plaintext opt-out is honored ONLY when the community's own
+        // key is the `substrate_persist` governance authority — a self-
+        // labeled `infrastructure` community whose key is NOT substrate_persist
+        // is NOT exempted (it gets the full DEK cascade, fail-secure: an
+        // unauthorized infra label can never force its content to plaintext).
+        if crate::federation::admission::is_authorized_infrastructure_community(backend, &community)
+            .await
+            .map_err(map_dir_err)?
+        {
             return Err(BlobError::InvalidArgument(format!(
-                "community {community_key_id:?} is cohort_subkind:infrastructure — Commons-tier \
-                 plaintext (CC 4.4.3.2.1 opt-out); the DEK cascade must not run for it"
+                "community {community_key_id:?} is an authorized cohort_subkind:infrastructure — \
+                 Commons-tier plaintext (CC 4.4.3.2.1 opt-out); the DEK cascade must not run for it"
             )));
         }
 

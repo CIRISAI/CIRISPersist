@@ -1747,9 +1747,13 @@ pub const MAX_MODERATION_DELEGATION_DEPTH: usize = 5;
 ///   2. [`FederationDirectory::lookup_identity_for_occurrence`]`(k)`
 ///      resolves `k` to an identity whose key is `user`-role (k is a
 ///      device/occurrence of a human identity); OR
-///   3. ∃ a live `delegates_to(U → k)` with `U` a `user`-role key (a human
-///      delegated to k) — checked over k's INCOMING attestations
-///      ([`FederationDirectory::list_attestations_for`]).
+///   3. ∃ a **live** `delegates_to(U → k)` with `U` a `user`-role key (a
+///      human delegated to k) — checked over k's INCOMING attestations
+///      ([`FederationDirectory::list_attestations_for`]). "Live" excludes a
+///      delegation the granter has `withdraws`/`recants`-retracted against
+///      `k` (the §11.10 edge-retraction model) AND one whose `expires_at`
+///      has passed (SecReview F3) — a revoked or lapsed edge confers no
+///      owner-binding.
 ///
 /// A key whose chain to a `user` identity cannot be shown is NOT
 /// owner-bound and cannot root a moderation duty (fail-closed). Authority
@@ -1776,19 +1780,101 @@ pub async fn is_owner_bound(
             }
         }
     }
-    // (3) a live `delegates_to(U → k)` with U user-role. k's INCOMING
-    //     attestations name the granter as `attesting_key_id`.
+    // (3) a LIVE `delegates_to(U → k)` with U user-role. k's INCOMING
+    //     attestations name the granter as `attesting_key_id`. A delegation
+    //     edge confers owner-binding ONLY while genuinely live (SecReview
+    //     F3): skip it if (a) the granter has `withdraws`/`recants`-retracted
+    //     it (reusing the §11.10 edge-retraction bucketing the MODERATION_DUTY
+    //     walk uses — a retraction names the recipient `k` as
+    //     `attested_key_id`), or (b) the edge has expired (`expires_at <=
+    //     now`). A revoked/expired delegation must not confer standing.
+    let now = chrono::Utc::now();
     for r in directory.list_attestations_for(k).await? {
         if r.attestation_type != attestation_type::DELEGATES_TO {
             continue;
         }
-        if let Some(granter) = directory.lookup_public_key(&r.attesting_key_id).await? {
-            if identity_type::set_contains(&granter.identity_type, identity_type::USER) {
-                return Ok(true);
+        // (b) expiry — a lapsed delegation is not live.
+        if let Some(exp) = r.expires_at {
+            if exp <= now {
+                continue;
             }
         }
+        let Some(granter) = directory.lookup_public_key(&r.attesting_key_id).await? else {
+            continue;
+        };
+        if !identity_type::set_contains(&granter.identity_type, identity_type::USER) {
+            continue;
+        }
+        // (a) edge-retraction — skip if the granter `withdraws`/`recants` a
+        //     delegation against this recipient `k`. The retraction is one of
+        //     the granter's OUTGOING attestations whose `attested_key_id == k`.
+        let granter_retracted_k = directory
+            .list_attestations_by(&r.attesting_key_id)
+            .await?
+            .into_iter()
+            .any(|g| {
+                (g.attestation_type == attestation_type::WITHDRAWS
+                    || g.attestation_type == attestation_type::RECANTS)
+                    && g.attested_key_id == k
+            });
+        if granter_retracted_k {
+            continue;
+        }
+        return Ok(true);
     }
     Ok(false)
+}
+
+/// v9.0.0 SecReview F2 (CC 3.2 / CC 4.4.3.2.1) — is `community` an
+/// **authorized** infrastructure community whose carve-outs (owner-binding
+/// exemption + Commons-plaintext opt-out) may be honored?
+///
+/// A `cohort_subkind: infrastructure` label is honored ONLY IF the
+/// community's OWN key ([`Community::community_key_id`]) resolves in
+/// `federation_keys` to a record whose `identity_type` set contains
+/// [`identity_type::SUBSTRATE_PERSIST`] — the §5.3/§7.2 reserved
+/// governance/substrate authority that already owns the `system:` /
+/// `audit_chain:` / `corpus_health:` reserved prefixes
+/// ([`default_reserved_prefix_rules`]). CC 3.2 reserves the infrastructure
+/// carve-out for genuine governance / trust roots (`ciris-canonical`);
+/// without this check ANY caller could self-label a community
+/// `infrastructure` to (a) skip the owner-binding gate and (b) force its
+/// content to Commons-plaintext (no DEK).
+///
+/// **Fail-secure:** a community labeled `infrastructure` whose key does
+/// NOT resolve to `substrate_persist` (or does not resolve at all) returns
+/// `false` — the label is NOT honored, so the caller falls through to the
+/// STRICTER non-infra path (owner-binding REQUIRED + DEK cascade applies).
+/// An unauthorized infra label can only ever get the stricter treatment,
+/// never the weaker one.
+pub async fn is_authorized_infrastructure_community<F>(
+    directory: &F,
+    community: &super::Community,
+) -> Result<bool, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let labeled_infra = community
+        .policy_blob
+        .as_ref()
+        .and_then(|b| b.get("cohort_subkind"))
+        .and_then(|v| v.as_str())
+        == Some("infrastructure");
+    if !labeled_infra {
+        return Ok(false);
+    }
+    // Honor the carve-out ONLY if the community's own key is the reserved
+    // governance/substrate authority.
+    match directory
+        .lookup_public_key(&community.community_key_id)
+        .await?
+    {
+        Some(rec) => Ok(identity_type::set_contains(
+            &rec.identity_type,
+            identity_type::SUBSTRATE_PERSIST,
+        )),
+        None => Ok(false),
+    }
 }
 
 /// v9.0.0 (CC 3.2 "owner-binding gate for non-infrastructure membership"
@@ -1805,11 +1891,13 @@ pub async fn is_owner_bound(
 /// # Scope and the infrastructure carve-out
 ///
 /// `cohort_subkind: infrastructure` communities (`ciris-canonical` /
-/// operator governance roots — resolved from `community.policy_blob`,
-/// exactly the form [`crate::federation::types::crypto_tier`] and
-/// [`crate::federation::location::geographic_constraint_cell`] read) are
-/// **EXEMPT**: a node MAY trust + serve an infrastructure community with
-/// no owner (CC 3.2 "Trust ≠ membership"). For every other community this
+/// operator governance roots) are **EXEMPT** — a node MAY trust + serve
+/// an infrastructure community with no owner (CC 3.2 "Trust ≠
+/// membership"). The label is honored ONLY when
+/// [`is_authorized_infrastructure_community`] holds (the community's own
+/// key resolves to the `substrate_persist` governance authority, SecReview
+/// F2); a self-labeled infra community whose key is not `substrate_persist`
+/// gets the strict owner-binding treatment. For every other community this
 /// gate runs per roster member.
 ///
 /// A member key that does NOT resolve in `federation_keys`, or whose
@@ -1826,13 +1914,12 @@ pub async fn check_community_membership_owner_binding(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
 ) -> Result<(), Error> {
-    // Infrastructure carve-out: trust + serve needs no owner (CC 3.2).
-    let cohort_subkind = community
-        .policy_blob
-        .as_ref()
-        .and_then(|b| b.get("cohort_subkind"))
-        .and_then(|v| v.as_str());
-    if cohort_subkind == Some("infrastructure") {
+    // Infrastructure carve-out: trust + serve needs no owner (CC 3.2) —
+    // honored ONLY for an AUTHORIZED infrastructure community (its own key
+    // is the `substrate_persist` governance authority). A self-labeled
+    // infra community whose key is NOT substrate_persist falls through to
+    // the strict owner-binding path below (SecReview F2, fail-secure).
+    if is_authorized_infrastructure_community(directory, community).await? {
         return Ok(());
     }
     for member in &community.members {
@@ -2285,8 +2372,15 @@ pub async fn check_node_agency_admission(
         // downstream — it can never be persisted). See doc note.
         return Ok(());
     };
-    let members = identity_type::parse_set(&recipient.identity_type);
-    let is_node_only = members == [identity_type::NODE];
+    // Test the identity_type *set*, robust to duplicate/whitespace/order
+    // tokens (`"node,node"`, `"node, node"`). `parse_set` does NOT dedup,
+    // so an equality check against `[NODE]` is bypassable by a repeated
+    // token; collect into a `HashSet` and assert it is exactly `{node}`.
+    let member_set: std::collections::HashSet<&str> =
+        identity_type::parse_set(&recipient.identity_type)
+            .into_iter()
+            .collect();
+    let is_node_only = member_set.len() == 1 && member_set.contains(identity_type::NODE);
     if !is_node_only {
         return Ok(());
     }
