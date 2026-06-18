@@ -16586,10 +16586,16 @@ mod tests {
         let alice_p = format!("alice-occ-{s}");
         let bob_p = format!("bob-occ-{s}");
         for kid in [&comm, &infra, &alice, &bob, &alice_p, &bob_p] {
+            let mut record = fix_section_i_key(kid, "acme", now, true);
+            // Community members (alice/bob) are user-role humans — trivially
+            // owner-bound, satisfying the v9.0.0 G3 owner-binding precondition
+            // for non-infra community membership (CC 3.4.7.1). The DEK cascade
+            // under test is orthogonal to membership authority.
+            if kid == &alice || kid == &bob {
+                record.identity_type = crate::federation::types::identity_type::USER.into();
+            }
             backend
-                .put_public_key(crate::federation::SignedKeyRecord {
-                    record: fix_section_i_key(kid, "acme", now, true),
-                })
+                .put_public_key(crate::federation::SignedKeyRecord { record })
                 .await
                 .unwrap();
         }
