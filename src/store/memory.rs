@@ -1618,6 +1618,27 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             }
         }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // Parity with pg/sqlite: the revocation table PK is
+        // (community_key_id, removed_identity_key_id) (V067), so a REPLAYED
+        // revocation hits a unique-violation at the INSERT and errors BEFORE
+        // the hard_case emission + epoch bump. Memory must reject the replay
+        // the same way (else memory would double-bump the DEK epoch where
+        // pg/sqlite leave it untouched — an observable gate-path divergence).
+        // Matches map_revocation_pg_err's non-FK Backend mapping.
+        let revocation_key = (
+            row.community_key_id.clone(),
+            row.removed_identity_key_id.clone(),
+        );
+        if state
+            .federation_community_membership_revocations
+            .contains_key(&revocation_key)
+        {
+            return Err(crate::federation::Error::Backend(format!(
+                "insert community_membership_revocation: duplicate key value violates unique \
+                 constraint (community_key_id={}, removed_identity_key_id={})",
+                revocation_key.0, revocation_key.1
+            )));
+        }
         // CEG §7.8 (CIRISPersist#161 Ask 5) — community analog of the §7.7
         // removal emission (`change_kind: "removed"`). Idempotent on event_id.
         let event = crate::federation::hard_case::membership_removed_event(
@@ -1633,19 +1654,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // CC 4.4.3.2.2 rotation-on-removal: advance the community DEK epoch
         // (the at-rest crypto half lives only on the BlobStorage backends;
         // memory carries the rotation *state* so rotation-on-removal is
-        // observably present here too). Bump first → revocation insert moves
-        // `row`.
+        // observably present here too). Only on a genuinely new revocation
+        // (replays errored out above) — parity with pg/sqlite. Bump first →
+        // revocation insert moves `row`.
         *state
             .federation_community_dek_epoch
             .entry(row.community_key_id.clone())
             .or_insert(0) += 1;
-        state.federation_community_membership_revocations.insert(
-            (
-                row.community_key_id.clone(),
-                row.removed_identity_key_id.clone(),
-            ),
-            row,
-        );
+        state
+            .federation_community_membership_revocations
+            .insert(revocation_key, row);
         Ok(())
     }
 

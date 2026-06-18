@@ -13,14 +13,14 @@
 -- federates. Refinery wraps this migration in its own transaction.
 
 -- ── current epoch per community ────────────────────────────────────
-CREATE TABLE federation_community_dek_epoch (
+CREATE TABLE IF NOT EXISTS federation_community_dek_epoch (
     community_key_id  TEXT PRIMARY KEY,
     epoch             INTEGER NOT NULL DEFAULT 0 CHECK (epoch >= 0),
     rotated_at        TEXT NOT NULL DEFAULT (datetime('now', 'subsec'))
 );
 
 -- ── per-epoch community DEK self-retention (OQ-4, per epoch) ────────
-CREATE TABLE federation_community_dek (
+CREATE TABLE IF NOT EXISTS federation_community_dek (
     community_key_id  TEXT NOT NULL,
     epoch             INTEGER NOT NULL CHECK (epoch >= 0),
     wrap_algorithm    TEXT NOT NULL
@@ -31,7 +31,7 @@ CREATE TABLE federation_community_dek (
 );
 
 -- ── per-member epoch DEK grants (v2-only; fail-secure exclude) ──────
-CREATE TABLE federation_community_dek_member_grants (
+CREATE TABLE IF NOT EXISTS federation_community_dek_member_grants (
     community_key_id      TEXT NOT NULL,
     epoch                 INTEGER NOT NULL CHECK (epoch >= 0),
     member_key_id         TEXT NOT NULL,
@@ -42,11 +42,11 @@ CREATE TABLE federation_community_dek_member_grants (
     PRIMARY KEY (community_key_id, epoch, member_key_id)
 );
 
-CREATE INDEX federation_community_dek_member_grants_by_member
+CREATE INDEX IF NOT EXISTS federation_community_dek_member_grants_by_member
     ON federation_community_dek_member_grants (member_key_id);
 
 -- ── blob → community/epoch binding ─────────────────────────────────
-CREATE TABLE federation_community_blob_epoch (
+CREATE TABLE IF NOT EXISTS federation_community_blob_epoch (
     at_rest_sha256    BLOB PRIMARY KEY
         CHECK (length(at_rest_sha256) = 32),
     community_key_id  TEXT NOT NULL,
