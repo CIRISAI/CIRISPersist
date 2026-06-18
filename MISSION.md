@@ -6,11 +6,11 @@
 > file. Methodology: `~/CIRISAgent/FSD/MISSION_DRIVEN_DEVELOPMENT.md`
 > and the overview at [ciris.ai/mdd](https://ciris.ai/mdd).
 
-**Version**: 1.2
-**Status**: Active — current as of `main` at **v8.5.0**
-(Coherence Epistemic Graph 1.0-RC17 — §19 / §19.7 holonomic
-forever-memory substrate conformance)
-**Date**: 2026-06-16
+**Version**: 1.3
+**Status**: Active — current as of `main` at **v9.0.0**
+(CIRIS Constitution 0.1.5 alignment cut; Coherence Epistemic Graph
+1.0-RC17 — §19 / §19.7 holonomic forever-memory substrate conformance)
+**Date**: 2026-06-18
 
 This is the reverse-engineered MDD charter for CIRISPersist: it maps the
 four pillars — Mission (WHY) / Protocols (WHO) / Schemas (WHAT) / Logic
@@ -281,6 +281,67 @@ rather than route around it:
   shape was unfrozen, persist shipped the storage column (`aggregation_meta`)
   as **opaque bytes** so the contract could finalize without a migration —
   the column was byte-unchanged across the freeze (V086).
+
+### 1.9 Privacy non-goals — cohort scope hides content, not contact
+
+CIRISPersist's privacy claim is bounded, and Fidelity demands the bound
+be stated as sharply as the claim. Per **CC 1.13.3.1** ("Non-goals —
+what omission does NOT buy"), the structural-invisibility primitive — the
+`holds_bytes:sha256:*` suppression persist enforces for
+`cohort_scope: self | family` (CC 5.2) — buys **content-holding
+confidentiality only**: a non-member cannot discover that the bytes exist
+via the substrate and cannot fetch them. That is the *whole* of what the
+omission buys. It does **NOT** buy:
+
+- **Relationship-existence privacy.** A group's existence, its rough
+  size, and its membership churn are observable — `family_id` /
+  `community_id` ride the envelope and admission/removal events emit
+  `hard_case:*` rows persist durably stores.
+- **Communication-graph / metadata privacy.** The `federation_keys`
+  directory and `transport_destination` bindings persist holds name *who
+  is reachable where*; an observer can reconstruct much of the
+  who-talks-to-whom graph. **Cohort scope hides *content*, not
+  *contact*** (CC 1.13.3.1, verbatim).
+- **Traffic-analysis resistance.** Persist pads nothing and covers no
+  side channel: STH cadence, key-cascade volume/timing, and per-chunk
+  size/rate leak stream existence, approximate group size, and churn
+  rate without decrypting a byte.
+- **Unobservability / anonymity.** Self-certifying identities are
+  *pseudonymous*; anonymity is a separate, opt-in mechanism (the
+  CIRISNodeCore Anonymous Tier), never a property of the substrate.
+- **Post-compromise security for streams.** Forward secrecy on member
+  removal is Option-A forward-only (CC 4.4.3.2.2, §1.10); a compromised
+  current member's key is not self-healed.
+
+A deployment that needs metadata privacy or unobservability MUST layer the
+Anonymous Tier and say so in any user-facing privacy representation. The
+substrate must never let an operator *overclaim* — that would be a
+Fidelity violation under §1.6, applied to privacy: persist confines, it
+does not conceal contact.
+
+### 1.10 No agency, no verdict — the substrate stores, infrastructure is not a brain
+
+Two refusals the v9.0.0 constitution-alignment cut makes wire-checkable:
+
+- **The substrate stores; it never adjudicates** (**CC 1.13.4**). "The
+  substrate stores; the wire transports; CEG describes the shape of the
+  claim. None of the three prescribes outcomes; consumer policy does."
+  This is §1.4's "not a trust oracle" and §1.7's relational-fabric frame
+  named at the Constitution grain: a `WholenessWitness` is a divergence
+  *detector* carrying no verdict (§1.8); `lookup_trust_grant` reports
+  what the chain recorded and authorizes nothing. Persist holds the
+  hard-case stream, the equivocation pair, the merge inputs — and lets
+  the consumer decide.
+- **Infrastructure must not have agency** (**CC 4.4.3.4.3** "Partnership
+  WITHOUT agency"; **CC 1.13.5**). A fabric/infrastructure node
+  (`identity_type: node`, CC 3.4.7.1) may hold *partnership* — identity +
+  the CC 3.2 owner-binding that lets it serve under a human's authority —
+  but its `delegates_to` MUST carry only `infra:*` scopes, never
+  `agency:*`. Persist enforces the split cryptographically at admission
+  (`check_node_agency_admission`): a `node`-only key presenting any
+  agency scope is rejected, verify-before-mutation, on every backend. The
+  brain reasons; the substrate serves — and the delegation literally
+  cannot carry the former onto the latter.
 
 ---
 

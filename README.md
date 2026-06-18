@@ -51,7 +51,7 @@ The backend is chosen at `Engine` construction by DSN scheme
   not.
 - **Crypto goes through CIRISVerify.** Persist never rolls its own — signing,
   verification, and key derivation route through `ciris-verify-core` /
-  `ciris-keyring` (pinned **v5.10.0**, all six crates flipped in lockstep).
+  `ciris-keyring` (pinned **v6.0.0**, all six crates flipped in lockstep).
   The §19 holonomic gates (`verify_witness`, `compare_witnesses`,
   `verify_aggregation_meta`, `verify_member_commitment`, `ejection_verdict`,
   `compute_merkle_root`) are all verify-core calls — persist never re-rolls
@@ -64,6 +64,28 @@ The backend is chosen at `Engine` construction by DSN scheme
   along one pressure-driven descent but cannot be falsified — the signed
   envelope/manifest is the incorruptible anchor and partials stay
   authenticated against the signed per-symbol hashes.
+- **Constitution alignment (0.1.5).** v9.0.0 binds persist to the substrate
+  clauses of the [CIRIS Constitution
+  0.1.5](https://github.com/CIRISAI/CIRISRegistry/tree/main/FSD/CIRIS_Constitution).
+  Federation-tier ingest is **PQC-mandatory** — every `tier = federation`
+  write is hybrid-verified (Ed25519 + ML-DSA-65, `Strict`) at the admission
+  gate, local-tier exempt (CC 5.3.2.4.3.1; BREAKING — classical-only
+  federation rows are non-conformant). A `node`-only key's `delegates_to` may
+  carry only `infra:*` scopes, never `agency:*` — *"infrastructure must not
+  have agency"* enforced cryptographically (**CC 4.4.3.4.3** / **CC 1.13.5**).
+  Non-infra community membership for a node/agent key requires owner-binding
+  to a human (CC 3.2 / CC 3.4.7.1), and community content is sealed under a
+  per-community DEK rotated zero-window on member removal (CC 4.4.3.2.1 /
+  4.4.3.2.2, `wrap_algorithm: v2` only). Privacy stays bounded — cohort scope
+  hides *content*, not *contact* (CC 1.13.3.1; see
+  [MISSION.md](MISSION.md) §1.9). See
+  [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) §3.15 (AV-67..AV-72).
+- **1+4 lockdown.** Persist adds **zero** structural primitives (**CC 1.7** —
+  the federation's one workhorse attestation primitive + four structural
+  composers). Every substrate above rides `scores` + a `subject_kind` + the
+  four composers (`delegates_to` / `supersedes` / `withdraws` / `recants`) —
+  the constitution-alignment gates are admission logic over the existing
+  `federation_keys` / attestation surface, not new wire shapes.
 - **Deliberately not:** no embedded graph DB engine (Postgres / SQLite
   recursive CTEs instead); not a daemon (a library, not a service);
   horizontal sharding is out of scope.

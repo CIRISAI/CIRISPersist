@@ -1,7 +1,8 @@
 # CIRISPersist Threat Model
 
-**Status:** v8.5.0 (CEG 1.0-RC17 — §19 / §19.7 holonomic
-substrate). Earlier surface preserved verbatim: federation
+**Status:** v9.0.0 (CIRIS Constitution 0.1.5 alignment cut; CEG
+1.0-RC17 — §19 / §19.7 holonomic substrate). Earlier surface preserved
+verbatim: federation
 directory (v0.2.0), hybrid Ed25519+ML-DSA-65 PQC posture (v0.2.0),
 2.7.9 wire-format extensions (v0.3.0–v0.3.4), per-key DSAR + the
 `verify_hybrid` arbitrary-canonical-bytes surface (v0.3.6),
@@ -14,7 +15,12 @@ WholenessWitness corpus + divergence router, and the §19.7
 aggregation pyramid — §3.14, AV-59..AV-66.
 **v0.1.2 baseline** (AV-1..AV-26) preserved verbatim;
 v0.2.0–v0.3.6 attack surface in §3.7..§3.10 (AV-28..AV-39);
-holonomic surface in §3.14 (AV-59..AV-66).
+holonomic surface in §3.14 (AV-59..AV-66);
+constitution-alignment surface in §3.15 (AV-67..AV-72) — PQC-mandatory
+federation-tier per-trace ingest (CC 5.3.2.4.3.1), the node/agency
+delegation split (CC 4.4.3.4.3 / CC 1.13.5), owner-binding community
+membership (CC 3.2), the community-DEK rotation cascade (CC 4.4.3.2.2),
+and the four adversarial-review bypasses those gates initially carried.
 **RC17 compliance:** persist is COMPLIANT and rolls no §19 crypto —
 it calls verify-core's `compute_merkle_root` / `verify_witness` /
 `verify_aggregation_meta` / `verify_member_commitment` /
@@ -225,7 +231,7 @@ The adversary is assumed to NOT have:
 
 ## 3. Attack Vectors
 
-Sixty-six attack vectors organized by adversary goal. AV-1..AV-26
+Seventy-two attack vectors organized by adversary goal. AV-1..AV-26
 are the v0.1.x baseline (preserved verbatim from the v0.1.2 doc).
 AV-27 covers v0.1.7..v0.1.9 keyring-storage hardening. AV-28..AV-39
 cover the v0.2.0..v0.3.6 surface (federation directory, hybrid PQC,
@@ -237,9 +243,13 @@ incident substrates, cohort_scope read/write gates). AV-59..AV-66
 (§3.14) cover the v7.2.0..v8.5.0 holonomic / forever-memory surface
 (store-path PQC hard cut, WholenessWitness equivocation /
 divergence-router / anti-rollback / WW-2 leaf filter, aggregation-meta
-and member-commitment integrity, rarity-vs-revocation). Each AV lists
-the attack, the primary mitigation, the secondary mitigation, and the
-residual risk.
+and member-commitment integrity, rarity-vs-revocation). AV-67..AV-72
+(§3.15) cover the v9.0.0 CIRIS Constitution 0.1.5 alignment surface
+(PQC-mandatory federation-tier per-trace ingest, the node/agency
+delegation split, owner-binding community membership, community-DEK
+rotation, and the four adversarial-review bypasses those gates carried).
+Each AV lists the attack, the primary mitigation, the secondary
+mitigation, and the residual risk.
 
 ### 3.1 Forgery — adversary wants their bytes counted as real evidence
 
@@ -1965,6 +1975,260 @@ persist as `EnvelopeOnly` / below-the-noise-floor blur — §19.3 N5 requires
 **not individually recoverable**, not destruction of the collective gist
 (this is by design — "fades but cannot be falsified", §19.7).
 
+### 3.15 Constitution-alignment surface (CIRIS Constitution 0.1.5, v9.0.0)
+
+The v9.0.0 constitution-alignment cut binds persist to the CIRIS
+Constitution 0.1.5 substrate clauses. Two of these close attack surfaces
+that were previously **unmodeled** at the per-row admission grain, and the
+adversarial review of the cut surfaced four bypasses in the new gates —
+fixed at root in the same cut (CHANGELOG `## [9.0.0]` F1–F5). The §19
+verifiers are unchanged; these vectors are about *admission gating* over
+the federation directory + community substrate, not crypto. Note: AV-59
+(§3.14) is the **same forge-later class as CC 5.3.2.4.3** named at the
+trace-store path — AV-67 below extends that exact mandate from the
+fountain/witness/aggregation store-paths to the **bulk federation-tier
+attestation testimony corpus**, the single most forge-exposed surface
+(CC 5.3.2.4.3's "store at massive scale" CEWP crux); AV-60/AV-61 (witness
+divergence) relate to federation-tier reconciliation but are gated by the
+§19 PQC witness gate (AV-62), not the per-trace ingest gate.
+
+#### AV-67: Federation-tier forge-later via unverified per-trace ingest (CC 5.3.2.4.3.1)
+
+**Attack**: a CRQC-era adversary who has broken Ed25519 mints a backdated
+federation-tier `attestation` under a historical key and writes it to the
+durable, content-addressed, replicated testimony corpus via
+`put_attestation`. **Pre-v9.0.0, this surface was unmodeled at the
+per-trace grain**: `put_attestation` ran only the trust-**threshold**
+`AdmissionGate::check_federation` on the *key* and then INSERTed — a
+federation-tier row's envelope hybrid signature
+(`scrub_signature_classical` / `scrub_signature_pqc`) was merely
+**stored**, never *verified* at the per-trace write/replicate path.
+Hybrid-verify-at-gate existed only on `register_federation_key` (v8.8.0)
+and the fountain store-path (v8.4.0, AV-64) — NOT on the bulk testimony
+corpus, the single most forge-exposed surface in the federation. The
+`tier = federation` label was trusted. Content-addressing is no defense:
+the adversary hashes their own forgery, so the address matches by
+construction (CC 5.3.2.4.3).
+
+**Mitigation v9.0.0 (#237, BREAKING, CC 5.3.2.4.3.1)**:
+`federation::verify_federation_tier_ingest` is the reusable per-trace gate
+— the federation-tier sibling of `register::verify_key_registration` with
+byte-for-byte the same verify contract: canonicalize `attestation_envelope`
+through the CEG produce gate (`ceg_produce_canonicalize`, JCS post-#871),
+cross-check `SHA-256(canonical) == original_content_hash` (canonicalizer
+agreement, fail-secure), resolve the attester's **REGISTERED** pubkeys via
+`lookup_public_key` (an unknown/unregistered attester ⇒ reject — never
+verifies against pubkeys carried on the row alone), then `verify_hybrid`
+under `HybridPolicy::Strict` (BOTH Ed25519 over `JCS(envelope)` AND
+ML-DSA-65 over the bound `JCS(envelope) ‖ ed25519_sig` REQUIRED). Wired
+into `put_attestation` on all three backends, composed with — not
+replacing — the trust-threshold `check_federation`, running BEFORE
+`persist_row_hash` + INSERT (verify-before-mutation, AV-9;
+store-then-quarantine is non-conformant per CC 5.3.2.4.3.1). A rejected
+row (classical-only / tampered / canonicalizer-mismatch /
+unregistered-attester) leaves zero rows; typed
+`Error::FederationTierUnverified` (token
+`federation_federation_tier_unverified`).
+
+**Secondary**: **local-tier is EXEMPT** — the gate is a no-op for
+`tier = local` rows (CC 5.3.2.2 deferred signature; producer-only
+authority, self-read-only), proven by the `tier_ingest_matrix` arm (e):
+LOCAL-tier without PQC → ADMITTED (no over-rejection). The gate also
+exposed a systemic classical-only-federation-tier-`withdraws` emitter gap
+(evict/sweeper/takedown emitters built `tier = federation` WITHDRAWS with
+`scrub_signature_pqc: None`); **fixed in the same cut** — the emitter now
+hybrid-signs via the engine's PQC-capable `LocalSigner`, and a non-PQC
+engine (constructed via `from_shared`) returns a CLEAR typed error rather
+than emitting a classical-only or silently-skipped withdraws (fail-honest,
+§1.6 MISSION).
+
+**Residual**: **BREAKING** — classical-only federation-tier rows admitted
+pre-v9.0.0 are now non-conformant and rejected; non-PQC producers are
+confined to local-tier until they complete PQC wiring (intended — the
+forge-later mandate is the price of HNDL-completeness, CC 5.2). The
+per-trace corpus/bandwidth cost rises with the ML-DSA-65 half exactly as
+the trace-store path (AV-59). Verifies against the **registered** key, so
+a forged PQC pubkey on the row alone fails.
+
+#### AV-68: Node-only key receiving agency via `delegates_to` (CC 4.4.3.4.3 / CC 1.13.5)
+
+**Attack**: an adversary writes a `delegates_to` whose recipient is a
+fabric/infrastructure key (`identity_type: node`, CC 3.4.7.1) but whose
+scope grants **agency** (`agency:act_on_behalf` / `:message_io` /
+`:reason` / `:decide`, or a legacy unprefixed agency kind) — making a
+piece of infrastructure able to reason/act AS a principal, violating
+"infrastructure must not have agency" (CC 1.13.5, quoted by CC 4.4.3.4.3
+"Partnership WITHOUT agency"). The Constitution pins a reserved two-prefix
+delegation scope split (`infra:*` server-class / `agency:*` brain-only) so
+a verifier can enforce this cryptographically; pre-v9.0.0 persist did not.
+
+**Mitigation v9.0.0 (#235/#236, CC 4.4.3.4.3 / CC 1.13.5)**:
+`federation::admission::check_node_agency_admission`, wired into
+`put_attestation` on all three backends alongside the existing
+withdraws/delegated-duty gates, verify-before-mutation (AV-9 — a rejected
+emission leaves no trace). For a `delegates_to` it resolves the recipient
+(`attested_key_id`) via `lookup_public_key`; **only a recipient resolving
+to a `node`-ONLY identity is constrained** — its scope set MUST satisfy
+`scopes_are_infra_only` (non-empty AND every token starts with `infra:`),
+else REJECTED with typed `Error::NodeAgencyForbidden` (token
+`federation_node_agency_forbidden`), not stored. The canonical
+`identity_type::NODE` token + `delegation_scope` vocabulary (the `infra:*`
+/ `agency:*` constants + `LEGACY_AGENCY_KINDS`) are published so
+producer + verifier agree byte-for-byte.
+
+**Secondary**: **no over-rejection** — a non-node recipient (an `agent`/
+brain key) may legitimately carry `agency:*`, and a `{node, agent}` hybrid
+is not node-only, so neither is constrained. An **unresolved** recipient
+passes this gate but is independently FK-rejected by every backend's
+`put_attestation` (the `attested_key_id` must exist in `federation_keys`),
+so an agency delegation to a node key can never be persisted. CIRISServer's
+`src/auth/ownership.rs` enforcement becomes a thin wrapper over this
+substrate gate.
+
+**Residual**: the gate constrains the *delegation scope*, not what a
+recipient does with a key it already controls out-of-band; the wire-format
+invariant is "a node-only key's delegation literally cannot carry agency,"
+which is the structural property CC 1.13.5 names. **Closed v9.0.0; see
+AV-71 for the duplicate-token bypass closed in the same cut.**
+
+#### AV-69: Unowned node/agent admitted to a non-infra community (CC 3.2 / CC 3.4.7.1)
+
+**Attack**: an adversary writes a `put_community` whose roster includes a
+`node`- or `agent`-role key with **no owner-binding to an accountable
+human** — granting a bare, unowned node standing to speak AS the group.
+Per CC 3.2, non-infra community membership is an **authority act** and
+CC 1.13.2 requires authority to root in a `user`-role human; pre-v9.0.0
+`put_community` ran only `check_consensus_protocol_form` + the geographic
+gate and admitted the unowned member.
+
+**Mitigation v9.0.0 (#235, CC 3.2 / CC 3.4.7.1)**:
+`federation::admission::check_community_membership_owner_binding`, wired
+into `put_community` on all three backends after the geographic gate and
+before the write lock / `persist_row_hash` / INSERT (verify-before-mutation,
+AV-9). It reuses the `is_owner_bound(K)` predicate (CC 3.4.7.1 — a live,
+unrevoked path from `K` to a `user`-role identity); **only members
+resolving to `node` or `agent`** are constrained — the first such member
+lacking a live owner-binding REJECTS the whole write with typed
+`Error::UnownedCommunityMember` (token
+`federation_unowned_community_member`), not stored. A `user`-role member
+is trivially owner-bound.
+
+**Secondary**: the **infrastructure carve-out** (CC 3.2 "Trust ≠
+membership") — a community whose `policy_blob.cohort_subkind ==
+"infrastructure"` is exempt (a node MAY trust + serve an infra community
+with no owner). The gate is a **precondition**, NOT a substitute for the
+community's own `consensus_protocol` vote.
+
+**Residual**: an unresolved or non-node/agent member is out of scope (no
+over-rejection). The carve-out's authority is itself gated — **see AV-72
+for the self-label bypass closed in the same cut.**
+
+#### AV-70: Community-DEK not rotated on member removal (CC 4.4.3.2.2)
+
+**Attack**: a removed community member retains a valid wrap of the shared
+per-community DEK and continues to decrypt **new** community content sealed
+after its removal — a forward-secrecy break. Community content
+(`cohort_scope: community | affiliations`) is sealed under one shared DEK
+(CC 4.4.3.2.1 — "a community is a stream its members subscribe to,
+cryptographically"); without rotation, removal is not forward-secret.
+
+**Mitigation v9.0.0 (CC 4.4.3.2.2, Option-A forward secrecy)**:
+`put_community_membership_revocation` **bumps the community DEK epoch**
+(`community_dek_bump_epoch`) on all three backends as part of the
+revocation write. The NEXT emission mints a FRESH DEK for the new epoch
+wrapped only to remaining members (`encrypt_and_cascade_community` resolves
+the active roster = `lookup_community` ∖ effective revocations); a removed
+member's keys can never unwrap it. **Exposure window = zero** — the bump is
+part of the revocation write and every subsequent emission reads the bumped
+epoch. All wraps are `wrap_algorithm: v2` (`x25519_mlkem768_...`, FIPS-203
+hybrid) — NEVER v1 (CC 4.4.3.4.1 / CC 5.2 HNDL); a member without a valid
+ML-KEM-768 key is fail-secure **excluded** (no grant, never plaintext) and
+surfaced non-silently as `hard_case:recipient_excluded` (CC 5.2). The
+`wrap_algorithm` CHECK in V087 makes a v1 row unrepresentable.
+
+**Secondary**: **forward-only** — blobs sealed under the old epoch keep
+their grants (the removed member keeps what it could already read; receives
+no NEW content). This is a flat per-member re-wrap, deliberately NOT MLS
+TreeKEM (full CC 5.1 TreeKEM is the RET transport layer's open question,
+not the substrate's). Infrastructure communities (`cohort_subkind:
+infrastructure`, governance roots) opt OUT — Commons-tier plaintext, no
+DEK (CC 4.4.3.2.1, the trust root must be publicly auditable).
+
+**Residual**: PCS for a *currently-admitted* member's compromised key is
+not provided (Option-A is forward-only, CC 1.13.3.1 — MISSION §1.9).
+**See AV-72 (F4) for the future-dated-`effective_at` forward-secrecy hole
+closed in the same cut.**
+
+#### AV-71: Node-agency gate bypass via duplicate `identity_type` token (CC 1.13.5 / CC 4.4.3.4.3, F1)
+
+**Attack**: an adversary registers a node key with a **duplicate**
+`identity_type` token — `"node,node"` or `"node, node"` — then delegates
+`agency:*` to it. The v9.0.0 `check_node_agency_admission` (AV-68) decided
+"is this recipient node-only?" with `parse_set(identity_type) == [NODE]`,
+but `parse_set` does **not** dedup — so `["node","node"] != ["node"]`
+**skipped the gate**, letting a pure-`node` key receive agency and
+defeating CC 1.13.5.
+
+**Mitigation v9.0.0 (#237 adversarial review, F1)**: the gate now tests
+the identity_type **set** via a `HashSet<&str>` (`set.len() == 1 &&
+set.contains(NODE)`), robust to duplicate / whitespace / order tokens.
+
+**Secondary**: a genuine `node,agent` hybrid is still ADMITTED (it
+legitimately carries agency — no over-reject); regression-tested
+(`"node,node"` / `"node, node"` carrying `agency:*` → REJECTED + not
+stored) on all three backends.
+
+**Residual**: none for this token-canonicalization class; the set-semantics
+match the CC 3.4.7.1 `identity_type`-is-a-set definition.
+
+#### AV-72: Authority/forward-secrecy bypasses in the new community gates (CC 3.2 / CC 4.4.3.2.1 / CC 3.4.7.1 / CC 4.4.3.2.2, F2–F5)
+
+**Attack (four sub-vectors, all closed v9.0.0 by the adversarial review)**:
+
+- **F2 — self-labeled `cohort_subkind: infrastructure`.** Any caller could
+  self-label a community `infrastructure` to skip the AV-69 owner-binding
+  precondition AND force its content to Commons-plaintext (no DEK,
+  AV-70) — both gates honored the label with **no authority check**.
+  **Mitigation**: `is_authorized_infrastructure_community` honors the
+  carve-out **only if** the community's own key (`community_key_id`, via
+  `lookup_public_key`) has an `identity_type` set containing
+  **`substrate_persist`** (the reserved governance/substrate authority).
+  Used in BOTH gates; **fail-secure** — an unauthorized infra-labeled
+  community falls through to the STRICTER non-infra path (owner-binding
+  REQUIRED + DEK cascade APPLIES).
+- **F3 — `is_owner_bound` honored revoked/expired delegations.** Clause 3
+  ("∃ a live `delegates_to(U → k)` from a `user`-role granter") accepted
+  ANY `delegates_to` — a `withdraws`/`recants`-retracted or lapsed
+  delegation still conferred owner-binding (AV-69 bypass). **Mitigation**:
+  an edge is now skipped if the granter has a `withdraws`/`recants`
+  against `k` (the §11.10 edge-retraction model, recipient named as
+  `attested_key_id`) or if `expires_at <= now`; only a genuinely live edge
+  confers owner-binding.
+- **F4 — rotation forward-secrecy hole for future-dated `effective_at`.**
+  `put_community_membership_revocation` bumped the epoch at write time, but
+  `resolve_community_members` only dropped a member once `effective_at <=
+  now` — a revocation with `effective_at = now + 30d` bumped the epoch yet
+  kept wrapping the "removed" member into the fresh-epoch DEK for the whole
+  window, falsifying AV-70's "exposure window = zero." **Mitigation**:
+  community membership revocation is now **immediate** — a future-dated
+  `effective_at` (beyond a 60s clock-skew tolerance) is REJECTED with typed
+  `Error::InvalidArgument` BEFORE any write, on all three backends.
+- **F5 — revocation INSERT + `hard_case` emission + epoch bump not
+  atomic.** A bump failure after the INSERT committed left a durable
+  un-rotated revocation (a silent forward-secrecy gap). **Mitigation**:
+  wrapped in ONE transaction per backend (postgres `client.transaction()`;
+  sqlite `conn.transaction()` under a single lock); memory is already
+  atomic under its state lock.
+
+**Secondary**: each fix has a test that fails without it and passes with
+it, on all three backends where the path runs (CHANGELOG `## [9.0.0]`
+"Fixed — security review").
+
+**Residual**: these close the v9.0.0 gates' own bypasses; they do not add
+new substrate authority — the carve-out authority (`substrate_persist`) is
+the same reserved governance role that already owns `system:` /
+`audit_chain:` / `corpus_health:` reserved prefixes (§3.7).
+
 ---
 
 ## 4. Mitigation Matrix
@@ -2029,7 +2293,7 @@ persist as `EnvelopeOnly` / below-the-noise-floor blur — §19.3 N5 requires
 | AV-56 | Incident correlation_keys abuse (unbounded JSONB array exhausts GIN index, or single-key bloat masks attacker-controlled identifiers in operator-facing UI) | v0.8.3 `record_incident` validates `correlation_keys` at the trait surface BEFORE any SQL fires: rejects when `len > MAX_CORRELATION_KEYS = 32` or when any single key's byte-length exceeds `MAX_CORRELATION_KEY_BYTES = 256`. Empty strings also rejected (no implicit "match-anything" key). GIN index on `correlation_keys` JSONB column serves the reverse-lookup path; bounded element count keeps index entries small. | Bounded inputs map to predictable GIN-index growth (`O(incidents × MAX_CORRELATION_KEYS)` worst case); operators sizing storage can plan deterministically. | **✓ Mitigated v0.8.3** | CIRISPersist#37 |
 | AV-57 | Read-side cohort_scope escalation via caller-asserted admission (a reader forges `CallerScope::Authenticated { admission: { identity/families/communities = everything } }` to read self/family/community content it isn't a member of) | v4.0 `CallerAdmission` has NO public constructor — the sole way to obtain one is the substrate-side `build_caller_admission(engine, occurrence_key_id)`, which resolves identity / families / communities deterministically from `federation_identity_occurrences` / `federation_families` / `federation_communities`. The PyO3 boundary accepts only an `occurrence_key_id` string; no admission fields cross it. The §4.3 read predicate is pure target-membership: a row is admitted iff its `cohort_target_id` ∈ the reader's substrate-resolved sets — so a forged set cannot be constructed to begin with, and even the "shared cohort with emitter" leak class is eliminated (target-membership, not emitter-join). | Boundary auth (proving the caller controls the occurrence key's private key) is the caller-environment's responsibility (Ed25519 challenge / authenticated channel); persist trusts the boundary on key ownership and enforces visibility from what the chain admitted. Defense in depth: CIRISEdge#48-A re-checks cohort_scope at egress; joint `cohort_scope_double_miss_total` is the alert. | **✓ Mitigated v4.0** (closed by construction — private constructor + substrate-only builder) | CIRISPersist#160 |
 | AV-58 | Write-side cohort_scope downgrade (a writer stamps a broader `cohort_scope` / a `cohort_target_id` for a cohort it isn't a member of — e.g. tags `community: C` it isn't in, or `federation` on self content — to broaden visibility) | v4.0 `DimensionAdmissionPolicy::check_write_cohort_scope` (§4.6) runs AFTER the verify gate, BEFORE persist (zero-writes-on-refusal, mirroring `signature_mismatch_rejected_no_writes`): a writer claiming `(family\|community, target)` must have that target ∈ its substrate-resolved admission, else `ScopeRefusalReason::No{Family,Community}Membership`. `self` targets are substrate-stamped from the verified signer (never caller-supplied); broad tiers carry no target. Wired into trace ingest + `put_attestation`. | Symmetric to AV-57 (same `CallerAdmission`, opposite direction). Edge pre-ingest verification is Layer 2; joint `cohort_scope_write_double_miss_total` is the alert. Attestations carry `cohort_scope` but no `cohort_target_id` column in v4.0, so family/community attestation writes are refused (no provable target) — a named follow-up column would relax this. | **✓ Mitigated v4.0** (verify→gate→persist; set-membership) | CIRISPersist#160 |
-| AV-59 | HNDL forge-later on the durable trace corpus (backdated trace minted by a CRQC adversary who broke Ed25519) | v7.2.0 `verify_trace_hybrid` hard cut: `VerifyMode::Full` verifies BOTH halves via `verify_hybrid`(`Strict`); classical-only rejected at admission (`verify_hybrid_required`), no `require_hybrid: false` posture (store-path PQC, §10.1.5.1.1). | Verify-before-mutation step 2, before scrub/insert; dedup not moved ahead of verify; same cut on fountain manifests + aggregation meta. | **✓ Mitigated v7.2.0** (`2.7.legacy` import exempt as provenance-only) | CIRISPersist#225 |
+| AV-59 | HNDL forge-later on the durable trace corpus (backdated trace minted by a CRQC adversary who broke Ed25519) — the trace-store side of the CC 5.3.2.4.3 `tier=federation ⟹ hybrid present` invariant (the per-trace attestation corpus is AV-67) | v7.2.0 `verify_trace_hybrid` hard cut: `VerifyMode::Full` verifies BOTH halves via `verify_hybrid`(`Strict`); classical-only rejected at admission (`verify_hybrid_required`), no `require_hybrid: false` posture (store-path PQC, §10.1.5.1.1 / CC 5.3.2.4.3.1). | Verify-before-mutation step 2, before scrub/insert; dedup not moved ahead of verify; same cut on fountain manifests + aggregation meta. | **✓ Mitigated v7.2.0** (`2.7.legacy` import exempt as provenance-only) | CIRISPersist#225 |
 | AV-60 | WholenessWitness equivocation (two signed roots, one peer) | v8.2.0 `reconcile_peer_witnesses`/`classify_stored` run `compare_witnesses`; Equivocation RETAINS both + emits `hard_case:witness_equivocation` (idempotent), NEVER reconciled (§19 N4, non-repudiable). | Only verified witnesses enter the corpus (AV-62 PQC gate); re-scan idempotent. | **✓ Mitigated v8.2.0** (detect + preserve; consumer adjudicates) | CIRISPersist#228 |
 | AV-61 | Witness divergence escalated to drive the quorum-merge (witness supplies a winning root / resurrects a revoked key) | v8.2.0 Divergent → `WitnessReconcileAction::TriggerQuorumMerge` carrying NO winner / NO root; triggers the EXISTING V058 quorum-merge over stored rows (`resolve_monotonic_quorum` / `revision`); the witness root NEVER enters resolution — no fragment-pick, no revoked-key resurrection. | Directive type structurally cannot carry a root; tested (Divergent keeps the REVOKED record). | **✓ Mitigated v8.2.0** (witness = detector, not resolver) | CIRISPersist#228/#229 |
 | AV-62 | Witness anti-rollback / eclipse (stale signed witness replay) | v8.2.0 `accept_if_monotonic` + `last_witness_epoch_for_peer` strict-epoch monotonic guard (epoch MUST strictly advance, §19 N4); `put_wholeness_witness` runs `verify_witness` PQC-before-persist (`witness_admit_hybrid_required`), zero rows on reject (no store-then-quarantine). | Corpus pruned to last-K (8) verified per peer; no `verified` column (§19.0 F-5 — verdict recomputed at the gate). | **✓ Mitigated v8.2.0** | CIRISPersist#228/#229 |
@@ -2037,6 +2301,12 @@ persist as `EnvelopeOnly` / below-the-noise-floor blur — §19.3 N5 requires
 | AV-64 | Forged `aggregation_meta` on the store path (tampered/unsigned §19.7 composite meta) | v8.4.0 `put_aggregated_tier` runs `verify_aggregation_meta` (§19.7.1 bound-hybrid) BEFORE persist; missing/invalid ML-DSA-65 → `aggregation_meta_hybrid_required` (store-path PQC §10.1.5.1.1), tampered → `aggregation_meta_invalid`; zero rows; composite manifest also rides the #225 admit gate in one tx. | Storage column stays opaque BYTEA/BLOB (V086 unchanged across freeze — wire-churn firewall); verify inputs admission-only, never persisted. | **✓ Mitigated v8.4.0** (`EjectAggregatedTierOnly` tier-granular stratum-shed consumed v8.6.0 — verify v5.11.0) | CIRISPersist#230 |
 | AV-65 | Forged aggregation source set (descent as a force-evict channel) | v8.4.0 `descend_aggregated_sources` runs `verify_member_commitment` over the caller's source ids BEFORE descending — a set that doesn't re-derive the committed `member_commitment` is REJECTED; canonical `descend_order` (§19.7.2 lexicographic). Full source-id-list recomputation, never a partial inclusion proof (the §19.1 RC15-freeze CVE-2012-2459 non-exploitability rationale). | `member_commitment` is hybrid-signed in the composite manifest (AV-64) — the root to re-derive is itself authenticated. | **✓ Mitigated v8.4.0** | CIRISPersist#230 |
 | AV-66 | Rarity-driven retention resurrecting revoked content (N5) | v8.1.0/v8.2.0 `evict_fountain_content_hard_delete` is a SEPARATE path that NEVER consults `retention_priority` — drops all symbols, manifest stays `EnvelopeOnly`; `resolve_retention_action` drives `retention_decision`/`ejection_verdict` (Withdrawn → `EjectHardDelete` regardless of `is_rare`). Revocation overrides rarity by construction, not by comparison. | N6 `holding_claim_counts` gates rarity on possession-proven claims (unverified claim can't lower another peer's priority). | **✓ Mitigated v8.1.0/v8.2.0** | CIRISPersist#228 |
+| AV-67 | Federation-tier forge-later via unverified per-trace ingest (CC 5.3.2.4.3.1 — the CC 5.3.2.4.3 `tier=federation ⟹ hybrid present` invariant enforced at the bulk testimony corpus; same forge-later class as AV-59 at the trace-store path, previously unmodeled at the per-trace `put_attestation` grain) | v9.0.0 `verify_federation_tier_ingest` (`ceg_produce_canonicalize` JCS → `SHA-256 == original_content_hash` → `lookup_public_key` REGISTERED pubkeys → `verify_hybrid`(`Strict`), BOTH halves REQUIRED) wired into `put_attestation` on all three backends BEFORE `persist_row_hash`+INSERT (verify-before-mutation, AV-9); rejected ⇒ zero rows, typed `FederationTierUnverified`. Composed with — not replacing — `check_federation`. | **Local-tier EXEMPT** (CC 5.3.2.2 deferred sig; matrix arm (e) proves no over-reject). Exposed + fixed the classical-only `withdraws` emitter gap (evict/sweeper/takedown now hybrid-sign via `LocalSigner`; non-PQC engine fails honest, no silent skip). | **✓ Mitigated v9.0.0** (BREAKING — classical-only fed rows non-conformant; non-PQC producers local-tier-only) | CIRISPersist#237 |
+| AV-68 | Node-only key receiving agency via `delegates_to` (CC 4.4.3.4.3 "Partnership WITHOUT agency" / CC 1.13.5 "infrastructure must not have agency") | v9.0.0 `check_node_agency_admission` wired into `put_attestation` (3 backends, verify-before-mutation): a `delegates_to` to a `node`-ONLY recipient (resolved via `lookup_public_key`, CC 3.4.7.1) MUST be `scopes_are_infra_only` (non-empty, every token `infra:`), else REJECTED `NodeAgencyForbidden` + not stored. Published `identity_type::NODE` + `delegation_scope` (`infra:*`/`agency:*` + `LEGACY_AGENCY_KINDS`). | No over-reject: `agent`/brain key MAY carry `agency:*`; `{node,agent}` hybrid not constrained; unresolved recipient FK-rejected by `put_attestation` anyway. CIRISServer `ownership.rs` becomes a thin wrapper. | **✓ Mitigated v9.0.0** (see AV-71 for the dup-token bypass) | CIRISPersist#235/#236 |
+| AV-69 | Unowned node/agent admitted to a non-infra community (CC 3.2 owner-binding gate / CC 3.4.7.1; authority must root in a human, CC 1.13.2) | v9.0.0 `check_community_membership_owner_binding` wired into `put_community` (3 backends) after the geographic gate, before write lock/INSERT (verify-before-mutation): a `node`/`agent` roster member lacking a live `is_owner_bound(K)` path to a `user`-role identity REJECTS the write `UnownedCommunityMember` + not stored. Precondition, NOT a substitute for the `consensus_protocol` vote. | Infra carve-out (CC 3.2 "Trust ≠ membership"): `cohort_subkind: infrastructure` community admits an unowned node. `user` member trivially owner-bound; unresolved/non-node-agent out of scope (no over-reject). | **✓ Mitigated v9.0.0** (see AV-72/F2 self-label, AV-72/F3 revoked-delegation bypasses) | CIRISPersist#235 |
+| AV-70 | Community-DEK not rotated on member removal — removed member decrypts NEW community content (CC 4.4.3.2.2 forward secrecy; community-DEK is content's SOLE confidentiality boundary, CC 4.4.3.2.1) | v9.0.0 `put_community_membership_revocation` bumps the community DEK epoch (`community_dek_bump_epoch`, 3 backends) as part of the revocation write; next emission mints a FRESH DEK wrapped only to remaining members (active roster = `lookup_community` ∖ effective revocations); removed member can't unwrap. **Exposure window = zero.** All wraps `wrap_algorithm: v2` (FIPS-203 hybrid) — NEVER v1 (CC 4.4.3.4.1 / CC 5.2 HNDL); keyless member fail-secure EXCLUDED + `hard_case:recipient_excluded` (V087 CHECK makes v1 unrepresentable). | Forward-only (old-epoch blobs keep grants); flat per-member re-wrap, deliberately NOT MLS TreeKEM (CC 5.1, RET-layer OQ). Infra communities opt OUT (Commons plaintext, no DEK — trust root publicly auditable). | **✓ Mitigated v9.0.0** (see AV-72/F4 future-dated `effective_at`, AV-72/F5 atomicity) | CIRISPersist (CC 4.4.3.2.2) |
+| AV-71 | Node-agency gate (AV-68) bypass via duplicate `identity_type` token `"node,node"` (CC 1.13.5 / CC 4.4.3.4.3) | v9.0.0 (adversarial review F1) the gate now tests the identity_type **set** via `HashSet<&str>` (`len()==1 && contains(NODE)`), robust to duplicate/whitespace/order — `"node,node"` no longer evades node-only detection. | `node,agent` hybrid still ADMITTED (no over-reject); regression-tested on 3 backends (`"node,node"`/`"node, node"` + `agency:*` → REJECTED + not stored). | **✓ Mitigated v9.0.0** | CIRISPersist#237 (F1) |
+| AV-72 | Authority/forward-secrecy bypasses in the new v9.0.0 community gates (CC 3.2 / CC 4.4.3.2.1 / CC 3.4.7.1 / CC 4.4.3.2.2) | v9.0.0 (adversarial review F2–F5): **F2** self-labeled `cohort_subkind: infrastructure` skipped owner-binding + forced plaintext → `is_authorized_infrastructure_community` honors the carve-out ONLY if `community_key_id` is `substrate_persist`-roled (fail-secure to the stricter path). **F3** `is_owner_bound` honored revoked/expired delegations → edge skipped on `withdraws`/`recants` against `k` (§11.10) or `expires_at <= now`. **F4** future-dated `effective_at` kept wrapping a "removed" member → community revocation now immediate (future-dated beyond 60s skew REJECTED before write). **F5** non-atomic revoke+hard_case+bump → ONE transaction per backend. | Each fix has a fails-without/passes-with test on all backends where the path runs; no new substrate authority (`substrate_persist` is the existing reserved governance role, §3.7). | **✓ Mitigated v9.0.0** | CIRISPersist#237 (F2–F5) |
 
 ---
 
