@@ -1063,6 +1063,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // calls list_attestations_by on self).
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
+        // v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — reject-agency-
+        // on-node-key gate. A no-op for non-`delegates_to` rows; for a
+        // `delegates_to` whose recipient (`attested_key_id`) resolves to a
+        // node-ONLY identity it REJECTS any scope set that is not
+        // `infra:*`-only (agency:* / legacy unprefixed agency / empty /
+        // other) — "infrastructure must not have agency" made cryptographic.
+        // Runs BEFORE the state lock (it calls lookup_public_key on self,
+        // which acquires the lock itself) and BEFORE persist — a rejected
+        // emission leaves no trace.
+        crate::federation::admission::check_node_agency_admission(self, &row).await?;
+
         let mut state = self.state.lock().expect("memory backend lock");
         // FK enforcement parity with postgres: both attesting_key_id
         // and attested_key_id must exist in federation_keys.
@@ -4015,6 +4026,193 @@ mod tests {
             observed_region: crate::federation::verify_coord::region::US.into(),
             persist_row_hash: String::new(),
         }
+    }
+
+    // ── #236 CC 4.4.3.5 / CC 1.13.5 — reject-agency-on-node-key gate ───
+
+    /// Build a `delegates_to` row from `attesting` to `attested` carrying
+    /// the given scope set (array wire shape). Re-uses `fix_attestation`
+    /// then overrides the type + scope envelope.
+    fn fix_node_delegates_to(
+        id: &str,
+        attesting: &str,
+        attested: &str,
+        scrub_key_id: &str,
+        scope: &[&str],
+    ) -> Attestation {
+        let mut att = fix_attestation(id, attesting, attested, scrub_key_id);
+        att.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        att.attestation_envelope = serde_json::json!({
+            "id": id,
+            "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+        });
+        att
+    }
+
+    /// Register `owner` (user) + `node` (node-only) + an `agent` recipient.
+    async fn bootstrap_node_agency(backend: &MemoryBackend) {
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("registry-steward", "registry", "registry-steward"),
+            })
+            .await
+            .unwrap();
+        let mut owner = fix_key("owner", "owner", "registry-steward");
+        owner.identity_type = crate::federation::types::identity_type::USER.into();
+        backend
+            .put_public_key(SignedKeyRecord { record: owner })
+            .await
+            .unwrap();
+        let mut node = fix_key("node-key", "node", "registry-steward");
+        node.identity_type = crate::federation::types::identity_type::NODE.into();
+        backend
+            .put_public_key(SignedKeyRecord { record: node })
+            .await
+            .unwrap();
+        let mut agent = fix_key("agent-key", "agent", "registry-steward");
+        agent.identity_type = crate::federation::types::identity_type::AGENT.into();
+        backend
+            .put_public_key(SignedKeyRecord { record: agent })
+            .await
+            .unwrap();
+    }
+
+    /// (a) delegates_to → node key with ONLY infra:* scopes → ADMITTED.
+    #[tokio::test]
+    async fn node_delegation_infra_only_admitted() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = MemoryBackend::new();
+        bootstrap_node_agency(&backend).await;
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "d-infra",
+                    "owner",
+                    "node-key",
+                    "owner",
+                    &[ds::INFRA_NETWORK_PRESENCE, ds::INFRA_SERVE],
+                ),
+            })
+            .await
+            .unwrap();
+        let stored = backend.list_attestations_for("node-key").await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].attestation_id, "d-infra");
+    }
+
+    /// (b) delegates_to → node key carrying agency:* → REJECTED + not stored.
+    /// THE load-bearing CC 1.13.5 guard.
+    #[tokio::test]
+    async fn node_delegation_agency_rejected_not_stored() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = MemoryBackend::new();
+        bootstrap_node_agency(&backend).await;
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "d-agency",
+                    "owner",
+                    "node-key",
+                    "owner",
+                    &[ds::INFRA_SERVE, ds::AGENCY_ACT_ON_BEHALF],
+                ),
+            })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::NodeAgencyForbidden {
+                ref attested_key_id,
+                ref offending_scopes,
+            } => {
+                assert_eq!(attested_key_id, "node-key");
+                assert_eq!(
+                    offending_scopes,
+                    &vec![ds::AGENCY_ACT_ON_BEHALF.to_string()]
+                );
+            }
+            other => panic!("expected NodeAgencyForbidden, got {other:?}"),
+        }
+        assert_eq!(err.kind(), "federation_node_agency_forbidden");
+        // Not stored (verify-before-mutation).
+        assert!(backend
+            .list_attestations_for("node-key")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// (b') delegates_to → node key carrying a LEGACY unprefixed agency
+    /// kind (`act_on_behalf`) → REJECTED.
+    #[tokio::test]
+    async fn node_delegation_legacy_agency_rejected() {
+        use crate::federation::self_at_login::SCOPE_ACT_ON_BEHALF;
+        let backend = MemoryBackend::new();
+        bootstrap_node_agency(&backend).await;
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "d-legacy",
+                    "owner",
+                    "node-key",
+                    "owner",
+                    &[SCOPE_ACT_ON_BEHALF],
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::Error::NodeAgencyForbidden { .. }
+        ));
+        assert!(backend
+            .list_attestations_for("node-key")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// (c) delegates_to → node key with an EMPTY scope set → REJECTED.
+    #[tokio::test]
+    async fn node_delegation_empty_scope_rejected() {
+        let backend = MemoryBackend::new();
+        bootstrap_node_agency(&backend).await;
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to("d-empty", "owner", "node-key", "owner", &[]),
+            })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::NodeAgencyForbidden {
+                ref offending_scopes,
+                ..
+            } => assert!(offending_scopes.is_empty()),
+            other => panic!("expected NodeAgencyForbidden, got {other:?}"),
+        }
+    }
+
+    /// (d) delegates_to → NON-node (agent) key carrying agency:* → ADMITTED.
+    /// The gate ONLY constrains node recipients — no over-reject.
+    #[tokio::test]
+    async fn agent_delegation_agency_admitted_not_over_rejected() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = MemoryBackend::new();
+        bootstrap_node_agency(&backend).await;
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "d-agent",
+                    "owner",
+                    "agent-key",
+                    "owner",
+                    &[ds::AGENCY_ACT_ON_BEHALF, ds::AGENCY_DECIDE],
+                ),
+            })
+            .await
+            .unwrap();
+        let stored = backend.list_attestations_for("agent-key").await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].attestation_id, "d-agent");
     }
 
     #[tokio::test]

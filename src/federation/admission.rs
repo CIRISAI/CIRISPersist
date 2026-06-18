@@ -1205,6 +1205,40 @@ fn delegation_scope_set(envelope: &serde_json::Value) -> std::collections::HashS
     }
 }
 
+/// v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — the CC 1.13.5
+/// verifier: is `scopes` a delegation scope set a pure `node`-role
+/// delegate is allowed to carry?
+///
+/// Returns `true` **iff** the set is **non-empty** AND **every** token
+/// begins with [`super::types::delegation_scope::INFRA_PREFIX`]
+/// (`infra:`). Returns `false` for any set that:
+///
+/// - is **empty** (a node delegation must positively name infra scopes;
+///   a scope-less delegation grants nothing checkable), OR
+/// - contains any `agency:*` token, OR
+/// - contains any **legacy unprefixed** agency kind
+///   ([`super::types::delegation_scope::is_legacy_agency_scope`] —
+///   `act_on_behalf` / `message_io` / `reason` / `decide` /
+///   `sub_delegation`), OR
+/// - contains any other non-`infra:` token (unknown prefix, etc.).
+///
+/// **CIRISServer parity.** This mirrors CIRISServer
+/// `src/auth/ownership.rs::scopes_are_infra_only(&[String])` semantics
+/// EXACTLY (accepts `infra:*`, rejects `agency:*` + legacy agency kinds +
+/// empty + other). The legacy-agency and other-prefix cases are
+/// subsumed by the single "every token starts with `infra:`" predicate
+/// (a legacy kind like `act_on_behalf` does not start with `infra:`), so
+/// the predicate is the whole rule; the legacy-agency recognizer exists
+/// for the explicit reject-message / test clarity, not as a separate
+/// admission branch. Exposed `pub` for downstream reuse (the gate below
+/// + CIRISServer's server-side wrapper).
+pub fn scopes_are_infra_only(scopes: &std::collections::HashSet<String>) -> bool {
+    !scopes.is_empty()
+        && scopes
+            .iter()
+            .all(|s| s.starts_with(super::types::delegation_scope::INFRA_PREFIX))
+}
+
 /// v8.7.1 (CIRISPersist#233, CEG RC24 §11.10) — does a `delegates_to`
 /// envelope grant `sub_delegation` (the right of the recipient to
 /// further-delegate the duty)? `true` only when the envelope carries
@@ -2127,6 +2161,81 @@ pub async fn check_delegated_duty_scores_admission(
     .await
 }
 
+/// v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — the
+/// reject-agency-on-node-key gate: the `put_attestation` entry point that
+/// makes "infrastructure must not have agency" cryptographically enforced.
+///
+/// A no-op (`Ok(())`) for any row that is NOT a
+/// [`attestation_type::DELEGATES_TO`]. For a `delegates_to` it resolves the
+/// recipient's (`attested_key_id`'s) `identity_type` via
+/// [`FederationDirectory::lookup_public_key`]; the gate **only constrains a
+/// recipient that resolves to a `node`-ONLY identity** (the resolved
+/// `identity_type` set contains `node` and NOTHING else — a `{node}` key,
+/// not a `{node,agent}` hybrid). For such a node-only recipient the
+/// delegation's [`delegation_scope_set`] MUST satisfy
+/// [`scopes_are_infra_only`]; otherwise the row is REJECTED with
+/// [`Error::NodeAgencyForbidden`] (CC 4.4.3.5) and never stored.
+///
+/// # Unresolved / non-node recipients (design decision)
+///
+/// - **Recipient does not resolve** (`lookup_public_key` ⇒ `None`): the
+///   gate **passes** — an unregistered recipient is out of scope for THIS
+///   gate (it only constrains a *known* node key). This cannot be used to
+///   bypass the property: every backend's `put_attestation` independently
+///   FK-rejects a `delegates_to` whose `attested_key_id` does not exist in
+///   `federation_keys`, so an unresolved recipient can never be persisted
+///   at all — and once a key IS registered as `node` it resolves here and
+///   the gate fires. A node key can therefore never receive an agency
+///   delegation.
+/// - **Recipient resolves to a non-node identity** (`agent`, `user`, a
+///   `{node,agent}` hybrid, …): the gate **passes** (returns `Ok(())`).
+///   The gate ONLY constrains pure-node recipients — it does not
+///   over-reject `agency:*` on a brain/agent key, which legitimately
+///   carries agency (CC 1.13.5 is about *infrastructure*, not all keys).
+///
+/// Verify-before-mutation (AV-9): runs alongside the withdraws /
+/// delegated-duty gates BEFORE the row is hashed + INSERTed — a rejected
+/// emission leaves no trace. Mirrors exactly how the other shared
+/// admission gates are wired into the `put_attestation` path on every
+/// backend (memory / sqlite / postgres). Resolution uses the trait's own
+/// `lookup_public_key`, which all three backends implement, so this is
+/// backend-agnostic admission logic (no Backend-trait surface added).
+pub async fn check_node_agency_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::DELEGATES_TO {
+        return Ok(());
+    }
+    // Resolve the recipient's identity_type set. Only a recipient that
+    // resolves to a *node-only* identity is constrained here.
+    let Some(recipient) = directory.lookup_public_key(&row.attested_key_id).await? else {
+        // Unresolved recipient: out of scope for this gate (and FK-rejected
+        // downstream — it can never be persisted). See doc note.
+        return Ok(());
+    };
+    let members = identity_type::parse_set(&recipient.identity_type);
+    let is_node_only = members == [identity_type::NODE];
+    if !is_node_only {
+        return Ok(());
+    }
+    let scopes = delegation_scope_set(&row.attestation_envelope);
+    if scopes_are_infra_only(&scopes) {
+        return Ok(());
+    }
+    // Reject: a node-only key may carry ONLY infra:* scopes. Report the
+    // offending (non-infra) tokens, sorted for a stable error string.
+    let mut offending_scopes: Vec<String> = scopes
+        .into_iter()
+        .filter(|s| !s.starts_with(super::types::delegation_scope::INFRA_PREFIX))
+        .collect();
+    offending_scopes.sort();
+    Err(Error::NodeAgencyForbidden {
+        attested_key_id: row.attested_key_id.clone(),
+        offending_scopes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2871,5 +2980,63 @@ mod tests {
             .unwrap_err(),
             ScopeRefusalReason::NoFamilyMembership
         );
+    }
+
+    // ── #236 CC 1.13.5 — scopes_are_infra_only verifier unit table ─────
+
+    /// Build a `HashSet<String>` from string slices for the table tests.
+    fn scope_set(items: &[&str]) -> std::collections::HashSet<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn scopes_are_infra_only_table() {
+        use super::super::types::delegation_scope as ds;
+
+        // infra-only set → true (single + multiple).
+        assert!(scopes_are_infra_only(&scope_set(&[ds::INFRA_SERVE])));
+        assert!(scopes_are_infra_only(&scope_set(&[
+            ds::INFRA_NETWORK_PRESENCE,
+            ds::INFRA_MEMBERSHIP,
+            ds::INFRA_SERVE,
+            ds::INFRA_STORE,
+            ds::INFRA_TRANSPORT,
+            ds::INFRA_ATTEST,
+        ])));
+
+        // mixed infra + agency → false.
+        assert!(!scopes_are_infra_only(&scope_set(&[
+            ds::INFRA_SERVE,
+            ds::AGENCY_ACT_ON_BEHALF
+        ])));
+
+        // agency-only → false.
+        assert!(!scopes_are_infra_only(&scope_set(&[ds::AGENCY_DECIDE])));
+        assert!(!scopes_are_infra_only(&scope_set(&[
+            ds::AGENCY_ACT_ON_BEHALF,
+            ds::AGENCY_MESSAGE_IO,
+            ds::AGENCY_REASON,
+            ds::AGENCY_DECIDE,
+        ])));
+
+        // legacy unprefixed agency kind → false.
+        for legacy in ds::LEGACY_AGENCY_KINDS {
+            assert!(
+                !scopes_are_infra_only(&scope_set(&[legacy])),
+                "legacy agency kind {legacy:?} must not be infra-only"
+            );
+            assert!(ds::is_legacy_agency_scope(legacy));
+        }
+
+        // empty set → false.
+        assert!(!scopes_are_infra_only(&scope_set(&[])));
+
+        // unknown / other prefix → false.
+        assert!(!scopes_are_infra_only(&scope_set(&["consent_revocation"])));
+        assert!(!scopes_are_infra_only(&scope_set(&["moderate"])));
+        // `network_presence` (unprefixed) is NOT infra:* and NOT a legacy
+        // agency kind — it just isn't an admissible node scope unprefixed.
+        assert!(!scopes_are_infra_only(&scope_set(&["network_presence"])));
+        assert!(!ds::is_legacy_agency_scope("network_presence"));
     }
 }

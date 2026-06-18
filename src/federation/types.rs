@@ -137,6 +137,21 @@ pub mod identity_type {
     /// Carried alongside [`USER`] in the `identity_type` set when the
     /// human is also a WA (e.g. `"user,wise_authority"`).
     pub const WISE_AUTHORITY: &str = "wise_authority";
+    /// v8.9.0 (CIRISPersist#235, CC 3.4.7.1 / CC 1.13.5) — the
+    /// fabric/infrastructure role. A CIRISServer (or any pure
+    /// infrastructure node) self-registers its federation signing key
+    /// with this `identity_type`. **A `node`-role key MUST NOT carry
+    /// agency** (CC 1.13.5): a `delegates_to` whose recipient resolves
+    /// to a `node`-only identity may carry ONLY [`super::delegation_scope`]
+    /// `infra:*` scopes — the admission gate in
+    /// [`super::admission::check_node_agency_admission`] rejects any
+    /// `agency:*` (or legacy unprefixed agency kind) scope on such a
+    /// delegation, making "infrastructure must not have agency"
+    /// cryptographically enforced (CC 4.4.3.5). CIRISServer registers
+    /// the literal `"node"` today (`compose.rs::build_self_key_record`);
+    /// this publishes the canonical token so producer + verifier agree
+    /// byte-for-byte.
+    pub const NODE: &str = "node";
 
     /// v6.5.0 (CEG §7.0.1) — join an `identity_type` **set** into the
     /// single TEXT column representation: sorted, de-duplicated,
@@ -245,6 +260,88 @@ pub mod attestation_type {
     /// Wire-distinct from [`WITHDRAWS`] even when consumer UIs
     /// collapse the two — see module-level note.
     pub const RECANTS: &str = "recants";
+}
+
+/// v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — the reserved
+/// **two-prefix delegation scope split** that makes "infrastructure
+/// must not have agency" wire-checkable.
+///
+/// CC 4.4.3.5 pins two reserved scope prefixes on a `delegates_to`
+/// envelope's `scope` field:
+///
+/// - [`INFRA_PREFIX`] (`infra:*`) — **server-class** authority, the only
+///   class a pure `node`-role delegate ([`super::types::identity_type::NODE`])
+///   may carry. Canonical infra scopes: [`INFRA_NETWORK_PRESENCE`],
+///   [`INFRA_MEMBERSHIP`], [`INFRA_SERVE`], [`INFRA_STORE`],
+///   [`INFRA_TRANSPORT`], [`INFRA_ATTEST`].
+/// - [`AGENCY_PREFIX`] (`agency:*`) — **brain-only** authority, FORBIDDEN
+///   for a `node`-role delegate (CC 1.13.5). Canonical agency scopes:
+///   [`AGENCY_ACT_ON_BEHALF`], [`AGENCY_MESSAGE_IO`], [`AGENCY_REASON`],
+///   [`AGENCY_DECIDE`].
+///
+/// The pre-CC-4.4.3.5 **legacy unprefixed** agency profile (the
+/// `self_at_login` vocabulary — `act_on_behalf` / `message_io` /
+/// `reason` / `decide` / `sub_delegation`) is ALSO agency and MUST be
+/// rejected on a node key; [`is_legacy_agency_scope`] recognizes it.
+/// Note `network_presence` is NOT a legacy-agency kind — it maps to
+/// [`INFRA_NETWORK_PRESENCE`] (presence is an infra duty, not agency).
+///
+/// The CC 1.13.5 verifier is [`super::admission::scopes_are_infra_only`];
+/// the CC 4.4.3.5 admission gate is
+/// [`super::admission::check_node_agency_admission`].
+pub mod delegation_scope {
+    /// CC 4.4.3.5 — the server-class scope prefix. A `node`-role
+    /// delegate may carry ONLY scopes under this prefix.
+    pub const INFRA_PREFIX: &str = "infra:";
+    /// CC 4.4.3.5 / CC 1.13.5 — the brain-only scope prefix. FORBIDDEN
+    /// for a `node`-role delegate.
+    pub const AGENCY_PREFIX: &str = "agency:";
+
+    /// `infra:network_presence` — be reachable / present on the network
+    /// as the node (the infra realization of presence; cf. the legacy
+    /// unprefixed `network_presence`).
+    pub const INFRA_NETWORK_PRESENCE: &str = "infra:network_presence";
+    /// `infra:membership` — participate in federation membership.
+    pub const INFRA_MEMBERSHIP: &str = "infra:membership";
+    /// `infra:serve` — serve content / requests as infrastructure.
+    pub const INFRA_SERVE: &str = "infra:serve";
+    /// `infra:store` — persist / store data as infrastructure.
+    pub const INFRA_STORE: &str = "infra:store";
+    /// `infra:transport` — relay / transport traffic as infrastructure.
+    pub const INFRA_TRANSPORT: &str = "infra:transport";
+    /// `infra:attest` — emit infrastructure self-attestations.
+    pub const INFRA_ATTEST: &str = "infra:attest";
+
+    /// `agency:act_on_behalf` — take action attributable to a principal.
+    pub const AGENCY_ACT_ON_BEHALF: &str = "agency:act_on_behalf";
+    /// `agency:message_io` — send/receive messages as a principal.
+    pub const AGENCY_MESSAGE_IO: &str = "agency:message_io";
+    /// `agency:reason` — reason / deliberate as a principal.
+    pub const AGENCY_REASON: &str = "agency:reason";
+    /// `agency:decide` — make decisions as a principal.
+    pub const AGENCY_DECIDE: &str = "agency:decide";
+
+    /// CC 1.13.5 — the legacy **unprefixed** agency kinds (the pre-split
+    /// `self_at_login` agency profile + `reason`/`decide`) that MUST also
+    /// be rejected on a node key. `network_presence` is deliberately
+    /// EXCLUDED (it is the infra presence duty, not agency). The
+    /// `act_on_behalf` / `message_io` / `sub_delegation` entries alias the
+    /// canonical [`crate::federation::self_at_login`] constants by value.
+    pub const LEGACY_AGENCY_KINDS: [&str; 5] = [
+        crate::federation::self_at_login::SCOPE_ACT_ON_BEHALF,
+        crate::federation::self_at_login::SCOPE_MESSAGE_IO,
+        "reason",
+        "decide",
+        crate::federation::self_at_login::SCOPE_SUB_DELEGATION,
+    ];
+
+    /// CC 1.13.5 — is `scope` one of the legacy unprefixed agency kinds
+    /// ([`LEGACY_AGENCY_KINDS`])? Used by the node-agency gate so a
+    /// pre-split delegation cannot smuggle agency onto a node key by
+    /// dropping the `agency:` prefix.
+    pub fn is_legacy_agency_scope(scope: &str) -> bool {
+        LEGACY_AGENCY_KINDS.contains(&scope)
+    }
 }
 
 /// v6.7.0 (CIRISPersist#146 Ask 5, CEG 1.0-RC5 §5.6.8.7) — the

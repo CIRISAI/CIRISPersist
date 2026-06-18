@@ -2106,6 +2106,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // leaves no trace.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
+        // v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — reject-agency-
+        // on-node-key gate (parity with the postgres + memory backends). A
+        // no-op for non-`delegates_to` rows; for a `delegates_to` whose
+        // recipient (`attested_key_id`) resolves to a node-ONLY identity it
+        // REJECTS any scope set that is not `infra:*`-only (agency:* / legacy
+        // unprefixed agency / empty / other) — "infrastructure must not have
+        // agency" made cryptographic. Runs AFTER the delegated-duty gate and
+        // BEFORE persist_row_hash + INSERT — a rejected emission leaves no
+        // trace.
+        crate::federation::admission::check_node_agency_admission(self, &row).await?;
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
@@ -22692,6 +22703,172 @@ mod tests {
         assert_eq!(e.depth, 1);
         assert_eq!(e.evidence_refs.len(), 2);
         assert!(e.withdrawn_by.is_none());
+    }
+
+    // ── #236 CC 4.4.3.5 / CC 1.13.5 — reject-agency-on-node-key gate ───
+
+    /// Build a `delegates_to` row carrying a scope SET (array wire shape)
+    /// from `attesting` → `attested`. Mirrors the gate's array acceptance.
+    fn node_delegates_to_sqlite(attesting: &str, attested: &str, scope: &[&str]) -> Attestation {
+        let mut att = topo_attestation(
+            attesting,
+            attested,
+            crate::federation::types::attestation_type::DELEGATES_TO,
+            None,
+            None,
+            &[],
+            None,
+            chrono::Utc::now(),
+        );
+        att.attestation_envelope = serde_json::json!({
+            "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+        });
+        att
+    }
+
+    /// Register owner(user) + node(node-only) + agent recipients on a
+    /// fresh in-memory sqlite backend.
+    async fn bootstrap_node_agency_sqlite() -> SqliteBackend {
+        use crate::federation::types::identity_type;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for (k, ident, ity) in [
+            ("owner", "owner", identity_type::USER),
+            ("node-key", "node", identity_type::NODE),
+            ("agent-key", "agent", identity_type::AGENT),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key_with_identity_type(k, ident, k, ity),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+    }
+
+    /// (a) delegates_to → node key, ONLY infra:* → ADMITTED.
+    #[tokio::test]
+    async fn node_delegation_infra_only_admitted_sqlite() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = bootstrap_node_agency_sqlite().await;
+        let att = node_delegates_to_sqlite(
+            "owner",
+            "node-key",
+            &[ds::INFRA_NETWORK_PRESENCE, ds::INFRA_SERVE],
+        );
+        let id = att.attestation_id.clone();
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let stored =
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "node-key")
+                .await
+                .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].attestation_id, id);
+    }
+
+    /// (b) delegates_to → node key carrying agency:* → REJECTED + not
+    /// stored. THE load-bearing CC 1.13.5 guard.
+    #[tokio::test]
+    async fn node_delegation_agency_rejected_not_stored_sqlite() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = bootstrap_node_agency_sqlite().await;
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: node_delegates_to_sqlite(
+                    "owner",
+                    "node-key",
+                    &[ds::INFRA_SERVE, ds::AGENCY_ACT_ON_BEHALF],
+                ),
+            })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::NodeAgencyForbidden {
+                ref attested_key_id,
+                ref offending_scopes,
+            } => {
+                assert_eq!(attested_key_id, "node-key");
+                assert_eq!(
+                    offending_scopes,
+                    &vec![ds::AGENCY_ACT_ON_BEHALF.to_string()]
+                );
+            }
+            other => panic!("expected NodeAgencyForbidden, got {other:?}"),
+        }
+        assert_eq!(err.kind(), "federation_node_agency_forbidden");
+        assert!(
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "node-key")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// (b') delegates_to → node key, legacy unprefixed agency kind → REJECT.
+    #[tokio::test]
+    async fn node_delegation_legacy_agency_rejected_sqlite() {
+        use crate::federation::self_at_login::SCOPE_ACT_ON_BEHALF;
+        let backend = bootstrap_node_agency_sqlite().await;
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: node_delegates_to_sqlite("owner", "node-key", &[SCOPE_ACT_ON_BEHALF]),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::Error::NodeAgencyForbidden { .. }
+        ));
+        assert!(
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "node-key")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// (c) delegates_to → node key, EMPTY scope set → REJECTED.
+    #[tokio::test]
+    async fn node_delegation_empty_scope_rejected_sqlite() {
+        let backend = bootstrap_node_agency_sqlite().await;
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: node_delegates_to_sqlite("owner", "node-key", &[]),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::Error::NodeAgencyForbidden { .. }
+        ));
+    }
+
+    /// (d) delegates_to → NON-node (agent) key, agency:* → ADMITTED
+    /// (gate only constrains node recipients — no over-reject).
+    #[tokio::test]
+    async fn agent_delegation_agency_admitted_not_over_rejected_sqlite() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = bootstrap_node_agency_sqlite().await;
+        let att = node_delegates_to_sqlite(
+            "owner",
+            "agent-key",
+            &[ds::AGENCY_ACT_ON_BEHALF, ds::AGENCY_DECIDE],
+        );
+        let id = att.attestation_id.clone();
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let stored =
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "agent-key")
+                .await
+                .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].attestation_id, id);
     }
 
     /// #104 — delegates_to_graph BFS respects cycles + depth bound.

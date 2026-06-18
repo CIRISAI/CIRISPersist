@@ -2361,6 +2361,35 @@ pub enum Error {
         scope: String,
     },
 
+    /// v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5). A `delegates_to`
+    /// was REFUSED because its `attested_key_id` resolves to a `node`-only
+    /// [`crate::federation::types::identity_type::NODE`] identity but the
+    /// delegation carries a scope that is NOT `infra:*` — i.e. an
+    /// `agency:*` scope, a legacy unprefixed agency kind
+    /// (`act_on_behalf` / `message_io` / `reason` / `decide` /
+    /// `sub_delegation`), an empty scope set, or any other non-`infra:`
+    /// token. This is the gate that makes CC 1.13.5 ("infrastructure must
+    /// not have agency") cryptographically enforced: a node key can never
+    /// receive agency. The row is not stored (verify-before-mutation,
+    /// AV-9). Distinct from [`Error::InvalidArgument`] so consumers can
+    /// pattern-match the rejection deterministically (stable `kind()`
+    /// token `federation_node_agency_forbidden`). See
+    /// [`admission::check_node_agency_admission`] /
+    /// [`admission::scopes_are_infra_only`].
+    #[error(
+        "delegates_to to node-only key {attested_key_id:?} carries non-infra scope(s) \
+         {offending_scopes:?}: a node-role delegate may carry ONLY infra:* scopes \
+         (CC 4.4.3.5 / CC 1.13.5 — infrastructure must not have agency)"
+    )]
+    NodeAgencyForbidden {
+        /// The `attested_key_id` (recipient) that resolved to `node`-only.
+        attested_key_id: String,
+        /// The offending non-`infra:` scope tokens carried by the
+        /// delegation (sorted for a stable error string); empty vec when
+        /// the delegation carried no scope at all (empty-set rejection).
+        offending_scopes: Vec<String>,
+    },
+
     /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228 item 1 / #229 item 1)
     /// — a WholenessWitness was REJECTED at the verify-before-persist
     /// gate: the §19.0 PQC-mandatory hard cut (classical-only / missing
@@ -2421,6 +2450,7 @@ impl Error {
             Error::SetSemanticsUnsorted(_) => "federation_set_semantics_unsorted",
             Error::WithdrawsNotAdmitted { .. } => "federation_withdraws_not_admitted",
             Error::DelegatedScopeUnauthorized { .. } => "federation_delegated_scope_unauthorized",
+            Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",
         }

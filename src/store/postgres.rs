@@ -2405,6 +2405,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // leaves no trace.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
+        // v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — reject-agency-
+        // on-node-key gate (parity with the sqlite + memory backends). A
+        // no-op for non-`delegates_to` rows; for a `delegates_to` whose
+        // recipient (`attested_key_id`) resolves to a node-ONLY identity it
+        // REJECTS any scope set that is not `infra:*`-only (agency:* / legacy
+        // unprefixed agency / empty / other) — "infrastructure must not have
+        // agency" made cryptographic. Resolution uses the trait's own
+        // lookup_public_key (own client). Runs AFTER the delegated-duty gate
+        // and BEFORE persist_row_hash + INSERT — a rejected emission leaves
+        // no trace.
+        crate::federation::admission::check_node_agency_admission(self, &row).await?;
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
@@ -18994,6 +19006,133 @@ mod tests {
             "sub_delegation": sub_delegation,
         });
         a
+    }
+
+    /// v8.9.0 (CIRISPersist#236, CC 4.4.3.5 / CC 1.13.5) — reject-agency-
+    /// on-node-key gate, PG backend (3-backend parity with memory +
+    /// sqlite). Covers (a) infra-only → ADMITTED, (b) agency:* → REJECTED
+    /// + not stored, (b') legacy unprefixed agency → REJECTED, (c) empty
+    /// scope → REJECTED, (d) non-node recipient w/ agency:* → ADMITTED (no
+    /// over-reject). Run-scoped uuid-suffixed key ids.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_node_agency_scope_split_matrix() {
+        use crate::federation::types::delegation_scope as ds;
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let suffix = uuid_like();
+        let owner = format!("owner-{suffix}");
+        let node = format!("node-{suffix}");
+        let agent = format!("agent-{suffix}");
+        // owner = user, node = node-only, agent = agent.
+        for (kid, ity) in [
+            (&owner, crate::federation::types::identity_type::USER),
+            (&node, crate::federation::types::identity_type::NODE),
+            (&agent, crate::federation::types::identity_type::AGENT),
+        ] {
+            let mut k = fix_section_i_key(kid, "x", now, true);
+            k.identity_type = ity.into();
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord { record: k })
+                .await
+                .unwrap();
+        }
+
+        let put = |granter: &str, grantee: &str, scope: serde_json::Value| {
+            let a = pg_delegates_to(granter, grantee, scope, false);
+            (a.attestation_id.clone(), a)
+        };
+
+        // (a) infra-only → ADMITTED.
+        let (id_a, att_a) = put(
+            &owner,
+            &node,
+            serde_json::json!([ds::INFRA_NETWORK_PRESENCE, ds::INFRA_SERVE]),
+        );
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att_a })
+            .await
+            .unwrap();
+        let stored = backend.list_attestations_for(&node).await.unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].attestation_id, id_a);
+
+        // (b) agency:* → REJECTED + not stored. THE CC 1.13.5 guard.
+        let (id_b, att_b) = put(
+            &owner,
+            &node,
+            serde_json::json!([ds::INFRA_SERVE, ds::AGENCY_ACT_ON_BEHALF]),
+        );
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att_b })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::NodeAgencyForbidden {
+                ref attested_key_id,
+                ref offending_scopes,
+            } => {
+                assert_eq!(attested_key_id, &node);
+                assert_eq!(
+                    offending_scopes,
+                    &vec![ds::AGENCY_ACT_ON_BEHALF.to_string()]
+                );
+            }
+            other => panic!("expected NodeAgencyForbidden, got {other:?}"),
+        }
+        assert_eq!(err.kind(), "federation_node_agency_forbidden");
+        // Run-scoped: still exactly the one (a) row for this node; id_b absent.
+        let after_b = backend.list_attestations_for(&node).await.unwrap();
+        assert_eq!(after_b.len(), 1);
+        assert!(after_b.iter().all(|r| r.attestation_id != id_b));
+
+        // (b') legacy unprefixed agency kind → REJECTED.
+        let (_id, att_legacy) = put(
+            &owner,
+            &node,
+            serde_json::json!([crate::federation::self_at_login::SCOPE_ACT_ON_BEHALF]),
+        );
+        assert!(matches!(
+            backend
+                .put_attestation(crate::federation::SignedAttestation {
+                    attestation: att_legacy
+                })
+                .await
+                .unwrap_err(),
+            crate::federation::Error::NodeAgencyForbidden { .. }
+        ));
+
+        // (c) empty scope set → REJECTED.
+        let (_id, att_empty) = put(&owner, &node, serde_json::json!([]));
+        assert!(matches!(
+            backend
+                .put_attestation(crate::federation::SignedAttestation {
+                    attestation: att_empty
+                })
+                .await
+                .unwrap_err(),
+            crate::federation::Error::NodeAgencyForbidden { .. }
+        ));
+
+        // (d) NON-node recipient (agent) w/ agency:* → ADMITTED (no over-reject).
+        let (id_d, att_d) = put(
+            &owner,
+            &agent,
+            serde_json::json!([ds::AGENCY_ACT_ON_BEHALF, ds::AGENCY_DECIDE]),
+        );
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att_d })
+            .await
+            .unwrap();
+        let on_agent = backend.list_attestations_for(&agent).await.unwrap();
+        assert_eq!(on_agent.len(), 1);
+        assert_eq!(on_agent[0].attestation_id, id_d);
     }
 
     /// v8.7.1 (CIRISPersist#233, CEG §11.10) — FULL §11.10 moderation
