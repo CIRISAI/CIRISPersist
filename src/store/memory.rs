@@ -105,6 +105,13 @@ struct State {
         HashMap<(String, String), crate::federation::FamilyMembershipRevocation>,
     federation_community_membership_revocations:
         HashMap<(String, String), crate::federation::CommunityMembershipRevocation>,
+    /// v9.0.0 G5 (CC 4.4.3.2.2) — the community DEK rotation epoch
+    /// counter, `community_key_id -> current epoch`. The DEK crypto itself
+    /// (V087 grants) lives only on the at-rest BlobStorage backends
+    /// (postgres/sqlite); the MemoryBackend has no blob storage, so it
+    /// carries the rotation *state* (so rotation-on-removal is observably
+    /// PRESENT here too — the epoch advances) but not the wrapped DEK.
+    federation_community_dek_epoch: HashMap<String, u64>,
     /// v4.10.0 (CIRISPersist#154) — location_proofs keyed by the V068
     /// `(subject_key_id, asserted_at)` PK.
     federation_location_proofs:
@@ -175,6 +182,7 @@ impl Default for MemoryBackend {
                 federation_identity_occurrence_revocations: HashMap::new(),
                 federation_family_membership_revocations: HashMap::new(),
                 federation_community_membership_revocations: HashMap::new(),
+                federation_community_dek_epoch: HashMap::new(),
                 federation_location_proofs: HashMap::new(),
                 federation_organizations: HashMap::new(),
                 federation_org_memberships: HashMap::new(),
@@ -196,6 +204,22 @@ impl MemoryBackend {
     /// Create an empty memory backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// v9.0.0 G5 (CC 4.4.3.2.2) — the current community DEK rotation epoch
+    /// for `community_key_id` (0 if it was never rotated). The MemoryBackend
+    /// has no at-rest BlobStorage, so it carries only the rotation *state*
+    /// (advanced on every `put_community_membership_revocation`); the actual
+    /// per-epoch DEK + member grants live on the postgres/sqlite backends.
+    /// This accessor makes the rotation observable for parity assertions.
+    pub fn community_dek_epoch(&self, community_key_id: &str) -> u64 {
+        self.state
+            .lock()
+            .expect("memory backend lock")
+            .federation_community_dek_epoch
+            .get(community_key_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// v4.4.0 (CIRISPersist#171) — local-tier write (upsert/insert)
@@ -1599,6 +1623,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .federation_hard_case_events
             .entry(event.event_id.clone())
             .or_insert(event);
+        // CC 4.4.3.2.2 rotation-on-removal: advance the community DEK epoch
+        // (the at-rest crypto half lives only on the BlobStorage backends;
+        // memory carries the rotation *state* so rotation-on-removal is
+        // observably present here too). Bump first → revocation insert moves
+        // `row`.
+        *state
+            .federation_community_dek_epoch
+            .entry(row.community_key_id.clone())
+            .or_insert(0) += 1;
         state.federation_community_membership_revocations.insert(
             (
                 row.community_key_id.clone(),

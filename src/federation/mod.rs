@@ -38,6 +38,7 @@ pub mod at_rest_cascade;
 pub mod backfill;
 pub mod blackhole;
 pub mod blobs;
+pub mod community_dek;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
 pub mod goal;

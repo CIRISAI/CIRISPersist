@@ -1189,6 +1189,117 @@ pub trait BlobStorage: Send + Sync {
         signer: &'s crate::signing::LocalSigner,
         now: chrono::DateTime<chrono::Utc>,
     ) -> impl Future<Output = Result<EvictActorReport, BlobError>> + Send + 's;
+
+    // ── v9.0.0 G5 (CC 4.4.3.2.1 / 4.4.3.2.2, CIRISPersist#237) ──────
+    //   community DEK cascade + rotation-on-removal state (V087). The
+    //   InvisibleEncrypted (self/family) tier uses a FRESH per-write DEK
+    //   (V070); the CommunityDek tier shares ONE DEK per
+    //   `(community_key_id, epoch)` across emissions and rotates the
+    //   epoch on member removal. These are PG/SQLite-backed (the at-rest
+    //   storage backends), mirroring the V070 grant surface above. The
+    //   method names are `community_dek_*`-prefixed to keep them distinct
+    //   from the self/family `*_at_rest_grant` surface.
+
+    /// v9.0.0 G5 — the current sealing epoch for `community_key_id` from
+    /// `federation_community_dek_epoch` (0 if the community has no row
+    /// yet — a community that has never been rotated). The cascade seals
+    /// new emissions under this epoch's DEK.
+    fn community_dek_current_epoch(
+        &self,
+        community_key_id: &str,
+    ) -> impl Future<Output = Result<u64, BlobError>> + Send;
+
+    /// v9.0.0 G5 (CC 4.4.3.2.2) — advance the community DEK epoch by one
+    /// (rotation-on-removal). Upserts `federation_community_dek_epoch`,
+    /// returning the NEW epoch. The next emission mints a fresh DEK for
+    /// this epoch wrapped only to the remaining members; a removed member
+    /// cannot derive it. Idempotency is the caller's (the membership-
+    /// revocation row is itself idempotent); a double-bump only wastes an
+    /// epoch number (a fresh DEK is minted lazily on next emission, so an
+    /// unused epoch costs nothing).
+    fn community_dek_bump_epoch(
+        &self,
+        community_key_id: &str,
+    ) -> impl Future<Output = Result<u64, BlobError>> + Send;
+
+    /// v9.0.0 G5 — persist's content-master self-retention wrap of the
+    /// `(community_key_id, epoch)` shared DEK (the V070 OQ-4 discipline,
+    /// per-epoch). `wrapped_dek` is base64 of
+    /// `nonce(12) || aes256_gcm(content_master, dek)`. Idempotent on the
+    /// `(community_key_id, epoch)` PK (first-write-wins): the epoch DEK is
+    /// minted once.
+    fn community_dek_put_self_retention(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        wrapped_dek: &str,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v9.0.0 G5 — fetch persist's self-retention `wrapped_dek` for
+    /// `(community_key_id, epoch)`, or `None` if the epoch DEK has not
+    /// been minted yet (the cascade mints it on first emission in the
+    /// epoch).
+    fn community_dek_get_self_retention(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<Option<String>, BlobError>> + Send;
+
+    /// v9.0.0 G5 — record one per-member v2 wrap of the
+    /// `(community_key_id, epoch)` DEK (the cascade fan-out, written once
+    /// at epoch creation). `wrapped_dek` is the `KeyGrantWrapV2` JSON
+    /// envelope; `wrap_algorithm` MUST be
+    /// [`crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2`] (the DB
+    /// CHECK rejects anything else — the substrate's v2-only guarantee).
+    /// Idempotent on `(community_key_id, epoch, member_key_id)`.
+    fn community_dek_put_member_grant(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        member_key_id: &str,
+        wrap_algorithm: &str,
+        wrapped_dek: &str,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v9.0.0 G5 — member occurrence key_ids already holding a grant on
+    /// `(community_key_id, epoch)`. The cascade uses this to skip members
+    /// already wrapped (idempotent re-key) and tests assert the
+    /// fail-secure exclusion shape against it.
+    fn community_dek_member_grant_recipients(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<Vec<String>, BlobError>> + Send;
+
+    /// v9.0.0 G5 — does `member_key_id` hold a v2 grant on
+    /// `(community_key_id, epoch)`? The read-side authorization predicate
+    /// for [`crate::federation::community_dek::orchestrate::read_for_community_viewer`].
+    fn community_dek_has_member_grant(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        member_key_id: &str,
+    ) -> impl Future<Output = Result<bool, BlobError>> + Send;
+
+    /// v9.0.0 G5 — bind a sealed at-rest blob to the
+    /// `(community_key_id, epoch)` whose DEK sealed it, so a read recovers
+    /// the right epoch DEK. A blob is sealed under exactly one epoch
+    /// (current at emission); rotation never re-seals it (forward-only).
+    /// Idempotent on the `at_rest_sha256` PK.
+    fn community_dek_bind_blob_epoch(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        community_key_id: &str,
+        epoch: u64,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v9.0.0 G5 — the `(community_key_id, epoch)` a sealed blob belongs
+    /// to, or `None` if the blob carries no community-DEK binding (a
+    /// self/family or plaintext blob).
+    fn community_dek_blob_epoch(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> impl Future<Output = Result<Option<(String, u64)>, BlobError>> + Send;
 }
 
 /// v3.5.0 (CIRISPersist#125) — outcome of

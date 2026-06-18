@@ -3186,6 +3186,21 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             row.effective_at,
         ))
         .await?;
+        // CC 4.4.3.2.2 rotation-on-removal: bump the community DEK epoch so
+        // the next emission seals under a fresh DEK wrapped only to the
+        // remaining members. Forward-only — blobs already sealed under the
+        // old epoch keep their grants. A spurious extra bump only skips an
+        // epoch number (the DEK is minted lazily on next emission).
+        {
+            use crate::federation::blobs::BlobStorage as _;
+            self.community_dek_bump_epoch(&row.community_key_id)
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "community DEK rotation-on-removal: {e}"
+                    ))
+                })?;
+        }
         Ok(())
     }
 
@@ -5984,6 +5999,270 @@ impl crate::federation::BlobStorage for PostgresBackend {
         rows.iter()
             .map(|r| r.safe_get_with("recipient_key_id", crate::federation::BlobError::Backend))
             .collect()
+    }
+
+    // ── v9.0.0 G5 (CC 4.4.3.2.1 / 4.4.3.2.2) community DEK cascade ──
+    async fn community_dek_current_epoch(
+        &self,
+        community_key_id: &str,
+    ) -> Result<u64, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let row = client
+            .query_opt(
+                "SELECT epoch FROM cirislens.federation_community_dek_epoch \
+                 WHERE community_key_id = $1",
+                &[&community_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("community_dek_current_epoch: {e}"))
+            })?;
+        match row {
+            None => Ok(0),
+            Some(r) => {
+                let epoch: i64 = r.safe_get_with("epoch", crate::federation::BlobError::Backend)?;
+                Ok(epoch.max(0) as u64)
+            }
+        }
+    }
+
+    async fn community_dek_bump_epoch(
+        &self,
+        community_key_id: &str,
+    ) -> Result<u64, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        // Upsert: epoch 0 → first bump yields 1; subsequent bumps +1. The
+        // RETURNING gives the post-bump epoch atomically.
+        let row = client
+            .query_one(
+                "INSERT INTO cirislens.federation_community_dek_epoch \
+                    (community_key_id, epoch, rotated_at) \
+                 VALUES ($1, 1, NOW()) \
+                 ON CONFLICT (community_key_id) DO UPDATE SET \
+                    epoch = cirislens.federation_community_dek_epoch.epoch + 1, \
+                    rotated_at = NOW() \
+                 RETURNING epoch",
+                &[&community_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("community_dek_bump_epoch: {e}"))
+            })?;
+        let epoch: i64 = row.safe_get_with("epoch", crate::federation::BlobError::Backend)?;
+        Ok(epoch.max(0) as u64)
+    }
+
+    async fn community_dek_put_self_retention(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        wrapped_dek: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let ep = epoch as i64;
+        let alg = crate::federation::at_rest_cascade::WRAP_ALGORITHM_CONTENT_MASTER;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_community_dek (\
+                    community_key_id, epoch, wrap_algorithm, wrapped_dek\
+                 ) VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (community_key_id, epoch) DO NOTHING",
+                &[&community_key_id, &ep, &alg, &wrapped_dek],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "community_dek_put_self_retention: {e}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn community_dek_get_self_retention(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> Result<Option<String>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let ep = epoch as i64;
+        let row = client
+            .query_opt(
+                "SELECT wrapped_dek FROM cirislens.federation_community_dek \
+                 WHERE community_key_id = $1 AND epoch = $2",
+                &[&community_key_id, &ep],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "community_dek_get_self_retention: {e}"
+                ))
+            })?;
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let wrapped: String =
+                    r.safe_get_with("wrapped_dek", crate::federation::BlobError::Backend)?;
+                Ok(Some(wrapped))
+            }
+        }
+    }
+
+    async fn community_dek_put_member_grant(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        member_key_id: &str,
+        wrap_algorithm: &str,
+        wrapped_dek: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let ep = epoch as i64;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_community_dek_member_grants (\
+                    community_key_id, epoch, member_key_id, wrap_algorithm, wrapped_dek\
+                 ) VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (community_key_id, epoch, member_key_id) DO NOTHING",
+                &[
+                    &community_key_id,
+                    &ep,
+                    &member_key_id,
+                    &wrap_algorithm,
+                    &wrapped_dek,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "community_dek_put_member_grant: {e}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn community_dek_member_grant_recipients(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> Result<Vec<String>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let ep = epoch as i64;
+        let rows = client
+            .query(
+                "SELECT member_key_id FROM cirislens.federation_community_dek_member_grants \
+                 WHERE community_key_id = $1 AND epoch = $2 ORDER BY member_key_id",
+                &[&community_key_id, &ep],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "community_dek_member_grant_recipients: {e}"
+                ))
+            })?;
+        rows.iter()
+            .map(|r| r.safe_get_with("member_key_id", crate::federation::BlobError::Backend))
+            .collect()
+    }
+
+    async fn community_dek_has_member_grant(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        member_key_id: &str,
+    ) -> Result<bool, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let ep = epoch as i64;
+        let row = client
+            .query_opt(
+                "SELECT 1 FROM cirislens.federation_community_dek_member_grants \
+                 WHERE community_key_id = $1 AND epoch = $2 AND member_key_id = $3",
+                &[&community_key_id, &ep, &member_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "community_dek_has_member_grant: {e}"
+                ))
+            })?;
+        Ok(row.is_some())
+    }
+
+    async fn community_dek_bind_blob_epoch(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        community_key_id: &str,
+        epoch: u64,
+    ) -> Result<(), crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha_vec = at_rest_sha256.to_vec();
+        let ep = epoch as i64;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_community_blob_epoch (\
+                    at_rest_sha256, community_key_id, epoch\
+                 ) VALUES ($1, $2, $3) \
+                 ON CONFLICT (at_rest_sha256) DO NOTHING",
+                &[&sha_vec, &community_key_id, &ep],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("community_dek_bind_blob_epoch: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn community_dek_blob_epoch(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<Option<(String, u64)>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let sha_vec = at_rest_sha256.to_vec();
+        let row = client
+            .query_opt(
+                "SELECT community_key_id, epoch FROM cirislens.federation_community_blob_epoch \
+                 WHERE at_rest_sha256 = $1",
+                &[&sha_vec],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("community_dek_blob_epoch: {e}"))
+            })?;
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let community: String =
+                    r.safe_get_with("community_key_id", crate::federation::BlobError::Backend)?;
+                let epoch: i64 = r.safe_get_with("epoch", crate::federation::BlobError::Backend)?;
+                Ok(Some((community, epoch.max(0) as u64)))
+            }
+        }
     }
 
     // v6.1.0 (CIRISPersist#161 Ask 2/4) — the retroactive-ADD visibility
@@ -16259,6 +16538,226 @@ mod tests {
         assert!(exc
             .iter()
             .any(|e| e.subject_key_id.as_deref() == Some(carol_p.as_str())));
+    }
+
+    /// v9.0.0 G5 (CC 4.4.3.2.1 / 4.4.3.2.2) — PG parity for the community
+    /// DEK cascade + rotation-on-removal: v2 key_grant per keyed member,
+    /// fail-secure exclude + hard_case for a keyless member, the
+    /// infrastructure plaintext opt-out, rotation-on-removal forward
+    /// secrecy, and the v2-only guarantee — all run-scoped by `uuid_like`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn community_dek_cascade_rotation_and_v2_only_pg() {
+        use crate::federation::community_dek::orchestrate::{
+            emit_excluded_hard_cases, encrypt_and_cascade_community, read_for_community_viewer,
+        };
+        use crate::federation::hard_case::{kind, HardCaseFilter};
+        use crate::federation::types::cohort_scope::COMMUNITY;
+        use crate::federation::{BlobStorage, EncryptionPubkeys, FederationDirectory};
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let now = chrono::Utc::now();
+        let s = uuid_like();
+        let comm = format!("comm-{s}");
+        let infra = format!("infra-{s}");
+        let alice = format!("alice-{s}");
+        let bob = format!("bob-{s}");
+        let alice_p = format!("alice-occ-{s}");
+        let bob_p = format!("bob-occ-{s}");
+        for kid in [&comm, &infra, &alice, &bob, &alice_p, &bob_p] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: fix_section_i_key(kid, "acme", now, true),
+                })
+                .await
+                .unwrap();
+        }
+
+        let keyed = |occ_key: &str, identity: &str, seed: u8| {
+            let x_pub = ciris_crypto::x25519::public_from_secret(&[seed; 32]);
+            let (_mp, ml_pub) = ciris_crypto::ml_kem::generate_keypair().unwrap();
+            crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: crate::federation::IdentityOccurrence {
+                    identity_key_id: identity.into(),
+                    occurrence_key_id: occ_key.into(),
+                    device_class: crate::federation::types::device_class::AGENT.into(),
+                    hardware_attestation: None,
+                    asserted_at: now,
+                    valid_until: None,
+                    encryption_pubkeys: Some(EncryptionPubkeys {
+                        x25519_base64: B64.encode(x_pub),
+                        ml_kem_768_base64: B64.encode(&ml_pub),
+                    }),
+                    persist_row_hash: String::new(),
+                },
+            }
+        };
+        let bare = |occ_key: &str, identity: &str| crate::federation::SignedIdentityOccurrence {
+            identity_occurrence: crate::federation::IdentityOccurrence {
+                identity_key_id: identity.into(),
+                occurrence_key_id: occ_key.into(),
+                device_class: crate::federation::types::device_class::AGENT.into(),
+                hardware_attestation: None,
+                asserted_at: now,
+                valid_until: None,
+                encryption_pubkeys: None,
+                persist_row_hash: String::new(),
+            },
+        };
+        backend
+            .put_identity_occurrence(keyed(&alice_p, &alice, 0x11))
+            .await
+            .unwrap();
+        backend
+            .put_identity_occurrence(bare(&bob_p, &bob))
+            .await
+            .unwrap();
+
+        let community = |key: &str, members: Vec<&str>, policy: Option<serde_json::Value>| {
+            crate::federation::SignedCommunity {
+                community: crate::federation::Community {
+                    community_key_id: key.into(),
+                    community_name: "Co-op".into(),
+                    members: members
+                        .into_iter()
+                        .map(|k| crate::federation::CommunityMember {
+                            key_id: k.into(),
+                            joined_at: now,
+                            role: None,
+                        })
+                        .collect(),
+                    founded_at: now,
+                    consensus_protocol: "majority".into(),
+                    policy_blob: policy,
+                    persist_row_hash: String::new(),
+                },
+            }
+        };
+
+        // ── non-infra community: keyed alice granted, keyless bob excluded.
+        backend
+            .put_community(community(&comm, vec![&alice, &bob], None))
+            .await
+            .unwrap();
+        let r0 =
+            encrypt_and_cascade_community(&backend, &comm, b"minutes (pg)", Some("text/plain"))
+                .await
+                .unwrap();
+        assert_eq!(r0.epoch, 0);
+        assert_eq!(r0.granted, vec![alice_p.clone()]);
+        assert_eq!(r0.excluded, vec![bob_p.clone()]);
+        assert_eq!(
+            read_for_community_viewer(&backend, &r0.at_rest_sha256, &alice_p)
+                .await
+                .unwrap(),
+            b"minutes (pg)"
+        );
+        assert!(matches!(
+            read_for_community_viewer(&backend, &r0.at_rest_sha256, &bob_p)
+                .await
+                .unwrap_err(),
+            crate::federation::BlobError::NotGranted { .. }
+        ));
+        emit_excluded_hard_cases(&backend, &r0, chrono::Utc::now())
+            .await
+            .unwrap();
+        let exc = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::RECIPIENT_EXCLUDED.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert!(exc
+            .iter()
+            .any(|e| e.subject_key_id.as_deref() == Some(bob_p.as_str())
+                && e.detail.get("cohort_scope").and_then(|v| v.as_str()) == Some(COMMUNITY)));
+
+        // ── infrastructure community opts OUT (no DEK; cascade refuses).
+        backend
+            .put_community(community(
+                &infra,
+                vec![&alice],
+                Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            encrypt_and_cascade_community(&backend, &infra, b"root", None)
+                .await
+                .unwrap_err(),
+            crate::federation::BlobError::InvalidArgument(_)
+        ));
+        assert!(backend
+            .community_dek_get_self_retention(&infra, 0)
+            .await
+            .unwrap()
+            .is_none());
+
+        // ── rotation-on-removal: remove bob → epoch bumps; fresh DEK; the
+        //    pre-rotation blob is unchanged (forward-only).
+        backend
+            .put_community_membership_revocation(
+                crate::federation::SignedCommunityMembershipRevocation {
+                    community_membership_revocation:
+                        crate::federation::CommunityMembershipRevocation {
+                            community_key_id: comm.clone(),
+                            removed_identity_key_id: bob.clone(),
+                            removed_at: now,
+                            effective_at: now,
+                            reason: None,
+                            witness_set: vec![],
+                            persist_row_hash: String::new(),
+                        },
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend.community_dek_current_epoch(&comm).await.unwrap(), 1);
+        let r1 = encrypt_and_cascade_community(&backend, &comm, b"post-removal (pg)", None)
+            .await
+            .unwrap();
+        assert_eq!(r1.epoch, 1);
+        assert_eq!(r1.granted, vec![alice_p.clone()]);
+        assert_ne!(r0.at_rest_sha256, r1.at_rest_sha256);
+        assert_eq!(
+            read_for_community_viewer(&backend, &r1.at_rest_sha256, &alice_p)
+                .await
+                .unwrap(),
+            b"post-removal (pg)"
+        );
+        // The PRE-rotation blob is untouched — but bob never had a grant
+        // (keyless), so he still cannot read; alice still can.
+        assert_eq!(
+            read_for_community_viewer(&backend, &r0.at_rest_sha256, &alice_p)
+                .await
+                .unwrap(),
+            b"minutes (pg)"
+        );
+
+        // ── v2-only: every member-grant row is the v2 hybrid algorithm.
+        let client = backend.get_client().await.unwrap();
+        let rows = client
+            .query(
+                "SELECT DISTINCT wrap_algorithm \
+                 FROM cirislens.federation_community_dek_member_grants \
+                 WHERE community_key_id = $1",
+                &[&comm],
+            )
+            .await
+            .unwrap();
+        assert!(!rows.is_empty());
+        for r in &rows {
+            let alg: String = r.get("wrap_algorithm");
+            assert_eq!(alg, crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2);
+        }
     }
 
     /// v6.2.0 (#161 A4/A5) — PG parity for the roster-grow forward path:

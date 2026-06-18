@@ -2827,6 +2827,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &row.removed_identity_key_id,
             row.effective_at,
         );
+        // Captured before the move-closure consumes `row` (CC 4.4.3.2.2
+        // rotation-on-removal, applied after the revocation lands).
+        let community_key_id_for_rotation = row.community_key_id.clone();
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -2849,6 +2852,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })()
         .map_err(map_revocation_sqlite_err("community_membership_revocation"))?;
         self.record_hard_case(removal_event).await?;
+        // CC 4.4.3.2.2 rotation-on-removal: bump the community DEK epoch so
+        // the next emission seals under a fresh DEK wrapped only to the
+        // remaining members (the removed member's keys cannot unwrap it).
+        // Forward-only — blobs already sealed under the old epoch keep
+        // their grants. Idempotent at the revocation-row level (the row is
+        // PK-idempotent); a spurious extra bump only skips an epoch number,
+        // which is harmless (the DEK is minted lazily on next emission).
+        {
+            use crate::federation::blobs::BlobStorage as _;
+            self.community_dek_bump_epoch(&community_key_id_for_rotation)
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "community DEK rotation-on-removal: {e}"
+                    ))
+                })?;
+        }
         Ok(())
     }
 
@@ -5605,6 +5625,242 @@ impl crate::federation::BlobStorage for SqliteBackend {
             crate::federation::BlobError::Backend(format!("list_at_rest_grant_recipients: {e}"))
         })?;
         Ok(out)
+    }
+
+    // ── v9.0.0 G5 (CC 4.4.3.2.1 / 4.4.3.2.2) community DEK cascade ──
+    async fn community_dek_current_epoch(
+        &self,
+        community_key_id: &str,
+    ) -> Result<u64, crate::federation::BlobError> {
+        let community = community_key_id.to_owned();
+        let conn = self.conn.clone();
+        let epoch = (move || -> Result<Option<i64>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT epoch FROM federation_community_dek_epoch WHERE community_key_id = ?1",
+                rusqlite::params![community],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_current_epoch: {e}"))
+        })?;
+        Ok(epoch.unwrap_or(0).max(0) as u64)
+    }
+
+    async fn community_dek_bump_epoch(
+        &self,
+        community_key_id: &str,
+    ) -> Result<u64, crate::federation::BlobError> {
+        let community = community_key_id.to_owned();
+        let conn = self.conn.clone();
+        let new_epoch = (move || -> Result<i64, rusqlite::Error> {
+            let conn = conn.lock();
+            // Upsert: epoch 0 → first bump yields 1; subsequent bumps +1.
+            conn.execute(
+                "INSERT INTO federation_community_dek_epoch (community_key_id, epoch, rotated_at) \
+                 VALUES (?1, 1, datetime('now', 'subsec')) \
+                 ON CONFLICT (community_key_id) DO UPDATE SET \
+                    epoch = epoch + 1, rotated_at = datetime('now', 'subsec')",
+                rusqlite::params![community],
+            )?;
+            conn.query_row(
+                "SELECT epoch FROM federation_community_dek_epoch WHERE community_key_id = ?1",
+                rusqlite::params![community],
+                |r| r.get::<_, i64>(0),
+            )
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_bump_epoch: {e}"))
+        })?;
+        Ok(new_epoch.max(0) as u64)
+    }
+
+    async fn community_dek_put_self_retention(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        wrapped_dek: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        let community = community_key_id.to_owned();
+        let ep = epoch as i64;
+        let wrapped = wrapped_dek.to_owned();
+        let alg = crate::federation::at_rest_cascade::WRAP_ALGORITHM_CONTENT_MASTER.to_owned();
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_community_dek (\
+                    community_key_id, epoch, wrap_algorithm, wrapped_dek\
+                 ) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT (community_key_id, epoch) DO NOTHING",
+                rusqlite::params![community, ep, alg, wrapped],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_put_self_retention: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn community_dek_get_self_retention(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> Result<Option<String>, crate::federation::BlobError> {
+        let community = community_key_id.to_owned();
+        let ep = epoch as i64;
+        let conn = self.conn.clone();
+        let row = (move || -> Result<Option<String>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT wrapped_dek FROM federation_community_dek \
+                 WHERE community_key_id = ?1 AND epoch = ?2",
+                rusqlite::params![community, ep],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_get_self_retention: {e}"))
+        })?;
+        Ok(row)
+    }
+
+    async fn community_dek_put_member_grant(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        member_key_id: &str,
+        wrap_algorithm: &str,
+        wrapped_dek: &str,
+    ) -> Result<(), crate::federation::BlobError> {
+        let community = community_key_id.to_owned();
+        let ep = epoch as i64;
+        let member = member_key_id.to_owned();
+        let alg = wrap_algorithm.to_owned();
+        let wrapped = wrapped_dek.to_owned();
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_community_dek_member_grants (\
+                    community_key_id, epoch, member_key_id, wrap_algorithm, wrapped_dek\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT (community_key_id, epoch, member_key_id) DO NOTHING",
+                rusqlite::params![community, ep, member, alg, wrapped],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_put_member_grant: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn community_dek_member_grant_recipients(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+    ) -> Result<Vec<String>, crate::federation::BlobError> {
+        let community = community_key_id.to_owned();
+        let ep = epoch as i64;
+        let conn = self.conn.clone();
+        let out = (move || -> Result<Vec<String>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT member_key_id FROM federation_community_dek_member_grants \
+                 WHERE community_key_id = ?1 AND epoch = ?2 ORDER BY member_key_id",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![community, ep], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "community_dek_member_grant_recipients: {e}"
+            ))
+        })?;
+        Ok(out)
+    }
+
+    async fn community_dek_has_member_grant(
+        &self,
+        community_key_id: &str,
+        epoch: u64,
+        member_key_id: &str,
+    ) -> Result<bool, crate::federation::BlobError> {
+        let community = community_key_id.to_owned();
+        let ep = epoch as i64;
+        let member = member_key_id.to_owned();
+        let conn = self.conn.clone();
+        let found = (move || -> Result<bool, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT 1 FROM federation_community_dek_member_grants \
+                 WHERE community_key_id = ?1 AND epoch = ?2 AND member_key_id = ?3",
+                rusqlite::params![community, ep, member],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|o| o.is_some())
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_has_member_grant: {e}"))
+        })?;
+        Ok(found)
+    }
+
+    async fn community_dek_bind_blob_epoch(
+        &self,
+        at_rest_sha256: &[u8; 32],
+        community_key_id: &str,
+        epoch: u64,
+    ) -> Result<(), crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let community = community_key_id.to_owned();
+        let ep = epoch as i64;
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_community_blob_epoch (\
+                    at_rest_sha256, community_key_id, epoch\
+                 ) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (at_rest_sha256) DO NOTHING",
+                rusqlite::params![sha_vec, community, ep],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_bind_blob_epoch: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn community_dek_blob_epoch(
+        &self,
+        at_rest_sha256: &[u8; 32],
+    ) -> Result<Option<(String, u64)>, crate::federation::BlobError> {
+        let sha_vec = at_rest_sha256.to_vec();
+        let conn = self.conn.clone();
+        let row = (move || -> Result<Option<(String, i64)>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT community_key_id, epoch FROM federation_community_blob_epoch \
+                 WHERE at_rest_sha256 = ?1",
+                rusqlite::params![sha_vec],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("community_dek_blob_epoch: {e}"))
+        })?;
+        Ok(row.map(|(c, e)| (c, e.max(0) as u64)))
     }
 
     // v6.1.0 (CIRISPersist#161 Ask 2/4) — the retroactive-ADD visibility
@@ -16106,6 +16362,297 @@ mod tests {
             bob_err,
             crate::federation::BlobError::NotGranted { .. }
         ));
+    }
+
+    // ── v9.0.0 G5 (CC 4.4.3.2.1 / 4.4.3.2.2) community DEK cascade ─────
+
+    /// Helper: register identity keys + keyed/keyless occurrences + a
+    /// community, returning the backend. `members` is `(identity, occ,
+    /// keyed?)`. `policy` carries the optional cohort_subkind.
+    async fn community_fixture(
+        members: &[(&str, &str, bool)],
+        policy: Option<serde_json::Value>,
+    ) -> SqliteBackend {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("comm", "comm", "comm"),
+            })
+            .await
+            .unwrap();
+        let mut member_idents = Vec::new();
+        for (ident, occ, keyed) in members {
+            for k in [*ident, *occ] {
+                backend
+                    .put_public_key(SignedKeyRecord {
+                        record: fed_key(k, ident, k),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let enc = if *keyed {
+                Some(keyed_enc(occ.len() as u8 + 1))
+            } else {
+                None
+            };
+            backend
+                .put_identity_occurrence(occ_signed(ident, occ, enc))
+                .await
+                .unwrap();
+            member_idents.push(*ident);
+        }
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: fed_community(
+                    "comm",
+                    "Test Co-op",
+                    member_idents,
+                    crate::federation::types::consensus_protocol::MAJORITY,
+                    policy,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+    }
+
+    fn comm_revoke(
+        removed: &str,
+        effective: &str,
+    ) -> crate::federation::SignedCommunityMembershipRevocation {
+        crate::federation::SignedCommunityMembershipRevocation {
+            community_membership_revocation: crate::federation::CommunityMembershipRevocation {
+                community_key_id: "comm".into(),
+                removed_identity_key_id: removed.into(),
+                removed_at: effective.parse().unwrap(),
+                effective_at: effective.parse().unwrap(),
+                reason: Some("left".into()),
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+        }
+    }
+
+    /// Non-infra community with at-rest enabled → a v2 key_grant per member
+    /// with valid ML-KEM-768; a keyless member is EXCLUDED + a
+    /// hard_case:recipient_excluded is emitted (NOT plaintext, NOT v1).
+    #[tokio::test]
+    async fn community_dek_cascade_grants_members_excludes_keyless_sqlite() {
+        use crate::federation::community_dek::orchestrate::{
+            emit_excluded_hard_cases, encrypt_and_cascade_community, read_for_community_viewer,
+        };
+        use crate::federation::hard_case::{kind, HardCaseFilter};
+        use crate::federation::{BlobStorage, FederationDirectory};
+
+        let backend = community_fixture(
+            &[("alice", "alice-occ", true), ("bob", "bob-occ", false)],
+            None,
+        )
+        .await;
+
+        let plaintext = b"co-op meeting minutes";
+        let result = encrypt_and_cascade_community(&backend, "comm", plaintext, Some("text/plain"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.epoch, 0,
+            "never-rotated community seals under epoch 0"
+        );
+        assert_eq!(result.granted, vec!["alice-occ".to_string()]);
+        assert_eq!(result.excluded, vec!["bob-occ".to_string()]);
+
+        // Granted member's grant exists and is v2; keyless member has NONE.
+        let recips = backend
+            .community_dek_member_grant_recipients("comm", 0)
+            .await
+            .unwrap();
+        assert_eq!(recips, vec!["alice-occ".to_string()]);
+        assert!(backend
+            .community_dek_has_member_grant("comm", 0, "alice-occ")
+            .await
+            .unwrap());
+        assert!(!backend
+            .community_dek_has_member_grant("comm", 0, "bob-occ")
+            .await
+            .unwrap());
+
+        // The keyed member reads; the excluded one cannot (no plaintext).
+        assert_eq!(
+            read_for_community_viewer(&backend, &result.at_rest_sha256, "alice-occ")
+                .await
+                .unwrap(),
+            plaintext
+        );
+        assert!(matches!(
+            read_for_community_viewer(&backend, &result.at_rest_sha256, "bob-occ")
+                .await
+                .unwrap_err(),
+            crate::federation::BlobError::NotGranted { .. }
+        ));
+
+        // hard_case:recipient_excluded emitted for the keyless member.
+        emit_excluded_hard_cases(&backend, &result, chrono::Utc::now())
+            .await
+            .unwrap();
+        let events = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::RECIPIENT_EXCLUDED.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|e| e.subject_key_id.as_deref() == Some("bob-occ")));
+    }
+
+    /// A cohort_subkind:infrastructure community opts OUT of the DEK
+    /// cascade entirely (CC 4.4.3.2.1) — the cascade REFUSES to run, so the
+    /// caller stores plaintext via the ordinary path. No DEK row is written.
+    #[tokio::test]
+    async fn community_dek_infrastructure_opts_out_sqlite() {
+        use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+        use crate::federation::BlobStorage;
+
+        let backend = community_fixture(
+            &[("alice", "alice-occ", true)],
+            Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
+        )
+        .await;
+
+        let err = encrypt_and_cascade_community(&backend, "comm", b"canonical root", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::federation::BlobError::InvalidArgument(_)
+        ));
+        // No epoch-0 DEK was minted for the infra community.
+        assert!(backend
+            .community_dek_get_self_retention("comm", 0)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// CC 4.4.3.2.2 rotation-on-removal: removing a member bumps the epoch;
+    /// new content seals under a fresh DEK the removed member's keys cannot
+    /// unwrap, remaining members can read it, and the PRE-rotation blob is
+    /// unchanged (forward-only — the removed member keeps what they had).
+    #[tokio::test]
+    async fn community_dek_rotation_on_removal_forward_secrecy_sqlite() {
+        use crate::federation::community_dek::orchestrate::{
+            encrypt_and_cascade_community, read_for_community_viewer,
+        };
+        use crate::federation::{BlobStorage, FederationDirectory};
+
+        let backend = community_fixture(
+            &[("alice", "alice-occ", true), ("bob", "bob-occ", true)],
+            None,
+        )
+        .await;
+
+        // Epoch 0 emission — both members granted + can read.
+        let before = encrypt_and_cascade_community(&backend, "comm", b"pre-removal note", None)
+            .await
+            .unwrap();
+        assert_eq!(before.epoch, 0);
+        assert_eq!(
+            read_for_community_viewer(&backend, &before.at_rest_sha256, "bob-occ")
+                .await
+                .unwrap(),
+            b"pre-removal note"
+        );
+
+        // Remove bob — epoch bumps to 1 (rotation-on-removal).
+        backend
+            .put_community_membership_revocation(comm_revoke("bob", "2026-06-10T00:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.community_dek_current_epoch("comm").await.unwrap(),
+            1
+        );
+
+        // New emission seals under epoch 1 — fresh DEK, only alice granted.
+        let after = encrypt_and_cascade_community(&backend, "comm", b"post-removal secret", None)
+            .await
+            .unwrap();
+        assert_eq!(after.epoch, 1);
+        assert_eq!(after.granted, vec!["alice-occ".to_string()]);
+        assert!(!after.granted.contains(&"bob-occ".to_string()));
+        assert_ne!(
+            before.at_rest_sha256, after.at_rest_sha256,
+            "fresh epoch DEK → distinct ciphertext"
+        );
+
+        // Remaining member reads the new content; removed member cannot
+        // (no grant on epoch 1 — fail-secure, never plaintext).
+        assert_eq!(
+            read_for_community_viewer(&backend, &after.at_rest_sha256, "alice-occ")
+                .await
+                .unwrap(),
+            b"post-removal secret"
+        );
+        assert!(matches!(
+            read_for_community_viewer(&backend, &after.at_rest_sha256, "bob-occ")
+                .await
+                .unwrap_err(),
+            crate::federation::BlobError::NotGranted { .. }
+        ));
+
+        // Forward-only: the PRE-rotation blob is UNCHANGED — bob keeps the
+        // grant he already had on epoch 0 and can still read it.
+        assert!(backend
+            .community_dek_has_member_grant("comm", 0, "bob-occ")
+            .await
+            .unwrap());
+        assert_eq!(
+            read_for_community_viewer(&backend, &before.at_rest_sha256, "bob-occ")
+                .await
+                .unwrap(),
+            b"pre-removal note"
+        );
+    }
+
+    /// v2-ONLY: every community-DEK member grant carries the v2 hybrid
+    /// wrap_algorithm; the DB CHECK forbids v1 (CC 4.4.3.4.1 / CC 5.2).
+    #[tokio::test]
+    async fn community_dek_member_grants_are_v2_only_sqlite() {
+        use crate::federation::at_rest_cascade::WRAP_ALGORITHM_V2;
+        use crate::federation::community_dek::orchestrate::encrypt_and_cascade_community;
+
+        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        encrypt_and_cascade_community(&backend, "comm", b"x", None)
+            .await
+            .unwrap();
+
+        // Every member-grant row is v2; a v1 INSERT is rejected by the CHECK.
+        let conn = backend.conn.clone();
+        let (algs, v1_rejected) = {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare("SELECT wrap_algorithm FROM federation_community_dek_member_grants")
+                .unwrap();
+            let algs: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let v1_rejected = conn
+                .execute(
+                    "INSERT INTO federation_community_dek_member_grants \
+                     (community_key_id, epoch, member_key_id, wrap_algorithm, wrapped_dek) \
+                     VALUES ('comm', 0, 'mallory', 'v1', 'x')",
+                    [],
+                )
+                .is_err();
+            (algs, v1_rejected)
+        };
+        assert!(!algs.is_empty());
+        assert!(algs.iter().all(|a| a == WRAP_ALGORITHM_V2));
+        assert!(v1_rejected, "the wrap_algorithm CHECK must reject v1");
     }
 
     // ── v6.1.0 (CIRISPersist#161 Ask 2/4) membership-change re-key ─────
