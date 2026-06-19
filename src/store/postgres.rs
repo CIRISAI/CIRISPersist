@@ -5653,6 +5653,47 @@ fn pg_row_to_peer_metadata_for_hash(
     })
 }
 
+/// v9.1.0 (CIRISPersist#243, FSD §2.4) — decode a `federation_scope_blobs`
+/// row (with the fixed-width `nonce` / `tag` BYTEA columns length-checked)
+/// into a [`crate::federation::ScopeBlobSymbol`]. The row must expose
+/// `symbol_index, nonce, ciphertext, tag, group_dek_epoch`.
+fn scope_blob_symbol_from_pg_row(
+    row: &tokio_postgres::Row,
+) -> Result<crate::federation::ScopeBlobSymbol, crate::federation::BlobError> {
+    let symbol_index_i32: i32 =
+        row.safe_get_with("symbol_index", crate::federation::BlobError::Backend)?;
+    let symbol_index = u16::try_from(symbol_index_i32).map_err(|_| {
+        crate::federation::BlobError::Backend(format!(
+            "federation_scope_blobs.symbol_index out of u16 range: {symbol_index_i32}"
+        ))
+    })?;
+    let nonce_vec: Vec<u8> = row.safe_get_with("nonce", crate::federation::BlobError::Backend)?;
+    let nonce: [u8; 24] = nonce_vec.as_slice().try_into().map_err(|_| {
+        crate::federation::BlobError::Backend(format!(
+            "federation_scope_blobs.nonce is {} bytes, expected 24",
+            nonce_vec.len()
+        ))
+    })?;
+    let ciphertext: Vec<u8> =
+        row.safe_get_with("ciphertext", crate::federation::BlobError::Backend)?;
+    let tag_vec: Vec<u8> = row.safe_get_with("tag", crate::federation::BlobError::Backend)?;
+    let tag: [u8; 16] = tag_vec.as_slice().try_into().map_err(|_| {
+        crate::federation::BlobError::Backend(format!(
+            "federation_scope_blobs.tag is {} bytes, expected 16",
+            tag_vec.len()
+        ))
+    })?;
+    let epoch_i64: i64 =
+        row.safe_get_with("group_dek_epoch", crate::federation::BlobError::Backend)?;
+    Ok(crate::federation::ScopeBlobSymbol {
+        symbol_index,
+        nonce,
+        ciphertext,
+        tag,
+        group_dek_epoch: epoch_i64.max(0) as u64,
+    })
+}
+
 // ─── BlobStorage impl (v2.3, CIRISPersist#103) ─────────────────────
 //
 // Content-addressable byte storage. See `crate::federation::blobs` for
@@ -6301,6 +6342,152 @@ impl crate::federation::BlobStorage for PostgresBackend {
                 Ok(Some((community, epoch.max(0) as u64)))
             }
         }
+    }
+
+    // ── v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) scope-blob store ──
+
+    async fn put_scope_blob(
+        &self,
+        record_id: [u8; 32],
+        symbol_index: u16,
+        nonce: [u8; 24],
+        ciphertext: Vec<u8>,
+        tag: [u8; 16],
+        group_dek_ref: crate::federation::GroupDekRef,
+    ) -> Result<(), crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let record_id_vec = record_id.to_vec();
+        let symbol_index_i32 = symbol_index as i32;
+        let nonce_vec = nonce.to_vec();
+        let tag_vec = tag.to_vec();
+        let epoch_i64 = i64::try_from(group_dek_ref.epoch).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "group_dek_epoch exceeds i64 — federation_scope_blobs.group_dek_epoch is BIGINT"
+                    .into(),
+            )
+        })?;
+        // First-write-wins on (record_id, symbol_index): a re-put of the
+        // same symbol is a no-op so the LRU clock is not reset by a
+        // redundant write (only genuine reads bump last_accessed_at).
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_scope_blobs (\
+                    record_id, symbol_index, nonce, ciphertext, tag, group_dek_epoch\
+                 ) VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (record_id, symbol_index) DO NOTHING",
+                &[
+                    &record_id_vec,
+                    &symbol_index_i32,
+                    &nonce_vec,
+                    &ciphertext,
+                    &tag_vec,
+                    &epoch_i64,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("put_scope_blob insert: {e}"))
+            })?;
+        Ok(())
+    }
+
+    async fn get_scope_blob(
+        &self,
+        record_id: [u8; 32],
+        symbol_index: u16,
+    ) -> Result<Option<crate::federation::ScopeBlobSymbol>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let record_id_vec = record_id.to_vec();
+        let symbol_index_i32 = symbol_index as i32;
+        // Single UPDATE … RETURNING bumps the LRU clock AND fetches the row
+        // in one round-trip (the federation_blobs get_blob discipline).
+        let row_opt = client
+            .query_opt(
+                "UPDATE cirislens.federation_scope_blobs \
+                    SET last_accessed_at = NOW() \
+                  WHERE record_id = $1 AND symbol_index = $2 \
+                  RETURNING symbol_index, nonce, ciphertext, tag, group_dek_epoch",
+                &[&record_id_vec, &symbol_index_i32],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("get_scope_blob update+select: {e}"))
+            })?;
+        match row_opt {
+            None => Ok(None),
+            Some(row) => Ok(Some(scope_blob_symbol_from_pg_row(&row)?)),
+        }
+    }
+
+    async fn list_scope_blob_symbols(
+        &self,
+        record_id: [u8; 32],
+    ) -> Result<Vec<crate::federation::ScopeBlobSymbol>, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let record_id_vec = record_id.to_vec();
+        // UPDATE … RETURNING ordered by symbol_index: bump every symbol's
+        // LRU clock (RaptorQ reassembly reads the whole record at once) and
+        // return them in one round-trip.
+        let rows = client
+            .query(
+                "UPDATE cirislens.federation_scope_blobs \
+                    SET last_accessed_at = NOW() \
+                  WHERE record_id = $1 \
+                  RETURNING symbol_index, nonce, ciphertext, tag, group_dek_epoch",
+                &[&record_id_vec],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!(
+                    "list_scope_blob_symbols update+select: {e}"
+                ))
+            })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(scope_blob_symbol_from_pg_row(row)?);
+        }
+        out.sort_by_key(|s| s.symbol_index);
+        Ok(out)
+    }
+
+    async fn evict_scope_blobs(
+        &self,
+        max_symbols: u64,
+    ) -> Result<u64, crate::federation::BlobError> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(e.to_string()))?;
+        let max_i64 = i64::try_from(max_symbols).unwrap_or(i64::MAX);
+        // Delete the coldest (oldest last_accessed_at) symbols beyond the
+        // capacity bound. Pure LRU + capacity — NO trust-weighting, NO decay
+        // scoring (#243 §1). The single-statement DELETE … WHERE ctid IN
+        // (ordered subselect with OFFSET) keeps the newest `max_symbols`
+        // rows and removes the rest in one round-trip.
+        let deleted = client
+            .execute(
+                "DELETE FROM cirislens.federation_scope_blobs \
+                  WHERE ctid IN ( \
+                    SELECT ctid FROM cirislens.federation_scope_blobs \
+                     ORDER BY last_accessed_at DESC, admitted_at DESC \
+                     OFFSET $1 \
+                  )",
+                &[&max_i64],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("evict_scope_blobs delete: {e}"))
+            })?;
+        Ok(deleted)
     }
 
     // v6.1.0 (CIRISPersist#161 Ask 2/4) — the retroactive-ADD visibility
@@ -27323,5 +27510,244 @@ mod tests {
             fed(received),
             "sender and receiver compute an identical envelope_hash"
         );
+    }
+
+    // ── v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) scope-blob store ──
+
+    /// Run-scoped record_id: 32 bytes seeded from the nanos run tag so a
+    /// shared PG instance never collides between runs.
+    fn pg_scope_record_id() -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let tag = uuid_like();
+        let d = Sha256::digest(tag.as_bytes());
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&d);
+        out
+    }
+
+    async fn pg_truncate_scope_blobs(backend: &PostgresBackend) {
+        let client = backend.pool().get().await.unwrap();
+        client
+            .execute("DELETE FROM cirislens.federation_scope_blobs", &[])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_scope_blob_round_trip() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobStorage, GroupDekRef};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let record_id = pg_scope_record_id();
+        let nonce = [0x22u8; 24];
+        let ciphertext = b"caller-pre-encrypted-symbol-bytes".to_vec();
+        let tag = [0x33u8; 16];
+        backend
+            .put_scope_blob(
+                record_id,
+                0,
+                nonce,
+                ciphertext.clone(),
+                tag,
+                GroupDekRef::new("community-x".into(), 7),
+            )
+            .await
+            .expect("put_scope_blob");
+        let got = backend
+            .get_scope_blob(record_id, 0)
+            .await
+            .expect("get_scope_blob")
+            .expect("present");
+        assert_eq!(got.symbol_index, 0);
+        assert_eq!(got.nonce, nonce);
+        assert_eq!(got.ciphertext, ciphertext);
+        assert_eq!(got.tag, tag);
+        assert_eq!(got.group_dek_epoch, 7);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_scope_blob_n_symbols_and_idempotent_reput() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobStorage, GroupDekRef};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let record_id = pg_scope_record_id();
+        const N: u16 = 20;
+        for i in 0..N {
+            backend
+                .put_scope_blob(
+                    record_id,
+                    i,
+                    [i as u8; 24],
+                    vec![i as u8; 8],
+                    [i as u8; 16],
+                    GroupDekRef::new("community-y".into(), 3),
+                )
+                .await
+                .unwrap();
+        }
+        backend
+            .put_scope_blob(
+                record_id,
+                5,
+                [0xFFu8; 24],
+                b"different-bytes".to_vec(),
+                [0xFFu8; 16],
+                GroupDekRef::new("community-y".into(), 99),
+            )
+            .await
+            .unwrap();
+        let symbols = backend.list_scope_blob_symbols(record_id).await.unwrap();
+        assert_eq!(symbols.len(), N as usize, "PK dedup: no extra row");
+        for (i, s) in symbols.iter().enumerate() {
+            assert_eq!(s.symbol_index, i as u16, "ordered by symbol_index ASC");
+        }
+        let s5 = backend.get_scope_blob(record_id, 5).await.unwrap().unwrap();
+        assert_eq!(s5.ciphertext, vec![5u8; 8], "first write wins on re-put");
+        assert_eq!(s5.group_dek_epoch, 3);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_scope_blob_read_bumps_last_accessed_at() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobStorage, GroupDekRef};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let record_id = pg_scope_record_id();
+        backend
+            .put_scope_blob(
+                record_id,
+                0,
+                [1u8; 24],
+                vec![1u8; 4],
+                [1u8; 16],
+                GroupDekRef::new("community-z".into(), 0),
+            )
+            .await
+            .unwrap();
+        let read_la = || async {
+            let client = backend.pool().get().await.unwrap();
+            let row = client
+                .query_one(
+                    "SELECT last_accessed_at FROM cirislens.federation_scope_blobs \
+                     WHERE record_id = $1 AND symbol_index = 0",
+                    &[&record_id.to_vec()],
+                )
+                .await
+                .unwrap();
+            let la: chrono::DateTime<chrono::Utc> = row
+                .safe_get_with("last_accessed_at", crate::federation::Error::Backend)
+                .unwrap();
+            la
+        };
+        let before = read_la().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let _ = backend.get_scope_blob(record_id, 0).await.unwrap();
+        let after = read_la().await;
+        assert!(after > before, "read must bump last_accessed_at");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_scope_blob_eviction_removes_lru_first() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobStorage, GroupDekRef};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // evict_scope_blobs is table-wide; isolate (serial(postgres) gates).
+        pg_truncate_scope_blobs(&backend).await;
+        let record_id = pg_scope_record_id();
+        for i in 0..6u16 {
+            backend
+                .put_scope_blob(
+                    record_id,
+                    i,
+                    [i as u8; 24],
+                    vec![i as u8; 4],
+                    [i as u8; 16],
+                    GroupDekRef::new("community-e".into(), 1),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let _ = backend.get_scope_blob(record_id, 0).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let _ = backend.get_scope_blob(record_id, 1).await.unwrap();
+
+        let deleted = backend.evict_scope_blobs(3).await.expect("evict");
+        assert_eq!(deleted, 3);
+        let survivors: Vec<u16> = backend
+            .list_scope_blob_symbols(record_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.symbol_index)
+            .collect();
+        assert_eq!(survivors.len(), 3);
+        assert!(survivors.contains(&0), "re-read symbol 0 survives");
+        assert!(survivors.contains(&1), "re-read symbol 1 survives");
+        assert!(survivors.contains(&5), "newest-admitted symbol 5 survives");
+        for cold in [2u16, 3, 4] {
+            assert!(
+                !survivors.contains(&cold),
+                "LRU symbol {cold} must be evicted"
+            );
+        }
+        pg_truncate_scope_blobs(&backend).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_scope_blob_eviction_noop_under_capacity() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::{BlobStorage, GroupDekRef};
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        pg_truncate_scope_blobs(&backend).await;
+        let record_id = pg_scope_record_id();
+        for i in 0..3u16 {
+            backend
+                .put_scope_blob(
+                    record_id,
+                    i,
+                    [i as u8; 24],
+                    vec![i as u8; 4],
+                    [i as u8; 16],
+                    GroupDekRef::new("community-f".into(), 0),
+                )
+                .await
+                .unwrap();
+        }
+        let deleted = backend.evict_scope_blobs(10).await.unwrap();
+        assert_eq!(deleted, 0, "no eviction when under capacity");
+        assert_eq!(
+            backend
+                .list_scope_blob_symbols(record_id)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        pg_truncate_scope_blobs(&backend).await;
     }
 }

@@ -130,9 +130,9 @@ pub use admission::{
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
     holds_bytes_attestation_envelope, holds_bytes_attestation_type, BlobBody, BlobError, BlobRange,
-    BlobStorage, ChunkManifest, ChunkRef, EvictActorReport, ExternalRef, PutBlobAttestation,
-    CHUNK_MANIFEST_VERSION, DEFAULT_INLINE_BYTES_CAP, HOLDS_BYTES_ATTESTATION_TYPE_PREFIX,
-    HOLDS_BYTES_PREFIX_HEX_LEN,
+    BlobStorage, ChunkManifest, ChunkRef, EvictActorReport, ExternalRef, GroupDekRef,
+    PutBlobAttestation, ScopeBlobSymbol, CHUNK_MANIFEST_VERSION, DEFAULT_INLINE_BYTES_CAP,
+    HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
 pub use goal::{
     canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,

@@ -159,6 +159,27 @@ struct State {
     /// table (V086). `aggregation_meta` is OPAQUE bytes persist never
     /// parses.
     content_aggregations: HashMap<String, crate::fountain::AggregationRecordV1>,
+    /// v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) — scope-blob symbol
+    /// store, keyed by `(record_id, symbol_index)` (the PK), degraded-but-
+    /// present parity with the pg/sqlite `federation_scope_blobs` table.
+    /// `BlobStorage` itself is pg/sqlite-only (the at-rest backends), so the
+    /// scope-blob surface lives as inherent methods here — mirroring how the
+    /// community-DEK rotation *state* (`federation_community_dek_epoch`) is
+    /// carried on memory while its crypto half is BlobStorage-only.
+    federation_scope_blobs: HashMap<([u8; 32], u16), MemScopeBlob>,
+}
+
+/// v9.1.0 (CIRISPersist#243) — one in-memory scope-blob symbol + its LRU
+/// access clock. `last_accessed_at` is bumped on read so the in-memory
+/// eviction mirrors the pg/sqlite LRU discipline.
+#[derive(Clone)]
+struct MemScopeBlob {
+    nonce: [u8; 24],
+    ciphertext: Vec<u8>,
+    tag: [u8; 16],
+    group_dek_epoch: u64,
+    admitted_at: chrono::DateTime<chrono::Utc>,
+    last_accessed_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl Default for MemoryBackend {
@@ -195,6 +216,7 @@ impl Default for MemoryBackend {
                 fountain_symbols: HashMap::new(),
                 wholeness_witnesses: HashMap::new(),
                 content_aggregations: HashMap::new(),
+                federation_scope_blobs: HashMap::new(),
             }),
         }
     }
@@ -204,6 +226,127 @@ impl MemoryBackend {
     /// Create an empty memory backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    // ── v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) scope-blob store ──
+    //
+    // Inherent methods (NOT a BlobStorage impl — that trait is pg/sqlite-
+    // only). Degraded-but-present parity so the scope-native-privacy
+    // surface is testable on all three backends with no pg/sqlite
+    // asymmetry. Same behaviors as the pg/sqlite trait methods: opaque
+    // ciphertext round-trip, first-write-wins idempotency on
+    // (record_id, symbol_index), reads bump the LRU clock, LRU+capacity
+    // eviction (no trust-scoring).
+
+    /// Admit one symbol-AEAD-encrypted symbol; first-write-wins on
+    /// `(record_id, symbol_index)`.
+    pub fn put_scope_blob(
+        &self,
+        record_id: [u8; 32],
+        symbol_index: u16,
+        nonce: [u8; 24],
+        ciphertext: Vec<u8>,
+        tag: [u8; 16],
+        group_dek_ref: crate::federation::GroupDekRef,
+    ) -> Result<(), crate::federation::BlobError> {
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+        // DO NOTHING on conflict: a redundant re-put never resets the LRU
+        // clock (only genuine reads bump last_accessed_at).
+        state
+            .federation_scope_blobs
+            .entry((record_id, symbol_index))
+            .or_insert(MemScopeBlob {
+                nonce,
+                ciphertext,
+                tag,
+                group_dek_epoch: group_dek_ref.epoch,
+                admitted_at: now,
+                last_accessed_at: now,
+            });
+        Ok(())
+    }
+
+    /// Read one symbol back; bumps its LRU clock. `None` if absent.
+    pub fn get_scope_blob(
+        &self,
+        record_id: [u8; 32],
+        symbol_index: u16,
+    ) -> Result<Option<crate::federation::ScopeBlobSymbol>, crate::federation::BlobError> {
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+        match state
+            .federation_scope_blobs
+            .get_mut(&(record_id, symbol_index))
+        {
+            None => Ok(None),
+            Some(b) => {
+                b.last_accessed_at = now;
+                Ok(Some(crate::federation::ScopeBlobSymbol {
+                    symbol_index,
+                    nonce: b.nonce,
+                    ciphertext: b.ciphertext.clone(),
+                    tag: b.tag,
+                    group_dek_epoch: b.group_dek_epoch,
+                }))
+            }
+        }
+    }
+
+    /// List every symbol for `record_id`, ordered by `symbol_index` ASC;
+    /// bumps the LRU clock on each.
+    pub fn list_scope_blob_symbols(
+        &self,
+        record_id: [u8; 32],
+    ) -> Result<Vec<crate::federation::ScopeBlobSymbol>, crate::federation::BlobError> {
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+        let mut out: Vec<crate::federation::ScopeBlobSymbol> = state
+            .federation_scope_blobs
+            .iter_mut()
+            .filter(|((rid, _), _)| *rid == record_id)
+            .map(|((_, sidx), b)| {
+                b.last_accessed_at = now;
+                crate::federation::ScopeBlobSymbol {
+                    symbol_index: *sidx,
+                    nonce: b.nonce,
+                    ciphertext: b.ciphertext.clone(),
+                    tag: b.tag,
+                    group_dek_epoch: b.group_dek_epoch,
+                }
+            })
+            .collect();
+        out.sort_by_key(|s| s.symbol_index);
+        Ok(out)
+    }
+
+    /// Capacity-bound LRU eviction: keep the newest `max_symbols` (by
+    /// `last_accessed_at`), delete the coldest rest; returns the count
+    /// deleted. Pure LRU + capacity, no trust-scoring (#243 §1).
+    pub fn evict_scope_blobs(&self, max_symbols: u64) -> Result<u64, crate::federation::BlobError> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let total = state.federation_scope_blobs.len() as u64;
+        if total <= max_symbols {
+            return Ok(0);
+        }
+        // Rank keys by (last_accessed_at DESC, admitted_at DESC); the keys
+        // past the capacity bound are the eviction set.
+        let mut keys: Vec<([u8; 32], u16)> = state.federation_scope_blobs.keys().copied().collect();
+        keys.sort_by(|a, b| {
+            let ba = &state.federation_scope_blobs[a];
+            let bb = &state.federation_scope_blobs[b];
+            bb.last_accessed_at
+                .cmp(&ba.last_accessed_at)
+                .then(bb.admitted_at.cmp(&ba.admitted_at))
+        });
+        let to_evict: Vec<([u8; 32], u16)> = keys.into_iter().skip(max_symbols as usize).collect();
+        let mut deleted = 0u64;
+        for k in to_evict {
+            if state.federation_scope_blobs.remove(&k).is_some() {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 
     /// v9.0.0 G5 (CC 4.4.3.2.2) — the current community DEK rotation epoch
@@ -7436,5 +7579,166 @@ mod tests {
             Some(2),
             "canonical_binding admits as rule 2 (direct subject authority)"
         );
+    }
+
+    // ── v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) scope-blob store ──
+
+    #[tokio::test]
+    async fn mem_put_scope_blob_round_trip() {
+        use crate::federation::GroupDekRef;
+        let backend = MemoryBackend::new();
+        let record_id = [0x11u8; 32];
+        let nonce = [0x22u8; 24];
+        let ciphertext = b"caller-pre-encrypted-symbol-bytes".to_vec();
+        let tag = [0x33u8; 16];
+        backend
+            .put_scope_blob(
+                record_id,
+                0,
+                nonce,
+                ciphertext.clone(),
+                tag,
+                GroupDekRef::new("community-x".into(), 7),
+            )
+            .unwrap();
+        let got = backend
+            .get_scope_blob(record_id, 0)
+            .unwrap()
+            .expect("present");
+        assert_eq!(got.symbol_index, 0);
+        assert_eq!(got.nonce, nonce);
+        assert_eq!(got.ciphertext, ciphertext);
+        assert_eq!(got.tag, tag);
+        assert_eq!(got.group_dek_epoch, 7);
+    }
+
+    #[tokio::test]
+    async fn mem_scope_blob_n_symbols_and_idempotent_reput() {
+        use crate::federation::GroupDekRef;
+        let backend = MemoryBackend::new();
+        let record_id = [0x44u8; 32];
+        const N: u16 = 20;
+        for i in 0..N {
+            backend
+                .put_scope_blob(
+                    record_id,
+                    i,
+                    [i as u8; 24],
+                    vec![i as u8; 8],
+                    [i as u8; 16],
+                    GroupDekRef::new("community-y".into(), 3),
+                )
+                .unwrap();
+        }
+        backend
+            .put_scope_blob(
+                record_id,
+                5,
+                [0xFFu8; 24],
+                b"different-bytes".to_vec(),
+                [0xFFu8; 16],
+                GroupDekRef::new("community-y".into(), 99),
+            )
+            .unwrap();
+        let symbols = backend.list_scope_blob_symbols(record_id).unwrap();
+        assert_eq!(symbols.len(), N as usize, "PK dedup: no extra row");
+        for (i, s) in symbols.iter().enumerate() {
+            assert_eq!(s.symbol_index, i as u16, "ordered by symbol_index ASC");
+        }
+        let s5 = backend.get_scope_blob(record_id, 5).unwrap().unwrap();
+        assert_eq!(s5.ciphertext, vec![5u8; 8], "first write wins on re-put");
+        assert_eq!(s5.group_dek_epoch, 3);
+    }
+
+    #[tokio::test]
+    async fn mem_scope_blob_read_bumps_last_accessed_at() {
+        use crate::federation::GroupDekRef;
+        let backend = MemoryBackend::new();
+        let record_id = [0x55u8; 32];
+        backend
+            .put_scope_blob(
+                record_id,
+                0,
+                [1u8; 24],
+                vec![1u8; 4],
+                [1u8; 16],
+                GroupDekRef::new("community-z".into(), 0),
+            )
+            .unwrap();
+        let before = {
+            let state = backend.state.lock().unwrap();
+            state.federation_scope_blobs[&(record_id, 0)].last_accessed_at
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let _ = backend.get_scope_blob(record_id, 0).unwrap();
+        let after = {
+            let state = backend.state.lock().unwrap();
+            state.federation_scope_blobs[&(record_id, 0)].last_accessed_at
+        };
+        assert!(after > before, "read must bump last_accessed_at");
+    }
+
+    #[tokio::test]
+    async fn mem_scope_blob_eviction_removes_lru_first() {
+        use crate::federation::GroupDekRef;
+        let backend = MemoryBackend::new();
+        let record_id = [0x66u8; 32];
+        for i in 0..6u16 {
+            backend
+                .put_scope_blob(
+                    record_id,
+                    i,
+                    [i as u8; 24],
+                    vec![i as u8; 4],
+                    [i as u8; 16],
+                    GroupDekRef::new("community-e".into(), 1),
+                )
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        let _ = backend.get_scope_blob(record_id, 0).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        let _ = backend.get_scope_blob(record_id, 1).unwrap();
+
+        let deleted = backend.evict_scope_blobs(3).unwrap();
+        assert_eq!(deleted, 3);
+        let survivors: Vec<u16> = backend
+            .list_scope_blob_symbols(record_id)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.symbol_index)
+            .collect();
+        assert_eq!(survivors.len(), 3);
+        assert!(survivors.contains(&0), "re-read symbol 0 survives");
+        assert!(survivors.contains(&1), "re-read symbol 1 survives");
+        assert!(survivors.contains(&5), "newest-admitted symbol 5 survives");
+        for cold in [2u16, 3, 4] {
+            assert!(
+                !survivors.contains(&cold),
+                "LRU symbol {cold} must be evicted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mem_scope_blob_eviction_noop_under_capacity() {
+        use crate::federation::GroupDekRef;
+        let backend = MemoryBackend::new();
+        let record_id = [0x77u8; 32];
+        for i in 0..3u16 {
+            backend
+                .put_scope_blob(
+                    record_id,
+                    i,
+                    [i as u8; 24],
+                    vec![i as u8; 4],
+                    [i as u8; 16],
+                    GroupDekRef::new("community-f".into(), 0),
+                )
+                .unwrap();
+        }
+        let deleted = backend.evict_scope_blobs(10).unwrap();
+        assert_eq!(deleted, 0, "no eviction when under capacity");
+        assert_eq!(backend.list_scope_blob_symbols(record_id).unwrap().len(), 3);
     }
 }
