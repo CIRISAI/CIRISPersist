@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "9.1.0"
+version = "9.2.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -127,6 +127,21 @@ secrets-server = ["secrets", "server"]
 # `rustls-tls` (not native-tls) to match the rest of the federation
 # transport-layer security posture.
 secrets-client = ["secrets", "dep:reqwest", "dep:url"]
+
+# v9.2.0 (CIRISPersist#243 part 3) — `EncryptedKVStore`: an app-layer
+# XChaCha20-Poly1305 AEAD key/value store over the bundled rusqlite, for
+# the openmls `StorageProvider` cold-state CIRISEdge layers on top
+# (CEWP `FSD/SCOPE_PRIVACY.md` §7.8 phone-class degraded posture).
+#
+# Operator-chosen NOT to use SQLCipher: SQLCipher would change the
+# shared `libsqlite3-sys` across all 7 wheel platforms (a cross-platform
+# C-build risk). Instead the values + keys are sealed at the application
+# layer with the CIRISVerify v6.3.0 scope-privacy crypto (pure-Rust
+# `chacha20poly1305` / `hmac` / `hkdf` — NO new C dependency, NO wheel
+# risk). It is a sovereign/edge LOCAL-STORE surface (sqlite-backed,
+# standalone like a local secret box) — NOT a FederationDirectory
+# backend, so there is no pg/sqlite parity obligation.
+encrypted-kv = ["sqlite", "ciris-crypto/kdf", "ciris-crypto/hmac", "ciris-crypto/xchacha", "ciris-crypto/random"]
 
 # v0.7.0 (CIRISPersist#19 sibling track; FSD CIRIS_PERSIST.md Appendix A) —
 # federation-consensus substrate for CIRISNodeCore. Adds V011 migration
@@ -882,6 +897,13 @@ required-features = ["sqlite", "cirislens_occurrence"]
 name = "storage_floor"
 harness = false
 required-features = ["sqlite", "cirislens_sequence"]
+
+# v9.2.0 (CIRISPersist#243 part 3) — EncryptedKVStore cold-boot open +
+# per-op overhead vs a plaintext rusqlite baseline.
+[[bench]]
+name = "encrypted_kv"
+harness = false
+required-features = ["encrypted-kv"]
 
 # v1.10.0 — keep `target/` from ballooning. The full debuginfo
 # (`debug = 2`, the default) is the dominant cost in dev/test builds,

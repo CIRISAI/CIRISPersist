@@ -64,6 +64,11 @@ pub mod debug;
 #[cfg(feature = "cirislens_deferral_reports")]
 pub mod deferral_reports;
 pub mod derived;
+// v9.2.0 (CIRISPersist#243 part 3) — app-layer XChaCha20-Poly1305
+// EncryptedKVStore over the bundled rusqlite. Sovereign/edge local
+// store for the openmls StorageProvider cold-state (CEWP §7.8).
+#[cfg(feature = "encrypted-kv")]
+pub mod encrypted_kv;
 pub mod engine;
 pub mod federation;
 #[cfg(feature = "cirislens_feedback_mappings")]
