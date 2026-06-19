@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.0.2] — 2026-06-18
+
+### Changed — re-pin CIRISVerify v6.1.1 → v6.2.0 (additive minor)
+
+- All six git-tag verify crates flipped in lockstep per the coherence rule; `version = "6"` unchanged (6.2.0 satisfies it). v6.2.0 adds a **consumer-side build-manifest Contribution verifier** in CIRISVerify (`manifest_contribution` + the wheel-manifest FFI); persist consumes none of it (it uses `verify_hybrid` / `canonical` / `transparency` / `ciris-crypto` / `ciris-keyring`, unchanged). No persist code change; no migration; no version-string flip.
+
 ## [9.0.1] — 2026-06-18
 
 ### Changed — re-pin CIRISVerify v6.0.0 → v6.1.1 (additive minor)
