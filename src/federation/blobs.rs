@@ -374,6 +374,72 @@ impl BlobBody {
     }
 }
 
+/// v9.1.0 (CIRISPersist#243, CC 1.13.3 / FSD §2.4) — reference to the
+/// community DEK a scope-blob symbol was sealed under.
+///
+/// Ties the [`put_scope_blob`](BlobStorage::put_scope_blob) admission
+/// path to the existing community-DEK surface
+/// ([`community_dek_current_epoch`](BlobStorage::community_dek_current_epoch)):
+/// the caller (CIRISEdge) resolves the `(community_key_id, epoch)` of the
+/// group DEK it used to seal the symbols and passes it here. Persist
+/// records only `epoch` (as the table's `group_dek_epoch`) — the
+/// `community_key_id` is the caller's addressing key into the DEK surface,
+/// not stored on the symbol row itself (FSD §2.4: holder/community
+/// identity is opaque on the symbol store; the DEK binding lives in the
+/// community_dek_* tables).
+///
+/// Construct via [`GroupDekRef::new`] or, for the common case, resolve
+/// the current epoch first:
+///
+/// ```ignore
+/// let epoch = backend.community_dek_current_epoch(community_key_id).await?;
+/// let dek_ref = GroupDekRef::new(community_key_id.to_string(), epoch);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupDekRef {
+    /// The community whose shared DEK sealed the symbols. Caller-side
+    /// addressing key into the `community_dek_*` surface; not persisted on
+    /// the symbol row (opaque-holder property, FSD §2.4).
+    pub community_key_id: String,
+    /// The DEK epoch (from
+    /// [`community_dek_current_epoch`](BlobStorage::community_dek_current_epoch)).
+    /// Stored as `federation_scope_blobs.group_dek_epoch` so a read
+    /// recovers the right epoch DEK. `0` = a community with no rotation
+    /// row yet.
+    pub epoch: u64,
+}
+
+impl GroupDekRef {
+    /// Construct a reference to `(community_key_id, epoch)`.
+    pub fn new(community_key_id: String, epoch: u64) -> Self {
+        Self {
+            community_key_id,
+            epoch,
+        }
+    }
+}
+
+/// v9.1.0 (CIRISPersist#243, FSD §2.4) — one symbol-AEAD-encrypted RaptorQ
+/// fragment as read back from the scope-blob store.
+///
+/// The bytes round-trip exactly what
+/// [`put_scope_blob`](BlobStorage::put_scope_blob) admitted: persist
+/// stores caller-pre-encrypted ciphertext and returns it verbatim (it
+/// never decrypts — the XChaCha20-Poly1305 seal is CIRISEdge-side).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeBlobSymbol {
+    /// 0..N symbol index within the record.
+    pub symbol_index: u16,
+    /// XChaCha20-Poly1305 nonce (24 bytes).
+    pub nonce: [u8; 24],
+    /// Pre-encrypted symbol bytes (opaque to the substrate).
+    pub ciphertext: Vec<u8>,
+    /// Poly1305 tag (16 bytes).
+    pub tag: [u8; 16],
+    /// The community DEK epoch the symbol was sealed under.
+    pub group_dek_epoch: u64,
+}
+
 /// v2.3 (CIRISPersist#103) — Content-addressable byte storage trait.
 ///
 /// Sibling to [`FederationDirectory`](crate::federation::FederationDirectory).
@@ -1300,6 +1366,90 @@ pub trait BlobStorage: Send + Sync {
         &self,
         at_rest_sha256: &[u8; 32],
     ) -> impl Future<Output = Result<Option<(String, u64)>, BlobError>> + Send;
+
+    // ── v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243 parts 1+2) ───────
+    //   scope-native privacy: a store for caller-pre-encrypted
+    //   (XChaCha20-Poly1305) RaptorQ symbols at community/family/self
+    //   scope. Distinct from put_blob_signing — NO trust score, NO
+    //   attesting_key_id (holder identity opaque per FSD §2.4), PK is
+    //   (record_id, symbol_index). Persist stores opaque ciphertext only
+    //   (the seal + record_id/symbol_key derivation are CIRISEdge-side);
+    //   eviction is pure LRU + capacity (CC 1.2), never trust-weighted.
+
+    /// v9.1.0 (CC 1.13.3 / FSD §2.4) — admit one symbol-AEAD-encrypted
+    /// RaptorQ fragment.
+    ///
+    /// The caller (CIRISEdge) supplies the XChaCha20-Poly1305 seal
+    /// (`nonce` / `ciphertext` / `tag`) — persist NEVER encrypts or
+    /// decrypts; it stores opaque ciphertext addressed by
+    /// `(record_id, symbol_index)`. `record_id` is the FSD §2.4
+    /// HMAC-SHA3-256 output; `symbol_index` is `0..N` (N=20 default).
+    /// `group_dek_ref` ties the symbol to the community DEK epoch it was
+    /// sealed under (resolved from
+    /// [`community_dek_current_epoch`](BlobStorage::community_dek_current_epoch));
+    /// only the epoch is persisted (opaque-holder property).
+    ///
+    /// Unlike [`put_blob_signing`](BlobStorage::put_blob_signing) there is
+    /// NO trust-score lookup, NO attesting key, and NO
+    /// [`AdmissionGate`](crate::federation::AdmissionGate) — community-scope
+    /// eviction is LRU + capacity, not trust-weighted (#243 §1).
+    ///
+    /// # Idempotency
+    ///
+    /// First-write-wins on the `(record_id, symbol_index)` PK: a re-put of
+    /// the same `(record_id, symbol_index)` is a no-op (ON CONFLICT DO
+    /// NOTHING) — the original ciphertext/nonce/tag/epoch and `admitted_at`
+    /// are preserved. (A symbol is content under a fixed AEAD key + index;
+    /// re-admitting it carries no new information, and DO-NOTHING avoids
+    /// resetting the LRU clock on a redundant write — only genuine reads
+    /// bump `last_accessed_at`.)
+    fn put_scope_blob(
+        &self,
+        record_id: [u8; 32],
+        symbol_index: u16,
+        nonce: [u8; 24],
+        ciphertext: Vec<u8>,
+        tag: [u8; 16],
+        group_dek_ref: GroupDekRef,
+    ) -> impl Future<Output = Result<(), BlobError>> + Send;
+
+    /// v9.1.0 (FSD §2.4) — read one scope-blob symbol back by
+    /// `(record_id, symbol_index)`, or `None` if absent.
+    ///
+    /// Bumps the row's `last_accessed_at` (the LRU signal the capacity
+    /// sweeper consumes) — a read keeps a symbol fresh. The bytes
+    /// round-trip exactly what [`put_scope_blob`](BlobStorage::put_scope_blob)
+    /// admitted (persist never decrypts).
+    fn get_scope_blob(
+        &self,
+        record_id: [u8; 32],
+        symbol_index: u16,
+    ) -> impl Future<Output = Result<Option<ScopeBlobSymbol>, BlobError>> + Send;
+
+    /// v9.1.0 (FSD §2.4) — list every stored symbol for `record_id`,
+    /// ordered by `symbol_index` ASC. Empty vec if the record has no
+    /// symbols. Bumps `last_accessed_at` on the returned rows (RaptorQ
+    /// reassembly reads the whole record at once, so the read keeps all of
+    /// the record's symbols fresh together).
+    fn list_scope_blob_symbols(
+        &self,
+        record_id: [u8; 32],
+    ) -> impl Future<Output = Result<Vec<ScopeBlobSymbol>, BlobError>> + Send;
+
+    /// v9.1.0 (CC 1.2, FSD §2.4) — capacity-bound LRU eviction for the
+    /// scope-blob store: while the row count exceeds `max_symbols`, delete
+    /// the coldest (oldest `last_accessed_at`) symbols first, returning the
+    /// number of symbols deleted.
+    ///
+    /// Mirrors the `federation_blobs` eviction discipline (the
+    /// `(last_accessed_at ASC)` index walk) but with NO trust-weighting and
+    /// NO decay scoring — pure LRU + capacity, per #243 §1. The disk-pressure
+    /// / capacity sweeper drives this the same way it drives the
+    /// federation_blobs sweep (see module docs).
+    fn evict_scope_blobs(
+        &self,
+        max_symbols: u64,
+    ) -> impl Future<Output = Result<u64, BlobError>> + Send;
 }
 
 /// v3.5.0 (CIRISPersist#125) — outcome of

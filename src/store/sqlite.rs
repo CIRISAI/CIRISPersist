@@ -5304,6 +5304,60 @@ async fn sqlite_update_peer_field(
 // attestation FK violation rolls back the blob row too (atomic
 // put_blob semantic).
 
+/// v9.1.0 (CIRISPersist#243, FSD §2.4) — a raw `federation_scope_blobs`
+/// row as read from rusqlite, before fixed-width length validation.
+struct ScopeBlobRow {
+    symbol_index: i64,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+    tag: Vec<u8>,
+    group_dek_epoch: i64,
+}
+
+/// rusqlite row mapper for the `symbol_index, nonce, ciphertext, tag,
+/// group_dek_epoch` projection.
+fn scope_blob_row_from_sqlite(r: &rusqlite::Row<'_>) -> Result<ScopeBlobRow, rusqlite::Error> {
+    Ok(ScopeBlobRow {
+        symbol_index: r.get::<_, i64>(0)?,
+        nonce: r.get::<_, Vec<u8>>(1)?,
+        ciphertext: r.get::<_, Vec<u8>>(2)?,
+        tag: r.get::<_, Vec<u8>>(3)?,
+        group_dek_epoch: r.get::<_, i64>(4)?,
+    })
+}
+
+/// Length-check the fixed-width columns and build the typed
+/// [`crate::federation::ScopeBlobSymbol`].
+fn scope_blob_symbol_from_sqlite_row(
+    row: ScopeBlobRow,
+) -> Result<crate::federation::ScopeBlobSymbol, crate::federation::BlobError> {
+    let symbol_index = u16::try_from(row.symbol_index).map_err(|_| {
+        crate::federation::BlobError::Backend(format!(
+            "federation_scope_blobs.symbol_index out of u16 range: {}",
+            row.symbol_index
+        ))
+    })?;
+    let nonce: [u8; 24] = row.nonce.as_slice().try_into().map_err(|_| {
+        crate::federation::BlobError::Backend(format!(
+            "federation_scope_blobs.nonce is {} bytes, expected 24",
+            row.nonce.len()
+        ))
+    })?;
+    let tag: [u8; 16] = row.tag.as_slice().try_into().map_err(|_| {
+        crate::federation::BlobError::Backend(format!(
+            "federation_scope_blobs.tag is {} bytes, expected 16",
+            row.tag.len()
+        ))
+    })?;
+    Ok(crate::federation::ScopeBlobSymbol {
+        symbol_index,
+        nonce,
+        ciphertext: row.ciphertext,
+        tag,
+        group_dek_epoch: row.group_dek_epoch.max(0) as u64,
+    })
+}
+
 impl crate::federation::BlobStorage for SqliteBackend {
     fn inline_bytes_cap(&self) -> usize {
         self.inline_bytes_cap
@@ -5886,6 +5940,148 @@ impl crate::federation::BlobStorage for SqliteBackend {
             crate::federation::BlobError::Backend(format!("community_dek_blob_epoch: {e}"))
         })?;
         Ok(row.map(|(c, e)| (c, e.max(0) as u64)))
+    }
+
+    // ── v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) scope-blob store ──
+
+    async fn put_scope_blob(
+        &self,
+        record_id: [u8; 32],
+        symbol_index: u16,
+        nonce: [u8; 24],
+        ciphertext: Vec<u8>,
+        tag: [u8; 16],
+        group_dek_ref: crate::federation::GroupDekRef,
+    ) -> Result<(), crate::federation::BlobError> {
+        let record_id_vec = record_id.to_vec();
+        let symbol_index_i64 = symbol_index as i64;
+        let nonce_vec = nonce.to_vec();
+        let tag_vec = tag.to_vec();
+        let epoch_i64 = i64::try_from(group_dek_ref.epoch).map_err(|_| {
+            crate::federation::BlobError::InvalidArgument(
+                "group_dek_epoch exceeds i64 — federation_scope_blobs.group_dek_epoch is INTEGER"
+                    .into(),
+            )
+        })?;
+        // SQLite has no DEFAULT NOW(); the application supplies the
+        // wall-clock (the federation_blobs V053 discipline).
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            // First-write-wins on (record_id, symbol_index): a re-put of the
+            // same symbol is a no-op (no LRU clock reset on a redundant write).
+            conn.execute(
+                "INSERT INTO federation_scope_blobs (\
+                    record_id, symbol_index, nonce, ciphertext, tag, group_dek_epoch, \
+                    admitted_at, last_accessed_at\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) \
+                 ON CONFLICT (record_id, symbol_index) DO NOTHING",
+                rusqlite::params![
+                    record_id_vec,
+                    symbol_index_i64,
+                    nonce_vec,
+                    ciphertext,
+                    tag_vec,
+                    epoch_i64,
+                    now_iso,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| crate::federation::BlobError::Backend(format!("put_scope_blob: {e}")))?;
+        Ok(())
+    }
+
+    async fn get_scope_blob(
+        &self,
+        record_id: [u8; 32],
+        symbol_index: u16,
+    ) -> Result<Option<crate::federation::ScopeBlobSymbol>, crate::federation::BlobError> {
+        let record_id_vec = record_id.to_vec();
+        let symbol_index_i64 = symbol_index as i64;
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.clone();
+        let row = (move || -> Result<Option<ScopeBlobRow>, rusqlite::Error> {
+            let conn = conn.lock();
+            // Bump the LRU clock first, then read (rusqlite has no UPDATE …
+            // RETURNING on this driver version; two statements under one
+            // lock are atomic enough — no concurrent writer holds the lock).
+            conn.execute(
+                "UPDATE federation_scope_blobs SET last_accessed_at = ?3 \
+                  WHERE record_id = ?1 AND symbol_index = ?2",
+                rusqlite::params![record_id_vec, symbol_index_i64, now_iso],
+            )?;
+            conn.query_row(
+                "SELECT symbol_index, nonce, ciphertext, tag, group_dek_epoch \
+                   FROM federation_scope_blobs \
+                  WHERE record_id = ?1 AND symbol_index = ?2",
+                rusqlite::params![record_id_vec, symbol_index_i64],
+                scope_blob_row_from_sqlite,
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::BlobError::Backend(format!("get_scope_blob: {e}")))?;
+        row.map(scope_blob_symbol_from_sqlite_row).transpose()
+    }
+
+    async fn list_scope_blob_symbols(
+        &self,
+        record_id: [u8; 32],
+    ) -> Result<Vec<crate::federation::ScopeBlobSymbol>, crate::federation::BlobError> {
+        let record_id_vec = record_id.to_vec();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.clone();
+        let rows = (move || -> Result<Vec<ScopeBlobRow>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "UPDATE federation_scope_blobs SET last_accessed_at = ?2 \
+                  WHERE record_id = ?1",
+                rusqlite::params![record_id_vec, now_iso],
+            )?;
+            let mut stmt = conn.prepare(
+                "SELECT symbol_index, nonce, ciphertext, tag, group_dek_epoch \
+                   FROM federation_scope_blobs \
+                  WHERE record_id = ?1 \
+                  ORDER BY symbol_index ASC",
+            )?;
+            let mapped = stmt
+                .query_map(rusqlite::params![record_id_vec], scope_blob_row_from_sqlite)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(mapped)
+        })()
+        .map_err(|e| {
+            crate::federation::BlobError::Backend(format!("list_scope_blob_symbols: {e}"))
+        })?;
+        rows.into_iter()
+            .map(scope_blob_symbol_from_sqlite_row)
+            .collect()
+    }
+
+    async fn evict_scope_blobs(
+        &self,
+        max_symbols: u64,
+    ) -> Result<u64, crate::federation::BlobError> {
+        let max_i64 = i64::try_from(max_symbols).unwrap_or(i64::MAX);
+        let conn = self.conn.clone();
+        let deleted = (move || -> Result<u64, rusqlite::Error> {
+            let conn = conn.lock();
+            // Keep the newest `max_symbols` (by last_accessed_at), delete the
+            // coldest rest. Pure LRU + capacity — NO trust-weighting, NO decay
+            // scoring (#243 §1). rowid identifies the rows to drop.
+            let n = conn.execute(
+                "DELETE FROM federation_scope_blobs \
+                  WHERE rowid IN ( \
+                    SELECT rowid FROM federation_scope_blobs \
+                     ORDER BY last_accessed_at DESC, admitted_at DESC \
+                     LIMIT -1 OFFSET ?1 \
+                  )",
+                rusqlite::params![max_i64],
+            )?;
+            Ok(n as u64)
+        })()
+        .map_err(|e| crate::federation::BlobError::Backend(format!("evict_scope_blobs: {e}")))?;
+        Ok(deleted)
     }
 
     // v6.1.0 (CIRISPersist#161 Ask 2/4) — the retroactive-ADD visibility
@@ -26767,6 +26963,216 @@ mod tests {
         assert_ne!(
             first.ml_kem_768_pubkey_b64, other_id.ml_kem_768_pubkey_b64,
             "two independent ML-KEM-768 mints must differ"
+        );
+    }
+
+    // ── v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) scope-blob store ──
+
+    fn scope_record_id(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_scope_blob_round_trip() {
+        use crate::federation::{BlobStorage, GroupDekRef};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let record_id = scope_record_id(0x11);
+        let nonce = [0x22u8; 24];
+        let ciphertext = b"caller-pre-encrypted-symbol-bytes".to_vec();
+        let tag = [0x33u8; 16];
+        backend
+            .put_scope_blob(
+                record_id,
+                0,
+                nonce,
+                ciphertext.clone(),
+                tag,
+                GroupDekRef::new("community-x".into(), 7),
+            )
+            .await
+            .expect("put_scope_blob");
+        let got = backend
+            .get_scope_blob(record_id, 0)
+            .await
+            .expect("get_scope_blob")
+            .expect("present");
+        assert_eq!(got.symbol_index, 0);
+        assert_eq!(got.nonce, nonce);
+        assert_eq!(got.ciphertext, ciphertext);
+        assert_eq!(got.tag, tag);
+        assert_eq!(got.group_dek_epoch, 7);
+    }
+
+    #[tokio::test]
+    async fn sqlite_scope_blob_n_symbols_and_idempotent_reput() {
+        use crate::federation::{BlobStorage, GroupDekRef};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let record_id = scope_record_id(0x44);
+        const N: u16 = 20;
+        for i in 0..N {
+            backend
+                .put_scope_blob(
+                    record_id,
+                    i,
+                    [i as u8; 24],
+                    vec![i as u8; 8],
+                    [i as u8; 16],
+                    GroupDekRef::new("community-y".into(), 3),
+                )
+                .await
+                .unwrap();
+        }
+        // Re-put of an existing index is idempotent (first-write-wins): the
+        // original ciphertext is preserved, no duplicate row.
+        backend
+            .put_scope_blob(
+                record_id,
+                5,
+                [0xFFu8; 24],
+                b"different-bytes".to_vec(),
+                [0xFFu8; 16],
+                GroupDekRef::new("community-y".into(), 99),
+            )
+            .await
+            .unwrap();
+        let symbols = backend
+            .list_scope_blob_symbols(record_id)
+            .await
+            .expect("list");
+        assert_eq!(symbols.len(), N as usize, "PK dedup: no extra row");
+        for (i, s) in symbols.iter().enumerate() {
+            assert_eq!(s.symbol_index, i as u16, "ordered by symbol_index ASC");
+        }
+        let s5 = backend.get_scope_blob(record_id, 5).await.unwrap().unwrap();
+        assert_eq!(s5.ciphertext, vec![5u8; 8], "first write wins on re-put");
+        assert_eq!(s5.group_dek_epoch, 3);
+        assert_eq!(s5.nonce, [5u8; 24]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_scope_blob_read_bumps_last_accessed_at() {
+        use crate::federation::{BlobStorage, GroupDekRef};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let record_id = scope_record_id(0x55);
+        backend
+            .put_scope_blob(
+                record_id,
+                0,
+                [1u8; 24],
+                vec![1u8; 4],
+                [1u8; 16],
+                GroupDekRef::new("community-z".into(), 0),
+            )
+            .await
+            .unwrap();
+
+        let read_last_accessed = || {
+            let conn = backend.conn.clone();
+            let rid = record_id.to_vec();
+            move || -> String {
+                let conn = conn.lock();
+                conn.query_row(
+                    "SELECT last_accessed_at FROM federation_scope_blobs \
+                     WHERE record_id = ?1 AND symbol_index = 0",
+                    rusqlite::params![rid],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap()
+            }
+        };
+        let before = read_last_accessed()();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let _ = backend.get_scope_blob(record_id, 0).await.unwrap();
+        let after = read_last_accessed()();
+        assert!(
+            after > before,
+            "read must bump last_accessed_at (before={before}, after={after})"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_scope_blob_eviction_removes_lru_first() {
+        use crate::federation::{BlobStorage, GroupDekRef};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let record_id = scope_record_id(0x66);
+        // Admit 6 symbols; admitted_at == last_accessed_at on write, so the
+        // staggered admission order IS the LRU order initially.
+        for i in 0..6u16 {
+            backend
+                .put_scope_blob(
+                    record_id,
+                    i,
+                    [i as u8; 24],
+                    vec![i as u8; 4],
+                    [i as u8; 16],
+                    GroupDekRef::new("community-e".into(), 1),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        // Re-read the two oldest (0, 1) so they become the freshest and must
+        // survive despite being admitted first.
+        let _ = backend.get_scope_blob(record_id, 0).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        let _ = backend.get_scope_blob(record_id, 1).await.unwrap();
+
+        // Capacity = 3: evict the 3 coldest of the 6.
+        let deleted = backend.evict_scope_blobs(3).await.expect("evict");
+        assert_eq!(deleted, 3);
+        let survivors: Vec<u16> = backend
+            .list_scope_blob_symbols(record_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.symbol_index)
+            .collect();
+        assert_eq!(survivors.len(), 3);
+        // 0 and 1 were re-read last → freshest → survive. 5 was admitted
+        // last → also fresh → survives. 2,3,4 are the coldest → evicted.
+        assert!(survivors.contains(&0), "re-read symbol 0 survives");
+        assert!(survivors.contains(&1), "re-read symbol 1 survives");
+        assert!(survivors.contains(&5), "newest-admitted symbol 5 survives");
+        for cold in [2u16, 3, 4] {
+            assert!(
+                !survivors.contains(&cold),
+                "LRU symbol {cold} must be evicted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_scope_blob_eviction_noop_under_capacity() {
+        use crate::federation::{BlobStorage, GroupDekRef};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let record_id = scope_record_id(0x77);
+        for i in 0..3u16 {
+            backend
+                .put_scope_blob(
+                    record_id,
+                    i,
+                    [i as u8; 24],
+                    vec![i as u8; 4],
+                    [i as u8; 16],
+                    GroupDekRef::new("community-f".into(), 0),
+                )
+                .await
+                .unwrap();
+        }
+        let deleted = backend.evict_scope_blobs(10).await.unwrap();
+        assert_eq!(deleted, 0, "no eviction when under capacity");
+        assert_eq!(
+            backend
+                .list_scope_blob_symbols(record_id)
+                .await
+                .unwrap()
+                .len(),
+            3
         );
     }
 }
