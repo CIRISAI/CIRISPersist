@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.0.3] — 2026-06-19
+
+### Fixed — wheel `Requires-Dist` ciris-verify range tracks the v6 Cargo pin (CIRISPersist#241)
+
+- The published v9.0.2 wheel declared `Requires-Dist: ciris-verify <6,>=5.0.0` while its Cargo deps pin `ciris-verify` v6.2.0 (since the v9.0.0 cut moved to the v6 family). The Rust side was consistent; the **Python wheel metadata was stale** — so sibling-repo cohabitation jobs (`pip install ciris-persist==9.0.2 ciris-verify==6.2.0`) hit a hard pip resolution conflict. Metadata-only fix: `pyproject.toml` `[project.dependencies]` floor bumped **`>=5.0.0,<6` → `>=6.0.0,<7`**, restoring the family-floor discipline (the Python wheel `Requires-Dist` tracks the Cargo verify pin). No Rust code change, no migration, no Cargo dep change. Same drift class as the v2.0.1 / v4.10.0 `Requires-Dist` corrections.
+
 ## [9.0.2] — 2026-06-18
 
 ### Changed — re-pin CIRISVerify v6.1.1 → v6.2.0 (additive minor)

@@ -49,8 +49,19 @@ classifiers = [
 # Python binding, CIRISVerify#61) into its matrix alongside persist.
 # Floor is v5.0.0 to require the JCS-cutover line, coherent with the
 # Rust pin.
+#
+# v9.0.3 (CIRISPersist#241 metadata-only retag) — bumped floor to v6.0.0
+# (`<7`). The Rust-side Cargo.toml moved to ciris-verify-core/keyring/
+# crypto v6.x in the v9.0.0 cut (re-pinned 6.0.0→6.1.1→6.2.0 across
+# v9.0.0/.1/.2), but THIS Python wheel Requires-Dist stayed at `<6` —
+# the same drift class as the v2.0.1 / v4.10.0 entries above. The
+# mismatch made the published v9.0.2 wheel declare `ciris-verify<6`
+# while its Cargo deps pin v6.2.0, so sibling-repo cohabitation jobs
+# (`pip install ciris-persist==9.0.2 ciris-verify==6.2.0`) hit a hard
+# pip resolution conflict. Floor is v6.0.0 to track the v6 family floor,
+# coherent with the Rust pin.
 dependencies = [
-    "ciris-verify>=5.0.0,<6",
+    "ciris-verify>=6.0.0,<7",
 ]
 dynamic = ["version"]
 
