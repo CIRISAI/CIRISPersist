@@ -121,6 +121,10 @@ features = [
     # at import). maturin enabling it here preserves the wheel shape.
     "extension-module",
     "sqlite",
+    # v9.2.0 (CIRISPersist#243 part 3) — XChaCha20-Poly1305 EncryptedKVStore
+    # over the bundled rusqlite (the openmls StorageProvider cold-state
+    # CIRISEdge layers on top). Pure-Rust crypto; no new C dep / no wheel risk.
+    "encrypted-kv",
     "cirisgraph",
     "cirisaudit",
     "telemetry",
