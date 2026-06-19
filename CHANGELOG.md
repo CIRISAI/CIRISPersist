@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.0.1] — 2026-06-18
+
+### Changed — re-pin CIRISVerify v6.0.0 → v6.1.1 (additive minor)
+
+- All six git-tag verify crates (`ciris-keyring` / `ciris-verify-core` / `ciris-crypto`, incl. the tpm/ios/android target pins) flipped in lockstep per the coherence rule; `version = "6"` unchanged (6.1.1 satisfies it). v6.1.x is additive for persist — CIRISVerify adds a producer-side `delegate` CLI, build-manifest-as-CEG-Contribution, and a YubiKey (pkcs11) granter path; persist consumes none of those (it uses `verify_hybrid` / `canonical` / `transparency` / `ciris-crypto` / `ciris-keyring`, unchanged). No persist code change; no migration; no version-string flip.
+
 ## [9.0.0] — 2026-06-18
 
 **Constitution-alignment major cut** — aligned to the CIRIS Constitution 0.1.5 (`CIRISAI/CIRISRegistry@FSD/CIRIS_Constitution`). Bundles the CIRISVerify v6.0.0 re-pin with the substrate-binding clauses surfaced by a full constitution→persist alignment pass. The MAJOR bump is earned by the breaking changes below (PQC-mandatory federation-tier ingest + the node-agency admission rejection).
