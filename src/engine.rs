@@ -1769,6 +1769,253 @@ impl Engine {
         Ok(attestation_id)
     }
 
+    // ── #249 Cut C ── delegates_to / moderation emit ceremonies ───────
+    //
+    // v9.3.0 (CIRISPersist#249, CEG §3.2.1 / §11.10 / CC 4.4.3.4.3) — the
+    // typed emit conveniences over the #248 [`Self::emit_attestation`]
+    // primitive. Each builds the right `delegates_to` / `withdraws` /
+    // `scores` envelope and calls `emit_attestation` — NONE re-hand-rolls
+    // the canonicalize→sign→assemble→put recipe (the #247 derived-key_id
+    // floor is inherited: the attester/scrub key is always the signer's
+    // DERIVED federation key_id, never a caller alias). `grant_delegation`
+    // is the general primitive; `owner_bind` / `add_moderator` specialize
+    // it with the CC 4.4.3.4.3 `infra:*` and §11.10 duty scopes; the
+    // `revoke_*` pair emit a producer-self `withdraws` (rule-1 admitted)
+    // against the prior edge.
+
+    /// v9.3.0 (CIRISPersist#249, CEG §3.2.1) — THE general delegation emit:
+    /// "I authorize `delegate_key_id` within `scopes`, optionally with
+    /// `sub_delegation` (deputization)". Builds the
+    /// [`delegates_to_envelope`](crate::federation::delegates_to_envelope)
+    /// (the §11.10-admissible shape: `scope` as an array-set + a top-level
+    /// `sub_delegation` bool) and composes
+    /// [`Self::emit_attestation`] with `attestation_type = "delegates_to"`
+    /// and `attested_key_id = delegate_key_id` (the recipient — required so
+    /// the per-edge retraction bucketing in the duty walk + `is_owner_bound`
+    /// key the edge by its recipient). Returns the `attestation_id`.
+    ///
+    /// `delegate_key_id` MUST exist in `federation_keys` (the
+    /// `attested_key_id` FK). The CC 4.4.3.4.3 node-agency gate runs on the
+    /// emitted row: a node-ONLY recipient may carry only `infra:*` scopes —
+    /// use [`Self::owner_bind`] for that case. `#247`-derived
+    /// `attesting_key_id` is internal.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn grant_delegation(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        delegate_key_id: &str,
+        scopes: Vec<String>,
+        sub_delegation: bool,
+    ) -> Result<String, crate::federation::Error> {
+        let envelope =
+            crate::federation::delegates_to_envelope(delegate_key_id, &scopes, sub_delegation);
+        let mut input = crate::federation::EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::DELEGATES_TO,
+            envelope,
+        );
+        // The edge is keyed by its RECIPIENT: the §11.10 duty walk + the
+        // `is_owner_bound` retraction bucketing both match a delegation /
+        // its later `withdraws` by `attested_key_id`, so a `delegates_to`
+        // MUST name the delegate there (not the self-attestation default).
+        input.attested_key_id = Some(delegate_key_id.to_owned());
+        self.emit_attestation(signer, input).await
+    }
+
+    /// v9.3.0 (CIRISPersist#249, CC 4.4.3.4.3 owner-binding) — bind a node /
+    /// agent occurrence to its owner by granting it **`infra:*`-only**
+    /// scopes. A [`Self::grant_delegation`] specialization that carries ONLY
+    /// server-class (`infra:*`) authority, so it passes the CC 4.4.3.4.3
+    /// node-agency gate even when `node_or_agent_key_id` resolves to a
+    /// node-ONLY identity (the gate rejects any non-`infra:*` token on such
+    /// a key). `sub_delegation` is `false` — an owner-binding is a leaf
+    /// authorization, not a deputization. Returns the `attestation_id`.
+    ///
+    /// `infra_scopes` SHOULD be drawn from
+    /// [`delegation_scope`](crate::federation::types::delegation_scope)'s
+    /// `INFRA_*` constants; an empty set or any non-`infra:*` token will be
+    /// rejected by the node-agency gate (`scopes_are_infra_only`) when the
+    /// recipient is a node key. The owner-binding this writes is exactly the
+    /// `delegates_to(U → k)` edge [`is_owner_bound`] reads.
+    ///
+    /// [`is_owner_bound`]: crate::federation::admission::is_owner_bound
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn owner_bind(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        node_or_agent_key_id: &str,
+        infra_scopes: Vec<String>,
+    ) -> Result<String, crate::federation::Error> {
+        self.grant_delegation(signer, node_or_agent_key_id, infra_scopes, false)
+            .await
+    }
+
+    /// v9.3.0 (CIRISPersist#249, CEG §11.10/§11.11 appointment) — appoint
+    /// `moderator_key_id` a named moderator of `community_id` for `duty`
+    /// (`moderate` / `takedown` / `review`). A [`Self::grant_delegation`]
+    /// specialization stamping the single `duty` scope. After this,
+    /// [`is_named_moderator`](crate::federation::admission::is_named_moderator)`(moderator, community, duty)`
+    /// holds IFF the `signer` is in the community's authority set
+    /// (founder / consensus signer per
+    /// [`community_authority_set`](crate::federation::admission)) AND
+    /// owner-bound — the appointment edge `signer → moderator` is the
+    /// root-out-edge the §11.10 duty walk traverses.
+    ///
+    /// `community_id` rides the appointment **implicitly**: the §11.10 walk
+    /// resolves the community → its authority roots, then walks `root →*
+    /// moderator` over `duty`-scoped `delegates_to` edges — so the binding
+    /// is "this owner-bound community authority delegated `duty` to the
+    /// moderator", NOT a `community_id` field on the edge. The caller is
+    /// therefore responsible for `signer` BEING a community authority (this
+    /// helper emits the edge; admissibility is the authority-set membership,
+    /// checked by the reader). `sub_delegation` is `true` so the appointee
+    /// may further-deputize within the duty (§11.10 deputization). Returns
+    /// the `attestation_id`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn add_moderator(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        community_id: &str,
+        moderator_key_id: &str,
+        duty: &str,
+    ) -> Result<String, crate::federation::Error> {
+        // `community_id` is intentionally not stamped on the edge: the
+        // §11.10 walk binds a moderator to a community by reaching it from
+        // the community's authority roots, not by a field match. Bind it in
+        // the debug log so the appointment is traceable.
+        let _ = community_id;
+        self.grant_delegation(signer, moderator_key_id, vec![duty.to_owned()], true)
+            .await
+    }
+
+    /// v9.3.0 (CIRISPersist#249, CEG §3.2.3 / FSD-002 §2.2.3 withdraws) —
+    /// revoke a prior `delegates_to` edge by emitting a `withdraws` against
+    /// `target_attestation_id`. Composes [`Self::emit_attestation`] with
+    /// `attestation_type = "withdraws"` + the
+    /// [`withdraws_attestation_envelope`](crate::federation::withdraws_attestation_envelope)
+    /// referencing the target edge, and `attested_key_id = delegate_key_id`
+    /// — the recipient the original edge named, so the §11.10 walk's
+    /// per-edge retraction bucketing (and `is_owner_bound`'s) recognize the
+    /// retraction (both match a `withdraws` by `attested_key_id == k`).
+    /// Returns the `attestation_id`.
+    ///
+    /// The signer MUST be the original granter (`attesting_key_id` of the
+    /// target edge): the withdraws gate admits a producer self-revocation
+    /// under rule 1. `delegate_key_id` is the key the revoked edge
+    /// delegated TO.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn revoke_delegation(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        target_attestation_id: &str,
+        delegate_key_id: &str,
+    ) -> Result<String, crate::federation::Error> {
+        let envelope = crate::federation::withdraws_attestation_envelope(
+            target_attestation_id,
+            crate::federation::types::attestation_type::DELEGATES_TO,
+        );
+        let mut input = crate::federation::EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::WITHDRAWS,
+            envelope,
+        );
+        // Key the retraction by the revoked edge's recipient so the duty
+        // walk's `retracted` bucket (`attested_key_id`) invalidates it.
+        input.attested_key_id = Some(delegate_key_id.to_owned());
+        self.emit_attestation(signer, input).await
+    }
+
+    /// v9.3.0 (CIRISPersist#249, CEG §11.10) — remove a named moderator:
+    /// emit a `withdraws` against the appointment `delegates_to` edge.
+    /// Composes [`Self::revoke_delegation`] (same producer-self-revocation /
+    /// `attested_key_id = moderator_key_id` retraction-bucketing shape).
+    /// After this,
+    /// [`is_named_moderator`](crate::federation::admission::is_named_moderator)`(moderator,
+    /// community, duty)` no longer holds for an appointment the `signer`
+    /// granted (the §11.10 walk skips the `withdraws`-revoked edge). Returns
+    /// the `attestation_id`.
+    ///
+    /// `target_attestation_id` is the appointment edge
+    /// ([`Self::add_moderator`]'s return). `community_id` / `duty` are
+    /// accepted for call-site symmetry + traceability; the retraction is
+    /// keyed structurally by the target edge + the moderator recipient, not
+    /// by those fields.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn remove_moderator(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        community_id: &str,
+        target_attestation_id: &str,
+        moderator_key_id: &str,
+        duty: &str,
+    ) -> Result<String, crate::federation::Error> {
+        let _ = (community_id, duty);
+        self.revoke_delegation(signer, target_attestation_id, moderator_key_id)
+            .await
+    }
+
+    /// v9.3.0 (CIRISPersist#249, CEG §11.10 EMIT) — file a moderation report
+    /// as a `scores` attestation on the `moderation:{allegation_type}`
+    /// dimension over content (`content_sha256`), naming `community_id`. The
+    /// §11.10 EMIT-path convenience: composes [`Self::emit_attestation`]
+    /// directly (the `scores` admission gate
+    /// [`check_delegated_duty_scores_admission`](crate::federation::admission::check_delegated_duty_scores_admission)
+    /// runs on `put_attestation` and admits IFF the signer is a `moderate`
+    /// duty-holder over the target — a named moderator of the community, or
+    /// reached by one via a live `moderate`-scoped chain). Returns the
+    /// `attestation_id`.
+    ///
+    /// # cirisnode gating
+    ///
+    /// This producer convenience is **feature-free** (no `--features
+    /// cirisnode`): it emits a federation-tier `scores` attestation through
+    /// the always-present `emit_attestation` path — the
+    /// `moderation:{allegation}` dimension IS the §11.10 federation-image of
+    /// a moderation report (admission.rs `MODERATION_DIMENSION_PREFIX`), and
+    /// the gate that admits it (`check_delegated_duty_scores_admission`)
+    /// ships unconditionally on every backend's `put_attestation`. The
+    /// `cirisnode`-gated surface (the `ModerationEvent` put-path / takedown
+    /// handler) is the SEPARATE node-server ingest path; this is the pure
+    /// attestation emit, so no feature gate is needed here.
+    ///
+    /// `duty` is currently always `moderate` for a `moderation:*` report;
+    /// it is accepted for symmetry with the §11.10 duty vocabulary
+    /// (`takedown` / `review` ride their own dimensions/paths).
+    /// `content_sha256` is routing/advisory in the envelope — the gate
+    /// resolves the content's SIGNED subjects from it; `community_id` names
+    /// the moderating community.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn file_moderation(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        content_sha256: &str,
+        community_id: &str,
+        duty: &str,
+        allegation_type: &str,
+    ) -> Result<String, crate::federation::Error> {
+        let _ = duty;
+        // The §11.10 moderation-report image: a `scores` on the
+        // `moderation:{allegation}:v1` dimension (the `:v1` segment
+        // satisfies the §13.1 version gate; the allegation is the report
+        // taxonomy axis). `content_sha256` + `community_id` ride the
+        // envelope so the gate resolves the target's duty-holders.
+        let dimension = format!(
+            "{}{allegation_type}:v1",
+            crate::federation::admission::MODERATION_DIMENSION_PREFIX
+        );
+        let envelope = serde_json::json!({
+            "kind": "scores",
+            "dimension": dimension,
+            "score": 1.0,
+            "confidence": 0.9,
+            "content_sha256": content_sha256,
+            "community_id": community_id,
+        });
+        let input = crate::federation::EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::SCORES,
+            envelope,
+        );
+        self.emit_attestation(signer, input).await
+    }
+
     /// Borrow the SQLite backend Arc, if this Engine was constructed
     /// with a `sqlite://` DSN. Returns `None` for Postgres-backed
     /// Engines (or when the `sqlite` feature is off).
@@ -6970,6 +7217,374 @@ mod tests {
             .scrub_signature_pqc
             .as_deref()
             .is_some_and(|s| !s.is_empty()));
+    }
+
+    // ── #249 Cut C ── delegates_to / moderation emit ceremonies ───────
+    //
+    // v9.3.0 (CIRISPersist#249) — round-trips for the typed emit ceremonies
+    // over the #248 `emit_attestation` primitive. Each composes
+    // `emit_attestation` (no re-hand-roll), so the attester/scrub key is the
+    // signer's DERIVED key_id (#247 floor); we additionally assert the
+    // emitted edge is ADMISSIBLE by the reader gate it targets
+    // (`is_named_moderator` / `is_owner_bound` / the moderation `scores`
+    // gate) — proving the moderate-scope tokens match the duty walk.
+
+    /// A `user`-role `federation_keys` row keyed by `derived_key_id` but
+    /// carrying `pubkey_label`'s REAL deterministic hybrid pubkeys — so a
+    /// federation-tier row attested as `derived_key_id` and signed by
+    /// `pubkey_label`'s keys both FK-resolves AND hybrid-verifies, while the
+    /// `user` identity_type makes the key owner-bound (clause 1 of
+    /// `is_owner_bound`). The owner-bound-authority shape the §11.10
+    /// named-moderator walk requires at the root.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn user_test_key_derived_for(
+        derived_key_id: &str,
+        pubkey_label: &str,
+    ) -> crate::federation::SignedKeyRecord {
+        let mut signed = sweeper_test_key_derived_for(derived_key_id, pubkey_label);
+        signed.record.identity_type = crate::federation::types::identity_type::USER.into();
+        signed
+    }
+
+    /// Seed a `founder_only` community whose sole founder is
+    /// `founder_key_id` (already registered + owner-bound). The community's
+    /// own key is registered too (required by `community_authority_set`).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn seed_community_with_founder(
+        engine: &Engine,
+        community_id: &str,
+        founder_key_id: &str,
+    ) {
+        engine
+            .federation_directory()
+            .put_public_key(sweeper_test_key(community_id))
+            .await
+            .expect("seed community key");
+        engine
+            .federation_directory()
+            .put_community(crate::federation::SignedCommunity {
+                community: crate::federation::types::Community {
+                    community_key_id: community_id.into(),
+                    community_name: "cut-c-community".into(),
+                    members: vec![crate::federation::types::CommunityMember {
+                        key_id: founder_key_id.into(),
+                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        role: Some("founder".into()),
+                    }],
+                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
+                        .into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .expect("seed community");
+    }
+
+    /// #249 — `grant_delegation` stores a `delegates_to` row whose
+    /// attester/scrub == the signer's DERIVED key_id (#247 floor) and whose
+    /// `attested_key_id` is the delegate; the row is retrievable via
+    /// `list_attestations_by(derived)`.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn grant_delegation_stores_edge_under_derived_key_id_sqlite() {
+        use crate::federation::FederationDirectory;
+        let signer = crate::federation::tier_ingest::test_support::local_signer("granter");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "granter"))
+            .await
+            .expect("seed granter");
+        // The delegate must FK-resolve (attested_key_id).
+        sq.put_public_key(sweeper_test_key("delegate"))
+            .await
+            .expect("seed delegate");
+
+        let att_id = engine
+            .grant_delegation(
+                &signer,
+                "delegate",
+                vec!["message_io".into(), "review".into()],
+                true,
+            )
+            .await
+            .expect("grant_delegation");
+
+        let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            row.attestation_type,
+            crate::federation::types::attestation_type::DELEGATES_TO
+        );
+        assert_eq!(row.attesting_key_id, derived, "attester == derived (#247)");
+        assert_eq!(row.scrub_key_id, derived, "scrub == derived (#247)");
+        assert_eq!(row.attested_key_id, "delegate", "edge keyed by recipient");
+        // Stored + listable by the signer's derived id.
+        let by = sq.list_attestations_by(&derived).await.unwrap();
+        assert!(by.iter().any(|a| a.attestation_id == att_id));
+    }
+
+    /// #249 — `owner_bind` emits an `infra:*`-only `delegates_to` from an
+    /// owner-bound (user) signer to a node-ONLY key: it PASSES the CC
+    /// 4.4.3.4.3 node-agency gate (so it stores), and afterward
+    /// `is_owner_bound(node)` is true (the edge the reader walks).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn owner_bind_infra_only_passes_node_agency_and_owner_binds_sqlite() {
+        use crate::federation::admission::is_owner_bound;
+        use crate::federation::types::delegation_scope;
+        use crate::federation::FederationDirectory;
+        let signer = crate::federation::tier_ingest::test_support::local_signer("owner");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        // Owner is user-role (owner-bound) + verifies at the ingest gate.
+        sq.put_public_key(user_test_key_derived_for(&derived, "owner"))
+            .await
+            .expect("seed owner");
+        // The recipient is a NODE-ONLY key (the gate constrains it).
+        let mut node_key = sweeper_test_key("node-1");
+        node_key.record.identity_type = crate::federation::types::identity_type::NODE.into();
+        sq.put_public_key(node_key).await.expect("seed node");
+
+        // infra:*-only owner-binding → admissible on a node key.
+        let att_id = engine
+            .owner_bind(
+                &signer,
+                "node-1",
+                vec![
+                    delegation_scope::INFRA_NETWORK_PRESENCE.into(),
+                    delegation_scope::INFRA_SERVE.into(),
+                ],
+            )
+            .await
+            .expect("owner_bind infra:* admitted on node key");
+        let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        // Edge carries infra:* only (passed the node-agency gate).
+        let scope = row.attestation_envelope["scope"].as_array().unwrap();
+        assert!(
+            scope
+                .iter()
+                .all(|s| s.as_str().unwrap().starts_with("infra:")),
+            "owner_bind edge is infra:*-only"
+        );
+        // The node is now owner-bound (a live delegates_to(U → node), U user).
+        assert!(
+            is_owner_bound(&*sq, "node-1").await.unwrap(),
+            "node is owner-bound after owner_bind"
+        );
+
+        // Negative control: an agency:* scope on the SAME node key is REJECTED
+        // by the node-agency gate (so the moderate-scope tokens we add cannot
+        // be smuggled as agency onto a node).
+        let err = engine
+            .grant_delegation(
+                &signer,
+                "node-1",
+                vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_node_agency_forbidden");
+    }
+
+    /// #249 — the add_moderator ↔ is_named_moderator round-trip: an
+    /// owner-bound community founder appoints a moderator with the
+    /// `moderate` duty; `is_named_moderator(moderator, community, moderate)`
+    /// is true after — proving SCOPE_MODERATE matches the §11.10 duty walk.
+    /// Then `remove_moderator` revokes it and the authority no longer holds.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn add_then_remove_moderator_round_trip_sqlite() {
+        use crate::federation::admission::is_named_moderator;
+        use crate::federation::types::delegation_scope::SCOPE_MODERATE;
+        use crate::federation::FederationDirectory;
+        let signer = crate::federation::tier_ingest::test_support::local_signer("founder");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        // Founder: owner-bound (user) authority root of the community.
+        sq.put_public_key(user_test_key_derived_for(&derived, "founder"))
+            .await
+            .expect("seed founder");
+        sq.put_public_key(sweeper_test_key("moderator"))
+            .await
+            .expect("seed moderator");
+        seed_community_with_founder(&engine, "comm-1", &derived).await;
+
+        // Pre: not yet a moderator.
+        assert!(
+            !is_named_moderator(&*sq, "moderator", "comm-1", SCOPE_MODERATE)
+                .await
+                .unwrap(),
+            "not a moderator before appointment"
+        );
+
+        // Appoint.
+        let appt = engine
+            .add_moderator(&signer, "comm-1", "moderator", SCOPE_MODERATE)
+            .await
+            .expect("add_moderator");
+        assert!(
+            is_named_moderator(&*sq, "moderator", "comm-1", SCOPE_MODERATE)
+                .await
+                .unwrap(),
+            "is_named_moderator TRUE after add_moderator (SCOPE_MODERATE matches the duty walk)"
+        );
+
+        // Remove → the appointment edge is withdrawn; authority gone.
+        engine
+            .remove_moderator(&signer, "comm-1", &appt, "moderator", SCOPE_MODERATE)
+            .await
+            .expect("remove_moderator");
+        assert!(
+            !is_named_moderator(&*sq, "moderator", "comm-1", SCOPE_MODERATE)
+                .await
+                .unwrap(),
+            "is_named_moderator FALSE after remove_moderator (withdraws revokes the edge)"
+        );
+    }
+
+    /// #249 — `file_moderation` stores a `moderation:{allegation}` scores
+    /// row when the signer is a named moderator (community founder, as-self
+    /// duty-holder). Proves the §11.10 EMIT path is feature-free (no
+    /// `--features cirisnode`) and admitted by the always-present
+    /// `check_delegated_duty_scores_admission` gate.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn file_moderation_stores_moderation_scores_sqlite() {
+        use crate::federation::FederationDirectory;
+        let signer = crate::federation::tier_ingest::test_support::local_signer("founder");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(user_test_key_derived_for(&derived, "founder"))
+            .await
+            .expect("seed founder");
+        seed_community_with_founder(&engine, "comm-1", &derived).await;
+
+        // The founder IS a named moderator (community authority root,
+        // owner-bound) → as-self duty-holder → ADMIT.
+        let content_sha = "a".repeat(64);
+        let att_id = engine
+            .file_moderation(&signer, &content_sha, "comm-1", "moderate", "rogue_action")
+            .await
+            .expect("file_moderation admitted for a named moderator");
+        let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            row.attestation_type,
+            crate::federation::types::attestation_type::SCORES
+        );
+        assert_eq!(
+            row.attestation_envelope["dimension"], "moderation:rogue_action:v1",
+            "moderation:{{allegation}}:v1 dimension"
+        );
+        assert_eq!(row.attesting_key_id, derived, "attester == derived (#247)");
+    }
+
+    // ── PG twins ──────────────────────────────────────────────────────
+
+    /// #249 PG twin of the add_moderator ↔ is_named_moderator round-trip.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn add_then_remove_moderator_round_trip_postgres() {
+        use crate::federation::admission::is_named_moderator;
+        use crate::federation::types::delegation_scope::SCOPE_MODERATE;
+        use crate::federation::FederationDirectory;
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let label = format!("founder-{}", uuid::Uuid::new_v4().simple());
+        let signer = crate::federation::tier_ingest::test_support::local_signer(&label);
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), &dsn)
+            .await
+            .expect("pg engine");
+        let pg = engine.postgres_backend().expect("pg").clone();
+        let community = format!("comm-{}", uuid::Uuid::new_v4().simple());
+        let moderator = format!("mod-{}", uuid::Uuid::new_v4().simple());
+        pg.put_public_key(user_test_key_derived_for(&derived, &label))
+            .await
+            .expect("seed founder");
+        pg.put_public_key(sweeper_test_key(&moderator))
+            .await
+            .expect("seed moderator");
+        seed_community_with_founder(&engine, &community, &derived).await;
+
+        let appt = engine
+            .add_moderator(&signer, &community, &moderator, SCOPE_MODERATE)
+            .await
+            .expect("add_moderator");
+        assert!(
+            is_named_moderator(&*pg, &moderator, &community, SCOPE_MODERATE)
+                .await
+                .unwrap(),
+            "is_named_moderator TRUE after add_moderator (PG)"
+        );
+        engine
+            .remove_moderator(&signer, &community, &appt, &moderator, SCOPE_MODERATE)
+            .await
+            .expect("remove_moderator");
+        assert!(
+            !is_named_moderator(&*pg, &moderator, &community, SCOPE_MODERATE)
+                .await
+                .unwrap(),
+            "is_named_moderator FALSE after remove_moderator (PG)"
+        );
+    }
+
+    /// #249 PG twin — `file_moderation` stores the moderation scores row.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn file_moderation_stores_moderation_scores_postgres() {
+        use crate::federation::FederationDirectory;
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let label = format!("founder-{}", uuid::Uuid::new_v4().simple());
+        let signer = crate::federation::tier_ingest::test_support::local_signer(&label);
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), &dsn)
+            .await
+            .expect("pg engine");
+        let pg = engine.postgres_backend().expect("pg").clone();
+        let community = format!("comm-{}", uuid::Uuid::new_v4().simple());
+        pg.put_public_key(user_test_key_derived_for(&derived, &label))
+            .await
+            .expect("seed founder");
+        seed_community_with_founder(&engine, &community, &derived).await;
+
+        let content_sha = "b".repeat(64);
+        let att_id = engine
+            .file_moderation(
+                &signer,
+                &content_sha,
+                &community,
+                "moderate",
+                "rogue_action",
+            )
+            .await
+            .expect("file_moderation admitted (PG)");
+        let row = pg.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            row.attestation_envelope["dimension"],
+            "moderation:rogue_action:v1"
+        );
+        assert_eq!(row.attesting_key_id, derived);
     }
 
     // ── v5.4.0 (CIRISPersist#198, CEG 1.0 §5.6.8.8.2) LocalIdentityAggregate ──
