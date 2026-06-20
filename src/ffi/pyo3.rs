@@ -14883,6 +14883,343 @@ impl PyEngine {
         })
     }
 
+    // ── #249 Cut B ── CEG-native graph DX enumerators + community-roster
+    //    grow. Each mirrors an existing predicate/forward-walk as a reader.
+
+    /// #249 Cut B — the active member roster of `community_key_id`
+    /// (`members` MINUS effective membership revocations). Returns a JSON
+    /// array of [`crate::federation::CommunityMember`].
+    fn active_community_members_json(
+        &self,
+        py: Python<'_>,
+        community_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let community_key_id = community_key_id.to_owned();
+            py.detach(move || {
+                let rows: Vec<crate::federation::types::CommunityMember> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .active_community_members(&community_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .active_community_members(&community_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyValueError::new_err(format!("active community members serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// #249 Cut B — the active member roster of `family_key_id`. Returns a
+    /// JSON array of [`crate::federation::types::FamilyMember`].
+    fn active_family_members_json(&self, py: Python<'_>, family_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let family_key_id = family_key_id.to_owned();
+            py.detach(move || {
+                let rows: Vec<crate::federation::types::FamilyMember> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .active_family_members(&family_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .active_family_members(&family_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyValueError::new_err(format!("active family members serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// #249 Cut B — the FULL named-moderator set of `community_key_id` for
+    /// `duty` (`moderate` / `takedown` / `review`): owner-bound authority
+    /// roots ∪ their duty-scoped delegates. Returns a JSON array of key_ids.
+    fn moderators_of_json(
+        &self,
+        py: Python<'_>,
+        community_key_id: &str,
+        duty: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let community_key_id = community_key_id.to_owned();
+            let duty = duty.to_owned();
+            py.detach(move || {
+                let mods: Vec<String> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::moderators_of(
+                                &*backend,
+                                &community_key_id,
+                                &duty,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::moderators_of(
+                                &*backend,
+                                &community_key_id,
+                                &duty,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&mods)
+                    .map_err(|e| PyValueError::new_err(format!("moderators_of serialize: {e}")))
+            })
+        })
+    }
+
+    /// #249 Cut B — the `user`-role key(s) that owner-bind `key_id` (who
+    /// `key_id` is owner-bound TO). Returns a JSON array of key_ids; empty
+    /// when `key_id` is not owner-bound.
+    fn owner_bindings_of_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(move || {
+                let bindings: Vec<String> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::owner_bindings_of(&*backend, &key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::owner_bindings_of(&*backend, &key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&bindings)
+                    .map_err(|e| PyValueError::new_err(format!("owner_bindings_of serialize: {e}")))
+            })
+        })
+    }
+
+    /// #249 Cut B — the owner-binding PATH (`user → … → key_id`,
+    /// anchor-first) for audit — the chain, not just the endpoints. Returns
+    /// a JSON array of key_ids; empty when `key_id` is not owner-bound.
+    fn owner_binding_chain_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(move || {
+                let chain: Vec<String> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::owner_binding_chain(&*backend, &key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::owner_binding_chain(&*backend, &key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&chain).map_err(|e| {
+                    PyValueError::new_err(format!("owner_binding_chain serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// #249 Cut B — the general scoped-delegation reachability primitive:
+    /// does `issuer_key_id` reach `target_key_id` via a `delegates_to` chain
+    /// where every edge carries `scope` (⊆-attenuation + sub_delegation +
+    /// withdraws-aware + depth-capped, §11.10)? The primitive every
+    /// delegated-duty reader specializes.
+    fn reachable_under_scope(
+        &self,
+        py: Python<'_>,
+        issuer_key_id: &str,
+        target_key_id: &str,
+        scope: &str,
+        max_depth: usize,
+    ) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let issuer_key_id = issuer_key_id.to_owned();
+            let target_key_id = target_key_id.to_owned();
+            let scope = scope.to_owned();
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::admission::reachable_under_scope(
+                            &*backend,
+                            &issuer_key_id,
+                            &target_key_id,
+                            &scope,
+                            max_depth,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::admission::reachable_under_scope(
+                            &*backend,
+                            &issuer_key_id,
+                            &target_key_id,
+                            &scope,
+                            max_depth,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// #249 Cut B — the inbound `delegates_to` edges naming `key_id` as
+    /// recipient ("who delegated TO me?" — the reverse of
+    /// `delegates_to_graph`). Returns a JSON array of
+    /// [`crate::federation::Attestation`].
+    fn delegations_to_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(move || {
+                let rows: Vec<crate::federation::Attestation> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .delegations_to(&key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .delegations_to(&key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows)
+                    .map_err(|e| PyValueError::new_err(format!("delegations_to serialize: {e}")))
+            })
+        })
+    }
+
+    /// #249 Cut B — incrementally add one member to a community roster
+    /// (mirror of `add_family_member`). `member_json` is a
+    /// [`crate::federation::types::CommunityMember`]. Returns `true` on a
+    /// genuine add, `false` if the member was already on the roster
+    /// (idempotent).
+    fn add_community_member(
+        &self,
+        py: Python<'_>,
+        community_key_id: &str,
+        member_json: &str,
+    ) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let community_key_id = community_key_id.to_owned();
+            let member: crate::federation::types::CommunityMember =
+                serde_json::from_str(member_json)
+                    .map_err(|e| PyValueError::new_err(format!("CommunityMember decode: {e}")))?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .add_community_member(&community_key_id, member)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .add_community_member(&community_key_id, member)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     /// v2.7.0 (CIRISPersist#104) — Audit-lineage walk for a
     /// `trace_id`. Locates the `cirislens_audit_log` row whose
     /// `subject_id == trace_id`, then walks back to genesis on the

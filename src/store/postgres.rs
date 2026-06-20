@@ -2927,6 +2927,57 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(true)
     }
 
+    // ── #249 Cut B ── incremental community-roster grow (mirror of
+    //    add_family_member). Same read-modify-write under the
+    //    `WHERE persist_row_hash = $4` lost-update guard.
+    async fn add_community_member(
+        &self,
+        community_key_id: &str,
+        member: crate::federation::types::CommunityMember,
+    ) -> Result<bool, crate::federation::Error> {
+        let mut community = self
+            .lookup_community(community_key_id)
+            .await?
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "add_community_member names unknown community_key_id {community_key_id:?}"
+                ))
+            })?;
+        if community.members.iter().any(|m| m.key_id == member.key_id) {
+            return Ok(false); // already on the roster — no-op
+        }
+        let prior_hash = community.persist_row_hash.clone();
+        community.members.push(member);
+        community.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(&community)?;
+        let members_value = serde_json::to_value(&community.members)
+            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let affected = client
+            .execute(
+                "UPDATE cirislens.federation_communities \
+                    SET members = $2, persist_row_hash = $3 \
+                  WHERE community_key_id = $1 AND persist_row_hash = $4",
+                &[
+                    &community_key_id,
+                    &members_value,
+                    &community.persist_row_hash,
+                    &prior_hash,
+                ],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("add_community_member: {e}")))?;
+        if affected == 0 {
+            return Err(crate::federation::Error::Backend(format!(
+                "add_community_member on {community_key_id:?} lost a concurrent update (roster changed under the read); retry"
+            )));
+        }
+        Ok(true)
+    }
+
     async fn lookup_family(
         &self,
         family_key_id: &str,
@@ -27793,5 +27844,285 @@ mod tests {
             3
         );
         pg_truncate_scope_blobs(&backend).await;
+    }
+
+    // ── #249 Cut B — enumerators + add_community_member (PG parity).
+    //    One consolidated run-scoped test (serial on the postgres lock).
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_cut_b_graph_dx_enumerators_and_add_member() {
+        use crate::federation::admission::{DELEGATION_SCOPE_MODERATE, MEMBER_ROLE_FOUNDER};
+        use crate::federation::types::{delegation_scope as ds, identity_type};
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let s = uuid_like();
+        // Run-scoped key ids. All members are user-role (trivially
+        // owner-bound) so put_community passes the owner-binding gate.
+        let comm = format!("cb-comm-{s}");
+        let u0 = format!("cb-u0-{s}");
+        let u1 = format!("cb-u1-{s}");
+        let u2 = format!("cb-u2-{s}");
+        let founder = format!("cb-founder-{s}");
+        let deputy = format!("cb-deputy-{s}");
+        let outsider = format!("cb-outsider-{s}");
+        let node = format!("cb-node-{s}");
+        let dt_k = format!("cb-dtk-{s}");
+        let dt_g1 = format!("cb-dtg1-{s}");
+        let dt_g2 = format!("cb-dtg2-{s}");
+        for (kid, ity) in [
+            (&comm, identity_type::PRIMITIVE),
+            (&u0, identity_type::USER),
+            (&u1, identity_type::USER),
+            (&u2, identity_type::USER),
+            (&founder, identity_type::USER),
+            (&deputy, identity_type::PRIMITIVE),
+            (&outsider, identity_type::PRIMITIVE),
+            (&node, identity_type::NODE),
+            (&dt_k, identity_type::PRIMITIVE),
+            (&dt_g1, identity_type::PRIMITIVE),
+            (&dt_g2, identity_type::PRIMITIVE),
+        ] {
+            let mut k = fix_section_i_key(kid, "cb", now, true);
+            k.identity_type = ity.into();
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord { record: k })
+                .await
+                .unwrap();
+        }
+
+        // ── active_community_members + add_community_member ──
+        let member = |k: &str, role: Option<&str>| crate::federation::CommunityMember {
+            key_id: k.to_owned(),
+            joined_at: now,
+            role: role.map(str::to_owned),
+        };
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: crate::federation::Community {
+                    community_key_id: comm.clone(),
+                    community_name: "cb".into(),
+                    members: vec![member(&u0, None), member(&u1, None)],
+                    founded_at: now,
+                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
+                        .into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.active_community_members(&comm).await.unwrap().len(),
+            2
+        );
+        // add u2 → roster grows, reader sees it.
+        assert!(backend
+            .add_community_member(&comm, member(&u2, None))
+            .await
+            .unwrap());
+        assert_eq!(
+            backend.active_community_members(&comm).await.unwrap().len(),
+            3
+        );
+        // idempotent re-add.
+        assert!(!backend
+            .add_community_member(&comm, member(&u2, None))
+            .await
+            .unwrap());
+        assert_eq!(
+            backend
+                .lookup_community(&comm)
+                .await
+                .unwrap()
+                .unwrap()
+                .members
+                .len(),
+            3
+        );
+        // revoke u1 effective now → 2 active, full roster intact.
+        backend
+            .put_community_membership_revocation(
+                crate::federation::SignedCommunityMembershipRevocation {
+                    community_membership_revocation:
+                        crate::federation::CommunityMembershipRevocation {
+                            community_key_id: comm.clone(),
+                            removed_identity_key_id: u1.clone(),
+                            removed_at: now,
+                            effective_at: now,
+                            reason: None,
+                            witness_set: vec![],
+                            persist_row_hash: String::new(),
+                        },
+                },
+            )
+            .await
+            .unwrap();
+        let active = backend.active_community_members(&comm).await.unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(!active.iter().any(|m| m.key_id == u1));
+        assert_eq!(
+            backend
+                .lookup_community(&comm)
+                .await
+                .unwrap()
+                .unwrap()
+                .members
+                .len(),
+            3
+        );
+
+        // ── moderators_of ── founder-rooted community + moderate delegate.
+        let mod_comm = format!("cb-modcomm-{s}");
+        let mut mk = fix_section_i_key(&mod_comm, "cb", now, true);
+        mk.identity_type = identity_type::PRIMITIVE.into();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord { record: mk })
+            .await
+            .unwrap();
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: crate::federation::Community {
+                    community_key_id: mod_comm.clone(),
+                    community_name: "mods".into(),
+                    members: vec![member(&founder, Some(MEMBER_ROLE_FOUNDER))],
+                    founded_at: now,
+                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
+                        .into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_delegates_to(
+                    &founder,
+                    &deputy,
+                    serde_json::json!([DELEGATION_SCOPE_MODERATE]),
+                    false,
+                ),
+            })
+            .await
+            .unwrap();
+        let mods = crate::federation::admission::moderators_of(
+            &backend,
+            &mod_comm,
+            DELEGATION_SCOPE_MODERATE,
+        )
+        .await
+        .unwrap();
+        assert!(mods.contains(&founder));
+        assert!(mods.contains(&deputy));
+        assert!(!mods.contains(&outsider));
+
+        // ── owner_bindings_of ── unbound node → empty; live infra
+        //    delegation → [owner=founder].
+        assert!(
+            crate::federation::admission::owner_bindings_of(&backend, &node)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_delegates_to(
+                    &founder,
+                    &node,
+                    serde_json::json!([ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE]),
+                    false,
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::federation::admission::owner_bindings_of(&backend, &node)
+                .await
+                .unwrap(),
+            vec![founder.clone()]
+        );
+
+        // ── owner_binding_chain ── the audit PATH. founder (user) → [self];
+        //    node (via the live infra delegation above) → [founder, node].
+        assert_eq!(
+            crate::federation::admission::owner_binding_chain(&backend, &founder)
+                .await
+                .unwrap(),
+            vec![founder.clone()]
+        );
+        assert_eq!(
+            crate::federation::admission::owner_binding_chain(&backend, &node)
+                .await
+                .unwrap(),
+            vec![founder.clone(), node.clone()]
+        );
+
+        // ── reachable_under_scope ── the founder→deputy `moderate` edge
+        //    (from the moderators_of section above) is reachable under
+        //    moderate, NOT under review (scope-isolation), and the outsider
+        //    is unreachable.
+        let depth = crate::federation::admission::MAX_MODERATION_DELEGATION_DEPTH;
+        assert!(crate::federation::admission::reachable_under_scope(
+            &backend,
+            &founder,
+            &deputy,
+            DELEGATION_SCOPE_MODERATE,
+            depth
+        )
+        .await
+        .unwrap());
+        assert!(!crate::federation::admission::reachable_under_scope(
+            &backend,
+            &founder,
+            &deputy,
+            crate::federation::admission::DELEGATION_SCOPE_REVIEW,
+            depth
+        )
+        .await
+        .unwrap());
+        assert!(!crate::federation::admission::reachable_under_scope(
+            &backend,
+            &founder,
+            &outsider,
+            DELEGATION_SCOPE_MODERATE,
+            depth
+        )
+        .await
+        .unwrap());
+
+        // ── delegations_to ── dt_k with 2 inbound delegates_to; scores
+        //    inbound excluded.
+        assert!(backend.delegations_to(&dt_k).await.unwrap().is_empty());
+        for g in [&dt_g1, &dt_g2] {
+            backend
+                .put_attestation(crate::federation::SignedAttestation {
+                    attestation: pg_delegates_to(g, &dt_k, serde_json::json!(["share"]), false),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_scores_attestation(&dt_g1, &dt_k, &dt_g1, "identity_binding:v1"),
+            })
+            .await
+            .unwrap();
+        let inbound = backend.delegations_to(&dt_k).await.unwrap();
+        assert_eq!(inbound.len(), 2);
+        assert!(inbound.iter().all(
+            |a| a.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
+        ));
+        let granters: std::collections::HashSet<&str> = inbound
+            .iter()
+            .map(|a| a.attesting_key_id.as_str())
+            .collect();
+        assert!(granters.contains(dt_g1.as_str()) && granters.contains(dt_g2.as_str()));
     }
 }

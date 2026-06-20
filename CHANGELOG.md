@@ -20,6 +20,18 @@ First cut of the **#249** CEG-native graph DX umbrella (the typed-attestation-gr
 - **FFI:** `PyEngine.emit_attestation(input_json) -> attestation_id` (uses the engine's configured local signer, mirroring `attestation_promote`'s engine reconstruction; raises `PyValueError` on JSON decode / missing-PQC-signer / backend error). In a clearly-labeled `#247 + #248 CEG-DX foundation` FFI section so later #249 cuts minimize merge surface.
 - **Backend + FFI parity** (the fix + emit are backend-agnostic — `emit_attestation` composes `put_attestation`, which all backends implement; verified on sqlite + live Postgres). Test fixtures across the blob / eviction / takedown / self-at-login surface were updated to the **real-node shape** (register the `federation_keys` row under the derived id) — the assumption #247 exists to kill.
 
+### Added — Cut A (FFI-expose existing graph readers) + Cut B (enumerators + add_community_member)
+
+- **Cut A — FFI exposure (#249).** Thin pyo3 wrappers over existing pub Rust readers (zero new Rust logic), unblocking the KMP/Python UI (ex-#104 `PERSIST_DELEGATES_TO`): `lookup_community_json`, `list_communities_for_member_json`, `list_{families,communities}_for_member_active_json` (the revocation-folded variants), `list_{family,community}_membership_revocations_for_json`, `is_named_moderator_json`, `is_owner_bound_json`, `duty_holders_for_community_json`, `duty_holders_for_content_json` (4-arg: `content_sha256, community_id, duty`).
+- **Cut B — read-side enumerators + incremental roster grow (#249).** The enumeration companions of existing predicates / forward-only walks:
+  - **`active_community_members` / `active_family_members`** — roster MINUS effective (`effective_at <= now`) revocations; the subtraction is **factored** into one shared `federation::removed_key_ids_at` that `community_dek::resolve_community_members` now also composes (not forked).
+  - **`admission::reachable_under_scope(issuer, target, scope, max_depth)`** — the **general scoped-delegation reachability primitive** (the by-construction load-bearing walk every delegated-duty reader specializes); a **thin `pub` wrapper** over the previously-private `issuer_reaches_target_via_scoped_delegation` with **zero change** to the ⊆-attenuation / `sub_delegation`-gated / `withdraws`-aware / depth-cap semantics.
+  - **`admission::moderators_of(community, duty)`** — full named-moderator set (owner-bound roots ∪ live `duty`-scoped delegated reach); `k ∈ moderators_of ⟺ is_named_moderator(k)`.
+  - **`admission::owner_bindings_of(key)`** (the user anchors) + **`owner_binding_chain(key)`** (the audit path) — enumerators over the `is_owner_bound` predicate.
+  - **`delegations_to(key)`** — inbound `delegates_to` edges ("who delegated TO me"), reverse of the forward-only delegation graph.
+  - **`add_community_member(community, member)`** — incremental roster grow (mirror of `add_family_member`; idempotent), vs whole-re-put `put_community`.
+  - 3-backend parity (pg/sqlite/memory) + FFI for each + thin `Engine` wrappers.
+
 ## [9.2.2] — 2026-06-20
 
 ### Changed — re-pin CIRISVerify v6.5.0 → v6.6.0 (wheel concurrence)
