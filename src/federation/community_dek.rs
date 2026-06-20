@@ -240,17 +240,20 @@ pub mod orchestrate {
 
         // Active membership = roster minus effective revocations (the
         // CC 4.4.3.2.2 forward-secrecy read: a removed member is dropped
-        // from the wrap fan-out BEFORE we wrap).
+        // from the wrap fan-out BEFORE we wrap). The roster-minus-effective-
+        // revocations subtraction is the shared #249 Cut B
+        // [`removed_key_ids_at`](crate::federation::removed_key_ids_at) fold —
+        // the SAME rule the `active_*_members` group-roster readers compose,
+        // so the forward-secrecy subtraction is never forked.
         let revs = backend
             .list_community_membership_revocations_for(community_key_id)
             .await
             .map_err(map_dir_err)?;
-        let now = chrono::Utc::now();
-        let removed: std::collections::HashSet<&str> = revs
-            .iter()
-            .filter(|r| r.effective_at <= now)
-            .map(|r| r.removed_identity_key_id.as_str())
-            .collect();
+        let removed = crate::federation::removed_key_ids_at(
+            revs.iter()
+                .map(|r| (r.removed_identity_key_id.as_str(), r.effective_at)),
+            chrono::Utc::now(),
+        );
 
         let mut out = Vec::new();
         for member in &community.members {

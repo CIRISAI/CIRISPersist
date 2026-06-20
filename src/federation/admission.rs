@@ -1459,6 +1459,153 @@ async fn issuer_reaches_target_via_scoped_delegation(
     Ok(false)
 }
 
+/// #249 Cut B — the **public** scoped-delegation reachability primitive
+/// (CIRISPersist#249, the by-construction "#13 `reachable_under_scope`"
+/// load-bearing walk). Does `issuer_key_id` reach `target_key_id` via a
+/// `delegates_to` chain where **every edge carries `scope`** under the
+/// §11.10 [`MODERATION_DUTY`] walk policy: `⊆`-parent attenuation +
+/// `sub_delegation`-gated deputization past depth 1 + per-edge
+/// `withdraws`/`recants` revocation + depth cap (`max_depth`, itself
+/// clamped to [`MAX_WITHDRAWS_DELEGATION_DEPTH`]).
+///
+/// This is the general primitive every delegated-duty reader specializes:
+/// [`moderators_of`] / [`is_named_moderator`] root it at a community
+/// authority set, [`owner_bindings_of`] / [`owner_binding_chain`] read the
+/// human anchor, and `duty_holders_*` compose it per target. It is a thin
+/// `pub` wrapper over the private predicate walk
+/// [`issuer_reaches_target_via_scoped_delegation`] with a singleton target
+/// set and the `MODERATION_DUTY` policy — **no change** to the
+/// attenuation/depth/withdraws semantics. A zero-hop `issuer == target` is
+/// NOT a reach (no edge carries the scope to the self); callers wanting the
+/// reflexive case test it separately (as `is_named_moderator` does for the
+/// authority root).
+///
+/// [`MODERATION_DUTY`]: DelegationWalkPolicy::MODERATION_DUTY
+pub async fn reachable_under_scope(
+    directory: &dyn super::FederationDirectory,
+    issuer_key_id: &str,
+    target_key_id: &str,
+    scope: &str,
+    max_depth: usize,
+) -> Result<bool, Error> {
+    let target: std::collections::HashSet<String> =
+        std::iter::once(target_key_id.to_owned()).collect();
+    issuer_reaches_target_via_scoped_delegation(
+        directory,
+        issuer_key_id,
+        &target,
+        scope,
+        max_depth,
+        DelegationWalkPolicy::MODERATION_DUTY,
+    )
+    .await
+}
+
+/// #249 Cut B — the **enumeration** companion of
+/// [`issuer_reaches_target_via_scoped_delegation`]. Where the predicate
+/// answers "does `issuer` reach SOME target?", this collects EVERY key
+/// `issuer` reaches via a `delegates_to` chain whose every edge carries
+/// `scope_token`, under the same [`DelegationWalkPolicy`] (attenuation +
+/// `sub_delegation`-gated deputization + withdrawn-edge skipping + depth
+/// cap). The returned set EXCLUDES `issuer` itself (the caller adds the
+/// owner-bound roots separately) — it is exactly the set of delegates the
+/// `issuer` root empowers under `scope_token`.
+///
+/// Identical BFS to the predicate (same edge filters, same per-node
+/// `parent_scope` / `parent_sub_delegation` walk state), so the two never
+/// diverge on reachability — this one simply records the visited recipients
+/// instead of short-circuiting on a target match.
+async fn enumerate_scoped_delegation_reach(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+    scope_token: &str,
+    max_depth: usize,
+    policy: DelegationWalkPolicy,
+) -> Result<std::collections::HashSet<String>, Error> {
+    use std::collections::{HashSet, VecDeque};
+    let effective_depth = max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH);
+    let mut reached: HashSet<String> = HashSet::new();
+    if effective_depth == 0 {
+        return Ok(reached);
+    }
+    struct Node {
+        key: String,
+        depth: usize,
+        parent_scope: Option<HashSet<String>>,
+        parent_sub_delegation: bool,
+    }
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<Node> = VecDeque::new();
+    queue.push_back(Node {
+        key: issuer.to_owned(),
+        depth: 0,
+        parent_scope: None,
+        parent_sub_delegation: false,
+    });
+    visited.insert(issuer.to_owned());
+
+    while let Some(node) = queue.pop_front() {
+        if node.depth >= effective_depth {
+            continue;
+        }
+        // §11.10 deputization gate (identical to the predicate walk): a
+        // non-root granter may only further-delegate if its incoming edge
+        // granted `sub_delegation`.
+        if policy.enforce_attenuation_and_sub_delegation
+            && node.parent_scope.is_some()
+            && !node.parent_sub_delegation
+        {
+            continue;
+        }
+        let rows = directory.list_attestations_by(&node.key).await?;
+        let mut retracted: HashSet<String> = HashSet::new();
+        if policy.skip_withdrawn_edges {
+            for r in &rows {
+                if r.attestation_type == attestation_type::WITHDRAWS
+                    || r.attestation_type == attestation_type::RECANTS
+                {
+                    retracted.insert(r.attested_key_id.clone());
+                }
+            }
+        }
+        for r in rows {
+            if r.attestation_type != attestation_type::DELEGATES_TO {
+                continue;
+            }
+            if !delegation_scope_grants(&r.attestation_envelope, scope_token) {
+                continue;
+            }
+            if policy.skip_withdrawn_edges && retracted.contains(&r.attested_key_id) {
+                continue;
+            }
+            if policy.enforce_attenuation_and_sub_delegation {
+                if let Some(parent_scope) = &node.parent_scope {
+                    let child_scope = delegation_scope_set(&r.attestation_envelope);
+                    if !child_scope.is_subset(parent_scope) {
+                        continue;
+                    }
+                }
+            }
+            // Record the reached recipient. The cycle guard (`visited`)
+            // ensures we never enqueue a key twice; `reached` accumulates
+            // every recipient regardless of further traversal.
+            reached.insert(r.attested_key_id.clone());
+            if !visited.contains(&r.attested_key_id) && node.depth + 1 < effective_depth {
+                visited.insert(r.attested_key_id.clone());
+                queue.push_back(Node {
+                    key: r.attested_key_id,
+                    depth: node.depth + 1,
+                    parent_scope: Some(delegation_scope_set(&r.attestation_envelope)),
+                    parent_sub_delegation: delegation_grants_sub_delegation(
+                        &r.attestation_envelope,
+                    ),
+                });
+            }
+        }
+    }
+    Ok(reached)
+}
+
 /// v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3 / §8.1.11.2) — the
 /// broadened `withdraws` admission gate. Resolves WHICH of the four
 /// admission rules (if any) authorizes `issuer` to withdraw target
@@ -1825,6 +1972,154 @@ pub async fn is_owner_bound(
     Ok(false)
 }
 
+/// #249 Cut B — the **enumeration** of [`is_owner_bound`]: the `user`-role
+/// key(s) that owner-bind `k` (who `k` is owner-bound TO). Collects every
+/// human anchor across the same three clauses the predicate tests:
+///
+///   1. `k`'s OWN key is `user`-role → `k` owner-binds itself (`k` is in the
+///      set); AND/OR
+///   2. `k` is an occurrence of a `user`-role identity → that identity key;
+///      AND/OR
+///   3. each granter `U` of a **live** `delegates_to(U → k)` with `U`
+///      `user`-role (live = not `withdraws`/`recants`-retracted against `k`
+///      by `U`, and not expired) → `U`.
+///
+/// Consistency: `is_owner_bound(k)` ⟺ `!owner_bindings_of(k).is_empty()` —
+/// the predicate returns true iff ANY clause holds, and this returns the
+/// union of all satisfying anchors (deduped, sorted). An unbound `k` yields
+/// the empty set.
+pub async fn owner_bindings_of(
+    directory: &dyn super::FederationDirectory,
+    k: &str,
+) -> Result<Vec<String>, Error> {
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // (1) k's own key is user-role.
+    if let Some(rec) = directory.lookup_public_key(k).await? {
+        if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
+            out.insert(k.to_owned());
+        }
+    }
+    // (2) k is an occurrence of a user-role identity.
+    if let Some(occ) = directory.lookup_identity_for_occurrence(k).await? {
+        if let Some(id_rec) = directory.lookup_public_key(&occ.identity_key_id).await? {
+            if identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
+                out.insert(occ.identity_key_id);
+            }
+        }
+    }
+    // (3) each granter U of a LIVE delegates_to(U → k) with U user-role.
+    let now = chrono::Utc::now();
+    for r in directory.list_attestations_for(k).await? {
+        if r.attestation_type != attestation_type::DELEGATES_TO {
+            continue;
+        }
+        if let Some(exp) = r.expires_at {
+            if exp <= now {
+                continue;
+            }
+        }
+        let Some(granter) = directory.lookup_public_key(&r.attesting_key_id).await? else {
+            continue;
+        };
+        if !identity_type::set_contains(&granter.identity_type, identity_type::USER) {
+            continue;
+        }
+        let granter_retracted_k = directory
+            .list_attestations_by(&r.attesting_key_id)
+            .await?
+            .into_iter()
+            .any(|g| {
+                (g.attestation_type == attestation_type::WITHDRAWS
+                    || g.attestation_type == attestation_type::RECANTS)
+                    && g.attested_key_id == k
+            });
+        if granter_retracted_k {
+            continue;
+        }
+        out.insert(r.attesting_key_id);
+    }
+    let mut out: Vec<String> = out.into_iter().collect();
+    out.sort();
+    Ok(out)
+}
+
+/// #249 Cut B — the owner-binding **PATH** for audit: the actual delegation
+/// chain `user → … → key_id` that owner-binds `key_id`, anchor-first (the
+/// human `user`-role key at index 0, `key_id` last). Where
+/// [`owner_bindings_of`] returns just the human ENDPOINTS, this returns the
+/// resolving path so a consumer can show WHY a key is owner-bound.
+///
+/// Resolves the FIRST satisfying clause in [`is_owner_bound`]'s precedence
+/// order (so `!owner_binding_chain(k).is_empty()` ⟺ `is_owner_bound(k)`):
+///   1. `k` is itself `user`-role → `[k]` (the key IS the human anchor).
+///   2. `k` is an occurrence of a `user`-role identity → `[identity, k]`.
+///   3. a **live** `delegates_to(U → k)` with `U` `user`-role (not
+///      `withdraws`/`recants`-retracted against `k`, not expired) →
+///      `[U, k]`. The §11.10 owner-binding clause (3) is a DIRECT incoming
+///      edge (same as the predicate), so the delegated path is one hop; a
+///      multi-hop human→…→k owner-binding is not part of the predicate and
+///      is not synthesized here.
+///
+/// Returns the empty vec when `k` is not owner-bound (fail-closed, mirrors
+/// the predicate).
+pub async fn owner_binding_chain(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+) -> Result<Vec<String>, Error> {
+    // (1) k's own key is user-role — k is the anchor.
+    if let Some(rec) = directory.lookup_public_key(key_id).await? {
+        if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
+            return Ok(vec![key_id.to_owned()]);
+        }
+    }
+    // (2) k is an occurrence of a user-role identity — identity → k.
+    if let Some(occ) = directory.lookup_identity_for_occurrence(key_id).await? {
+        if let Some(id_rec) = directory.lookup_public_key(&occ.identity_key_id).await? {
+            if identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
+                return Ok(vec![occ.identity_key_id, key_id.to_owned()]);
+            }
+        }
+    }
+    // (3) a LIVE delegates_to(U → k) with U user-role — U → k. Lowest
+    //     granter key_id first for a deterministic path when several humans
+    //     delegate to k (consistent with the sorted `owner_bindings_of`).
+    let now = chrono::Utc::now();
+    let mut anchors: Vec<String> = Vec::new();
+    for r in directory.list_attestations_for(key_id).await? {
+        if r.attestation_type != attestation_type::DELEGATES_TO {
+            continue;
+        }
+        if let Some(exp) = r.expires_at {
+            if exp <= now {
+                continue;
+            }
+        }
+        let Some(granter) = directory.lookup_public_key(&r.attesting_key_id).await? else {
+            continue;
+        };
+        if !identity_type::set_contains(&granter.identity_type, identity_type::USER) {
+            continue;
+        }
+        let granter_retracted_k = directory
+            .list_attestations_by(&r.attesting_key_id)
+            .await?
+            .into_iter()
+            .any(|g| {
+                (g.attestation_type == attestation_type::WITHDRAWS
+                    || g.attestation_type == attestation_type::RECANTS)
+                    && g.attested_key_id == key_id
+            });
+        if granter_retracted_k {
+            continue;
+        }
+        anchors.push(r.attesting_key_id);
+    }
+    if let Some(anchor) = anchors.into_iter().min() {
+        return Ok(vec![anchor, key_id.to_owned()]);
+    }
+    Ok(Vec::new())
+}
+
 /// v9.0.0 SecReview F2 (CC 3.2 / CC 4.4.3.2.1) — is `community` an
 /// **authorized** infrastructure community whose carve-outs (owner-binding
 /// exemption + Commons-plaintext opt-out) may be honored?
@@ -2005,6 +2300,55 @@ pub async fn is_named_moderator(
         }
     }
     Ok(false)
+}
+
+/// #249 Cut B — the **enumeration** of [`is_named_moderator`]: the FULL
+/// named-moderator set of community `community_id` for `duty` — the
+/// owner-bound authority roots ∪ every delegate they reach via a live
+/// `duty`-scoped `delegates_to` chain (the same [`MODERATION_DUTY`] walk
+/// `is_named_moderator` probes, but accumulated instead of target-tested).
+///
+/// For each root in the community authority set
+/// ([`community_authority_set`]) that [`is_owner_bound`], the root itself is
+/// a named moderator (zero-hop founder) AND every key it reaches under the
+/// §11.10 scoped walk
+/// ([`enumerate_scoped_delegation_reach`]) is one too. Returns the deduped
+/// key_id set (sorted for a deterministic surface). Consistency with the
+/// predicate: `is_named_moderator(k, …)` ⟺ `k ∈ moderators_of(…)`, because
+/// both compose the SAME authority set, the SAME owner-binding gate, and the
+/// SAME scoped-reach walk.
+///
+/// Fail-closed: an unknown community / no owner-bound authority yields the
+/// empty set (no named moderators), never an error.
+pub async fn moderators_of(
+    directory: &dyn super::FederationDirectory,
+    community_id: &str,
+    duty: &str,
+) -> Result<Vec<String>, Error> {
+    let authority = community_authority_set(directory, community_id).await?;
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for root in authority {
+        // Owner-binding of the root is REQUIRED (§11.11 → §5.6.8.10) — a
+        // non-owner-bound authority roots no moderation duty.
+        if !is_owner_bound(directory, &root).await? {
+            continue;
+        }
+        // Zero-hop: the owner-bound authority IS a named moderator.
+        // Then every delegate it reaches under the duty-scoped walk.
+        let reach = enumerate_scoped_delegation_reach(
+            directory,
+            &root,
+            duty,
+            MAX_MODERATION_DELEGATION_DEPTH,
+            DelegationWalkPolicy::MODERATION_DUTY,
+        )
+        .await?;
+        out.insert(root);
+        out.extend(reach);
+    }
+    let mut out: Vec<String> = out.into_iter().collect();
+    out.sort();
+    Ok(out)
 }
 
 /// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §11.11) — the **authority set**

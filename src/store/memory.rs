@@ -1610,6 +1610,30 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(state.federation_families.get(family_key_id).cloned())
     }
 
+    // ── #249 Cut B ── incremental community-roster grow (mirror of
+    //    add_family_member).
+    async fn add_community_member(
+        &self,
+        community_key_id: &str,
+        member: crate::federation::types::CommunityMember,
+    ) -> Result<bool, crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        let community = state
+            .federation_communities
+            .get_mut(community_key_id)
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "add_community_member names unknown community_key_id {community_key_id:?}"
+                ))
+            })?;
+        if community.members.iter().any(|m| m.key_id == member.key_id) {
+            return Ok(false); // already on the roster — no-op
+        }
+        community.members.push(member);
+        community.persist_row_hash = crate::federation::types::compute_persist_row_hash(community)?;
+        Ok(true)
+    }
+
     async fn list_families_for_member(
         &self,
         member_identity_key_id: &str,
@@ -7740,5 +7764,523 @@ mod tests {
         let deleted = backend.evict_scope_blobs(10).unwrap();
         assert_eq!(deleted, 0, "no eviction when under capacity");
         assert_eq!(backend.list_scope_blob_symbols(record_id).unwrap().len(), 3);
+    }
+
+    // ── #249 Cut B — CEG-native graph DX enumerators + add_community_member.
+
+    /// Register `n` user-role keys `pfx-0..pfx-(n-1)` (trivially owner-bound,
+    /// so a community of them passes the owner-binding gate).
+    async fn seed_user_keys(backend: &MemoryBackend, pfx: &str, n: usize) -> Vec<String> {
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let id = format!("{pfx}-{i}");
+            let mut k = fix_key(&id, "user", &id);
+            k.identity_type = crate::federation::types::identity_type::USER.into();
+            backend
+                .put_public_key(SignedKeyRecord { record: k })
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// active_community_members: roster of N, revoke 1 (effective now) →
+    /// N−1; the removed member is gone, the rest remain.
+    #[tokio::test]
+    async fn active_community_members_subtracts_effective_revocation() {
+        let backend = MemoryBackend::new();
+        let ids = seed_user_keys(&backend, "acm", 3).await;
+        put_community_with(
+            &backend,
+            "acm-comm",
+            ids.iter().map(|i| member(i)).collect(),
+            None,
+        )
+        .await
+        .unwrap();
+        // Full roster active before any revocation.
+        let all = backend.active_community_members("acm-comm").await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Revoke acm-1 effective now → N−1.
+        backend
+            .put_community_membership_revocation(
+                crate::federation::SignedCommunityMembershipRevocation {
+                    community_membership_revocation:
+                        crate::federation::CommunityMembershipRevocation {
+                            community_key_id: "acm-comm".into(),
+                            removed_identity_key_id: "acm-1".into(),
+                            removed_at: chrono::Utc::now(),
+                            effective_at: chrono::Utc::now(),
+                            reason: None,
+                            witness_set: vec![],
+                            persist_row_hash: String::new(),
+                        },
+                },
+            )
+            .await
+            .unwrap();
+        let active = backend.active_community_members("acm-comm").await.unwrap();
+        let keys: std::collections::HashSet<&str> =
+            active.iter().map(|m| m.key_id.as_str()).collect();
+        assert_eq!(active.len(), 2, "one effective revocation drops one member");
+        assert!(!keys.contains("acm-1"));
+        assert!(keys.contains("acm-0") && keys.contains("acm-2"));
+        // lookup_community still carries the FULL roster (revocation is the
+        // composed-against append-only table, not a roster mutation).
+        assert_eq!(
+            backend
+                .lookup_community("acm-comm")
+                .await
+                .unwrap()
+                .unwrap()
+                .members
+                .len(),
+            3
+        );
+    }
+
+    /// active_family_members: a FUTURE-DATED revocation does NOT drop its
+    /// subject (family revocations may be future-dated; the member is active
+    /// until effective_at arrives). Exercises the SAME `removed_key_ids_at`
+    /// fold the community reader uses (community future-dating is rejected at
+    /// write time — SecReview F4 — so the future-dated path is covered here).
+    #[tokio::test]
+    async fn active_family_members_future_revocation_keeps_member() {
+        let backend = family_backend("afm-fam", "afm-carol").await;
+        // Effective revocation of a NON-member key is a no-op; here we
+        // future-date a revocation of the real member and assert it stays.
+        let future = chrono::Utc::now() + chrono::Duration::days(30);
+        backend
+            .put_family_membership_revocation(SignedFamilyMembershipRevocation {
+                family_membership_revocation: FamilyMembershipRevocation {
+                    family_key_id: "afm-fam".into(),
+                    removed_identity_key_id: "afm-carol".into(),
+                    removed_at: chrono::Utc::now(),
+                    effective_at: future,
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+        let active = backend.active_family_members("afm-fam").await.unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "future-dated revocation leaves the member active"
+        );
+        assert_eq!(active[0].key_id, "afm-carol");
+
+        // Now an effective (now) revocation DOES drop it → empty roster.
+        backend
+            .put_family_membership_revocation(SignedFamilyMembershipRevocation {
+                family_membership_revocation: FamilyMembershipRevocation {
+                    family_key_id: "afm-fam".into(),
+                    removed_identity_key_id: "afm-carol".into(),
+                    removed_at: chrono::Utc::now(),
+                    effective_at: chrono::Utc::now(),
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+        let active = backend.active_family_members("afm-fam").await.unwrap();
+        assert!(active.is_empty(), "effective revocation drops the member");
+    }
+
+    /// add_community_member: add → appears in lookup + active reader; re-add
+    /// same key → idempotent (no dup, returns false).
+    #[tokio::test]
+    async fn add_community_member_grows_roster_idempotent() {
+        let backend = MemoryBackend::new();
+        let ids = seed_user_keys(&backend, "addc", 3).await;
+        put_community_with(&backend, "addc-comm", vec![member(&ids[0])], None)
+            .await
+            .unwrap();
+        // Genuine add → true, appears in both lookup + active reader.
+        assert!(backend
+            .add_community_member("addc-comm", member("addc-1"))
+            .await
+            .unwrap());
+        let active = backend.active_community_members("addc-comm").await.unwrap();
+        let keys: std::collections::HashSet<&str> =
+            active.iter().map(|m| m.key_id.as_str()).collect();
+        assert!(keys.contains("addc-0") && keys.contains("addc-1"));
+        assert!(backend
+            .lookup_community("addc-comm")
+            .await
+            .unwrap()
+            .unwrap()
+            .members
+            .iter()
+            .any(|m| m.key_id == "addc-1"));
+        // Re-add same key → idempotent no-op (false), no duplicate.
+        assert!(!backend
+            .add_community_member("addc-comm", member("addc-1"))
+            .await
+            .unwrap());
+        assert_eq!(
+            backend
+                .lookup_community("addc-comm")
+                .await
+                .unwrap()
+                .unwrap()
+                .members
+                .iter()
+                .filter(|m| m.key_id == "addc-1")
+                .count(),
+            1,
+            "no duplicate member row on re-add"
+        );
+        // Unknown community → InvalidArgument.
+        assert!(matches!(
+            backend
+                .add_community_member("no-such-comm", member("addc-2"))
+                .await
+                .unwrap_err(),
+            crate::federation::Error::UnownedCommunityMember { .. }
+                | crate::federation::Error::InvalidArgument(_)
+        ));
+    }
+
+    /// moderators_of: a community with a founder (authority root) + a
+    /// `delegates_to(moderate)` chain founder → deputy → returns the full
+    /// set {founder, deputy}; a non-moderator key is excluded.
+    #[tokio::test]
+    async fn moderators_of_enumerates_roots_and_delegates() {
+        use crate::federation::admission::DELEGATION_SCOPE_MODERATE;
+        let backend = MemoryBackend::new();
+        // founder is a user-role key (owner-bound + authority root).
+        let mut founder = fix_key("mod-founder", "user", "mod-founder");
+        founder.identity_type = crate::federation::types::identity_type::USER.into();
+        backend
+            .put_public_key(SignedKeyRecord { record: founder })
+            .await
+            .unwrap();
+        for k in ["mod-deputy", "mod-outsider", "mod-comm"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        // Community whose authority root is the founder.
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: crate::federation::types::Community {
+                    community_key_id: "mod-comm".into(),
+                    community_name: "mods".into(),
+                    members: vec![crate::federation::types::CommunityMember {
+                        key_id: "mod-founder".into(),
+                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
+                    }],
+                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
+                        .into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+        // founder delegates `moderate` to deputy.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "mod-d",
+                    "mod-founder",
+                    "mod-deputy",
+                    serde_json::json!([DELEGATION_SCOPE_MODERATE]),
+                ),
+            })
+            .await
+            .unwrap();
+        let mods = crate::federation::admission::moderators_of(
+            &backend,
+            "mod-comm",
+            DELEGATION_SCOPE_MODERATE,
+        )
+        .await
+        .unwrap();
+        let set: std::collections::HashSet<&str> = mods.iter().map(|s| s.as_str()).collect();
+        assert!(set.contains("mod-founder"), "authority root is a moderator");
+        assert!(
+            set.contains("mod-deputy"),
+            "duty-scoped delegate is a moderator"
+        );
+        assert!(!set.contains("mod-outsider"), "non-delegate excluded");
+        // Consistency with the predicate: every enumerated key is a named
+        // moderator; the outsider is not.
+        for m in &mods {
+            assert!(crate::federation::admission::is_named_moderator(
+                &backend,
+                m,
+                "mod-comm",
+                DELEGATION_SCOPE_MODERATE
+            )
+            .await
+            .unwrap());
+        }
+        assert!(!crate::federation::admission::is_named_moderator(
+            &backend,
+            "mod-outsider",
+            "mod-comm",
+            DELEGATION_SCOPE_MODERATE
+        )
+        .await
+        .unwrap());
+    }
+
+    /// owner_bindings_of: an owner-bound node (live `delegates_to(user →
+    /// node, infra:*)`) → returns the binding user; an unbound node → empty.
+    #[tokio::test]
+    async fn owner_bindings_of_returns_user_anchors() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await; // ob-owner (user), ob-node (node), ob-agent
+                                      // Unbound node → empty.
+        assert!(
+            crate::federation::admission::owner_bindings_of(&backend, "ob-node")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Live delegates_to(user → node, infra:*) → owner-bound to ob-owner.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "ob-bind",
+                    "ob-owner",
+                    "ob-node",
+                    "ob-owner",
+                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                ),
+            })
+            .await
+            .unwrap();
+        let bindings = crate::federation::admission::owner_bindings_of(&backend, "ob-node")
+            .await
+            .unwrap();
+        assert_eq!(bindings, vec!["ob-owner".to_string()]);
+        // The user key owner-binds itself (clause 1).
+        assert_eq!(
+            crate::federation::admission::owner_bindings_of(&backend, "ob-owner")
+                .await
+                .unwrap(),
+            vec!["ob-owner".to_string()]
+        );
+        // Consistency with the predicate.
+        assert!(
+            crate::federation::admission::is_owner_bound(&backend, "ob-node")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// owner_binding_chain: the PATH (anchor-first), not just endpoints.
+    /// clause 1 (user key) → [self]; clause 3 (delegated node) → [user, k];
+    /// unbound → empty.
+    #[tokio::test]
+    async fn owner_binding_chain_returns_audit_path() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        // Unbound → empty.
+        assert!(
+            crate::federation::admission::owner_binding_chain(&backend, "ob-node")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Clause 1: the user key is its own anchor → [self].
+        assert_eq!(
+            crate::federation::admission::owner_binding_chain(&backend, "ob-owner")
+                .await
+                .unwrap(),
+            vec!["ob-owner".to_string()]
+        );
+        // Clause 3: live delegates_to(user → node) → [user, node].
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "ob-bind-chain",
+                    "ob-owner",
+                    "ob-node",
+                    "ob-owner",
+                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::federation::admission::owner_binding_chain(&backend, "ob-node")
+                .await
+                .unwrap(),
+            vec!["ob-owner".to_string(), "ob-node".to_string()]
+        );
+        // Predicate consistency: a non-empty chain ⟺ owner-bound.
+        let chain_nonempty =
+            !crate::federation::admission::owner_binding_chain(&backend, "ob-node")
+                .await
+                .unwrap()
+                .is_empty();
+        let bound = crate::federation::admission::is_owner_bound(&backend, "ob-node")
+            .await
+            .unwrap();
+        assert_eq!(chain_nonempty, bound);
+    }
+
+    /// reachable_under_scope: the general ⊆-attenuation, withdraws-aware,
+    /// depth-capped scoped walk. A `moderate`-scoped founder → deputy →
+    /// reaches under `moderate`; the same pair is NOT reachable under a
+    /// DIFFERENT scope (scope-isolation); a withdrawn edge breaks the reach;
+    /// zero-hop self is not a reach.
+    #[tokio::test]
+    async fn reachable_under_scope_scoped_attenuated_walk() {
+        use crate::federation::admission::{
+            reachable_under_scope, DELEGATION_SCOPE_MODERATE, DELEGATION_SCOPE_REVIEW,
+            MAX_MODERATION_DELEGATION_DEPTH,
+        };
+        let backend = MemoryBackend::new();
+        for k in ["rk-root", "rk-mid", "rk-leaf", "rk-other"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        // root → mid (moderate, sub_delegation) → leaf (moderate). The
+        // root→mid edge MUST grant `sub_delegation` for mid to further-
+        // delegate past depth 1 (§11.10 deputization gate).
+        let delegate = |id: &str, granter: &str, grantee: &str, sub: bool| {
+            let mut d = fix_attestation(id, granter, grantee, granter);
+            d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+            d.attestation_envelope = serde_json::json!({
+                "references_attestation_id": id,
+                "scope": [DELEGATION_SCOPE_MODERATE],
+                "sub_delegation": sub,
+            });
+            resign_fix(&mut d);
+            d
+        };
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: delegate("rk-d1", "rk-root", "rk-mid", true),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: delegate("rk-d2", "rk-mid", "rk-leaf", false),
+            })
+            .await
+            .unwrap();
+        let depth = MAX_MODERATION_DELEGATION_DEPTH;
+        // Reaches leaf under moderate (2 hops).
+        assert!(reachable_under_scope(
+            &backend,
+            "rk-root",
+            "rk-leaf",
+            DELEGATION_SCOPE_MODERATE,
+            depth
+        )
+        .await
+        .unwrap());
+        // Scope-isolation: NOT reachable under `review`.
+        assert!(!reachable_under_scope(
+            &backend,
+            "rk-root",
+            "rk-leaf",
+            DELEGATION_SCOPE_REVIEW,
+            depth
+        )
+        .await
+        .unwrap());
+        // Unrelated key not reachable.
+        assert!(!reachable_under_scope(
+            &backend,
+            "rk-root",
+            "rk-other",
+            DELEGATION_SCOPE_MODERATE,
+            depth
+        )
+        .await
+        .unwrap());
+        // Zero-hop self is not a reach (no scope-bearing edge to self).
+        assert!(!reachable_under_scope(
+            &backend,
+            "rk-root",
+            "rk-root",
+            DELEGATION_SCOPE_MODERATE,
+            depth
+        )
+        .await
+        .unwrap());
+        // depth=1 reaches mid but not leaf (depth cap).
+        assert!(
+            reachable_under_scope(&backend, "rk-root", "rk-mid", DELEGATION_SCOPE_MODERATE, 1)
+                .await
+                .unwrap()
+        );
+        assert!(!reachable_under_scope(
+            &backend,
+            "rk-root",
+            "rk-leaf",
+            DELEGATION_SCOPE_MODERATE,
+            1
+        )
+        .await
+        .unwrap());
+    }
+
+    /// delegations_to: K with 2 inbound `delegates_to` → returns both;
+    /// a key with none → empty. Non-`delegates_to` inbound edges excluded.
+    #[tokio::test]
+    async fn delegations_to_lists_inbound_delegation_edges() {
+        let backend = MemoryBackend::new();
+        for k in ["dt-k", "dt-g1", "dt-g2"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        // No inbound delegations yet.
+        assert!(backend.delegations_to("dt-k").await.unwrap().is_empty());
+        // Two granters delegate to dt-k.
+        for (id, g) in [("dt-d1", "dt-g1"), ("dt-d2", "dt-g2")] {
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: fix_delegates_to(id, g, "dt-k", serde_json::json!(["share"])),
+                })
+                .await
+                .unwrap();
+        }
+        // A non-delegation inbound edge (plain attestation) must NOT appear.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_attestation("dt-vouch", "dt-g1", "dt-k", "dt-g1"),
+            })
+            .await
+            .unwrap();
+        let inbound = backend.delegations_to("dt-k").await.unwrap();
+        assert_eq!(inbound.len(), 2, "both delegates_to edges, vouch excluded");
+        let granters: std::collections::HashSet<&str> = inbound
+            .iter()
+            .map(|a| a.attesting_key_id.as_str())
+            .collect();
+        assert!(granters.contains("dt-g1") && granters.contains("dt-g2"));
+        assert!(inbound.iter().all(
+            |a| a.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
+        ));
     }
 }

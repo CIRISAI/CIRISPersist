@@ -2615,6 +2615,129 @@ impl Engine {
         }
     }
 
+    // ── #249 Cut B ── CEG-native graph DX enumerators + community-roster
+    //    grow, surfaced as Engine convenience wrappers over the
+    //    `federation_directory()` reader + the admission free functions.
+
+    /// #249 Cut B — active member roster of `community_key_id` (`members`
+    /// MINUS effective membership revocations). See
+    /// [`FederationDirectory::active_community_members`](crate::federation::FederationDirectory::active_community_members).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn active_community_members(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<crate::federation::types::CommunityMember>, crate::federation::Error> {
+        self.federation_directory()
+            .active_community_members(community_key_id)
+            .await
+    }
+
+    /// #249 Cut B — active member roster of `family_key_id`. See
+    /// [`FederationDirectory::active_family_members`](crate::federation::FederationDirectory::active_family_members).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn active_family_members(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<crate::federation::types::FamilyMember>, crate::federation::Error> {
+        self.federation_directory()
+            .active_family_members(family_key_id)
+            .await
+    }
+
+    /// #249 Cut B — incrementally add `member` to `community_key_id`'s
+    /// roster (idempotent on `member.key_id`). See
+    /// [`FederationDirectory::add_community_member`](crate::federation::FederationDirectory::add_community_member).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn add_community_member(
+        &self,
+        community_key_id: &str,
+        member: crate::federation::types::CommunityMember,
+    ) -> Result<bool, crate::federation::Error> {
+        self.federation_directory()
+            .add_community_member(community_key_id, member)
+            .await
+    }
+
+    /// #249 Cut B — the FULL named-moderator set of `community_key_id` for
+    /// `duty` (authority roots ∪ duty-scoped delegates). See
+    /// [`admission::moderators_of`](crate::federation::admission::moderators_of).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn moderators_of(
+        &self,
+        community_key_id: &str,
+        duty: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        crate::federation::admission::moderators_of(
+            self.federation_directory().as_ref(),
+            community_key_id,
+            duty,
+        )
+        .await
+    }
+
+    /// #249 Cut B — the `user`-role key(s) that owner-bind `key_id`. See
+    /// [`admission::owner_bindings_of`](crate::federation::admission::owner_bindings_of).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn owner_bindings_of(
+        &self,
+        key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        crate::federation::admission::owner_bindings_of(
+            self.federation_directory().as_ref(),
+            key_id,
+        )
+        .await
+    }
+
+    /// #249 Cut B — inbound `delegates_to` edges naming `key_id` as
+    /// recipient. See
+    /// [`FederationDirectory::delegations_to`](crate::federation::FederationDirectory::delegations_to).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn delegations_to(
+        &self,
+        key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        self.federation_directory().delegations_to(key_id).await
+    }
+
+    /// #249 Cut B — the general scoped-delegation reachability primitive:
+    /// does `issuer_key_id` reach `target_key_id` via a `delegates_to` chain
+    /// where every edge carries `scope` (⊆-attenuation + sub_delegation +
+    /// withdraws-aware + depth-capped, §11.10)? See
+    /// [`admission::reachable_under_scope`](crate::federation::admission::reachable_under_scope).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn reachable_under_scope(
+        &self,
+        issuer_key_id: &str,
+        target_key_id: &str,
+        scope: &str,
+        max_depth: usize,
+    ) -> Result<bool, crate::federation::Error> {
+        crate::federation::admission::reachable_under_scope(
+            self.federation_directory().as_ref(),
+            issuer_key_id,
+            target_key_id,
+            scope,
+            max_depth,
+        )
+        .await
+    }
+
+    /// #249 Cut B — the owner-binding PATH (`user → … → key_id`, anchor-
+    /// first) for audit. See
+    /// [`admission::owner_binding_chain`](crate::federation::admission::owner_binding_chain).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn owner_binding_chain(
+        &self,
+        key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        crate::federation::admission::owner_binding_chain(
+            self.federation_directory().as_ref(),
+            key_id,
+        )
+        .await
+    }
+
     /// v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the
     /// **single canonical federation-key registration admission gate**.
     ///
