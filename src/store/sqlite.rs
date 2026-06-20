@@ -16866,6 +16866,97 @@ mod tests {
         );
     }
 
+    /// #249 Cut A — the JSON-shape contract the FFI active-variant
+    /// wrappers (`list_communities_for_member_active_json` /
+    /// `list_families_for_member_active_json`) expose to pyo3 consumers:
+    /// seed a community + an effective membership revocation, then assert
+    /// the serde_json serialization of `list_communities_for_member_active`
+    /// (exactly what the wrapper returns) EXCLUDES the revoked member while
+    /// the full-history `list_communities_for_member` still includes them.
+    /// This is the "stop hand-folding revocations" property — proven at the
+    /// serialized boundary the UI consumes, not just the typed Rust level.
+    #[tokio::test]
+    async fn cut_a_active_community_json_excludes_revoked_member_sqlite() {
+        use crate::federation::{Community, FederationDirectory};
+        let backend = community_fixture(
+            &[("alice", "alice-occ", true), ("bob", "bob-occ", true)],
+            None,
+        )
+        .await;
+
+        // Pre-revocation: both alice and bob see the community in their
+        // active list, and the JSON array carries one Community.
+        for member in ["alice", "bob"] {
+            let active = backend
+                .list_communities_for_member_active(member)
+                .await
+                .unwrap();
+            let json = serde_json::to_string(&active).unwrap();
+            let parsed: Vec<Community> = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.len(), 1, "{member} active before revocation");
+            assert_eq!(parsed[0].community_key_id, "comm");
+        }
+
+        // Remove bob, effective in the past.
+        backend
+            .put_community_membership_revocation(comm_revoke("bob", "2026-06-10T00:00:00Z"))
+            .await
+            .unwrap();
+
+        // Active list (the FFI wrapper's payload) now EXCLUDES bob via the
+        // serialized JSON shape...
+        let bob_active = backend
+            .list_communities_for_member_active("bob")
+            .await
+            .unwrap();
+        let bob_json = serde_json::to_string(&bob_active).unwrap();
+        let bob_parsed: Vec<Community> = serde_json::from_str(&bob_json).unwrap();
+        assert!(
+            bob_parsed.is_empty(),
+            "active JSON must drop the revoked member, got {bob_json}"
+        );
+
+        // ...while the full-history reader still lists the community for bob
+        // (the `_json` wrapper of `list_communities_for_member` is unchanged).
+        let bob_history = backend.list_communities_for_member("bob").await.unwrap();
+        assert_eq!(
+            bob_history.len(),
+            1,
+            "full-history reader is unaffected by the revocation"
+        );
+
+        // alice (not revoked) stays in the active JSON.
+        let alice_active = backend
+            .list_communities_for_member_active("alice")
+            .await
+            .unwrap();
+        let alice_parsed: Vec<Community> =
+            serde_json::from_str(&serde_json::to_string(&alice_active).unwrap()).unwrap();
+        assert_eq!(alice_parsed.len(), 1, "remaining member stays active");
+
+        // The community-membership revocation reader (the
+        // `list_community_membership_revocations_for_json` payload) carries
+        // exactly the one bob removal.
+        let revs = backend
+            .list_community_membership_revocations_for("comm")
+            .await
+            .unwrap();
+        let revs_parsed: Vec<crate::federation::CommunityMembershipRevocation> =
+            serde_json::from_str(&serde_json::to_string(&revs).unwrap()).unwrap();
+        assert_eq!(revs_parsed.len(), 1);
+        assert_eq!(revs_parsed[0].removed_identity_key_id, "bob");
+
+        // lookup_community (the `lookup_community_json` payload) round-trips
+        // through JSON and carries the full roster (revocation is a separate
+        // table; the roster itself is untouched).
+        let looked = backend.lookup_community("comm").await.unwrap();
+        let looked_json = serde_json::to_string(&looked).unwrap();
+        let looked_parsed: Option<Community> = serde_json::from_str(&looked_json).unwrap();
+        let community = looked_parsed.expect("community present");
+        assert_eq!(community.community_key_id, "comm");
+        assert_eq!(community.members.len(), 2, "roster intact post-revocation");
+    }
+
     /// SecReview F5: INSERT + hard_case + epoch-bump are ONE transaction —
     /// if the epoch bump fails, the revocation INSERT is rolled back (no
     /// durable un-rotated revocation). Induce the bump failure by dropping
@@ -24149,6 +24240,83 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// #249 Cut A — the owner-binding + duty-holders readers
+    /// (`is_owner_bound_json` / `duty_holders_for_community_json`) the FFI
+    /// exposes: a `user`-role key IS owner-bound, a bare `node` key is NOT,
+    /// and the duty-holder set of a MAJORITY community (whole roster =
+    /// authority) is exactly its owner-bound members — proven through the
+    /// serde_json array shape the wrapper emits (HashSet sorted to a stable
+    /// `Vec`), the #104 PERSIST_DELEGATES_TO blocker's by-construction view.
+    #[tokio::test]
+    async fn cut_a_owner_binding_and_duty_holders_json_sqlite() {
+        use crate::federation::admission::{duty_holders_for_community, is_owner_bound};
+        use crate::federation::FederationDirectory;
+        let backend = bootstrap_node_agency_sqlite().await;
+
+        // is_owner_bound: `owner` (USER) is bound; `node-key` (NODE, no
+        // delegation) is not — the exact bools the JSON wrapper serializes.
+        let owner_bound = is_owner_bound(&backend as &dyn FederationDirectory, "owner")
+            .await
+            .unwrap();
+        let node_bound = is_owner_bound(&backend as &dyn FederationDirectory, "node-key")
+            .await
+            .unwrap();
+        assert!(
+            serde_json::from_str::<bool>(&serde_json::to_string(&owner_bound).unwrap()).unwrap()
+        );
+        assert!(
+            !serde_json::from_str::<bool>(&serde_json::to_string(&node_bound).unwrap()).unwrap()
+        );
+
+        // A MAJORITY community whose whole roster is the authority set; only
+        // the owner-bound member surfaces as a duty-holder. Seed the
+        // community's own key, then a single owner-bound member (`owner`) —
+        // owner-binding admission accepts it (`owner` is a USER).
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("duty-comm", "duty-comm", "duty-comm"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: fed_community(
+                    "duty-comm",
+                    "Duty Co-op",
+                    vec!["owner"],
+                    crate::federation::types::consensus_protocol::MAJORITY,
+                    None,
+                ),
+            })
+            .await
+            .expect("owner-bound member admitted under MAJORITY");
+
+        // duty_holders_for_community → exactly {owner}, through the sorted
+        // JSON array the FFI wrapper returns.
+        let holders = duty_holders_for_community(
+            &backend as &dyn FederationDirectory,
+            "duty-comm",
+            "moderate",
+        )
+        .await
+        .unwrap();
+        let mut sorted: Vec<String> = holders.into_iter().collect();
+        sorted.sort();
+        let json = serde_json::to_string(&sorted).unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, vec!["owner".to_string()], "duty-holders JSON shape");
+
+        // An unknown community → fail-closed empty array (not an error).
+        let none = duty_holders_for_community(
+            &backend as &dyn FederationDirectory,
+            "no-such-community",
+            "moderate",
+        )
+        .await
+        .unwrap();
+        assert!(none.is_empty(), "unknown community ⇒ empty duty-holder set");
     }
 
     /// SecReview F2: an `infrastructure`-LABELED community whose own key is

@@ -5903,6 +5903,513 @@ impl PyEngine {
         })
     }
 
+    // ── #249 Cut A: graph-traversal read exposure ──
+    //
+    // Thin pyo3 wrappers over EXISTING `FederationDirectory` /
+    // `admission` readers (no new Rust logic). Each mirrors the
+    // `lookup_family_json` / `list_families_for_member_json` patterns
+    // above: `py.detach` + per-backend `runtime.block_on`, errors mapped
+    // via `federation_err_to_py`, results serialized with serde_json
+    // (the underlying types already derive `Serialize`).
+
+    /// #249 Cut A — fetch a single community by `community_key_id`.
+    /// Returns JSON `Community` object or `None` (null). Structural mirror
+    /// of [`Self::lookup_family_json`]; wraps
+    /// [`FederationDirectory::lookup_community`].
+    fn lookup_community_json(
+        &self,
+        py: Python<'_>,
+        community_key_id: &str,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let community_key_id = community_key_id.to_owned();
+            py.detach(move || {
+                let row: Option<crate::federation::Community> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .lookup_community(&community_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .lookup_community(&community_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                row.map(|r| {
+                    serde_json::to_string(&r)
+                        .map_err(|e| PyValueError::new_err(format!("community serialize: {e}")))
+                })
+                .transpose()
+            })
+        })
+    }
+
+    /// #249 Cut A — list every community that `member_identity_key_id`
+    /// belongs to (full-history roster, no revocation filter). Returns
+    /// JSON array of `Community` objects. Structural mirror of
+    /// [`Self::list_families_for_member_json`]; wraps
+    /// [`FederationDirectory::list_communities_for_member`].
+    fn list_communities_for_member_json(
+        &self,
+        py: Python<'_>,
+        member_identity_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let member_identity_key_id = member_identity_key_id.to_owned();
+            py.detach(move || {
+                let rows: Vec<crate::federation::Community> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_communities_for_member(&member_identity_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_communities_for_member(&member_identity_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows)
+                    .map_err(|e| PyValueError::new_err(format!("communities serialize: {e}")))
+            })
+        })
+    }
+
+    /// #249 Cut A — families `member_identity_key_id` is **currently** an
+    /// active member of (roster − effective revocations). Returns JSON
+    /// array of `Family` objects. Wraps
+    /// [`FederationDirectory::list_families_for_member_active`] — the
+    /// substrate-side revocation fold, so consumers stop hand-folding it.
+    fn list_families_for_member_active_json(
+        &self,
+        py: Python<'_>,
+        member_identity_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let member_identity_key_id = member_identity_key_id.to_owned();
+            py.detach(move || {
+                let rows: Vec<crate::federation::Family> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_families_for_member_active(&member_identity_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_families_for_member_active(&member_identity_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows)
+                    .map_err(|e| PyValueError::new_err(format!("active families serialize: {e}")))
+            })
+        })
+    }
+
+    /// #249 Cut A — communities `member_identity_key_id` is **currently**
+    /// an active member of (roster − effective revocations). Returns JSON
+    /// array of `Community` objects. Structural mirror of
+    /// [`Self::list_families_for_member_active_json`]; wraps
+    /// [`FederationDirectory::list_communities_for_member_active`].
+    fn list_communities_for_member_active_json(
+        &self,
+        py: Python<'_>,
+        member_identity_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let member_identity_key_id = member_identity_key_id.to_owned();
+            py.detach(move || {
+                let rows: Vec<crate::federation::Community> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_communities_for_member_active(&member_identity_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_communities_for_member_active(&member_identity_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyValueError::new_err(format!("active communities serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// #249 Cut A — all family-membership revocations for `family_key_id`
+    /// (full history, no `effective_at` filter). Returns JSON array of
+    /// `FamilyMembershipRevocation` objects. Wraps
+    /// [`FederationDirectory::list_family_membership_revocations_for`].
+    fn list_family_membership_revocations_for_json(
+        &self,
+        py: Python<'_>,
+        family_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let family_key_id = family_key_id.to_owned();
+            py.detach(move || {
+                let rows: Vec<crate::federation::FamilyMembershipRevocation> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_family_membership_revocations_for(&family_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_family_membership_revocations_for(&family_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyValueError::new_err(format!("family revocations serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// #249 Cut A — all community-membership revocations for
+    /// `community_key_id` (full history). Returns JSON array of
+    /// `CommunityMembershipRevocation` objects. Structural mirror of
+    /// [`Self::list_family_membership_revocations_for_json`]; wraps
+    /// [`FederationDirectory::list_community_membership_revocations_for`].
+    fn list_community_membership_revocations_for_json(
+        &self,
+        py: Python<'_>,
+        community_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let community_key_id = community_key_id.to_owned();
+            py.detach(move || {
+                let rows: Vec<crate::federation::CommunityMembershipRevocation> =
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => {
+                            let backend = pg.clone();
+                            runtime.block_on(async move {
+                                use crate::federation::FederationDirectory;
+                                backend
+                                    .list_community_membership_revocations_for(&community_key_id)
+                                    .await
+                                    .map_err(federation_err_to_py)
+                            })?
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => {
+                            let backend = sq.clone();
+                            runtime.block_on(async move {
+                                use crate::federation::FederationDirectory;
+                                backend
+                                    .list_community_membership_revocations_for(&community_key_id)
+                                    .await
+                                    .map_err(federation_err_to_py)
+                            })?
+                        }
+                    };
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyValueError::new_err(format!("community revocations serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// #249 Cut A — is `key_id` a **named moderator** of community
+    /// `community_id` for `duty` (`moderate` / `takedown` / `review`)?
+    /// Returns JSON `true` / `false`. Wraps the free function
+    /// [`admission::is_named_moderator`](crate::federation::admission::is_named_moderator),
+    /// which is fail-closed (returns `false`, never errors, on an unknown
+    /// community or unreachable authority). The concrete backend is coerced
+    /// to `&dyn FederationDirectory` inside each dispatch arm.
+    fn is_named_moderator_json(
+        &self,
+        py: Python<'_>,
+        key_id: &str,
+        community_id: &str,
+        duty: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            let community_id = community_id.to_owned();
+            let duty = duty.to_owned();
+            py.detach(move || {
+                let is_mod: bool = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            crate::federation::admission::is_named_moderator(
+                                &*backend as &dyn FederationDirectory,
+                                &key_id,
+                                &community_id,
+                                &duty,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            crate::federation::admission::is_named_moderator(
+                                &*backend as &dyn FederationDirectory,
+                                &key_id,
+                                &community_id,
+                                &duty,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&is_mod).map_err(|e| {
+                    PyValueError::new_err(format!("is_named_moderator serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// #249 Cut A — is `key_id` **owner-bound** (resolves to a `user`-role
+    /// human identity, directly / via occurrence / via a live `delegates_to`
+    /// from a user-role granter)? Returns JSON `true` / `false`. Wraps the
+    /// free function
+    /// [`admission::is_owner_bound`](crate::federation::admission::is_owner_bound) —
+    /// fail-closed (a key whose chain to a `user` identity cannot be shown is
+    /// not owner-bound). The most-reconstructed walk; exposing it stops
+    /// consumers re-deriving the §5.6.8.10 graph.
+    fn is_owner_bound_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(move || {
+                let bound: bool = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            crate::federation::admission::is_owner_bound(
+                                &*backend as &dyn FederationDirectory,
+                                &key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            crate::federation::admission::is_owner_bound(
+                                &*backend as &dyn FederationDirectory,
+                                &key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&bound)
+                    .map_err(|e| PyValueError::new_err(format!("is_owner_bound serialize: {e}")))
+            })
+        })
+    }
+
+    /// #249 Cut A — the **duty-holders** of a bare community-scoped action
+    /// (a `moderation:*` / `reconsideration:*` over `community_id` with no
+    /// content subject) for `duty` (`moderate` / `takedown` / `review`): the
+    /// owner-bound authority roots of the community. Returns a JSON array of
+    /// key-id strings (the underlying `HashSet<String>` sorted for a stable
+    /// payload). Wraps
+    /// [`admission::duty_holders_for_community`](crate::federation::admission::duty_holders_for_community).
+    /// Empty community / no owner-bound authority ⇒ `[]`.
+    fn duty_holders_for_community_json(
+        &self,
+        py: Python<'_>,
+        community_id: &str,
+        duty: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let community_id = community_id.to_owned();
+            let duty = duty.to_owned();
+            py.detach(move || {
+                let holders: std::collections::HashSet<String> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            crate::federation::admission::duty_holders_for_community(
+                                &*backend as &dyn FederationDirectory,
+                                &community_id,
+                                &duty,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            crate::federation::admission::duty_holders_for_community(
+                                &*backend as &dyn FederationDirectory,
+                                &community_id,
+                                &duty,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                let mut sorted: Vec<String> = holders.into_iter().collect();
+                sorted.sort();
+                serde_json::to_string(&sorted).map_err(|e| {
+                    PyValueError::new_err(format!("community duty-holders serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// #249 Cut A — the **duty-holders** of a content target
+    /// (`content_sha256`) for `duty` (`moderate` / `takedown` / `review`):
+    /// the content's resolved subjects ∪ the named-moderator authority roots
+    /// of `community_id`. Returns a JSON array of key-id strings (the
+    /// underlying `HashSet<String>` sorted for a stable payload). Wraps
+    /// [`admission::duty_holders_for_content`](crate::federation::admission::duty_holders_for_content).
+    ///
+    /// NB: the Rust method takes the content's declared `community_id` (an
+    /// empty string ⇒ no community moderators, subjects only) in addition to
+    /// `content_sha256` + `duty`; the FFI signature mirrors it.
+    fn duty_holders_for_content_json(
+        &self,
+        py: Python<'_>,
+        content_sha256: &str,
+        community_id: &str,
+        duty: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let content_sha256 = content_sha256.to_owned();
+            let community_id = community_id.to_owned();
+            let duty = duty.to_owned();
+            py.detach(move || {
+                let holders: std::collections::HashSet<String> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            crate::federation::admission::duty_holders_for_content(
+                                &*backend as &dyn FederationDirectory,
+                                &content_sha256,
+                                &community_id,
+                                &duty,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            crate::federation::admission::duty_holders_for_content(
+                                &*backend as &dyn FederationDirectory,
+                                &content_sha256,
+                                &community_id,
+                                &duty,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                let mut sorted: Vec<String> = holders.into_iter().collect();
+                sorted.sort();
+                serde_json::to_string(&sorted).map_err(|e| {
+                    PyValueError::new_err(format!("content duty-holders serialize: {e}"))
+                })
+            })
+        })
+    }
+    // ── end #249 Cut A ──
+
     /// Federation blob storage: read a blob by SHA-256 (hex).
     ///
     /// Returns `None` when no row exists; otherwise a JSON string of
