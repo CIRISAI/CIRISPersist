@@ -5,6 +5,16 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.4.0] — 2026-06-20
+
+### Added — complete the `emit_attestation` surface (CIRISPersist#253 + #252)
+
+Two additive completions to the v9.3.0 `emit_attestation` primitive (#248) so **hardware** nodes and **weighted** scores producers can adopt it without hand-rolling the recipe. Both keep the existing `emit_attestation(&LocalSigner, …)` API unchanged.
+
+- **#253 — `Engine::emit_attestation_self(EmitAttestationInput) -> attestation_id`.** The node-self emit path (the common case: a node emitting a federation-tier row about itself with its own configured signer). Same canonicalize → hybrid-sign → 20-field `Attestation` → `put_attestation` recipe as `emit_attestation`, but signs over the engine's **composed signer** via `Engine::sign_hybrid` and derives `attesting_key_id` / `scrub_key_id` from `Engine::local_derived_key_id()` (the #247 floor). So it works for **software** (`with_signer`) AND **hardware-hybrid** (`with_hardware_signer_hybrid`) engines — the latter holds only the composed signer (no external `LocalSigner` to hand to `emit_attestation`), so it previously could not emit without a parallel signer mirroring its identity (CIRISServer#45 `peer.rs` / `graph_config.rs`). The shared canonicalize→hash→assemble→put body is factored into private helpers (`emit_canonicalize` + `emit_attestation_assemble`) so `emit_attestation` and `emit_attestation_self` share one implementation (no duplication). No-signer / no-PQC surfaces as `Error::Backend` wrapping the typed `SignError::LocalSignerUnavailable` / `PqcNotConfigured`.
+  - **FFI:** `PyEngine.emit_attestation_self(input_json) -> attestation_id` signs over the engine's composed signer (so a hardware-hybrid PyEngine can emit — unlike `emit_attestation`'s FFI which reconstructs a `LocalSigner` a hardware engine lacks). No pre-gate; the typed no-signer error surfaces honestly.
+- **#252 — optional `weight: Option<f64>` on `EmitAttestationInput`.** Additive (default `None`), folded onto the assembled `Attestation::weight`. `None` preserves the pre-9.4.0 emit behavior (the row's `weight` stays `None`, read as `1.0` by the replication trust model in `trust_scoring` / `topology`); `Some(w)` lets a weighted `scores` producer (CIRISServer#45 `scorer.rs` — the `capacity:sustained_coherence:v1` band IS the trust weight) keep its band instead of silently collapsing every row to `1.0`. New `EmitAttestationInput::with_weight(Option<f64>)` builder setter alongside `with_envelope`.
+
 ## [9.3.0] — 2026-06-20
 
 ### Added — CEG-native graph DX: foundation (CIRISPersist#247 + #248)

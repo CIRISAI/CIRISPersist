@@ -777,6 +777,15 @@ pub struct EmitAttestationInput {
     /// Optional expiry (`delegates_to` / `consent:*` lifecycles).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    /// v9.4.0 (CIRISPersist#252) — optional weight folded onto the
+    /// assembled row's [`Attestation::weight`]. `None` (the default)
+    /// preserves the pre-9.4.0 emit behavior (the row's `weight` stays
+    /// `None`, which the replication trust model reads as `1.0`); a
+    /// weighted `scores` producer sets `Some(w)` so the band survives the
+    /// emit instead of collapsing to the `1.0` default
+    /// (`trust_scoring`/`topology` fold `weight.unwrap_or(1.0)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
 }
 
 impl EmitAttestationInput {
@@ -796,7 +805,17 @@ impl EmitAttestationInput {
             subject_key_ids: Vec::new(),
             cohort_scope: cohort_scope::FEDERATION.to_string(),
             expires_at: None,
+            weight: None,
         }
+    }
+
+    /// v9.4.0 (CIRISPersist#252) — set the optional `weight` folded onto
+    /// the assembled [`Attestation::weight`] (builder convenience for
+    /// weighted `scores` producers). `None` keeps the default emit
+    /// behavior.
+    pub fn with_weight(mut self, weight: Option<f64>) -> Self {
+        self.weight = weight;
+        self
     }
 }
 

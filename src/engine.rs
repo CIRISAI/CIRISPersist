@@ -1707,29 +1707,108 @@ impl Engine {
         signer: &crate::signing::LocalSigner,
         input: crate::federation::EmitAttestationInput,
     ) -> Result<String, crate::federation::Error> {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use sha2::{Digest, Sha256};
-
         // Derive the registered federation key_id from the signer itself
         // (#247 floor) — never a caller-supplied alias.
         let key_id = signer.derived_key_id();
 
-        // Canonicalize (produce gate → JCS post-cut) + hash.
-        let canonical =
-            crate::verify::canonical::ceg_produce_canonicalize(&input.attestation_envelope)
-                .map_err(|e| {
-                    crate::federation::Error::Backend(format!("emit_attestation canonicalize: {e}"))
-                })?;
-        let original_content_hash = hex::encode(Sha256::digest(&canonical));
-
-        // Hybrid-sign (Ed25519 + ML-DSA-65 bound). A non-PQC signer cannot
-        // emit a conformant federation-tier attestation — surface honestly.
+        // Canonicalize once here so the same bytes are both hashed and
+        // signed; hybrid-sign over the EXTERNAL signer. A non-PQC signer
+        // cannot emit a conformant federation-tier attestation — surface
+        // honestly with the same message the self-emit path uses.
+        let canonical = Self::emit_canonicalize(&input.attestation_envelope)?;
         let sig = signer.sign_hybrid(&canonical).await.map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "emit_attestation sign_hybrid: {e} — a conformant federation-tier emit requires a \
                  hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
             ))
         })?;
+
+        self.emit_attestation_assemble(key_id, &canonical, sig, input)
+            .await
+    }
+
+    /// v9.4.0 (CIRISPersist#253) — node-self emit over the engine's OWN
+    /// **composed signer** (`Arc<dyn HardwareSigner>`), the common case: a
+    /// node emitting a federation-tier row about itself with its configured
+    /// identity. Same canonicalize → hybrid-sign → 20-field [`Attestation`]
+    /// → [`put_attestation`](crate::federation::FederationDirectory::put_attestation)
+    /// recipe as [`Self::emit_attestation`], but signs via
+    /// [`Self::sign_hybrid`] and derives `attesting_key_id`/`scrub_key_id`
+    /// from [`Self::local_derived_key_id`] — so it works for **software**
+    /// ([`Self::with_signer`]) AND **hardware-hybrid**
+    /// ([`Self::with_hardware_signer_hybrid`]) engines alike.
+    ///
+    /// This is the surface a hardware-hybrid node uses to fold its own
+    /// federation-tier emits onto the #249 helpers: such an engine holds
+    /// only the composed signer (no [`LocalSigner`](crate::signing::LocalSigner)
+    /// to pass to [`Self::emit_attestation`]), so it could not previously
+    /// emit without constructing a parallel signer mirroring its identity
+    /// (CIRISPersist#253, CIRISServer#45).
+    ///
+    /// Returns [`crate::federation::Error::Backend`] wrapping
+    /// [`SignError::LocalSignerUnavailable`] (no signer composed) or the
+    /// signer's own [`PqcNotConfigured`](crate::signing::LocalSignerError::PqcNotConfigured)
+    /// (no ML-DSA half) — a conformant emit requires a hybrid signer.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn emit_attestation_self(
+        &self,
+        input: crate::federation::EmitAttestationInput,
+    ) -> Result<String, crate::federation::Error> {
+        // #247-correct derived federation key_id of the engine's own
+        // composed signer (works for software + hardware-hybrid alike).
+        let key_id = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("emit_attestation_self derive key_id: {e}"))
+        })?;
+
+        let canonical = Self::emit_canonicalize(&input.attestation_envelope)?;
+        // Hybrid-sign over the COMPOSED signer. No `LocalSigner` is needed,
+        // so a hardware-hybrid engine can emit here.
+        let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "emit_attestation_self sign_hybrid: {e} — a conformant federation-tier emit \
+                 requires a composed hybrid (Ed25519 + ML-DSA-65) signer (CC 5.3.2.4.3.1)"
+            ))
+        })?;
+
+        self.emit_attestation_assemble(key_id, &canonical, sig, input)
+            .await
+    }
+
+    /// Shared body of [`Self::emit_attestation`] / [`Self::emit_attestation_self`]:
+    /// canonicalize the envelope (produce gate → JCS post-cut, §0.9). The
+    /// canonical bytes are both SHA-256'd (`original_content_hash`) and
+    /// hybrid-signed by the caller, so the two paths sign byte-identical
+    /// content.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    fn emit_canonicalize(
+        envelope: &serde_json::Value,
+    ) -> Result<Vec<u8>, crate::federation::Error> {
+        crate::verify::canonical::ceg_produce_canonicalize(envelope).map_err(|e| {
+            crate::federation::Error::Backend(format!("emit_attestation canonicalize: {e}"))
+        })
+    }
+
+    /// Shared body of [`Self::emit_attestation`] / [`Self::emit_attestation_self`]:
+    /// assemble the 20-field [`Attestation`] from the already-derived
+    /// `key_id` (the attester/scrub — #247 derived federation key_id, never
+    /// a caller alias), the `canonical` bytes (for the
+    /// `original_content_hash`), the computed hybrid `sig`, and `input`, then
+    /// [`put_attestation`](crate::federation::FederationDirectory::put_attestation).
+    /// The two public entry points differ ONLY in where the signer / key_id
+    /// come from — this keeps the canonicalize→hash→assemble→put recipe
+    /// single-sourced (no duplication).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn emit_attestation_assemble(
+        &self,
+        key_id: String,
+        canonical: &[u8],
+        sig: ciris_crypto::HybridSignature,
+        input: crate::federation::EmitAttestationInput,
+    ) -> Result<String, crate::federation::Error> {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        let original_content_hash = hex::encode(Sha256::digest(canonical));
         let now = chrono::Utc::now();
 
         let attested_key_id = input.attested_key_id.unwrap_or_else(|| key_id.clone());
@@ -1744,7 +1823,11 @@ impl Engine {
             attesting_key_id: key_id.clone(),
             attested_key_id,
             attestation_type: input.attestation_type,
-            weight: None,
+            // v9.4.0 (#252) — fold the optional weight onto the row. `None`
+            // preserves the pre-9.4.0 default (read as `1.0` by the trust
+            // model); `Some(w)` lets a weighted `scores` producer keep its
+            // band instead of collapsing to `1.0`.
+            weight: input.weight,
             asserted_at: now,
             expires_at: input.expires_at,
             attestation_envelope: input.attestation_envelope,
@@ -7340,6 +7423,265 @@ mod tests {
             .scrub_signature_pqc
             .as_deref()
             .is_some_and(|s| !s.is_empty()));
+    }
+
+    // ── v9.4.0 (CIRISPersist#253 / #252) — emit_attestation_self + weight ──
+
+    /// #253 — `emit_attestation_self` on a **software** engine signs over the
+    /// engine's composed signer and derives attester/scrub from
+    /// `local_derived_key_id()`, producing the SAME row shape as
+    /// `emit_attestation(&signer, …)`: federation tier, attester == scrub ==
+    /// derived key_id, self-attested, populated hybrid scrub.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn emit_attestation_self_software_matches_emit_attestation_sqlite() {
+        use crate::federation::types::attestation_type::SCORES;
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("ciris-self");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        // `local_derived_key_id()` (the value emit_attestation_self uses)
+        // matches the LocalSigner's derived_key_id (#247 floor).
+        assert_eq!(
+            engine.local_derived_key_id().await.expect("derive"),
+            derived,
+            "composed-signer derived id == LocalSigner derived id"
+        );
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "ciris-self"))
+            .await
+            .expect("seed key");
+
+        let input = crate::federation::EmitAttestationInput::with_envelope(
+            SCORES,
+            serde_json::json!({
+                "id": "emit-self-1", "dimension": "identity_binding:v1",
+                "score": 1.0, "confidence": 0.9,
+            }),
+        );
+        let att_id = engine
+            .emit_attestation_self(input)
+            .await
+            .expect("emit_attestation_self over composed signer");
+
+        let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            row.tier,
+            crate::federation::types::attestation_tier::FEDERATION
+        );
+        assert_eq!(
+            row.attesting_key_id, derived,
+            "attester == derived key_id of the composed signer (#247 floor)"
+        );
+        assert_eq!(row.scrub_key_id, derived, "scrub == derived key_id");
+        assert_eq!(
+            row.attested_key_id, derived,
+            "self-attestation default = derived key_id"
+        );
+        assert!(!row.scrub_signature_classical.is_empty());
+        assert!(row
+            .scrub_signature_pqc
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()));
+        assert_eq!(row.original_content_hash.len(), 64);
+        assert_eq!(row.weight, None, "no weight set ⇒ default None");
+    }
+
+    /// #253 PG twin — `emit_attestation_self` over the composed signer on a
+    /// live Postgres backend. Skips when `CIRIS_PERSIST_TEST_PG_URL` unset.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn emit_attestation_self_software_postgres() {
+        use crate::federation::types::attestation_type::SCORES;
+        use crate::federation::FederationDirectory;
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let label = format!("emit-self-{}", uuid::Uuid::new_v4().simple());
+        let signer = crate::federation::tier_ingest::test_support::local_signer(&label);
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), &dsn)
+            .await
+            .expect("pg engine");
+        let pg = engine.postgres_backend().expect("pg backend");
+        pg.put_public_key(sweeper_test_key_derived_for(&derived, &label))
+            .await
+            .unwrap();
+
+        let input = crate::federation::EmitAttestationInput::with_envelope(
+            SCORES,
+            serde_json::json!({
+                "id": "emit-self-pg-1", "dimension": "identity_binding:v1",
+                "score": 1.0, "confidence": 0.9,
+            }),
+        );
+        let att_id = engine
+            .emit_attestation_self(input)
+            .await
+            .expect("emit_attestation_self FK holds on derived id");
+
+        let row = pg.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            row.tier,
+            crate::federation::types::attestation_tier::FEDERATION
+        );
+        assert_eq!(row.attesting_key_id, derived);
+        assert_eq!(row.scrub_key_id, derived);
+        assert_eq!(row.original_content_hash.len(), 64);
+        assert!(!row.scrub_signature_classical.is_empty());
+        assert!(row
+            .scrub_signature_pqc
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()));
+    }
+
+    /// #253 — THE deliverable: a **hardware-hybrid** engine
+    /// (`with_hardware_signer_hybrid`, which holds only a composed signer and
+    /// no external `LocalSigner` to hand to `emit_attestation`) emits a
+    /// federation-tier row via `emit_attestation_self`. We register the key
+    /// under the engine's `local_derived_key_id()` carrying the HARDWARE
+    /// signer's real Ed25519 pubkey + the ML-DSA-65 half's pubkey, so the
+    /// federation-tier ingest gate hybrid-verifies the composed scrub sig.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn emit_attestation_self_hardware_hybrid_emits_sqlite() {
+        use crate::federation::types::attestation_type::SCORES;
+        use crate::federation::{FederationDirectory, KeyRecord, SignedKeyRecord};
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        let classical = hw_classical("hw-self-steward");
+        let hw_pubkey = classical.public_key().await.expect("hw pubkey");
+        let pqc = pqc_half();
+        let pqc_pubkey = pqc.public_key().await.expect("pqc pubkey");
+
+        let engine = Engine::with_hardware_signer_hybrid(
+            classical.clone(),
+            Some(pqc),
+            Some("hw-hybrid-pqc".to_owned()),
+            "sqlite::memory:",
+        )
+        .await
+        .expect("construct hybrid-hardware engine");
+
+        // The engine has NO external LocalSigner to hand to
+        // `emit_attestation` — `emit_attestation_self` is the only path.
+        let derived = engine.local_derived_key_id().await.expect("derive");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+
+        // Register the key under the derived id with the HARDWARE signer's
+        // real hybrid pubkeys so the ingest gate verifies the composed scrub.
+        let record = KeyRecord {
+            key_id: derived.clone(),
+            pubkey_ed25519_base64: B64.encode(&hw_pubkey),
+            pubkey_ml_dsa_65_base64: Some(B64.encode(&pqc_pubkey)),
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+            identity_ref: derived.clone(),
+            valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": derived.clone() }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: derived.clone(),
+            scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        sq.put_public_key(SignedKeyRecord { record })
+            .await
+            .expect("seed hw-derived key");
+
+        let input = crate::federation::EmitAttestationInput::with_envelope(
+            SCORES,
+            serde_json::json!({
+                "id": "emit-hw-1", "dimension": "identity_binding:v1",
+                "score": 1.0, "confidence": 0.9,
+            }),
+        );
+        let att_id = engine
+            .emit_attestation_self(input)
+            .await
+            .expect("hardware-hybrid engine emits via the composed signer (#253)");
+
+        let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            row.tier,
+            crate::federation::types::attestation_tier::FEDERATION
+        );
+        assert_eq!(
+            row.attesting_key_id, derived,
+            "attester == hardware-composed signer's derived key_id"
+        );
+        assert_eq!(row.scrub_key_id, derived);
+        assert!(row
+            .scrub_signature_pqc
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()));
+    }
+
+    /// #252 — `weight: Some(w)` folds onto the assembled row's
+    /// `Attestation::weight`; `None` (the default) leaves it `None`. A
+    /// weighted `scores` row round-trips its band instead of collapsing to
+    /// the `1.0` trust-model default.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn emit_attestation_weight_round_trips_sqlite() {
+        use crate::federation::types::attestation_type::SCORES;
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("ciris-weight");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "ciris-weight"))
+            .await
+            .expect("seed key");
+
+        // Weighted scores emit (the capacity-band case): weight survives.
+        let weighted = crate::federation::EmitAttestationInput::with_envelope(
+            SCORES,
+            serde_json::json!({
+                "id": "emit-w-1", "dimension": "capacity:sustained_coherence:v1",
+                "score": 0.42, "confidence": 0.9,
+            }),
+        )
+        .with_weight(Some(0.42));
+        let w_id = engine
+            .emit_attestation(&signer, weighted)
+            .await
+            .expect("weighted emit");
+        let w_row = sq.get_attestation(&w_id).await.unwrap().expect("row");
+        assert_eq!(
+            w_row.weight,
+            Some(0.42),
+            "Some(w) folds onto Attestation::weight (no collapse to 1.0)"
+        );
+
+        // Default (None) emit: weight stays None (pre-9.4.0 behavior).
+        let plain = crate::federation::EmitAttestationInput::with_envelope(
+            SCORES,
+            serde_json::json!({
+                "id": "emit-w-2", "dimension": "identity_binding:v1",
+                "score": 1.0, "confidence": 0.9,
+            }),
+        );
+        let p_id = engine
+            .emit_attestation(&signer, plain)
+            .await
+            .expect("default emit");
+        let p_row = sq.get_attestation(&p_id).await.unwrap().expect("row");
+        assert_eq!(p_row.weight, None, "None ⇒ unchanged default");
     }
 
     // ── #249 Cut C ── delegates_to / moderation emit ceremonies ───────

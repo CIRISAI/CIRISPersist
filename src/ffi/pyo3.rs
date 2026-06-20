@@ -3921,6 +3921,52 @@ impl PyEngine {
         })
     }
 
+    /// v9.4.0 (CIRISPersist#253) — node-self emit over the engine's OWN
+    /// **composed signer** (the common case: a node emitting a
+    /// federation-tier row about itself). `input_json` is the same
+    /// `EmitAttestationInput` as [`PyEngine::emit_attestation`]. Unlike
+    /// `emit_attestation` — whose FFI reconstructs a `LocalSigner` and
+    /// raises if absent — this signs via the engine's composed signer
+    /// (`Engine::sign_hybrid` over the propagated local signer), so a
+    /// **hardware-hybrid** PyEngine can emit. Returns the `attestation_id`.
+    ///
+    /// `attesting_key_id` / `scrub_key_id` are the composed signer's
+    /// **DERIVED** federation key_id (`local_derived_key_id`, the #247
+    /// floor), computed internally. Surfaces a clear error if the engine
+    /// has no composed hybrid signer (no local signer / no PQC half).
+    fn emit_attestation_self(&self, py: Python<'_>, input_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let input: crate::federation::EmitAttestationInput = serde_json::from_str(input_json)
+                .map_err(|e| {
+                PyValueError::new_err(format!("EmitAttestationInput JSON decode: {e}"))
+            })?;
+            let runtime = self.runtime.clone();
+            let backend = match &self.backend {
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            // Propagate the engine's OWN composed local signer (present for
+            // both software AND hardware-hybrid PyEngines — the latter is
+            // exactly the #253 case `emit_attestation` cannot serve). No
+            // pre-gate: `emit_attestation_self` surfaces the typed no-signer
+            // / PqcNotConfigured error honestly if the hybrid surface is
+            // unavailable.
+            let local_signer = self.local_signer.clone();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .emit_attestation_self(input)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
     // ── #249 Cut C ── delegates_to / moderation emit ceremonies ───────
     //
     // v9.3.0 (CIRISPersist#249) — the typed emit conveniences over the #248
