@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.2.1] — 2026-06-19
+
+### Changed — re-pin CIRISVerify v6.3.0 → v6.5.0 (wheel concurrence)
+
+- All six git-tag verify crates flipped in lockstep per the coherence rule; `version = "6"` unchanged (6.5.0 satisfies it). v6.4.x/6.5.0 are accord/server-facing (genesis producer, invocation concurrence) and do **not** touch persist's consumed surface — persist pins verify only for the scope-privacy XChaCha20-Poly1305 AEAD (`put_scope_blob`), live since v6.3.0. This re-pin is **family-floor / wheel concurrence** only: it keeps `pip install ciris-persist ciris-verify` resolving to one coherent verify across the cdylib family. No persist code change, no migration. Wheel `Requires-Dist` floor stays `ciris-verify>=6.0.0,<7` (6.5.0 in range; no #241-class metadata change).
+
 ## [9.2.0] — 2026-06-19
 
 ### Added — `EncryptedKVStore` app-layer XChaCha20-Poly1305 store (CIRISPersist#243 part 3)
