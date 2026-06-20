@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781909645302,
+  "lastUpdate": 1781914438556,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -35969,6 +35969,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 580105,
             "range": "± 1430",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f2b28d20dacf8e901e4ec2f7901553813386cb15",
+          "message": "feat(encrypted-kv): EncryptedKVStore — app-layer XChaCha20-Poly1305 over rusqlite (v9.2.0, #243 part 3) (#245)\n\nCold-state opacity for the openmls StorageProvider state CIRISEdge layers\non top, without SQLCipher (operator-chosen — no new C dependency, no change\nto the shared bundled rusqlite/libsqlite3-sys across the 7 wheel platforms).\n\nNew `encrypted-kv` feature + `src/encrypted_kv.rs`:\n- `EncryptedKVStore` trait (get/put/delete/scan, `impl Future + Send` style\n  matching BlobStorage) + `XChaChaKvStore` impl over a dedicated rusqlite\n  Connection (Arc<Mutex<…>> + spawn_blocking; self-creates its table) +\n  typed `KVError`.\n- Seals values AND keys with the CIRISVerify v6.3.0 scope-privacy crypto\n  (HKDF-SHA3-256 / HMAC-SHA3-256 / XChaCha20-Poly1305 — pure Rust):\n  value = xchacha::seal(K_value(ns), CSPRNG-24-nonce, value); keys blinded\n  as HMAC-SHA3-256(K_blind, ns ‖ key); a sealed plaintext-key copy enables\n  scan(prefix) recovery + filtering. Key hierarchy HKDF-derived from the\n  boot passphrase; K_value is namespace-bound (namespace isolation is\n  cryptographic). Derived keys + passphrase copy zeroized.\n- Boot UX: write-once __verifier__ row at fixed passphrase-independent\n  blinds; wrong passphrase ⇒ AEAD auth failure ⇒ KVError::WrongPassphrase,\n  refuse to operate. Hardware-key custodian releasing the passphrase is the\n  caller/operator's responsibility (FSD §7.8 phone-class degraded posture).\n\nVerify pin unchanged (v6.3.0). `encrypted-kv` added to the maturin wheel\nfeature list. Tests prove roundtrip/overwrite/namespace-isolation/wrong-\npassphrase and the load-bearing COLD-STATE OPACITY property (raw DB file\ncontains no plaintext key/value/namespace bytes). criterion bench reports\ncold-boot open + per-op overhead vs a plaintext rusqlite baseline.\n\nScope = part 3 only; part 4 lattice contraction stays CEG §11-blocked; #243\nremains open.\n\n\nClaude-Session: https://claude.ai/code/session_01RWKf675EcbswPMuEqprUNQ\n\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-06-19T18:49:20-05:00",
+          "tree_id": "7f057620648dc6064491f7349f409735d721855d",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/f2b28d20dacf8e901e4ec2f7901553813386cb15"
+        },
+        "date": 1781914436783,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 35977595,
+            "range": "± 429707",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2155644,
+            "range": "± 236910",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 9229,
+            "range": "± 59",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 12683,
+            "range": "± 92",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 19549,
+            "range": "± 48",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 52886,
+            "range": "± 423",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 34,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 176,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 500,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 570,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1964,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 72,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 222,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 974,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 14,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 39772,
+            "range": "± 39481",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 84125,
+            "range": "± 128862",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 302021,
+            "range": "± 437387",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 9209,
+            "range": "± 429",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 10376,
+            "range": "± 423",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 15147,
+            "range": "± 782",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 25378,
+            "range": "± 1216",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1829242,
+            "range": "± 7597",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 5104836,
+            "range": "± 46504",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 313016,
+            "range": "± 11997",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 919090,
+            "range": "± 28191",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 52037954,
+            "range": "± 1424699",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1973522,
+            "range": "± 90235",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 9498575,
+            "range": "± 307815",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 129529410,
+            "range": "± 1840363",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 5210205,
+            "range": "± 303802",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 23892490,
+            "range": "± 436820",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 101821,
+            "range": "± 4651",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 96386,
+            "range": "± 5004",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 7311,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 49144,
+            "range": "± 186",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 459386,
+            "range": "± 2354",
             "unit": "ns/iter"
           }
         ]
