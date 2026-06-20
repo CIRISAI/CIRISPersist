@@ -491,6 +491,38 @@ impl LocalSigner {
         B64.encode(self.classical.public_key_bytes())
     }
 
+    /// v9.3.0 (CIRISPersist#247) — 32-byte raw Ed25519 public key.
+    ///
+    /// The input to `ciris_verify_core::fedcode::derive_key_id(label,
+    /// ed25519_pubkey)`: a registered federation key_id is
+    /// `derive_key_id(<keystore alias>, <this pubkey>)`. The public,
+    /// synchronous sibling of the `pub(crate)`
+    /// [`Self::classical_public_key_bytes`] — exposed so
+    /// [`crate::Engine::emit_attestation`] (and any Rust consumer that
+    /// composes attestations) can reproduce the signer's derived
+    /// (registered) federation key_id without re-reading the seal.
+    /// Plaintext: derived; hardware: the ctor-cached
+    /// [`HardwareSigner::public_key`] read.
+    pub fn ed25519_public_key_bytes(&self) -> [u8; 32] {
+        self.classical.public_key_bytes()
+    }
+
+    /// v9.3.0 (CIRISPersist#247) — the signer's **registered (derived)
+    /// federation key_id**, `derive_key_id(self.key_id(), self
+    /// .ed25519_public_key_bytes())` = `"<label>-<fingerprint>"`.
+    ///
+    /// Distinct from [`Self::key_id`], which returns the raw keystore
+    /// **alias/label** (the `derive_key_id` *input*, e.g.
+    /// `"ciris-client"`). After CIRISVerify FSD-003 a node registers its
+    /// `federation_keys` row under the derived id (e.g.
+    /// `"ciris-client-cjgfikxxd5"`), so any value that must FK to
+    /// `federation_keys` (`attesting_key_id` / `scrub_key_id` on a
+    /// federation-tier write) MUST use this, not [`Self::key_id`]
+    /// (CIRISPersist#247).
+    pub fn derived_key_id(&self) -> String {
+        ciris_verify_core::fedcode::derive_key_id(&self.key_id, &self.ed25519_public_key_bytes())
+    }
+
     /// Local ML-DSA-65 public key, base64 standard alphabet
     /// (~2604 chars; 1952 raw bytes). Async because `PqcSigner`'s
     /// public_key path is async (HW signers may dispatch).

@@ -3863,6 +3863,64 @@ impl PyEngine {
         })
     }
 
+    // ── v9.3.0 (CIRISPersist#247 + #248) CEG-native graph DX: foundation ──
+    // The high-level emit primitive (later #249 cuts add more DX FFI here).
+
+    /// v9.3.0 (CIRISPersist#248) — emit ONE signed, **federation-tier** CEG
+    /// attestation. `input_json` is an `EmitAttestationInput`
+    /// (`attestation_type`, `attestation_envelope`, optional
+    /// `attested_key_id` / `subject_key_ids` / `cohort_scope` /
+    /// `expires_at`). The engine canonicalizes → SHA-256s → hybrid-signs
+    /// (Ed25519 + ML-DSA-65) with its configured local signer → assembles
+    /// the 20-field row → `put_attestation`. Returns the `attestation_id`.
+    ///
+    /// `attesting_key_id` / `scrub_key_id` are the signer's **DERIVED**
+    /// federation key_id, computed internally (never a caller alias) — the
+    /// #247 floor: this can't FK-violate the way the hand-rolled emit sites
+    /// did. Requires a PQC-configured local signer (the hybrid sign);
+    /// raises if absent.
+    fn emit_attestation(&self, py: Python<'_>, input_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let input: crate::federation::EmitAttestationInput = serde_json::from_str(input_json)
+                .map_err(|e| {
+                PyValueError::new_err(format!("EmitAttestationInput JSON decode: {e}"))
+            })?;
+            let runtime = self.runtime.clone();
+            // Convert the PyO3 dispatch to the crate-level engine dispatch
+            // (same shape `attestation_promote` reconstructs).
+            let backend = match &self.backend {
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            // `emit_attestation` derives the key_id from the LocalSigner it
+            // is handed — the engine's configured local signer (mirrors how
+            // `attestation_promote` reaches `sign_hybrid`). Absent ⇒ no
+            // hybrid-capable identity, surface honestly.
+            let local_signer = self.local_signer.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "emit_attestation requires a PQC-configured local signer \
+                     (construct the engine with local_pqc_key_id + local_pqc_key_path)",
+                )
+            })?;
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(
+                    backend,
+                    signer,
+                    Some(local_signer.clone()),
+                );
+                runtime.block_on(async move {
+                    engine
+                        .emit_attestation(&local_signer, input)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
     // NB (v4.0 #135) — the legacy `list_attestations_for(attested_key_id)
     // -> Vec<Attestation>` PyO3 wrapper (uncapped, no scope, no cursor) is
     // superseded by the scope-gated cursor-paged
@@ -22497,6 +22555,12 @@ mod tests {
                 Some(Arc::new(pqc)),
                 Some("promote-pqc".to_string()),
             ));
+            // v9.3.0 (#247) — the real-node shape: keystore alias ("occ") ≠
+            // registered derived federation key_id. Seed the row + the local
+            // attestation under the DERIVED id; promote scrubs as the derived
+            // id (FK holds — this FK-violated before the #247 fix).
+            let derived = local.derived_key_id();
+            assert_ne!(derived, "occ", "derived id differs from the alias");
             let signer: Arc<dyn HardwareSigner> = Arc::new(
                 crate::signing::LocalSignerHardwareAdapter::new(local.clone()),
             );
@@ -22504,19 +22568,19 @@ mod tests {
             // Seed the federation key + a local-tier self-attestation.
             sq.put_public_key(SignedKeyRecord {
                 record: KeyRecord {
-                    key_id: "occ".into(),
+                    key_id: derived.clone(),
                     pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
                     pubkey_ml_dsa_65_base64: None,
                     algorithm: crate::federation::types::algorithm::HYBRID.into(),
                     identity_type: crate::federation::types::identity_type::STEWARD.into(),
-                    identity_ref: "occ".into(),
+                    identity_ref: derived.clone(),
                     valid_from: "2026-05-01T00:00:00Z".parse().unwrap(),
                     valid_until: None,
-                    registration_envelope: serde_json::json!({ "id": "occ" }),
+                    registration_envelope: serde_json::json!({ "id": derived.clone() }),
                     original_content_hash: "deadbeef".into(),
                     scrub_signature_classical: "c2ln".into(),
                     scrub_signature_pqc: None,
-                    scrub_key_id: "occ".into(),
+                    scrub_key_id: derived.clone(),
                     scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
                     pqc_completed_at: None,
                     persist_row_hash: String::new(),
@@ -22528,7 +22592,7 @@ mod tests {
             .unwrap();
             let att_id = sq
                 .attestation_upsert_local(crate::federation::types::LocalAttestationInput {
-                    attesting_key_id: "occ".into(),
+                    attesting_key_id: derived.clone(),
                     attested_key_id: None,
                     attestation_type: crate::federation::types::attestation_type::SCORES.into(),
                     weight: Some(1.0),

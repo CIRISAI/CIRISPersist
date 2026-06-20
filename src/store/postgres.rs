@@ -19523,6 +19523,33 @@ mod tests {
             })
             .await
             .unwrap();
+        // v9.3.0 (#247) — put_blob_signing's holds_bytes scrub_key_id +
+        // the eviction `withdraws` are written under the host's DERIVED
+        // federation key_id; register that row too (keyed by the derived
+        // id, carrying the host's real pubkeys so the FK resolves and the
+        // withdraws hybrid-verifies on a real node).
+        let derived = pg_derived_id_for(host_key_id);
+        let mut record = fix_section_i_key(host_key_id, host_key_id, chrono::Utc::now(), false);
+        record.key_id = derived.clone();
+        record.identity_ref = derived.clone();
+        record.scrub_key_id = derived.clone();
+        record.registration_envelope = serde_json::json!({ "id": derived });
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord { record })
+            .await
+            .unwrap();
+    }
+
+    /// v9.3.0 (#247) — the DERIVED federation key_id for `alias`'s
+    /// deterministic test keypair (`derive_key_id(alias, <ed pubkey>)`).
+    fn pg_derived_id_for(alias: &str) -> String {
+        let (ed_pk_b64, _) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(alias);
+        let ed_pk = {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            B64.decode(ed_pk_b64).expect("ed pubkey b64")
+        };
+        ciris_verify_core::fedcode::derive_key_id(alias, &ed_pk)
     }
 
     fn pg_blob_attestation(
@@ -25160,6 +25187,12 @@ mod tests {
         // pg_blob_bootstrap_host registers via fix_section_i_key) so the
         // sweeper's federation-tier withdraws verifies at the ingest gate.
         let signer = crate::federation::tier_ingest::test_support::local_signer(&host);
+        // v9.3.0 (#247) — the real-node shape: the steward's registered
+        // federation key_id is the DERIVED id (`<alias>-<fp>`); the sweeper
+        // now matches + withdraws by it, so the FK row + holds_bytes are
+        // seeded under the derived id (carrying `host`'s real pubkeys so the
+        // ingest gate verifies).
+        let derived = signer.derived_key_id();
         let cfg = crate::federation::ReplicationConfig {
             // Very tight budget so eviction is forced.
             storage_budget_bytes: 1024,
@@ -25171,12 +25204,23 @@ mod tests {
             .await
             .unwrap();
         // Seed the federation_keys row for the signer (FK target for
-        // withdraws attestations).
+        // withdraws attestations), keyed by the DERIVED id but carrying
+        // `host`'s real hybrid pubkeys.
         let pg = engine.postgres_backend().expect("pg").clone();
-        pg_blob_bootstrap_host(&pg, &host).await;
+        {
+            use crate::federation::FederationDirectory;
+            let mut record = fix_section_i_key(&host, &host, chrono::Utc::now(), false);
+            record.key_id = derived.clone();
+            record.identity_ref = derived.clone();
+            record.scrub_key_id = derived.clone();
+            record.registration_envelope = serde_json::json!({ "id": derived.clone() });
+            pg.put_public_key(crate::federation::SignedKeyRecord { record })
+                .await
+                .unwrap();
+        }
         // Seed 5 × 1 KiB blobs via the Engine's put_blob_signing path
         // so each lands a holds_bytes attestation owned by the
-        // signer.
+        // signer (the derived id).
         use crate::federation::BlobBody;
         let mut shas = Vec::new();
         for i in 0..5 {
@@ -25187,7 +25231,7 @@ mod tests {
                     &sha,
                     BlobBody::Inline(bytes),
                     None,
-                    &host,
+                    &derived,
                     chrono::Utc::now(),
                     uuid::Uuid::new_v4(),
                 )
@@ -25217,7 +25261,7 @@ mod tests {
         // Confirm at least one withdraws row exists in PG
         // federation_attestations for this signer.
         let directory = engine.federation_directory();
-        let atts = directory.list_attestations_by(&host).await.unwrap();
+        let atts = directory.list_attestations_by(&derived).await.unwrap();
         let withdraws_count = atts
             .iter()
             .filter(|a| a.attestation_type == crate::federation::types::attestation_type::WITHDRAWS)
@@ -25246,15 +25290,12 @@ mod tests {
             return;
         };
         use crate::federation::{BlobBody, BlobStorage};
-        use crate::signing::LocalSigner;
-        use ed25519_dalek::SigningKey;
         let host = format!("score-host-{}", uuid_like());
-        let signer = std::sync::Arc::new(LocalSigner::from_parts(
-            SigningKey::from_bytes(&[0x7C; 32]),
-            host.clone(),
-            None,
-            None,
-        ));
+        // v9.3.0 (#247) — deterministic keypair (matching hybrid_pubkeys)
+        // so the signer's DERIVED id == the one `pg_blob_bootstrap_host`
+        // registers; put_blob_signing's holds_bytes scrub FK then resolves.
+        let signer = crate::federation::tier_ingest::test_support::local_signer(&host);
+        let derived = pg_derived_id_for(&host);
         let cfg = crate::federation::ReplicationConfig {
             storage_budget_bytes: 4 * 1024,
             steady_state_utilization: 0.9,
@@ -25275,7 +25316,7 @@ mod tests {
                     &sha,
                     BlobBody::Inline(bytes),
                     None,
-                    &host,
+                    &derived,
                     chrono::Utc::now(),
                     uuid::Uuid::new_v4(),
                 )
@@ -25318,6 +25359,9 @@ mod tests {
         // `host` (matches pg_blob_bootstrap_host's registered pubkeys) so
         // the sweeper's federation-tier withdraws verifies at the gate.
         let signer = crate::federation::tier_ingest::test_support::local_signer(&host);
+        // v9.3.0 (#247) — the holder/attester is the signer's DERIVED
+        // federation key_id; the sweeper matches + withdraws by it.
+        let derived = pg_derived_id_for(&host);
         let cfg = crate::federation::ReplicationConfig {
             storage_budget_bytes: 1024,
             steady_state_utilization: 0.5,
@@ -25338,7 +25382,7 @@ mod tests {
                     &sha,
                     BlobBody::Inline(bytes),
                     None,
-                    &host,
+                    &derived,
                     chrono::Utc::now(),
                     uuid::Uuid::new_v4(),
                 )
@@ -25346,10 +25390,10 @@ mod tests {
                 .unwrap();
             shas.push(sha);
         }
-        // Before sweep: each blob has this signer as holder.
+        // Before sweep: each blob has this signer (derived id) as holder.
         for sha in &shas {
             let holders = pg.list_holders(sha).await.unwrap();
-            assert!(holders.contains(&host));
+            assert!(holders.contains(&derived));
         }
         let report = engine.sweep_evictions_once().await.expect("sweep");
         assert!(report.rows_evicted > 0);
@@ -25376,7 +25420,7 @@ mod tests {
             }
             let holders = pg.list_holders(sha).await.unwrap();
             assert!(
-                !holders.contains(&host),
+                !holders.contains(&derived),
                 "evicted blob must have host removed from holders"
             );
         }

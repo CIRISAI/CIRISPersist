@@ -13880,6 +13880,37 @@ mod tests {
         }
     }
 
+    /// v9.3.0 (#247) — the DERIVED federation key_id for `alias`'s
+    /// deterministic test keypair (`derive_key_id(alias, <ed pubkey>)`).
+    /// `put_blob_signing` / the eviction `withdraws` now write
+    /// `scrub_key_id` = this (the signer's registered id), so blob-test
+    /// seed helpers register this row in addition to the bare-alias row.
+    fn derived_id_for(alias: &str) -> String {
+        let (ed_pk_b64, _) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(alias);
+        let ed_pk = {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            B64.decode(ed_pk_b64).expect("ed pubkey b64")
+        };
+        ciris_verify_core::fedcode::derive_key_id(alias, &ed_pk)
+    }
+
+    /// v9.3.0 (#247) — a `federation_keys` row keyed by `alias`'s DERIVED
+    /// id but carrying `alias`'s REAL deterministic hybrid pubkeys, so a
+    /// federation-tier row signed by `alias`'s keypair and attested as the
+    /// derived id both FK-resolves AND hybrid-verifies at the ingest gate
+    /// (the holds_bytes scrub / eviction withdraws path).
+    fn fed_key_derived(alias: &str) -> KeyRecord {
+        let derived = derived_id_for(alias);
+        // fed_key(<key_id>, ...) fills pubkeys from hybrid_pubkeys(<key_id>);
+        // override key_id to the derived id while keeping `alias`'s pubkeys.
+        let mut record = fed_key(alias, &derived, &derived);
+        record.key_id = derived.clone();
+        record.identity_ref = derived.clone();
+        record.registration_envelope = serde_json::json!({ "id": derived });
+        record
+    }
+
     /// v9.0.0 (CC 5.3.2.4.3.1) — (re-)sign a federation-tier test
     /// attestation's envelope with its `attesting_key_id`'s deterministic
     /// hybrid key, so the mandatory federation-tier ingest gate verifies
@@ -19343,6 +19374,15 @@ mod tests {
             })
             .await
             .unwrap();
+        // v9.3.0 (#247) — put_blob_signing's holds_bytes scrub_key_id is
+        // host-a's DERIVED federation key_id; register that row too
+        // (keyed by the derived id, carrying host-a's real pubkeys).
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_derived("host-a"),
+            })
+            .await
+            .unwrap();
         backend
     }
 
@@ -20055,6 +20095,16 @@ mod tests {
             backend
                 .put_public_key(SignedKeyRecord {
                     record: fed_key(actor, actor, actor),
+                })
+                .await
+                .unwrap();
+            // v9.3.0 (#247) — the eviction `withdraws` + holds_bytes scrub
+            // are attested/signed under the actor's DERIVED federation
+            // key_id; register that row (carrying the actor's real pubkeys)
+            // so those FKs resolve AND the withdraws hybrid-verifies.
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key_derived(actor),
                 })
                 .await
                 .unwrap();
