@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.3.1] — 2026-06-20
+
+### Changed — re-pin CIRISVerify v6.6.0 → v6.6.1 (wheel concurrence)
+
+- All six git-tag verify crates flipped in lockstep; `version = "6"` unchanged. v6.6.1 is an identity-producer fix (decouple the ML-DSA seal alias from the recorded key_id in `create_federation_identity`, CIRISVerify#89) and does **not** touch persist's consumed surface (`verify_hybrid` / `canonical` / `transparency` / `xchacha` / `hkdf` / `hmac`). Family-floor / wheel-concurrence re-pin only; no persist code change. Wheel `Requires-Dist` floor stays `>=6.0.0,<7`. (CIRISVerify#89 unblocks the CIRISServer#45 USER derived-key_id path, pairing with persist's #247 node-half already in v9.3.0.)
+
 ## [9.3.0] — 2026-06-20
 
 ### Added — CEG-native graph DX: foundation (CIRISPersist#247 + #248)
