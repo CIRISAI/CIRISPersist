@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.4.1] — 2026-06-20
+
+### Changed — re-pin CIRISVerify v6.6.1 → v6.7.1 (wheel concurrence)
+
+- All six git-tag verify crates flipped in lockstep; `version = "6"` unchanged. v6.7.0/v6.7.1 add an **accord-holder custody attestation** module (`ciris_verify_core::accord_custody_attestation`, Yubico/FIPS variable-length hardware-key chain, the safe-mesh custody floor — CIRISVerify#91/#93) — a purely **additive** new surface that does **not** touch persist's consumed APIs (`verify_hybrid` / `canonical` / `transparency` / `xchacha` / `hkdf` / `hmac` / `fedcode`). Family-floor / wheel-concurrence re-pin only; no persist code change. Wheel `Requires-Dist` floor stays `>=6.0.0,<7`.
+
 ## [9.4.0] — 2026-06-20
 
 ### Added — complete the `emit_attestation` surface (CIRISPersist#253 + #252)
