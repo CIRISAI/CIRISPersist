@@ -64,6 +64,14 @@ pub const SELF_AT_LOGIN_DELEGATION_SCOPE: [&str; 4] = [
 /// (`require_version_segment`); structural primitives are gate-exempt
 /// but we version uniformly so a future consumer can gate on it.
 pub const DIMENSION_DELEGATES_TO_AGENT: &str = "self:delegates_to:agent_occurrence:v1";
+/// v9.3.0 (CIRISPersist#249) — `dimension` for the GENERAL `delegates_to`
+/// envelope ([`delegates_to_envelope`]), the §11.10 grant/owner-bind/
+/// add-moderator emit ceremonies' edge axis. `delegates_to` is a
+/// structural primitive (gate-exempt from the §13.1 dimension gate — only
+/// `scores` passes through [`crate::federation::admission::DimensionAdmissionPolicy`]),
+/// so this is advisory/routing, not load-bearing; carried for uniformity
+/// with [`DIMENSION_DELEGATES_TO_AGENT`].
+pub const DIMENSION_DELEGATES_TO: &str = "self:delegates_to:v1";
 /// `dimension` for the partnership-grant consent envelope. Carries the
 /// `:v1` version segment the `scores` admission gate
 /// (`require_version_segment`) requires.
@@ -104,6 +112,50 @@ pub fn delegates_to_agent_envelope(
         "agent_occurrence_key_id": agent_occurrence_key_id,
         "bilateral_pair_id": bilateral_pair_id,
         "scope": scope,
+    })
+}
+
+/// v9.3.0 (CIRISPersist#249, CEG §3.2.1 / §11.10) — the **general**
+/// `delegates_to` envelope: "I authorize `delegate_key_id` within
+/// `scopes`", with an explicit `sub_delegation` deputization flag. This is
+/// the builder the §249 Cut C emit ceremonies
+/// ([`crate::Engine::grant_delegation`] and its specializations
+/// `owner_bind` / `add_moderator`) stamp; the login-specific
+/// [`delegates_to_agent_envelope`] is the §8.1.12.7 specialization (it
+/// additionally carries `agent_occurrence_key_id` + `bilateral_pair_id`).
+///
+/// The `scope` is emitted as a JSON array (a set) — the exact shape the
+/// [`crate::federation::admission`] duty walk's
+/// `delegation_scope_grants` / `delegation_scope_set` accept for
+/// set-containment + §11.10 `⊆`-parent attenuation. `sub_delegation` is a
+/// top-level bool the §11.10 deputization gate
+/// ([`crate::federation::admission`]'s `delegation_grants_sub_delegation`)
+/// reads — a delegate WITHOUT it is a leaf (may exercise the duty, may not
+/// deputize onward). An edge built here is therefore directly admissible
+/// by `is_named_moderator` / `is_owner_bound` / `check_moderation_admission`.
+///
+/// Wire shape (sorted-keys when canonicalized):
+///
+/// ```json
+/// {
+///   "delegate_key_id": "<delegate key>",
+///   "dimension": "self:delegates_to:v1",
+///   "kind": "delegates_to",
+///   "scope": ["moderate"],
+///   "sub_delegation": false
+/// }
+/// ```
+pub fn delegates_to_envelope(
+    delegate_key_id: &str,
+    scopes: &[String],
+    sub_delegation: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "delegates_to",
+        "dimension": DIMENSION_DELEGATES_TO,
+        "delegate_key_id": delegate_key_id,
+        "scope": scopes,
+        "sub_delegation": sub_delegation,
     })
 }
 
@@ -181,6 +233,25 @@ mod tests {
         assert_eq!(scope.len(), 4);
         assert!(scope.iter().any(|v| v == SCOPE_ACT_ON_BEHALF));
         assert!(scope.iter().any(|v| v == SCOPE_SUB_DELEGATION));
+    }
+
+    #[test]
+    fn general_delegates_to_envelope_admissible_shape() {
+        // #249 Cut C — the general builder emits `scope` as an array-set +
+        // a top-level `sub_delegation` bool, the exact shape the §11.10 duty
+        // walk's containment + deputization checks read.
+        let env = delegates_to_envelope(
+            "delegate-key",
+            &["moderate".to_string(), "review".to_string()],
+            true,
+        );
+        assert_eq!(env["kind"], "delegates_to");
+        assert_eq!(env["dimension"], DIMENSION_DELEGATES_TO);
+        assert_eq!(env["delegate_key_id"], "delegate-key");
+        assert_eq!(env["sub_delegation"], true);
+        let scope = env["scope"].as_array().unwrap();
+        assert!(scope.iter().any(|v| v == "moderate"));
+        assert!(scope.iter().any(|v| v == "review"));
     }
 
     #[test]

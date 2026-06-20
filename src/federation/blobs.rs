@@ -900,7 +900,18 @@ pub trait BlobStorage: Send + Sync {
                 .await
                 .map_err(|e| BlobError::AttestationEmissionFailed(format!("signer.sign: {e}")))?;
             let scrub_signature_classical = B64.encode(&sig_bytes);
-            let scrub_key_id = signer.current_alias().to_string();
+            // v9.3.0 (#247) — the holds_bytes `scrub_key_id` FKs to
+            // `federation_keys(key_id)`, which is the DERIVED wire key_id
+            // (`<label>-<fp>`), NOT the keystore alias `current_alias()`.
+            // Using the alias FK-violated on every node whose alias ≠
+            // derived id (the same class as `attestation_promote` #247).
+            let signer_pubkey = signer.public_key().await.map_err(|e| {
+                BlobError::AttestationEmissionFailed(format!(
+                    "holds_bytes derive scrub_key_id (signer public_key): {e}"
+                ))
+            })?;
+            let scrub_key_id =
+                ciris_verify_core::fedcode::derive_key_id(signer.current_alias(), &signer_pubkey);
 
             let att = PutBlobAttestation {
                 attesting_key_id: attesting_key_id.to_string(),
@@ -1753,7 +1764,7 @@ pub fn holds_bytes_attestation_envelope(sha256: &[u8; 32]) -> serde_json::Value 
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) async fn emit_withdraws_attestation_helper(
     prior: &crate::federation::Attestation,
-    signer_key_id: &str,
+    _signer_key_id: &str,
     signer: &crate::signing::LocalSigner,
     directory: &dyn crate::federation::FederationDirectory,
     now: chrono::DateTime<chrono::Utc>,
@@ -1761,6 +1772,14 @@ pub(crate) async fn emit_withdraws_attestation_helper(
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
+
+    // v9.3.0 (#247) — the withdraws' FK fields (attesting/attested/scrub)
+    // are the SIGNER's registered DERIVED federation key_id (`<label>-<fp>`),
+    // computed from the signer itself — NOT the caller-supplied alias
+    // (`_signer_key_id`), which FK-violated on every real node (alias ≠
+    // derived id). Same #247 floor as `Engine::emit_attestation`. The host
+    // attests it itself no longer holds the bytes (a self-revocation).
+    let signer_key_id = signer.derived_key_id();
 
     let envelope = crate::federation::withdraws_attestation_envelope(
         &prior.attestation_id,
@@ -2619,7 +2638,27 @@ mod tests {
             attestation_evidence: None,
         };
         backend
-            .put_public_key(crate::federation::types::SignedKeyRecord { record })
+            .put_public_key(crate::federation::types::SignedKeyRecord {
+                record: record.clone(),
+            })
+            .await
+            .unwrap();
+        // v9.3.0 (#247) — put_blob_signing's holds_bytes scrub_key_id is
+        // the signer's DERIVED federation key_id; register that row too so
+        // the scrub FK resolves on a real node (alias ≠ derived id).
+        let derived = ciris_verify_core::fedcode::derive_key_id(
+            key_id,
+            &signing_key.verifying_key().to_bytes(),
+        );
+        let mut derived_record = record;
+        derived_record.key_id = derived.clone();
+        derived_record.identity_ref = derived.clone();
+        derived_record.scrub_key_id = derived.clone();
+        derived_record.registration_envelope = serde_json::json!({ "id": derived });
+        backend
+            .put_public_key(crate::federation::types::SignedKeyRecord {
+                record: derived_record,
+            })
             .await
             .unwrap();
         let local = std::sync::Arc::new(crate::signing::LocalSigner::from_parts(

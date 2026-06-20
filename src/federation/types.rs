@@ -321,6 +321,38 @@ pub mod delegation_scope {
     /// `agency:decide` — make decisions as a principal.
     pub const AGENCY_DECIDE: &str = "agency:decide";
 
+    // ── #249 Cut C ── §11.10 delegated-duty scope tokens ──────────────
+    //
+    // v9.3.0 (CIRISPersist#249, CEG §11.10 / §3.2.3 rule-(3);
+    // CIRISRegistry#90) — the three moderation **duty** scope tokens a
+    // `delegates_to` chain bears to confer a §11.10 moderation duty. These
+    // are unprefixed duty tokens (NOT `infra:*` / `agency:*` — a
+    // moderation duty is orthogonal to the CC 4.4.3.4.3 server/brain
+    // split), and they are the producer-side names for the duties the
+    // admission duty-walk matches: each ALIASES the canonical
+    // [`crate::federation::admission`] duty-scope constant BY VALUE, so an
+    // edge stamped with one of these is exactly what
+    // [`crate::federation::admission::is_named_moderator`] /
+    // [`crate::federation::admission::check_moderation_admission`] admit
+    // (the walk's [`delegation_scope_grants`] containment check compares
+    // against these same tokens). Same wire-shape acceptance as the other
+    // scopes (bare string OR array-set).
+    //
+    // [`delegation_scope_grants`]: crate::federation::admission
+
+    /// `moderate` — the §11.10 moderation duty. Aliases
+    /// [`crate::federation::admission::DELEGATION_SCOPE_MODERATE`] by value
+    /// (the token the duty walk matches). A `delegates_to` bearing this
+    /// authorizes the delegate to file a `moderation:*` report on the
+    /// delegator's behalf.
+    pub const SCOPE_MODERATE: &str = crate::federation::admission::DELEGATION_SCOPE_MODERATE;
+    /// `takedown` — the §11.10 takedown duty. Aliases
+    /// [`crate::federation::admission::DELEGATION_SCOPE_TAKEDOWN`] by value.
+    pub const SCOPE_TAKEDOWN: &str = crate::federation::admission::DELEGATION_SCOPE_TAKEDOWN;
+    /// `review` — the §11.10 reconsideration/review duty. Aliases
+    /// [`crate::federation::admission::DELEGATION_SCOPE_REVIEW`] by value.
+    pub const SCOPE_REVIEW: &str = crate::federation::admission::DELEGATION_SCOPE_REVIEW;
+
     /// CC 1.13.5 — the legacy **unprefixed** agency kinds (the pre-split
     /// `self_at_login` agency profile + `reason`/`decide`) that MUST also
     /// be rejected on a node key. `network_presence` is deliberately
@@ -707,6 +739,63 @@ impl LocalAttestationInput {
             cohort_scope: self.cohort_scope,
             tier: attestation_tier::LOCAL.to_string(),
             promoted_at: None,
+        }
+    }
+}
+
+/// v9.3.0 (CIRISPersist#248) — inputs to
+/// [`crate::Engine::emit_attestation`], the high-level "produce ONE
+/// signed federation-tier CEG attestation" primitive.
+///
+/// The helper canonicalizes [`Self::attestation_envelope`], SHA-256s the
+/// canonical bytes (`original_content_hash`), hybrid-signs (Ed25519 +
+/// ML-DSA-65 bound), and assembles the 20-field [`Attestation`] with
+/// `attesting_key_id == scrub_key_id == <signer's DERIVED federation
+/// key_id>` — derived internally (never a caller alias), which
+/// structurally fixes CIRISPersist#247. Consumers stop hand-rolling the
+/// ~50-line canonicalize→sign→assemble→`put_attestation` pattern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmitAttestationInput {
+    /// The §3 structural primitive (`scores` / `delegates_to` /
+    /// `withdraws` / …) — the row's `attestation_type`.
+    pub attestation_type: String,
+    /// Primary attested key. Defaults to the signer's derived key_id
+    /// (a self-attestation) when `None`. Must exist in `federation_keys`
+    /// when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attested_key_id: Option<String>,
+    /// The CEG attestation envelope (canonicalized via
+    /// `ceg_produce_canonicalize`; never mutated).
+    pub attestation_envelope: serde_json::Value,
+    /// §4.2.6 subjects this attestation names. May be empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_key_ids: Vec<String>,
+    /// Producer-side visibility scope. Defaults `federation` for a
+    /// federation-tier emit (see [`Self::with_envelope`]).
+    #[serde(default = "default_cohort_scope")]
+    pub cohort_scope: String,
+    /// Optional expiry (`delegates_to` / `consent:*` lifecycles).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl EmitAttestationInput {
+    /// Build a federation-scope input from a `type` + envelope, leaving
+    /// `attested_key_id`/`subject_key_ids`/`expires_at` at their
+    /// self-attestation defaults. `cohort_scope` defaults to
+    /// `federation` (the tier of every [`crate::Engine::emit_attestation`]
+    /// write).
+    pub fn with_envelope(
+        attestation_type: impl Into<String>,
+        attestation_envelope: serde_json::Value,
+    ) -> Self {
+        Self {
+            attestation_type: attestation_type.into(),
+            attested_key_id: None,
+            attestation_envelope,
+            subject_key_ids: Vec::new(),
+            cohort_scope: cohort_scope::FEDERATION.to_string(),
+            expires_at: None,
         }
     }
 }
@@ -1756,6 +1845,29 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #249 Cut C — the producer-side moderate-scope tokens MUST equal the
+    /// admission duty-walk's scope constants, or an emitted edge would not
+    /// be admissible by `is_named_moderator` / `check_moderation_admission`.
+    #[test]
+    fn moderate_scope_tokens_match_the_admission_duty_walk() {
+        assert_eq!(delegation_scope::SCOPE_MODERATE, "moderate");
+        assert_eq!(delegation_scope::SCOPE_TAKEDOWN, "takedown");
+        assert_eq!(delegation_scope::SCOPE_REVIEW, "review");
+        // Aliased BY VALUE to the admission constants the walk matches.
+        assert_eq!(
+            delegation_scope::SCOPE_MODERATE,
+            crate::federation::admission::DELEGATION_SCOPE_MODERATE
+        );
+        assert_eq!(
+            delegation_scope::SCOPE_TAKEDOWN,
+            crate::federation::admission::DELEGATION_SCOPE_TAKEDOWN
+        );
+        assert_eq!(
+            delegation_scope::SCOPE_REVIEW,
+            crate::federation::admission::DELEGATION_SCOPE_REVIEW
+        );
+    }
 
     fn fixture_key_record() -> KeyRecord {
         KeyRecord {

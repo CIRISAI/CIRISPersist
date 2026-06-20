@@ -348,6 +348,27 @@ mod tests {
         }
     }
 
+    /// v9.3.0 (#247) — a `federation_keys` row keyed by `alias`'s DERIVED
+    /// federation key_id but carrying `alias`'s real pubkeys, so the
+    /// holds_bytes scrub_key_id + the takedown `withdraws` (both written
+    /// under the signer's derived id) FK-resolve and hybrid-verify on a
+    /// real node (alias ≠ derived id).
+    fn fed_key_derived(alias: &str) -> KeyRecord {
+        let (ed_pk_b64, _) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(alias);
+        let ed_pk = {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            B64.decode(ed_pk_b64).expect("ed pubkey b64")
+        };
+        let derived = ciris_verify_core::fedcode::derive_key_id(alias, &ed_pk);
+        let mut record = fed_key(alias);
+        record.key_id = derived.clone();
+        record.identity_ref = derived.clone();
+        record.scrub_key_id = derived.clone();
+        record.registration_envelope = serde_json::json!({ "id": derived });
+        record
+    }
+
     /// v9.0.0 (CC 5.3.2.4.3.1) — a PQC-configured LocalSigner keyed on
     /// `alias` (deterministic; matches the pubkeys `fed_key(alias)`
     /// registers). The takedown handler hybrid-signs the federation-tier
@@ -373,6 +394,15 @@ mod tests {
             backend
                 .put_public_key(SignedKeyRecord {
                     record: fed_key(actor),
+                })
+                .await
+                .unwrap();
+            // v9.3.0 (#247) — also register the actor's DERIVED id row
+            // (the holds_bytes scrub + the takedown withdraws are written
+            // under it).
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key_derived(actor),
                 })
                 .await
                 .unwrap();

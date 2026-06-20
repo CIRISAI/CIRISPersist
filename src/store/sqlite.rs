@@ -2583,6 +2583,46 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(true)
     }
 
+    // ── #249 Cut B ── incremental community-roster grow (mirror of
+    //    add_family_member). Read-modify-write under the connection lock.
+    async fn add_community_member(
+        &self,
+        community_key_id: &str,
+        member: crate::federation::types::CommunityMember,
+    ) -> Result<bool, crate::federation::Error> {
+        let mut community = self
+            .lookup_community(community_key_id)
+            .await?
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "add_community_member names unknown community_key_id {community_key_id:?}"
+                ))
+            })?;
+        if community.members.iter().any(|m| m.key_id == member.key_id) {
+            return Ok(false); // already on the roster — no-op
+        }
+        community.members.push(member);
+        community.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(&community)?;
+        let members_json = serde_json::to_string(&community.members)
+            .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
+        let conn = self.conn.clone();
+        let key = community_key_id.to_owned();
+        let hash = community.persist_row_hash.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "UPDATE federation_communities \
+                    SET members = ?2, persist_row_hash = ?3 \
+                  WHERE community_key_id = ?1",
+                rusqlite::params![key, members_json, hash],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("add_community_member: {e}")))?;
+        Ok(true)
+    }
+
     async fn lookup_family(
         &self,
         family_key_id: &str,
@@ -13880,6 +13920,37 @@ mod tests {
         }
     }
 
+    /// v9.3.0 (#247) — the DERIVED federation key_id for `alias`'s
+    /// deterministic test keypair (`derive_key_id(alias, <ed pubkey>)`).
+    /// `put_blob_signing` / the eviction `withdraws` now write
+    /// `scrub_key_id` = this (the signer's registered id), so blob-test
+    /// seed helpers register this row in addition to the bare-alias row.
+    fn derived_id_for(alias: &str) -> String {
+        let (ed_pk_b64, _) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(alias);
+        let ed_pk = {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            B64.decode(ed_pk_b64).expect("ed pubkey b64")
+        };
+        ciris_verify_core::fedcode::derive_key_id(alias, &ed_pk)
+    }
+
+    /// v9.3.0 (#247) — a `federation_keys` row keyed by `alias`'s DERIVED
+    /// id but carrying `alias`'s REAL deterministic hybrid pubkeys, so a
+    /// federation-tier row signed by `alias`'s keypair and attested as the
+    /// derived id both FK-resolves AND hybrid-verifies at the ingest gate
+    /// (the holds_bytes scrub / eviction withdraws path).
+    fn fed_key_derived(alias: &str) -> KeyRecord {
+        let derived = derived_id_for(alias);
+        // fed_key(<key_id>, ...) fills pubkeys from hybrid_pubkeys(<key_id>);
+        // override key_id to the derived id while keeping `alias`'s pubkeys.
+        let mut record = fed_key(alias, &derived, &derived);
+        record.key_id = derived.clone();
+        record.identity_ref = derived.clone();
+        record.registration_envelope = serde_json::json!({ "id": derived });
+        record
+    }
+
     /// v9.0.0 (CC 5.3.2.4.3.1) — (re-)sign a federation-tier test
     /// attestation's envelope with its `attesting_key_id`'s deterministic
     /// hybrid key, so the mandatory federation-tier ingest gate verifies
@@ -16866,6 +16937,97 @@ mod tests {
         );
     }
 
+    /// #249 Cut A — the JSON-shape contract the FFI active-variant
+    /// wrappers (`list_communities_for_member_active_json` /
+    /// `list_families_for_member_active_json`) expose to pyo3 consumers:
+    /// seed a community + an effective membership revocation, then assert
+    /// the serde_json serialization of `list_communities_for_member_active`
+    /// (exactly what the wrapper returns) EXCLUDES the revoked member while
+    /// the full-history `list_communities_for_member` still includes them.
+    /// This is the "stop hand-folding revocations" property — proven at the
+    /// serialized boundary the UI consumes, not just the typed Rust level.
+    #[tokio::test]
+    async fn cut_a_active_community_json_excludes_revoked_member_sqlite() {
+        use crate::federation::{Community, FederationDirectory};
+        let backend = community_fixture(
+            &[("alice", "alice-occ", true), ("bob", "bob-occ", true)],
+            None,
+        )
+        .await;
+
+        // Pre-revocation: both alice and bob see the community in their
+        // active list, and the JSON array carries one Community.
+        for member in ["alice", "bob"] {
+            let active = backend
+                .list_communities_for_member_active(member)
+                .await
+                .unwrap();
+            let json = serde_json::to_string(&active).unwrap();
+            let parsed: Vec<Community> = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.len(), 1, "{member} active before revocation");
+            assert_eq!(parsed[0].community_key_id, "comm");
+        }
+
+        // Remove bob, effective in the past.
+        backend
+            .put_community_membership_revocation(comm_revoke("bob", "2026-06-10T00:00:00Z"))
+            .await
+            .unwrap();
+
+        // Active list (the FFI wrapper's payload) now EXCLUDES bob via the
+        // serialized JSON shape...
+        let bob_active = backend
+            .list_communities_for_member_active("bob")
+            .await
+            .unwrap();
+        let bob_json = serde_json::to_string(&bob_active).unwrap();
+        let bob_parsed: Vec<Community> = serde_json::from_str(&bob_json).unwrap();
+        assert!(
+            bob_parsed.is_empty(),
+            "active JSON must drop the revoked member, got {bob_json}"
+        );
+
+        // ...while the full-history reader still lists the community for bob
+        // (the `_json` wrapper of `list_communities_for_member` is unchanged).
+        let bob_history = backend.list_communities_for_member("bob").await.unwrap();
+        assert_eq!(
+            bob_history.len(),
+            1,
+            "full-history reader is unaffected by the revocation"
+        );
+
+        // alice (not revoked) stays in the active JSON.
+        let alice_active = backend
+            .list_communities_for_member_active("alice")
+            .await
+            .unwrap();
+        let alice_parsed: Vec<Community> =
+            serde_json::from_str(&serde_json::to_string(&alice_active).unwrap()).unwrap();
+        assert_eq!(alice_parsed.len(), 1, "remaining member stays active");
+
+        // The community-membership revocation reader (the
+        // `list_community_membership_revocations_for_json` payload) carries
+        // exactly the one bob removal.
+        let revs = backend
+            .list_community_membership_revocations_for("comm")
+            .await
+            .unwrap();
+        let revs_parsed: Vec<crate::federation::CommunityMembershipRevocation> =
+            serde_json::from_str(&serde_json::to_string(&revs).unwrap()).unwrap();
+        assert_eq!(revs_parsed.len(), 1);
+        assert_eq!(revs_parsed[0].removed_identity_key_id, "bob");
+
+        // lookup_community (the `lookup_community_json` payload) round-trips
+        // through JSON and carries the full roster (revocation is a separate
+        // table; the roster itself is untouched).
+        let looked = backend.lookup_community("comm").await.unwrap();
+        let looked_json = serde_json::to_string(&looked).unwrap();
+        let looked_parsed: Option<Community> = serde_json::from_str(&looked_json).unwrap();
+        let community = looked_parsed.expect("community present");
+        assert_eq!(community.community_key_id, "comm");
+        assert_eq!(community.members.len(), 2, "roster intact post-revocation");
+    }
+
     /// SecReview F5: INSERT + hard_case + epoch-bump are ONE transaction —
     /// if the epoch bump fails, the revocation INSERT is rolled back (no
     /// durable un-rotated revocation). Induce the bump failure by dropping
@@ -19343,6 +19505,15 @@ mod tests {
             })
             .await
             .unwrap();
+        // v9.3.0 (#247) — put_blob_signing's holds_bytes scrub_key_id is
+        // host-a's DERIVED federation key_id; register that row too
+        // (keyed by the derived id, carrying host-a's real pubkeys).
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_derived("host-a"),
+            })
+            .await
+            .unwrap();
         backend
     }
 
@@ -20055,6 +20226,16 @@ mod tests {
             backend
                 .put_public_key(SignedKeyRecord {
                     record: fed_key(actor, actor, actor),
+                })
+                .await
+                .unwrap();
+            // v9.3.0 (#247) — the eviction `withdraws` + holds_bytes scrub
+            // are attested/signed under the actor's DERIVED federation
+            // key_id; register that row (carrying the actor's real pubkeys)
+            // so those FKs resolve AND the withdraws hybrid-verifies.
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key_derived(actor),
                 })
                 .await
                 .unwrap();
@@ -24151,6 +24332,83 @@ mod tests {
             .is_some());
     }
 
+    /// #249 Cut A — the owner-binding + duty-holders readers
+    /// (`is_owner_bound_json` / `duty_holders_for_community_json`) the FFI
+    /// exposes: a `user`-role key IS owner-bound, a bare `node` key is NOT,
+    /// and the duty-holder set of a MAJORITY community (whole roster =
+    /// authority) is exactly its owner-bound members — proven through the
+    /// serde_json array shape the wrapper emits (HashSet sorted to a stable
+    /// `Vec`), the #104 PERSIST_DELEGATES_TO blocker's by-construction view.
+    #[tokio::test]
+    async fn cut_a_owner_binding_and_duty_holders_json_sqlite() {
+        use crate::federation::admission::{duty_holders_for_community, is_owner_bound};
+        use crate::federation::FederationDirectory;
+        let backend = bootstrap_node_agency_sqlite().await;
+
+        // is_owner_bound: `owner` (USER) is bound; `node-key` (NODE, no
+        // delegation) is not — the exact bools the JSON wrapper serializes.
+        let owner_bound = is_owner_bound(&backend as &dyn FederationDirectory, "owner")
+            .await
+            .unwrap();
+        let node_bound = is_owner_bound(&backend as &dyn FederationDirectory, "node-key")
+            .await
+            .unwrap();
+        assert!(
+            serde_json::from_str::<bool>(&serde_json::to_string(&owner_bound).unwrap()).unwrap()
+        );
+        assert!(
+            !serde_json::from_str::<bool>(&serde_json::to_string(&node_bound).unwrap()).unwrap()
+        );
+
+        // A MAJORITY community whose whole roster is the authority set; only
+        // the owner-bound member surfaces as a duty-holder. Seed the
+        // community's own key, then a single owner-bound member (`owner`) —
+        // owner-binding admission accepts it (`owner` is a USER).
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("duty-comm", "duty-comm", "duty-comm"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: fed_community(
+                    "duty-comm",
+                    "Duty Co-op",
+                    vec!["owner"],
+                    crate::federation::types::consensus_protocol::MAJORITY,
+                    None,
+                ),
+            })
+            .await
+            .expect("owner-bound member admitted under MAJORITY");
+
+        // duty_holders_for_community → exactly {owner}, through the sorted
+        // JSON array the FFI wrapper returns.
+        let holders = duty_holders_for_community(
+            &backend as &dyn FederationDirectory,
+            "duty-comm",
+            "moderate",
+        )
+        .await
+        .unwrap();
+        let mut sorted: Vec<String> = holders.into_iter().collect();
+        sorted.sort();
+        let json = serde_json::to_string(&sorted).unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, vec!["owner".to_string()], "duty-holders JSON shape");
+
+        // An unknown community → fail-closed empty array (not an error).
+        let none = duty_holders_for_community(
+            &backend as &dyn FederationDirectory,
+            "no-such-community",
+            "moderate",
+        )
+        .await
+        .unwrap();
+        assert!(none.is_empty(), "unknown community ⇒ empty duty-holder set");
+    }
+
     /// SecReview F2: an `infrastructure`-LABELED community whose own key is
     /// NOT `substrate_persist` does NOT get the carve-out — owner-binding is
     /// STILL enforced, so an UNOWNED node member is REJECTED + not stored
@@ -27179,5 +27437,487 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    // ── #249 Cut B — enumerators + add_community_member (sqlite parity).
+
+    /// Seed `n` user-role keys `pfx-0..` (trivially owner-bound) + a fresh
+    /// migrated backend; returns the backend.
+    async fn cutb_backend_with_users(pfx: &str, n: usize) -> SqliteBackend {
+        use crate::federation::types::identity_type;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for i in 0..n {
+            let id = format!("{pfx}-{i}");
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key_with_identity_type(&id, "user", &id, identity_type::USER),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+    }
+
+    fn cm(key_id: &str) -> crate::federation::CommunityMember {
+        crate::federation::CommunityMember {
+            key_id: key_id.into(),
+            joined_at: "2026-06-04T00:00:00Z".parse().unwrap(),
+            role: None,
+        }
+    }
+
+    /// active_community_members: roster of 3, revoke 1 (effective now) →
+    /// 2 active; lookup keeps the full roster.
+    #[tokio::test]
+    async fn active_community_members_subtracts_effective_revocation_sqlite() {
+        use crate::federation::FederationDirectory;
+        let backend = cutb_backend_with_users("acm", 3).await;
+        // community key.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("acm-comm", "acm-comm", "acm-comm"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: fed_community(
+                    "acm-comm",
+                    "acm",
+                    vec!["acm-0", "acm-1", "acm-2"],
+                    crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                    None,
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .active_community_members("acm-comm")
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        backend
+            .put_community_membership_revocation(
+                crate::federation::SignedCommunityMembershipRevocation {
+                    community_membership_revocation:
+                        crate::federation::CommunityMembershipRevocation {
+                            community_key_id: "acm-comm".into(),
+                            removed_identity_key_id: "acm-1".into(),
+                            removed_at: chrono::Utc::now(),
+                            effective_at: chrono::Utc::now(),
+                            reason: None,
+                            witness_set: vec![],
+                            persist_row_hash: String::new(),
+                        },
+                },
+            )
+            .await
+            .unwrap();
+        let active = backend.active_community_members("acm-comm").await.unwrap();
+        let keys: std::collections::HashSet<&str> =
+            active.iter().map(|m| m.key_id.as_str()).collect();
+        assert_eq!(active.len(), 2);
+        assert!(!keys.contains("acm-1"));
+        assert_eq!(
+            backend
+                .lookup_community("acm-comm")
+                .await
+                .unwrap()
+                .unwrap()
+                .members
+                .len(),
+            3
+        );
+    }
+
+    /// active_family_members: a FUTURE-DATED revocation keeps the member;
+    /// an effective one drops it (same shared fold).
+    #[tokio::test]
+    async fn active_family_members_future_revocation_keeps_member_sqlite() {
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["afm-fam", "afm-carol", "afm-dave"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_family(crate::federation::SignedFamily {
+                family: fed_family(
+                    "afm-fam",
+                    "fam",
+                    vec!["afm-carol", "afm-dave"],
+                    crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                ),
+            })
+            .await
+            .unwrap();
+        let rev = |member: &str, effective_at: chrono::DateTime<chrono::Utc>| {
+            crate::federation::SignedFamilyMembershipRevocation {
+                family_membership_revocation: crate::federation::FamilyMembershipRevocation {
+                    family_key_id: "afm-fam".into(),
+                    removed_identity_key_id: member.into(),
+                    removed_at: chrono::Utc::now(),
+                    effective_at,
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            }
+        };
+        // carol: future-dated → stays active. dave: effective now → drops.
+        let future = chrono::Utc::now() + chrono::Duration::days(30);
+        backend
+            .put_family_membership_revocation(rev("afm-carol", future))
+            .await
+            .unwrap();
+        backend
+            .put_family_membership_revocation(rev("afm-dave", chrono::Utc::now()))
+            .await
+            .unwrap();
+        let active = backend.active_family_members("afm-fam").await.unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "future-dated member stays; effective drops"
+        );
+        assert_eq!(active[0].key_id, "afm-carol");
+    }
+
+    /// add_community_member: add → appears in lookup + active reader; re-add
+    /// → idempotent (false, no dup).
+    #[tokio::test]
+    async fn add_community_member_grows_roster_idempotent_sqlite() {
+        use crate::federation::FederationDirectory;
+        let backend = cutb_backend_with_users("addc", 2).await;
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("addc-comm", "addc-comm", "addc-comm"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: fed_community(
+                    "addc-comm",
+                    "addc",
+                    vec!["addc-0"],
+                    crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                    None,
+                ),
+            })
+            .await
+            .unwrap();
+        assert!(backend
+            .add_community_member("addc-comm", cm("addc-1"))
+            .await
+            .unwrap());
+        let active = backend.active_community_members("addc-comm").await.unwrap();
+        let keys: std::collections::HashSet<&str> =
+            active.iter().map(|m| m.key_id.as_str()).collect();
+        assert!(keys.contains("addc-0") && keys.contains("addc-1"));
+        assert!(backend
+            .lookup_community("addc-comm")
+            .await
+            .unwrap()
+            .unwrap()
+            .members
+            .iter()
+            .any(|m| m.key_id == "addc-1"));
+        // Idempotent re-add.
+        assert!(!backend
+            .add_community_member("addc-comm", cm("addc-1"))
+            .await
+            .unwrap());
+        assert_eq!(
+            backend
+                .lookup_community("addc-comm")
+                .await
+                .unwrap()
+                .unwrap()
+                .members
+                .iter()
+                .filter(|m| m.key_id == "addc-1")
+                .count(),
+            1
+        );
+        // Unknown community.
+        assert!(backend
+            .add_community_member("no-such", cm("addc-0"))
+            .await
+            .is_err());
+    }
+
+    /// moderators_of: founder (authority root) + `delegates_to(moderate)`
+    /// founder → deputy → {founder, deputy}; outsider excluded.
+    #[tokio::test]
+    async fn moderators_of_enumerates_roots_and_delegates_sqlite() {
+        use crate::federation::admission::{DELEGATION_SCOPE_MODERATE, MEMBER_ROLE_FOUNDER};
+        use crate::federation::types::identity_type;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    "mod-founder",
+                    "user",
+                    "mod-founder",
+                    identity_type::USER,
+                ),
+            })
+            .await
+            .unwrap();
+        for k in ["mod-deputy", "mod-outsider", "mod-comm"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+        let mut community = fed_community(
+            "mod-comm",
+            "mods",
+            vec!["mod-founder"],
+            crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+            None,
+        );
+        community.members[0].role = Some(MEMBER_ROLE_FOUNDER.into());
+        backend
+            .put_community(crate::federation::SignedCommunity { community })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: node_delegates_to_sqlite(
+                    "mod-founder",
+                    "mod-deputy",
+                    &[DELEGATION_SCOPE_MODERATE],
+                ),
+            })
+            .await
+            .unwrap();
+        let mods = crate::federation::admission::moderators_of(
+            &backend,
+            "mod-comm",
+            DELEGATION_SCOPE_MODERATE,
+        )
+        .await
+        .unwrap();
+        let set: std::collections::HashSet<&str> = mods.iter().map(|s| s.as_str()).collect();
+        assert!(set.contains("mod-founder"));
+        assert!(set.contains("mod-deputy"));
+        assert!(!set.contains("mod-outsider"));
+    }
+
+    /// owner_bindings_of: owner-bound node (live infra:* delegation) →
+    /// [owner]; unbound → empty.
+    #[tokio::test]
+    async fn owner_bindings_of_returns_user_anchors_sqlite() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = bootstrap_node_agency_sqlite().await;
+        assert!(
+            crate::federation::admission::owner_bindings_of(&backend, "node-key")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: node_delegates_to_sqlite(
+                    "owner",
+                    "node-key",
+                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::federation::admission::owner_bindings_of(&backend, "node-key")
+                .await
+                .unwrap(),
+            vec!["owner".to_string()]
+        );
+    }
+
+    /// owner_binding_chain: the audit PATH. clause 1 → [self]; clause 3 →
+    /// [user, node]; unbound → empty (sqlite parity).
+    #[tokio::test]
+    async fn owner_binding_chain_returns_audit_path_sqlite() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = bootstrap_node_agency_sqlite().await;
+        assert!(
+            crate::federation::admission::owner_binding_chain(&backend, "node-key")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::federation::admission::owner_binding_chain(&backend, "owner")
+                .await
+                .unwrap(),
+            vec!["owner".to_string()]
+        );
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: node_delegates_to_sqlite(
+                    "owner",
+                    "node-key",
+                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::federation::admission::owner_binding_chain(&backend, "node-key")
+                .await
+                .unwrap(),
+            vec!["owner".to_string(), "node-key".to_string()]
+        );
+    }
+
+    /// reachable_under_scope: the ⊆-attenuation, withdraws-aware, depth-
+    /// capped scoped walk (sqlite parity). moderate root→mid→leaf reaches
+    /// under moderate; scope-isolation under review; depth cap.
+    #[tokio::test]
+    async fn reachable_under_scope_scoped_attenuated_walk_sqlite() {
+        use crate::federation::admission::{
+            reachable_under_scope, DELEGATION_SCOPE_MODERATE, DELEGATION_SCOPE_REVIEW,
+            MAX_MODERATION_DELEGATION_DEPTH,
+        };
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["rk-root", "rk-mid", "rk-leaf", "rk-other"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+        let delegate = |granter: &str, grantee: &str, sub: bool| {
+            let mut d = topo_attestation(
+                granter,
+                grantee,
+                crate::federation::types::attestation_type::DELEGATES_TO,
+                None,
+                None,
+                &[],
+                None,
+                chrono::Utc::now(),
+            );
+            d.attestation_envelope = serde_json::json!({
+                "scope": [DELEGATION_SCOPE_MODERATE],
+                "sub_delegation": sub,
+            });
+            resign_fed(&mut d);
+            d
+        };
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: delegate("rk-root", "rk-mid", true),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: delegate("rk-mid", "rk-leaf", false),
+            })
+            .await
+            .unwrap();
+        let depth = MAX_MODERATION_DELEGATION_DEPTH;
+        assert!(reachable_under_scope(
+            &backend,
+            "rk-root",
+            "rk-leaf",
+            DELEGATION_SCOPE_MODERATE,
+            depth
+        )
+        .await
+        .unwrap());
+        assert!(!reachable_under_scope(
+            &backend,
+            "rk-root",
+            "rk-leaf",
+            DELEGATION_SCOPE_REVIEW,
+            depth
+        )
+        .await
+        .unwrap());
+        assert!(!reachable_under_scope(
+            &backend,
+            "rk-root",
+            "rk-other",
+            DELEGATION_SCOPE_MODERATE,
+            depth
+        )
+        .await
+        .unwrap());
+        // depth cap: reaches mid at depth 1, not leaf.
+        assert!(
+            reachable_under_scope(&backend, "rk-root", "rk-mid", DELEGATION_SCOPE_MODERATE, 1)
+                .await
+                .unwrap()
+        );
+        assert!(!reachable_under_scope(
+            &backend,
+            "rk-root",
+            "rk-leaf",
+            DELEGATION_SCOPE_MODERATE,
+            1
+        )
+        .await
+        .unwrap());
+    }
+
+    /// delegations_to: K with 2 inbound `delegates_to` → both; none → empty;
+    /// non-delegation inbound edge excluded.
+    #[tokio::test]
+    async fn delegations_to_lists_inbound_delegation_edges_sqlite() {
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["dt-k", "dt-g1", "dt-g2"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+        assert!(backend.delegations_to("dt-k").await.unwrap().is_empty());
+        for g in ["dt-g1", "dt-g2"] {
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: node_delegates_to_sqlite(g, "dt-k", &["share"]),
+                })
+                .await
+                .unwrap();
+        }
+        // A non-delegation (scores) inbound edge must not appear.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fed_attestation("dt-vouch", "dt-g1", "dt-k", "dt-g1"),
+            })
+            .await
+            .unwrap();
+        let inbound = backend.delegations_to("dt-k").await.unwrap();
+        assert_eq!(inbound.len(), 2);
+        let granters: std::collections::HashSet<&str> = inbound
+            .iter()
+            .map(|a| a.attesting_key_id.as_str())
+            .collect();
+        assert!(granters.contains("dt-g1") && granters.contains("dt-g2"));
+        assert!(inbound.iter().all(
+            |a| a.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
+        ));
     }
 }

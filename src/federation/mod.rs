@@ -170,8 +170,8 @@ pub use schema_resolver::{
     axis_from_dimension, AxisSchema, NoOpSchemaResolver, SchemaResolver, SchemaResolverError,
 };
 pub use self_at_login::{
-    delegates_to_agent_envelope, partnership_accept_envelope, partnership_grant_envelope,
-    TransportDestination, SELF_AT_LOGIN_DELEGATION_SCOPE,
+    delegates_to_agent_envelope, delegates_to_envelope, partnership_accept_envelope,
+    partnership_grant_envelope, TransportDestination, SELF_AT_LOGIN_DELEGATION_SCOPE,
 };
 pub use shared_instance::{SharedInstanceLease, DEFAULT_STALE_AFTER};
 #[cfg(feature = "sqlite")]
@@ -188,14 +188,45 @@ pub use topology::{
 };
 pub use types::{device_class, identity_type};
 pub use types::{
-    Attestation, Community, CommunityMember, CommunityMembershipRevocation, EncryptionPubkeys,
-    Family, FamilyMember, FamilyMembershipRevocation, HybridPendingRow, IdentityOccurrence,
-    IdentityOccurrenceRevocation, KeyRecord, LocationProof, PeerMetadataRow, PeerPolicyBlob,
-    Revocation, SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation,
-    SignedFamily, SignedFamilyMembershipRevocation, SignedIdentityOccurrence,
-    SignedIdentityOccurrenceRevocation, SignedKeyRecord, SignedLocationProof, SignedRevocation,
-    TrustClass, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
+    Attestation, Community, CommunityMember, CommunityMembershipRevocation, EmitAttestationInput,
+    EncryptionPubkeys, Family, FamilyMember, FamilyMembershipRevocation, HybridPendingRow,
+    IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof, PeerMetadataRow,
+    PeerPolicyBlob, Revocation, SignedAttestation, SignedCommunity,
+    SignedCommunityMembershipRevocation, SignedFamily, SignedFamilyMembershipRevocation,
+    SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
+    SignedLocationProof, SignedRevocation, TrustClass, TrustFilter, TrustGrant, TrustRelationship,
+    TrustRow, TrustType,
 };
+
+/// v9.3.0 (CIRISPersist#249 Cut B) — the **roster-minus-effective-
+/// revocations** fold, shared by every "currently-active membership"
+/// reader. `removed_key_ids_at` collapses a revocation list to the set of
+/// member key_ids whose `effective_at <= as_of`; callers then retain only
+/// the roster members NOT in that set.
+///
+/// This is the ONE place the "a revocation with `effective_at <= now`
+/// drops its subject" rule lives. The community-DEK cascade
+/// ([`community_dek::orchestrate`]'s `resolve_community_members`) and the
+/// new `active_*_members` group-roster readers both compose it, so the
+/// forward-secrecy subtraction is never forked. A FUTURE-dated revocation
+/// (`effective_at > as_of`) is intentionally NOT in the removed set — the
+/// member is still active until its effective time arrives.
+///
+/// `revs` yields `(removed_identity_key_id, effective_at)` pairs (the
+/// shape both [`FamilyMembershipRevocation`] and
+/// [`CommunityMembershipRevocation`] project to).
+pub fn removed_key_ids_at<'a, I>(
+    revs: I,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> std::collections::HashSet<&'a str>
+where
+    I: IntoIterator<Item = (&'a str, chrono::DateTime<chrono::Utc>)>,
+{
+    revs.into_iter()
+        .filter(|(_, effective_at)| *effective_at <= as_of)
+        .map(|(key_id, _)| key_id)
+        .collect()
+}
 
 /// Federation directory trait — the registry/lens/agent's read+write
 /// surface over persist's three federation tables.
@@ -928,6 +959,118 @@ pub trait FederationDirectory: Send + Sync {
             }
         }
         Ok(active)
+    }
+
+    // ─── #249 Cut B — group-roster enumerators (members-of-a-group) ───
+    //
+    // The INVERSE of the `list_*_for_member_active` readers above (which
+    // answer "which groups is this member in?"): these answer "who are the
+    // currently-active members of THIS group?" — a group's roster MINUS its
+    // effective membership revocations. Both share the
+    // [`removed_key_ids_at`] fold so the revocation-subtraction logic is
+    // never forked (the community-DEK cascade composes the same fold).
+
+    /// #249 Cut B — the **active member roster** of `family_key_id`: the
+    /// family's `members` MINUS every member removed by a revocation whose
+    /// `effective_at <= now`. A future-dated revocation does NOT drop its
+    /// subject (the member is active until its effective time arrives).
+    ///
+    /// Default impl composes [`Self::lookup_family`] with
+    /// [`Self::list_family_membership_revocations_for`] through the shared
+    /// [`removed_key_ids_at`] fold; backends need not override.
+    /// [`Error::InvalidArgument`] if the family is unknown.
+    async fn active_family_members(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<types::FamilyMember>, Error> {
+        let family = self.lookup_family(family_key_id).await?.ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "active_family_members names unknown family_key_id {family_key_id:?}"
+            ))
+        })?;
+        let revs = self
+            .list_family_membership_revocations_for(family_key_id)
+            .await?;
+        let removed = removed_key_ids_at(
+            revs.iter()
+                .map(|r| (r.removed_identity_key_id.as_str(), r.effective_at)),
+            chrono::Utc::now(),
+        );
+        Ok(family
+            .members
+            .into_iter()
+            .filter(|m| !removed.contains(m.key_id.as_str()))
+            .collect())
+    }
+
+    /// #249 Cut B — the **active member roster** of `community_key_id`.
+    /// Structural mirror of [`Self::active_family_members`]; the forward
+    /// fold the community-DEK cascade's wrap fan-out resolves over (same
+    /// roster-minus-effective-revocations rule, via [`removed_key_ids_at`]).
+    /// [`Error::InvalidArgument`] if the community is unknown.
+    async fn active_community_members(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<types::CommunityMember>, Error> {
+        let community = self
+            .lookup_community(community_key_id)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "active_community_members names unknown community_key_id {community_key_id:?}"
+                ))
+            })?;
+        let revs = self
+            .list_community_membership_revocations_for(community_key_id)
+            .await?;
+        let removed = removed_key_ids_at(
+            revs.iter()
+                .map(|r| (r.removed_identity_key_id.as_str(), r.effective_at)),
+            chrono::Utc::now(),
+        );
+        Ok(community
+            .members
+            .into_iter()
+            .filter(|m| !removed.contains(m.key_id.as_str()))
+            .collect())
+    }
+
+    /// #249 Cut B — incremental **community-roster grow**. The exact mirror
+    /// of [`Self::add_family_member`]: admit one identity into an existing
+    /// community roster additively (roster mutates in place; removal stays
+    /// append-only revocation the `active_*` reads compose against).
+    ///
+    /// Idempotent on `member.key_id`: a member already on the roster is a
+    /// no-op returning `Ok(false)`; a genuine add returns `Ok(true)`. The
+    /// community must exist ([`Error::InvalidArgument`] otherwise).
+    /// Recomputes `persist_row_hash` over the grown roster.
+    async fn add_community_member(
+        &self,
+        community_key_id: &str,
+        member: types::CommunityMember,
+    ) -> Result<bool, Error>;
+
+    /// #249 Cut B — the INBOUND delegation walk: every key that holds a
+    /// `delegates_to` edge naming `key_id` as the recipient ("who delegated
+    /// TO me?"). The reverse of the forward-only
+    /// [`topology::build_delegation_graph`](crate::federation::topology::build_delegation_graph),
+    /// which walks OUTBOUND. Returns the full inbound `delegates_to`
+    /// [`Attestation`] rows (deduped on `attestation_id`), so a consumer can
+    /// read each edge's scope/expiry/granter.
+    ///
+    /// Default impl filters [`Self::list_attestations_for`] to
+    /// `delegates_to`; backends need not override. Returns an empty vec when
+    /// no key delegates to `key_id`.
+    async fn delegations_to(&self, key_id: &str) -> Result<Vec<Attestation>, Error> {
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::new();
+        Ok(self
+            .list_attestations_for(key_id)
+            .await?
+            .into_iter()
+            .filter(|a| a.attestation_type == types::attestation_type::DELEGATES_TO)
+            .filter(|a| seen.insert(a.attestation_id.clone()))
+            .collect())
     }
 
     /// v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
