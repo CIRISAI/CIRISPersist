@@ -25946,7 +25946,8 @@ mod tests {
     async fn register_hybrid_producer(
         backend: &SqliteBackend,
         key_id: &str,
-    ) -> ciris_crypto::HybridSigner<ciris_crypto::Ed25519Signer, ciris_crypto::MlDsa65Signer> {
+    ) -> Box<ciris_crypto::HybridSigner<ciris_crypto::Ed25519Signer, ciris_crypto::MlDsa65Signer>>
+    {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
         let ed = ciris_crypto::Ed25519Signer::from_seed(&[0x31; 32]).unwrap();
@@ -25959,11 +25960,15 @@ mod tests {
             use ciris_crypto::PqcSigner as _;
             B64.encode(mldsa.public_key().unwrap())
         };
-        // v9.0.0 — build the KeyRecord inline (NOT via `fed_key`): both
-        // pubkeys are overwritten with this producer's real hybrid keys
-        // anyway, and `fed_key` now derives ML-DSA pubkeys (a multi-KiB
-        // keygen) which, stacked on this frame's own ML-DSA signer +
-        // HybridSigner, overflowed the tokio worker stack.
+        // v9.2.2 — return a BOXED HybridSigner, built BEFORE the
+        // `put_public_key().await`. The multi-KiB Ed25519+ML-DSA-65 signer
+        // would otherwise live in this async fn's future state ACROSS the
+        // await (and inline into the caller's future), and CIRISVerify
+        // v6.6.0's larger ML-DSA-65 tipped the 2 MiB tokio test-thread stack
+        // over (#88 zeroize/layout). Only the 8-byte Box crosses the await.
+        // (KeyRecord is also built inline rather than via `fed_key`, which
+        // would derive its own multi-KiB ML-DSA pubkeys on this frame.)
+        let signer = Box::new(ciris_crypto::HybridSigner::new(ed, mldsa).unwrap());
         let record = crate::federation::KeyRecord {
             key_id: key_id.into(),
             pubkey_ed25519_base64: ed_pub_b64,
@@ -25988,7 +25993,7 @@ mod tests {
             .put_public_key(SignedKeyRecord { record })
             .await
             .unwrap();
-        ciris_crypto::HybridSigner::new(ed, mldsa).unwrap()
+        signer
     }
 
     /// Produce a producer-signed STH over a stream's recomputed root for
