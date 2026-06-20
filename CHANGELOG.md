@@ -32,19 +32,9 @@ First cut of the **#249** CEG-native graph DX umbrella (the typed-attestation-gr
   - **`add_community_member(community, member)`** — incremental roster grow (mirror of `add_family_member`; idempotent), vs whole-re-put `put_community`.
   - 3-backend parity (pg/sqlite/memory) + FFI for each + thin `Engine` wrappers.
 
-## [9.2.2] — 2026-06-20
-
-### Changed — re-pin CIRISVerify v6.5.0 → v6.6.0 (wheel concurrence)
-
-- All six git-tag verify crates flipped in lockstep per the coherence rule; `version = "6"` unchanged (6.6.0 satisfies it). v6.6.0 is accord/keyring-facing (portable signature-wrapped ML-DSA-65 USB key mode, CIRISVerify#88) and does **not** touch persist's consumed surface (`verify_hybrid` / `canonical` / `transparency` / `xchacha` / `hkdf` / `hmac`). Family-floor / wheel-concurrence re-pin only. No persist production-code change. Wheel `Requires-Dist` floor stays `>=6.0.0,<7`.
-
-### Fixed — `sth_*` test stack overflow under v6.6.0's larger ML-DSA-65
-
-- v6.6.0's ML-DSA-65 layout/`zeroize` change (#88) enlarged the signer's stack footprint just enough that the transparency-log test helper `register_hybrid_producer` overflowed the 2 MiB tokio test-thread stack (it held a multi-KiB `HybridSigner` across the `put_public_key().await`). Fixed test-side: the helper returns a **boxed** signer built **before** the await (production's 8 MiB main-thread stack was never affected). Pure test-fixture change.
-
 ### Added — Cut C (emit ceremonies): `delegates_to` / moderation typed conveniences (CIRISPersist#249)
 
-The **#249 Cut C** typed emit ceremonies — the high-level, signer-based conveniences consumers (form-server, node) hand-roll today, each **composing the #248 `emit_attestation` primitive** (none re-hand-rolls the canonicalize→sign→assemble→`put` recipe; all inherit the #247 derived-key_id floor — attester/scrub is always the signer's DERIVED federation key_id, never a caller alias). Backend-agnostic (emit composes `put_attestation`); verify pin unchanged (v6.5.0); no version bump.
+The **#249 Cut C** typed emit ceremonies — the high-level, signer-based conveniences consumers (form-server, node) hand-roll today, each **composing the #248 `emit_attestation` primitive** (none re-hand-rolls the canonicalize→sign→assemble→`put` recipe; all inherit the #247 derived-key_id floor — attester/scrub is always the signer's DERIVED federation key_id, never a caller alias). Backend-agnostic (emit composes `put_attestation`); verify v6.6.0 inherited from v9.2.2; no version bump.
 
 - **Moderate-scope constants** — `delegation_scope::SCOPE_MODERATE` / `SCOPE_TAKEDOWN` / `SCOPE_REVIEW` (`src/federation/types.rs`), the producer-side names for the §11.10 moderation duties. Each **aliases the `admission::DELEGATION_SCOPE_*` constant BY VALUE** (`"moderate"` / `"takedown"` / `"review"`) — the exact tokens the admission duty-walk's scope-containment check matches — so an edge stamped with one is admissible by `is_named_moderator` / `check_moderation_admission`. A test pins the alias equality.
 - **General envelope builder** — `federation::delegates_to_envelope(delegate, scopes, sub_delegation)` (`src/federation/self_at_login.rs`, re-exported from `federation`): emits `scope` as an array-set + a top-level `sub_delegation` bool — the §11.10-admissible shape (the login-specific `delegates_to_agent_envelope` is the §8.1.12.7 specialization).
@@ -56,6 +46,16 @@ The **#249 Cut C** typed emit ceremonies — the high-level, signer-based conven
   - **`file_moderation(signer, content_sha256, community, duty, allegation_type) -> id`** — a `scores` on the `moderation:{allegation_type}:v1` dimension over content; admitted by the always-present `check_delegated_duty_scores_admission` gate when the signer is a `moderate` duty-holder. **Feature-free** (no `--features cirisnode`): the moderation-report **image** is a federation-tier `scores` attestation through the unconditional `emit_attestation` path; the `cirisnode`-gated surface (the `ModerationEvent` put-path / takedown handler) is the SEPARATE node-server ingest path, untouched here.
 - **FFI** — `PyEngine.{grant_delegation, owner_bind, add_moderator, revoke_delegation, remove_moderator, file_moderation}` in a labeled `// ── #249 Cut C ──` section, each reconstructing a hybrid-capable Engine over the shared backend + the engine's configured local signer (the #248 `emit_attestation` FFI shape) via a shared `cut_c_emit_handles` helper.
 - **Tests** — sqlite + live-Postgres round-trips: `grant_delegation` stores the edge under the derived key_id; `owner_bind` infra:* passes the node-agency gate + owner-binds (with an `agency:*`-rejected negative control); the **`add_moderator` ↔ `is_named_moderator` round-trip** (true after appoint, false after `remove_moderator`); `file_moderation` stores the `moderation:{allegation}:v1` scores row.
+
+## [9.2.2] — 2026-06-20
+
+### Changed — re-pin CIRISVerify v6.5.0 → v6.6.0 (wheel concurrence)
+
+- All six git-tag verify crates flipped in lockstep per the coherence rule; `version = "6"` unchanged (6.6.0 satisfies it). v6.6.0 is accord/keyring-facing (portable signature-wrapped ML-DSA-65 USB key mode, CIRISVerify#88) and does **not** touch persist's consumed surface (`verify_hybrid` / `canonical` / `transparency` / `xchacha` / `hkdf` / `hmac`). Family-floor / wheel-concurrence re-pin only. No persist production-code change. Wheel `Requires-Dist` floor stays `>=6.0.0,<7`.
+
+### Fixed — `sth_*` test stack overflow under v6.6.0's larger ML-DSA-65
+
+- v6.6.0's ML-DSA-65 layout/`zeroize` change (#88) enlarged the signer's stack footprint just enough that the transparency-log test helper `register_hybrid_producer` overflowed the 2 MiB tokio test-thread stack (it held a multi-KiB `HybridSigner` across the `put_public_key().await`). Fixed test-side: the helper returns a **boxed** signer built **before** the await (production's 8 MiB main-thread stack was never affected). Pure test-fixture change.
 
 ## [9.2.1] — 2026-06-19
 
