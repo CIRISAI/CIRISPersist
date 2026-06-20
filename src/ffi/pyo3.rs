@@ -3921,6 +3921,217 @@ impl PyEngine {
         })
     }
 
+    // ── #249 Cut C ── delegates_to / moderation emit ceremonies ───────
+    //
+    // v9.3.0 (CIRISPersist#249) — the typed emit conveniences over the #248
+    // `emit_attestation` primitive, each reconstructing a hybrid-capable
+    // Engine over the shared backend + the engine's configured local signer
+    // (the exact `emit_attestation` FFI shape above) and calling the
+    // matching `Engine` ceremony method. All return the new
+    // `attestation_id`. Each requires a PQC-configured local signer (the
+    // hybrid sign); raises if absent.
+
+    /// v9.3.0 (#249) — emit a general `delegates_to` edge: authorize
+    /// `delegate_key_id` within `scopes` (a list of scope tokens), with an
+    /// explicit `sub_delegation` deputization flag. The recipient FKs to
+    /// `federation_keys`; the CC 4.4.3.4.3 node-agency gate runs on the row.
+    fn grant_delegation(
+        &self,
+        py: Python<'_>,
+        delegate_key_id: &str,
+        scopes: Vec<String>,
+        sub_delegation: bool,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let (backend, signer, local_signer) = self.cut_c_emit_handles()?;
+            let delegate = delegate_key_id.to_owned();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(
+                    backend,
+                    signer,
+                    Some(local_signer.clone()),
+                );
+                runtime.block_on(async move {
+                    engine
+                        .grant_delegation(&local_signer, &delegate, scopes, sub_delegation)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v9.3.0 (#249, CC 4.4.3.4.3) — owner-bind a node/agent occurrence by
+    /// granting it `infra:*`-only scopes (passes the node-agency gate on a
+    /// node-only key). A `grant_delegation` specialization,
+    /// `sub_delegation=false`.
+    fn owner_bind(
+        &self,
+        py: Python<'_>,
+        node_or_agent_key_id: &str,
+        infra_scopes: Vec<String>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let (backend, signer, local_signer) = self.cut_c_emit_handles()?;
+            let key = node_or_agent_key_id.to_owned();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(
+                    backend,
+                    signer,
+                    Some(local_signer.clone()),
+                );
+                runtime.block_on(async move {
+                    engine
+                        .owner_bind(&local_signer, &key, infra_scopes)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v9.3.0 (#249, §11.10/§11.11) — appoint `moderator_key_id` a named
+    /// moderator of `community_id` for `duty` (`moderate`/`takedown`/
+    /// `review`). Admissible IFF the engine's signer is a community
+    /// authority (founder/consensus signer) AND owner-bound.
+    fn add_moderator(
+        &self,
+        py: Python<'_>,
+        community_id: &str,
+        moderator_key_id: &str,
+        duty: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let (backend, signer, local_signer) = self.cut_c_emit_handles()?;
+            let community = community_id.to_owned();
+            let moderator = moderator_key_id.to_owned();
+            let duty = duty.to_owned();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(
+                    backend,
+                    signer,
+                    Some(local_signer.clone()),
+                );
+                runtime.block_on(async move {
+                    engine
+                        .add_moderator(&local_signer, &community, &moderator, &duty)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v9.3.0 (#249, §3.2.3) — revoke a prior `delegates_to`
+    /// (`target_attestation_id`) by emitting a `withdraws`. `delegate_key_id`
+    /// is the key the revoked edge delegated to (keys the retraction). The
+    /// engine's signer must be the original granter (rule-1 self-revocation).
+    fn revoke_delegation(
+        &self,
+        py: Python<'_>,
+        target_attestation_id: &str,
+        delegate_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let (backend, signer, local_signer) = self.cut_c_emit_handles()?;
+            let target = target_attestation_id.to_owned();
+            let delegate = delegate_key_id.to_owned();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(
+                    backend,
+                    signer,
+                    Some(local_signer.clone()),
+                );
+                runtime.block_on(async move {
+                    engine
+                        .revoke_delegation(&local_signer, &target, &delegate)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v9.3.0 (#249, §11.10) — remove a named moderator: `withdraws` against
+    /// the appointment edge `target_attestation_id`. `moderator_key_id` keys
+    /// the retraction; `community_id`/`duty` are call-site symmetry only.
+    fn remove_moderator(
+        &self,
+        py: Python<'_>,
+        community_id: &str,
+        target_attestation_id: &str,
+        moderator_key_id: &str,
+        duty: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let (backend, signer, local_signer) = self.cut_c_emit_handles()?;
+            let community = community_id.to_owned();
+            let target = target_attestation_id.to_owned();
+            let moderator = moderator_key_id.to_owned();
+            let duty = duty.to_owned();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(
+                    backend,
+                    signer,
+                    Some(local_signer.clone()),
+                );
+                runtime.block_on(async move {
+                    engine
+                        .remove_moderator(&local_signer, &community, &target, &moderator, &duty)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
+    /// v9.3.0 (#249, §11.10 EMIT) — file a moderation report: a `scores` on
+    /// the `moderation:{allegation_type}` dimension over `content_sha256`,
+    /// naming `community_id`. Admitted IFF the engine's signer is a
+    /// `moderate` duty-holder over the target. Feature-free (no
+    /// `--features cirisnode` — this is the pure attestation emit).
+    fn file_moderation(
+        &self,
+        py: Python<'_>,
+        content_sha256: &str,
+        community_id: &str,
+        duty: &str,
+        allegation_type: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let (backend, signer, local_signer) = self.cut_c_emit_handles()?;
+            let content = content_sha256.to_owned();
+            let community = community_id.to_owned();
+            let duty = duty.to_owned();
+            let allegation = allegation_type.to_owned();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(
+                    backend,
+                    signer,
+                    Some(local_signer.clone()),
+                );
+                runtime.block_on(async move {
+                    engine
+                        .file_moderation(&local_signer, &content, &community, &duty, &allegation)
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
     // NB (v4.0 #135) — the legacy `list_attestations_for(attested_key_id)
     // -> Vec<Attestation>` PyO3 wrapper (uncapped, no scope, no cursor) is
     // superseded by the scope-gated cursor-paged
@@ -20764,6 +20975,33 @@ fn decode_role_authority_inputs(
 /// them). Kept out of the `#[pymethods]` block because they take the
 /// non-Python `OperationalKind` discriminator.
 impl PyEngine {
+    /// v9.3.0 (#249 Cut C) — extract the (crate-level `BackendDispatch`,
+    /// hardware signer, LocalSigner) triple the emit ceremonies share to
+    /// reconstruct a hybrid-capable Engine over the shared backend (the
+    /// cohabitation path, identical to the #248 `emit_attestation` FFI).
+    /// Raises when no PQC-configured local signer is present (a conformant
+    /// federation-tier emit needs the hybrid identity).
+    fn cut_c_emit_handles(
+        &self,
+    ) -> PyResult<(
+        crate::engine::BackendDispatch,
+        Arc<dyn HardwareSigner>,
+        Arc<crate::signing::LocalSigner>,
+    )> {
+        let backend = match &self.backend {
+            BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+        };
+        let local_signer = self.local_signer.clone().ok_or_else(|| {
+            PyValueError::new_err(
+                "this emit ceremony requires a PQC-configured local signer \
+                 (construct the engine with local_pqc_key_id + local_pqc_key_path)",
+            )
+        })?;
+        Ok((backend, self.signer.clone(), local_signer))
+    }
+
     fn operational_list_for(
         &self,
         py: Python<'_>,
