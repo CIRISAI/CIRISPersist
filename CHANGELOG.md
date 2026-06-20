@@ -5,6 +5,16 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.2.2] — 2026-06-20
+
+### Changed — re-pin CIRISVerify v6.5.0 → v6.6.0 (wheel concurrence)
+
+- All six git-tag verify crates flipped in lockstep per the coherence rule; `version = "6"` unchanged (6.6.0 satisfies it). v6.6.0 is accord/keyring-facing (portable signature-wrapped ML-DSA-65 USB key mode, CIRISVerify#88) and does **not** touch persist's consumed surface (`verify_hybrid` / `canonical` / `transparency` / `xchacha` / `hkdf` / `hmac`). Family-floor / wheel-concurrence re-pin only — keeps `pip install ciris-persist ciris-verify` resolving to one coherent verify. No persist production-code change. Wheel `Requires-Dist` floor stays `>=6.0.0,<7`.
+
+### Fixed — `sth_*` test stack overflow under v6.6.0's larger ML-DSA-65
+
+- v6.6.0's ML-DSA-65 layout/`zeroize` change (#88) enlarged the signer's stack footprint just enough that the transparency-log test helper `register_hybrid_producer` (sqlite test module) overflowed the 2 MiB tokio test-thread stack — it held a multi-KiB Ed25519+ML-DSA-65 `HybridSigner` in its async future state **across** the `put_public_key().await`. Fixed test-side: the helper now returns a **boxed** signer built **before** the await, so only an 8-byte pointer crosses it (production's 8 MiB main-thread stack was never affected). Pure test-fixture change.
+
 ## [9.2.1] — 2026-06-19
 
 ### Changed — re-pin CIRISVerify v6.3.0 → v6.5.0 (wheel concurrence)
