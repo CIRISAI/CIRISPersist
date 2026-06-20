@@ -188,13 +188,14 @@ pub use topology::{
 };
 pub use types::{device_class, identity_type};
 pub use types::{
-    Attestation, Community, CommunityMember, CommunityMembershipRevocation, EncryptionPubkeys,
-    Family, FamilyMember, FamilyMembershipRevocation, HybridPendingRow, IdentityOccurrence,
-    IdentityOccurrenceRevocation, KeyRecord, LocationProof, PeerMetadataRow, PeerPolicyBlob,
-    Revocation, SignedAttestation, SignedCommunity, SignedCommunityMembershipRevocation,
-    SignedFamily, SignedFamilyMembershipRevocation, SignedIdentityOccurrence,
-    SignedIdentityOccurrenceRevocation, SignedKeyRecord, SignedLocationProof, SignedRevocation,
-    TrustClass, TrustFilter, TrustGrant, TrustRelationship, TrustRow, TrustType,
+    Attestation, Community, CommunityMember, CommunityMembershipRevocation, EmitAttestationInput,
+    EncryptionPubkeys, Family, FamilyMember, FamilyMembershipRevocation, HybridPendingRow,
+    IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof, PeerMetadataRow,
+    PeerPolicyBlob, Revocation, SignedAttestation, SignedCommunity,
+    SignedCommunityMembershipRevocation, SignedFamily, SignedFamilyMembershipRevocation,
+    SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
+    SignedLocationProof, SignedRevocation, TrustClass, TrustFilter, TrustGrant, TrustRelationship,
+    TrustRow, TrustType,
 };
 
 /// Federation directory trait — the registry/lens/agent's read+write

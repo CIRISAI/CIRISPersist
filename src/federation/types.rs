@@ -711,6 +711,63 @@ impl LocalAttestationInput {
     }
 }
 
+/// v9.3.0 (CIRISPersist#248) — inputs to
+/// [`crate::Engine::emit_attestation`], the high-level "produce ONE
+/// signed federation-tier CEG attestation" primitive.
+///
+/// The helper canonicalizes [`Self::attestation_envelope`], SHA-256s the
+/// canonical bytes (`original_content_hash`), hybrid-signs (Ed25519 +
+/// ML-DSA-65 bound), and assembles the 20-field [`Attestation`] with
+/// `attesting_key_id == scrub_key_id == <signer's DERIVED federation
+/// key_id>` — derived internally (never a caller alias), which
+/// structurally fixes CIRISPersist#247. Consumers stop hand-rolling the
+/// ~50-line canonicalize→sign→assemble→`put_attestation` pattern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmitAttestationInput {
+    /// The §3 structural primitive (`scores` / `delegates_to` /
+    /// `withdraws` / …) — the row's `attestation_type`.
+    pub attestation_type: String,
+    /// Primary attested key. Defaults to the signer's derived key_id
+    /// (a self-attestation) when `None`. Must exist in `federation_keys`
+    /// when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attested_key_id: Option<String>,
+    /// The CEG attestation envelope (canonicalized via
+    /// `ceg_produce_canonicalize`; never mutated).
+    pub attestation_envelope: serde_json::Value,
+    /// §4.2.6 subjects this attestation names. May be empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_key_ids: Vec<String>,
+    /// Producer-side visibility scope. Defaults `federation` for a
+    /// federation-tier emit (see [`Self::with_envelope`]).
+    #[serde(default = "default_cohort_scope")]
+    pub cohort_scope: String,
+    /// Optional expiry (`delegates_to` / `consent:*` lifecycles).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl EmitAttestationInput {
+    /// Build a federation-scope input from a `type` + envelope, leaving
+    /// `attested_key_id`/`subject_key_ids`/`expires_at` at their
+    /// self-attestation defaults. `cohort_scope` defaults to
+    /// `federation` (the tier of every [`crate::Engine::emit_attestation`]
+    /// write).
+    pub fn with_envelope(
+        attestation_type: impl Into<String>,
+        attestation_envelope: serde_json::Value,
+    ) -> Self {
+        Self {
+            attestation_type: attestation_type.into(),
+            attested_key_id: None,
+            attestation_envelope,
+            subject_key_ids: Vec::new(),
+            cohort_scope: cohort_scope::FEDERATION.to_string(),
+            expires_at: None,
+        }
+    }
+}
+
 /// v3.9.0 (CIRISPersist#150) — default cohort_scope for backward compat.
 /// Pre-v3.9.0 attestations had no cohort_scope; reading them under the
 /// new schema returns the column DEFAULT 'federation', so the Rust
