@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781933732184,
+  "lastUpdate": 1781936064461,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -36743,6 +36743,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 607335,
             "range": "± 1802",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3df329a0f8a7e27e5e1ff7bd6eb79120a36ad16c",
+          "message": "v9.3.0 — CEG-native graph DX: foundation (#247/#248) + traversal/enumerator/emit surface (#249 Cuts A/B/C) (#251)\n\n* feat(ffi): #249 Cut A — FFI-expose graph-traversal read readers over pyo3\n\nPure pyo3 wrappers of EXISTING FederationDirectory / admission readers\n(zero new Rust logic) so the CIRISAgent KMP UI + other consumers stop\nhand-folding revocations and re-deriving the owner-binding /\nduty-holder graph. Each mirrors the established lookup_family_json /\nlist_families_for_member_json patterns (py.detach + per-backend\nblock_on, federation_err_to_py, serde_json out). All additions live in a\ndelimited `// ── #249 Cut A ──` section to minimize conflict with the\nparallel #249 cuts.\n\nAdded (each wraps an existing pub method):\n- lookup_community_json → FederationDirectory::lookup_community\n- list_communities_for_member_json → list_communities_for_member\n- list_families_for_member_active_json → list_families_for_member_active\n- list_communities_for_member_active_json → list_communities_for_member_active\n- list_family_membership_revocations_for_json → list_family_membership_revocations_for\n- list_community_membership_revocations_for_json → list_community_membership_revocations_for\n- is_named_moderator_json → admission::is_named_moderator (fail-closed bool)\n- is_owner_bound_json → admission::is_owner_bound (fail-closed bool; the\n  most-reconstructed walk, #104 PERSIST_DELEGATES_TO blocker)\n- duty_holders_for_community_json → admission::duty_holders_for_community\n  (JSON array; HashSet sorted to a stable Vec)\n- duty_holders_for_content_json → admission::duty_holders_for_content\n  (signature mirrors the Rust fn: content_sha256 + community_id + duty)\n\nadmission free fns are coerced to `&dyn FederationDirectory` via\n`&*backend` per dispatch arm (same as is_named_moderator_json).\n\nTests (sqlite store module, reusing existing fixtures):\n- active-variant JSON-shape: seed community + effective revocation; the\n  active wrapper's serialized array EXCLUDES the revoked member while the\n  full-history reader includes them.\n- owner-binding + duty-holders JSON-shape: a USER key is owner-bound, a\n  bare NODE key is not; a MAJORITY community's duty-holder set is exactly\n  its owner-bound members through the sorted JSON array; unknown\n  community ⇒ fail-closed empty array.\n\nNo reader had to be SKIPPED — all ten target methods already exist as\npub Rust. No version bump, no CHANGELOG version header, no verify re-pin\n(lead bundles #249 cuts into v9.3.0).\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01RWKf675EcbswPMuEqprUNQ\n\n* feat(graph-dx): #249 Cut B — enumerators + add_community_member + reachable_under_scope\n\nCEG-native graph DX: the missing read-side enumerators (members-of-a-group,\nfull named-moderator set, owner-binding endpoints + audit chain, inbound\ndelegations), the general scoped-delegation reachability primitive, and the\nincremental community-roster grow — each the enumeration companion of an\nexisting predicate / forward-only walk.\n\n- FederationDirectory::active_community_members / active_family_members —\n  roster MINUS effective (effective_at<=now) membership revocations; future-\n  dated revocation keeps the member. The roster-minus-revocations fold is\n  factored into one shared free fn (federation::removed_key_ids_at) that the\n  community-DEK cascade's resolve_community_members now composes too (not\n  forked).\n- admission::reachable_under_scope — the general scoped-delegation\n  reachability primitive (#13, the load-bearing walk every delegated-duty\n  reader specializes). Makes the previously-PRIVATE\n  issuer_reaches_target_via_scoped_delegation walk public via a thin pub\n  wrapper (singleton target + MODERATION_DUTY policy); ZERO change to the\n  attenuation/sub_delegation/withdraws/depth-cap semantics.\n- admission::moderators_of — owner-bound authority roots ∪ duty-scoped\n  delegates, via a new enumerate_scoped_delegation_reach BFS sharing the\n  MODERATION_DUTY walk policy of the is_named_moderator predicate.\n- admission::owner_bindings_of — the user-role keys that owner-bind k;\n  admission::owner_binding_chain — the audit PATH user→…→k (anchor-first).\n- FederationDirectory::delegations_to — inbound delegates_to edges (reverse\n  of the forward-only build_delegation_graph).\n- FederationDirectory::add_community_member — mirror of add_family_member;\n  idempotent roster-grow, recompute persist_row_hash. New pg/sqlite/memory\n  impls.\n\n3-backend parity (pg JSONB / sqlite TEXT / memory Vec) + FFI for each + thin\nEngine wrappers. Tests on all three backends. No version bump, no verify\nre-pin (lead bundles #249 cuts into v9.3.0).\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01RWKf675EcbswPMuEqprUNQ\n\n* feat(ceg-dx): derived-key_id floor (#247) + emit_attestation primitive (#248) — v9.3.0 foundation\n\nFirst cut of the #249 CEG-native graph DX umbrella: the emit-side floor.\n\n#247 — derived-key_id resolver + alias-vs-derived FK fix. After CIRISVerify\nFSD-003 a node's federation_keys row is keyed by the DERIVED wire key_id\n(derive_key_id(label, ed25519_pubkey) = \"<label>-<fp>\"), not the keystore\nalias. Every federation-tier emit that stamped current_alias() as an\nFK-bound key_id FK-violated on every real node.\n  - Resolver: Engine::local_derived_key_id() (async, via the composed\n    HardwareSigner pubkey) + LocalSigner::derived_key_id() /\n    ed25519_public_key_bytes() (sync).\n  - Fixed FK-write sites: attestation_promote scrub_key_id (the named bug);\n    put_blob_signing holds_bytes scrub_key_id + the eviction\n    emit_withdraws_attestation_helper attester/scrub (same class); the\n    sweeper holds_bytes lookup + is_local_or_family_key local-identity\n    comparison (so the holds_bytes/withdraws lifecycle is FK-consistent\n    end-to-end).\n  - Left as-is (correctly the label, not an FK): LocalSigner construction\n    label; derive_key_id's label arg; the ingest scrub envelope's\n    scrub_key_id on the non-FK trace_events column.\n    local_identity_aggregate's published key_id is a separate behavioral\n    concern (returns a struct, no FK crash) tracked for a later cut.\n\n#248 — Engine::emit_attestation(signer, EmitAttestationInput) -> attestation_id.\nTHE emit primitive: canonicalize -> SHA-256 -> hybrid-sign (Ed25519 +\nML-DSA-65 bound) -> assemble the 20-field federation-tier Attestation ->\nput_attestation. Derives attesting_key_id/scrub_key_id internally from the\nsigner (the #247 floor — never a caller alias). New EmitAttestationInput\ntype + with_envelope() builder. Persist's own eviction-sweeper withdraws\nproducer (Engine::emit_withdraws_attestation) now composes this primitive.\n\nFFI: PyEngine.emit_attestation(input_json) -> attestation_id (engine's\nconfigured local signer; PyValueError on decode / missing-PQC / backend).\n\nBackend + FFI parity (sqlite + live Postgres). Verify pin unchanged\n(v6.5.0). Blob/eviction/takedown/self-at-login test fixtures updated to the\nreal-node shape (register the federation_keys row under the derived id).\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01RWKf675EcbswPMuEqprUNQ\n\n* feat(ceg-dx): #249 Cut C emit ceremonies — delegates_to / moderation typed conveniences (v9.3.0)\n\nCut C of the #249 CEG-native graph DX umbrella: the high-level signer-based\nemit ceremonies + moderate-scope constants, each COMPOSING the #248\nemit_attestation primitive (no re-hand-roll; all inherit the #247\nderived-key_id floor — attester/scrub is the signer's DERIVED federation\nkey_id, never a caller alias). Backend-agnostic; verify pin unchanged\n(v6.5.0); no version bump (foundation set 9.3.0).\n\n- delegation_scope::SCOPE_MODERATE/TAKEDOWN/REVIEW (types.rs) alias the\n  admission::DELEGATION_SCOPE_* constants BY VALUE — the exact tokens the\n  §11.10 duty walk matches, so emitted edges are admissible.\n- federation::delegates_to_envelope(delegate, scopes, sub_delegation)\n  (self_at_login.rs) — the §11.10-admissible array-set + sub_delegation shape.\n- Engine: grant_delegation (general) → owner_bind (infra:*-only, passes the\n  CC 4.4.3.4.3 node-agency gate) / add_moderator (duty scope; community rides\n  implicitly via the authority-root walk) / revoke_delegation + remove_moderator\n  (producer-self withdraws, keyed by recipient so the walk's retraction\n  bucketing invalidates the edge) / file_moderation (moderation:{allegation}:v1\n  scores; feature-free — the producer convenience needs no --features cirisnode).\n- FFI: PyEngine.{grant_delegation,owner_bind,add_moderator,revoke_delegation,\n  remove_moderator,file_moderation} in a labeled // ── #249 Cut C ── section,\n  sharing a cut_c_emit_handles helper (the #248 emit_attestation FFI shape).\n- Tests (sqlite + live PG): grant stores under the derived id; owner_bind\n  infra:* passes the node-agency gate + owner-binds (agency:* negative\n  control); the add_moderator ↔ is_named_moderator round-trip (true after\n  appoint, false after remove_moderator); file_moderation stores the\n  moderation scores row.\n\nGate (all --features \"postgres server pyo3 sqlite cirisaudit cirisnode\nencrypted-kv\"): build / clippy -D warnings / fmt --check / nextest\n1546 passed 0 failed. No-backend: sqlite-only 1010 passed, server-only\n633 passed; clippy clean on server / postgres,pyo3,server / sqlite.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01RWKf675EcbswPMuEqprUNQ\n\n* v9.3.0: integrate Cut C (emit ceremonies) + order CHANGELOG\n\n---------\n\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-06-20T00:51:14-05:00",
+          "tree_id": "c7210592085517338123225bf1b03fa6791152ef",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/3df329a0f8a7e27e5e1ff7bd6eb79120a36ad16c"
+        },
+        "date": 1781936063244,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 45703994,
+            "range": "± 690733",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2743798,
+            "range": "± 505092",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 9263,
+            "range": "± 93",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 12790,
+            "range": "± 738",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 19880,
+            "range": "± 269",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 53221,
+            "range": "± 1044",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 35,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 179,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 507,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 578,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1991,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 74,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 237,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1052,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 27358,
+            "range": "± 756",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 69538,
+            "range": "± 3027",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 227123,
+            "range": "± 7943",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 8910,
+            "range": "± 446",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 10452,
+            "range": "± 1086",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 15049,
+            "range": "± 1704",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 25284,
+            "range": "± 10678",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1870435,
+            "range": "± 33498",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 5120016,
+            "range": "± 160552",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 304913,
+            "range": "± 4422",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 911054,
+            "range": "± 11262",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 51758887,
+            "range": "± 293534",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1724474,
+            "range": "± 23145",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 8717977,
+            "range": "± 152362",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 129299023,
+            "range": "± 757785",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 4493623,
+            "range": "± 220530",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 23331898,
+            "range": "± 1234777",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 102736,
+            "range": "± 2993",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 97332,
+            "range": "± 12562",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 7446,
+            "range": "± 23",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 50712,
+            "range": "± 414",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 467284,
+            "range": "± 8451",
             "unit": "ns/iter"
           }
         ]
