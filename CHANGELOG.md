@@ -5,6 +5,13 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.4.2] — 2026-06-21
+
+### Changed — re-pin CIRISVerify v6.7.1 → v6.8.0 (wheel concurrence)
+
+- All six git-tag verify crates flipped in lockstep; `version = "6"` unchanged. v6.8.0 adds the **growable M-of-N accord family genesis** surface (`ciris_verify_core::accord_genesis` — membership-change supersedes + name-free labels, CIRISVerify#95/#96/#97) — a purely **additive** new module that does **not** touch persist's consumed APIs (`verify_hybrid` / `canonical` / `transparency` / `xchacha` / `hkdf` / `hmac` / `fedcode`). Family-floor / wheel-concurrence re-pin only; no persist code change. Wheel `Requires-Dist` floor stays `>=6.0.0,<7`.
+- **Forward pointer:** v6.8.0 is the crypto half of a coordinated rostered-group governance cut. CIRISServer made HUMANITY_ACCORD a first-class persist family (v0.5.22) and filed the symmetric **write + governance** ask on CIRISPersist#249 (uniform `cohort:{self|family|community}` dispatch, `supersede_group`/reconstitute, the deferred v3.13+ quorum-authorized membership gate, a canonical membership-change payload, atomic `swap_member`, rekey-on-revoke, group versioning/history, change-event hook). That substrate surface is scoped for a following cut, not this re-pin.
+
 ## [9.4.1] — 2026-06-20
 
 ### Changed — re-pin CIRISVerify v6.6.1 → v6.7.1 (wheel concurrence)
