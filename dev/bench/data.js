@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782062884618,
+  "lastUpdate": 1782065226123,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -38033,6 +38033,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 416473,
             "range": "± 1655",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "57ccfda02faeceb0b2de441f89ac07488f6c26d6",
+          "message": "v9.5.0 — #249 Cut G1: uniform cohort rostered-group surface (#258)\n\n* #249 Cut G1 — uniform cohort rostered-group surface (CIRISServer #249 §1/§2/§6)\n\nOne cohort-parameterized surface {self|family|community} over the three\nmirrored rostered-group method sets, so consumers write rostered-group ops\nonce instead of branching family-vs-community-vs-self by hand.\n\n- New `federation::cohort` module: `Cohort` (#[non_exhaustive], wire tokens\n  self/family/community), `RosterMember`, `GroupRef`, `RevokeSpec`.\n- Default `FederationDirectory` methods composing the existing per-backend\n  methods (backend parity inherited, no override): `active_members`,\n  `active_member_keys` (§2 — roster -> pinned hybrid pubkeys, fail-secure on\n  a missing key), `lookup_group`, `groups_of`, `add_member`, `revoke_member`,\n  `swap_member` (§6).\n- FFI: `cohort_*` JSON methods (RevokeSpec/RosterMember as JSON).\n- Round-trip tested on sqlite + live Postgres across all 3 cohorts.\n\n`affiliations` stays non-rostered (CIRISServer #249 Q1); `Cohort` is\n#[non_exhaustive] so a future CEG decision adds it without a break.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01RWKf675EcbswPMuEqprUNQ\n\n* v9.5.0 — #249 Cut G1: uniform cohort rostered-group surface\n\nCHANGELOG [9.5.0]: the persist half of the CIRISServer #249 write+governance\nask (first cut), §1/§2/§6. One cohort-parameterized surface over the three\nmirrored rostered-group method sets.\n\nGate: 1573/1573 nextest (full features, live postgres:16 + sqlite + memory)\n+ clippy -D + fmt + 3 no-backend -D warnings combos — all green.\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01RWKf675EcbswPMuEqprUNQ\n\n---------\n\nCo-authored-by: Claude Opus 4.8 <noreply@anthropic.com>",
+          "timestamp": "2026-06-21T12:44:12-05:00",
+          "tree_id": "d2ae43e9a9ac5c03ae70c0a83c1af4c0f1a0d51a",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/57ccfda02faeceb0b2de441f89ac07488f6c26d6"
+        },
+        "date": 1782065224871,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 45672622,
+            "range": "± 210202",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 3665015,
+            "range": "± 222938",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 9248,
+            "range": "± 111",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 12711,
+            "range": "± 80",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 19844,
+            "range": "± 99",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 53101,
+            "range": "± 239",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 34,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 178,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 507,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 577,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 1992,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 73,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 238,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1052,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 27511,
+            "range": "± 3847",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 67437,
+            "range": "± 2267",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 225701,
+            "range": "± 5389",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 9196,
+            "range": "± 459",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 10747,
+            "range": "± 498",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 15047,
+            "range": "± 831",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 25589,
+            "range": "± 4158",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 1872367,
+            "range": "± 9681",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 3800279,
+            "range": "± 29151",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 233632,
+            "range": "± 8344",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 705157,
+            "range": "± 18705",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 38418467,
+            "range": "± 283368",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1388753,
+            "range": "± 42628",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 7012894,
+            "range": "± 178595",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 96398801,
+            "range": "± 374390",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 3684449,
+            "range": "± 166818",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 18196726,
+            "range": "± 238574",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 78904,
+            "range": "± 4114",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 70446,
+            "range": "± 2478",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 5569,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 37553,
+            "range": "± 162",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 347881,
+            "range": "± 2415",
             "unit": "ns/iter"
           }
         ]
