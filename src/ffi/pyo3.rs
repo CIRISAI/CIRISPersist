@@ -15224,6 +15224,313 @@ impl PyEngine {
         })
     }
 
+    // ── #249 Cut G1 ── uniform cohort FFI (CIRISServer #249 §1/§2/§6) ──
+    //
+    // One cohort-parameterized surface (`cohort` ∈ {"self","family",
+    // "community"}) over the rostered-group read+write methods, so the
+    // KMP/Python consumers write rostered-group ops once instead of
+    // branching family-vs-community-vs-self. Each composes the
+    // [`crate::federation::cohort`] default methods (backend parity
+    // inherited). A hardware-hybrid engine needs no extra signer here —
+    // these are admission/read, not emit.
+
+    /// #249 Cut G1 (§1) — active roster of `group_key_id` in `cohort`. Returns
+    /// a JSON array of [`crate::federation::cohort::RosterMember`].
+    fn cohort_active_members_json(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        group_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let cohort = cohort_from_token(cohort)?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let group_key_id = group_key_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .active_members(cohort, &group_key_id)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyValueError::new_err(format!(
+                                    "cohort active_members serialize: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// #249 Cut G1 (§2) — active roster of `group_key_id` resolved to pinned
+    /// hybrid pubkeys. Returns a JSON array of
+    /// [`crate::federation::types::KeyRecord`]. Raises `ValueError` if a roster
+    /// member has no `federation_keys` row (fail-secure — see
+    /// [`FederationDirectory::active_member_keys`](crate::federation::FederationDirectory::active_member_keys)).
+    fn cohort_active_member_keys_json(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        group_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let cohort = cohort_from_token(cohort)?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let group_key_id = group_key_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .active_member_keys(cohort, &group_key_id)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyValueError::new_err(format!(
+                                    "cohort active_member_keys serialize: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// #249 Cut G1 (§1) — look up a group uniformly. Returns the
+    /// [`crate::federation::cohort::GroupRef`] JSON, or `None` if unknown.
+    fn cohort_lookup_group_json(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        group_key_id: &str,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        let cohort = cohort_from_token(cohort)?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let group_key_id = group_key_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let row = b
+                                .lookup_group(cohort, &group_key_id)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            match row {
+                                Some(g) => serde_json::to_string(&g).map(Some).map_err(|e| {
+                                    PyValueError::new_err(format!(
+                                        "cohort lookup_group serialize: {e}"
+                                    ))
+                                }),
+                                None => Ok(None),
+                            }
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// #249 Cut G1 (§1) — every group in `cohort` that `member_key_id` is
+    /// currently a member of. Returns a JSON array of
+    /// [`crate::federation::cohort::GroupRef`].
+    fn cohort_groups_of_json(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        member_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let cohort = cohort_from_token(cohort)?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let member_key_id = member_key_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .groups_of(cohort, &member_key_id)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyValueError::new_err(format!("cohort groups_of serialize: {e}"))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// #249 Cut G1 (§1) — admit a [`crate::federation::cohort::RosterMember`]
+    /// (JSON) into a `family`/`community` roster. Returns `True` on a genuine
+    /// add, `False` if already present. Raises `ValueError` for the `self`
+    /// cohort (occurrences are added via `put_identity_occurrence`).
+    fn cohort_add_member(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        group_key_id: &str,
+        member_json: &str,
+    ) -> PyResult<bool> {
+        self.ensure_usable()?;
+        let cohort = cohort_from_token(cohort)?;
+        let member: crate::federation::cohort::RosterMember = serde_json::from_str(member_json)
+            .map_err(|e| PyValueError::new_err(format!("cohort_add_member member JSON: {e}")))?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let group_key_id = group_key_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            b.add_member(cohort, &group_key_id, member.clone())
+                                .await
+                                .map_err(federation_err_to_py)
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// #249 Cut G1 (§1) — remove `removed_key_id` from a `cohort` roster via the
+    /// append-only revocation table. `revoke_spec_json` is a
+    /// [`crate::federation::cohort::RevokeSpec`] (`{effective_at, reason?,
+    /// witness_set?}`); `effective_at` may be future-dated.
+    fn cohort_revoke_member(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        group_key_id: &str,
+        removed_key_id: &str,
+        revoke_spec_json: &str,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        let cohort = cohort_from_token(cohort)?;
+        let spec: crate::federation::cohort::RevokeSpec = serde_json::from_str(revoke_spec_json)
+            .map_err(|e| PyValueError::new_err(format!("revoke_spec_json: {e}")))?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let group_key_id = group_key_id.to_owned();
+            let removed_key_id = removed_key_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            b.revoke_member(cohort, &group_key_id, &removed_key_id, spec.clone())
+                                .await
+                                .map_err(federation_err_to_py)
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// #249 Cut G1 (§6) — atomically swap `out_key_id` for the
+    /// [`crate::federation::cohort::RosterMember`] in `in_member_json` (revoke
+    /// then add) in a `family`/`community` roster. `revoke_spec_json` is a
+    /// [`crate::federation::cohort::RevokeSpec`]. Returns the add result.
+    fn cohort_swap_member(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        group_key_id: &str,
+        out_key_id: &str,
+        in_member_json: &str,
+        revoke_spec_json: &str,
+    ) -> PyResult<bool> {
+        self.ensure_usable()?;
+        let cohort = cohort_from_token(cohort)?;
+        let in_member: crate::federation::cohort::RosterMember =
+            serde_json::from_str(in_member_json).map_err(|e| {
+                PyValueError::new_err(format!("cohort_swap_member in_member JSON: {e}"))
+            })?;
+        let spec: crate::federation::cohort::RevokeSpec = serde_json::from_str(revoke_spec_json)
+            .map_err(|e| PyValueError::new_err(format!("revoke_spec_json: {e}")))?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let group_key_id = group_key_id.to_owned();
+            let out_key_id = out_key_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            b.swap_member(
+                                cohort,
+                                &group_key_id,
+                                &out_key_id,
+                                in_member.clone(),
+                                spec.clone(),
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
     /// #249 Cut B — the FULL named-moderator set of `community_key_id` for
     /// `duty` (`moderate` / `takedown` / `review`): owner-bound authority
     /// roots ∪ their duty-scoped delegates. Returns a JSON array of key_ids.
@@ -21821,6 +22128,16 @@ fn base64_encode(bytes: &[u8]) -> String {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     B64.encode(bytes)
+}
+
+/// #249 Cut G1 — parse a cohort wire token (`"self"`/`"family"`/`"community"`)
+/// for the uniform cohort FFI. `ValueError` for a non-rostered scope.
+fn cohort_from_token(cohort: &str) -> PyResult<crate::federation::cohort::Cohort> {
+    crate::federation::cohort::Cohort::from_token(cohort).map_err(|bad| {
+        PyValueError::new_err(format!(
+            "unknown cohort {bad:?} (expected one of: self | family | community)"
+        ))
+    })
 }
 
 fn federation_err_to_py(e: crate::federation::Error) -> PyErr {

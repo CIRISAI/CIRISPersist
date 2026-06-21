@@ -38,6 +38,7 @@ pub mod at_rest_cascade;
 pub mod backfill;
 pub mod blackhole;
 pub mod blobs;
+pub mod cohort;
 pub mod community_dek;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
@@ -134,6 +135,7 @@ pub use blobs::{
     PutBlobAttestation, ScopeBlobSymbol, CHUNK_MANIFEST_VERSION, DEFAULT_INLINE_BYTES_CAP,
     HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
+pub use cohort::{Cohort, GroupRef, RevokeSpec, RosterMember};
 pub use goal::{
     canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
     MetaGoalAlignment,
@@ -1049,6 +1051,301 @@ pub trait FederationDirectory: Send + Sync {
         community_key_id: &str,
         member: types::CommunityMember,
     ) -> Result<bool, Error>;
+
+    // ── #249 Cut G1 ── the uniform rostered-group surface ──────────────
+    //
+    // CIRISServer #249 write+governance ask §1/§2/§6/§Q1-self. `self` /
+    // `family` / `community` are the same machine (roster + append-only
+    // revocations + the `roster − effective revocations` fold) at three
+    // points on the visibility gradient; these methods are the single
+    // `cohort`-parameterized surface over the three mirrored method sets,
+    // so consumers write rostered-group ops ONCE. All are DEFAULT methods
+    // composing the existing per-backend methods — backend parity (pg /
+    // sqlite / memory) is inherited, no override needed. See
+    // [`cohort`](crate::federation::cohort).
+
+    /// #249 Cut G1 (§1) — the **active roster** of `group_key_id` in `cohort`,
+    /// uniform across `self` / `family` / `community` (`roster − effective
+    /// revocations`, `effective_at <= now`). Dispatches to
+    /// [`Self::active_family_members`] / [`Self::active_community_members`] /
+    /// [`Self::list_identity_occurrences_active`] and projects each to the
+    /// uniform [`RosterMember`]. [`Error::InvalidArgument`] if a
+    /// family/community `group_key_id` is unknown.
+    async fn active_members(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<cohort::RosterMember>, Error> {
+        Ok(match cohort {
+            cohort::Cohort::Family => self
+                .active_family_members(group_key_id)
+                .await?
+                .into_iter()
+                .map(cohort::RosterMember::from)
+                .collect(),
+            cohort::Cohort::Community => self
+                .active_community_members(group_key_id)
+                .await?
+                .into_iter()
+                .map(cohort::RosterMember::from)
+                .collect(),
+            cohort::Cohort::SelfId => self
+                .list_identity_occurrences_active(group_key_id)
+                .await?
+                .into_iter()
+                .map(cohort::RosterMember::from)
+                .collect(),
+        })
+    }
+
+    /// #249 Cut G1 (§2) — the active roster resolved to its **pinned hybrid
+    /// public keys** ([`KeyRecord`]s), one call. The bridge from membership to
+    /// threshold verification (the input to every quorum check): composes
+    /// [`Self::active_members`] with [`Self::lookup_public_key`] per member.
+    ///
+    /// **Fail-secure:** an active roster member whose key is absent from
+    /// `federation_keys` is a graph inconsistency that would silently undercount
+    /// a quorum, so this returns [`Error::InvalidArgument`] rather than skip it.
+    async fn active_member_keys(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<types::KeyRecord>, Error> {
+        let members = self.active_members(cohort, group_key_id).await?;
+        let mut out = Vec::with_capacity(members.len());
+        for m in members {
+            let rec = self.lookup_public_key(&m.key_id).await?.ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "active_member_keys: roster member {:?} of {} {:?} has no federation_keys \
+                     row (broken roster — refusing to undercount a quorum)",
+                    m.key_id,
+                    cohort.as_str(),
+                    group_key_id
+                ))
+            })?;
+            out.push(rec);
+        }
+        Ok(out)
+    }
+
+    /// #249 Cut G1 (§1) — look up a group's identity uniformly. Dispatches to
+    /// [`Self::lookup_family`] / [`Self::lookup_community`]; for `self` the
+    /// identity_key IS the group, so it returns a metadata-free [`GroupRef`]
+    /// when `group_key_id` is a known key ([`Self::lookup_public_key`] is
+    /// `Some`). `Ok(None)` if the group/key is unknown.
+    async fn lookup_group(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Option<cohort::GroupRef>, Error> {
+        Ok(match cohort {
+            cohort::Cohort::Family => self
+                .lookup_family(group_key_id)
+                .await?
+                .map(cohort::GroupRef::from),
+            cohort::Cohort::Community => self
+                .lookup_community(group_key_id)
+                .await?
+                .map(cohort::GroupRef::from),
+            cohort::Cohort::SelfId => {
+                self.lookup_public_key(group_key_id)
+                    .await?
+                    .map(|_| cohort::GroupRef {
+                        cohort: cohort::Cohort::SelfId,
+                        group_key_id: group_key_id.to_string(),
+                        name: None,
+                        consensus_protocol: None,
+                        founded_at: None,
+                    })
+            }
+        })
+    }
+
+    /// #249 Cut G1 (§1) — every group in `cohort` that `member_key_id` is
+    /// **currently** a member of (the active reverse lookup). Dispatches to
+    /// [`Self::list_families_for_member_active`] /
+    /// [`Self::list_communities_for_member_active`]; for `self` it resolves the
+    /// occurrence → its identity via [`Self::lookup_identity_for_occurrence`].
+    async fn groups_of(
+        &self,
+        cohort: cohort::Cohort,
+        member_key_id: &str,
+    ) -> Result<Vec<cohort::GroupRef>, Error> {
+        Ok(match cohort {
+            cohort::Cohort::Family => self
+                .list_families_for_member_active(member_key_id)
+                .await?
+                .into_iter()
+                .map(cohort::GroupRef::from)
+                .collect(),
+            cohort::Cohort::Community => self
+                .list_communities_for_member_active(member_key_id)
+                .await?
+                .into_iter()
+                .map(cohort::GroupRef::from)
+                .collect(),
+            cohort::Cohort::SelfId => self
+                .lookup_identity_for_occurrence(member_key_id)
+                .await?
+                .into_iter()
+                .map(|o| cohort::GroupRef {
+                    cohort: cohort::Cohort::SelfId,
+                    group_key_id: o.identity_key_id,
+                    name: None,
+                    consensus_protocol: None,
+                    founded_at: None,
+                })
+                .collect(),
+        })
+    }
+
+    /// #249 Cut G1 (§1) — admit one [`RosterMember`] into a `family` /
+    /// `community` roster uniformly (dispatches to [`Self::add_family_member`]
+    /// / [`Self::add_community_member`]). Idempotent on `member.key_id`
+    /// (`Ok(false)` = already present, `Ok(true)` = genuine add).
+    ///
+    /// The `self` cohort is **not** admissible here: an occurrence carries
+    /// `device_class` / `hardware_attestation` / `encryption_pubkeys` that a
+    /// [`RosterMember`] cannot, so `self` members are added via
+    /// [`Self::put_identity_occurrence`]. Returns [`Error::InvalidArgument`]
+    /// for `Cohort::SelfId`.
+    async fn add_member(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        member: cohort::RosterMember,
+    ) -> Result<bool, Error> {
+        match cohort {
+            cohort::Cohort::Family => {
+                self.add_family_member(
+                    group_key_id,
+                    types::FamilyMember {
+                        key_id: member.key_id,
+                        joined_at: member.joined_at,
+                        role: member.role,
+                    },
+                )
+                .await
+            }
+            cohort::Cohort::Community => {
+                self.add_community_member(
+                    group_key_id,
+                    types::CommunityMember {
+                        key_id: member.key_id,
+                        joined_at: member.joined_at,
+                        role: member.role,
+                    },
+                )
+                .await
+            }
+            cohort::Cohort::SelfId => Err(Error::InvalidArgument(
+                "add_member: the `self` cohort admits members via \
+                 put_identity_occurrence (an occurrence carries device_class / \
+                 hardware_attestation / encryption_pubkeys a RosterMember cannot)"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// #249 Cut G1 (§1) — remove one member from a `cohort` roster uniformly,
+    /// via the append-only revocation table (the roster `members[]` is left
+    /// intact; the `active_*` reads compose against the revocation). Builds the
+    /// cohort's revocation row (`persist_row_hash` is backend-computed) and
+    /// dispatches to the matching `put_*_revocation`. `effective_at` may be
+    /// future-dated (the member stays active until it arrives).
+    async fn revoke_member(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        removed_key_id: &str,
+        spec: cohort::RevokeSpec,
+    ) -> Result<(), Error> {
+        let now = chrono::Utc::now();
+        let cohort::RevokeSpec {
+            effective_at,
+            reason,
+            witness_set,
+        } = spec;
+        match cohort {
+            cohort::Cohort::Family => {
+                self.put_family_membership_revocation(types::SignedFamilyMembershipRevocation {
+                    family_membership_revocation: types::FamilyMembershipRevocation {
+                        family_key_id: group_key_id.to_string(),
+                        removed_identity_key_id: removed_key_id.to_string(),
+                        removed_at: now,
+                        effective_at,
+                        reason,
+                        witness_set,
+                        persist_row_hash: String::new(),
+                    },
+                })
+                .await
+            }
+            cohort::Cohort::Community => {
+                self.put_community_membership_revocation(
+                    types::SignedCommunityMembershipRevocation {
+                        community_membership_revocation: types::CommunityMembershipRevocation {
+                            community_key_id: group_key_id.to_string(),
+                            removed_identity_key_id: removed_key_id.to_string(),
+                            removed_at: now,
+                            effective_at,
+                            reason,
+                            witness_set,
+                            persist_row_hash: String::new(),
+                        },
+                    },
+                )
+                .await
+            }
+            cohort::Cohort::SelfId => {
+                self.put_identity_occurrence_revocation(types::SignedIdentityOccurrenceRevocation {
+                    identity_occurrence_revocation: types::IdentityOccurrenceRevocation {
+                        identity_key_id: group_key_id.to_string(),
+                        occurrence_key_id: removed_key_id.to_string(),
+                        revoked_at: now,
+                        effective_at,
+                        reason,
+                        witness_set,
+                        persist_row_hash: String::new(),
+                    },
+                })
+                .await
+            }
+        }
+    }
+
+    /// #249 Cut G1 (§6) — atomically swap one member for another in a `family`
+    /// / `community` roster: [`Self::revoke_member`] the outgoing key, then
+    /// [`Self::add_member`] the incoming one. Returns the `add_member` result
+    /// (`Ok(true)` = genuine add).
+    ///
+    /// **Consistency note:** this default composes two writes, so it is
+    /// *eventually* consistent rather than single-transaction atomic — between
+    /// the two calls a concurrent reader sees the outgoing member revoked but
+    /// the incoming one not yet added (a transiently *smaller* roster, never a
+    /// double-counted one; the `roster − revocations` fold can never report
+    /// `out` as active). A backend-level single-transaction `swap` (one
+    /// `persist_row_hash` recompute, no torn read) is a Cut G2 hardening.
+    /// `self` is rejected ([`Error::InvalidArgument`]) — see [`Self::add_member`].
+    async fn swap_member(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        out_key_id: &str,
+        in_member: cohort::RosterMember,
+        spec: cohort::RevokeSpec,
+    ) -> Result<bool, Error> {
+        if cohort == cohort::Cohort::SelfId {
+            return Err(Error::InvalidArgument(
+                "swap_member: the `self` cohort manages occurrences via \
+                 put_identity_occurrence / put_identity_occurrence_revocation"
+                    .to_string(),
+            ));
+        }
+        self.revoke_member(cohort, group_key_id, out_key_id, spec)
+            .await?;
+        self.add_member(cohort, group_key_id, in_member).await
+    }
 
     /// #249 Cut B — the INBOUND delegation walk: every key that holds a
     /// `delegates_to` edge naming `key_id` as the recipient ("who delegated
