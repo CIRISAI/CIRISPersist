@@ -5,6 +5,22 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.5.0] — 2026-06-21
+
+### Added — #249 Cut G1: the uniform cohort **rostered-group** surface (CIRISServer #249 §1/§2/§6)
+
+The persist half of the CIRISServer #249 write+governance ask, first cut. `self` (identity_occurrences), `family`, and `community` are the three **rostered groups** — the same machine (`members[]` + an append-only revocation table + the `roster − effective revocations` fold) at three points on the visibility gradient. Persist exposed that machine **three times** as mirrored `*_family_*` / `*_community_*` / occurrence-* method sets; this cut is the single **cohort-parameterized** surface over them, so consumers (CIRISServer's `family.rs`, the KMP UI) write rostered-group ops **once** instead of branching family-vs-community-vs-self by hand. (verify v6.8.0's `accord_genesis` is the crypto half of the same coordinated cut.)
+
+- **New `federation::cohort` module:** `Cohort` (`#[non_exhaustive]`; wire tokens `self` / `family` / `community`), `RosterMember`, `GroupRef`, `RevokeSpec`.
+- **Seven default `FederationDirectory` methods**, each composing the existing per-backend mirrored methods — so **backend parity (pg / sqlite / memory) is inherited with zero backend overrides**:
+  - `active_members(cohort, group)` (§1) — the uniform active roster.
+  - `active_member_keys(cohort, group)` (§2) — the active roster resolved to pinned hybrid pubkeys (`Vec<KeyRecord>`), the bridge to threshold verification. **Fail-secure:** a roster member with no `federation_keys` row is `InvalidArgument`, never a silent quorum undercount.
+  - `lookup_group` / `groups_of` (§1) — uniform group lookup + active reverse-membership.
+  - `add_member` / `revoke_member` / `swap_member` (§1/§6) — uniform roster mutation (`self` admits occurrences via the richer `put_identity_occurrence`; `swap_member` composes revoke+add — eventually-consistent, never a double-counted roster; a single-transaction backend swap is a later hardening).
+- **FFI:** `cohort_active_members_json` / `cohort_active_member_keys_json` / `cohort_lookup_group_json` / `cohort_groups_of_json` / `cohort_add_member` / `cohort_revoke_member` / `cohort_swap_member` (RosterMember / RevokeSpec as JSON).
+- **Cohort coverage (CIRISServer #249 Q1):** `affiliations` / `species` / `biosphere` / `federation` are audience scopes with no roster table, so they are not cohorts; `Cohort` is `#[non_exhaustive]` so a future CEG decision to make `affiliations` rostered extends it without a break.
+- **Tested:** round-trips across all three cohorts on sqlite + live Postgres (`cohort_surface_roundtrip_*`).
+
 ## [9.4.2] — 2026-06-21
 
 ### Changed — re-pin CIRISVerify v6.7.1 → v6.8.0 (wheel concurrence)
