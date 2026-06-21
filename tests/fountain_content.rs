@@ -338,6 +338,68 @@ async fn run_fountain_assertions<B: Backend>(backend: &B, suffix: &str) {
         0,
         "(i) zero symbols survive revocation HardDelete"
     );
+
+    // (#227 publisher view) list_held_fountain_content — the publisher sees
+    // their held content + its degradation state without fetching symbols.
+    let hcid = format!("c-held-{suffix}");
+    let (hmanifest, hsymbols) =
+        build_manifest_and_symbols(&hcid, n_source, k_repair, symbol_size, true).await;
+    backend
+        .put_fountain_content(&hmanifest, &hsymbols)
+        .await
+        .expect("admit held-list content");
+    // Full: all N+K symbols held, recoverable (held >= min_viable_symbols=2).
+    let held = backend
+        .list_held_fountain_content("fountain-mldsa")
+        .await
+        .expect("list_held_fountain_content");
+    assert!(
+        held.iter().all(|m| m.pqc_key_id == "fountain-mldsa"),
+        "filtered to the publisher"
+    );
+    let mine = held
+        .iter()
+        .find(|m| m.content_id == hcid)
+        .expect("admitted content is listed for its publisher");
+    assert_eq!(mine.held_symbols, total, "all symbols held when full");
+    assert_eq!(mine.min_viable_symbols, 2);
+    assert!(mine.recoverable, "full content is recoverable");
+    assert_eq!(
+        mine.recoverable,
+        mine.held_symbols >= mine.min_viable_symbols,
+        "recoverable == held >= min_viable"
+    );
+    // Degrade: evict to the lowest tier — the publisher SEES the fade (#227).
+    backend
+        .evict_fountain_content_to_tier(&hcid, corpus, FountainTier::T5)
+        .await
+        .expect("evict to T5");
+    let after = backend
+        .list_held_fountain_content("fountain-mldsa")
+        .await
+        .expect("list after evict");
+    let faded = after
+        .iter()
+        .find(|m| m.content_id == hcid)
+        .expect("still listed after eviction (manifest intact)");
+    assert!(
+        faded.held_symbols < total,
+        "held_symbols dropped after eviction — the fade is visible to the publisher"
+    );
+    assert_eq!(
+        faded.recoverable,
+        faded.held_symbols >= faded.min_viable_symbols,
+        "recoverable tracks the post-eviction symbol count"
+    );
+    // A publisher who holds nothing → empty.
+    assert!(
+        backend
+            .list_held_fountain_content("no-such-publisher")
+            .await
+            .unwrap()
+            .is_empty(),
+        "unknown publisher holds nothing"
+    );
 }
 
 #[tokio::test]

@@ -1176,6 +1176,48 @@ impl Backend for SqliteBackend {
         )?))
     }
 
+    // #227 — publisher-facing held fountain-content enumerator.
+    async fn list_held_fountain_content(
+        &self,
+        publisher_key_id: &str,
+    ) -> Result<Vec<crate::fountain::FountainHeldMeta>, Error> {
+        let conn = self.conn.clone();
+        let publisher = publisher_key_id.to_owned();
+        (move || -> Result<Vec<crate::fountain::FountainHeldMeta>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT m.content_id, m.corpus_kind, m.pqc_key_id, \
+                        m.original_content_length, m.n_source, m.k_repair, \
+                        m.min_viable_symbols, m.symbol_size, m.admitted_at, \
+                        (SELECT COUNT(*) FROM content_symbols s \
+                         WHERE s.content_id = m.content_id) AS held \
+                 FROM content_manifest m WHERE m.pqc_key_id = ?1 \
+                 ORDER BY m.admitted_at DESC, m.content_id ASC",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![publisher], |row| {
+                    let min_viable: i64 = row.get(6)?;
+                    let held: i64 = row.get(9)?;
+                    Ok(crate::fountain::FountainHeldMeta {
+                        content_id: row.get(0)?,
+                        corpus_kind: row.get(1)?,
+                        pqc_key_id: row.get(2)?,
+                        original_content_length: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                        n_source: u32::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                        k_repair: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                        min_viable_symbols: u32::try_from(min_viable).unwrap_or(0),
+                        symbol_size: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                        held_symbols: u32::try_from(held).unwrap_or(0),
+                        recoverable: held >= min_viable,
+                        admitted_at: row.get(8)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })()
+        .map_err(|e| Error::Backend(format!("list_held_fountain_content: {e}")))
+    }
+
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
 
     async fn put_aggregated_tier(

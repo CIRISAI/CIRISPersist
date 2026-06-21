@@ -1605,6 +1605,60 @@ impl Backend for PostgresBackend {
         )?))
     }
 
+    // #227 — publisher-facing held fountain-content enumerator.
+    async fn list_held_fountain_content(
+        &self,
+        publisher_key_id: &str,
+    ) -> Result<Vec<crate::fountain::FountainHeldMeta>, Error> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT m.content_id, m.corpus_kind, m.pqc_key_id, \
+                        m.original_content_length, m.n_source, m.k_repair, \
+                        m.min_viable_symbols, m.symbol_size, m.admitted_at, \
+                        (SELECT COUNT(*) FROM cirislens.content_symbols s \
+                         WHERE s.content_id = m.content_id) AS held \
+                 FROM cirislens.content_manifest m WHERE m.pqc_key_id = $1 \
+                 ORDER BY m.admitted_at DESC, m.content_id ASC",
+                &[&publisher_key_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("list_held_fountain_content: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let min_viable: i64 = r.safe_get_with("min_viable_symbols", Error::Backend)?;
+            let held: i64 = r.safe_get_with("held", Error::Backend)?;
+            let admitted_at: chrono::DateTime<chrono::Utc> =
+                r.safe_get_with("admitted_at", Error::Backend)?;
+            out.push(crate::fountain::FountainHeldMeta {
+                content_id: r.safe_get_with("content_id", Error::Backend)?,
+                corpus_kind: r.safe_get_with("corpus_kind", Error::Backend)?,
+                pqc_key_id: r.safe_get_with("pqc_key_id", Error::Backend)?,
+                original_content_length: u64::try_from(
+                    r.safe_get_with::<i64, _, _, _>("original_content_length", Error::Backend)?,
+                )
+                .unwrap_or(0),
+                n_source: u32::try_from(
+                    r.safe_get_with::<i64, _, _, _>("n_source", Error::Backend)?,
+                )
+                .unwrap_or(0),
+                k_repair: u32::try_from(
+                    r.safe_get_with::<i64, _, _, _>("k_repair", Error::Backend)?,
+                )
+                .unwrap_or(0),
+                min_viable_symbols: u32::try_from(min_viable).unwrap_or(0),
+                symbol_size: u32::try_from(
+                    r.safe_get_with::<i64, _, _, _>("symbol_size", Error::Backend)?,
+                )
+                .unwrap_or(0),
+                held_symbols: u32::try_from(held).unwrap_or(0),
+                recoverable: held >= min_viable,
+                admitted_at: admitted_at.to_rfc3339(),
+            });
+        }
+        Ok(out)
+    }
+
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
 
     async fn put_aggregated_tier(
