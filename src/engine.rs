@@ -7918,6 +7918,286 @@ mod tests {
         );
     }
 
+    /// #249 Cut G1 — the uniform cohort surface round-trips across all three
+    /// rostered cohorts (`family` / `community` / `self`) over the SAME API:
+    /// `active_members` / `active_member_keys` / `lookup_group` / `groups_of` /
+    /// `add_member` / `revoke_member` / `swap_member`. Backend-generic body run
+    /// on sqlite + live Postgres (backend parity, CIRISServer #249 §1/§2/§6).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn cohort_surface_roundtrip_body<D>(d: &D, s: &str)
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        use crate::federation::cohort::{Cohort, RevokeSpec, RosterMember};
+        use crate::federation::types;
+
+        let founder = format!("g1-founder-{s}");
+        let mem_b = format!("g1-memb-{s}");
+        let mem_c = format!("g1-memc-{s}");
+        let fam = format!("g1-fam-{s}");
+        let comm = format!("g1-comm-{s}");
+        let ident = format!("g1-ident-{s}");
+        let occ1 = format!("g1-occ1-{s}");
+        let occ2 = format!("g1-occ2-{s}");
+
+        // Members / groups / occurrences all FK to federation_keys.
+        for k in [&founder, &mem_b, &mem_c, &fam, &comm, &ident, &occ1, &occ2] {
+            d.put_public_key(sweeper_test_key(k))
+                .await
+                .expect("seed key");
+        }
+        let joined: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+
+        d.put_family(crate::federation::SignedFamily {
+            family: types::Family {
+                family_key_id: fam.clone(),
+                family_name: "g1-fam".into(),
+                members: vec![types::FamilyMember {
+                    key_id: founder.clone(),
+                    joined_at: joined,
+                    role: Some("founder".into()),
+                }],
+                founded_at: joined,
+                consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
+                consensus_protocol_entrenched: false,
+                persist_row_hash: String::new(),
+            },
+        })
+        .await
+        .expect("put_family");
+        d.put_community(crate::federation::SignedCommunity {
+            community: types::Community {
+                community_key_id: comm.clone(),
+                community_name: "g1-comm".into(),
+                members: vec![types::CommunityMember {
+                    key_id: founder.clone(),
+                    joined_at: joined,
+                    role: Some("founder".into()),
+                }],
+                founded_at: joined,
+                consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        })
+        .await
+        .expect("put_community");
+
+        // family + community: identical uniform ops, no per-cohort branching.
+        for (cohort, group) in [(Cohort::Family, &fam), (Cohort::Community, &comm)] {
+            let tag = cohort.as_str();
+            let m = d
+                .active_members(cohort, group)
+                .await
+                .expect("active_members");
+            assert_eq!(m.len(), 1, "{tag} starts with founder");
+            assert_eq!(m[0].key_id, founder);
+
+            let g = d
+                .lookup_group(cohort, group)
+                .await
+                .expect("lookup_group")
+                .expect("group exists");
+            assert_eq!(g.cohort, cohort);
+            assert_eq!(
+                g.consensus_protocol.as_deref(),
+                Some(types::consensus_protocol::FOUNDER_ONLY),
+                "{tag} lookup_group carries consensus_protocol"
+            );
+            assert!(g.name.is_some(), "{tag} lookup_group carries name");
+
+            let gs = d.groups_of(cohort, &founder).await.expect("groups_of");
+            assert!(
+                gs.iter().any(|x| &x.group_key_id == group),
+                "{tag} groups_of(founder) contains the group"
+            );
+
+            assert!(
+                d.add_member(
+                    cohort,
+                    group,
+                    RosterMember {
+                        key_id: mem_b.clone(),
+                        joined_at: joined,
+                        role: None
+                    },
+                )
+                .await
+                .expect("add_member"),
+                "{tag} add_member(mem_b) is a genuine add"
+            );
+            assert_eq!(d.active_members(cohort, group).await.unwrap().len(), 2);
+            assert!(
+                !d.add_member(
+                    cohort,
+                    group,
+                    RosterMember {
+                        key_id: mem_b.clone(),
+                        joined_at: joined,
+                        role: None
+                    },
+                )
+                .await
+                .expect("add_member idempotent"),
+                "{tag} re-add(mem_b) is a no-op"
+            );
+
+            let keys = d
+                .active_member_keys(cohort, group)
+                .await
+                .expect("active_member_keys");
+            assert_eq!(keys.len(), 2, "{tag} active_member_keys resolves both pins");
+
+            d.revoke_member(
+                cohort,
+                group,
+                &mem_b,
+                RevokeSpec {
+                    effective_at: chrono::Utc::now(),
+                    reason: Some("test".into()),
+                    witness_set: vec![],
+                },
+            )
+            .await
+            .expect("revoke_member");
+            assert_eq!(
+                d.active_members(cohort, group).await.unwrap().len(),
+                1,
+                "{tag} revoke drops mem_b"
+            );
+
+            assert!(
+                d.swap_member(
+                    cohort,
+                    group,
+                    &founder,
+                    RosterMember {
+                        key_id: mem_c.clone(),
+                        joined_at: joined,
+                        role: None
+                    },
+                    RevokeSpec {
+                        effective_at: chrono::Utc::now(),
+                        reason: None,
+                        witness_set: vec![],
+                    },
+                )
+                .await
+                .expect("swap_member"),
+                "{tag} swap adds mem_c"
+            );
+            let after: Vec<String> = d
+                .active_members(cohort, group)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.key_id)
+                .collect();
+            assert_eq!(after, vec![mem_c.clone()], "{tag} after swap = {{mem_c}}");
+        }
+
+        // self cohort: identity_occurrences through the SAME read API.
+        for occ in [&occ1, &occ2] {
+            d.put_identity_occurrence(crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: types::IdentityOccurrence {
+                    identity_key_id: ident.clone(),
+                    occurrence_key_id: occ.clone(),
+                    device_class: types::device_class::SERVER.into(),
+                    hardware_attestation: None,
+                    asserted_at: joined,
+                    valid_until: None,
+                    encryption_pubkeys: None,
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .expect("put_identity_occurrence");
+        }
+        let occ_members = d
+            .active_members(Cohort::SelfId, &ident)
+            .await
+            .expect("self active_members");
+        assert_eq!(occ_members.len(), 2, "self has 2 active occurrences");
+        assert!(
+            occ_members
+                .iter()
+                .all(|m| m.role.as_deref() == Some("server")),
+            "self RosterMember.role projects device_class"
+        );
+        let ig = d
+            .groups_of(Cohort::SelfId, &occ1)
+            .await
+            .expect("groups_of self");
+        assert_eq!(ig.len(), 1);
+        assert_eq!(ig[0].group_key_id, ident, "occ1 resolves to its identity");
+        assert!(
+            d.lookup_group(Cohort::SelfId, &ident)
+                .await
+                .unwrap()
+                .is_some(),
+            "self lookup_group on a known identity key"
+        );
+        d.revoke_member(
+            Cohort::SelfId,
+            &ident,
+            &occ1,
+            RevokeSpec {
+                effective_at: chrono::Utc::now(),
+                reason: None,
+                witness_set: vec![],
+            },
+        )
+        .await
+        .expect("revoke self occurrence");
+        assert_eq!(
+            d.active_members(Cohort::SelfId, &ident)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "self revoke drops occ1"
+        );
+        // self admits occurrences via the typed put, NOT the uniform add_member.
+        let err = d
+            .add_member(
+                Cohort::SelfId,
+                &ident,
+                RosterMember {
+                    key_id: "nope".into(),
+                    joined_at: joined,
+                    role: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_invalid_argument");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn cohort_surface_roundtrip_sqlite() {
+        let signer = crate::federation::tier_ingest::test_support::local_signer("g1");
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        cohort_surface_roundtrip_body(&*sq, "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn cohort_surface_roundtrip_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let label = format!("g1-{}", uuid::Uuid::new_v4().simple());
+        let signer = crate::federation::tier_ingest::test_support::local_signer(&label);
+        let engine = Engine::with_signer(signer, &dsn).await.expect("pg engine");
+        let pg = engine.postgres_backend().expect("pg backend").clone();
+        cohort_surface_roundtrip_body(&*pg, &uuid::Uuid::new_v4().simple().to_string()).await;
+    }
+
     /// #249 — `file_moderation` stores a `moderation:{allegation}` scores
     /// row when the signer is a named moderator (community founder, as-self
     /// duty-holder). Proves the §11.10 EMIT path is feature-free (no
