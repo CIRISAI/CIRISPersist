@@ -8342,6 +8342,147 @@ mod tests {
         supersede_versioning_body(&*pg, &uuid::Uuid::new_v4().simple().to_string()).await;
     }
 
+    /// #249 Cut G3 — quorum-authorized membership gate (CIRISServer #249 §4/§5).
+    /// A `quorum:2/3` family expands to `quorum:3/5` ONLY when ≥M (=2) of the
+    /// PRIOR roster's real hybrid keys cosign the canonical change payload;
+    /// 1 cosignature is rejected and leaves the live row untouched. Real
+    /// Ed25519 + ML-DSA-65 signers; backend-generic body run on sqlite + pg.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn quorum_supersede_body<D>(d: &D, s: &str)
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        use crate::federation::cohort::Cohort;
+        use crate::federation::tier_ingest::test_support::{register_hybrid_key, threshold_sign};
+        use crate::federation::types;
+
+        let fam = format!("g3-fam-{s}");
+        let m: Vec<String> = (0..5).map(|i| format!("g3-m{i}-{s}")).collect();
+        // Register the family key + all 5 member keys with REAL deterministic
+        // hybrid pubkeys (so threshold_sign's signatures verify against them).
+        register_hybrid_key(d, &fam).await;
+        for k in &m {
+            register_hybrid_key(d, k).await;
+        }
+        let joined: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+        let mk = |n: usize| -> Vec<types::FamilyMember> {
+            m[..n]
+                .iter()
+                .map(|k| types::FamilyMember {
+                    key_id: k.clone(),
+                    joined_at: joined,
+                    role: Some("founder".into()),
+                })
+                .collect()
+        };
+
+        // Genesis: quorum:2/3 family (3 members, M=2).
+        d.put_family(crate::federation::SignedFamily {
+            family: types::Family {
+                family_key_id: fam.clone(),
+                family_name: "accord".into(),
+                members: mk(3),
+                founded_at: joined,
+                consensus_protocol: "quorum:2/3".into(),
+                consensus_protocol_entrenched: true,
+                persist_row_hash: String::new(),
+            },
+        })
+        .await
+        .expect("genesis");
+
+        // Change payload (what the prior roster cosigns) → expand to 5 / 3-of-5.
+        let change_envelope = serde_json::json!({
+            "family_key_id": fam,
+            "new_member_key_ids": m,
+            "consensus_protocol": "quorum:3/5",
+        });
+        let bytes = ciris_verify_core::jcs::canonicalize(&change_envelope).unwrap();
+        let new5 = crate::federation::SignedFamily {
+            family: types::Family {
+                family_key_id: fam.clone(),
+                family_name: "accord".into(),
+                members: mk(5),
+                founded_at: joined,
+                consensus_protocol: "quorum:3/5".into(),
+                consensus_protocol_entrenched: true,
+                persist_row_hash: String::new(),
+            },
+        };
+
+        // 2 of the 3 PRIOR members cosign → meets quorum:2/3.
+        let sigs = vec![threshold_sign(&m[0], &bytes), threshold_sign(&m[1], &bytes)];
+        let v = d
+            .supersede_family_with_quorum(new5.clone(), change_envelope.clone(), sigs)
+            .await
+            .expect("2-of-3 quorum authorizes the expansion");
+        assert_eq!(v, 2, "supersede bumps to version 2");
+        let live = d.lookup_family(&fam).await.unwrap().unwrap();
+        assert_eq!(live.members.len(), 5);
+        assert_eq!(live.consensus_protocol, "quorum:3/5");
+        // The quorum envelope + signatures are recorded as the v1 authorization.
+        let hist = d.group_history(Cohort::Family, &fam).await.unwrap();
+        assert_eq!(hist[0].version, 1);
+        assert!(
+            hist[0].authorization.is_some(),
+            "superseded v1 carries the quorum authorization"
+        );
+
+        // Negative: the group is now quorum:3/5 (M=3); 1 cosignature is
+        // insufficient → rejected, and the live row is untouched.
+        let env2 = serde_json::json!({"family_key_id": fam, "note": "shrink attempt"});
+        let bytes2 = ciris_verify_core::jcs::canonicalize(&env2).unwrap();
+        let one = vec![threshold_sign(&m[0], &bytes2)];
+        let shrink = crate::federation::SignedFamily {
+            family: types::Family {
+                family_key_id: fam.clone(),
+                family_name: "accord".into(),
+                members: mk(3),
+                founded_at: joined,
+                consensus_protocol: "quorum:2/3".into(),
+                consensus_protocol_entrenched: true,
+                persist_row_hash: String::new(),
+            },
+        };
+        let err = d
+            .supersede_family_with_quorum(shrink, env2, one)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_invalid_argument");
+        let live2 = d.lookup_family(&fam).await.unwrap().unwrap();
+        assert_eq!(
+            live2.members.len(),
+            5,
+            "rejected supersede left the live roster untouched"
+        );
+        assert_eq!(live2.consensus_protocol, "quorum:3/5");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn quorum_supersede_sqlite() {
+        let signer = crate::federation::tier_ingest::test_support::local_signer("g3");
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        quorum_supersede_body(&*sq, "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn quorum_supersede_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let label = format!("g3-{}", uuid::Uuid::new_v4().simple());
+        let signer = crate::federation::tier_ingest::test_support::local_signer(&label);
+        let engine = Engine::with_signer(signer, &dsn).await.expect("pg engine");
+        let pg = engine.postgres_backend().expect("pg backend").clone();
+        quorum_supersede_body(&*pg, &uuid::Uuid::new_v4().simple().to_string()).await;
+    }
+
     /// #249 — `file_moderation` stores a `moderation:{allegation}` scores
     /// row when the signer is a named moderator (community founder, as-self
     /// duty-holder). Proves the §11.10 EMIT path is feature-free (no
