@@ -15697,13 +15697,69 @@ impl PyEngine {
 
     // ── #249 Cut G3 ── quorum-authorized membership gate FFI (§4/§5) ──
 
-    /// #249 Cut G3 (§4/§5) — verify a membership change is authorized by the
-    /// group's current strict-majority quorum. `change_envelope_json` is the
-    /// canonical change payload (the bytes the members signed, as JSON);
-    /// `signatures_json` is a JSON array of
-    /// [`ciris_verify_core::threshold::ThresholdSignature`]. Returns the count
-    /// of valid distinct cosigners; raises `ValueError` if the quorum is not
-    /// met (or the group/policy is invalid).
+    /// #249 Cut G3.5 (§5) — build the canonical membership-change payload for a
+    /// roster change on `group_key_id` (verify v6.9.0's `build_membership_change`,
+    /// with the anti-replay `supersedes` binding). `new_member_key_ids_json` is
+    /// a JSON array of key_ids; `consensus_protocol` `None` ⇒ strict-majority
+    /// for the new count. Returns the envelope JSON — the prior roster cosigns
+    /// its JCS bytes, then submit it to `cohort_supersede_group_with_quorum`.
+    #[pyo3(signature = (cohort, group_key_id, new_member_key_ids_json, entrenched, consensus_protocol=None))]
+    fn cohort_build_membership_change_envelope(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        group_key_id: &str,
+        new_member_key_ids_json: &str,
+        entrenched: bool,
+        consensus_protocol: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let cohort = cohort_from_token(cohort)?;
+        let new_member_key_ids: Vec<String> = serde_json::from_str(new_member_key_ids_json)
+            .map_err(|e| PyValueError::new_err(format!("new_member_key_ids_json: {e}")))?;
+        let cp = consensus_protocol.map(|s| s.to_owned());
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let group_key_id = group_key_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let env = b
+                                .build_membership_change_envelope(
+                                    cohort,
+                                    &group_key_id,
+                                    &new_member_key_ids,
+                                    entrenched,
+                                    cp.as_deref(),
+                                )
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&env).map_err(|e| {
+                                PyValueError::new_err(format!("change envelope serialize: {e}"))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// #249 Cut G3 (§4/§5), robust on G3.5 — verify a membership change is
+    /// authorized by the group's current strict-majority quorum (composes
+    /// verify v6.9.0's `verify_membership_change`: distinct + strict-majority +
+    /// one-seat + entrenchment + anti-replay + prior-quorum). `change_envelope_json`
+    /// is the `cohort_build_membership_change_envelope` output the members
+    /// cosigned; `signatures_json` is a JSON array of
+    /// [`ciris_verify_core::threshold::ThresholdSignature`]. Returns `None` on
+    /// success; raises `ValueError` if not authorized.
     fn cohort_verify_membership_quorum(
         &self,
         py: Python<'_>,
@@ -15711,7 +15767,7 @@ impl PyEngine {
         group_key_id: &str,
         change_envelope_json: &str,
         signatures_json: &str,
-    ) -> PyResult<usize> {
+    ) -> PyResult<()> {
         self.ensure_usable()?;
         let cohort = cohort_from_token(cohort)?;
         let change_envelope: serde_json::Value = serde_json::from_str(change_envelope_json)

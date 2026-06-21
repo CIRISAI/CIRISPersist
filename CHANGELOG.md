@@ -5,6 +5,18 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.8.0] — 2026-06-21
+
+### Changed — #249 Cut G3.5: the quorum gate now composes verify 6.9.0's `verify_membership_change` (robust)
+
+The Cut G3 quorum gate (v9.7.0) was a count-only check (`verify_threshold_signatures_with_policy`). This cut upgrades `FederationDirectory::verify_membership_quorum` to compose **CIRISVerify v6.9.0's general `verify_membership_change`** (CIRISVerify#104/#105) — strictly stronger, with the canonical membership-change payload defined **once in verify** (portable + re-verifiable across the federation).
+
+- **New fail-closed guarantees** the count-only gate lacked: **one-seat key-distinctness** (the new roster must resolve to distinct pubkeys in the directory — no human seated under two `key_id`s) + **anti-replay** (`supersedes.prior_member_key_ids` must equal the actual prior roster) + **entrenchment-preserved** (`family_key_id` unchanged, no de-entrenchment), on top of distinct-members + strict-majority + the prior roster's hybrid quorum.
+- **`FederationDirectory::build_membership_change_envelope(cohort, group_key_id, new_member_key_ids, entrenched, consensus_protocol)`** (default method) — the §5 canonical payload builder, wrapping verify's `build_membership_change` with the live group's prior envelope. The prior roster cosigns its JCS bytes. New private `group_prior_envelope` derives the family-shaped prior envelope (a community maps `community_*` → the helper's `family_*` keys, `entrenched=false`).
+- **Verify-A-store-B guard:** `supersede_*_with_quorum` now assert the superseding row's roster + `consensus_protocol` + key exactly match the authorized `change_envelope` before persisting (`assert_change_envelope_matches`).
+- **API change (days-old surface):** `verify_membership_quorum` returns `Result<()>` (was `Result<usize>` in v9.7.0); FFI `cohort_verify_membership_quorum` returns `None` on success; new FFI `cohort_build_membership_change_envelope`. The accord path keeps `verify_accord_membership_change`.
+- **Tests:** the `quorum:2/3 → quorum:3/5` expansion now flows through `build_membership_change_envelope`; added **anti-replay** (tampered `supersedes` rejected despite a valid 3-of-5 quorum) and **one-seat** (a roster with two key_ids sharing one pubkey rejected) — sqlite + live Postgres.
+
 ## [9.7.1] — 2026-06-21
 
 ### Changed — re-pin CIRISVerify v6.8.0 → v6.9.0 (wheel concurrence)

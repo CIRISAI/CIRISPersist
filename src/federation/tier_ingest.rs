@@ -270,7 +270,19 @@ pub(crate) mod test_support {
         dir: &D,
         key_id: &str,
     ) {
-        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
+        register_hybrid_key_aliased(dir, key_id, key_id).await
+    }
+
+    /// #249 Cut G3.5 — register `key_id` carrying the hybrid pubkeys OF
+    /// `pubkey_source_key_id` (so two distinct `key_id`s can share one pubkey).
+    /// Used to drive verify's one-seat / one-human-one-seat rejection (two
+    /// key_ids backed by the same pubkey in a roster).
+    pub async fn register_hybrid_key_aliased<D: crate::federation::FederationDirectory + ?Sized>(
+        dir: &D,
+        key_id: &str,
+        pubkey_source_key_id: &str,
+    ) {
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(pubkey_source_key_id);
         let now = chrono::Utc::now();
         let rec = crate::federation::KeyRecord {
             key_id: key_id.to_owned(),
