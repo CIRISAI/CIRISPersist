@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.9.1] — 2026-06-21
+
+### Changed — re-pin CIRISVerify v6.9.0 → v6.11.0 (wheel concurrence)
+
+- All six git-tag verify crates flipped in lockstep; `version = "6"` unchanged. v6.10.0 adds the `accord:lifecycle:active` reactivation scope (CIRISVerify#95 Gap 1) and v6.11.0 the pinned HUMANITY_ACCORD genesis recognition root (CIRISVerify#107) — both **additive** accord surfaces (`accord_genesis` / `humanity_accord`) that do **not** touch persist's consumed APIs (`verify_hybrid` / `canonical` / `jcs` / `threshold` / `transparency` / `xchacha` / `hkdf` / `hmac` / `fedcode`). Family-floor / wheel-concurrence re-pin only; no persist code change. Wheel `Requires-Dist` floor stays `>=6.0.0,<7`.
+
 ## [9.9.0] — 2026-06-21
 
 ### Added — #249 Cut G4: rekey-on-revoke (§7) + membership change-event hook (§9) — the rostered-ops DX is complete
