@@ -5,6 +5,13 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.7.1] — 2026-06-21
+
+### Changed — re-pin CIRISVerify v6.8.0 → v6.9.0 (wheel concurrence)
+
+- All six git-tag verify crates flipped in lockstep; `version = "6"` unchanged. v6.9.0 (CIRISVerify#105) lands the **general, role-agnostic `build_membership_change` / `verify_membership_change`** — exactly the helper persist filed as CIRISVerify#104, the optional consolidation Cut G3 (v9.7.0) referenced; v6.8.1 carried an ml-dsa 0.1.1 fix (the outer ML-DSA-65 `SigningKey` seed self-zeroizes + `from_seed_file` scrub, CIRISVerify#87). The ml-dsa bump touches `ciris-crypto::ml_dsa`, so this re-pin's green gate confirms `MlDsa65Signer::from_seed` stays API-stable (persist's `tier_ingest::test_support` + the Cut G3 quorum tests sign through it). No persist consumed-surface change (`verify_hybrid` / `canonical` / `jcs` / `threshold` / `transparency` / `xchacha` / `hkdf` / `hmac` / `fedcode`); wheel `Requires-Dist` floor stays `>=6.0.0,<7`.
+- **Forward pointer:** v9.8.0 adopts v6.9.0's general `verify_membership_change` to upgrade the Cut G3 quorum gate from count-only to the full fail-closed check (anti-replay `supersedes` binding + one-seat key-distinctness).
+
 ## [9.7.0] — 2026-06-21
 
 ### Added — #249 Cut G3: quorum-authorized membership gate (CIRISServer #249 §4/§5)
