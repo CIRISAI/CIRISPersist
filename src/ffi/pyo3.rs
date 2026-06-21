@@ -15695,6 +15695,139 @@ impl PyEngine {
         })
     }
 
+    // ── #249 Cut G3 ── quorum-authorized membership gate FFI (§4/§5) ──
+
+    /// #249 Cut G3 (§4/§5) — verify a membership change is authorized by the
+    /// group's current strict-majority quorum. `change_envelope_json` is the
+    /// canonical change payload (the bytes the members signed, as JSON);
+    /// `signatures_json` is a JSON array of
+    /// [`ciris_verify_core::threshold::ThresholdSignature`]. Returns the count
+    /// of valid distinct cosigners; raises `ValueError` if the quorum is not
+    /// met (or the group/policy is invalid).
+    fn cohort_verify_membership_quorum(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        group_key_id: &str,
+        change_envelope_json: &str,
+        signatures_json: &str,
+    ) -> PyResult<usize> {
+        self.ensure_usable()?;
+        let cohort = cohort_from_token(cohort)?;
+        let change_envelope: serde_json::Value = serde_json::from_str(change_envelope_json)
+            .map_err(|e| PyValueError::new_err(format!("change_envelope_json: {e}")))?;
+        let signatures: Vec<ciris_verify_core::threshold::ThresholdSignature> =
+            serde_json::from_str(signatures_json)
+                .map_err(|e| PyValueError::new_err(format!("signatures_json: {e}")))?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let group_key_id = group_key_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            b.verify_membership_quorum(
+                                cohort,
+                                &group_key_id,
+                                &change_envelope,
+                                &signatures,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// #249 Cut G3 (§3/§4/§5) — quorum-gated supersede: verify the current
+    /// roster's strict-majority quorum cosigned `change_envelope_json`, then
+    /// supersede `new_group_json` (raw `Family`/`Community`), recording the
+    /// envelope + signatures as the superseded version's authorization.
+    /// Returns the new version. `self` is rejected.
+    fn cohort_supersede_group_with_quorum(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        new_group_json: &str,
+        change_envelope_json: &str,
+        signatures_json: &str,
+    ) -> PyResult<u32> {
+        self.ensure_usable()?;
+        let cohort = cohort_from_token(cohort)?;
+        let change_envelope: serde_json::Value = serde_json::from_str(change_envelope_json)
+            .map_err(|e| PyValueError::new_err(format!("change_envelope_json: {e}")))?;
+        let signatures: Vec<ciris_verify_core::threshold::ThresholdSignature> =
+            serde_json::from_str(signatures_json)
+                .map_err(|e| PyValueError::new_err(format!("signatures_json: {e}")))?;
+        use crate::federation::cohort::Cohort;
+        let family: Option<crate::federation::SignedFamily> = match cohort {
+            Cohort::Family => Some(crate::federation::SignedFamily {
+                family: serde_json::from_str(new_group_json)
+                    .map_err(|e| PyValueError::new_err(format!("supersede family JSON: {e}")))?,
+            }),
+            _ => None,
+        };
+        let community: Option<crate::federation::SignedCommunity> = match cohort {
+            Cohort::Community => Some(crate::federation::SignedCommunity {
+                community: serde_json::from_str(new_group_json)
+                    .map_err(|e| PyValueError::new_err(format!("supersede community JSON: {e}")))?,
+            }),
+            _ => None,
+        };
+        if cohort == Cohort::SelfId {
+            return Err(PyValueError::new_err(
+                "cohort_supersede_group_with_quorum: the `self` cohort is not versioned",
+            ));
+        }
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            match cohort {
+                                Cohort::Family => {
+                                    b.supersede_family_with_quorum(
+                                        family.clone().unwrap(),
+                                        change_envelope.clone(),
+                                        signatures.clone(),
+                                    )
+                                    .await
+                                }
+                                Cohort::Community => {
+                                    b.supersede_community_with_quorum(
+                                        community.clone().unwrap(),
+                                        change_envelope.clone(),
+                                        signatures.clone(),
+                                    )
+                                    .await
+                                }
+                                Cohort::SelfId => unreachable!(),
+                            }
+                            .map_err(federation_err_to_py)
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
     /// #249 Cut B — the FULL named-moderator set of `community_key_id` for
     /// `duty` (`moderate` / `takedown` / `review`): owner-bound authority
     /// roots ∪ their duty-scoped delegates. Returns a JSON array of key_ids.

@@ -1449,6 +1449,145 @@ pub trait FederationDirectory: Send + Sync {
             .find(|v| v.version == version))
     }
 
+    // ── #249 Cut G3 ── quorum-authorized membership gate (§4/§5) ──
+    //
+    // The deferred v3.13+ admission gate, landable on verify v6.8.0's
+    // threshold primitives. A membership change to a `quorum:M/N` group MUST
+    // carry ≥M valid hybrid member cosignatures over the canonical change
+    // payload — enforced HERE in the substrate, so one-seat-per-human +
+    // M-of-N-to-change become invariants of the graph, not properties any one
+    // server upholds. The PRIOR roster authorizes the change (the current
+    // holders decide who joins/leaves; an incoming key never authorizes its
+    // own admission). Default methods composing the trait + verify
+    // primitives, so backend parity is inherited.
+
+    /// #249 Cut G3 (§4/§5) — verify a membership change is authorized by the
+    /// group's **current** strict-majority quorum: ≥M of the live roster's
+    /// pinned hybrid keys ([`Self::active_member_keys`]) validly cosigned the
+    /// canonical `change_envelope` (its JCS bytes — the §5 payload). Returns
+    /// the count of valid distinct cosigners.
+    ///
+    /// [`Error::InvalidArgument`] if the group is unknown, its
+    /// `consensus_protocol` is not a `quorum:M/N` (`founder_only` / `unanimous`
+    /// have their own rules), the policy is not a strict majority (`2M>N`), or
+    /// fewer than M valid hybrid cosignatures are present.
+    /// `HybridPolicy::RequireHybrid` — a classical-only signature does NOT
+    /// count at this federation-authority gate (CC 5.3.2.4.3.1).
+    async fn verify_membership_quorum(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        change_envelope: &serde_json::Value,
+        signatures: &[ciris_verify_core::threshold::ThresholdSignature],
+    ) -> Result<usize, Error> {
+        use ciris_verify_core::threshold::{
+            verify_threshold_signatures_with_policy, HybridPolicy, QuorumPolicy, ThresholdMember,
+        };
+        let group = self
+            .lookup_group(cohort, group_key_id)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "verify_membership_quorum: unknown {} group {group_key_id:?}",
+                    cohort.as_str()
+                ))
+            })?;
+        let cp = group.consensus_protocol.ok_or_else(|| {
+            Error::InvalidArgument(
+                "verify_membership_quorum: group has no consensus_protocol (the `self` cohort \
+                 has no quorum)"
+                    .to_string(),
+            )
+        })?;
+        let policy = QuorumPolicy::parse(&cp).ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "verify_membership_quorum: consensus_protocol {cp:?} is not a quorum:M/N policy"
+            ))
+        })?;
+        policy.validate().map_err(|e| {
+            Error::InvalidArgument(format!(
+                "verify_membership_quorum: {cp:?} is not a strict-majority quorum: {e}"
+            ))
+        })?;
+        let members: Vec<ThresholdMember> = self
+            .active_member_keys(cohort, group_key_id)
+            .await?
+            .into_iter()
+            .map(|k| ThresholdMember {
+                member_id: k.key_id,
+                ed25519_public_key_base64: k.pubkey_ed25519_base64,
+                mldsa65_public_key_base64: k.pubkey_ml_dsa_65_base64,
+                role: None,
+            })
+            .collect();
+        let bytes = ciris_verify_core::jcs::canonicalize(change_envelope)
+            .map_err(|e| Error::Backend(format!("verify_membership_quorum canonicalize: {e}")))?;
+        // The threshold M is enforced inside the primitive (`Insufficient` if
+        // fewer than M distinct valid hybrid cosignatures); `RequireHybrid`
+        // makes a classical-only signature not count.
+        verify_threshold_signatures_with_policy(
+            &bytes,
+            &members,
+            signatures,
+            policy.m,
+            HybridPolicy::RequireHybrid,
+        )
+        .map_err(|e| {
+            Error::InvalidArgument(format!(
+                "verify_membership_quorum: quorum not met for {cp} ({}-of-{}): {e}",
+                policy.m, policy.n
+            ))
+        })
+    }
+
+    /// #249 Cut G3 (§3/§4/§5) — quorum-gated family supersede: verify the
+    /// current roster's strict-majority quorum cosigned `change_envelope` via
+    /// [`Self::verify_membership_quorum`], THEN [`Self::supersede_family`],
+    /// recording `{change_envelope, quorum_signatures}` as the superseded
+    /// version's authorization (the §8 audit trail). The quorum is checked
+    /// against the PRIOR group — the current holders authorize the change.
+    async fn supersede_family_with_quorum(
+        &self,
+        new: types::SignedFamily,
+        change_envelope: serde_json::Value,
+        signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
+    ) -> Result<u32, Error> {
+        self.verify_membership_quorum(
+            cohort::Cohort::Family,
+            &new.family.family_key_id,
+            &change_envelope,
+            &signatures,
+        )
+        .await?;
+        let authorization = serde_json::json!({
+            "change_envelope": change_envelope,
+            "quorum_signatures": signatures,
+        });
+        self.supersede_family(new, Some(authorization)).await
+    }
+
+    /// #249 Cut G3 — quorum-gated community supersede. Mirror of
+    /// [`Self::supersede_family_with_quorum`].
+    async fn supersede_community_with_quorum(
+        &self,
+        new: types::SignedCommunity,
+        change_envelope: serde_json::Value,
+        signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
+    ) -> Result<u32, Error> {
+        self.verify_membership_quorum(
+            cohort::Cohort::Community,
+            &new.community.community_key_id,
+            &change_envelope,
+            &signatures,
+        )
+        .await?;
+        let authorization = serde_json::json!({
+            "change_envelope": change_envelope,
+            "quorum_signatures": signatures,
+        });
+        self.supersede_community(new, Some(authorization)).await
+    }
+
     /// #249 Cut B — the INBOUND delegation walk: every key that holds a
     /// `delegates_to` edge naming `key_id` as the recipient ("who delegated
     /// TO me?"). The reverse of the forward-only

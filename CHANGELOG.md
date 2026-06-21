@@ -5,6 +5,20 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.7.0] — 2026-06-21
+
+### Added — #249 Cut G3: quorum-authorized membership gate (CIRISServer #249 §4/§5)
+
+The deferred v3.13+ admission gate, landed on CIRISVerify v6.8.0's threshold primitives. A membership change to a `quorum:M/N` family/community is now authorized **in the substrate** by ≥M valid hybrid member cosignatures over the canonical change payload — so **one-seat-per-human + M-of-N-to-change become invariants of the graph**, not properties any single server upholds. The change is authorized by the group's **current/prior** roster (the existing holders decide who joins or leaves; an incoming key never authorizes its own admission).
+
+- **`FederationDirectory::verify_membership_quorum(cohort, group_key_id, change_envelope, signatures)`** (default method, backend parity): looks up the group → parses its `consensus_protocol` to a `ciris_verify_core::threshold::QuorumPolicy` (rejecting non-`quorum:M/N` forms and non-strict-majority `2M>N`) → maps the active roster (`active_member_keys`, Cut G1 §2) to `ThresholdMember`s → canonicalizes `change_envelope` with `ciris_verify_core::jcs` (the §5 payload) → `verify_threshold_signatures_with_policy(.., M, HybridPolicy::RequireHybrid)`. A classical-only signature does **not** count at this federation-authority gate (CC 5.3.2.4.3.1). Returns the valid distinct-cosigner count.
+- **`supersede_family_with_quorum` / `supersede_community_with_quorum`** (default methods): verify the quorum against the prior group, THEN supersede (Cut G2), recording `{change_envelope, quorum_signatures}` as the superseded version's authorization (the §8 audit trail). A rejected quorum leaves the live row untouched (verify before mutation).
+- **FFI:** `cohort_verify_membership_quorum` / `cohort_supersede_group_with_quorum`.
+- **Test helpers:** `tier_ingest::test_support::{threshold_sign, register_hybrid_key}` (real deterministic Ed25519 + ML-DSA-65 hybrid signers, pubkeys matching the registered roster).
+- **Tested:** a `quorum:2/3` family expands to `quorum:3/5` only when 2 of the 3 prior members cosign the JCS payload; 1 cosignature is rejected (insufficient) and the live roster is untouched — on sqlite + live Postgres.
+
+This consumes verify v6.8.0 as-is; the optional general (role-agnostic, non-entrenched) `build/verify_membership_change` helper is tracked at CIRISVerify#104.
+
 ## [9.6.0] — 2026-06-21
 
 ### Added — #249 Cut G2: rostered-group **supersede + versioning** (CIRISServer #249 §3/§8)

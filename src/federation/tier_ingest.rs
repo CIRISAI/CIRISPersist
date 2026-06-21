@@ -240,6 +240,63 @@ pub(crate) mod test_support {
         (ed_pk, Some(mldsa_pk))
     }
 
+    /// #249 Cut G3 — produce a [`ThresholdSignature`](ciris_verify_core::threshold::ThresholdSignature)
+    /// for `key_id` over `bytes` using `key_id`'s deterministic hybrid keypair
+    /// (the same pair [`hybrid_pubkeys`] registers). The ML-DSA-65 half signs
+    /// the bound message `bytes ‖ ed25519_sig` (the stripping-attack guard the
+    /// threshold verifier checks). Use to drive the quorum gate in tests.
+    pub fn threshold_sign(
+        key_id: &str,
+        bytes: &[u8],
+    ) -> ciris_verify_core::threshold::ThresholdSignature {
+        let ed_sig = ed_signer(key_id).sign(bytes).expect("ed sign");
+        let mut bound = bytes.to_vec();
+        bound.extend_from_slice(&ed_sig);
+        let pqc_sig = mldsa_signer(key_id).sign(&bound).expect("mldsa sign");
+        ciris_verify_core::threshold::ThresholdSignature {
+            member_id: key_id.to_string(),
+            ed25519_signature_base64: B64.encode(&ed_sig),
+            mldsa65_signature_base64: Some(B64.encode(&pqc_sig)),
+        }
+    }
+
+    /// #249 Cut G3 — register `key_id` with its REAL deterministic hybrid
+    /// pubkeys (matching [`hybrid_pubkeys`] / [`threshold_sign`]) via
+    /// `put_public_key`, so a cosignature this key produces verifies against
+    /// the stored roster. The registration row's own scrub fields are
+    /// placeholders (`put_public_key` does not hybrid-verify the
+    /// registration; only the PUBKEYS must be real).
+    pub async fn register_hybrid_key<D: crate::federation::FederationDirectory + ?Sized>(
+        dir: &D,
+        key_id: &str,
+    ) {
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
+        let now = chrono::Utc::now();
+        let rec = crate::federation::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: crate::federation::types::identity_type::AGENT.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": key_id }),
+            original_content_hash: "deadbeef".to_owned(),
+            scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        };
+        dir.put_public_key(crate::federation::SignedKeyRecord { record: rec })
+            .await
+            .expect("register hybrid key");
+    }
+
     /// Build a PQC-configured [`crate::signing::LocalSigner`] whose
     /// Ed25519 + ML-DSA-65 keypair is the SAME deterministic pair as
     /// [`hybrid_pubkeys`] / [`sign_envelope`] for `key_id`. Use this to
@@ -339,7 +396,7 @@ mod tests {
     /// `put_public_key` does not hybrid-verify the registration (that gate
     /// is `register_federation_key`); only the PUBKEYS must be real for
     /// the federation-tier ingest gate to verify attestations.
-    async fn register_hybrid_key(dir: &dyn FederationDirectory, key_id: &str) {
+    pub async fn register_hybrid_key(dir: &dyn FederationDirectory, key_id: &str) {
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
         let now = chrono::Utc::now();
         let rec = KeyRecord {
