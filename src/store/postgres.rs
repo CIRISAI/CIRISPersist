@@ -2978,6 +2978,279 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(true)
     }
 
+    // #249 Cut G2 — supersede + versioning (CIRISServer #249 §3/§8).
+    async fn supersede_group_row(
+        &self,
+        cohort: crate::federation::cohort::Cohort,
+        new_snapshot: serde_json::Value,
+        authorization: Option<serde_json::Value>,
+    ) -> Result<u32, crate::federation::Error> {
+        use crate::federation::cohort::Cohort;
+        use crate::federation::Error;
+        match cohort {
+            Cohort::SelfId => {
+                return Err(Error::InvalidArgument(
+                    "supersede: the `self` cohort is not versioned".to_string(),
+                ))
+            }
+            Cohort::Family | Cohort::Community => {}
+        }
+        let now = chrono::Utc::now();
+        let mut client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        let next: i32 = match cohort {
+            Cohort::Family => {
+                let mut new_fam: crate::federation::Family = serde_json::from_value(new_snapshot)
+                    .map_err(|e| {
+                    Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
+                })?;
+                new_fam.persist_row_hash =
+                    crate::federation::types::compute_persist_row_hash(&new_fam)?;
+                let members_value = serde_json::to_value(&new_fam.members)
+                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
+                let tx = client
+                    .transaction()
+                    .await
+                    .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+                let prior = tx
+                    .query_opt(
+                        "SELECT version, family_key_id, family_name, members, founded_at, \
+                                consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                         FROM cirislens.federation_families WHERE family_key_id = $1",
+                        &[&new_fam.family_key_id],
+                    )
+                    .await
+                    .map_err(|e| Error::Backend(format!("supersede read prior family: {e}")))?
+                    .ok_or_else(|| {
+                        Error::InvalidArgument(format!(
+                            "supersede: unknown family group {:?} (nothing to supersede)",
+                            new_fam.family_key_id
+                        ))
+                    })?;
+                let prior_version: i32 = prior.get("version");
+                let prior_fam = pg_row_to_family(prior)?;
+                let snapshot = serde_json::to_value(&prior_fam)
+                    .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
+                tx.execute(
+                    "INSERT INTO cirislens.federation_group_versions \
+                        (cohort, group_key_id, version, snapshot, change_authorization, \
+                         superseded_at, persist_row_hash) \
+                     VALUES ('family', $1, $2, $3, $4, $5, $6)",
+                    &[
+                        &new_fam.family_key_id,
+                        &prior_version,
+                        &snapshot,
+                        &authorization,
+                        &now,
+                        &prior_fam.persist_row_hash,
+                    ],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("insert group version: {e}")))?;
+                let next = prior_version + 1;
+                tx.execute(
+                    "UPDATE cirislens.federation_families SET \
+                        family_name = $2, members = $3, founded_at = $4, \
+                        consensus_protocol = $5, consensus_protocol_entrenched = $6, \
+                        persist_row_hash = $7, version = $8 \
+                     WHERE family_key_id = $1",
+                    &[
+                        &new_fam.family_key_id,
+                        &new_fam.family_name,
+                        &members_value,
+                        &new_fam.founded_at,
+                        &new_fam.consensus_protocol,
+                        &new_fam.consensus_protocol_entrenched,
+                        &new_fam.persist_row_hash,
+                        &next,
+                    ],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("update family: {e}")))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+                next
+            }
+            Cohort::Community => {
+                let mut new_comm: crate::federation::Community =
+                    serde_json::from_value(new_snapshot).map_err(|e| {
+                        Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
+                    })?;
+                new_comm.persist_row_hash =
+                    crate::federation::types::compute_persist_row_hash(&new_comm)?;
+                let members_value = serde_json::to_value(&new_comm.members)
+                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
+                let tx = client
+                    .transaction()
+                    .await
+                    .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+                let prior = tx
+                    .query_opt(
+                        "SELECT version, community_key_id, community_name, members, founded_at, \
+                                consensus_protocol, policy_blob, persist_row_hash \
+                         FROM cirislens.federation_communities WHERE community_key_id = $1",
+                        &[&new_comm.community_key_id],
+                    )
+                    .await
+                    .map_err(|e| Error::Backend(format!("supersede read prior community: {e}")))?
+                    .ok_or_else(|| {
+                        Error::InvalidArgument(format!(
+                            "supersede: unknown community group {:?} (nothing to supersede)",
+                            new_comm.community_key_id
+                        ))
+                    })?;
+                let prior_version: i32 = prior.get("version");
+                let prior_comm = pg_row_to_community(prior)?;
+                let snapshot = serde_json::to_value(&prior_comm)
+                    .map_err(|e| Error::Backend(format!("snapshot serialize: {e}")))?;
+                tx.execute(
+                    "INSERT INTO cirislens.federation_group_versions \
+                        (cohort, group_key_id, version, snapshot, change_authorization, \
+                         superseded_at, persist_row_hash) \
+                     VALUES ('community', $1, $2, $3, $4, $5, $6)",
+                    &[
+                        &new_comm.community_key_id,
+                        &prior_version,
+                        &snapshot,
+                        &authorization,
+                        &now,
+                        &prior_comm.persist_row_hash,
+                    ],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("insert group version: {e}")))?;
+                let next = prior_version + 1;
+                tx.execute(
+                    "UPDATE cirislens.federation_communities SET \
+                        community_name = $2, members = $3, founded_at = $4, \
+                        consensus_protocol = $5, policy_blob = $6, \
+                        persist_row_hash = $7, version = $8 \
+                     WHERE community_key_id = $1",
+                    &[
+                        &new_comm.community_key_id,
+                        &new_comm.community_name,
+                        &members_value,
+                        &new_comm.founded_at,
+                        &new_comm.consensus_protocol,
+                        &new_comm.policy_blob,
+                        &new_comm.persist_row_hash,
+                        &next,
+                    ],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("update community: {e}")))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+                next
+            }
+            Cohort::SelfId => unreachable!("guarded above"),
+        };
+        Ok(next as u32)
+    }
+
+    // #249 Cut G2 (§8) — full version chain: history rows + the live current.
+    async fn list_group_versions(
+        &self,
+        cohort: crate::federation::cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<crate::federation::cohort::GroupVersion>, crate::federation::Error> {
+        use crate::federation::cohort::{Cohort, GroupVersion};
+        use crate::federation::Error;
+        if cohort == Cohort::SelfId {
+            return Err(Error::InvalidArgument(
+                "list_group_versions: the `self` cohort is not versioned".to_string(),
+            ));
+        }
+        let cohort_str = if cohort == Cohort::Family {
+            "family"
+        } else {
+            "community"
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT version, snapshot, change_authorization, superseded_at \
+                 FROM cirislens.federation_group_versions \
+                 WHERE cohort = $1 AND group_key_id = $2 ORDER BY version ASC",
+                &[&cohort_str, &group_key_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("list_group_versions: {e}")))?;
+        let mut out: Vec<GroupVersion> = Vec::new();
+        for r in rows {
+            let version: i32 = r.get("version");
+            let snapshot: serde_json::Value = r.get("snapshot");
+            let authorization: Option<serde_json::Value> = r.get("change_authorization");
+            let superseded_at: chrono::DateTime<chrono::Utc> = r.get("superseded_at");
+            out.push(GroupVersion {
+                cohort,
+                group_key_id: group_key_id.to_string(),
+                version: version as u32,
+                snapshot,
+                authorization,
+                superseded_at: Some(superseded_at),
+                is_current: false,
+            });
+        }
+        let live = if cohort == Cohort::Family {
+            client
+                .query_opt(
+                    "SELECT version, family_key_id, family_name, members, founded_at, \
+                            consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                     FROM cirislens.federation_families WHERE family_key_id = $1",
+                    &[&group_key_id],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("list_group_versions live family: {e}")))?
+                .map(|r| {
+                    let v: i32 = r.get("version");
+                    let fam = pg_row_to_family(r)?;
+                    let snap = serde_json::to_value(&fam)
+                        .map_err(|e| Error::Backend(format!("live snapshot: {e}")))?;
+                    Ok::<_, Error>((v, snap))
+                })
+                .transpose()?
+        } else {
+            client
+                .query_opt(
+                    "SELECT version, community_key_id, community_name, members, founded_at, \
+                            consensus_protocol, policy_blob, persist_row_hash \
+                     FROM cirislens.federation_communities WHERE community_key_id = $1",
+                    &[&group_key_id],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("list_group_versions live community: {e}")))?
+                .map(|r| {
+                    let v: i32 = r.get("version");
+                    let comm = pg_row_to_community(r)?;
+                    let snap = serde_json::to_value(&comm)
+                        .map_err(|e| Error::Backend(format!("live snapshot: {e}")))?;
+                    Ok::<_, Error>((v, snap))
+                })
+                .transpose()?
+        };
+        if let Some((version, snapshot)) = live {
+            out.push(GroupVersion {
+                cohort,
+                group_key_id: group_key_id.to_string(),
+                version: version as u32,
+                snapshot,
+                authorization: None,
+                superseded_at: None,
+                is_current: true,
+            });
+        }
+        out.sort_by_key(|v| v.version);
+        Ok(out)
+    }
+
     async fn lookup_family(
         &self,
         family_key_id: &str,

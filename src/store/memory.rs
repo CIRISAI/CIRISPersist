@@ -97,6 +97,14 @@ struct State {
     /// v4.0 (CEG 0.8 §8.1.13.3) — community rows keyed by
     /// `community_key_id`. Mirrors V060 PG/SQLite PK.
     federation_communities: HashMap<String, crate::federation::Community>,
+    /// #249 Cut G2 — current live version per group, keyed by
+    /// `(cohort, group_key_id)` (`cohort` ∈ `family`/`community`). Mirrors
+    /// the V089 `version` column; absent ⇒ 1.
+    federation_group_current_version: HashMap<(String, String), u32>,
+    /// #249 Cut G2 (§8) — append-only superseded version history, keyed by
+    /// `(cohort, group_key_id)`. Mirrors V089 `federation_group_versions`.
+    federation_group_versions:
+        HashMap<(String, String), Vec<crate::federation::cohort::GroupVersion>>,
     /// v4.8.0 (CIRISPersist#161, CEG §11.7.1) — Option-A forward-secrecy
     /// removal/revocation rows. Keyed by the V067 composite PKs.
     federation_identity_occurrence_revocations:
@@ -200,6 +208,8 @@ impl Default for MemoryBackend {
                 federation_identity_occurrences: HashMap::new(),
                 federation_families: HashMap::new(),
                 federation_communities: HashMap::new(),
+                federation_group_current_version: HashMap::new(),
+                federation_group_versions: HashMap::new(),
                 federation_identity_occurrence_revocations: HashMap::new(),
                 federation_family_membership_revocations: HashMap::new(),
                 federation_community_membership_revocations: HashMap::new(),
@@ -1632,6 +1642,169 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         community.members.push(member);
         community.persist_row_hash = crate::federation::types::compute_persist_row_hash(community)?;
         Ok(true)
+    }
+
+    // #249 Cut G2 — supersede + versioning (CIRISServer #249 §3/§8).
+    async fn supersede_group_row(
+        &self,
+        cohort: crate::federation::cohort::Cohort,
+        new_snapshot: serde_json::Value,
+        authorization: Option<serde_json::Value>,
+    ) -> Result<u32, crate::federation::Error> {
+        use crate::federation::cohort::{Cohort, GroupVersion};
+        use crate::federation::Error;
+        let cohort_str = match cohort {
+            Cohort::Family => "family".to_string(),
+            Cohort::Community => "community".to_string(),
+            Cohort::SelfId => {
+                return Err(Error::InvalidArgument(
+                    "supersede: the `self` cohort is not versioned".to_string(),
+                ))
+            }
+        };
+        let now = chrono::Utc::now();
+        let mut state = self.state.lock().expect("memory backend lock");
+        match cohort {
+            Cohort::Family => {
+                let mut new_fam: crate::federation::Family = serde_json::from_value(new_snapshot)
+                    .map_err(|e| {
+                    Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
+                })?;
+                new_fam.persist_row_hash =
+                    crate::federation::types::compute_persist_row_hash(&new_fam)?;
+                let key = new_fam.family_key_id.clone();
+                let prior = state
+                    .federation_families
+                    .get(&key)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::InvalidArgument(format!(
+                            "supersede: unknown family group {key:?} (nothing to supersede)"
+                        ))
+                    })?;
+                let cur_ver = *state
+                    .federation_group_current_version
+                    .get(&(cohort_str.clone(), key.clone()))
+                    .unwrap_or(&1);
+                let snapshot = serde_json::to_value(&prior).unwrap_or(serde_json::Value::Null);
+                state
+                    .federation_group_versions
+                    .entry((cohort_str.clone(), key.clone()))
+                    .or_default()
+                    .push(GroupVersion {
+                        cohort,
+                        group_key_id: key.clone(),
+                        version: cur_ver,
+                        snapshot,
+                        authorization,
+                        superseded_at: Some(now),
+                        is_current: false,
+                    });
+                state.federation_families.insert(key.clone(), new_fam);
+                let next = cur_ver + 1;
+                state
+                    .federation_group_current_version
+                    .insert((cohort_str, key), next);
+                Ok(next)
+            }
+            Cohort::Community => {
+                let mut new_comm: crate::federation::Community =
+                    serde_json::from_value(new_snapshot).map_err(|e| {
+                        Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
+                    })?;
+                new_comm.persist_row_hash =
+                    crate::federation::types::compute_persist_row_hash(&new_comm)?;
+                let key = new_comm.community_key_id.clone();
+                let prior = state
+                    .federation_communities
+                    .get(&key)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::InvalidArgument(format!(
+                            "supersede: unknown community group {key:?} (nothing to supersede)"
+                        ))
+                    })?;
+                let cur_ver = *state
+                    .federation_group_current_version
+                    .get(&(cohort_str.clone(), key.clone()))
+                    .unwrap_or(&1);
+                let snapshot = serde_json::to_value(&prior).unwrap_or(serde_json::Value::Null);
+                state
+                    .federation_group_versions
+                    .entry((cohort_str.clone(), key.clone()))
+                    .or_default()
+                    .push(GroupVersion {
+                        cohort,
+                        group_key_id: key.clone(),
+                        version: cur_ver,
+                        snapshot,
+                        authorization,
+                        superseded_at: Some(now),
+                        is_current: false,
+                    });
+                state.federation_communities.insert(key.clone(), new_comm);
+                let next = cur_ver + 1;
+                state
+                    .federation_group_current_version
+                    .insert((cohort_str, key), next);
+                Ok(next)
+            }
+            Cohort::SelfId => unreachable!("guarded above"),
+        }
+    }
+
+    // #249 Cut G2 (§8) — full version chain: history rows + the live current.
+    async fn list_group_versions(
+        &self,
+        cohort: crate::federation::cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<crate::federation::cohort::GroupVersion>, crate::federation::Error> {
+        use crate::federation::cohort::{Cohort, GroupVersion};
+        use crate::federation::Error;
+        if cohort == Cohort::SelfId {
+            return Err(Error::InvalidArgument(
+                "list_group_versions: the `self` cohort is not versioned".to_string(),
+            ));
+        }
+        let cohort_str = if cohort == Cohort::Family {
+            "family".to_string()
+        } else {
+            "community".to_string()
+        };
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out: Vec<GroupVersion> = state
+            .federation_group_versions
+            .get(&(cohort_str.clone(), group_key_id.to_string()))
+            .cloned()
+            .unwrap_or_default();
+        let cur_ver = *state
+            .federation_group_current_version
+            .get(&(cohort_str, group_key_id.to_string()))
+            .unwrap_or(&1);
+        let live = match cohort {
+            Cohort::Family => state
+                .federation_families
+                .get(group_key_id)
+                .map(|f| serde_json::to_value(f).unwrap_or(serde_json::Value::Null)),
+            Cohort::Community => state
+                .federation_communities
+                .get(group_key_id)
+                .map(|c| serde_json::to_value(c).unwrap_or(serde_json::Value::Null)),
+            Cohort::SelfId => None,
+        };
+        if let Some(snapshot) = live {
+            out.push(GroupVersion {
+                cohort,
+                group_key_id: group_key_id.to_string(),
+                version: cur_ver,
+                snapshot,
+                authorization: None,
+                superseded_at: None,
+                is_current: true,
+            });
+        }
+        out.sort_by_key(|v| v.version);
+        Ok(out)
     }
 
     async fn list_families_for_member(

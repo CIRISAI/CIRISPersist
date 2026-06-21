@@ -2623,6 +2623,298 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(true)
     }
 
+    // #249 Cut G2 — supersede + versioning (CIRISServer #249 §3/§8).
+    async fn supersede_group_row(
+        &self,
+        cohort: crate::federation::cohort::Cohort,
+        new_snapshot: serde_json::Value,
+        authorization: Option<serde_json::Value>,
+    ) -> Result<u32, crate::federation::Error> {
+        use crate::federation::cohort::Cohort;
+        use crate::federation::Error;
+        let conn = self.conn.clone();
+        let now = chrono::Utc::now().to_rfc3339();
+        let auth_json = match authorization {
+            Some(v) => Some(
+                serde_json::to_string(&v)
+                    .map_err(|e| Error::Backend(format!("authorization serialize: {e}")))?,
+            ),
+            None => None,
+        };
+        // Map a "group does not exist" sentinel back to a typed error.
+        let not_found = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let nf = not_found.clone();
+        let cohort_str = match cohort {
+            Cohort::Family => "family",
+            Cohort::Community => "community",
+            Cohort::SelfId => {
+                return Err(Error::InvalidArgument(
+                    "supersede: the `self` cohort is not versioned (manage occurrences via \
+                     put_identity_occurrence / put_identity_occurrence_revocation)"
+                        .to_string(),
+                ))
+            }
+        };
+
+        let new_version = match cohort {
+            Cohort::Family => {
+                let mut new_fam: crate::federation::Family = serde_json::from_value(new_snapshot)
+                    .map_err(|e| {
+                    Error::InvalidArgument(format!("supersede family snapshot decode: {e}"))
+                })?;
+                new_fam.persist_row_hash =
+                    crate::federation::types::compute_persist_row_hash(&new_fam)?;
+                let members_json = serde_json::to_string(&new_fam.members)
+                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
+                (move || -> Result<u32, rusqlite::Error> {
+                    let mut conn = conn.lock();
+                    let tx = conn.transaction()?;
+                    let prior = tx
+                        .query_row(
+                            "SELECT version, family_key_id, family_name, members, founded_at, \
+                                    consensus_protocol, consensus_protocol_entrenched, \
+                                    persist_row_hash \
+                             FROM federation_families WHERE family_key_id = ?1",
+                            [&new_fam.family_key_id],
+                            |r| Ok((r.get::<_, u32>("version")?, sqlite_row_to_family(r)?)),
+                        )
+                        .optional()?;
+                    let (prior_version, prior_fam) = match prior {
+                        Some(p) => p,
+                        None => {
+                            nf.store(true, std::sync::atomic::Ordering::SeqCst);
+                            return Err(rusqlite::Error::QueryReturnedNoRows);
+                        }
+                    };
+                    let snapshot = serde_json::to_string(&prior_fam)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    tx.execute(
+                        "INSERT INTO federation_group_versions \
+                            (cohort, group_key_id, version, snapshot, change_authorization, \
+                             superseded_at, persist_row_hash) \
+                         VALUES ('family', ?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            new_fam.family_key_id,
+                            prior_version,
+                            snapshot,
+                            auth_json,
+                            now,
+                            prior_fam.persist_row_hash,
+                        ],
+                    )?;
+                    let next = prior_version + 1;
+                    tx.execute(
+                        "UPDATE federation_families SET \
+                            family_name = ?2, members = ?3, founded_at = ?4, \
+                            consensus_protocol = ?5, consensus_protocol_entrenched = ?6, \
+                            persist_row_hash = ?7, version = ?8 \
+                         WHERE family_key_id = ?1",
+                        rusqlite::params![
+                            new_fam.family_key_id,
+                            new_fam.family_name,
+                            members_json,
+                            new_fam.founded_at.to_rfc3339(),
+                            new_fam.consensus_protocol,
+                            new_fam.consensus_protocol_entrenched as i64,
+                            new_fam.persist_row_hash,
+                            next,
+                        ],
+                    )?;
+                    tx.commit()?;
+                    Ok(next)
+                })()
+            }
+            Cohort::Community => {
+                let mut new_comm: crate::federation::Community =
+                    serde_json::from_value(new_snapshot).map_err(|e| {
+                        Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
+                    })?;
+                new_comm.persist_row_hash =
+                    crate::federation::types::compute_persist_row_hash(&new_comm)?;
+                let members_json = serde_json::to_string(&new_comm.members)
+                    .map_err(|e| Error::Backend(format!("members serialize: {e}")))?;
+                let policy_json = match &new_comm.policy_blob {
+                    Some(v) => Some(
+                        serde_json::to_string(v)
+                            .map_err(|e| Error::Backend(format!("policy_blob serialize: {e}")))?,
+                    ),
+                    None => None,
+                };
+                (move || -> Result<u32, rusqlite::Error> {
+                    let mut conn = conn.lock();
+                    let tx = conn.transaction()?;
+                    let prior = tx
+                        .query_row(
+                            "SELECT version, community_key_id, community_name, members, \
+                                    founded_at, consensus_protocol, policy_blob, persist_row_hash \
+                             FROM federation_communities WHERE community_key_id = ?1",
+                            [&new_comm.community_key_id],
+                            |r| Ok((r.get::<_, u32>("version")?, sqlite_row_to_community(r)?)),
+                        )
+                        .optional()?;
+                    let (prior_version, prior_comm) = match prior {
+                        Some(p) => p,
+                        None => {
+                            nf.store(true, std::sync::atomic::Ordering::SeqCst);
+                            return Err(rusqlite::Error::QueryReturnedNoRows);
+                        }
+                    };
+                    let snapshot = serde_json::to_string(&prior_comm)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    tx.execute(
+                        "INSERT INTO federation_group_versions \
+                            (cohort, group_key_id, version, snapshot, change_authorization, \
+                             superseded_at, persist_row_hash) \
+                         VALUES ('community', ?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            new_comm.community_key_id,
+                            prior_version,
+                            snapshot,
+                            auth_json,
+                            now,
+                            prior_comm.persist_row_hash,
+                        ],
+                    )?;
+                    let next = prior_version + 1;
+                    tx.execute(
+                        "UPDATE federation_communities SET \
+                            community_name = ?2, members = ?3, founded_at = ?4, \
+                            consensus_protocol = ?5, policy_blob = ?6, \
+                            persist_row_hash = ?7, version = ?8 \
+                         WHERE community_key_id = ?1",
+                        rusqlite::params![
+                            new_comm.community_key_id,
+                            new_comm.community_name,
+                            members_json,
+                            new_comm.founded_at.to_rfc3339(),
+                            new_comm.consensus_protocol,
+                            policy_json,
+                            new_comm.persist_row_hash,
+                            next,
+                        ],
+                    )?;
+                    tx.commit()?;
+                    Ok(next)
+                })()
+            }
+            Cohort::SelfId => unreachable!("guarded above"),
+        }
+        .map_err(|e| {
+            if not_found.load(std::sync::atomic::Ordering::SeqCst) {
+                Error::InvalidArgument(format!(
+                    "supersede: unknown {cohort_str} group (nothing to supersede)"
+                ))
+            } else {
+                Error::Backend(format!("supersede {cohort_str}: {e}"))
+            }
+        })?;
+        Ok(new_version)
+    }
+
+    // #249 Cut G2 (§8) — full version chain: history rows + the live current.
+    async fn list_group_versions(
+        &self,
+        cohort: crate::federation::cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<crate::federation::cohort::GroupVersion>, crate::federation::Error> {
+        use crate::federation::cohort::{Cohort, GroupVersion};
+        use crate::federation::Error;
+        if cohort == Cohort::SelfId {
+            return Err(Error::InvalidArgument(
+                "list_group_versions: the `self` cohort is not versioned".to_string(),
+            ));
+        }
+        let cohort_str = if cohort == Cohort::Family {
+            "family"
+        } else {
+            "community"
+        };
+        let conn = self.conn.clone();
+        let key = group_key_id.to_owned();
+        let cs = cohort_str.to_owned();
+        (move || -> Result<Vec<GroupVersion>, rusqlite::Error> {
+            let conn = conn.lock();
+            // Superseded prior versions.
+            let mut out: Vec<GroupVersion> = Vec::new();
+            let mut stmt = conn.prepare(
+                "SELECT version, snapshot, change_authorization, superseded_at \
+                 FROM federation_group_versions \
+                 WHERE cohort = ?1 AND group_key_id = ?2 ORDER BY version ASC",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![cs, key], |r| {
+                let version: u32 = r.get("version")?;
+                let snapshot_text: String = r.get("snapshot")?;
+                let auth_text: Option<String> = r.get("change_authorization")?;
+                let superseded_at: String = r.get("superseded_at")?;
+                Ok((version, snapshot_text, auth_text, superseded_at))
+            })?;
+            for row in rows {
+                let (version, snapshot_text, auth_text, superseded_at) = row?;
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&snapshot_text).unwrap_or(serde_json::Value::Null);
+                let authorization =
+                    auth_text.and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+                out.push(GroupVersion {
+                    cohort,
+                    group_key_id: key.clone(),
+                    version,
+                    snapshot,
+                    authorization,
+                    superseded_at: Some(parse_rfc3339(&superseded_at)),
+                    is_current: false,
+                });
+            }
+            // The live current version.
+            let live: Option<(u32, serde_json::Value)> = if cohort == Cohort::Family {
+                conn.query_row(
+                    "SELECT version, family_key_id, family_name, members, founded_at, \
+                            consensus_protocol, consensus_protocol_entrenched, persist_row_hash \
+                     FROM federation_families WHERE family_key_id = ?1",
+                    [&key],
+                    |r| {
+                        let v: u32 = r.get("version")?;
+                        let fam = sqlite_row_to_family(r)?;
+                        Ok((
+                            v,
+                            serde_json::to_value(&fam).unwrap_or(serde_json::Value::Null),
+                        ))
+                    },
+                )
+                .optional()?
+            } else {
+                conn.query_row(
+                    "SELECT version, community_key_id, community_name, members, founded_at, \
+                            consensus_protocol, policy_blob, persist_row_hash \
+                     FROM federation_communities WHERE community_key_id = ?1",
+                    [&key],
+                    |r| {
+                        let v: u32 = r.get("version")?;
+                        let comm = sqlite_row_to_community(r)?;
+                        Ok((
+                            v,
+                            serde_json::to_value(&comm).unwrap_or(serde_json::Value::Null),
+                        ))
+                    },
+                )
+                .optional()?
+            };
+            if let Some((version, snapshot)) = live {
+                out.push(GroupVersion {
+                    cohort,
+                    group_key_id: key.clone(),
+                    version,
+                    snapshot,
+                    authorization: None,
+                    superseded_at: None,
+                    is_current: true,
+                });
+            }
+            out.sort_by_key(|v| v.version);
+            Ok(out)
+        })()
+        .map_err(|e| Error::Backend(format!("list_group_versions: {e}")))
+    }
+
     async fn lookup_family(
         &self,
         family_key_id: &str,

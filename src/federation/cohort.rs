@@ -185,6 +185,33 @@ impl From<types::Community> for GroupRef {
     }
 }
 
+/// One version of a rostered group's history (#249 Cut G2 §8). The live
+/// (current) version and every superseded prior version share this shape, so
+/// `group_history` returns a uniform chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroupVersion {
+    /// Which rostered-group kind (`family` / `community`; `self` is not
+    /// versioned).
+    pub cohort: Cohort,
+    /// The group's `federation_keys.key_id`.
+    pub group_key_id: String,
+    /// Monotonic version number (genesis = 1; each `supersede` increments).
+    pub version: u32,
+    /// The full `Family` / `Community` row at this version (JSON).
+    pub snapshot: serde_json::Value,
+    /// The membership-change authorization that PRODUCED this version (the Cut
+    /// G3 quorum envelope + cosignatures), or `None` (genesis / a plain
+    /// pre-supersede `put`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<serde_json::Value>,
+    /// When this version was superseded by the next. `None` ⇒ the live
+    /// (current) version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_at: Option<DateTime<Utc>>,
+    /// `true` for the current live version, `false` for a historical one.
+    pub is_current: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

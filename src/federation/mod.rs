@@ -135,7 +135,7 @@ pub use blobs::{
     PutBlobAttestation, ScopeBlobSymbol, CHUNK_MANIFEST_VERSION, DEFAULT_INLINE_BYTES_CAP,
     HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
-pub use cohort::{Cohort, GroupRef, RevokeSpec, RosterMember};
+pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
 pub use goal::{
     canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
     MetaGoalAlignment,
@@ -1345,6 +1345,108 @@ pub trait FederationDirectory: Send + Sync {
         self.revoke_member(cohort, group_key_id, out_key_id, spec)
             .await?;
         self.add_member(cohort, group_key_id, in_member).await
+    }
+
+    // ── #249 Cut G2 ── supersede + versioning (CIRISServer #249 §3/§8) ──
+    //
+    // THE write gap: `put_family` / `put_community` error on differing
+    // content and `add`/`revoke` can't touch the `consensus_protocol`, so
+    // there is no way to change an entrenched group's M/N threshold or
+    // atomically re-baseline its roster — `expand 3→5` (which forces
+    // `quorum:2/3 → quorum:3/5` under strict majority) is impossible.
+    // `supersede` REPLACES the live row as a NEW version, snapshotting the
+    // prior version into the append-only `federation_group_versions` history
+    // (§8). `self` is not versioned (occurrences are managed individually).
+    //
+    // `supersede_group_row` + `list_group_versions` are the backend
+    // primitives (the supersede is one transaction: snapshot prior → replace
+    // live → bump version); the typed `supersede_family` / `supersede_community`
+    // and the `group_history` / `group_at` reads are default methods.
+
+    /// #249 Cut G2 — backend primitive: atomically supersede the live
+    /// `family`/`community` row named by `new_snapshot`'s key with the new
+    /// content, snapshotting the prior version into `federation_group_versions`
+    /// and bumping `version`. `new_snapshot` is the full `Family`/`Community`
+    /// JSON (the backend recomputes its `persist_row_hash`). `authorization`
+    /// records the membership-change justification (the Cut G3 quorum envelope
+    /// + cosignatures) on the superseded prior row, or `None`. Returns the new
+    /// version. [`Error::InvalidArgument`] if the group does not exist or the
+    /// cohort is `self`. Prefer the typed [`Self::supersede_family`] /
+    /// [`Self::supersede_community`] wrappers.
+    async fn supersede_group_row(
+        &self,
+        cohort: cohort::Cohort,
+        new_snapshot: serde_json::Value,
+        authorization: Option<serde_json::Value>,
+    ) -> Result<u32, Error>;
+
+    /// #249 Cut G2 (§8) — the full version chain of a `family`/`community`:
+    /// every superseded prior version (from `federation_group_versions`) plus
+    /// the live current version, ascending by `version`. Empty for an unknown
+    /// group; the live version always has `is_current = true` and
+    /// `superseded_at = None`.
+    async fn list_group_versions(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<cohort::GroupVersion>, Error>;
+
+    /// #249 Cut G2 (§3) — supersede a family with new content (a re-baselined
+    /// roster and/or a new `consensus_protocol`) as a new version. Validates
+    /// the new `consensus_protocol` form, then composes
+    /// [`Self::supersede_group_row`]. `authorization` is the membership-change
+    /// justification recorded on the superseded prior version.
+    async fn supersede_family(
+        &self,
+        new: types::SignedFamily,
+        authorization: Option<serde_json::Value>,
+    ) -> Result<u32, Error> {
+        check_consensus_protocol_form(&new.family.consensus_protocol)?;
+        let snapshot = serde_json::to_value(&new.family)
+            .map_err(|e| Error::Backend(format!("supersede_family snapshot serialize: {e}")))?;
+        self.supersede_group_row(cohort::Cohort::Family, snapshot, authorization)
+            .await
+    }
+
+    /// #249 Cut G2 (§3) — supersede a community with new content as a new
+    /// version. Mirror of [`Self::supersede_family`].
+    async fn supersede_community(
+        &self,
+        new: types::SignedCommunity,
+        authorization: Option<serde_json::Value>,
+    ) -> Result<u32, Error> {
+        check_consensus_protocol_form(&new.community.consensus_protocol)?;
+        let snapshot = serde_json::to_value(&new.community)
+            .map_err(|e| Error::Backend(format!("supersede_community snapshot serialize: {e}")))?;
+        self.supersede_group_row(cohort::Cohort::Community, snapshot, authorization)
+            .await
+    }
+
+    /// #249 Cut G2 (§8) — alias for [`Self::list_group_versions`]: the
+    /// supersession audit trail (who superseded whom, when, authorized by
+    /// which quorum).
+    async fn group_history(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<cohort::GroupVersion>, Error> {
+        self.list_group_versions(cohort, group_key_id).await
+    }
+
+    /// #249 Cut G2 (§8) — the `family`/`community` at a specific `version`
+    /// (historical or current). Default filters [`Self::list_group_versions`];
+    /// `Ok(None)` if that version does not exist.
+    async fn group_at(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        version: u32,
+    ) -> Result<Option<cohort::GroupVersion>, Error> {
+        Ok(self
+            .list_group_versions(cohort, group_key_id)
+            .await?
+            .into_iter()
+            .find(|v| v.version == version))
     }
 
     /// #249 Cut B — the INBOUND delegation walk: every key that holds a
