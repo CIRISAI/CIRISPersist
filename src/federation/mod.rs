@@ -1262,8 +1262,9 @@ pub trait FederationDirectory: Send + Sync {
         group_key_id: &str,
         member: cohort::RosterMember,
     ) -> Result<bool, Error> {
-        match cohort {
-            cohort::Cohort::Family => {
+        let member_key_id = member.key_id.clone();
+        let (added, change_kind) = match cohort {
+            cohort::Cohort::Family => (
                 self.add_family_member(
                     group_key_id,
                     types::FamilyMember {
@@ -1272,9 +1273,10 @@ pub trait FederationDirectory: Send + Sync {
                         role: member.role,
                     },
                 )
-                .await
-            }
-            cohort::Cohort::Community => {
+                .await?,
+                hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
+            ),
+            cohort::Cohort::Community => (
                 self.add_community_member(
                     group_key_id,
                     types::CommunityMember {
@@ -1283,15 +1285,38 @@ pub trait FederationDirectory: Send + Sync {
                         role: member.role,
                     },
                 )
-                .await
+                .await?,
+                hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE,
+            ),
+            cohort::Cohort::SelfId => {
+                return Err(Error::InvalidArgument(
+                    "add_member: the `self` cohort admits members via \
+                     put_identity_occurrence (an occurrence carries device_class / \
+                     hardware_attestation / encryption_pubkeys a RosterMember cannot)"
+                        .to_string(),
+                ))
             }
-            cohort::Cohort::SelfId => Err(Error::InvalidArgument(
-                "add_member: the `self` cohort admits members via \
-                 put_identity_occurrence (an occurrence carries device_class / \
-                 hardware_attestation / encryption_pubkeys a RosterMember cannot)"
-                    .to_string(),
-            )),
+        };
+        // #249 Cut G4 (§9) — notify on "joined" (only on a genuine add, not the
+        // idempotent no-op) so consumers reconcile via `list_hard_case_events`.
+        // change_kind=ADDED; idempotent on the event_id.
+        if added {
+            let now = chrono::Utc::now();
+            self.record_hard_case(hard_case::HardCaseEvent {
+                event_id: hard_case::membership_change_event_id(group_key_id, &member_key_id, now),
+                kind: change_kind.to_string(),
+                target_key_id: Some(group_key_id.to_string()),
+                subject_key_id: Some(member_key_id.clone()),
+                detail: serde_json::json!({
+                    "change_kind": hard_case::change_kind::ADDED,
+                    "subject_key_id": member_key_id,
+                    "cohort_key_id": group_key_id,
+                }),
+                emitted_at: now,
+            })
+            .await?;
         }
+        Ok(added)
     }
 
     /// #249 Cut G1 (§1) — remove one member from a `cohort` roster uniformly,
@@ -1313,6 +1338,14 @@ pub trait FederationDirectory: Send + Sync {
             reason,
             witness_set,
         } = spec;
+        // #249 Cut G4 (§9) — `kind` of the membership-change "removed" event to
+        // emit after a family/community revocation (`self` uses the occurrence
+        // path, which carries its own events). `None` ⇒ no membership event.
+        let change_kind = match cohort {
+            cohort::Cohort::Family => Some(hard_case::kind::FAMILY_MEMBERSHIP_CHANGE),
+            cohort::Cohort::Community => Some(hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE),
+            cohort::Cohort::SelfId => None,
+        };
         match cohort {
             cohort::Cohort::Family => {
                 self.put_family_membership_revocation(types::SignedFamilyMembershipRevocation {
@@ -1326,7 +1359,7 @@ pub trait FederationDirectory: Send + Sync {
                         persist_row_hash: String::new(),
                     },
                 })
-                .await
+                .await?;
             }
             cohort::Cohort::Community => {
                 self.put_community_membership_revocation(
@@ -1342,23 +1375,40 @@ pub trait FederationDirectory: Send + Sync {
                         },
                     },
                 )
-                .await
+                .await?;
             }
             cohort::Cohort::SelfId => {
-                self.put_identity_occurrence_revocation(types::SignedIdentityOccurrenceRevocation {
-                    identity_occurrence_revocation: types::IdentityOccurrenceRevocation {
-                        identity_key_id: group_key_id.to_string(),
-                        occurrence_key_id: removed_key_id.to_string(),
-                        revoked_at: now,
-                        effective_at,
-                        reason,
-                        witness_set,
-                        persist_row_hash: String::new(),
+                self.put_identity_occurrence_revocation(
+                    types::SignedIdentityOccurrenceRevocation {
+                        identity_occurrence_revocation: types::IdentityOccurrenceRevocation {
+                            identity_key_id: group_key_id.to_string(),
+                            occurrence_key_id: removed_key_id.to_string(),
+                            revoked_at: now,
+                            effective_at,
+                            reason,
+                            witness_set,
+                            persist_row_hash: String::new(),
+                        },
                     },
-                })
-                .await
+                )
+                .await?;
             }
         }
+        // #249 Cut G4 (§9) — notify on "left" so consumers reconcile via
+        // `list_hard_case_events` instead of polling. Idempotent on the event_id
+        // (keyed on effective_at). NOT a forward-secrecy re-key — for community
+        // that is `at_rest_cascade::rekey_community_member_revoke` (epoch bump);
+        // for self/family it is inherent (fresh-per-write DEK).
+        if let Some(kind) = change_kind {
+            self.record_hard_case(hard_case::membership_removed_event(
+                kind,
+                group_key_id,
+                removed_key_id,
+                effective_at,
+            ))
+            .await?;
+        }
+        Ok(())
     }
 
     /// #249 Cut G1 (§6) — atomically swap one member for another in a `family`

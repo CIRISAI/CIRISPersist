@@ -2478,6 +2478,49 @@ impl Engine {
         }
     }
 
+    /// #249 Cut G4 (§7) — forward-secrecy re-key on **community** member
+    /// REMOVAL (the symmetric of [`rekey_family_member_add`](Engine::rekey_family_member_add)):
+    /// records the community membership revocation, **bumps the community DEK
+    /// epoch** (CC 4.4.3.2.2) so the next cascade mints a fresh DEK wrapped only
+    /// to the remaining members, and emits the §9 `community_membership_change`
+    /// removed event. Returns the new epoch.
+    ///
+    /// Community-only by construction: `self`/`family` use a fresh-per-write DEK,
+    /// so a removed member is excluded from future writes inherently (no epoch
+    /// to bump) — use [`Engine::revoke_member`](crate::federation::FederationDirectory::revoke_member)
+    /// there (it still emits the §9 event).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn rekey_community_member_revoke(
+        &self,
+        community_key_id: &str,
+        removed_identity_key_id: &str,
+    ) -> Result<u64, crate::federation::BlobError> {
+        use crate::federation::at_rest_cascade::orchestrate::rekey_community_member_revoke;
+        let now = chrono::Utc::now();
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                rekey_community_member_revoke(
+                    arc.as_ref(),
+                    community_key_id,
+                    removed_identity_key_id,
+                    now,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                rekey_community_member_revoke(
+                    arc.as_ref(),
+                    community_key_id,
+                    removed_identity_key_id,
+                    now,
+                )
+                .await
+            }
+        }
+    }
+
     /// v6.1.0 (CIRISPersist#161 Ask 2/4, CEG §11.7.1 / §10.1.4) — the
     /// retroactive ADD re-wrap for a **self** occurrence-add: a person
     /// admitting new device-occurrence(s) into their self-collective. Same
@@ -8540,6 +8583,197 @@ mod tests {
         let engine = Engine::with_signer(signer, &dsn).await.expect("pg engine");
         let pg = engine.postgres_backend().expect("pg backend").clone();
         quorum_supersede_body(&*pg, &uuid::Uuid::new_v4().simple().to_string()).await;
+    }
+
+    /// #249 Cut G4 — forward-secrecy rekey-on-revoke (§7) + change-event hook
+    /// (§9). Community removal bumps the DEK epoch (so the next cascade excludes
+    /// the departed member) and emits a `community_membership_change` removed
+    /// event; the cohort `revoke_member`/`add_member` paths emit the §9 events
+    /// (family/community) consumers reconcile via `list_hard_case_events`.
+    /// sqlite + pg.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn g4_rekey_events_body<D>(d: &D, s: &str)
+    where
+        D: crate::federation::FederationDirectory + crate::federation::BlobStorage + Sync,
+    {
+        use crate::federation::at_rest_cascade;
+        use crate::federation::cohort::{Cohort, RevokeSpec, RosterMember};
+        use crate::federation::hard_case::{change_kind, kind, HardCaseFilter};
+        use crate::federation::types;
+
+        // G4 rekey/events don't verify member signatures, so members are
+        // registered as PRIMITIVE keys (sweeper_test_key) — non-node/agent, so
+        // they pass the CC 3.2 community owner-binding gate without owner-binds.
+        let joined: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+
+        // ── §7 community rekey-on-revoke (epoch bump) ──
+        let comm = format!("g4-comm-{s}");
+        let cm: Vec<String> = (0..3).map(|i| format!("g4-cm{i}-{s}")).collect();
+        d.put_public_key(sweeper_test_key(&comm))
+            .await
+            .expect("seed");
+        for k in &cm {
+            d.put_public_key(sweeper_test_key(k)).await.expect("seed");
+        }
+        d.put_community(crate::federation::SignedCommunity {
+            community: types::Community {
+                community_key_id: comm.clone(),
+                community_name: "c".into(),
+                members: cm
+                    .iter()
+                    .map(|k| types::CommunityMember {
+                        key_id: k.clone(),
+                        joined_at: joined,
+                        role: None,
+                    })
+                    .collect(),
+                founded_at: joined,
+                consensus_protocol: "founder_only".into(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        })
+        .await
+        .expect("put_community");
+
+        let e1 = d
+            .community_dek_bump_epoch(&comm)
+            .await
+            .expect("genesis epoch");
+        let e2 = at_rest_cascade::orchestrate::rekey_community_member_revoke(
+            d,
+            &comm,
+            &cm[0],
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("rekey on revoke");
+        assert!(
+            e2 > e1,
+            "removal bumps the community DEK epoch (forward secrecy)"
+        );
+        let active: Vec<String> = d
+            .active_members(Cohort::Community, &comm)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert!(
+            !active.contains(&cm[0]),
+            "removed member excluded from active roster"
+        );
+        let evs = d
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::COMMUNITY_MEMBERSHIP_CHANGE.into()),
+                since: None,
+            })
+            .await
+            .expect("list events");
+        assert!(
+            evs.iter()
+                .any(|e| e.subject_key_id.as_deref() == Some(cm[0].as_str())
+                    && e.detail["change_kind"] == change_kind::REMOVED),
+            "§9 community removed event emitted"
+        );
+
+        // ── §9 family cohort revoke + add events ──
+        let fam = format!("g4-fam-{s}");
+        let fmk: Vec<String> = (0..3).map(|i| format!("g4-fm{i}-{s}")).collect();
+        d.put_public_key(sweeper_test_key(&fam))
+            .await
+            .expect("seed");
+        for k in &fmk {
+            d.put_public_key(sweeper_test_key(k)).await.expect("seed");
+        }
+        d.put_family(crate::federation::SignedFamily {
+            family: types::Family {
+                family_key_id: fam.clone(),
+                family_name: "f".into(),
+                members: vec![types::FamilyMember {
+                    key_id: fmk[0].clone(),
+                    joined_at: joined,
+                    role: None,
+                }],
+                founded_at: joined,
+                consensus_protocol: "founder_only".into(),
+                consensus_protocol_entrenched: false,
+                persist_row_hash: String::new(),
+            },
+        })
+        .await
+        .expect("put_family");
+
+        // add → §9 added event
+        assert!(d
+            .add_member(
+                Cohort::Family,
+                &fam,
+                RosterMember {
+                    key_id: fmk[1].clone(),
+                    joined_at: joined,
+                    role: None
+                },
+            )
+            .await
+            .expect("add_member"));
+        // revoke → §9 removed event (family FS is inherent fresh-per-write)
+        d.revoke_member(
+            Cohort::Family,
+            &fam,
+            &fmk[0],
+            RevokeSpec {
+                effective_at: chrono::Utc::now(),
+                reason: None,
+                witness_set: vec![],
+            },
+        )
+        .await
+        .expect("revoke_member");
+        let fevs = d
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::FAMILY_MEMBERSHIP_CHANGE.into()),
+                since: None,
+            })
+            .await
+            .expect("list family events");
+        assert!(
+            fevs.iter()
+                .any(|e| e.subject_key_id.as_deref() == Some(fmk[1].as_str())
+                    && e.detail["change_kind"] == change_kind::ADDED),
+            "§9 family added event"
+        );
+        assert!(
+            fevs.iter()
+                .any(|e| e.subject_key_id.as_deref() == Some(fmk[0].as_str())
+                    && e.detail["change_kind"] == change_kind::REMOVED),
+            "§9 family removed event"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn g4_rekey_events_sqlite() {
+        let signer = crate::federation::tier_ingest::test_support::local_signer("g4");
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        g4_rekey_events_body(&*sq, "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn g4_rekey_events_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let label = format!("g4-{}", uuid::Uuid::new_v4().simple());
+        let signer = crate::federation::tier_ingest::test_support::local_signer(&label);
+        let engine = Engine::with_signer(signer, &dsn).await.expect("pg engine");
+        let pg = engine.postgres_backend().expect("pg backend").clone();
+        g4_rekey_events_body(&*pg, &uuid::Uuid::new_v4().simple().to_string()).await;
     }
 
     /// #249 — `file_moderation` stores a `moderation:{allegation}` scores

@@ -5,6 +5,18 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.9.0] — 2026-06-21
+
+### Added — #249 Cut G4: rekey-on-revoke (§7) + membership change-event hook (§9) — the rostered-ops DX is complete
+
+The final cut of the CIRISServer #249 rostered-ops write+governance surface.
+
+- **§7 forward-secrecy rekey-on-revoke** — `at_rest_cascade::orchestrate::rekey_community_member_revoke` (+ `Engine::rekey_community_member_revoke`): records the community membership revocation, **bumps the community DEK epoch** (CC 4.4.3.2.2) so the next `encrypt_and_cascade_community` mints a fresh DEK wrapped only to the remaining members — the departed member's keys can never unwrap content sealed after removal — and emits the §9 removed event. Returns the new epoch. **Community-only by construction:** `self`/`family` use a *fresh-per-write* DEK (`CryptoTier::InvisibleEncrypted`), so a removed member is excluded from all future writes **inherently** — there is no shared epoch to bump (forward secrecy holds without a re-key; documented + tested).
+- **§9 membership change-event hook** — the cohort `add_member` / `revoke_member` (and therefore `swap_member`) now emit `family_membership_change` / `community_membership_change` hard-case events (`change_kind: added`/`removed`, idempotent on the event_id) so consumers reconcile via the existing `list_hard_case_events` instead of polling — mirroring the consent reconciler. (`self` keeps its occurrence-revocation event path.)
+- **Tested** (sqlite + live Postgres): community rekey-on-revoke bumps the epoch + excludes the removed member from the active roster + emits the removed event; family `add_member`/`revoke_member` emit the added/removed events.
+
+**The rostered-ops DX is now complete** — CIRISServer's `family.rs` collapses to thin pass-throughs over `cohort` (G1) + supersede/versioning (G2) + the quorum gate (G3/G3.5) + rekey/events (G4); **one-seat-per-human and M-of-N-to-change are substrate invariants**, the HUMANITY_ACCORD mesh genesis stands on this surface.
+
 ## [9.8.0] — 2026-06-21
 
 ### Changed — #249 Cut G3.5: the quorum gate now composes verify 6.9.0's `verify_membership_change` (robust)
