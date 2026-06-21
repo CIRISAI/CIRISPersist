@@ -8342,119 +8342,178 @@ mod tests {
         supersede_versioning_body(&*pg, &uuid::Uuid::new_v4().simple().to_string()).await;
     }
 
-    /// #249 Cut G3 — quorum-authorized membership gate (CIRISServer #249 §4/§5).
-    /// A `quorum:2/3` family expands to `quorum:3/5` ONLY when ≥M (=2) of the
-    /// PRIOR roster's real hybrid keys cosign the canonical change payload;
-    /// 1 cosignature is rejected and leaves the live row untouched. Real
-    /// Ed25519 + ML-DSA-65 signers; backend-generic body run on sqlite + pg.
+    /// #249 Cut G3 (robust on G3.5) — quorum-authorized membership gate
+    /// (CIRISServer #249 §4/§5) composing CIRISVerify v6.9.0's
+    /// `verify_membership_change`. A `quorum:2/3` family expands to `quorum:3/5`
+    /// ONLY when ≥M (=2) of the PRIOR roster's real hybrid keys cosign the
+    /// canonical `build_membership_change_envelope` payload; insufficient
+    /// quorum, an anti-replay-tampered `supersedes`, and a one-seat
+    /// (duplicate-pubkey) roster are each rejected, live row untouched. Real
+    /// Ed25519 + ML-DSA-65 signers; sqlite + pg.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn quorum_supersede_body<D>(d: &D, s: &str)
     where
         D: crate::federation::FederationDirectory + ?Sized,
     {
         use crate::federation::cohort::Cohort;
-        use crate::federation::tier_ingest::test_support::{register_hybrid_key, threshold_sign};
+        use crate::federation::tier_ingest::test_support::{
+            register_hybrid_key, register_hybrid_key_aliased, threshold_sign,
+        };
         use crate::federation::types;
 
-        let fam = format!("g3-fam-{s}");
-        let m: Vec<String> = (0..5).map(|i| format!("g3-m{i}-{s}")).collect();
-        // Register the family key + all 5 member keys with REAL deterministic
-        // hybrid pubkeys (so threshold_sign's signatures verify against them).
+        let fam = format!("g35-fam-{s}");
+        let m: Vec<String> = (0..5).map(|i| format!("g35-m{i}-{s}")).collect();
         register_hybrid_key(d, &fam).await;
         for k in &m {
             register_hybrid_key(d, k).await;
         }
         let joined: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
-        let mk = |n: usize| -> Vec<types::FamilyMember> {
-            m[..n]
-                .iter()
-                .map(|k| types::FamilyMember {
-                    key_id: k.clone(),
-                    joined_at: joined,
-                    role: Some("founder".into()),
-                })
-                .collect()
+        let fam_row = |members: Vec<String>, cp: &str| -> crate::federation::SignedFamily {
+            crate::federation::SignedFamily {
+                family: types::Family {
+                    family_key_id: fam.clone(),
+                    family_name: "accord".into(),
+                    members: members
+                        .into_iter()
+                        .map(|k| types::FamilyMember {
+                            key_id: k,
+                            joined_at: joined,
+                            role: Some("founder".into()),
+                        })
+                        .collect(),
+                    founded_at: joined,
+                    consensus_protocol: cp.into(),
+                    consensus_protocol_entrenched: true,
+                    persist_row_hash: String::new(),
+                },
+            }
         };
 
         // Genesis: quorum:2/3 family (3 members, M=2).
-        d.put_family(crate::federation::SignedFamily {
-            family: types::Family {
-                family_key_id: fam.clone(),
-                family_name: "accord".into(),
-                members: mk(3),
-                founded_at: joined,
-                consensus_protocol: "quorum:2/3".into(),
-                consensus_protocol_entrenched: true,
-                persist_row_hash: String::new(),
-            },
-        })
-        .await
-        .expect("genesis");
+        d.put_family(fam_row(m[..3].to_vec(), "quorum:2/3"))
+            .await
+            .expect("genesis");
 
-        // Change payload (what the prior roster cosigns) → expand to 5 / 3-of-5.
-        let change_envelope = serde_json::json!({
-            "family_key_id": fam,
-            "new_member_key_ids": m,
-            "consensus_protocol": "quorum:3/5",
-        });
-        let bytes = ciris_verify_core::jcs::canonicalize(&change_envelope).unwrap();
-        let new5 = crate::federation::SignedFamily {
-            family: types::Family {
-                family_key_id: fam.clone(),
-                family_name: "accord".into(),
-                members: mk(5),
-                founded_at: joined,
-                consensus_protocol: "quorum:3/5".into(),
-                consensus_protocol_entrenched: true,
-                persist_row_hash: String::new(),
-            },
-        };
+        // Build the canonical change payload via the substrate helper (verify's
+        // build_membership_change — carries the supersedes anti-replay binding).
+        let change = d
+            .build_membership_change_envelope(
+                Cohort::Family,
+                &fam,
+                &m[..5],
+                true,
+                Some("quorum:3/5"),
+            )
+            .await
+            .expect("build change envelope");
+        let bytes = ciris_verify_core::jcs::canonicalize(&change).unwrap();
 
         // 2 of the 3 PRIOR members cosign → meets quorum:2/3.
-        let sigs = vec![threshold_sign(&m[0], &bytes), threshold_sign(&m[1], &bytes)];
         let v = d
-            .supersede_family_with_quorum(new5.clone(), change_envelope.clone(), sigs)
+            .supersede_family_with_quorum(
+                fam_row(m[..5].to_vec(), "quorum:3/5"),
+                change.clone(),
+                vec![threshold_sign(&m[0], &bytes), threshold_sign(&m[1], &bytes)],
+            )
             .await
-            .expect("2-of-3 quorum authorizes the expansion");
-        assert_eq!(v, 2, "supersede bumps to version 2");
+            .expect("2-of-3 quorum authorizes the 3->5 expansion");
+        assert_eq!(v, 2);
         let live = d.lookup_family(&fam).await.unwrap().unwrap();
         assert_eq!(live.members.len(), 5);
         assert_eq!(live.consensus_protocol, "quorum:3/5");
-        // The quorum envelope + signatures are recorded as the v1 authorization.
         let hist = d.group_history(Cohort::Family, &fam).await.unwrap();
-        assert_eq!(hist[0].version, 1);
         assert!(
             hist[0].authorization.is_some(),
-            "superseded v1 carries the quorum authorization"
+            "v1 carries the authorization"
         );
 
-        // Negative: the group is now quorum:3/5 (M=3); 1 cosignature is
-        // insufficient → rejected, and the live row is untouched.
-        let env2 = serde_json::json!({"family_key_id": fam, "note": "shrink attempt"});
-        let bytes2 = ciris_verify_core::jcs::canonicalize(&env2).unwrap();
-        let one = vec![threshold_sign(&m[0], &bytes2)];
-        let shrink = crate::federation::SignedFamily {
-            family: types::Family {
-                family_key_id: fam.clone(),
-                family_name: "accord".into(),
-                members: mk(3),
-                founded_at: joined,
-                consensus_protocol: "quorum:2/3".into(),
-                consensus_protocol_entrenched: true,
-                persist_row_hash: String::new(),
-            },
-        };
+        // The group is now quorum:3/5 (M=3). Build a fresh change for the
+        // negatives (its supersedes binds to the current 5-roster).
+        let change2 = d
+            .build_membership_change_envelope(
+                Cohort::Family,
+                &fam,
+                &m[..5],
+                true,
+                Some("quorum:3/5"),
+            )
+            .await
+            .unwrap();
+        let bytes2 = ciris_verify_core::jcs::canonicalize(&change2).unwrap();
+
+        // (a) Insufficient quorum: 1 cosignature where M=3 → rejected.
         let err = d
-            .supersede_family_with_quorum(shrink, env2, one)
+            .supersede_family_with_quorum(
+                fam_row(m[..5].to_vec(), "quorum:3/5"),
+                change2.clone(),
+                vec![threshold_sign(&m[0], &bytes2)],
+            )
             .await
             .unwrap_err();
-        assert_eq!(err.kind(), "federation_invalid_argument");
-        let live2 = d.lookup_family(&fam).await.unwrap().unwrap();
         assert_eq!(
-            live2.members.len(),
-            5,
-            "rejected supersede left the live roster untouched"
+            err.kind(),
+            "federation_invalid_argument",
+            "insufficient quorum"
         );
+
+        // (b) Anti-replay: tamper the supersedes binding, cosign with a valid
+        // 3-of-5 quorum → rejected (supersedes.prior_member_key_ids mismatch).
+        let mut tampered = change2.clone();
+        tampered["supersedes"]["prior_member_key_ids"] = serde_json::json!(["ghost"]);
+        let tbytes = ciris_verify_core::jcs::canonicalize(&tampered).unwrap();
+        let err = d
+            .supersede_family_with_quorum(
+                fam_row(m[..5].to_vec(), "quorum:3/5"),
+                tampered,
+                vec![
+                    threshold_sign(&m[0], &tbytes),
+                    threshold_sign(&m[1], &tbytes),
+                    threshold_sign(&m[2], &tbytes),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_invalid_argument", "anti-replay");
+
+        // (c) One-seat: a new roster with two key_ids sharing one pubkey
+        // (alias of m[0]) → rejected even with a valid quorum.
+        let alias = format!("g35-alias-{s}");
+        register_hybrid_key_aliased(d, &alias, &m[0]).await;
+        let seat_roster = vec![
+            m[0].clone(),
+            m[1].clone(),
+            m[2].clone(),
+            m[3].clone(),
+            alias.clone(),
+        ];
+        let seat_change = d
+            .build_membership_change_envelope(
+                Cohort::Family,
+                &fam,
+                &seat_roster,
+                true,
+                Some("quorum:3/5"),
+            )
+            .await
+            .unwrap();
+        let sbytes = ciris_verify_core::jcs::canonicalize(&seat_change).unwrap();
+        let err = d
+            .supersede_family_with_quorum(
+                fam_row(seat_roster, "quorum:3/5"),
+                seat_change,
+                vec![
+                    threshold_sign(&m[0], &sbytes),
+                    threshold_sign(&m[1], &sbytes),
+                    threshold_sign(&m[2], &sbytes),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_invalid_argument", "one-seat");
+
+        // Every rejection left the live row untouched (still v2, 5 members).
+        let live2 = d.lookup_family(&fam).await.unwrap().unwrap();
+        assert_eq!(live2.members.len(), 5);
         assert_eq!(live2.consensus_protocol, "quorum:3/5");
     }
 

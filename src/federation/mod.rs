@@ -230,6 +230,53 @@ where
         .collect()
 }
 
+/// #249 Cut G3.5 — the verify-A-store-B guard for quorum-gated supersede: the
+/// roster/protocol being persisted MUST be exactly the one the quorum
+/// authorized in `change_envelope` (`group_key_id` + member `key_id` set +
+/// `consensus_protocol` all match). Defends against verifying one membership
+/// change and storing another.
+fn assert_change_envelope_matches(
+    group_key_id: &str,
+    new_member_key_ids: &std::collections::BTreeSet<&str>,
+    new_consensus_protocol: &str,
+    change_envelope: &serde_json::Value,
+) -> Result<(), Error> {
+    let env_key = change_envelope
+        .get("family_key_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if env_key != group_key_id {
+        return Err(Error::InvalidArgument(format!(
+            "supersede: change_envelope family_key_id {env_key:?} != group {group_key_id:?}"
+        )));
+    }
+    let env_cp = change_envelope
+        .get("consensus_protocol")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if env_cp != new_consensus_protocol {
+        return Err(Error::InvalidArgument(format!(
+            "supersede: change_envelope consensus_protocol {env_cp:?} != superseding row \
+             {new_consensus_protocol:?}"
+        )));
+    }
+    let env_members: std::collections::BTreeSet<&str> = change_envelope
+        .get("members")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m.get("key_id").and_then(|v| v.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if &env_members != new_member_key_ids {
+        return Err(Error::InvalidArgument(
+            "supersede: change_envelope roster does not match the superseding roster".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Federation directory trait — the registry/lens/agent's read+write
 /// surface over persist's three federation tables.
 ///
@@ -1461,83 +1508,175 @@ pub trait FederationDirectory: Send + Sync {
     // own admission). Default methods composing the trait + verify
     // primitives, so backend parity is inherited.
 
-    /// #249 Cut G3 (§4/§5) — verify a membership change is authorized by the
-    /// group's **current** strict-majority quorum: ≥M of the live roster's
-    /// pinned hybrid keys ([`Self::active_member_keys`]) validly cosigned the
-    /// canonical `change_envelope` (its JCS bytes — the §5 payload). Returns
-    /// the count of valid distinct cosigners.
+    /// #249 Cut G3 (§4/§5), robust on Cut G3.5 — verify a membership change is
+    /// authorized by the group's **current** strict-majority quorum, composing
+    /// CIRISVerify v6.9.0's general
+    /// [`verify_membership_change`](ciris_verify_core::accord_genesis::verify_membership_change)
+    /// (CIRISVerify#104). `change_envelope` is the canonical membership-change
+    /// payload (build it with [`Self::build_membership_change_envelope`]); the
+    /// **prior** roster cosigned its JCS bytes.
     ///
-    /// [`Error::InvalidArgument`] if the group is unknown, its
-    /// `consensus_protocol` is not a `quorum:M/N` (`founder_only` / `unanimous`
-    /// have their own rules), the policy is not a strict majority (`2M>N`), or
-    /// fewer than M valid hybrid cosignatures are present.
-    /// `HybridPolicy::RequireHybrid` — a classical-only signature does NOT
-    /// count at this federation-authority gate (CC 5.3.2.4.3.1).
+    /// Inherits verify's full fail-closed gate — strictly stronger than the
+    /// v9.7.0 count-only check:
+    /// - well-formed + **distinct** member `key_id`s;
+    /// - **strict-majority** `quorum:M/N` (`2M>N`) over the new roster;
+    /// - **one-seat key-distinctness** — the new roster resolves to **distinct
+    ///   pubkeys** in the directory (no human seated under two `key_id`s);
+    /// - **entrenchment preserved** — `family_key_id` unchanged, an entrenched
+    ///   group cannot be de-entrenched;
+    /// - **anti-replay** — `supersedes.prior_member_key_ids` MUST equal the
+    ///   actual prior roster (no presenting the change against a different
+    ///   prior state);
+    /// - the **prior** roster's strict-majority quorum validly signed the new
+    ///   envelope (role-agnostic, hybrid; classical-only does not count —
+    ///   CC 5.3.2.4.3.1).
+    ///
+    /// The `directory` handed to verify is the authoritative `federation_keys`
+    /// pin set for the prior roster ∪ the new roster (resolved via
+    /// [`Self::lookup_public_key`]); authorization is exactly as strong as it.
+    /// [`Error::InvalidArgument`] (wrapping the verify-side `AccordGenesisError`)
+    /// on any failed check; the `self` cohort has no quorum.
     async fn verify_membership_quorum(
         &self,
         cohort: cohort::Cohort,
         group_key_id: &str,
         change_envelope: &serde_json::Value,
         signatures: &[ciris_verify_core::threshold::ThresholdSignature],
-    ) -> Result<usize, Error> {
-        use ciris_verify_core::threshold::{
-            verify_threshold_signatures_with_policy, HybridPolicy, QuorumPolicy, ThresholdMember,
-        };
-        let group = self
-            .lookup_group(cohort, group_key_id)
-            .await?
-            .ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "verify_membership_quorum: unknown {} group {group_key_id:?}",
-                    cohort.as_str()
-                ))
-            })?;
-        let cp = group.consensus_protocol.ok_or_else(|| {
-            Error::InvalidArgument(
-                "verify_membership_quorum: group has no consensus_protocol (the `self` cohort \
-                 has no quorum)"
-                    .to_string(),
-            )
-        })?;
-        let policy = QuorumPolicy::parse(&cp).ok_or_else(|| {
-            Error::InvalidArgument(format!(
-                "verify_membership_quorum: consensus_protocol {cp:?} is not a quorum:M/N policy"
-            ))
-        })?;
-        policy.validate().map_err(|e| {
-            Error::InvalidArgument(format!(
-                "verify_membership_quorum: {cp:?} is not a strict-majority quorum: {e}"
-            ))
-        })?;
-        let members: Vec<ThresholdMember> = self
-            .active_member_keys(cohort, group_key_id)
-            .await?
-            .into_iter()
-            .map(|k| ThresholdMember {
-                member_id: k.key_id,
-                ed25519_public_key_base64: k.pubkey_ed25519_base64,
-                mldsa65_public_key_base64: k.pubkey_ml_dsa_65_base64,
-                role: None,
-            })
-            .collect();
-        let bytes = ciris_verify_core::jcs::canonicalize(change_envelope)
-            .map_err(|e| Error::Backend(format!("verify_membership_quorum canonicalize: {e}")))?;
-        // The threshold M is enforced inside the primitive (`Insufficient` if
-        // fewer than M distinct valid hybrid cosignatures); `RequireHybrid`
-        // makes a classical-only signature not count.
-        verify_threshold_signatures_with_policy(
-            &bytes,
-            &members,
+    ) -> Result<(), Error> {
+        use ciris_verify_core::threshold::ThresholdMember;
+        let prior_envelope = self.group_prior_envelope(cohort, group_key_id).await?;
+        // Directory = prior active roster ∪ the new envelope's members,
+        // resolved to their REGISTERED pinned hybrid pubkeys. verify resolves
+        // the NEW roster against this for the one-seat (distinct-pubkey) check
+        // and the PRIOR roster for the quorum count, so it must cover both.
+        let mut key_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for m in self.active_members(cohort, group_key_id).await? {
+            key_ids.insert(m.key_id);
+        }
+        if let Some(arr) = change_envelope.get("members").and_then(|v| v.as_array()) {
+            for m in arr {
+                if let Some(k) = m.get("key_id").and_then(|v| v.as_str()) {
+                    key_ids.insert(k.to_string());
+                }
+            }
+        }
+        let mut directory: Vec<ThresholdMember> = Vec::with_capacity(key_ids.len());
+        for k in key_ids {
+            if let Some(rec) = self.lookup_public_key(&k).await? {
+                directory.push(ThresholdMember {
+                    member_id: rec.key_id,
+                    ed25519_public_key_base64: rec.pubkey_ed25519_base64,
+                    mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
+                    role: None,
+                });
+            }
+        }
+        ciris_verify_core::accord_genesis::verify_membership_change(
+            &prior_envelope,
+            change_envelope,
             signatures,
-            policy.m,
-            HybridPolicy::RequireHybrid,
+            &directory,
         )
         .map_err(|e| {
             Error::InvalidArgument(format!(
-                "verify_membership_quorum: quorum not met for {cp} ({}-of-{}): {e}",
-                policy.m, policy.n
+                "verify_membership_quorum: membership change not authorized: {e}"
             ))
         })
+    }
+
+    /// #249 Cut G3.5 — the family-shaped **prior envelope** of the live
+    /// `family`/`community`: the input both
+    /// [`Self::build_membership_change_envelope`] and
+    /// [`Self::verify_membership_quorum`] derive from, so build-time and
+    /// verify-time agree byte-for-byte (the anti-replay `supersedes` binding
+    /// depends on it). verify's general helper reads `family_key_id` /
+    /// `family_name` / `members[].key_id` / `consensus_protocol` /
+    /// `consensus_protocol_entrenched` generically; a community maps its
+    /// `community_*` fields onto those keys (`entrenched=false`). `self` has no
+    /// quorum → [`Error::InvalidArgument`].
+    async fn group_prior_envelope(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<serde_json::Value, Error> {
+        fn members_json(members: Vec<(String, Option<String>)>) -> serde_json::Value {
+            serde_json::Value::Array(
+                members
+                    .into_iter()
+                    .map(|(key_id, role)| {
+                        serde_json::json!({
+                            "key_id": key_id,
+                            "role": role.unwrap_or_else(|| "member".into()),
+                        })
+                    })
+                    .collect(),
+            )
+        }
+        match cohort {
+            cohort::Cohort::Family => {
+                let f = self.lookup_family(group_key_id).await?.ok_or_else(|| {
+                    Error::InvalidArgument(format!("unknown family group {group_key_id:?}"))
+                })?;
+                Ok(serde_json::json!({
+                    "family_key_id": f.family_key_id,
+                    "family_name": f.family_name,
+                    "members": members_json(
+                        f.members.into_iter().map(|m| (m.key_id, m.role)).collect()
+                    ),
+                    "consensus_protocol": f.consensus_protocol,
+                    "consensus_protocol_entrenched": f.consensus_protocol_entrenched,
+                }))
+            }
+            cohort::Cohort::Community => {
+                let c = self.lookup_community(group_key_id).await?.ok_or_else(|| {
+                    Error::InvalidArgument(format!("unknown community group {group_key_id:?}"))
+                })?;
+                Ok(serde_json::json!({
+                    "family_key_id": c.community_key_id,
+                    "family_name": c.community_name,
+                    "members": members_json(
+                        c.members.into_iter().map(|m| (m.key_id, m.role)).collect()
+                    ),
+                    "consensus_protocol": c.consensus_protocol,
+                    "consensus_protocol_entrenched": false,
+                }))
+            }
+            cohort::Cohort::SelfId => Err(Error::InvalidArgument(
+                "the `self` cohort has no quorum / membership-change envelope".to_string(),
+            )),
+        }
+    }
+
+    /// #249 Cut G3.5 (§5) — build the canonical membership-change payload for a
+    /// roster change on `group_key_id`, via CIRISVerify v6.9.0's
+    /// [`build_membership_change`](ciris_verify_core::accord_genesis::build_membership_change).
+    /// The prior roster cosigns this envelope's JCS bytes; submit it + the
+    /// cosignatures to [`Self::supersede_family_with_quorum`] /
+    /// [`Self::supersede_community_with_quorum`]. Defined once in verify so the
+    /// payload is portable + re-verifiable across the federation. Role is
+    /// `Founder` for a `family` (entrenched M-of-N), `Member` for a `community`
+    /// (role is cosmetic — the general gate counts role-agnostically).
+    async fn build_membership_change_envelope(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+        new_member_key_ids: &[String],
+        entrenched: bool,
+        consensus_protocol: Option<&str>,
+    ) -> Result<serde_json::Value, Error> {
+        use ciris_verify_core::threshold::Role;
+        let prior_envelope = self.group_prior_envelope(cohort, group_key_id).await?;
+        let role = match cohort {
+            cohort::Cohort::Family => Role::Founder,
+            _ => Role::Member,
+        };
+        Ok(ciris_verify_core::accord_genesis::build_membership_change(
+            &prior_envelope,
+            new_member_key_ids,
+            role,
+            entrenched,
+            consensus_protocol,
+        ))
     }
 
     /// #249 Cut G3 (§3/§4/§5) — quorum-gated family supersede: verify the
@@ -1552,6 +1691,21 @@ pub trait FederationDirectory: Send + Sync {
         change_envelope: serde_json::Value,
         signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
     ) -> Result<u32, Error> {
+        // Verify-A-store-B guard: the quorum authorized `change_envelope`, so
+        // the roster/protocol being stored MUST be exactly the one it
+        // describes — never verify one roster and persist another.
+        let members: std::collections::BTreeSet<&str> = new
+            .family
+            .members
+            .iter()
+            .map(|m| m.key_id.as_str())
+            .collect();
+        assert_change_envelope_matches(
+            &new.family.family_key_id,
+            &members,
+            &new.family.consensus_protocol,
+            &change_envelope,
+        )?;
         self.verify_membership_quorum(
             cohort::Cohort::Family,
             &new.family.family_key_id,
@@ -1574,6 +1728,18 @@ pub trait FederationDirectory: Send + Sync {
         change_envelope: serde_json::Value,
         signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
     ) -> Result<u32, Error> {
+        let members: std::collections::BTreeSet<&str> = new
+            .community
+            .members
+            .iter()
+            .map(|m| m.key_id.as_str())
+            .collect();
+        assert_change_envelope_matches(
+            &new.community.community_key_id,
+            &members,
+            &new.community.consensus_protocol,
+            &change_envelope,
+        )?;
         self.verify_membership_quorum(
             cohort::Cohort::Community,
             &new.community.community_key_id,
