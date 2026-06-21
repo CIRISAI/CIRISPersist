@@ -5,6 +5,20 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.6.0] — 2026-06-21
+
+### Added — #249 Cut G2: rostered-group **supersede + versioning** (CIRISServer #249 §3/§8)
+
+THE write gap (CIRISServer #249 §3): `put_family` / `put_community` error on differing content and `add`/`revoke` can't touch the `consensus_protocol`, so there was **no way** to change an entrenched group's M/N threshold or atomically re-baseline its roster — `expand 3→5` (which forces `quorum:2/3 → quorum:3/5` under the strict-majority rule `2M>N`) was impossible. `supersede` REPLACES the live row as a **new version**, snapshotting the prior version into an append-only history (§8 — the accord's recovery/expansion audit trail).
+
+- **Migration V089** (pg + sqlite): a `version` column on `federation_families` / `federation_communities` (`DEFAULT 1`; **not** part of `persist_row_hash` — the structs don't carry it — so every legacy row hashes byte-identically) + a `federation_group_versions` history table. (`change_authorization`, not `authorization` — the latter is a PostgreSQL reserved word.)
+- **Trait:** `supersede_group_row` + `list_group_versions` (backend primitives — the supersede is ONE transaction: snapshot prior → replace live → bump version) + default `supersede_family` / `supersede_community` (validate `consensus_protocol` form, then compose) + `group_history` / `group_at` (§8 reads). Backends: sqlite (rusqlite tx), postgres (`cirislens` tx), memory (parity).
+- **New `cohort::GroupVersion`** read type (the live + each superseded version share one shape).
+- **FFI:** `cohort_supersede_group` / `cohort_group_history` / `cohort_group_at`.
+- **Tested:** the `quorum:2/3` (3) → `quorum:3/5` (5) expansion + the full version chain (`group_history` carries the prior `quorum:2/3` snapshot + its authorization; `group_at` pins a version) on sqlite + live Postgres.
+
+The authorization recorded on a superseded version is where Cut G3's quorum envelope + cosignatures land (the next cut wires `ciris_verify_core::threshold` quorum enforcement — verify v6.8.0 ships the crypto; the optional general non-accord helper is CIRISVerify#104).
+
 ## [9.5.0] — 2026-06-21
 
 ### Added — #249 Cut G1: the uniform cohort **rostered-group** surface (CIRISServer #249 §1/§2/§6)

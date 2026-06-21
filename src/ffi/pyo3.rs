@@ -15531,6 +15531,170 @@ impl PyEngine {
         })
     }
 
+    // ── #249 Cut G2 ── supersede + versioning FFI (CIRISServer #249 §3/§8) ──
+
+    /// #249 Cut G2 (§3) — supersede a `family`/`community` with new content
+    /// (`new_group_json` is the raw `Family`/`Community` object, like
+    /// `put_family_json`) as a new version. `authorization_json` is the
+    /// optional membership-change justification (Cut G3 quorum envelope +
+    /// cosignatures) recorded on the superseded prior version. Returns the new
+    /// version number. `self` is rejected.
+    #[pyo3(signature = (cohort, new_group_json, authorization_json=None))]
+    fn cohort_supersede_group(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        new_group_json: &str,
+        authorization_json: Option<&str>,
+    ) -> PyResult<u32> {
+        self.ensure_usable()?;
+        let cohort = cohort_from_token(cohort)?;
+        let authorization: Option<serde_json::Value> = match authorization_json {
+            Some(s) if !s.is_empty() => Some(
+                serde_json::from_str(s)
+                    .map_err(|e| PyValueError::new_err(format!("authorization_json: {e}")))?,
+            ),
+            _ => None,
+        };
+        use crate::federation::cohort::Cohort;
+        let family: Option<crate::federation::SignedFamily> = match cohort {
+            Cohort::Family => Some(crate::federation::SignedFamily {
+                family: serde_json::from_str(new_group_json)
+                    .map_err(|e| PyValueError::new_err(format!("supersede family JSON: {e}")))?,
+            }),
+            _ => None,
+        };
+        let community: Option<crate::federation::SignedCommunity> = match cohort {
+            Cohort::Community => Some(crate::federation::SignedCommunity {
+                community: serde_json::from_str(new_group_json)
+                    .map_err(|e| PyValueError::new_err(format!("supersede community JSON: {e}")))?,
+            }),
+            _ => None,
+        };
+        if cohort == Cohort::SelfId {
+            return Err(PyValueError::new_err(
+                "cohort_supersede_group: the `self` cohort is not versioned",
+            ));
+        }
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            match cohort {
+                                Cohort::Family => {
+                                    b.supersede_family(
+                                        family.clone().unwrap(),
+                                        authorization.clone(),
+                                    )
+                                    .await
+                                }
+                                Cohort::Community => {
+                                    b.supersede_community(
+                                        community.clone().unwrap(),
+                                        authorization.clone(),
+                                    )
+                                    .await
+                                }
+                                Cohort::SelfId => unreachable!(),
+                            }
+                            .map_err(federation_err_to_py)
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// #249 Cut G2 (§8) — the full version chain of a `family`/`community`
+    /// (superseded history + the live current). Returns a JSON array of
+    /// [`crate::federation::cohort::GroupVersion`].
+    fn cohort_group_history(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        group_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let cohort = cohort_from_token(cohort)?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let group_key_id = group_key_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .group_history(cohort, &group_key_id)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyValueError::new_err(format!("group_history serialize: {e}"))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// #249 Cut G2 (§8) — the `family`/`community` at a specific `version`.
+    /// Returns the [`crate::federation::cohort::GroupVersion`] JSON or `None`.
+    fn cohort_group_at(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        group_key_id: &str,
+        version: u32,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        let cohort = cohort_from_token(cohort)?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let group_key_id = group_key_id.to_owned();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let row = b
+                                .group_at(cohort, &group_key_id, version)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            match row {
+                                Some(v) => serde_json::to_string(&v).map(Some).map_err(|e| {
+                                    PyValueError::new_err(format!("group_at serialize: {e}"))
+                                }),
+                                None => Ok(None),
+                            }
+                        }};
+                    }
+                    match &self.backend {
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
     /// #249 Cut B — the FULL named-moderator set of `community_key_id` for
     /// `duty` (`moderate` / `takedown` / `review`): owner-bound authority
     /// roots ∪ their duty-scoped delegates. Returns a JSON array of key_ids.

@@ -8198,6 +8198,150 @@ mod tests {
         cohort_surface_roundtrip_body(&*pg, &uuid::Uuid::new_v4().simple().to_string()).await;
     }
 
+    /// #249 Cut G2 — supersede + versioning round-trip (CIRISServer #249 §3/§8):
+    /// expand a `quorum:2/3` family of 3 to a `quorum:3/5` family of 5 (the
+    /// strict-majority threshold MUST track the roster), and verify the version
+    /// chain (`group_history` / `group_at`) preserves the prior version with
+    /// its authorization. Backend-generic body; sqlite + live Postgres.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn supersede_versioning_body<D>(d: &D, s: &str)
+    where
+        D: crate::federation::FederationDirectory + ?Sized,
+    {
+        use crate::federation::cohort::Cohort;
+        use crate::federation::types;
+
+        let fam = format!("g2-fam-{s}");
+        let m: Vec<String> = (0..5).map(|i| format!("g2-m{i}-{s}")).collect();
+        for k in std::iter::once(&fam).chain(m.iter()) {
+            d.put_public_key(sweeper_test_key(k))
+                .await
+                .expect("seed key");
+        }
+        let joined: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+        let mk_members = |n: usize| -> Vec<types::FamilyMember> {
+            m[..n]
+                .iter()
+                .map(|k| types::FamilyMember {
+                    key_id: k.clone(),
+                    joined_at: joined,
+                    role: Some("founder".into()),
+                })
+                .collect()
+        };
+
+        // Genesis: 3-member quorum:2/3 family (version 1).
+        d.put_family(crate::federation::SignedFamily {
+            family: types::Family {
+                family_key_id: fam.clone(),
+                family_name: "accord".into(),
+                members: mk_members(3),
+                founded_at: joined,
+                consensus_protocol: "quorum:2/3".into(),
+                consensus_protocol_entrenched: true,
+                persist_row_hash: String::new(),
+            },
+        })
+        .await
+        .expect("genesis put_family");
+
+        // Supersede → 5-member quorum:3/5 (the expansion the write gap blocked).
+        let auth = serde_json::json!({"membership_change": "expand 3->5", "quorum": "2/3"});
+        let new_version = d
+            .supersede_family(
+                crate::federation::SignedFamily {
+                    family: types::Family {
+                        family_key_id: fam.clone(),
+                        family_name: "accord".into(),
+                        members: mk_members(5),
+                        founded_at: joined,
+                        consensus_protocol: "quorum:3/5".into(),
+                        consensus_protocol_entrenched: true,
+                        persist_row_hash: String::new(),
+                    },
+                },
+                Some(auth.clone()),
+            )
+            .await
+            .expect("supersede 3->5");
+        assert_eq!(new_version, 2, "supersede bumps version 1 -> 2");
+
+        // Live row is the new 5-member quorum:3/5.
+        let live = d.lookup_family(&fam).await.unwrap().expect("live family");
+        assert_eq!(live.members.len(), 5);
+        assert_eq!(live.consensus_protocol, "quorum:3/5");
+
+        // History chain: v1 (superseded, quorum:2/3, carries authorization) +
+        // v2 (current, quorum:3/5).
+        let hist = d
+            .group_history(Cohort::Family, &fam)
+            .await
+            .expect("history");
+        assert_eq!(hist.len(), 2, "two versions in the chain");
+        assert_eq!(hist[0].version, 1);
+        assert!(!hist[0].is_current);
+        assert!(hist[0].superseded_at.is_some());
+        assert_eq!(hist[0].authorization.as_ref(), Some(&auth));
+        assert_eq!(hist[0].snapshot["consensus_protocol"], "quorum:2/3");
+        assert_eq!(hist[1].version, 2);
+        assert!(hist[1].is_current);
+        assert!(hist[1].superseded_at.is_none());
+
+        // group_at pins a specific version.
+        let v1 = d
+            .group_at(Cohort::Family, &fam, 1)
+            .await
+            .unwrap()
+            .expect("v1 exists");
+        assert_eq!(v1.snapshot["consensus_protocol"], "quorum:2/3");
+        assert!(d.group_at(Cohort::Family, &fam, 9).await.unwrap().is_none());
+
+        // supersede on an unknown group is rejected.
+        let err = d
+            .supersede_family(
+                crate::federation::SignedFamily {
+                    family: types::Family {
+                        family_key_id: format!("g2-ghost-{s}"),
+                        family_name: "ghost".into(),
+                        members: vec![],
+                        founded_at: joined,
+                        consensus_protocol: "quorum:2/3".into(),
+                        consensus_protocol_entrenched: true,
+                        persist_row_hash: String::new(),
+                    },
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_invalid_argument");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn supersede_versioning_sqlite() {
+        let signer = crate::federation::tier_ingest::test_support::local_signer("g2");
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        supersede_versioning_body(&*sq, "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn supersede_versioning_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let label = format!("g2-{}", uuid::Uuid::new_v4().simple());
+        let signer = crate::federation::tier_ingest::test_support::local_signer(&label);
+        let engine = Engine::with_signer(signer, &dsn).await.expect("pg engine");
+        let pg = engine.postgres_backend().expect("pg backend").clone();
+        supersede_versioning_body(&*pg, &uuid::Uuid::new_v4().simple().to_string()).await;
+    }
+
     /// #249 — `file_moderation` stores a `moderation:{allegation}` scores
     /// row when the signer is a named moderator (community founder, as-self
     /// duty-holder). Proves the §11.10 EMIT path is feature-free (no
