@@ -879,6 +879,70 @@ pub mod orchestrate {
         Ok(result)
     }
 
+    /// #249 Cut G4 (§7) — forward-secrecy re-key on **community** member
+    /// REMOVAL: the symmetric of [`rekey_family_member_add`]. Records the
+    /// community membership revocation (forward-only; the active fold drops the
+    /// member), then **bumps the community DEK epoch** (CC 4.4.3.2.2) so the
+    /// next [`encrypt_and_cascade_community`](crate::federation::community_dek::encrypt_and_cascade_community)
+    /// mints a FRESH DEK wrapped only to the REMAINING members — the removed
+    /// member's keys can never unwrap content sealed after this point. Emits the
+    /// [`membership_removed_event`](crate::federation::hard_case::membership_removed_event)
+    /// (§9). Returns the new epoch.
+    ///
+    /// **Community-only by construction.** `self`/`family` use a *fresh-per-write*
+    /// DEK ([`CryptoTier::InvisibleEncrypted`](crate::federation::types::cohort_scope::CryptoTier)):
+    /// every write's wrap set is the active roster at write time, so a removed
+    /// member is excluded from all FUTURE writes **inherently** — there is no
+    /// shared epoch to bump (forward secrecy holds without a re-key). Only the
+    /// community tier shares one DEK per `(community, epoch)` and therefore must
+    /// rotate on removal.
+    pub async fn rekey_community_member_revoke<B>(
+        backend: &B,
+        community_key_id: &str,
+        removed_identity_key_id: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, BlobError>
+    where
+        B: FederationDirectory + BlobStorage + Sync,
+    {
+        use crate::federation::hard_case;
+        // 1. Record the removal (append-only; the roster-minus-effective-
+        //    revocations fold stops counting the member from `effective_at`).
+        backend
+            .put_community_membership_revocation(
+                crate::federation::types::SignedCommunityMembershipRevocation {
+                    community_membership_revocation:
+                        crate::federation::types::CommunityMembershipRevocation {
+                            community_key_id: community_key_id.to_string(),
+                            removed_identity_key_id: removed_identity_key_id.to_string(),
+                            removed_at: observed_at,
+                            effective_at: observed_at,
+                            reason: None,
+                            witness_set: Vec::new(),
+                            persist_row_hash: String::new(),
+                        },
+                },
+            )
+            .await
+            .map_err(map_dir_err)?;
+        // 2. Forward secrecy: bump the epoch. The next community cascade mints a
+        //    fresh DEK and wraps it only to the remaining members (the wrap
+        //    fan-out reads the active roster, which now excludes this member).
+        let new_epoch = backend.community_dek_bump_epoch(community_key_id).await?;
+        // 3. §9 — emit the membership-removed change event (consumers reconcile
+        //    via list_hard_case_events instead of polling).
+        backend
+            .record_hard_case(hard_case::membership_removed_event(
+                hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE,
+                community_key_id,
+                removed_identity_key_id,
+                observed_at,
+            ))
+            .await
+            .map_err(|e| BlobError::Backend(format!("emit membership_removed: {e}")))?;
+        Ok(new_epoch)
+    }
+
     /// The default-tier read: recover the plaintext blob body for a
     /// granted viewer. Persist unwraps the DEK (via its content-master
     /// self-retention grant), AES-GCM-decrypts, and returns the bytes.
