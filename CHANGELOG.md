@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.10.1] — 2026-06-22
+
+### Changed — re-pin CIRISVerify v6.11.0 → v6.12.0 (wheel concurrence)
+
+- All six git-tag verify crates flipped in lockstep; `version = "6"` unchanged. v6.12.0 makes `ciris-keyring`'s `pkcs11` (cryptoki) backend build on **all** targets (moved out of the Linux/Windows-only table; cross-validated on iOS + android; TPM stays hardware-gated) and bumps the transitive `quinn-proto` to 0.11.15 (clears RUSTSEC-2026-0185), plus a PKCS#11 provisioning runbook step (CIRISVerify#111). No change to persist's consumed APIs (`verify_hybrid` / `canonical` / `jcs` / `threshold` / `transparency` / `xchacha` / `hkdf` / `hmac` / `fedcode`) — persist does not enable a `ciris-keyring` hardware feature on its default build. Family-floor / wheel-concurrence re-pin only; no persist code change. Wheel `Requires-Dist` floor stays `>=6.0.0,<7`.
+
 ## [9.10.0] — 2026-06-21
 
 ### Added — #227: `list_held_fountain_content` (publisher-facing held enumerator)
