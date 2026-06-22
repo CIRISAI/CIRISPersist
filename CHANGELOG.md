@@ -5,6 +5,17 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.10.0] — 2026-06-21
+
+### Added — #227: `list_held_fountain_content` (publisher-facing held enumerator)
+
+A publisher can now enumerate the fountain-coded content persist holds **for them** and watch it fade — the #227 "fades but can't be falsified" property made observable without fetching symbol bytes.
+
+- **`Backend::list_held_fountain_content(publisher_key_id) -> Vec<FountainHeldMeta>`** (sqlite + postgres + memory): filters `content_manifest` to `pqc_key_id = publisher_key_id` (the manifest signer) and joins the **current** `COUNT(content_symbols)`. `FountainHeldMeta` carries the manifest essentials (`content_id`, `corpus_kind`, `pqc_key_id`, `original_content_length`, `n_source`, `k_repair`, `min_viable_symbols`, `symbol_size`, `admitted_at`) plus the **degradation state**: `held_symbols` (currently retained, post-eviction) and `recoverable` (`held_symbols >= min_viable_symbols` — is the content still decodable from what persist holds?). No symbol payload is read. Ordered by `admitted_at` desc.
+- **`Engine::list_held_fountain_content`** (pg/sqlite) + **FFI `list_held_fountain_content(publisher_key_id) -> JSON`** (mirrors the existing `*_fountain_content` surface).
+- Memory parity (`admitted_at` empty — the in-memory manifest map keeps no admission timestamp; the Engine/FFI fountain surface is pg/sqlite only).
+- **Tested** (sqlite + live Postgres, in `run_fountain_assertions`): full content lists with `held_symbols == n+k` + `recoverable`; after evicting to the lowest tier the publisher sees `held_symbols` drop (the fade) with `recoverable` tracking the count; an unknown publisher lists empty.
+
 ## [9.9.1] — 2026-06-21
 
 ### Changed — re-pin CIRISVerify v6.9.0 → v6.11.0 (wheel concurrence)

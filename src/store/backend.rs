@@ -416,6 +416,18 @@ pub trait Backend: Send + Sync {
         corpus_kind: &str,
     ) -> impl Future<Output = Result<Option<crate::fountain::FountainContent>, Error>> + Send;
 
+    /// #227 — list the fountain-coded content a **publisher** holds, as
+    /// [`FountainHeldMeta`](crate::fountain::FountainHeldMeta) (manifest
+    /// essentials + the current degradation state: `held_symbols` vs
+    /// `min_viable_symbols` ⇒ `recoverable`). Filtered to
+    /// `content_manifest.pqc_key_id = publisher_key_id` (the manifest signer);
+    /// no symbol bytes are read. Ordered by `admitted_at` descending. Empty
+    /// when the publisher holds nothing.
+    fn list_held_fountain_content(
+        &self,
+        publisher_key_id: &str,
+    ) -> impl Future<Output = Result<Vec<crate::fountain::FountainHeldMeta>, Error>> + Send;
+
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
     //
     // The forever-memory storage half of operator 2. persist is

@@ -8198,6 +8198,47 @@ impl PyEngine {
     ///  "symbols":[{...FountainSymbolV1...}, ...]}   # absent for envelope_only
     /// ```
     ///
+    /// #227 — list the fountain-coded content a **publisher** holds
+    /// (`pqc_key_id == publisher_key_id`). Returns a JSON array of
+    /// [`crate::fountain::FountainHeldMeta`] — manifest essentials + the
+    /// current degradation state (`held_symbols` vs `min_viable_symbols` ⇒
+    /// `recoverable`), no symbol bytes. The publisher's view of their content
+    /// fading (#227) without a fetch.
+    fn list_held_fountain_content(
+        &self,
+        py: Python<'_>,
+        publisher_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let publisher = publisher_key_id.to_owned();
+        let rows = catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::store::Backend;
+                            backend.list_held_fountain_content(&publisher).await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::store::Backend;
+                            backend.list_held_fountain_content(&publisher).await
+                        })
+                    }
+                }
+                .map_err(fountain_store_err_to_py)
+            })
+        })?;
+        serde_json::to_string(&rows).map_err(|e| {
+            PyValueError::new_err(format!("list_held_fountain_content serialize: {e}"))
+        })
+    }
+
     /// Each present symbol's SHA-256 is re-verified against the signed
     /// `symbol_hashes` on read; a mismatch raises a `ValueError`
     /// (`fountain_integrity`) rather than returning unauthenticated

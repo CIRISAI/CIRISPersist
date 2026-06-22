@@ -59,5 +59,6 @@ pub use retention::{
     holding_claim_counts, map_consent_state, resolve_retention_action, RetentionAction,
 };
 pub use types::{
-    FountainContent, FountainManifestV1, FountainReadClass, FountainSymbolV1, MANIFEST_VERSION_V1,
+    FountainContent, FountainHeldMeta, FountainManifestV1, FountainReadClass, FountainSymbolV1,
+    MANIFEST_VERSION_V1,
 };

@@ -1101,6 +1101,26 @@ impl Engine {
         }
     }
 
+    /// #227 — list the fountain-coded content a **publisher** holds (filtered
+    /// to `pqc_key_id = publisher_key_id`), as
+    /// [`FountainHeldMeta`](crate::fountain::FountainHeldMeta): the manifest
+    /// essentials + the current degradation state (`held_symbols` vs
+    /// `min_viable_symbols` ⇒ `recoverable`), so a publisher can watch their
+    /// content fade (#227) without fetching symbol bytes.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn list_held_fountain_content(
+        &self,
+        publisher_key_id: &str,
+    ) -> Result<Vec<crate::fountain::FountainHeldMeta>, crate::store::Error> {
+        use crate::store::Backend;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.list_held_fountain_content(publisher_key_id).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.list_held_fountain_content(publisher_key_id).await,
+        }
+    }
+
     /// v8.0.0 (CIRISPersist#227) — evict a content unit's symbols down to
     /// the given [`FountainTier`](crate::fountain::FountainTier) keep-
     /// count (highest `retention_priority` first). The manifest is never

@@ -983,6 +983,44 @@ impl Backend for MemoryBackend {
         Ok(Some(assemble_fountain_content(manifest, symbols)?))
     }
 
+    // #227 — publisher-facing held fountain-content enumerator. Memory parity
+    // for the pg/sqlite query; `admitted_at` is empty (the in-memory manifest
+    // map does not retain an admission timestamp — the Engine/FFI fountain
+    // surface is pg/sqlite only).
+    async fn list_held_fountain_content(
+        &self,
+        publisher_key_id: &str,
+    ) -> Result<Vec<crate::fountain::FountainHeldMeta>, Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out: Vec<crate::fountain::FountainHeldMeta> = state
+            .fountain_manifests
+            .iter()
+            .filter(|((_, _), m)| m.pqc_key_id == publisher_key_id)
+            .map(|((content_id, corpus_kind), m)| {
+                let held = state
+                    .fountain_symbols
+                    .get(content_id)
+                    .map(|b| b.len())
+                    .unwrap_or(0) as u32;
+                crate::fountain::FountainHeldMeta {
+                    content_id: content_id.clone(),
+                    corpus_kind: corpus_kind.clone(),
+                    pqc_key_id: m.pqc_key_id.clone(),
+                    original_content_length: m.original_content_length,
+                    n_source: m.n_source,
+                    k_repair: m.k_repair,
+                    min_viable_symbols: m.min_viable_symbols,
+                    symbol_size: m.symbol_size,
+                    held_symbols: held,
+                    recoverable: held >= m.min_viable_symbols,
+                    admitted_at: String::new(),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| b.content_id.cmp(&a.content_id));
+        Ok(out)
+    }
+
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
 
     async fn put_aggregated_tier(

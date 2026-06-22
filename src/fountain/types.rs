@@ -265,3 +265,40 @@ mod tests {
         assert_eq!(m.total_symbols(), 6);
     }
 }
+
+/// #227 — publisher-facing metadata for one HELD fountain-coded content item.
+///
+/// What a publisher gets from
+/// [`list_held_fountain_content`](crate::store::Backend::list_held_fountain_content):
+/// the manifest essentials + the **current degradation state**
+/// (`held_symbols` vs `min_viable_symbols` ⇒ `recoverable`), so a publisher can
+/// watch their content fade (#227 "fades but can't be falsified") without
+/// fetching any symbol bytes. No symbol payload is returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FountainHeldMeta {
+    /// The content's id (`content_manifest.content_id`).
+    pub content_id: String,
+    /// The corpus kind (`content_manifest.corpus_kind`).
+    pub corpus_kind: String,
+    /// The publisher's PQC key_id — the manifest signer
+    /// (`content_manifest.pqc_key_id`); the filter key.
+    pub pqc_key_id: String,
+    /// Decoded length of the original content.
+    pub original_content_length: u64,
+    /// Source-symbol count `n`.
+    pub n_source: u32,
+    /// Repair-symbol count `k`.
+    pub k_repair: u32,
+    /// Minimum symbols needed to reconstruct (`min_viable_symbols`).
+    pub min_viable_symbols: u32,
+    /// Per-symbol size (bytes).
+    pub symbol_size: u32,
+    /// Symbols CURRENTLY retained for this content (post-eviction /
+    /// degradation) — `COUNT(content_symbols)`.
+    pub held_symbols: u32,
+    /// `held_symbols >= min_viable_symbols` — is the content still decodable
+    /// from what persist currently holds?
+    pub recoverable: bool,
+    /// Admission timestamp (ISO-8601 UTC, as stored in `admitted_at`).
+    pub admitted_at: String,
+}
