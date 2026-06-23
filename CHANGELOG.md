@@ -5,6 +5,22 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.11.0] — 2026-06-23
+
+### Changed — re-pin CIRISVerify v6.13.0 → v7.2.0 (verify MAJOR)
+
+- All six git-tag verify crates flipped in lockstep; family floor `version = "6"` → `"7"`, and the wheel `Requires-Dist` floor `ciris-verify>=6.0.0,<7` → `>=7.0.0,<8` (the verify-MAJOR knob). The 7.x line is the **accord trio**: 7.0.0 hash-commits the ML-DSA-65 pubkey in the custody attestation (CIRISVerify#116), 7.1.0 bridges custody attestation → persist `attestation_evidence` (CIRISVerify#117), 7.2.0 bakes the HUMANITY_ACCORD genesis recognition root (CIRISVerify#107). The only consumed-surface delta is `ciris-keyring`'s new `PlatformAttestation::ExternalSecureElement` variant (see below); persist's other consumed APIs (`verify_hybrid` / `canonical` / `jcs` / `threshold` / `transparency` / `xchacha` / `hkdf` / `hmac` / `fedcode`) are unchanged.
+
+### Fixed — #268: admit FIPS YubiKey PIV (external secure element) accord holders
+
+The `accord_holder` hardware-attestation gate (`src/federation/hardware_attestation.rs`) could admit Android/iOS/TPM holders but **not** a FIPS YubiKey PIV token — the canonical HUMANITY_ACCORD holder custody (`portable_2fa`). So real YubiKey-backed accord holders 409'd at admission ("seat is not a registered, custody-verified accord_holder") and genesis entrenchment was blocked. verify 7.x adds the missing `ciris_keyring::PlatformAttestation::ExternalSecureElement(ExternalSecureElementAttestation)` variant (CIRISVerify#117); persist now consumes it:
+
+- **`platform_to_hardware_type`** maps `ExternalSecureElement(_)` → `HardwareType::ExternalSecureElement`.
+- **`required_field_gaps`** for the variant requires the leaf attestation cert (`attestation_cert_der` — a YubiKey's slot-9c attestation certificate), the chain above it (`attestation_chain_der`, leaf-first up to but excluding the pinned root), and the `hardware_class`. `fips_certified` / `touch_always` are bools (always present). Structural shape + nonce-freshness only — chain validation to the pinned Yubico root stays registry-side (consistent with the Android/TPM path; persist preserves the audit trail).
+- **`HardwareAttestationPolicy::default().accepted_hardware_types`** now includes `ExternalSecureElement` (12 of the 13 non-`SoftwareOnly` variants).
+- No FFI change: the variant flows through the existing `put_public_key` `attestation_evidence` JSON path via serde.
+- **Tested**: variant→hardware-type mapping; default policy accepts the variant; a full FIPS YubiKey 5.7.4 slot-9c attestation admits; missing cert/chain reports `AttestationEvidenceIncomplete` with `attestation_cert_der` / `attestation_chain_der` gaps.
+
 ## [9.10.2] — 2026-06-22
 
 ### Changed — re-pin CIRISVerify v6.12.0 → v6.13.0 (wheel concurrence)

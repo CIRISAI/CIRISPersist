@@ -44,7 +44,7 @@
 //! hardware-attested, period. Everything finer (which HSMs are
 //! production-grade, which require firmware vs discrete TPM, etc.) is
 //! the consumer's call. [`HardwareAttestationPolicy::default()`]'s
-//! accepted set drops `SoftwareOnly` and accepts the other 11 variants;
+//! accepted set drops `SoftwareOnly` and accepts the other 12 variants;
 //! deployments tighten further (e.g. AWS HSM-only) by overriding.
 
 use std::collections::HashSet;
@@ -76,7 +76,7 @@ pub const DEFAULT_MAX_NONCE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 ///
 /// # Default (FSD-002 §7.3)
 ///
-/// - `accepted_hardware_types`: all 11 non-`SoftwareOnly` variants.
+/// - `accepted_hardware_types`: all 12 non-`SoftwareOnly` variants.
 ///   The one structural floor Verify draws is
 ///   `SoftwareOnly.supports_professional_license() == false`; that
 ///   floor is operationally absorbed here.
@@ -96,7 +96,7 @@ pub struct HardwareAttestationPolicy {
 
 impl Default for HardwareAttestationPolicy {
     fn default() -> Self {
-        // All 12 variants minus SoftwareOnly. Listed explicitly so
+        // All 13 variants minus SoftwareOnly. Listed explicitly so
         // adding a future variant in ciris-keyring lights up a
         // compile error here (good — forces a policy decision).
         let accepted = [
@@ -111,6 +111,11 @@ impl Default for HardwareAttestationPolicy {
             HardwareType::AzureHsm,
             HardwareType::GcpCloudHsm,
             HardwareType::YubiHsm,
+            // CIRISPersist#268 (v9.11.0) — external secure element /
+            // FIPS YubiKey PIV token. The canonical HUMANITY_ACCORD holder
+            // custody (`portable_2fa`); without it real YubiKey-backed
+            // accord holders cannot be admitted and genesis entrenchment 409s.
+            HardwareType::ExternalSecureElement,
         ];
         Self {
             accepted_hardware_types: accepted.into_iter().collect(),
@@ -257,6 +262,7 @@ pub(crate) fn platform_to_hardware_type(att: &PlatformAttestation) -> HardwareTy
                 HardwareType::TpmFirmware
             }
         }
+        PlatformAttestation::ExternalSecureElement(_) => HardwareType::ExternalSecureElement,
         PlatformAttestation::Software(_) => HardwareType::SoftwareOnly,
     }
 }
@@ -323,6 +329,22 @@ pub(crate) fn required_field_gaps(att: &PlatformAttestation) -> Vec<String> {
                 }
             }
         }
+        PlatformAttestation::ExternalSecureElement(e) => {
+            // §9.4 external secure element (YubiKey PIV / smartcard). The
+            // load-bearing evidence is the leaf attestation cert (a YubiKey's
+            // slot-9c attestation certificate) plus the chain above it up to
+            // the pinned root. `hardware_class` names the §9.4 class.
+            // `fips_certified` / `touch_always` are bools — always present.
+            if e.hardware_class.is_empty() {
+                gaps.push("hardware_class".into());
+            }
+            if e.attestation_cert_der.is_empty() {
+                gaps.push("attestation_cert_der".into());
+            }
+            if e.attestation_chain_der.is_empty() {
+                gaps.push("attestation_chain_der".into());
+            }
+        }
         PlatformAttestation::Software(_) => {
             gaps.push("software_only_not_accepted".into());
         }
@@ -333,7 +355,9 @@ pub(crate) fn required_field_gaps(att: &PlatformAttestation) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ciris_keyring::{AndroidAttestation, IosAttestation, SoftwareAttestation};
+    use ciris_keyring::{
+        AndroidAttestation, ExternalSecureElementAttestation, IosAttestation, SoftwareAttestation,
+    };
 
     fn android_full() -> PlatformAttestation {
         PlatformAttestation::Android(AndroidAttestation {
@@ -405,14 +429,28 @@ mod tests {
         PlatformAttestation::Software(SoftwareAttestation::default())
     }
 
+    /// A fully-populated FIPS YubiKey PIV slot-9c attestation — the
+    /// canonical HUMANITY_ACCORD holder custody (CIRISPersist#268).
+    fn external_se_yubikey_full() -> PlatformAttestation {
+        PlatformAttestation::ExternalSecureElement(ExternalSecureElementAttestation {
+            hardware_class: "YubiKey_5_FIPS".into(),
+            attestation_cert_der: vec![0x30, 0x82, 0x01, 0x00], // slot-9c leaf
+            attestation_chain_der: vec![vec![0x30, 0x82, 0x02, 0x00]], // [f9, ..]
+            firmware: Some("5.7.4".into()),
+            serial: Some(12_345_678),
+            fips_certified: true,
+            touch_always: true,
+        })
+    }
+
     #[test]
     fn default_policy_drops_software_only() {
         let p = HardwareAttestationPolicy::default();
         assert!(!p
             .accepted_hardware_types
             .contains(&HardwareType::SoftwareOnly));
-        // 11 of the 12 variants accepted.
-        assert_eq!(p.accepted_hardware_types.len(), 11);
+        // 12 of the 13 variants accepted.
+        assert_eq!(p.accepted_hardware_types.len(), 12);
     }
 
     #[test]
@@ -544,6 +582,62 @@ mod tests {
         };
         let v = serde_json::to_value(&ev).unwrap();
         p.check("k1", Some(&v), Utc::now()).unwrap();
+    }
+
+    #[test]
+    fn platform_to_hardware_type_maps_external_se() {
+        assert_eq!(
+            platform_to_hardware_type(&external_se_yubikey_full()),
+            HardwareType::ExternalSecureElement
+        );
+    }
+
+    #[test]
+    fn default_policy_accepts_external_secure_element() {
+        // CIRISPersist#268 — the FIPS YubiKey PIV admission path must be
+        // open by default, else genesis entrenchment 409s.
+        let p = HardwareAttestationPolicy::default();
+        assert!(p
+            .accepted_hardware_types
+            .contains(&HardwareType::ExternalSecureElement));
+    }
+
+    #[test]
+    fn check_accepts_full_yubikey_piv() {
+        let p = HardwareAttestationPolicy::default();
+        let ev = AttestationEvidence {
+            platform_attestation: external_se_yubikey_full(),
+            nonce_captured_at: Utc::now(),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        p.check("k1", Some(&v), Utc::now()).unwrap();
+    }
+
+    #[test]
+    fn check_reports_missing_cert_and_chain_for_external_se() {
+        let p = HardwareAttestationPolicy::default();
+        let mut att = external_se_yubikey_full();
+        if let PlatformAttestation::ExternalSecureElement(ref mut e) = att {
+            e.attestation_cert_der.clear();
+            e.attestation_chain_der.clear();
+        }
+        let ev = AttestationEvidence {
+            platform_attestation: att,
+            nonce_captured_at: Utc::now(),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        let err = p.check("k1", Some(&v), Utc::now()).unwrap_err();
+        match err {
+            Error::AttestationEvidenceIncomplete {
+                hardware_type,
+                missing_fields,
+            } => {
+                assert_eq!(hardware_type, "ExternalSecureElement");
+                assert!(missing_fields.iter().any(|f| f == "attestation_cert_der"));
+                assert!(missing_fields.iter().any(|f| f == "attestation_chain_der"));
+            }
+            other => panic!("expected AttestationEvidenceIncomplete, got {other:?}"),
+        }
     }
 
     #[test]
