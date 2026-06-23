@@ -61,7 +61,7 @@ classifiers = [
 # pip resolution conflict. Floor is v6.0.0 to track the v6 family floor,
 # coherent with the Rust pin.
 dependencies = [
-    "ciris-verify>=6.0.0,<7",
+    "ciris-verify>=7.0.0,<8",
 ]
 dynamic = ["version"]
 
