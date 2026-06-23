@@ -125,7 +125,7 @@ pub(crate) mod serde_bytes_b64 {
 pub use admission::{
     check_cohort_scope, check_consensus_protocol_form, check_device_class,
     check_encryption_pubkeys, check_observed_region, AttestationLadderTransitionPolicy,
-    DimensionAdmissionPolicy, DimensionRejectionReason, ReservedPrefixRule,
+    DimensionAdmissionPolicy, DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule,
     ATTESTATION_LADDER_MECHANISMS,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
@@ -2774,6 +2774,58 @@ pub trait FederationDirectory: Send + Sync {
         }
         Ok(report)
     }
+
+    // ─── v10.0.0 — fountain holdings/eviction surface (CIRISPersist#270) ──
+    //
+    // Promoted from the concrete `Backend` trait onto the PUBLIC
+    // `FederationDirectory` so downstream consumers holding
+    // `Arc<dyn FederationDirectory>` (CIRISEdge#143 swarm runtime) can call
+    // the fountain store-and-evict half directly — collapsing the
+    // `FountainHoldingsSource` / `FountainTierEvict` / `FountainEvictHardDelete`
+    // adapter traits onto this one surface. Each mirrors the identically
+    // named [`crate::store::Backend`] method 1:1.
+
+    /// v10.0.0 (CIRISPersist#270) — list the fountain-coded content a
+    /// **publisher** holds, as [`FountainHeldMeta`](crate::fountain::FountainHeldMeta)
+    /// (manifest essentials + the current degradation state: `held_symbols`
+    /// vs `min_viable_symbols` ⇒ `recoverable`). Filtered to the manifest
+    /// signer (`content_manifest.pqc_key_id = publisher_key_id`); no symbol
+    /// bytes are read. Ordered by `admitted_at` descending. Empty when the
+    /// publisher holds nothing.
+    ///
+    /// Mirrors [`crate::store::Backend::list_held_fountain_content`].
+    async fn list_held_fountain_content(
+        &self,
+        publisher_key_id: &str,
+    ) -> Result<Vec<crate::fountain::FountainHeldMeta>, Error>;
+
+    /// v10.0.0 (CIRISPersist#270) — evict a content unit's symbols down to
+    /// the per-tier keep-count, dropping by `retention_priority DESC` within
+    /// the `content_id`. The manifest is NEVER touched. Returns the number
+    /// of symbol rows evicted. No-op (`Ok(0)`) when the content_id is unknown
+    /// or already at/below the keep-count.
+    ///
+    /// Mirrors [`crate::store::Backend::evict_fountain_content_to_tier`].
+    async fn evict_fountain_content_to_tier(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+        tier: crate::fountain::FountainTier,
+    ) -> Result<u64, Error>;
+
+    /// v10.0.0 (CIRISPersist#270) — **HardDelete** every symbol row for
+    /// `(content_id, corpus_kind)` unconditionally (the §8.1.11.3
+    /// deletion-SLA / revocation-dominates-rarity path), leaving the manifest
+    /// as the always-retained `EnvelopeOnly` provenance. Never consults
+    /// `retention_priority`. Returns the number of symbol rows dropped.
+    /// Unknown content ⇒ `Ok(0)` no-op.
+    ///
+    /// Mirrors [`crate::store::Backend::evict_fountain_content_hard_delete`].
+    async fn evict_fountain_content_hard_delete(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<u64, Error>;
 }
 
 /// Federation directory errors. Distinct from

@@ -1501,6 +1501,204 @@ pub async fn reachable_under_scope(
     .await
 }
 
+/// v10.0.0 (CIRISPersist#272) — the typed verdict returned by
+/// [`reachable_under_scope_with_reasons`]. Where
+/// [`reachable_under_scope`] collapses every "no" into `false`, this
+/// discriminates WHY, so a consumer (CIRISEdge's
+/// `verify_self_at_login_delegation`) can route a distinct forensic
+/// audit-trail entry per refusal reason instead of hand-rolling its own
+/// scope-discriminating walk.
+///
+/// `#[non_exhaustive]` — future walk refinements may add reasons (or
+/// attach payloads to the existing ones) without a further major bump.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReachabilityVerdict {
+    /// A `delegates_to` chain from the issuer reaches the target where
+    /// every edge carries `scope` (§11.10 attenuation/deputization
+    /// satisfied) and no edge on the path is withdrawn/recanted.
+    Reachable,
+    /// A scope-bearing `delegates_to` edge to the target exists, but its
+    /// granter has `withdraws`/`recants`-retracted it (UCAN-style edge
+    /// retraction). Named for the depth-1 login case where the issuer
+    /// (root) retracts its own edge to the target.
+    RetractedAtRoot,
+    /// A `delegates_to` edge to the target exists but does NOT grant the
+    /// required `scope`.
+    MissingScope,
+    /// The issuer emitted delegation edges, but none — after the scope,
+    /// retraction, ⊆-attenuation, deputization, and depth gates — reach
+    /// the target. The target was never established as a scoped delegate.
+    SignerUnreached,
+    /// A substrate read failed mid-walk. Unlike [`reachable_under_scope`]
+    /// (which propagates substrate failures as `Err`), the with-reasons
+    /// walk classifies them so the consumer's `match` over the verdict
+    /// stays total and can emit an "unavailable" audit entry. This is the
+    /// one contract difference between the two walks.
+    SubstrateUnavailable,
+    /// The issuer emitted no `delegates_to` edges at all — there is no
+    /// trust root to seed the walk from.
+    NoTrustRoots,
+}
+
+/// v10.0.0 (CIRISPersist#272) — the **refusal-reason** companion of
+/// [`reachable_under_scope`]. Runs the identical §11.10
+/// [`MODERATION_DUTY`] scope-bearing `delegates_to` walk (⊆-parent
+/// attenuation + `sub_delegation`-gated deputization past depth 1 +
+/// per-edge `withdraws`/`recants` skipping + depth cap), but returns a
+/// typed [`ReachabilityVerdict`] instead of `bool`.
+///
+/// # Refusal precedence (when not [`Reachable`](ReachabilityVerdict::Reachable))
+///
+/// The walk records, across every edge-to-target it encounters, whether
+/// that edge was *scope-bearing-but-retracted* or *present-but-unscoped*,
+/// plus whether the issuer emitted any delegation at all. On a "no" it
+/// returns the most specific signal, in order:
+///
+/// 1. [`RetractedAtRoot`](ReachabilityVerdict::RetractedAtRoot) — a
+///    scope-bearing edge to the target was explicitly retracted.
+/// 2. [`MissingScope`](ReachabilityVerdict::MissingScope) — an edge to
+///    the target exists but does not carry `scope`.
+/// 3. [`NoTrustRoots`](ReachabilityVerdict::NoTrustRoots) — the issuer
+///    emitted no delegation edges whatsoever.
+/// 4. [`SignerUnreached`](ReachabilityVerdict::SignerUnreached) — edges
+///    exist but no scoped path reaches the target.
+///
+/// A substrate read failure short-circuits to
+/// [`SubstrateUnavailable`](ReachabilityVerdict::SubstrateUnavailable).
+///
+/// The reachability decision is byte-identical to
+/// [`reachable_under_scope`]: this returns
+/// [`Reachable`](ReachabilityVerdict::Reachable) in exactly the cases the
+/// `bool` form returns `true`. Only the classification of the "no" is new.
+///
+/// [`MODERATION_DUTY`]: DelegationWalkPolicy::MODERATION_DUTY
+pub async fn reachable_under_scope_with_reasons(
+    directory: &dyn super::FederationDirectory,
+    issuer_key_id: &str,
+    target_key_id: &str,
+    scope: &str,
+    max_depth: usize,
+) -> Result<ReachabilityVerdict, Error> {
+    use std::collections::{HashSet, VecDeque};
+    let policy = DelegationWalkPolicy::MODERATION_DUTY;
+    let effective_depth = max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH);
+    if effective_depth == 0 {
+        return Ok(ReachabilityVerdict::SignerUnreached);
+    }
+    // Same per-node walk state as the predicate walk; see
+    // `issuer_reaches_target_via_scoped_delegation`.
+    struct Node {
+        key: String,
+        depth: usize,
+        parent_scope: Option<HashSet<String>>,
+        parent_sub_delegation: bool,
+    }
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<Node> = VecDeque::new();
+    queue.push_back(Node {
+        key: issuer_key_id.to_owned(),
+        depth: 0,
+        parent_scope: None,
+        parent_sub_delegation: false,
+    });
+    visited.insert(issuer_key_id.to_owned());
+
+    // Observations that classify a "no" — see the precedence in the
+    // doc comment. None of these influence the reachability decision
+    // itself (that stays identical to the predicate walk).
+    let mut issuer_emitted_delegation = false;
+    let mut saw_target_edge_retracted = false;
+    let mut saw_target_edge_missing_scope = false;
+
+    while let Some(node) = queue.pop_front() {
+        if node.depth >= effective_depth {
+            continue;
+        }
+        if policy.enforce_attenuation_and_sub_delegation
+            && node.parent_scope.is_some()
+            && !node.parent_sub_delegation
+        {
+            continue;
+        }
+        let rows = match directory.list_attestations_by(&node.key).await {
+            Ok(rows) => rows,
+            Err(_) => return Ok(ReachabilityVerdict::SubstrateUnavailable),
+        };
+        let mut retracted: HashSet<String> = HashSet::new();
+        if policy.skip_withdrawn_edges {
+            for r in &rows {
+                if r.attestation_type == attestation_type::WITHDRAWS
+                    || r.attestation_type == attestation_type::RECANTS
+                {
+                    retracted.insert(r.attested_key_id.clone());
+                }
+            }
+        }
+        let is_issuer = node.depth == 0;
+        for r in rows {
+            if r.attestation_type != attestation_type::DELEGATES_TO {
+                continue;
+            }
+            if is_issuer {
+                issuer_emitted_delegation = true;
+            }
+            let to_target = r.attested_key_id == target_key_id;
+            // Scope gate (checked first, mirroring the predicate walk).
+            if !delegation_scope_grants(&r.attestation_envelope, scope) {
+                if to_target {
+                    saw_target_edge_missing_scope = true;
+                }
+                continue;
+            }
+            // Retraction gate.
+            if policy.skip_withdrawn_edges && retracted.contains(&r.attested_key_id) {
+                if to_target {
+                    saw_target_edge_retracted = true;
+                }
+                continue;
+            }
+            // ⊆-parent attenuation gate. A pruned edge here is neither a
+            // clean missing-scope nor a retraction — the duty just cannot
+            // validly flow down this path; it contributes only to a
+            // SignerUnreached "no".
+            if policy.enforce_attenuation_and_sub_delegation {
+                if let Some(parent_scope) = &node.parent_scope {
+                    let child_scope = delegation_scope_set(&r.attestation_envelope);
+                    if !child_scope.is_subset(parent_scope) {
+                        continue;
+                    }
+                }
+            }
+            if to_target {
+                return Ok(ReachabilityVerdict::Reachable);
+            }
+            if !visited.contains(&r.attested_key_id) && node.depth + 1 < effective_depth {
+                visited.insert(r.attested_key_id.clone());
+                queue.push_back(Node {
+                    key: r.attested_key_id,
+                    depth: node.depth + 1,
+                    parent_scope: Some(delegation_scope_set(&r.attestation_envelope)),
+                    parent_sub_delegation: delegation_grants_sub_delegation(
+                        &r.attestation_envelope,
+                    ),
+                });
+            }
+        }
+    }
+
+    if saw_target_edge_retracted {
+        return Ok(ReachabilityVerdict::RetractedAtRoot);
+    }
+    if saw_target_edge_missing_scope {
+        return Ok(ReachabilityVerdict::MissingScope);
+    }
+    if !issuer_emitted_delegation {
+        return Ok(ReachabilityVerdict::NoTrustRoots);
+    }
+    Ok(ReachabilityVerdict::SignerUnreached)
+}
+
 /// #249 Cut B — the **enumeration** companion of
 /// [`issuer_reaches_target_via_scoped_delegation`]. Where the predicate
 /// answers "does `issuer` reach SOME target?", this collects EVERY key
