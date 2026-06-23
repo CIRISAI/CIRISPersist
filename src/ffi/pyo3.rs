@@ -6869,6 +6869,151 @@ impl PyEngine {
         })
     }
 
+    /// v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243; FFI #271) — admit
+    /// one caller-pre-encrypted (XChaCha20-Poly1305) RaptorQ symbol into
+    /// the scope-blob store, addressed by `(record_id, symbol_index)`.
+    ///
+    /// Persist NEVER encrypts/decrypts; it stores the opaque seal
+    /// components verbatim. Mirrors
+    /// [`BlobStorage::put_scope_blob`](crate::federation::BlobStorage::put_scope_blob)
+    /// — see that method for the first-write-wins idempotency contract
+    /// (re-put of an existing `(record_id, symbol_index)` is a no-op) and
+    /// the opaque-holder property (only the DEK *epoch* is persisted).
+    ///
+    /// Parameters (all byte params are `bytes`):
+    /// - `record_id` — the FSD §2.4 HMAC-SHA3-256 output (32 bytes).
+    /// - `symbol_index` — `0..N` symbol index within the record.
+    /// - `nonce` — XChaCha20-Poly1305 nonce (24 bytes).
+    /// - `ciphertext` — the pre-encrypted symbol bytes (opaque).
+    /// - `tag` — Poly1305 tag (16 bytes).
+    /// - `group_dek_ref_json` — JSON object
+    ///   `{"community_key_id": str, "epoch": int}` tying the symbol to the
+    ///   community DEK epoch it was sealed under (a
+    ///   [`GroupDekRef`](crate::federation::GroupDekRef)).
+    #[allow(clippy::too_many_arguments)]
+    fn put_scope_blob(
+        &self,
+        py: Python<'_>,
+        record_id: &Bound<'_, PyBytes>,
+        symbol_index: u16,
+        nonce: &Bound<'_, PyBytes>,
+        ciphertext: &Bound<'_, PyBytes>,
+        tag: &Bound<'_, PyBytes>,
+        group_dek_ref_json: &str,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let record_id = parse_fixed_bytes::<32>(record_id, "record_id")?;
+            let nonce = parse_fixed_bytes::<24>(nonce, "nonce")?;
+            let tag = parse_fixed_bytes::<16>(tag, "tag")?;
+            let ciphertext = ciphertext.as_bytes().to_vec();
+            let group_dek_ref: crate::federation::GroupDekRef =
+                serde_json::from_str(group_dek_ref_json).map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "group_dek_ref must be JSON {{\"community_key_id\": str, \
+                         \"epoch\": int}}: {e}"
+                    ))
+                })?;
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_scope_blob(
+                                record_id,
+                                symbol_index,
+                                nonce,
+                                ciphertext,
+                                tag,
+                                group_dek_ref,
+                            )
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .put_scope_blob(
+                                record_id,
+                                symbol_index,
+                                nonce,
+                                ciphertext,
+                                tag,
+                                group_dek_ref,
+                            )
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
+    /// v9.1.0 (FSD §2.4, CIRISPersist#243; FFI #271) — read one scope-blob
+    /// symbol back by `(record_id, symbol_index)`. Returns `None` if
+    /// absent; otherwise a `(nonce, ciphertext, tag)` tuple of `bytes`.
+    ///
+    /// Bumps the row's `last_accessed_at` (the LRU signal the capacity
+    /// sweeper consumes). The bytes round-trip exactly what
+    /// [`put_scope_blob`](Self::put_scope_blob) admitted — persist never
+    /// decrypts. Mirrors
+    /// [`BlobStorage::get_scope_blob`](crate::federation::BlobStorage::get_scope_blob).
+    fn get_scope_blob<'py>(
+        &self,
+        py: Python<'py>,
+        record_id: &Bound<'py, PyBytes>,
+        symbol_index: u16,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let record_id = parse_fixed_bytes::<32>(record_id, "record_id")?;
+            let sym_opt = py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .get_scope_blob(record_id, symbol_index)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::BlobStorage;
+                        backend
+                            .get_scope_blob(record_id, symbol_index)
+                            .await
+                            .map_err(blob_err_to_py)
+                    })
+                }
+            })?;
+            match sym_opt {
+                None => Ok(None),
+                Some(sym) => {
+                    let tuple = pyo3::types::PyTuple::new(
+                        py,
+                        [
+                            PyBytes::new(py, &sym.nonce).into_any(),
+                            PyBytes::new(py, &sym.ciphertext).into_any(),
+                            PyBytes::new(py, &sym.tag).into_any(),
+                        ],
+                    )?;
+                    Ok(Some(tuple.into_any().unbind()))
+                }
+            }
+        })
+    }
+
     /// Federation blob storage: existence check by SHA-256 (hex).
     fn has_blob_json(&self, py: Python<'_>, sha256_hex: &str) -> PyResult<bool> {
         self.ensure_usable()?;
@@ -16095,6 +16240,74 @@ impl PyEngine {
         })
     }
 
+    /// v10.0.0 (CIRISPersist#272) — the refusal-reason companion of
+    /// [`reachable_under_scope`](Self::reachable_under_scope). Same
+    /// scope-bearing `delegates_to` walk, but returns a stable
+    /// snake_case verdict token instead of a bool so a Python consumer
+    /// can route a distinct audit entry per refusal reason. Tokens:
+    /// `"reachable"`, `"retracted_at_root"`, `"missing_scope"`,
+    /// `"signer_unreached"`, `"substrate_unavailable"`, `"no_trust_roots"`.
+    fn reachable_under_scope_with_reasons(
+        &self,
+        py: Python<'_>,
+        issuer_key_id: &str,
+        target_key_id: &str,
+        scope: &str,
+        max_depth: usize,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let issuer_key_id = issuer_key_id.to_owned();
+            let target_key_id = target_key_id.to_owned();
+            let scope = scope.to_owned();
+            let verdict = py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::admission::reachable_under_scope_with_reasons(
+                            &*backend,
+                            &issuer_key_id,
+                            &target_key_id,
+                            &scope,
+                            max_depth,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::admission::reachable_under_scope_with_reasons(
+                            &*backend,
+                            &issuer_key_id,
+                            &target_key_id,
+                            &scope,
+                            max_depth,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+            })?;
+            // Same-crate match on the `#[non_exhaustive]` enum is exhaustive
+            // (the attribute only forces a wildcard in downstream crates).
+            let token = match verdict {
+                crate::federation::ReachabilityVerdict::Reachable => "reachable",
+                crate::federation::ReachabilityVerdict::RetractedAtRoot => "retracted_at_root",
+                crate::federation::ReachabilityVerdict::MissingScope => "missing_scope",
+                crate::federation::ReachabilityVerdict::SignerUnreached => "signer_unreached",
+                crate::federation::ReachabilityVerdict::SubstrateUnavailable => {
+                    "substrate_unavailable"
+                }
+                crate::federation::ReachabilityVerdict::NoTrustRoots => "no_trust_roots",
+            };
+            Ok(token.to_owned())
+        })
+    }
+
     /// #249 Cut B — the inbound `delegates_to` edges naming `key_id` as
     /// recipient ("who delegated TO me?" — the reverse of
     /// `delegates_to_graph`). Returns a JSON array of
@@ -22917,6 +23130,23 @@ fn parse_sha256_hex(hex_str: &str) -> PyResult<[u8; 32]> {
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(&v);
+    Ok(out)
+}
+
+/// v9.1.0 (CIRISPersist#271) — extract a Python `bytes` of an exact
+/// fixed length into `[u8; N]`, raising a typed `ValueError` on a
+/// length mismatch. Used by the scope-blob FFI (`record_id` = 32,
+/// `nonce` = 24, `tag` = 16).
+fn parse_fixed_bytes<const N: usize>(b: &Bound<'_, PyBytes>, field: &str) -> PyResult<[u8; N]> {
+    let v = b.as_bytes();
+    if v.len() != N {
+        return Err(PyValueError::new_err(format!(
+            "{field} must be exactly {N} bytes, got {}",
+            v.len()
+        )));
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(v);
     Ok(out)
 }
 

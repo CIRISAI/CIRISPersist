@@ -3026,6 +3026,72 @@ impl Engine {
         }
     }
 
+    /// v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) — Engine-facade for
+    /// [`BlobStorage::put_scope_blob`](crate::federation::BlobStorage::put_scope_blob):
+    /// admit one caller-pre-encrypted (XChaCha20-Poly1305) RaptorQ symbol
+    /// addressed by `(record_id, symbol_index)`. Persist never
+    /// encrypts/decrypts; it stores opaque ciphertext only. See the trait
+    /// method's doc for the first-write-wins idempotency contract and the
+    /// opaque-holder property.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_scope_blob(
+        &self,
+        record_id: [u8; 32],
+        symbol_index: u16,
+        nonce: [u8; 24],
+        ciphertext: Vec<u8>,
+        tag: [u8; 16],
+        group_dek_ref: crate::federation::GroupDekRef,
+    ) -> Result<(), crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => {
+                arc.put_scope_blob(
+                    record_id,
+                    symbol_index,
+                    nonce,
+                    ciphertext,
+                    tag,
+                    group_dek_ref,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => {
+                arc.put_scope_blob(
+                    record_id,
+                    symbol_index,
+                    nonce,
+                    ciphertext,
+                    tag,
+                    group_dek_ref,
+                )
+                .await
+            }
+        }
+    }
+
+    /// v9.1.0 (FSD §2.4, CIRISPersist#243) — Engine-facade for
+    /// [`BlobStorage::get_scope_blob`](crate::federation::BlobStorage::get_scope_blob):
+    /// read one scope-blob symbol back by `(record_id, symbol_index)`, or
+    /// `None` if absent. Bumps the row's `last_accessed_at` (the LRU
+    /// signal). Bytes round-trip exactly what `put_scope_blob` admitted.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn get_scope_blob(
+        &self,
+        record_id: [u8; 32],
+        symbol_index: u16,
+    ) -> Result<Option<crate::federation::ScopeBlobSymbol>, crate::federation::BlobError> {
+        use crate::federation::BlobStorage;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(arc) => arc.get_scope_blob(record_id, symbol_index).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(arc) => arc.get_scope_blob(record_id, symbol_index).await,
+        }
+    }
+
     /// v1.11.0 (CIRISPersist#90) — borrow a per-backend
     /// [`NodeCoreService`](crate::cirisnode::NodeCoreService) handle
     /// wrapping the Engine's underlying backend Arc.
@@ -3215,6 +3281,31 @@ impl Engine {
         max_depth: usize,
     ) -> Result<bool, crate::federation::Error> {
         crate::federation::admission::reachable_under_scope(
+            self.federation_directory().as_ref(),
+            issuer_key_id,
+            target_key_id,
+            scope,
+            max_depth,
+        )
+        .await
+    }
+
+    /// v10.0.0 (CIRISPersist#272) — the refusal-reason companion of
+    /// [`reachable_under_scope`](Self::reachable_under_scope): the same
+    /// scope-bearing `delegates_to` walk, returning a typed
+    /// [`ReachabilityVerdict`](crate::federation::ReachabilityVerdict) so
+    /// callers route a distinct forensic audit-trail entry per refusal
+    /// reason. See
+    /// [`admission::reachable_under_scope_with_reasons`](crate::federation::admission::reachable_under_scope_with_reasons).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn reachable_under_scope_with_reasons(
+        &self,
+        issuer_key_id: &str,
+        target_key_id: &str,
+        scope: &str,
+        max_depth: usize,
+    ) -> Result<crate::federation::ReachabilityVerdict, crate::federation::Error> {
+        crate::federation::admission::reachable_under_scope_with_reasons(
             self.federation_directory().as_ref(),
             issuer_key_id,
             target_key_id,

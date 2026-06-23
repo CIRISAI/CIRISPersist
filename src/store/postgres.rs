@@ -5854,6 +5854,51 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         meta.persist_row_hash = persist_row_hash;
         Ok(Some(meta))
     }
+
+    // ─── v10.0.0 — fountain holdings/eviction surface (CIRISPersist#270) ──
+    // Delegate to the inherent `Backend` methods of the SAME NAME via
+    // fully-qualified syntax (a bare `self.<name>` would re-dispatch to
+    // this trait method ⇒ infinite recursion), then map `store::Error`
+    // onto `federation::Error::Backend`.
+
+    async fn list_held_fountain_content(
+        &self,
+        publisher_key_id: &str,
+    ) -> Result<Vec<crate::fountain::FountainHeldMeta>, crate::federation::Error> {
+        <Self as crate::store::Backend>::list_held_fountain_content(self, publisher_key_id)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
+    async fn evict_fountain_content_to_tier(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+        tier: crate::fountain::FountainTier,
+    ) -> Result<u64, crate::federation::Error> {
+        <Self as crate::store::Backend>::evict_fountain_content_to_tier(
+            self,
+            content_id,
+            corpus_kind,
+            tier,
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
+    async fn evict_fountain_content_hard_delete(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<u64, crate::federation::Error> {
+        <Self as crate::store::Backend>::evict_fountain_content_hard_delete(
+            self,
+            content_id,
+            corpus_kind,
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
 }
 
 // ─── Peer-metadata update helpers (v3.1.0, CIRISPersist#117) ───────

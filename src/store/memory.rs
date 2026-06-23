@@ -3209,6 +3209,51 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .filter(|r| r.removed_at.is_none())
             .cloned())
     }
+
+    // ─── v10.0.0 — fountain holdings/eviction surface (CIRISPersist#270) ──
+    // Delegate to the inherent `Backend` methods of the SAME NAME via
+    // fully-qualified syntax (a bare `self.<name>` would re-dispatch to
+    // this trait method ⇒ infinite recursion), then map `store::Error`
+    // onto `federation::Error::Backend`.
+
+    async fn list_held_fountain_content(
+        &self,
+        publisher_key_id: &str,
+    ) -> Result<Vec<crate::fountain::FountainHeldMeta>, crate::federation::Error> {
+        <Self as crate::store::Backend>::list_held_fountain_content(self, publisher_key_id)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
+    async fn evict_fountain_content_to_tier(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+        tier: crate::fountain::FountainTier,
+    ) -> Result<u64, crate::federation::Error> {
+        <Self as crate::store::Backend>::evict_fountain_content_to_tier(
+            self,
+            content_id,
+            corpus_kind,
+            tier,
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
+
+    async fn evict_fountain_content_hard_delete(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<u64, crate::federation::Error> {
+        <Self as crate::store::Backend>::evict_fountain_content_hard_delete(
+            self,
+            content_id,
+            corpus_kind,
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(e.to_string()))
+    }
 }
 
 // ─── BlackholeRules impl (v3.2.0, CIRISPersist#120) ────────────────
@@ -8450,6 +8495,106 @@ mod tests {
         )
         .await
         .unwrap());
+    }
+
+    /// reachable_under_scope_with_reasons (#272): the refusal-reason
+    /// companion classifies each "no" — Reachable / MissingScope /
+    /// RetractedAtRoot / SignerUnreached / NoTrustRoots — and stays
+    /// byte-identical to the bool walk on the Reachable case. Distinct
+    /// key pairs isolate the scenarios in one backend.
+    #[tokio::test]
+    async fn reachable_under_scope_with_reasons_classifies_refusals() {
+        use crate::federation::admission::{
+            reachable_under_scope, reachable_under_scope_with_reasons, ReachabilityVerdict,
+            DELEGATION_SCOPE_MODERATE, DELEGATION_SCOPE_REVIEW, MAX_MODERATION_DELEGATION_DEPTH,
+        };
+        let backend = MemoryBackend::new();
+        for k in [
+            "ar-root", "ar-tgt", "br-root", "br-tgt", "cr-root", "cr-mid", "cr-tgt", "dr-iso",
+            "dr-tgt",
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        // A scope-bearing (`moderate`) delegation edge.
+        let delegate = |id: &str, granter: &str, grantee: &str| {
+            let mut d = fix_attestation(id, granter, grantee, granter);
+            d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+            d.attestation_envelope = serde_json::json!({
+                "references_attestation_id": id,
+                "scope": [DELEGATION_SCOPE_MODERATE],
+                "sub_delegation": true,
+            });
+            resign_fix(&mut d);
+            d
+        };
+        // A `withdraws` keyed on the recipient (the scoped walk's edge-
+        // retraction model — `attested_key_id == recipient`).
+        let withdraw_edge = |id: &str, granter: &str, recipient: &str| {
+            let mut w = fix_attestation(id, granter, recipient, granter);
+            w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+            resign_fix(&mut w);
+            w
+        };
+        for a in [
+            delegate("ar-d", "ar-root", "ar-tgt"), // Reachable / MissingScope pair
+            delegate("br-d", "br-root", "br-tgt"), // RetractedAtRoot pair
+            withdraw_edge("br-w", "br-root", "br-tgt"), // … retracted
+            delegate("cr-d", "cr-root", "cr-mid"), // SignerUnreached: edge, but not to tgt
+        ] {
+            backend
+                .put_attestation(SignedAttestation { attestation: a })
+                .await
+                .unwrap();
+        }
+        let depth = MAX_MODERATION_DELEGATION_DEPTH;
+        let verdict = |issuer: &'static str, tgt: &'static str, scope: &'static str| {
+            let b = &backend;
+            async move {
+                reachable_under_scope_with_reasons(b, issuer, tgt, scope, depth)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Reachable — and consistent with the bool walk.
+        assert_eq!(
+            verdict("ar-root", "ar-tgt", DELEGATION_SCOPE_MODERATE).await,
+            ReachabilityVerdict::Reachable
+        );
+        assert!(reachable_under_scope(
+            &backend,
+            "ar-root",
+            "ar-tgt",
+            DELEGATION_SCOPE_MODERATE,
+            depth
+        )
+        .await
+        .unwrap());
+        // MissingScope — edge to target exists but does not carry `review`.
+        assert_eq!(
+            verdict("ar-root", "ar-tgt", DELEGATION_SCOPE_REVIEW).await,
+            ReachabilityVerdict::MissingScope
+        );
+        // RetractedAtRoot — scope-bearing edge to target, but withdrawn.
+        assert_eq!(
+            verdict("br-root", "br-tgt", DELEGATION_SCOPE_MODERATE).await,
+            ReachabilityVerdict::RetractedAtRoot
+        );
+        // SignerUnreached — issuer delegates, but no path reaches the target.
+        assert_eq!(
+            verdict("cr-root", "cr-tgt", DELEGATION_SCOPE_MODERATE).await,
+            ReachabilityVerdict::SignerUnreached
+        );
+        // NoTrustRoots — issuer emitted no delegation edges at all.
+        assert_eq!(
+            verdict("dr-iso", "dr-tgt", DELEGATION_SCOPE_MODERATE).await,
+            ReachabilityVerdict::NoTrustRoots
+        );
     }
 
     /// delegations_to: K with 2 inbound `delegates_to` → returns both;

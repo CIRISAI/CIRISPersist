@@ -5,6 +5,66 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.0.0] — 2026-06-23
+
+The **public-surface-completion** major: four downstream consumers
+(CIRISEdge swarm/login, CIRISConformance §9 forensic suite, CIRISServer
+SCOPE_PRIVACY) were each reaching around the canonical persist surface —
+adapter traits, hand-rolled walks, raw-SQLite inspection, a verify-core
+layering inversion. This cut collapses all four onto persist's own
+interface. The one BREAKING change is the `FederationDirectory` trait
+gaining required methods (#270); everything else is additive.
+
+### Changed (BREAKING) — #270: fountain methods promoted to the public `FederationDirectory` trait
+
+`list_held_fountain_content`, `evict_fountain_content_to_tier`, and
+`evict_fountain_content_hard_delete` are now **required methods on the
+public `FederationDirectory` trait** (previously only on the concrete
+`Engine` / the `Backend` trait). CIRISEdge's `FountainSwarmRuntime` can
+now be constructed against `Arc<dyn FederationDirectory>` alone, dropping
+its `FountainHoldingsSource` / `FountainTierEvict` / `FountainEvictHardDelete`
+adapter traits (CIRISEdge#143), the same shape as `ReplicationRuntime`.
+
+- **BREAKING**: any external `impl FederationDirectory` must add the three
+  methods. All three in-tree backends (memory/sqlite/postgres) implement
+  them by delegating to the existing `Backend` methods
+  (`<Self as Backend>::…`, recursion-safe), bridging `store::Error` →
+  `federation::Error::Backend`. No feature gating needed (the fountain
+  module is unconditional).
+
+### Added — #271: `put_scope_blob` / `get_scope_blob` Python FFI
+
+PyO3 bindings for the v9.2.0 scope-blob surface so CIRISConformance's
+`test_410_scope_privacy_forensic.py` can verify cold-state opacity through
+the wheel (in addition to its raw-SQLite check), and CIRISServer#38 can
+publish/retrieve scope blobs from Python.
+
+- New `PyEngine.put_scope_blob(record_id: bytes, symbol_index: int, nonce: bytes, ciphertext: bytes, tag: bytes, group_dek_ref_json: str)` and `get_scope_blob(record_id, symbol_index) -> Optional[(nonce, ciphertext, tag)]`, plus thin `Engine` wrappers (dispatch via `BlobStorage`, cfg-gated). `group_dek_ref` is a **JSON string** (`{"community_key_id","epoch"}`), not a dict — matching every other structured-input FFI method (the crate has no `pythonize` dep). The 3-tuple intentionally omits `group_dek_epoch` (opaque-holder property).
+
+### Added — #272: `reachable_under_scope_with_reasons` (typed refusal verdict)
+
+The refusal-reason companion of `reachable_under_scope`. Same §11.10
+scope-bearing `delegates_to` walk, but returns a typed
+`ReachabilityVerdict` (`Reachable` | `RetractedAtRoot` | `MissingScope` |
+`SignerUnreached` | `SubstrateUnavailable` | `NoTrustRoots`) instead of
+collapsing every "no" into `false`. CIRISEdge's
+`verify_self_at_login_delegation` can now drop its hand-rolled
+scope-discriminating walk (the last graph-DX adoption gap, CIRISEdge#179)
+and route a distinct forensic audit entry per reason.
+
+- `admission::reachable_under_scope_with_reasons` (free fn, same arg shape as the bool walk) + `Engine::reachable_under_scope_with_reasons` + FFI returning a stable snake_case token. `ReachabilityVerdict` is `#[non_exhaustive]` and re-exported at `crate::federation`. The reachability decision is byte-identical to the bool walk — only the classification of the "no" is new. Substrate read failures classify as `SubstrateUnavailable` (not `Err`) so the consumer's `match` stays total — the one contract difference from the bool walk.
+- **Tested**: all five verdicts discriminated on a MemoryBackend fixture, with a parity assertion that `Reachable` ⟺ the bool walk's `true`.
+
+### Added — #273: `ceg_produce_canonicalize` exported through `prelude`
+
+The produce-side source-of-truth canonicalizer (`verify::canonical`) is
+now re-exported through `crate::verify` and `crate::prelude`, so downstream
+consumers (CIRISEdge v6.3.2 fixture-sig helpers, CIRISConformance's
+cross-impl `record_id` test) canonicalize signing payloads through the
+persist boundary instead of calling `ciris_verify_core::jcs` directly — the
+layering inversion is removed; persist stays the single owner of the
+produce-canon-version flip.
+
 ## [9.11.0] — 2026-06-23
 
 ### Changed — re-pin CIRISVerify v6.13.0 → v7.2.0 (verify MAJOR)

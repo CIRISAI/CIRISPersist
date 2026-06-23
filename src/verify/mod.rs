@@ -16,7 +16,8 @@ pub mod ed25519;
 pub mod hybrid;
 
 pub use canonical::{
-    body_sha256, canonicalize_envelope_for_signing, Canonicalizer, PythonJsonDumpsCanonicalizer,
+    body_sha256, canonicalize_envelope_for_signing, ceg_produce_canonicalize, Canonicalizer,
+    PythonJsonDumpsCanonicalizer,
 };
 pub use canonical_validation::{
     validate_canonical_datetime, validate_canonical_hex, validate_envelope_canonical_form,
