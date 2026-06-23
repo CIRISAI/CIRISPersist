@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [9.10.2] — 2026-06-22
+
+### Changed — re-pin CIRISVerify v6.12.0 → v6.13.0 (wheel concurrence)
+
+- All six git-tag verify crates flipped in lockstep; `version = "6"` unchanged. v6.13.0 fixes the real-hardware YubiKey PKCS#11 provisioning blockers (CIRISVerify#112 / #113) — accord/hardware-path only, no change to persist's consumed APIs (`verify_hybrid` / `canonical` / `jcs` / `threshold` / `transparency` / `xchacha` / `hkdf` / `hmac` / `fedcode`). Family-floor / wheel-concurrence re-pin only; no persist code change. Wheel `Requires-Dist` floor stays `>=6.0.0,<7`.
+
 ## [9.10.1] — 2026-06-22
 
 ### Changed — re-pin CIRISVerify v6.11.0 → v6.12.0 (wheel concurrence)
