@@ -5,6 +5,42 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.1.1] — 2026-06-24
+
+### Fixed — #275 (withdraws/eviction surface): `register_self_federation_key` now stores the ML-DSA-65 pubkey + hybrid-signs
+
+The eviction `withdraws` path (`evict_actor` → `withdraws_failed: N`) was the
+last live #275 surface. It is **not** an FK / key_id-divergence issue (those
+were fixed in 10.0.1–10.1.0): `register_self_federation_key` stored the row with
+`pubkey_ml_dsa_65_base64 = None` (deferred to a "cold-path fill" that never runs
+in a standalone / SQLite wheel). A registered key with **no ML-DSA pubkey** makes
+the federation-tier ingest gate reject *every* hybrid-signed emission verified
+against it — `verify_hybrid_pqc_fields_mismatch` ("PQC signature without pubkey").
+So a node that registered itself could hold blobs (classical/local-tier scrub)
+but could not emit the federation-tier `withdraws` that eviction requires.
+
+- **`Engine::register_self_federation_key`** now populates `pubkey_ml_dsa_65_base64`
+  from the engine's PQC signer and writes a complete hybrid scrub signature
+  (`sign_hybrid`) when a PQC identity is configured — the registered row is a
+  full Ed25519 + ML-DSA-65 hybrid key. A non-PQC (Ed25519-only) engine still
+  registers a classical-only row (federation-tier emits are gated off there by
+  design). The classical half of `sign_hybrid` is the engine's composed signer,
+  so the row stays internally consistent with `pubkey_ed25519_base64`.
+- **Tested**: a new end-to-end `evict_actor_after_register_self_emits_withdraws`
+  Rust test (`register_self → put_blob_signing → evict_actor`, asserts
+  `withdraws_failed == 0` / `withdraws_emitted == 1`) — the construct→register→
+  emit→withdraws lifecycle the prior tests didn't cover.
+
+### Note — `enqueue_outbound` is not a derived-key_id regression
+
+Investigated the reported `enqueue_outbound` "durable-send FK": the **sender**
+FK (the registered derived key_id) resolves correctly. The reproducible failures
+are (a) the **by-design** `destination_key_id` FK — `edge_outbound_queue`
+requires the destination to be a registered `federation_keys` row (schema V007),
+so a send to an unregistered peer fails (register the peer first), and (b) a
+`requires_ack=true` call without `ack_timeout_seconds` (input validation). No
+persist change here; flagged for the harness.
+
 ## [10.1.0] — 2026-06-24
 
 ### Hardened — federation signing-identity surface (the #275 bug class)
