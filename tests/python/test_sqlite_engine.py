@@ -289,3 +289,61 @@ def test_retention_ffi_round_trip_large_bytes() -> None:
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
+
+
+def test_register_self_then_put_blob_signing_275() -> None:
+    """v10.0.1 (CIRISPersist#275) — regression for the canonical
+    "register my self key, then store a blob I hold" flow.
+
+    The #247 floor (v9.3.0) made every federation-tier emit's
+    `scrub_key_id` the DERIVED federation key_id
+    (`derive_key_id(<alias>, <pubkey>)` = `<label>-<fp>`), but
+    `register_self_federation_key` kept registering the bare keystore
+    ALIAS — so `put_blob_signing`'s holds_bytes scrub FK pointed at a row
+    that never existed and FK-failed (`blob_attestation_emission_failed`)
+    on every persist >= 9.3.0. The fix registers (and returns) the derived
+    id. Skips on a non-sqlite wheel."""
+    import base64
+    import hashlib
+    import os
+    import secrets
+    import tempfile
+    import uuid
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    seed = os.path.join(tempfile.mkdtemp(), "seed")
+    with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    alias = "node-" + secrets.token_hex(8)
+    try:
+        eng = ciris_persist.Engine(
+            "sqlite::memory:", alias, local_key_id=alias, local_key_path=seed
+        )
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        kid = eng.register_self_federation_key("agent", "ref", None, None, None)
+        # The registered + returned key_id is the DERIVED wire id, NOT the
+        # bare alias — this is the heart of the #275 fix.
+        assert kid != alias, "register_self must register the derived id, not the alias"
+        assert kid.startswith(alias + "-"), f"derived id shape <label>-<fp>: {kid!r}"
+
+        # The canonical self-holds-bytes ingest must NOT FK-fail now.
+        body = b"hello-275"
+        sha = hashlib.sha256(body).hexdigest()
+        eng.put_blob_signing(
+            sha,
+            base64.b64encode(body).decode(),
+            None,
+            None,
+            kid,
+            "2026-05-28T13:45:09.000Z",
+            str(uuid.uuid4()),
+        )
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()

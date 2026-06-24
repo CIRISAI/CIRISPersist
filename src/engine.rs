@@ -1602,6 +1602,121 @@ impl Engine {
         ))
     }
 
+    /// v10.0.1 (CIRISPersist#275) — register THIS engine's **own
+    /// federation identity** — the composed `self.signer`, the key every
+    /// emit/scrub path derives its key_id from — as a self-signed
+    /// `federation_keys` row of `identity_type`.
+    ///
+    /// The row is keyed by the **derived** federation key_id
+    /// ([`Self::local_derived_key_id`] = `derive_key_id(<alias>, <ed25519
+    /// pubkey>)` = `<label>-<fp>`), carries `self.signer`'s Ed25519 pubkey,
+    /// and a classical self-signature over the canonical
+    /// `registration_envelope`. This is the row the holds_bytes / withdraws
+    /// / emit `scrub_key_id` FK resolves against (the #247 floor).
+    ///
+    /// # Why `self.signer`, not a `LocalSigner`
+    ///
+    /// Pre-#275 the FFI bootstrap registered the **`LocalSigner`** seed's
+    /// identity (and historically the bare keystore alias). But every
+    /// federation-tier emit — [`Self::put_blob_signing`]'s holds_bytes
+    /// scrub, [`Self::emit_attestation_self`], [`Self::attestation_promote`],
+    /// the eviction `withdraws` — derives its key_id from `self.signer`
+    /// ([`Self::local_derived_key_id`]). When the composed signer and the
+    /// local seed are distinct identities (different Ed25519 pubkeys ⇒
+    /// different derived ids — the real-node shape), the registered row and
+    /// the scrub FK target diverged, so `put_blob_signing` FK-failed on the
+    /// canonical "register self, then hold bytes" flow for every persist
+    /// ≥ 9.3.0. Registering `self.signer`'s identity (and returning its
+    /// derived id, which the caller threads back as `attesting_key_id`)
+    /// closes that gap structurally.
+    ///
+    /// The ML-DSA half is left to the cold-path PQC fill (matches the
+    /// pre-#275 shape). Returns the registered (derived) key_id.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn register_self_federation_key(
+        &self,
+        identity_type: &str,
+        identity_ref: &str,
+        valid_until: Option<chrono::DateTime<chrono::Utc>>,
+        registration_envelope: serde_json::Value,
+        roles: Vec<String>,
+    ) -> Result<String, crate::federation::Error> {
+        use crate::federation::FederationDirectory;
+        use crate::verify::canonical::{Canonicalizer, PythonJsonDumpsCanonicalizer};
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        // The federation identity is the engine's composed signer — the
+        // SAME key every emit/scrub path derives its key_id from (#247/#275).
+        let key_id = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("register_self derive key_id: {e}"))
+        })?;
+        let pubkey = self.signer.public_key().await.map_err(|e| {
+            crate::federation::Error::Backend(format!("register_self signer public_key: {e}"))
+        })?;
+        let pubkey_ed25519_base64 = B64.encode(&pubkey);
+
+        // Canonicalize the registration envelope with the production
+        // Python-dumps canonicalizer (the rule the manual/FFI workflow
+        // signs over), SHA-256 it, and classically self-sign with the
+        // composed signer.
+        let canonical = PythonJsonDumpsCanonicalizer
+            .canonicalize_value(&registration_envelope)
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("register_self canonicalize: {e}"))
+            })?;
+        let original_content_hash = hex::encode(Sha256::digest(&canonical));
+        let classical_sig = self.signer.sign(&canonical).await.map_err(|e| {
+            crate::federation::Error::Backend(format!("register_self classical sign: {e}"))
+        })?;
+        let scrub_signature_classical = B64.encode(&classical_sig);
+
+        // Microsecond truncation (Postgres TIMESTAMPTZ precision) — inlined
+        // to avoid a cirisaudit-feature dep on this path (mirrors the FFI).
+        let now = {
+            use chrono::Timelike as _;
+            let dt = chrono::Utc::now();
+            let micros = dt.nanosecond() / 1000;
+            dt.with_nanosecond(micros * 1000).unwrap_or(dt)
+        };
+
+        let record = crate::federation::KeyRecord {
+            key_id: key_id.clone(),
+            pubkey_ed25519_base64,
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: identity_type.to_owned(),
+            identity_ref: identity_ref.to_owned(),
+            valid_from: now,
+            valid_until,
+            registration_envelope,
+            original_content_hash,
+            scrub_signature_classical,
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.clone(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles,
+            attestation_evidence: None,
+        };
+        let signed = crate::federation::SignedKeyRecord { record };
+
+        // Self-bootstrap write — the same path the FFI `put_public_key`
+        // takes (NO `verify_key_registration`: that hybrid-mandatory
+        // §5.6.8.15 gate is for PEER registration via
+        // [`Self::register_federation_key`], not a node minting its own
+        // bootstrap row; the PQC half is filled by the cold path). The
+        // `put_public_key` writer is idempotent on the `key_id` PK.
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.put_public_key(signed).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.put_public_key(signed).await?,
+        }
+        Ok(key_id)
+    }
+
     /// v4.6 (CIRISPersist#171 phase 2, CEG §10.1.3/§10.1.5) — promote a
     /// **local**-tier self-attestation to **federation**: canonicalize the
     /// row's envelope through the produce-side gate (JCS post-cut, §0.9),
@@ -6163,6 +6278,54 @@ mod tests {
         // list_holders sees the writer.
         let holders = sq.list_holders(&sha).await.expect("list_holders");
         assert_eq!(holders, vec![signer_alias]);
+    }
+
+    /// v10.0.1 (CIRISPersist#275) — regression: `register_self_federation_key`
+    /// must register the engine's COMPOSED-signer derived id (the same id
+    /// `put_blob_signing`'s holds_bytes `scrub_key_id` derives), so the
+    /// canonical "register self, then hold bytes" flow does NOT FK-fail. The
+    /// #247 floor (v9.3.0) made the scrub FK target the derived id while the
+    /// bootstrap registered the alias / a different signer's id, breaking
+    /// this on every persist >= 9.3.0.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn register_self_then_put_blob_signing_resolves_scrub_fk_275() {
+        use crate::federation::BlobBody;
+
+        let signer = test_signer();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+
+        // register_self registers the engine's federation identity, keyed
+        // by the DERIVED id — not the bare alias.
+        let kid = engine
+            .register_self_federation_key("agent", "ref", None, serde_json::json!({}), vec![])
+            .await
+            .expect("register_self_federation_key");
+        let derived = engine.local_derived_key_id().await.expect("derived id");
+        assert_eq!(kid, derived, "must register (and return) the derived id");
+        assert_ne!(
+            kid,
+            signer.key_id(),
+            "derived id is NOT the bare keystore alias"
+        );
+
+        // The canonical self-holds-bytes ingest must resolve the holds_bytes
+        // scrub_key_id FK against the row register_self just wrote.
+        let bytes = b"register-self-275".to_vec();
+        let sha = sha256_of_bytes(&bytes);
+        engine
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(bytes),
+                Some("application/octet-stream"),
+                &kid,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("put_blob_signing must resolve the scrub FK after register_self");
     }
 
     #[cfg(feature = "sqlite")]
