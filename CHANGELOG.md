@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.1.2] — 2026-06-24
+
+### Changed — re-pin CIRISVerify v7.2.0 → v7.4.0 (wheel concurrence)
+
+- All six git-tag verify crates flipped in lockstep; family floor `version = "7"` unchanged; wheel `Requires-Dist` floor stays `ciris-verify>=7.0.0,<8`. v7.3.0 exposes RNS `destination_hash` recompute on the verify wheel (CIRISVerify#28 lift) and v7.4.0 exposes the scope-native privacy derivations on the wheel (CIRISVerify#82) — both **additive verify-wheel (Python FFI) surfaces** that do **not** touch persist's consumed Rust APIs (`verify_hybrid` / `canonical` / `jcs` / `threshold` / `transparency` / `xchacha` / `hkdf` / `hmac` / `fedcode` / `accord_genesis`). Family-floor / wheel-concurrence re-pin only; no persist code change.
+
 ## [10.1.1] — 2026-06-24
 
 ### Fixed — #275 (withdraws/eviction surface): `register_self_federation_key` now stores the ML-DSA-65 pubkey + hybrid-signs
