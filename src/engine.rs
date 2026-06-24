@@ -1596,6 +1596,26 @@ impl Engine {
                 "local_derived_key_id: hardware public_key read failed: {e}"
             )))
         })?;
+        // v10.1.0 (CIRISPersist#275 hardening) — fail LOUD, not silent: a
+        // federation key_id is `derive_key_id(<alias>, <32-byte Ed25519
+        // pubkey>)`. If the composed signer is NOT Ed25519 (e.g. a 65-byte
+        // P-256 `EcdsaP256` keystore fallback), deriving over its pubkey
+        // would mint a key_id that no valid Ed25519 federation row can match
+        // — and silently store an unverifiable key (the #275 3rd surface).
+        // Reject here so the misconfiguration surfaces at the source instead
+        // of as a downstream FK / invalid_length failure.
+        // An Ed25519 public key is exactly 32 bytes.
+        const ED25519_PUBLIC_KEY_LEN: usize = 32;
+        if pubkey.len() != ED25519_PUBLIC_KEY_LEN {
+            return Err(SignError::LocalSigner(
+                crate::signing::LocalSignerError::ClassicalSign(format!(
+                    "local_derived_key_id: signer public_key is {} bytes, not a 32-byte Ed25519 \
+                     key — the engine's federation signing identity must be Ed25519 (got a \
+                     non-Ed25519 signer; pass an Ed25519 local_key_id/local_key_path)",
+                    pubkey.len(),
+                )),
+            ));
+        }
         Ok(ciris_verify_core::fedcode::derive_key_id(
             self.signer.current_alias(),
             &pubkey,
@@ -2386,7 +2406,19 @@ impl Engine {
         scrubber: &dyn Scrubber,
         verify_mode: crate::ingest::VerifyMode,
     ) -> Result<crate::ingest::BatchSummary, crate::ingest::IngestError> {
-        let key_id = self.signer.current_alias().to_owned();
+        // v10.1.0 (CIRISPersist#275 hardening) — the ingest pipeline carries
+        // this into each scrubbed row's `scrub_key_id`, which FKs to
+        // `federation_keys(key_id)` (the #247 floor). A registered node emits
+        // under its DERIVED federation key_id (`<label>-<fp>`), NOT the bare
+        // keystore alias — so the lookup key must be the derived id (matching
+        // the `sweep_evictions_once_inner` / `emit_withdraws_attestation`
+        // floor; this was a missed site). Falls back to the alias only if the
+        // derived id can't be resolved (no signer pubkey), preserving prior
+        // behaviour for Ed25519-only / no-pubkey signers.
+        let key_id = self
+            .local_derived_key_id()
+            .await
+            .unwrap_or_else(|_| self.signer.current_alias().to_owned());
         match &self.backend {
             #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(arc) => {

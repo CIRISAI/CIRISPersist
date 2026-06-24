@@ -2093,6 +2093,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     ) -> Result<(), crate::federation::Error> {
         let mut row = record.record;
 
+        // v10.1.0 (CIRISPersist#275 hardening) — universal write-path
+        // invariant: pubkey_ed25519_base64 MUST decode to a 32-byte Ed25519
+        // key. Rejects a wrong-curve / malformed key (e.g. a 65-byte P-256
+        // point) at admission for EVERY registration path — the backstop the
+        // #275 saga proved was missing. Backend-symmetric with SQLite. Runs
+        // first so a bad key leaves no trace.
+        crate::federation::register::validate_registration_pubkey(&row)?;
+
         // v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation
         // admission gate for accord_holder rows. Runs BEFORE
         // persist_row_hash + INSERT so rejected rows leave no trace.
