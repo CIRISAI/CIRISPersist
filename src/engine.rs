@@ -1686,10 +1686,6 @@ impl Engine {
                 crate::federation::Error::Backend(format!("register_self canonicalize: {e}"))
             })?;
         let original_content_hash = hex::encode(Sha256::digest(&canonical));
-        let classical_sig = self.signer.sign(&canonical).await.map_err(|e| {
-            crate::federation::Error::Backend(format!("register_self classical sign: {e}"))
-        })?;
-        let scrub_signature_classical = B64.encode(&classical_sig);
 
         // Microsecond truncation (Postgres TIMESTAMPTZ precision) — inlined
         // to avoid a cirisaudit-feature dep on this path (mirrors the FFI).
@@ -1700,10 +1696,49 @@ impl Engine {
             dt.with_nanosecond(micros * 1000).unwrap_or(dt)
         };
 
+        // v10.1.0 (CIRISPersist#275 — withdraws/eviction surface) — populate
+        // the ML-DSA-65 PUBLIC KEY and a complete hybrid scrub signature when
+        // the engine has a PQC identity. Pre-#275 the row left
+        // `pubkey_ml_dsa_65_base64 = None` (deferred to a "cold-path fill"
+        // that never runs in a standalone / SQLite wheel). A registered key
+        // with NO ML-DSA pubkey makes the federation-tier ingest gate REJECT
+        // every hybrid-signed emission verified against it
+        // (`verify_hybrid_pqc_fields_mismatch`: "PQC signature without
+        // pubkey") — e.g. the eviction `withdraws` and any `emit_attestation`.
+        // So a node that registered itself could not emit. The classical half
+        // of `sign_hybrid` is the engine's composed signer (== the Ed25519
+        // identity in `pubkey_ed25519_base64`), so the row is internally
+        // consistent.
+        let pqc_pubkey_b64 = match self.local_signer.as_ref() {
+            Some(ls) => ls.pqc_public_key_b64().await.map_err(|e| {
+                crate::federation::Error::Backend(format!("register_self pqc public_key: {e}"))
+            })?,
+            None => None,
+        };
+        let (scrub_signature_classical, scrub_signature_pqc, pqc_completed_at) =
+            if pqc_pubkey_b64.is_some() {
+                let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
+                    crate::federation::Error::Backend(format!("register_self hybrid sign: {e}"))
+                })?;
+                (
+                    B64.encode(&sig.classical.signature),
+                    Some(B64.encode(&sig.pqc.signature)),
+                    Some(now),
+                )
+            } else {
+                // Ed25519-only identity — classical-only self-signature. A
+                // non-PQC node cannot emit federation-tier rows (enforced at
+                // those emit sites); the row stays Ed25519-only.
+                let classical_sig = self.signer.sign(&canonical).await.map_err(|e| {
+                    crate::federation::Error::Backend(format!("register_self classical sign: {e}"))
+                })?;
+                (B64.encode(&classical_sig), None, None)
+            };
+
         let record = crate::federation::KeyRecord {
             key_id: key_id.clone(),
             pubkey_ed25519_base64,
-            pubkey_ml_dsa_65_base64: None,
+            pubkey_ml_dsa_65_base64: pqc_pubkey_b64,
             algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
             identity_type: identity_type.to_owned(),
             identity_ref: identity_ref.to_owned(),
@@ -1712,10 +1747,10 @@ impl Engine {
             registration_envelope,
             original_content_hash,
             scrub_signature_classical,
-            scrub_signature_pqc: None,
+            scrub_signature_pqc,
             scrub_key_id: key_id.clone(),
             scrub_timestamp: now,
-            pqc_completed_at: None,
+            pqc_completed_at,
             persist_row_hash: String::new(),
             roles,
             attestation_evidence: None,
@@ -6358,6 +6393,58 @@ mod tests {
             )
             .await
             .expect("put_blob_signing must resolve the scrub FK after register_self");
+    }
+
+    /// v10.1.0 (CIRISPersist#275 — withdraws/eviction surface) — the
+    /// canonical "register self → hold a blob → evict the actor" lifecycle
+    /// end to end: the eviction `withdraws` attestation must FK-resolve
+    /// against the row `register_self_federation_key` wrote. Reproduces the
+    /// conformance harness's `withdraws_failed` report.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn evict_actor_after_register_self_emits_withdraws_275() {
+        use crate::federation::BlobBody;
+
+        let signer = test_signer(); // PQC-configured (hybrid withdraws need it)
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let kid = engine
+            .register_self_federation_key("agent", "ref", None, serde_json::json!({}), vec![])
+            .await
+            .expect("register_self_federation_key");
+
+        // Hold a blob under the registered (derived) id.
+        let bytes = b"evict-275".to_vec();
+        let sha = sha256_of_bytes(&bytes);
+        engine
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(bytes),
+                Some("application/octet-stream"),
+                &kid,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("put_blob_signing");
+
+        // Evict the actor → emits a federation-tier withdraws whose
+        // attesting/attested/scrub key_id must FK-resolve against the
+        // register_self row.
+        let report = engine
+            .evict_actor(&kid, chrono::Utc::now())
+            .await
+            .expect("evict_actor");
+        assert_eq!(report.blobs_evicted, 1, "the held blob is evicted");
+        assert_eq!(
+            report.withdraws_failed, 0,
+            "the withdraws must NOT FK-fail after register_self: {report:?}"
+        );
+        assert_eq!(
+            report.withdraws_emitted, 1,
+            "one withdraws emitted: {report:?}"
+        );
     }
 
     #[cfg(feature = "sqlite")]
