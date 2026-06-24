@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782317585318,
+  "lastUpdate": 1782318962759,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -41645,6 +41645,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 706394,
             "range": "± 7129",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0650d352b54d234532d36c8c31ee9a5596317852",
+          "message": "Merge pull request #278 from CIRISAI/v10.1.0-federation-identity-hardening\n\nv10.1.0 — federation signing-identity hardening (the #275 bug class)",
+          "timestamp": "2026-06-24T11:05:33-05:00",
+          "tree_id": "a24ffae3be083a50b6658893b7ad68a16a1fae9a",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/0650d352b54d234532d36c8c31ee9a5596317852"
+        },
+        "date": 1782318960720,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40435845,
+            "range": "± 19629",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 2437964,
+            "range": "± 121302",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 8310,
+            "range": "± 26",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 12063,
+            "range": "± 55",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 19674,
+            "range": "± 63",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 54467,
+            "range": "± 323",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 9,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 37,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 217,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 522,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 597,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2064,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 82,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 255,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1133,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 32932,
+            "range": "± 969",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 75137,
+            "range": "± 1848",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 242806,
+            "range": "± 5234",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 10153,
+            "range": "± 698",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 11898,
+            "range": "± 654",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 18911,
+            "range": "± 1318",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 36784,
+            "range": "± 1841",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 2278111,
+            "range": "± 8138",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 5908768,
+            "range": "± 50633",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 346935,
+            "range": "± 8195",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 1109530,
+            "range": "± 33208",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 59430438,
+            "range": "± 670113",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1858664,
+            "range": "± 76112",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 10486615,
+            "range": "± 204885",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 147606844,
+            "range": "± 1391661",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 4692557,
+            "range": "± 214876",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 27215149,
+            "range": "± 362920",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 112459,
+            "range": "± 5271",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 103486,
+            "range": "± 4924",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 8962,
+            "range": "± 66",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 59320,
+            "range": "± 172",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 551917,
+            "range": "± 2481",
             "unit": "ns/iter"
           }
         ]
