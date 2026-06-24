@@ -5,6 +5,52 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.0.1] — 2026-06-24
+
+### Fixed — #275: `register_self_federation_key` registered the wrong identity → `put_blob_signing` FK-failed on every persist ≥ 9.3.0
+
+The canonical "register my self key, then store a blob I hold" flow
+(`register_self_federation_key` → `put_blob_signing`) raised
+`ValueError: blob_attestation_emission_failed` on every persist **≥ 9.3.0**
+(through 10.0.0); it worked on ≤ 9.2.2. Found by the CIRISConformance
+cross-wheel harness bumping its matrix to the 9.11/10.0 floor.
+
+Root cause: the #247 floor (v9.3.0) made every federation-tier emit's
+`scrub_key_id` the **derived** wire key_id (`derive_key_id(<alias>, <ed25519
+pubkey>)` = `<label>-<fp>`), and `put_blob_signing`'s holds_bytes scrub FKs
+to it. But `register_self_federation_key` registered the **`LocalSigner`
+seed's** identity (and historically the bare keystore alias) — a *different*
+key from the engine's composed `self.signer`, the one every emit/scrub path
+actually derives its key_id from. On a real node (composed signer ≠ local
+seed ⇒ different Ed25519 pubkeys ⇒ different derived ids) the registered row
+and the scrub FK target diverged, so the holds_bytes insert FK-failed. Pre-
+9.3.0 both paths used the bare alias, which matched — the #247 floor exposed
+the latent two-identity split.
+
+- **`Engine::register_self_federation_key`** (new crate-level method) now
+  registers the engine's **composed-signer** federation identity: keyed by
+  the derived id ([`Engine::local_derived_key_id`]), carrying `self.signer`'s
+  Ed25519 pubkey + a classical self-signature, and **returns the derived id**
+  so the caller threads it back as `attesting_key_id`. The PyO3
+  `register_self_federation_key` delegates to it (the `attestation_promote` /
+  `emit_attestation` cohabitation pattern). Same fix covers the eviction
+  `withdraws` emission path (Ask #2) — it derives from the same signer, so the
+  now-registered derived row resolves its FK too.
+- **Error surfacing** (Ask #3): `blob_err_to_py` now appends the inner detail
+  to `AttestationEmissionFailed` (e.g. `blob_attestation_emission_failed: FK
+  violation on holds_bytes attestation: FOREIGN KEY constraint failed`),
+  keeping the stable kind token as a prefix — previously the underlying cause
+  was swallowed to a bare token.
+- **Tested**: a Rust regression (`register_self_federation_key` →
+  `put_blob_signing` resolves the scrub FK; returned id is the derived id, not
+  the alias) and the exact issue repro as a Python wheel test
+  (`tests/python/test_sqlite_engine.py`, runs in CI).
+
+**Behavior change**: `register_self_federation_key` now returns the derived
+federation key_id (`<label>-<fp>`), not the bare alias — this is the value
+that FKs across the federation surface, and the value callers must use as
+`attesting_key_id`. Verify family unchanged (v7.2.0).
+
 ## [10.0.0] — 2026-06-23
 
 The **public-surface-completion** major: four downstream consumers

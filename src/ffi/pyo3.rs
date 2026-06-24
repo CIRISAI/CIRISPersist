@@ -3340,8 +3340,12 @@ impl PyEngine {
     ///    asynchronously if the engine was constructed with PQC keys.
     /// 7. Calls `put_public_key` with the assembled `SignedKeyRecord`.
     ///
-    /// Returns the registered `key_id` (which equals
-    /// `engine.local_key_id()`).
+    /// Returns the registered `key_id` — the **derived** federation
+    /// key_id `derive_key_id(<alias>, <pubkey>)` (= `engine.local_derived_key_id()`),
+    /// NOT the bare keystore alias. Thread this returned value back as the
+    /// `attesting_key_id` to `put_blob_signing` / the emit helpers so the
+    /// holds_bytes / withdraws `scrub_key_id` FK resolves (CIRISPersist#275;
+    /// the #247 floor).
     ///
     /// Idempotent on `(key_id)` PRIMARY KEY of `federation_keys` — the
     /// underlying `put_public_key` writer rejects on key_id conflict
@@ -3365,17 +3369,6 @@ impl PyEngine {
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
-            use base64::engine::general_purpose::STANDARD as B64;
-            use base64::Engine as _;
-            use sha2::{Digest, Sha256};
-
-            let signer = self.local_signer.clone().ok_or_else(|| {
-                PyValueError::new_err(
-                    "no local signing key configured (pass local_key_id + local_key_path \
-                     to the Engine constructor)",
-                )
-            })?;
-
             // Parse valid_until.
             let valid_until_dt: Option<chrono::DateTime<chrono::Utc>> = match valid_until {
                 None => None,
@@ -3391,79 +3384,45 @@ impl PyEngine {
                     PyValueError::new_err(format!("registration_envelope JSON decode: {e}"))
                 })?,
             };
+            let roles = roles.unwrap_or_default();
 
-            // Canonicalize envelope — same shape as canonicalize_envelope
-            // PyO3 surface, which the documented manual workflow uses.
-            let canonical_bytes = <PythonJsonDumpsCanonicalizer as crate::verify::canonical::Canonicalizer>::canonicalize_value(
-                &PythonJsonDumpsCanonicalizer,
-                &envelope,
-            )
-            .map_err(|e| PyRuntimeError::new_err(format!("canonicalize: {e}")))?;
-
-            // SHA-256 hex of the canonical bytes.
-            let mut hasher = Sha256::new();
-            hasher.update(&canonical_bytes);
-            let original_content_hash = format!("{:x}", hasher.finalize());
-
-            // Classical Ed25519 sig over canonical_bytes — base64.
-            let classical_sig_bytes = signer
-                .sign_ed25519(&canonical_bytes)
-                .map_err(|e| PyRuntimeError::new_err(format!("local_sign: {e}")))?;
-            let classical_sig_b64 = B64.encode(classical_sig_bytes);
-
-            // Build KeyRecord. PQC half + persist_row_hash + pqc_completed_at
-            // left to the existing put_public_key cold-path + server-compute.
-            let key_id = signer.key_id().to_owned();
-            let pubkey_ed25519_b64 = signer.public_key_b64();
-            // Truncate to microsecond precision — Postgres TIMESTAMPTZ is
-            // microsecond-precision, so the post-storage round-trip would
-            // otherwise differ from the pre-storage canonical bytes. Mirrors
-            // crate::audit::verify::truncate_to_micros (inlined to avoid a
-            // cirisaudit-feature dependency on this path).
-            let now = {
-                use chrono::Timelike as _;
-                let dt = chrono::Utc::now();
-                let micros = dt.nanosecond() / 1000;
-                dt.with_nanosecond(micros * 1000).unwrap_or(dt)
+            // v10.0.1 (CIRISPersist#275) — delegate to the crate-level
+            // `Engine::register_self_federation_key`, which registers the
+            // engine's **composed-signer** federation identity (the key
+            // every emit/scrub path derives its key_id from), keyed by the
+            // DERIVED federation key_id. Pre-#275 this FFI registered the
+            // `LocalSigner` seed's identity (or, earlier, the bare alias) —
+            // a row the holds_bytes / withdraws scrub FK could never resolve
+            // against when the composed signer and the local seed are
+            // distinct identities, so `put_blob_signing` FK-failed on every
+            // persist ≥ 9.3.0. Reconstruct the hybrid-capable engine over
+            // the shared backend + signer (the `attestation_promote` /
+            // `emit_attestation` cohabitation pattern) and call it.
+            let backend = match &self.backend {
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
             };
-
-            let record = crate::federation::KeyRecord {
-                key_id: key_id.clone(),
-                pubkey_ed25519_base64: pubkey_ed25519_b64,
-                pubkey_ml_dsa_65_base64: None,
-                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
-                identity_type: identity_type.to_owned(),
-                identity_ref: identity_ref.to_owned(),
-                valid_from: now,
-                valid_until: valid_until_dt,
-                registration_envelope: envelope,
-                original_content_hash,
-                scrub_signature_classical: classical_sig_b64,
-                scrub_signature_pqc: None,
-                scrub_key_id: key_id.clone(),
-                scrub_timestamp: now,
-                pqc_completed_at: None,
-                persist_row_hash: String::new(),
-                roles: roles.unwrap_or_default(),
-                // v2.5.0 (CIRISPersist#102 Ask 8) — the PyO3
-                // self-signing path is used by lens/agent bootstrap
-                // for steward / primitive / agent identities; it
-                // does NOT mint accord-holder keys (those go through
-                // a separate hardware-attestation bootstrap that
-                // populates `attestation_evidence` directly via
-                // `put_public_key` with a fully-formed
-                // SignedKeyRecord). Default to None here.
-                attestation_evidence: None,
-            };
-            let signed = crate::federation::SignedKeyRecord { record };
-            let signed_json = serde_json::to_string(&signed).map_err(|e| {
-                PyRuntimeError::new_err(format!("SignedKeyRecord JSON encode: {e}"))
-            })?;
-
-            // Delegate to put_public_key — handles backend dispatch +
-            // cold-path PQC fill automatically.
-            self.put_public_key(py, &signed_json)?;
-            Ok(key_id)
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let runtime = self.runtime.clone();
+            let identity_type = identity_type.to_owned();
+            let identity_ref = identity_ref.to_owned();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .register_self_federation_key(
+                            &identity_type,
+                            &identity_ref,
+                            valid_until_dt,
+                            envelope,
+                            roles,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
         })
     }
 
@@ -22889,10 +22848,17 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
     let kind = e.kind();
     tracing::warn!(error = %e, kind = kind, "blob storage error");
     match e {
+        // v10.0.1 (CIRISPersist#275) — keep the stable `kind` token as a
+        // prefix (callers branching on `str(e).startswith(...)` / `in`
+        // still match) but append the inner detail, which carries the
+        // underlying cause (e.g. the holds_bytes/withdraws scrub_key_id FK
+        // violation) — previously swallowed to a bare token.
+        crate::federation::BlobError::AttestationEmissionFailed(ref detail) => {
+            PyValueError::new_err(format!("{kind}: {detail}"))
+        }
         crate::federation::BlobError::HashMismatch { .. }
         | crate::federation::BlobError::InlineSizeExceeded { .. }
-        | crate::federation::BlobError::InvalidArgument(_)
-        | crate::federation::BlobError::AttestationEmissionFailed(_) => PyValueError::new_err(kind),
+        | crate::federation::BlobError::InvalidArgument(_) => PyValueError::new_err(kind),
         // v3.4.0 (CIRISPersist#123) — trust gate rejection.
         crate::federation::BlobError::TrustBelowThreshold { .. } => PyValueError::new_err(kind),
         // v3.6.0 (CIRISPersist#134) — perceptual-hash matcher hit.
