@@ -94,6 +94,41 @@ use super::{Error, FederationDirectory};
 use crate::verify::canonical::ceg_produce_canonicalize;
 use crate::verify::{verify_hybrid, HybridPolicy, VerifyOutcome};
 
+/// v10.1.0 (CIRISPersist#275 hardening) — the **write-path admission
+/// invariant** for a `federation_keys` row's classical public key: it
+/// MUST base64-decode to exactly 32 bytes (a valid Ed25519 key).
+///
+/// This is the universal backstop the #275 saga proved was missing: a
+/// row whose `pubkey_ed25519_base64` was a 65-byte P-256 point was stored
+/// unchallenged and only failed (`invalid_length`) at a downstream
+/// `verify_hybrid_via_directory` read. Called by **every** backend's
+/// `put_public_key` (the one write chokepoint all registration paths —
+/// `register_self_federation_key`, `register_federation_key`, the FFI,
+/// direct callers — funnel through), so a wrong-curve / malformed key can
+/// never be admitted regardless of how it was produced. Backend-agnostic:
+/// the SAME check runs on Postgres and SQLite.
+pub fn validate_registration_pubkey(record: &KeyRecord) -> Result<(), Error> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    /// An Ed25519 public key is exactly 32 bytes.
+    const ED25519_PUBLIC_KEY_LEN: usize = 32;
+    let decoded = B64.decode(&record.pubkey_ed25519_base64).map_err(|e| {
+        Error::InvalidArgument(format!(
+            "pubkey_ed25519_base64 is not valid base64 (key_id {}): {e}",
+            record.key_id
+        ))
+    })?;
+    if decoded.len() != ED25519_PUBLIC_KEY_LEN {
+        return Err(Error::InvalidArgument(format!(
+            "pubkey_ed25519_base64 must decode to a 32-byte Ed25519 key, got {} bytes (key_id {}) \
+             — a non-Ed25519 key (e.g. a 65-byte P-256 point) cannot be admitted to \
+             federation_keys",
+            decoded.len(),
+            record.key_id
+        )));
+    }
+    Ok(())
+}
+
 /// Verify a [`KeyRecord`] registration against the §5.6.8.15 admission
 /// gate, BEFORE any store. Generic over [`FederationDirectory`] so it
 /// composes against any backend (postgres, sqlite, memory) — the
@@ -142,6 +177,10 @@ where
             "scrub_key_id must be non-empty for registration".to_string(),
         ));
     }
+    // #275 hardening — the classical pubkey must be a valid 32-byte Ed25519
+    // key (fail-fast before the PQC verify; `put_public_key` re-checks at the
+    // store chokepoint for paths that skip this gate).
+    validate_registration_pubkey(record)?;
 
     // Canonicalize the registration envelope through the CEG produce
     // gate — the same canonical form the producer signed. Cross-check
@@ -330,6 +369,35 @@ mod tests {
         record
     }
 
+    /// #275 hardening — `validate_registration_pubkey` enforces the
+    /// 32-byte Ed25519 invariant: accepts a real 32-byte key, rejects a
+    /// 65-byte P-256 point, rejects non-base64. Backend-free unit coverage
+    /// of the admission backstop (the matrix exercises it end-to-end on both
+    /// backends via put_public_key).
+    #[tokio::test]
+    async fn validate_registration_pubkey_enforces_32_byte_ed25519() {
+        let mut rec =
+            signed_self_record("vrp-key", identity_type::AGENT, None, false, false, false).await;
+        // Valid 32-byte Ed25519 (the builder uses a real key) — accepted.
+        validate_registration_pubkey(&rec).expect("32-byte Ed25519 key must be accepted");
+
+        // 65-byte uncompressed P-256 point — rejected, naming the invariant.
+        rec.pubkey_ed25519_base64 = B64.encode([0x04u8; 65]);
+        let err = validate_registration_pubkey(&rec).unwrap_err();
+        assert_eq!(err.kind(), "federation_invalid_argument");
+        assert!(
+            format!("{err}").contains("32-byte"),
+            "must name the invariant: {err}"
+        );
+
+        // Not valid base64 — rejected.
+        rec.pubkey_ed25519_base64 = "!!! not base64 !!!".into();
+        assert!(
+            validate_registration_pubkey(&rec).is_err(),
+            "non-base64 must be rejected"
+        );
+    }
+
     /// The full §5.6.8.15 admission-gate matrix, backend-agnostic.
     async fn run_register_matrix(engine: &Engine, run_tag: &str) {
         let directory = engine.federation_directory();
@@ -349,6 +417,42 @@ mod tests {
         assert!(
             read.is_some(),
             "(a) admitted key must be readable via lookup_public_key"
+        );
+
+        // (a') #275 hardening — a row whose pubkey_ed25519_base64 is NOT a
+        // 32-byte Ed25519 key (here a 65-byte P-256 point) is REJECTED at the
+        // put_public_key write chokepoint, on BOTH backends, before any
+        // INSERT. This is the admission backstop the #275 saga proved was
+        // missing (a wrong-curve key was stored unchallenged and only failed
+        // at read). Self-signed (scrub_key_id == key_id) so it reaches the
+        // store path directly.
+        let wrongcurve_id = format!("peer-wrongcurve-{run_tag}");
+        let mut wrongcurve = signed_self_record(
+            &wrongcurve_id,
+            identity_type::AGENT,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+        wrongcurve.pubkey_ed25519_base64 = B64.encode([0x04u8; 65]); // uncompressed P-256 point
+        let err = directory
+            .put_public_key(SignedKeyRecord { record: wrongcurve })
+            .await
+            .expect_err("(a') a non-32-byte pubkey must be rejected at put_public_key");
+        assert_eq!(err.kind(), "federation_invalid_argument");
+        assert!(
+            format!("{err}").contains("32-byte"),
+            "(a') rejection must name the 32-byte Ed25519 invariant: {err}"
+        );
+        assert!(
+            directory
+                .lookup_public_key(&wrongcurve_id)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "(a') a rejected wrong-curve key must leave NO row"
         );
 
         // (b) bad/missing ML-DSA-65 (hybrid-pending under Strict) →

@@ -5,6 +5,46 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.1.0] — 2026-06-24
+
+### Hardened — federation signing-identity surface (the #275 bug class)
+
+A targeted hardening pass over the federation signing-identity surface, after
+#275 surfaced three times from one root (the engine's classical identity is
+Ed25519, but a key_id-deriving / scrub / write path could use or store a
+non-Ed25519 key). A 41-agent adversarial audit mapped the surface; the
+confirmed, actionable findings are fixed here. The substrate is otherwise
+heavily tested — this closes the specific gap that hid #275: no wheel-level
+construct→register→emit→**verify** round-trip, and no write-time pubkey-shape
+admission guard.
+
+- **Write-path admission backstop** — `federation::register::validate_registration_pubkey`
+  enforces that `pubkey_ed25519_base64` decodes to exactly **32 bytes** (a
+  valid Ed25519 key), and is called from **every** backend's `put_public_key`
+  (the one chokepoint all registration paths funnel through) AND from
+  `verify_key_registration` (fail-fast for the peer path). A wrong-curve /
+  malformed key (e.g. a 65-byte P-256 point) can no longer be admitted to
+  `federation_keys` regardless of how it was produced — caught at admission
+  with `federation_invalid_argument`, before INSERT, leaving no row.
+  Backend-symmetric (identical on Postgres + SQLite).
+- **Fixed a missed #247/#275 site** — `Engine::receive_and_persist_with` (the
+  ingest entry for `receive_and_persist` / `_pre_verified`) used the bare
+  keystore **alias** as the `signer_key_id` that the pipeline writes into each
+  row's `scrub_key_id` (which FKs to `federation_keys` post-#247). It now
+  derives the **registered** key_id via `local_derived_key_id()` (alias
+  fallback), matching the `sweep_evictions_once_inner` / `emit_withdraws`
+  floor — so trace/ingest scrub rows FK-resolve on a real node.
+- **Fail-loud at derivation** — `Engine::local_derived_key_id` now returns an
+  error when the composed signer's public key isn't 32 bytes (a non-Ed25519
+  signer), instead of silently deriving a key_id over a P-256 point and
+  storing an unverifiable identity.
+- **Tested**: a backend-free unit test for the validator (accepts 32-byte,
+  rejects 65-byte P-256 + non-base64); a wrong-curve `put_public_key`
+  rejection arm in the backend-agnostic register matrix (runs on Postgres +
+  SQLite, asserts no row is left); the Python wheel #275 regression asserts
+  the stored pubkey decodes to 32 bytes. Full gate green. Verify family
+  unchanged (v7.2.0).
+
 ## [10.0.2] — 2026-06-24
 
 ### Fixed — #275 (3rd surface): PyEngine federation signer must be Ed25519, not the P-256 keystore fallback
