@@ -5,6 +5,38 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.0.2] — 2026-06-24
+
+### Fixed — #275 (3rd surface): PyEngine federation signer must be Ed25519, not the P-256 keystore fallback
+
+v10.0.1 fixed the FK divergence by registering `self.signer`'s derived
+identity — but on the **PyEngine** construction path `self.signer` is the
+**P-256** signer `get_platform_signer` returns when no Ed25519 keyring
+identity is present (its `public_key()` is a 65-byte uncompressed EC point).
+So `register_self_federation_key` stored a 65-byte P-256 key under
+`pubkey_ed25519_base64`, and any read-back verify (`verify_hybrid_via_directory`)
+failed `invalid_length`. (The v10.0.1 Rust regression passed only because
+`Engine::with_signer` — the *Rust* path — already makes `self.signer` the
+Ed25519 `LocalSignerHardwareAdapter`; the PyEngine path diverged.)
+
+Root cause: the engine's classical signing identity is Ed25519 (`sign_hybrid`
+signs via the Ed25519 `local_signer`), but `PyEngine::new` left `self.signer`
+as the non-Ed25519 platform fallback — desyncing every key_id-deriving / scrub
+path (`local_derived_key_id`, `put_blob_signing`, `register_self`) from
+`sign_hybrid`.
+
+- **`PyEngine::new`** now mirrors `Engine::with_signer`: when the platform
+  signer is **not** an Ed25519 key (`algorithm() != Ed25519` — e.g. the
+  `EcdsaP256` software/TPM fallback) **and** an Ed25519 `local_signer` is
+  configured, the engine's signer becomes that local Ed25519 key (wrapped in
+  `LocalSignerHardwareAdapter`). A genuine Ed25519 platform/hardware signer is
+  left untouched. This unifies the construction paths: `self.signer` is now
+  the Ed25519 federation identity, so the stored pubkey is a valid 32-byte
+  Ed25519 key and every emit/scrub/derive path agrees with `sign_hybrid`.
+- **Tested**: the Python wheel regression now asserts the stored
+  `pubkey_ed25519_base64` decodes to 32 bytes (catches the P-256 leak this
+  surface was) in addition to the FK + return-id checks.
+
 ## [10.0.1] — 2026-06-24
 
 ### Fixed — #275: `register_self_federation_key` registered the wrong identity → `put_blob_signing` FK-failed on every persist ≥ 9.3.0

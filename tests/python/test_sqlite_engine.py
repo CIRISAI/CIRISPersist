@@ -305,6 +305,7 @@ def test_register_self_then_put_blob_signing_275() -> None:
     id. Skips on a non-sqlite wheel."""
     import base64
     import hashlib
+    import json
     import os
     import secrets
     import tempfile
@@ -331,6 +332,14 @@ def test_register_self_then_put_blob_signing_275() -> None:
         # bare alias — this is the heart of the #275 fix.
         assert kid != alias, "register_self must register the derived id, not the alias"
         assert kid.startswith(alias + "-"), f"derived id shape <label>-<fp>: {kid!r}"
+
+        # #275 3rd surface — the stored pubkey_ed25519_base64 must be a valid
+        # 32-byte Ed25519 key (not the 65-byte P-256 point the keystore
+        # software/TPM fallback would yield), or any read-back verify
+        # (verify_hybrid_via_directory) fails invalid_length.
+        row = json.loads(eng.lookup_keys_for_identity("ref"))[0]
+        pubkey = base64.b64decode(row["pubkey_ed25519_base64"])
+        assert len(pubkey) == 32, f"stored pubkey must be 32-byte Ed25519, got {len(pubkey)}"
 
         # The canonical self-holds-bytes ingest must NOT FK-fail now.
         body = b"hello-275"

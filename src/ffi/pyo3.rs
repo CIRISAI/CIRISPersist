@@ -1371,6 +1371,36 @@ impl PyEngine {
                 }
             };
 
+        // v10.0.2 (CIRISPersist#275, 3rd surface) — the federation classical
+        // identity is Ed25519. `get_platform_signer`'s SOFTWARE fallback is a
+        // P-256 signer (its `public_key()` is a 65-byte uncompressed EC point,
+        // NOT a 32-byte Ed25519 key), so using it as `self.signer` desynced
+        // every key_id-deriving / scrub path (`local_derived_key_id`,
+        // `put_blob_signing`'s holds_bytes scrub, `register_self_federation_key`)
+        // from `sign_hybrid` (which signs classical via the Ed25519
+        // `local_signer`) — and stored an unverifiable P-256 key under
+        // `pubkey_ed25519_base64`. When a software-tier platform signer is
+        // paired with an Ed25519 `local_signer`, make the engine's signer that
+        // local Ed25519 key — wrapped exactly as [`crate::Engine::with_signer`]
+        // does (`LocalSignerHardwareAdapter`), the canonical Rust path. Real
+        // hardware signers (non-`SoftwareOnly`) are left untouched.
+        let signer: Arc<dyn HardwareSigner> = match local_signer.as_ref() {
+            // The platform signer is NOT an Ed25519 key (e.g. the
+            // P-256/`EcdsaP256` software/TPM fallback `get_platform_signer`
+            // returns when no Ed25519 keyring identity is present) but an
+            // Ed25519 `local_signer` IS configured — so the platform signer
+            // cannot serve as the federation classical identity (its
+            // `public_key()` is a 65-byte EC point, not a 32-byte Ed25519
+            // key). Use the local Ed25519 key as the engine's signer,
+            // wrapped exactly as `Engine::with_signer` does. A genuine
+            // Ed25519 platform/hardware signer (`algorithm() == Ed25519`)
+            // is left as-is.
+            Some(ls) if signer.algorithm() != ciris_keyring::ClassicalAlgorithm::Ed25519 => {
+                Arc::new(crate::signing::LocalSignerHardwareAdapter::new(ls.clone()))
+            }
+            _ => signer,
+        };
+
         // v0.3.2 (CIRISPersist#11) — Auto-sweep on init when a local
         // PQC key is configured. Drains hybrid-pending rows authored
         // before the per-write cold-path was wired (or rows where the
