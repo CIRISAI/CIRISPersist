@@ -1998,6 +1998,13 @@ impl Engine {
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
         use sha2::{Digest, Sha256};
 
+        // CIRISPersist#293 (CC 2.6.3 / §0.6) — refuse a non-canonical
+        // (uppercase / empty) subject id at admission, before the row is
+        // assembled. Covers BOTH emit entry points (this is their shared
+        // body), so `emit_attestation` and `emit_attestation_self` enforce
+        // it identically on either backend.
+        crate::federation::validate_subject_key_ids(&input.subject_key_ids)?;
+
         let original_content_hash = hex::encode(Sha256::digest(canonical));
         let now = chrono::Utc::now();
 
@@ -7924,6 +7931,61 @@ mod tests {
             .is_some_and(|s| !s.is_empty()));
         assert_eq!(row.original_content_hash.len(), 64);
         assert_eq!(row.weight, None, "no weight set ⇒ default None");
+    }
+
+    /// CIRISPersist#293 (CC 2.6.3 / §0.6) — `emit_attestation_self` REFUSES a
+    /// `subject_key_ids[]` element that is not canonical lowercase (the
+    /// uppercase-hex case from the issue repro). The check lives in the
+    /// shared assemble body, so `emit_attestation` enforces it identically.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn emit_attestation_self_rejects_uppercase_subject_key_id_293() {
+        use crate::federation::types::attestation_type::SCORES;
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("ciris-self");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "ciris-self"))
+            .await
+            .expect("seed key");
+
+        // Uppercase-hex subject id (the issue repro) — must be refused.
+        let upper = "FF7C5632DAE6EF3AE7F6283BD35268BC7910332414AA8A1C35A1645CA0295F61";
+        let mut bad = crate::federation::EmitAttestationInput::with_envelope(
+            SCORES,
+            serde_json::json!({
+                "id": "emit-self-293", "dimension": "identity_binding:v1",
+                "score": 1.0, "confidence": 0.9,
+            }),
+        );
+        bad.subject_key_ids = vec![upper.to_owned()];
+        let err = engine
+            .emit_attestation_self(bad)
+            .await
+            .expect_err("uppercase subject_key_id must be refused (#293)");
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+
+        // The canonical lowercase form of the SAME id is admitted — the rule
+        // rejects the encoding, not the subject.
+        let mut ok = crate::federation::EmitAttestationInput::with_envelope(
+            SCORES,
+            serde_json::json!({
+                "id": "emit-self-293-ok", "dimension": "identity_binding:v1",
+                "score": 1.0, "confidence": 0.9,
+            }),
+        );
+        ok.subject_key_ids = vec![upper.to_lowercase()];
+        engine
+            .emit_attestation_self(ok)
+            .await
+            .expect("lowercase subject_key_id is admitted");
     }
 
     /// #253 PG twin — `emit_attestation_self` over the composed signer on a

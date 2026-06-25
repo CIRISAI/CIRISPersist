@@ -5,6 +5,32 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.5.0] — 2026-06-25
+
+### Fixed — #293: `emit_attestation`/`emit_attestation_self` admitted non-lowercase-hex `subject_key_ids[]` (CC 2.6.3 / §0.6) — residual of #288
+
+The reserved-prefix half of #288 (`accord:*` / `capacity:*`-self / `system:*`)
+shipped in 10.4.0, but the **subject-key canonical-form half stayed open**: the
+emit path admitted a `subject_key_ids[]` element that was not canonical
+lowercase (e.g. an uppercase-hex subject id), which CC 2.6.3 / CEG §0.6 forbid
+because a wrong-case subject id breaks byte-identical canonicalization for
+downstream verifiers — two encodings of the same subject would both admit.
+
+The §0.6/§0.8 lowercase-canonical rejection was already enforced on adjacent
+fields (`location.rs` `cell_id`, `media_sharing.rs` content hashes); the gap was
+that the **emit path's `subject_key_ids` was never run through it**. Fixed by
+`federation::validate_subject_key_ids`, called in the shared
+`emit_attestation_assemble` body — so **both** `emit_attestation(&signer, …)`
+and `emit_attestation_self(…)` enforce it identically, on sqlite and postgres
+alike (engine-level, no backend asymmetry). A subject id is a federation
+key_id — on real nodes the derived `"<label>-<fingerprint>"` shape, all
+lowercase by construction — so the rule rejects any ASCII-uppercase (or empty)
+element rather than a strict `0-9a-f` charset (which would wrongly reject the
+legitimate `-`-bearing label). The canonical lowercase form of the same id is
+admitted: the rule rejects the *encoding*, not the subject. Closes the
+CIRISConformance `test_240::test_subject_key_ids_must_be_lowercase_hex`
+`xfail(strict=True)` (XPASSes the moment the rule lands).
+
 ## [10.4.0] — 2026-06-25
 
 ### Added — #290: `put_community_json` PyO3 binding (closes the put_family/put_community FFI asymmetry; also resolves #289)
