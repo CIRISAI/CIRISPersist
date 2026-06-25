@@ -1592,6 +1592,49 @@ mod tests {
         entry
     }
 
+    /// v10.2.1 (CIRISPersist#283) — the postgres `audit_log.action_type`
+    /// CHECK admits the LensAudit `consent_event` (`log_consent_event`) +
+    /// `wisdom_based_deferral` (`log_wbd`) vocabulary (V090). These record
+    /// fine on SQLite (no CHECK) but were CHECK-rejected on postgres — the
+    /// backend-parity gap CIRISConformance `test_320` surfaced.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn audit_admits_lensaudit_consent_and_wbd_283() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let key = SigningKey::from_bytes(&[0xC3; 32]);
+        let tenant = format!("audit-283-{}", Uuid::new_v4().simple());
+
+        let e1 = build_and_sign(
+            &key,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "consent_event",
+        );
+        backend
+            .record_entry(e1.clone())
+            .await
+            .expect("consent_event must be admitted by the V090 CHECK");
+        let e2 = build_and_sign(
+            &key,
+            &tenant,
+            2,
+            e1.entry_hash.clone(),
+            "wisdom_based_deferral",
+        );
+        backend
+            .record_entry(e2)
+            .await
+            .expect("wisdom_based_deferral must be admitted by the V090 CHECK");
+    }
+
     /// v0.8.1 (CIRISPersist#35) — end-to-end audit log lifecycle:
     /// genesis insert, chain extend, verify_chain Ok, replay
     /// rejection, chain-fork rejection, tenant isolation, verify

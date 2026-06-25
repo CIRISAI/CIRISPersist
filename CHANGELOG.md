@@ -5,6 +5,32 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.2.1] — 2026-06-25
+
+### Fixed — #283: postgres `audit_log.action_type` CHECK rejected `consent_event` + `wisdom_based_deferral` (pg/sqlite parity)
+
+`audit_record_entry` rejected two valid `LensAudit` action types on **postgres**
+that **sqlite accepts** — a backend-parity gap (the same API call works on the
+mobile/embedded sqlite backend, silently breaks on the server postgres backend).
+CIRISServer's `LensAudit` emits `consent_event` (`log_consent_event`) and
+`wisdom_based_deferral` (`log_wbd`); the postgres `audit_log.action_type` CHECK
+(V018/V020) enumerates a closed vocabulary that was missing both. Surfaced by
+the CIRISConformance harness (`test_320`, runs every scenario against both
+backends) once CIRISServer#93 seeded the chain so writes reached the CHECK.
+
+- **Migration V090** extends the postgres CHECK to admit `consent_event` +
+  `wisdom_based_deferral`, following the established additive-evolution pattern
+  (drop + re-add the extended CHECK, `NOT VALID` for legacy rows; CIRISAgent#756
+  Q2's closed-vocab accountability control). **Postgres-only**: sqlite's
+  `audit_log.action_type` is `TEXT NOT NULL` with no CHECK by design (sqlite
+  can't `ADD CONSTRAINT … NOT VALID`, and a table rebuild would re-validate
+  legacy rows), so the closed vocabulary is enforced postgres-side; after V090
+  both backends accept every action type `LensAudit` emits. sqlite/lens/V090 is
+  a documented parity no-op (keeps the version sequence in lockstep).
+- **Tested**: `audit_admits_lensaudit_consent_and_wbd_283` (postgres — exercises
+  the V090 CHECK against live PG) + `…_sqlite` (parity). Verify family unchanged
+  (v7.4.0).
+
 ## [10.2.0] — 2026-06-25
 
 ### Added — #281: `audit_next_chain_position` PyO3 binding (audit chain head)
