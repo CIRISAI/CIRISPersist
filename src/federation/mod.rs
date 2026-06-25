@@ -289,6 +289,12 @@ fn assert_change_envelope_matches(
 /// `0-9a-f` charset because a derived key_id legitimately carries a `-` and a
 /// lowercase alphabetic label — the operative canonical invariant is "no
 /// uppercase", matching the precedent validators.
+///
+/// Gated to the backends that have an emit path: the sole caller
+/// (`Engine::emit_attestation_assemble`) is
+/// `#[cfg(any(feature = "postgres", feature = "sqlite"))]`, so without a
+/// backend feature this function would be dead code (the crate denies it).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error> {
     for sid in subject_key_ids {
         if sid.is_empty() || sid.bytes().any(|b| b.is_ascii_uppercase()) {
