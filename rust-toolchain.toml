@@ -1,0 +1,7 @@
+# Common toolchain pin across the four Rust-compiling CIRIS repos (server /
+# persist / edge / verify) — the rustc version is part of the CIRISCache key,
+# so drift between repos = zero cross-repo cache hits (CIRISPersist#285 /
+# CIRISServer#99). Matches CIRISServer's pin.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

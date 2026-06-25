@@ -17,6 +17,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+permissions:
+  contents: read
+  packages: write   # CIRISCache save pushes to GHCR; PRs only restore, so fork PRs are unaffected
+
 jobs:
   # Mission category §4 (PLATFORM_ARCHITECTURE.md §4):
   # the linux-x86_64 path that runs the full feature set with a
@@ -73,18 +77,18 @@ jobs:
       - name: install libtss2-dev (TPM build dep)
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev
       - uses: dtolnay/rust-toolchain@stable
-      # v1.1.2 (CIRISVerify v2.1.1 hardening pattern):
-      # `continue-on-error: true` on cache restore. A cache miss /
-      # corruption shouldn't fail the whole job — compile from scratch
-      # is slower but correct. Same on every Swatinem/rust-cache site
-      # in this workflow.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # v2.0.1 — per-substrate cache key so matrix entries don't
-          # thrash each other's caches (each compiles a different
-          # feature set).
-          key: ${{ matrix.substrate.name }}
+      # CIRISCache (CIRISPersist#285) — GHCR-backed cross-repo Rust cache,
+      # replacing Swatinem/rust-cache (unlimited GHCR storage, survives the
+      # tag-ref boundary, cross-repo-capable). Hardened continue-on-error so a
+      # cache miss/infra hiccup downgrades to a cold build, never failing the
+      # job; real test/lint/compile failures still fail as before. Explicit
+      # per-substrate key: every matrix leg runs on ubuntu-x86_64, so the
+      # default os-arch-rustc key would collide and the legs would clobber
+      # each other's cache.
+      - uses: CIRISAI/CIRISCache/restore@v1
         continue-on-error: true
+        with:
+          key: ciris-persist-build-${{ matrix.substrate.name }}-${{ hashFiles('Cargo.lock') }}
       # v2.0.1 — nextest, not cargo test: streams per-test PASS/FAIL/
       # SLOW lines so a hung test surfaces in the live log as "the
       # last RUN with no follow-up" instead of disappearing into a
@@ -170,6 +174,16 @@ jobs:
           source .venv/bin/activate
           pytest tests/python/ -v
 
+      # Save the warmed cache (main only; PRs restore but never save).
+      # Same explicit per-substrate key as the restore above so save/restore
+      # line up.
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        with:
+          key: ciris-persist-build-${{ matrix.substrate.name }}-${{ hashFiles('Cargo.lock') }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   # NOTE: the prior `linux-aarch64-build` cross-compile job was removed
   # in v0.1.15. Its purpose ("prove the crate cross-compiles to arm64
   # from an x86_64 host") is fully subsumed by the native arm64 wheel
@@ -196,17 +210,46 @@ jobs:
       # `~/.cargo/bin/`. Disabling bin caching keeps the dtolnay-
       # installed cargo intact. Build cache (registry + target) is
       # unaffected. (v0.7.0/v0.7.1 main CI + v0.7.2 tag CI flakes.)
-      # v1.1.2: + continue-on-error per CIRISVerify v2.1.1 hardening.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
+      # CIRISCache (CIRISPersist#285) — GHCR-backed cross-repo Rust cache,
+      # replacing Swatinem/rust-cache. Single job → default key is fine.
+      # Hardened continue-on-error: a cache miss/infra hiccup downgrades to a
+      # cold build, never failing the job.
+      - uses: CIRISAI/CIRISCache/restore@v1
         continue-on-error: true
+      - name: Repair toolchain if rustup-init shadow (cache-poison heal)
+        # macOS runners can restore a `~/.cargo/bin/cargo` that IS the
+        # rustup-init shim binary. The shim passes `cargo --version` through
+        # (any CLI accepts --version), but `cargo build` triggers the shim's
+        # argv parser and fails with "unexpected argument 'build' found".
+        # Active heal: probe via `cargo build --help`, nuke ~/.cargo/bin,
+        # reinstall the toolchain. Kept defensive across the cache swap.
+        # shell: bash forces Git Bash on Windows runners (default is pwsh,
+        # which can't parse the if/then/fi syntax below).
+        shell: bash
+        run: |
+          if cargo build --help 2>&1 | grep -q "rustup-init"; then
+            echo "::warning::Detected rustup-init shadow in ~/.cargo/bin; reinstalling toolchain"
+            rm -rf "$HOME/.cargo/bin"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup default stable
+          cargo --version
+          cargo build --help >/dev/null
       - name: which cargo (diagnostic)
         run: |
           which cargo
           cargo --version
       - name: cargo test (no postgres feature)
         run: cargo test --features server
+
+      # Save the warmed cache (main only; PRs restore but never save).
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # Mission category §4 + PLATFORM_ARCHITECTURE.md §3.1: iOS device +
   # simulator build path. Runs on macOS with the iOS targets.
@@ -254,11 +297,35 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ios-${{ matrix.dir }}
-          cache-bin: false
+      # CIRISCache (CIRISPersist#285) — replaces Swatinem/rust-cache. Explicit
+      # per-target key: both iOS legs run on macos-14, so the default
+      # os-arch-rustc key would collide; lock-hash busts on dependency
+      # changes. Hardened continue-on-error.
+      - uses: CIRISAI/CIRISCache/restore@v1
         continue-on-error: true
+        with:
+          key: ciris-persist-build-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+      - name: Repair toolchain if rustup-init shadow (cache-poison heal)
+        # macOS runners can restore a `~/.cargo/bin/cargo` that IS the
+        # rustup-init shim binary. The shim passes `cargo --version` through
+        # (any CLI accepts --version), but `cargo build` triggers the shim's
+        # argv parser and fails with "unexpected argument 'build' found".
+        # Active heal: probe via `cargo build --help`, nuke ~/.cargo/bin,
+        # reinstall the toolchain. Kept defensive across the cache swap.
+        # shell: bash forces Git Bash on Windows runners (default is pwsh,
+        # which can't parse the if/then/fi syntax below).
+        shell: bash
+        run: |
+          if cargo build --help 2>&1 | grep -q "rustup-init"; then
+            echo "::warning::Detected rustup-init shadow in ~/.cargo/bin; reinstalling toolchain"
+            rm -rf "$HOME/.cargo/bin"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup default stable
+          cargo --version
+          cargo build --help >/dev/null
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
@@ -333,6 +400,16 @@ jobs:
           name: ciris-persist-ios-${{ matrix.dir }}
           path: dist/${{ matrix.dir }}/ciris_persist.abi3.so
 
+      # Save the warmed cache (main only; PRs restore but never save).
+      # Same explicit per-target key as the restore above so save/restore
+      # line up.
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        with:
+          key: ciris-persist-build-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   # ci-perf — recombine the two parallel iOS target builds into the single
   # `ciris-persist-ios` tar that mobile-release uploads. Mirrors
   # android-package. Runs on every PR (NOT tag-gated), so the recombine is
@@ -399,10 +476,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: android-${{ matrix.abi }}
+      # CIRISCache (CIRISPersist#285) — replaces Swatinem/rust-cache. Explicit
+      # per-ABI key: every Android leg runs on ubuntu-x86_64, so the default
+      # os-arch-rustc key would collide; lock-hash busts on dependency
+      # changes. Hardened continue-on-error.
+      - uses: CIRISAI/CIRISCache/restore@v1
         continue-on-error: true
+        with:
+          key: ciris-persist-build-${{ matrix.abi }}-${{ hashFiles('Cargo.lock') }}
       - name: setup Android NDK
         uses: nttld/setup-ndk@v1
         id: setup-ndk
@@ -536,6 +617,16 @@ jobs:
           name: ciris-persist-android-${{ matrix.abi }}
           path: dist/${{ matrix.abi }}/
 
+      # Save the warmed cache (main only; PRs restore but never save).
+      # Same explicit per-ABI key as the restore above so save/restore
+      # line up.
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        with:
+          key: ciris-persist-build-${{ matrix.abi }}-${{ hashFiles('Cargo.lock') }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   # Downstream job: collect per-ABI artifacts into tarballs + wheels.
   android-package:
     name: package android artifacts
@@ -655,8 +746,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      # v1.1.2: continue-on-error per CIRISVerify v2.1.1 hardening.
-      - uses: Swatinem/rust-cache@v2
+      # CIRISCache (CIRISPersist#285) — replaces Swatinem/rust-cache. Single
+      # job → default key is fine. Hardened continue-on-error.
+      - uses: CIRISAI/CIRISCache/restore@v1
         continue-on-error: true
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -668,6 +760,13 @@ jobs:
           cargo clippy --all-targets --features
           "postgres server pyo3 sqlite cirisaudit secrets cirisnode cirisgraph telemetry"
           -- -D warnings
+
+      # Save the warmed cache (main only; PRs restore but never save).
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # Mission category §4 "Mission rejection": the clippy + fmt gate
   # plus a license-deny pass per CRATE_RECOMMENDATIONS §6.
