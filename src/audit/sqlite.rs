@@ -1694,6 +1694,35 @@ mod tests {
         );
     }
 
+    /// v10.2.1 (CIRISPersist#283) — SQLite parity: the LensAudit
+    /// `consent_event` + `wisdom_based_deferral` action types record fine
+    /// (SQLite's `action_type` is unconstrained — the postgres CHECK is what
+    /// V090 extends to match). The postgres counterpart
+    /// (`audit_admits_lensaudit_consent_and_wbd_283`) exercises the CHECK.
+    #[tokio::test]
+    async fn audit_admits_lensaudit_consent_and_wbd_283_sqlite() {
+        let (_b, audit) = fresh_backend().await;
+        let key = SigningKey::from_bytes(&[0xC3; 32]);
+        let tenant = format!("audit-283-{}", Uuid::new_v4().simple());
+
+        let e1 = build_and_sign(
+            &key,
+            &tenant,
+            1,
+            GENESIS_PREV_HASH.to_vec(),
+            "consent_event",
+        );
+        audit.record_entry(e1.clone()).await.expect("consent_event");
+        let e2 = build_and_sign(
+            &key,
+            &tenant,
+            2,
+            e1.entry_hash.clone(),
+            "wisdom_based_deferral",
+        );
+        audit.record_entry(e2).await.expect("wisdom_based_deferral");
+    }
+
     /// v0.8.5 SQLite parity: same lifecycle as the v0.8.1 Postgres
     /// audit test, run against in-memory SQLite.
     #[tokio::test]
