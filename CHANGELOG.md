@@ -5,6 +5,33 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.4.0] — 2026-06-25
+
+### Added — #290: `put_community_json` PyO3 binding (closes the put_family/put_community FFI asymmetry; also resolves #289)
+
+`put_family_json` was on the PyO3 `Engine` but **`put_community_json` was not**,
+even though the `put_community` backend trait method + both stores have always
+implemented it. So from Python there was no way to bring a community into
+existence (`add_community_member` hard-requires the community to already exist) —
+which left the §11.10 moderation-authority walk's authority set always empty, so
+`is_named_moderator` / `moderators_of` could never resolve, and the positive
+moderation path (appoint → recognize → `file_moderation`) was undrivable. Found
+by the CIRISConformance harness (`test_270`).
+
+- New **`Engine.put_community_json(payload_json)`**, symmetric to
+  `put_family_json`: a **flat** `Community` object (`persist_row_hash`
+  backend-computed — pass `""`; `community_key_id` + each member `key_id` FK
+  `federation_keys`; the CC 3.2 owner-binding `UnownedCommunityMember` gate
+  applies to agent/node members). Pure FFI exposure — no backend change.
+- **Resolves #289 too**: the *family* half of that seam was already drivable
+  (`put_family_json` + the `cohort_*` member ops, `test_260` green); the
+  community half was the only gap, and creating a community from Python also
+  makes the membership-**quorum** gate (`cohort_verify_membership_quorum`)
+  drivable end-to-end (create group → add members → change envelope →
+  sub-majority sigs → assert refusal).
+- **Tested**: a Python wheel round-trip (`put_community_json` →
+  `lookup_community_json`). Verify family unchanged (v7.5.0).
+
 ## [10.3.0] — 2026-06-25
 
 ### Fixed — #288: enforce reserved-prefix admission on the `attestation_type` namespace (CC 3.4.1 / 3.4.3 / 3.4.5)

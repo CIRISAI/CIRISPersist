@@ -356,3 +356,61 @@ def test_register_self_then_put_blob_signing_275() -> None:
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
+
+
+def test_put_community_json_round_trip_290() -> None:
+    """v10.4.0 (CIRISPersist#290) — `put_community_json` brings a community
+    into existence over the wheel (symmetric with `put_family_json`). Before
+    this, the only community surfaces were add/lookup/active — none could
+    CREATE one — so the §11.10 moderation-authority walk's authority set was
+    always empty. Round-trips create → lookup. Skips on a non-sqlite wheel."""
+    import json
+    import os
+    import secrets
+    import tempfile
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    seed = os.path.join(tempfile.mkdtemp(), "seed")
+    with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    alias = "node-" + secrets.token_hex(8)
+    try:
+        eng = ciris_persist.Engine(
+            "sqlite::memory:", alias, local_key_id=alias, local_key_path=seed
+        )
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        # The community_key_id + each member must FK a registered
+        # federation_keys row. Register as `primitive` — the put_community
+        # owner-binding gate (CC 3.2 UnownedCommunityMember) is exempt for
+        # primitive identities; agent/node members would need an owner-
+        # binding chain (which the conformance harness supplies in the real
+        # moderation flow, but isn't needed to prove the FFI admits a row).
+        kid = eng.register_self_federation_key("primitive", "ref", None, None, None)
+        now = "2026-06-25T00:00:00.000Z"
+        eng.put_community_json(
+            json.dumps(
+                {
+                    "community_key_id": kid,
+                    "community_name": "T",
+                    "members": [{"key_id": kid, "joined_at": now, "role": "founder"}],
+                    "founded_at": now,
+                    "consensus_protocol": "majority",
+                    "policy_blob": None,
+                    "persist_row_hash": "",
+                }
+            )
+        )
+        # The community now exists + is readable (the authority root the
+        # §11.10 moderation walk needs).
+        got = json.loads(eng.lookup_community_json(kid))
+        assert got["community_key_id"] == kid
+        assert any(m["key_id"] == kid for m in got["members"]), got
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()

@@ -6126,6 +6126,50 @@ impl PyEngine {
         })
     }
 
+    /// v10.4.0 (CIRISPersist#290) — admit a `Community` row, symmetric to
+    /// [`Self::put_family_json`]. The `put_community` backend trait method
+    /// has always existed; only the PyO3 exposure was missing — so from
+    /// Python there was no way to bring a community into existence, which
+    /// left the §11.10 moderation-authority walk's authority set always
+    /// empty (`is_named_moderator` / `moderators_of` could never resolve).
+    ///
+    /// `payload_json` is a **flat** `Community` object (not wrapped); like
+    /// the family path, `persist_row_hash` is backend-computed (pass `""`),
+    /// and `community_key_id` + each member `key_id` must FK a registered
+    /// `federation_keys` row.
+    fn put_community_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let community: crate::federation::Community = serde_json::from_str(payload_json)
+                .map_err(|e| PyValueError::new_err(format!("community decode: {e}")))?;
+            let signed = crate::federation::SignedCommunity { community };
+            py.detach(move || match &self.backend {
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .put_community(signed)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        backend
+                            .put_community(signed)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     /// v3.12.0 — fetch a single family by `family_key_id`. Returns
     /// JSON `Family` object or `None` (null).
     fn lookup_family_json(&self, py: Python<'_>, family_key_id: &str) -> PyResult<Option<String>> {
