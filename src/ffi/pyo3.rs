@@ -16819,6 +16819,66 @@ impl PyEngine {
         })
     }
 
+    /// v10.2.0 (CIRISPersist#281) — the audit chain HEAD for `tenant_id`:
+    /// the `(next_sequence_number, prev_hash)` a client must stamp onto the
+    /// next chained `AuditEntry` before [`Self::audit_record_entry`].
+    /// Returns JSON `{"next_sequence_number": <u64>, "prev_hash": "<64 hex
+    /// chars>"}`. A brand-new tenant chain returns `next_sequence_number = 1`
+    /// and the GENESIS `prev_hash` (32 zero bytes → 64 hex zeros).
+    ///
+    /// Exposes the internal `AuditService::next_chain_position` so a
+    /// cohabitation client (`LensAudit`, CIRISServer#93) can assemble a
+    /// valid entry over the wheel: `pos = audit_next_chain_position(tenant)`
+    /// → set `sequence_number = pos.next_sequence_number` / `prev_hash =
+    /// pos.prev_hash` → canonicalize → sign → `audit_record_entry`. Cleaner
+    /// (and pre-signable) than reconstructing it from `current_sth` (which
+    /// returns the Merkle tree head, NOT the per-entry `prev_hash`) plus a
+    /// tail `audit_list_entries`.
+    #[cfg(feature = "cirisaudit")]
+    fn audit_next_chain_position(&self, py: Python<'_>, tenant_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let tenant_id = tenant_id.to_owned();
+            py.detach(move || {
+                let pos = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::audit::AuditService;
+                            backend
+                                .next_chain_position(&tenant_id)
+                                .await
+                                .map_err(audit_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(_) => {
+                        let audit = self
+                            .sqlite_audit
+                            .as_ref()
+                            .expect(
+                                "v1.5.0 Phase H: sqlite_audit must be Some when backend is Sqlite",
+                            )
+                            .clone();
+                        runtime.block_on(async move {
+                            use crate::audit::AuditService;
+                            audit
+                                .next_chain_position(&tenant_id)
+                                .await
+                                .map_err(audit_err_to_py)
+                        })?
+                    }
+                };
+                Ok(serde_json::json!({
+                    "next_sequence_number": pos.next_sequence_number,
+                    "prev_hash": hex::encode(pos.prev_hash),
+                })
+                .to_string())
+            })
+        })
+    }
+
     /// v1.5.0 Phase H — Generate the full inclusion-proof bundle for
     /// a trust grant. Returns a JSON-serialized
     /// [`crate::federation::read::TrustGrantInclusionProof`] (sth +
