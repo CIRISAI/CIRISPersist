@@ -5,6 +5,12 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.2.2] — 2026-06-25
+
+### Changed — re-pin CIRISVerify v7.4.0 → v7.5.0 (wheel concurrence)
+
+- All six git-tag verify crates flipped in lockstep; family floor `version = "7"` unchanged; wheel `Requires-Dist` floor stays `ciris-verify>=7.0.0,<8`. v7.5.0 is a `ciris-keyring` build-portability fix — keyring builds on **musl** (CIRISVerify#127) + the wheel loads on **bare hosts** (CIRISVerify#125), plus verify's own CIRISCache CI adoption. No change to persist's consumed Rust APIs (`verify_hybrid` / `canonical` / `jcs` / `threshold` / `transparency` / `xchacha` / `hkdf` / `hmac` / `fedcode` / `accord_genesis`) — confirmed by a clean compile + full gate. Family-floor / wheel-concurrence re-pin only; no persist code change.
+
 ## [10.2.1] — 2026-06-25
 
 ### Fixed — #283: postgres `audit_log.action_type` CHECK rejected `consent_event` + `wisdom_based_deferral` (pg/sqlite parity)
