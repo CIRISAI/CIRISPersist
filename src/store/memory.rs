@@ -1289,6 +1289,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // emission leaves no trace.
         crate::federation::admission::check_node_agency_admission(self, &row).await?;
 
+        // v10.3.0 (CIRISPersist#288, CC 3.4.1/3.4.3/3.4.5) — reserved-prefix
+        // admission on the attestation_TYPE namespace, keyed on the attesting
+        // key's identity_type. Backend-symmetric with SQLite + Postgres.
+        crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
+
         // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
         // hybrid-verify at the federation-tier bulk store/replicate
         // ingest gate (parity with the postgres + sqlite backends). A
@@ -8638,5 +8643,114 @@ mod tests {
         assert!(inbound.iter().all(
             |a| a.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
         ));
+    }
+
+    /// #288 (CC 3.4.1/3.4.3/3.4.5) — reserved-prefix admission on the
+    /// attestation_TYPE, keyed on the attesting key's identity_type:
+    /// `accord:*`→accord_holder, `system:*`→substrate_persist,
+    /// `hard_case:*`→substrate_persist, `capacity:*`→no self-emission.
+    /// Reproduces the issue's three repro cases + the authorized contrast.
+    #[tokio::test]
+    async fn check_reserved_prefix_admission_enforces_cc_3_4_x_288() {
+        use crate::federation::admission::check_reserved_prefix_admission;
+        let backend = MemoryBackend::new();
+        for (k, it) in [
+            ("rp-agent", "agent"),
+            ("rp-accord", "accord_holder"),
+            ("rp-substrate", "substrate_persist"),
+        ] {
+            let mut rec = fix_key(k, "ref", k);
+            rec.identity_type = it.to_owned();
+            backend
+                .put_public_key(SignedKeyRecord { record: rec })
+                .await
+                .unwrap();
+        }
+        // Build a minimal row with a given type + attesting/attested keys.
+        // (The gate reads only attestation_type + attesting/attested key_id.)
+        let row = |attn: &str, attesting: &str, attested: &str| {
+            let mut a = fix_attestation("rp-att", attesting, attested, attesting);
+            a.attestation_type = attn.to_owned();
+            a
+        };
+
+        // accord:* — agent REJECTED (CC 3.4.1), accord_holder OK.
+        let e = check_reserved_prefix_admission(
+            &backend,
+            &row("accord:invoke:notify:x", "rp-agent", "rp-agent"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            e.kind(),
+            "federation_accord_dimension_requires_accord_holder"
+        );
+        check_reserved_prefix_admission(
+            &backend,
+            &row("accord:invoke:notify:x", "rp-accord", "rp-accord"),
+        )
+        .await
+        .expect("accord_holder may emit accord:*");
+
+        // capacity:* — self-emission REJECTED (CC 3.4.5); non-self OK (any id).
+        let e = check_reserved_prefix_admission(
+            &backend,
+            &row("capacity:composite", "rp-agent", "rp-agent"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.kind(), "federation_capacity_self_emission_rejected");
+        check_reserved_prefix_admission(
+            &backend,
+            &row("capacity:composite", "rp-agent", "rp-accord"),
+        )
+        .await
+        .expect("non-self capacity:* is allowed");
+
+        // system:* — agent REJECTED (CC 3.4.3), substrate_persist OK.
+        let e = check_reserved_prefix_admission(
+            &backend,
+            &row("system:audit_chain:hash_continuity", "rp-agent", "rp-agent"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
+        check_reserved_prefix_admission(
+            &backend,
+            &row(
+                "system:audit_chain:hash_continuity",
+                "rp-substrate",
+                "rp-substrate",
+            ),
+        )
+        .await
+        .expect("substrate_persist may emit system:*");
+
+        // hard_case:* — agent REJECTED, substrate_persist OK.
+        let e = check_reserved_prefix_admission(
+            &backend,
+            &row("hard_case:promotion_overdue", "rp-agent", "rp-agent"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
+        check_reserved_prefix_admission(
+            &backend,
+            &row(
+                "hard_case:promotion_overdue",
+                "rp-substrate",
+                "rp-substrate",
+            ),
+        )
+        .await
+        .expect("substrate_persist may emit hard_case:*");
+
+        // Non-reserved types fast-exit OK regardless of identity_type.
+        check_reserved_prefix_admission(&backend, &row("scores", "rp-agent", "rp-agent"))
+            .await
+            .expect("scores is not a reserved type");
+        check_reserved_prefix_admission(&backend, &row("delegates_to", "rp-agent", "rp-accord"))
+            .await
+            .expect("delegates_to is not a reserved type");
     }
 }

@@ -336,15 +336,14 @@ impl Default for DimensionAdmissionPolicy {
 ///   layer (see [`DimensionAdmissionPolicy::check`] Layer 1) so its
 ///   typed error variant stays distinct
 ///   ([`super::Error::AccordDimensionRequiresAccordHolder`]).
-/// - `capacity:*` self-emission rejection (CEG §7.5) is NOT in this
-///   table — it's an attester==attested check, not an identity-type
-///   check, and lives at the consumer composition layer per §7.5's
-///   anti-Goodhart commentary. The substrate's reserved-prefix gate
-///   doesn't enforce it because the substrate doesn't see the
-///   attester==attested distinction except at the row level (the
-///   `Attestation` row carries `attesting_key_id` + `attested_key_id`;
-///   the admission gate only knows the attester's identity-type, not
-///   whether the two keys are the same row).
+/// - `capacity:*` self-emission rejection (CEG §7.5 / CC 3.4.5) is NOT in
+///   this *dimension* table — it's an attester==attested check, not an
+///   identity-type check. As of v10.3.0 (CIRISPersist#288) it IS
+///   substrate-enforced, on the `attestation_type` namespace at the
+///   `put_attestation` chokepoint by
+///   [`check_reserved_prefix_admission`] (which sees the row-level
+///   `attesting_key_id` == `attested_key_id` distinction the
+///   identity-type-only `DimensionAdmissionPolicy::check` cannot).
 /// - `licensure:*` (CEG §7.3) is co-owned — the admission gate
 ///   doesn't reject single-source emissions; per §7.3, consumers
 ///   mark them `confidence ≤ 0.5` until the second co-owner attests.
@@ -2941,6 +2940,95 @@ pub async fn check_node_agency_admission(
         attested_key_id: row.attested_key_id.clone(),
         offending_scopes,
     })
+}
+
+/// v10.3.0 (CIRISPersist#288, CC 3.4.1 / 3.4.3 / 3.4.5) — reserved-prefix
+/// admission on the **`attestation_type`** namespace, keyed on the attesting
+/// key's `identity_type`.
+///
+/// The Constitution reserves whole `attestation_type` prefixes to specific
+/// emitter classes. The pre-existing [`DimensionAdmissionPolicy::check`] only
+/// gates the **`dimension`** field of `scores` rows — so an attestation whose
+/// **type** is `accord:invoke:*` / `system:audit_chain:*` / `capacity:*`
+/// slipped through unchecked (any `identity_type` could emit it). This gate
+/// closes that, at the `put_attestation` chokepoint (so it covers
+/// `emit_attestation` / `emit_attestation_self` / direct writes / replicated
+/// rows alike — keyed on the *attesting* key's identity_type, which is
+/// node-independent):
+///
+/// - `accord:*` → `accord_holder` only (CC 3.4.1 — the one constitutional
+///   asymmetry).
+/// - `system:*` / `audit_chain:*` / `corpus_health:*` / … → per the
+///   [`default_reserved_prefix_rules`] table (CC 3.4.3 — substrate-self-report).
+/// - `hard_case:*` → `substrate_persist` only (substrate-emitted).
+/// - `capacity:*` → MUST NOT be self-emitted (`attesting_key_id ==
+///   attested_key_id`) — CC 3.4.5's "Critical enforcement" anti-Goodhart rule
+///   (an `identity_type`-independent attester==attested check).
+///
+/// Structural primitives (`scores` / `delegates_to` / `supersedes` /
+/// `withdraws` / `recants`) and any non-reserved type fast-exit with no
+/// directory lookup.
+pub async fn check_reserved_prefix_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    use super::types::identity_type;
+    let at = row.attestation_type.as_str();
+
+    // CC 3.4.5 — capacity:* self-emission. Cheapest check (no lookup); an
+    // attester==attested rule independent of identity_type.
+    if at.starts_with("capacity:") && row.attesting_key_id == row.attested_key_id {
+        return Err(Error::CapacitySelfEmissionRejected {
+            key_id: row.attesting_key_id.clone(),
+            attestation_type: at.to_owned(),
+        });
+    }
+
+    // Which (if any) identity-gated reserved prefix does the TYPE carry?
+    let is_accord = at.starts_with("accord:");
+    let is_hard_case = at.starts_with("hard_case:");
+    let matched_rule = default_reserved_prefix_rules()
+        .into_iter()
+        .find(|r| at.starts_with(r.pattern_prefix.as_str()));
+    if !is_accord && !is_hard_case && matched_rule.is_none() {
+        return Ok(()); // not a reserved type — no lookup needed.
+    }
+
+    // Resolve the attester's identity_type (an unregistered/unknown attester
+    // resolves to "" — fail-secure: it satisfies no reserved-prefix rule).
+    let got = directory
+        .lookup_public_key(&row.attesting_key_id)
+        .await?
+        .map(|k| k.identity_type)
+        .unwrap_or_default();
+
+    if is_accord && got != identity_type::ACCORD_HOLDER {
+        return Err(Error::AccordDimensionRequiresAccordHolder {
+            dimension: at.to_owned(),
+            identity_type: got,
+        });
+    }
+    if is_hard_case && got != identity_type::SUBSTRATE_PERSIST {
+        return Err(Error::ReservedPrefixEmitterMismatch {
+            dimension: at.to_owned(),
+            prefix: "hard_case:".to_owned(),
+            required: vec![identity_type::SUBSTRATE_PERSIST.to_owned()],
+            got_identity_type: got,
+        });
+    }
+    if let Some(rule) = matched_rule {
+        if !rule.required_identity_types.contains(&got) {
+            let mut required = rule.required_identity_types.clone();
+            required.sort();
+            return Err(Error::ReservedPrefixEmitterMismatch {
+                dimension: at.to_owned(),
+                prefix: rule.pattern_prefix.clone(),
+                required,
+                got_identity_type: got,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

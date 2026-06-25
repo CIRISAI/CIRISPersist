@@ -22812,7 +22812,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // v3.0.0 (CIRISPersist#116, CEG 0.2 §7.0) — reserved-prefix
         // emitter mismatch is caller-fault malformed-content; same
         // shape as the other admission-gate rejections.
-        crate::federation::Error::ReservedPrefixEmitterMismatch { .. } => {
+        // v10.3.0 (#288, CC 3.4.5) — capacity:* self-emission is the same
+        // admission-gate-rejection shape (caller-fault, ValueError).
+        crate::federation::Error::ReservedPrefixEmitterMismatch { .. }
+        | crate::federation::Error::CapacitySelfEmissionRejected { .. } => {
             PyValueError::new_err(kind)
         }
         // v3.9.1 (CIRISPersist#150 Ask 3) — cohort_scope admission
