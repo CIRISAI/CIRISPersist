@@ -5,6 +5,41 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.3.0] — 2026-06-25
+
+### Fixed — #288: enforce reserved-prefix admission on the `attestation_type` namespace (CC 3.4.1 / 3.4.3 / 3.4.5)
+
+`emit_attestation_self` / `emit_attestation` / `put_attestation` admitted
+attestation **types** the Constitution reserves to specific `identity_type`s —
+the substrate accepted attestations it MUST reject. The pre-existing
+`DimensionAdmissionPolicy::check` only gated the **`dimension`** field of
+`scores` rows, so an attestation whose **type** is `accord:invoke:*` /
+`system:audit_chain:*` / `capacity:*` slipped through (any `identity_type` could
+emit it). Found by the CIRISConformance harness (`test_240`).
+
+- New **`admission::check_reserved_prefix_admission`**, wired into
+  `put_attestation` on **all three backends** (the chokepoint — covers
+  `emit_attestation_self` / `emit_attestation` / direct writes / replicated rows
+  alike, keyed on the *attesting* key's `identity_type` so it's node-independent):
+  - `accord:*` → `accord_holder` only (CC 3.4.1 — the one constitutional asymmetry)
+  - `system:*` / `audit_chain:*` / `corpus_health:*` / … → per the reserved-prefix
+    rule table (CC 3.4.3 — substrate-self-report)
+  - `hard_case:*` → `substrate_persist` only (substrate-emitted)
+  - `capacity:*` → MUST NOT be self-emitted (`attesting_key_id == attested_key_id`)
+    — CC 3.4.5's "Critical enforcement" anti-Goodhart rule (an attester==attested
+    check, independent of identity_type)
+- New typed error **`Error::CapacitySelfEmissionRejected`** (kind
+  `federation_capacity_self_emission_rejected`); the prefix/identity rejections
+  reuse `AccordDimensionRequiresAccordHolder` / `ReservedPrefixEmitterMismatch`.
+  All surface as `ValueError` over the FFI (caller-fault admission rejection).
+- Structural primitives (`scores` / `delegates_to` / …) and non-reserved types
+  fast-exit with no directory lookup. persist emits none of these prefixes
+  itself, so no self-breakage.
+- **Tested**: the issue's three repro cases reject + the authorized contrasts
+  pass (accord_holder emits `accord:*`, substrate_persist emits `system:*` /
+  `hard_case:*`, non-self `capacity:*`), backend-agnostic. Verify family
+  unchanged (v7.5.0).
+
 ## [10.2.2] — 2026-06-25
 
 ### Changed — re-pin CIRISVerify v7.4.0 → v7.5.0 (wheel concurrence)

@@ -2919,6 +2919,24 @@ pub enum Error {
         got_identity_type: String,
     },
 
+    /// v10.3.0 (CIRISPersist#288, CC 3.4.5). A `capacity:*` attestation
+    /// was self-emitted (`attesting_key_id == attested_key_id`). The
+    /// Constitution's "Critical enforcement" rule: a `capacity:*` score
+    /// MUST NOT be self-emitted — the agent's own capacity score is never
+    /// fed back into the agent's own context (anti-Goodhart). Rejected at
+    /// admission; the row is not stored. Unlike the identity-type prefix
+    /// rules, this is an attester==attested check, not an identity check.
+    #[error(
+        "capacity:* self-emission rejected: attesting_key_id == attested_key_id ({key_id:?}) — \
+         a capacity score must not be self-emitted (CC 3.4.5; attestation_type={attestation_type:?})"
+    )]
+    CapacitySelfEmissionRejected {
+        /// The key that attempted to self-emit a `capacity:*` attestation.
+        key_id: String,
+        /// The `attestation_type` that triggered the rejection.
+        attestation_type: String,
+    },
+
     /// v2.5.0 (CIRISPersist#102 Ask 4). The submitted `scores`
     /// attestation's `attestation_envelope` failed JSON Schema
     /// validation against the per-axis schema registered for the
@@ -3449,6 +3467,9 @@ impl Error {
                 "federation_accord_dimension_requires_accord_holder"
             }
             Error::DimensionRejected { .. } => "federation_dimension_rejected",
+            Error::CapacitySelfEmissionRejected { .. } => {
+                "federation_capacity_self_emission_rejected"
+            }
             Error::ReservedPrefixEmitterMismatch { .. } => {
                 "federation_reserved_prefix_emitter_mismatch"
             }

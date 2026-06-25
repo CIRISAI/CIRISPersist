@@ -2166,6 +2166,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // trace.
         crate::federation::admission::check_node_agency_admission(self, &row).await?;
 
+        // v10.3.0 (CIRISPersist#288, CC 3.4.1/3.4.3/3.4.5) — reserved-prefix
+        // admission on the attestation_TYPE namespace (accord:* → accord_holder;
+        // system:*/audit_chain:*/… → substrate-self-report; hard_case:* →
+        // substrate_persist; capacity:* → no self-emission), keyed on the
+        // attesting key's identity_type. Runs BEFORE persist_row_hash + INSERT
+        // so a rejected emission leaves no trace.
+        crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
+
         // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
         // hybrid-verify at the federation-tier bulk store/replicate
         // ingest gate (parity with the postgres + memory backends). A
