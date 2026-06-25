@@ -1654,6 +1654,46 @@ mod tests {
         entry
     }
 
+    /// v10.2.0 (CIRISPersist#281) — `next_chain_position` exposes the
+    /// chain HEAD a client stamps onto the next entry (the value the
+    /// `audit_next_chain_position` PyO3 binding returns): GENESIS
+    /// `(1, zeros)` for a fresh tenant, then `(tail_seq + 1, tail.entry_hash)`
+    /// after a record. This is the exact pair LensAudit needs to build a
+    /// valid entry (CIRISServer#93).
+    #[tokio::test]
+    async fn next_chain_position_genesis_then_increment() {
+        let (_b, audit) = fresh_backend().await;
+        let key = SigningKey::from_bytes(&[0xC2; 32]);
+        let tenant = format!("ncp-{}", Uuid::new_v4().simple());
+
+        // Fresh chain → (1, GENESIS_PREV_HASH).
+        let g = audit.next_chain_position(&tenant).await.unwrap();
+        assert_eq!(g.next_sequence_number, 1, "fresh chain starts at seq 1");
+        assert_eq!(
+            g.prev_hash, GENESIS_PREV_HASH,
+            "fresh chain prev_hash is genesis"
+        );
+
+        // Record entry 1 AT the genesis position the reader handed back.
+        let e1 = build_and_sign(
+            &key,
+            &tenant,
+            g.next_sequence_number,
+            g.prev_hash.to_vec(),
+            "config_change",
+        );
+        audit.record_entry(e1.clone()).await.unwrap();
+
+        // Head advances to (2, e1.entry_hash).
+        let p = audit.next_chain_position(&tenant).await.unwrap();
+        assert_eq!(p.next_sequence_number, 2, "head advances to tail_seq + 1");
+        assert_eq!(
+            p.prev_hash.to_vec(),
+            e1.entry_hash,
+            "head prev_hash is tail.entry_hash"
+        );
+    }
+
     /// v0.8.5 SQLite parity: same lifecycle as the v0.8.1 Postgres
     /// audit test, run against in-memory SQLite.
     #[tokio::test]

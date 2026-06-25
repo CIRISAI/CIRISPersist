@@ -5,6 +5,33 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.2.0] — 2026-06-25
+
+### Added — #281: `audit_next_chain_position` PyO3 binding (audit chain head)
+
+`audit_record_entry` requires the client to supply a fully-formed chained
+entry (`sequence_number == tail_seq + 1`, `prev_hash == previous entry_hash`,
+GENESIS = 32 zero bytes for the first). persist computes this internally
+(`AuditService::next_chain_position`) but it was **not on the PyO3 surface**,
+so CIRISServer's cohabitation `LensAudit.log_*` could not assemble a valid
+entry over the wheel (it sent `sequence_number = 0` / empty `prev_hash`, which
+`audit_record_entry` rejects) — leaving the **D02/D23 audit-chain controls
+with no working wheel implementation** (CIRISServer#93, found by the
+CIRISConformance harness).
+
+- New **`Engine.audit_next_chain_position(tenant_id) -> str`** (JSON
+  `{"next_sequence_number": <u64>, "prev_hash": "<64 hex chars>"}`),
+  `#[cfg(feature = "cirisaudit")]`, dispatching to the existing
+  `AuditService::next_chain_position` (Postgres backend / `sqlite_audit`).
+  A fresh tenant chain returns `next_sequence_number = 1` and the GENESIS
+  `prev_hash` (32 zero bytes → 64 hex zeros). The LensAudit flow is then:
+  `pos = audit_next_chain_position(tenant)` → set `sequence_number` /
+  `prev_hash` → canonicalize → sign → `audit_record_entry`; first entry lands
+  at sequence 1 and `audit_verify_chain` verifies. Additive — no change to the
+  existing audit surface.
+- **Tested**: `next_chain_position_genesis_then_increment` (genesis `(1, zeros)`
+  → record → head advances to `(2, tail.entry_hash)`).
+
 ## [10.1.2] — 2026-06-24
 
 ### Changed — re-pin CIRISVerify v7.2.0 → v7.4.0 (wheel concurrence)
