@@ -1469,7 +1469,7 @@ async fn issuer_reaches_target_via_scoped_delegation(
 ///
 /// This is the general primitive every delegated-duty reader specializes:
 /// [`moderators_of`] / [`is_named_moderator`] root it at a community
-/// authority set, [`owner_bindings_of`] / [`owner_binding_chain`] read the
+/// authority set, [`steward_bindings_of`] / [`steward_binding_chain`] read the
 /// human anchor, and `duty_holders_*` compose it per target. It is a thin
 /// `pub` wrapper over the private predicate walk
 /// [`issuer_reaches_target_via_scoped_delegation`] with a singleton target
@@ -1705,7 +1705,7 @@ pub async fn reachable_under_scope_with_reasons(
 /// `scope_token`, under the same [`DelegationWalkPolicy`] (attenuation +
 /// `sub_delegation`-gated deputization + withdrawn-edge skipping + depth
 /// cap). The returned set EXCLUDES `issuer` itself (the caller adds the
-/// owner-bound roots separately) — it is exactly the set of delegates the
+/// steward-bound roots separately) — it is exactly the set of delegates the
 /// `issuer` root empowers under `scope_token`.
 ///
 /// Identical BFS to the predicate (same edge filters, same per-node
@@ -2038,7 +2038,7 @@ pub async fn check_withdraws_admission(
 //
 // v8.7.1 (CIRISPersist#233) REPLACES the v8.7.0 `on_behalf_of`-field model
 // entirely. RC24 §11.10 pins the principal as the chain ROOT discovered by
-// walking UP from `attesting_key_id` to an owner-bound scoped duty-holder —
+// walking UP from `attesting_key_id` to an steward-bound scoped duty-holder —
 // NOT a payload field. The v8.7.0 absent/empty/self ⇒ admit path WAS the
 // bypass: CIRISServer#15 never emits `on_behalf_of` (not a spec field), so
 // every emission hit the as-self admit path and the authority check never
@@ -2052,7 +2052,7 @@ pub async fn check_withdraws_admission(
 //       scope-bearing `delegates_to` chain `root →* attesting_key_id`
 //       (every edge `scope ⊇ {duty}`, `⊆`-parent attenuation,
 //       `sub_delegation`-gated deputization, depth ≤ 5, no `withdraws`-
-//       revoked edge) AND `is_owner_bound(root)`.
+//       revoked edge) AND `is_steward_bound(root)`.
 //   else REJECT. Absence is NEVER an admit condition.
 
 /// v8.7.0 (CIRISPersist#232, CEG §11.10) — reserved `scores` dimension
@@ -2082,7 +2082,7 @@ pub const RECONSIDERATION_DIMENSION_PREFIX: &str = "reconsideration:";
 pub const MAX_MODERATION_DELEGATION_DEPTH: usize = 5;
 
 /// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §5.6.8.10) — is key `k`
-/// **owner-bound**? A moderation chain ROOT must terminate in a real human
+/// **steward-bound**? A moderation chain ROOT must terminate in a real human
 /// (a `user`-role identity), never a free-floating agent/service key — the
 /// §11.10 "takedown isn't a coup" anchor. True iff ANY of:
 ///
@@ -2097,15 +2097,15 @@ pub const MAX_MODERATION_DELEGATION_DEPTH: usize = 5;
 ///      delegation the granter has `withdraws`/`recants`-retracted against
 ///      `k` (the §11.10 edge-retraction model) AND one whose `expires_at`
 ///      has passed (SecReview F3) — a revoked or lapsed edge confers no
-///      owner-binding.
+///      steward-binding.
 ///
 /// A key whose chain to a `user` identity cannot be shown is NOT
-/// owner-bound and cannot root a moderation duty (fail-closed). Authority
+/// steward-bound and cannot root a moderation duty (fail-closed). Authority
 /// that the `user`-role key genuinely is a human is consumer/registry
 /// policy (§5.6.8.10 normative-honesty); persist resolves it structurally
 /// over the `federation_keys` `identity_type` set + occurrence + delegation
 /// graph that are already present.
-pub async fn is_owner_bound(
+pub async fn is_steward_bound(
     directory: &dyn super::FederationDirectory,
     k: &str,
 ) -> Result<bool, Error> {
@@ -2126,7 +2126,7 @@ pub async fn is_owner_bound(
     }
     // (3) a LIVE `delegates_to(U → k)` with U user-role. k's INCOMING
     //     attestations name the granter as `attesting_key_id`. A delegation
-    //     edge confers owner-binding ONLY while genuinely live (SecReview
+    //     edge confers steward-binding ONLY while genuinely live (SecReview
     //     F3): skip it if (a) the granter has `withdraws`/`recants`-retracted
     //     it (reusing the §11.10 edge-retraction bucketing the MODERATION_DUTY
     //     walk uses — a retraction names the recipient `k` as
@@ -2169,11 +2169,11 @@ pub async fn is_owner_bound(
     Ok(false)
 }
 
-/// #249 Cut B — the **enumeration** of [`is_owner_bound`]: the `user`-role
-/// key(s) that owner-bind `k` (who `k` is owner-bound TO). Collects every
+/// #249 Cut B — the **enumeration** of [`is_steward_bound`]: the `user`-role
+/// key(s) that steward-bind `k` (who `k` is steward-bound TO). Collects every
 /// human anchor across the same three clauses the predicate tests:
 ///
-///   1. `k`'s OWN key is `user`-role → `k` owner-binds itself (`k` is in the
+///   1. `k`'s OWN key is `user`-role → `k` steward-binds itself (`k` is in the
 ///      set); AND/OR
 ///   2. `k` is an occurrence of a `user`-role identity → that identity key;
 ///      AND/OR
@@ -2181,11 +2181,11 @@ pub async fn is_owner_bound(
 ///      `user`-role (live = not `withdraws`/`recants`-retracted against `k`
 ///      by `U`, and not expired) → `U`.
 ///
-/// Consistency: `is_owner_bound(k)` ⟺ `!owner_bindings_of(k).is_empty()` —
+/// Consistency: `is_steward_bound(k)` ⟺ `!steward_bindings_of(k).is_empty()` —
 /// the predicate returns true iff ANY clause holds, and this returns the
 /// union of all satisfying anchors (deduped, sorted). An unbound `k` yields
 /// the empty set.
-pub async fn owner_bindings_of(
+pub async fn steward_bindings_of(
     directory: &dyn super::FederationDirectory,
     k: &str,
 ) -> Result<Vec<String>, Error> {
@@ -2240,26 +2240,97 @@ pub async fn owner_bindings_of(
     Ok(out)
 }
 
-/// #249 Cut B — the owner-binding **PATH** for audit: the actual delegation
-/// chain `user → … → key_id` that owner-binds `key_id`, anchor-first (the
-/// human `user`-role key at index 0, `key_id` last). Where
-/// [`owner_bindings_of`] returns just the human ENDPOINTS, this returns the
-/// resolving path so a consumer can show WHY a key is owner-bound.
+/// CIRISPersist#299 — the **outbound** steward-binding projection: the nodes a
+/// `user`-role key owns. The exact inverse of [`steward_bindings_of`]:
 ///
-/// Resolves the FIRST satisfying clause in [`is_owner_bound`]'s precedence
-/// order (so `!owner_binding_chain(k).is_empty()` ⟺ `is_owner_bound(k)`):
+/// ```text
+/// n ∈ nodes_stewarded_by(U)  ⟺  U ∈ steward_bindings_of(n)
+/// ```
+///
+/// Consumers (CIRISServer's `auth::ownership::nodes_stewarded_by`, driving the
+/// client node-switcher `GET /v1/setup/owned-nodes`) used to hand-roll this:
+/// scan `U`'s outgoing `delegates_to` edges, then confirm each candidate back
+/// through `steward_bindings_of` — re-deriving liveness/retraction/role
+/// semantics at the consumer and missing the occurrence half. This folds it
+/// into one substrate reader, with **read-after-write correctness owned where
+/// the objects live**.
+///
+/// Implementation enumerates the candidate nodes `U` could steward-bind, then
+/// **confirms each via [`steward_bindings_of`]** (the single source of truth) —
+/// so the inverse property holds by construction and the
+/// liveness/`withdraws`/`recants`-retraction/live-`user`-role-anchor logic is
+/// inherited verbatim, never re-implemented. Candidates:
+///
+///   * **clause (3)** — `U`'s OUTGOING `delegates_to` edges → each recipient
+///     (`list_attestations_by(U)`);
+///   * **clause (2)** — occurrences that speak for identity `U`
+///     (`list_identity_occurrences_for(U)`);
+///   * **clause (1)** — `U` itself (so the invariant holds exactly: `U` is
+///     returned iff `U` is `user`-role, i.e. `U` steward-binds itself). A
+///     consumer wanting "nodes OTHER than me" filters `== U` — that's a
+///     presentation choice, not substrate policy.
+///
+/// Returns the deduped, sorted set; empty when `U` owns nothing (or isn't a
+/// live `user`-role anchor — `steward_bindings_of` fails each candidate closed).
+pub async fn nodes_stewarded_by(
+    directory: &dyn super::FederationDirectory,
+    steward_user_key_id: &str,
+) -> Result<Vec<String>, Error> {
+    // Enumerate candidate nodes (cheap, indexed reads) — NOT a full scan.
+    let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // (3) U's outgoing delegates_to edges → recipients.
+    for r in directory.list_attestations_by(steward_user_key_id).await? {
+        if r.attestation_type == attestation_type::DELEGATES_TO {
+            candidates.insert(r.attested_key_id);
+        }
+    }
+    // (2) occurrences speaking for identity U.
+    for occ in directory
+        .list_identity_occurrences_for(steward_user_key_id)
+        .await?
+    {
+        candidates.insert(occ.occurrence_key_id);
+    }
+    // (1) U itself (exact-inverse: U owns U iff U is user-role).
+    candidates.insert(steward_user_key_id.to_owned());
+
+    // Confirm each candidate through steward_bindings_of — the inverse is exact
+    // because membership is decided by the SAME predicate, never a re-derived
+    // copy of its liveness/retraction/role rules.
+    let mut out: Vec<String> = Vec::new();
+    for cand in candidates {
+        if steward_bindings_of(directory, &cand)
+            .await?
+            .iter()
+            .any(|anchor| anchor == steward_user_key_id)
+        {
+            out.push(cand);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// #249 Cut B — the steward-binding **PATH** for audit: the actual delegation
+/// chain `user → … → key_id` that steward-binds `key_id`, anchor-first (the
+/// human `user`-role key at index 0, `key_id` last). Where
+/// [`steward_bindings_of`] returns just the human ENDPOINTS, this returns the
+/// resolving path so a consumer can show WHY a key is steward-bound.
+///
+/// Resolves the FIRST satisfying clause in [`is_steward_bound`]'s precedence
+/// order (so `!steward_binding_chain(k).is_empty()` ⟺ `is_steward_bound(k)`):
 ///   1. `k` is itself `user`-role → `[k]` (the key IS the human anchor).
 ///   2. `k` is an occurrence of a `user`-role identity → `[identity, k]`.
 ///   3. a **live** `delegates_to(U → k)` with `U` `user`-role (not
 ///      `withdraws`/`recants`-retracted against `k`, not expired) →
-///      `[U, k]`. The §11.10 owner-binding clause (3) is a DIRECT incoming
+///      `[U, k]`. The §11.10 steward-binding clause (3) is a DIRECT incoming
 ///      edge (same as the predicate), so the delegated path is one hop; a
-///      multi-hop human→…→k owner-binding is not part of the predicate and
+///      multi-hop human→…→k steward-binding is not part of the predicate and
 ///      is not synthesized here.
 ///
-/// Returns the empty vec when `k` is not owner-bound (fail-closed, mirrors
+/// Returns the empty vec when `k` is not steward-bound (fail-closed, mirrors
 /// the predicate).
-pub async fn owner_binding_chain(
+pub async fn steward_binding_chain(
     directory: &dyn super::FederationDirectory,
     key_id: &str,
 ) -> Result<Vec<String>, Error> {
@@ -2279,7 +2350,7 @@ pub async fn owner_binding_chain(
     }
     // (3) a LIVE delegates_to(U → k) with U user-role — U → k. Lowest
     //     granter key_id first for a deterministic path when several humans
-    //     delegate to k (consistent with the sorted `owner_bindings_of`).
+    //     delegate to k (consistent with the sorted `steward_bindings_of`).
     let now = chrono::Utc::now();
     let mut anchors: Vec<String> = Vec::new();
     for r in directory.list_attestations_for(key_id).await? {
@@ -2318,7 +2389,7 @@ pub async fn owner_binding_chain(
 }
 
 /// v9.0.0 SecReview F2 (CC 3.2 / CC 4.4.3.2.1) — is `community` an
-/// **authorized** infrastructure community whose carve-outs (owner-binding
+/// **authorized** infrastructure community whose carve-outs (steward-binding
 /// exemption + Commons-plaintext opt-out) may be honored?
 ///
 /// A `cohort_subkind: infrastructure` label is honored ONLY IF the
@@ -2330,13 +2401,13 @@ pub async fn owner_binding_chain(
 /// ([`default_reserved_prefix_rules`]). CC 3.2 reserves the infrastructure
 /// carve-out for genuine governance / trust roots (`ciris-canonical`);
 /// without this check ANY caller could self-label a community
-/// `infrastructure` to (a) skip the owner-binding gate and (b) force its
+/// `infrastructure` to (a) skip the steward-binding gate and (b) force its
 /// content to Commons-plaintext (no DEK).
 ///
 /// **Fail-secure:** a community labeled `infrastructure` whose key does
 /// NOT resolve to `substrate_persist` (or does not resolve at all) returns
 /// `false` — the label is NOT honored, so the caller falls through to the
-/// STRICTER non-infra path (owner-binding REQUIRED + DEK cascade applies).
+/// STRICTER non-infra path (steward-binding REQUIRED + DEK cascade applies).
 /// An unauthorized infra label can only ever get the stricter treatment,
 /// never the weaker one.
 pub async fn is_authorized_infrastructure_community<F>(
@@ -2369,13 +2440,13 @@ where
     }
 }
 
-/// v9.0.0 (CC 3.2 "owner-binding gate for non-infrastructure membership"
+/// v9.0.0 (CC 3.2 "steward-binding gate for non-infrastructure membership"
 /// / CC 3.4.7.1) — the community-admission precondition: a `node`- or
 /// `agent`-role roster member of a **non-infrastructure** community MUST
-/// be owner-bound ([`is_owner_bound`]) before admission. Non-infra
+/// be steward-bound ([`is_steward_bound`]) before admission. Non-infra
 /// membership is an *authority act* (standing to speak AS the group),
 /// and CC 1.13.2 requires authority to root in an accountable human — a
-/// fresh, unowned node/agent is **canonical-trust-and-serve only** until
+/// fresh, unstewarded node/agent is **canonical-trust-and-serve only** until
 /// owned. This is a **precondition**, not a substitute for the community's
 /// own `consensus_protocol` vote (which still governs *whether* an owned
 /// key is admitted).
@@ -2384,33 +2455,33 @@ where
 ///
 /// `cohort_subkind: infrastructure` communities (`ciris-canonical` /
 /// operator governance roots) are **EXEMPT** — a node MAY trust + serve
-/// an infrastructure community with no owner (CC 3.2 "Trust ≠
+/// an infrastructure community with no steward (CC 3.2 "Trust ≠
 /// membership"). The label is honored ONLY when
 /// [`is_authorized_infrastructure_community`] holds (the community's own
 /// key resolves to the `substrate_persist` governance authority, SecReview
 /// F2); a self-labeled infra community whose key is not `substrate_persist`
-/// gets the strict owner-binding treatment. For every other community this
+/// gets the strict steward-binding treatment. For every other community this
 /// gate runs per roster member.
 ///
 /// A member key that does NOT resolve in `federation_keys`, or whose
 /// `identity_type` set contains NEITHER `node` NOR `agent` (e.g. a pure
 /// `user`/`org` member, or an unrecognized future role), is **out of
 /// scope** — the gate constrains only node/agent standing. A `user`-role
-/// member trivially satisfies `is_owner_bound` (clause 1) and is never
+/// member trivially satisfies `is_steward_bound` (clause 1) and is never
 /// rejected here.
 ///
-/// Fail-secure: the FIRST node/agent member lacking a live owner-binding
-/// rejects the whole `put_community` with [`Error::UnownedCommunityMember`]
+/// Fail-secure: the FIRST node/agent member lacking a live steward-binding
+/// rejects the whole `put_community` with [`Error::UnstewardedCommunityMember`]
 /// BEFORE any row is stored (verify-before-mutation, AV-9).
-pub async fn check_community_membership_owner_binding(
+pub async fn check_community_membership_steward_binding(
     directory: &dyn super::FederationDirectory,
     community: &super::Community,
 ) -> Result<(), Error> {
-    // Infrastructure carve-out: trust + serve needs no owner (CC 3.2) —
+    // Infrastructure carve-out: trust + serve needs no steward (CC 3.2) —
     // honored ONLY for an AUTHORIZED infrastructure community (its own key
     // is the `substrate_persist` governance authority). A self-labeled
     // infra community whose key is NOT substrate_persist falls through to
-    // the strict owner-binding path below (SecReview F2, fail-secure).
+    // the strict steward-binding path below (SecReview F2, fail-secure).
     if is_authorized_infrastructure_community(directory, community).await? {
         return Ok(());
     }
@@ -2430,8 +2501,8 @@ pub async fn check_community_membership_owner_binding(
         } else {
             continue;
         };
-        if !is_owner_bound(directory, &member.key_id).await? {
-            return Err(Error::UnownedCommunityMember {
+        if !is_steward_bound(directory, &member.key_id).await? {
+            return Err(Error::UnstewardedCommunityMember {
                 community_key_id: community.community_key_id.clone(),
                 member_key_id: member.key_id.clone(),
                 member_role,
@@ -2452,7 +2523,7 @@ pub async fn check_community_membership_owner_binding(
 ///     `consensus_protocol` signers (resolved from the
 ///     [`Community`](crate::federation::types::Community) record via
 ///     [`FederationDirectory::lookup_community`]), AND
-///   - `is_owner_bound(root)`.
+///   - `is_steward_bound(root)`.
 ///
 /// A zero-hop appointment (`root == k`, root directly in the authority set)
 /// is admitted — a founder IS a named moderator of their own community. The
@@ -2462,7 +2533,7 @@ pub async fn check_community_membership_owner_binding(
 ///
 /// `community_id` is the community's `community_key_id`. Returns `false`
 /// (never errors) when the community is unknown, declares no authority set,
-/// or no owner-bound authority reaches `k` — fail-closed.
+/// or no steward-bound authority reaches `k` — fail-closed.
 ///
 /// [`MODERATION_DUTY`]: DelegationWalkPolicy::MODERATION_DUTY
 pub async fn is_named_moderator(
@@ -2474,11 +2545,11 @@ pub async fn is_named_moderator(
     let authority = community_authority_set(directory, community_id).await?;
     let target: std::collections::HashSet<String> = std::iter::once(k.to_owned()).collect();
     for root in authority {
-        // Owner-binding of the root is REQUIRED (§11.11 → §5.6.8.10).
-        if !is_owner_bound(directory, &root).await? {
+        // Steward-binding of the root is REQUIRED (§11.11 → §5.6.8.10).
+        if !is_steward_bound(directory, &root).await? {
             continue;
         }
-        // Zero-hop: the owner-bound authority IS the named moderator.
+        // Zero-hop: the steward-bound authority IS the named moderator.
         if root == k {
             return Ok(true);
         }
@@ -2501,21 +2572,21 @@ pub async fn is_named_moderator(
 
 /// #249 Cut B — the **enumeration** of [`is_named_moderator`]: the FULL
 /// named-moderator set of community `community_id` for `duty` — the
-/// owner-bound authority roots ∪ every delegate they reach via a live
+/// steward-bound authority roots ∪ every delegate they reach via a live
 /// `duty`-scoped `delegates_to` chain (the same [`MODERATION_DUTY`] walk
 /// `is_named_moderator` probes, but accumulated instead of target-tested).
 ///
 /// For each root in the community authority set
-/// ([`community_authority_set`]) that [`is_owner_bound`], the root itself is
+/// ([`community_authority_set`]) that [`is_steward_bound`], the root itself is
 /// a named moderator (zero-hop founder) AND every key it reaches under the
 /// §11.10 scoped walk
 /// ([`enumerate_scoped_delegation_reach`]) is one too. Returns the deduped
 /// key_id set (sorted for a deterministic surface). Consistency with the
 /// predicate: `is_named_moderator(k, …)` ⟺ `k ∈ moderators_of(…)`, because
-/// both compose the SAME authority set, the SAME owner-binding gate, and the
+/// both compose the SAME authority set, the SAME steward-binding gate, and the
 /// SAME scoped-reach walk.
 ///
-/// Fail-closed: an unknown community / no owner-bound authority yields the
+/// Fail-closed: an unknown community / no steward-bound authority yields the
 /// empty set (no named moderators), never an error.
 pub async fn moderators_of(
     directory: &dyn super::FederationDirectory,
@@ -2525,12 +2596,12 @@ pub async fn moderators_of(
     let authority = community_authority_set(directory, community_id).await?;
     let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
     for root in authority {
-        // Owner-binding of the root is REQUIRED (§11.11 → §5.6.8.10) — a
-        // non-owner-bound authority roots no moderation duty.
-        if !is_owner_bound(directory, &root).await? {
+        // Steward-binding of the root is REQUIRED (§11.11 → §5.6.8.10) — a
+        // non-steward-bound authority roots no moderation duty.
+        if !is_steward_bound(directory, &root).await? {
             continue;
         }
-        // Zero-hop: the owner-bound authority IS a named moderator.
+        // Zero-hop: the steward-bound authority IS a named moderator.
         // Then every delegate it reaches under the duty-scoped walk.
         let reach = enumerate_scoped_delegation_reach(
             directory,
@@ -2597,7 +2668,7 @@ pub const MEMBER_ROLE_FOUNDER: &str = "founder";
 ///
 ///   (a) **as-self** — `signer ∈ duty_holders` (it itself holds the duty
 ///       over the target), OR
-///   (b) **delegated** — ∃ `root ∈ duty_holders` that `is_owner_bound`
+///   (b) **delegated** — ∃ `root ∈ duty_holders` that `is_steward_bound`
 ///       AND reaches `signer` via a live `duty`-scoped chain under the
 ///       [`MODERATION_DUTY`] walk policy (every edge `scope ⊇ {duty}`,
 ///       `⊆`-parent attenuation, `sub_delegation`-gated deputization,
@@ -2628,11 +2699,11 @@ pub async fn check_moderation_admission(
     if duty_holders.contains(signer) {
         return Ok(());
     }
-    // (b) delegated: an owner-bound duty-holder root reaches signer via a
+    // (b) delegated: an steward-bound duty-holder root reaches signer via a
     //     live duty-scoped chain (§11.10 attenuation + sub_delegation).
     let target: std::collections::HashSet<String> = std::iter::once(signer.to_owned()).collect();
     for root in duty_holders {
-        if !is_owner_bound(directory, root).await? {
+        if !is_steward_bound(directory, root).await? {
             continue;
         }
         if issuer_reaches_target_via_scoped_delegation(
@@ -2733,7 +2804,7 @@ pub async fn subject_of_content(
 /// community moderators, only subjects). The named-moderator half resolves
 /// only the AUTHORITY ROOTS into the holder set — the per-signer walk-down
 /// is then done by [`check_moderation_admission`]; here we materialize the
-/// roots (the community authority set, owner-bound) so a signer who IS a
+/// roots (the community authority set, steward-bound) so a signer who IS a
 /// named moderator is admitted as-self.
 pub async fn duty_holders_for_content(
     directory: &dyn super::FederationDirectory,
@@ -2782,11 +2853,11 @@ pub async fn duty_holders_for_community(
 }
 
 /// Materialize the named-moderator AUTHORITY ROOTS for `community_id` /
-/// `duty` into the duty-holder set: each owner-bound member of the
+/// `duty` into the duty-holder set: each steward-bound member of the
 /// community authority set. (The full `is_named_moderator` relation —
 /// including delegates reached from these roots — is then enforced by
 /// [`check_moderation_admission`]'s per-signer walk-down rooted at these
-/// holders.) Empty community / no owner-bound authority ⇒ empty set.
+/// holders.) Empty community / no steward-bound authority ⇒ empty set.
 async fn named_moderator_holders(
     directory: &dyn super::FederationDirectory,
     community_id: &str,
@@ -2798,7 +2869,7 @@ async fn named_moderator_holders(
     let authority = community_authority_set(directory, community_id).await?;
     let mut holders = std::collections::HashSet::new();
     for root in authority {
-        if is_owner_bound(directory, &root).await? {
+        if is_steward_bound(directory, &root).await? {
             holders.insert(root);
         }
     }

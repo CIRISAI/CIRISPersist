@@ -2058,7 +2058,7 @@ impl Engine {
     // the canonicalize→sign→assemble→put recipe (the #247 derived-key_id
     // floor is inherited: the attester/scrub key is always the signer's
     // DERIVED federation key_id, never a caller alias). `grant_delegation`
-    // is the general primitive; `owner_bind` / `add_moderator` specialize
+    // is the general primitive; `steward_bind` / `add_moderator` specialize
     // it with the CC 4.4.3.4.3 `infra:*` and §11.10 duty scopes; the
     // `revoke_*` pair emit a producer-self `withdraws` (rule-1 admitted)
     // against the prior edge.
@@ -2071,13 +2071,13 @@ impl Engine {
     /// `sub_delegation` bool) and composes
     /// [`Self::emit_attestation`] with `attestation_type = "delegates_to"`
     /// and `attested_key_id = delegate_key_id` (the recipient — required so
-    /// the per-edge retraction bucketing in the duty walk + `is_owner_bound`
+    /// the per-edge retraction bucketing in the duty walk + `is_steward_bound`
     /// key the edge by its recipient). Returns the `attestation_id`.
     ///
     /// `delegate_key_id` MUST exist in `federation_keys` (the
     /// `attested_key_id` FK). The CC 4.4.3.4.3 node-agency gate runs on the
     /// emitted row: a node-ONLY recipient may carry only `infra:*` scopes —
-    /// use [`Self::owner_bind`] for that case. `#247`-derived
+    /// use [`Self::steward_bind`] for that case. `#247`-derived
     /// `attesting_key_id` is internal.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn grant_delegation(
@@ -2094,32 +2094,32 @@ impl Engine {
             envelope,
         );
         // The edge is keyed by its RECIPIENT: the §11.10 duty walk + the
-        // `is_owner_bound` retraction bucketing both match a delegation /
+        // `is_steward_bound` retraction bucketing both match a delegation /
         // its later `withdraws` by `attested_key_id`, so a `delegates_to`
         // MUST name the delegate there (not the self-attestation default).
         input.attested_key_id = Some(delegate_key_id.to_owned());
         self.emit_attestation(signer, input).await
     }
 
-    /// v9.3.0 (CIRISPersist#249, CC 4.4.3.4.3 owner-binding) — bind a node /
-    /// agent occurrence to its owner by granting it **`infra:*`-only**
+    /// v9.3.0 (CIRISPersist#249, CC 4.4.3.4.3 steward-binding) — bind a node /
+    /// agent occurrence to its steward by granting it **`infra:*`-only**
     /// scopes. A [`Self::grant_delegation`] specialization that carries ONLY
     /// server-class (`infra:*`) authority, so it passes the CC 4.4.3.4.3
     /// node-agency gate even when `node_or_agent_key_id` resolves to a
     /// node-ONLY identity (the gate rejects any non-`infra:*` token on such
-    /// a key). `sub_delegation` is `false` — an owner-binding is a leaf
+    /// a key). `sub_delegation` is `false` — an steward-binding is a leaf
     /// authorization, not a deputization. Returns the `attestation_id`.
     ///
     /// `infra_scopes` SHOULD be drawn from
     /// [`delegation_scope`](crate::federation::types::delegation_scope)'s
     /// `INFRA_*` constants; an empty set or any non-`infra:*` token will be
     /// rejected by the node-agency gate (`scopes_are_infra_only`) when the
-    /// recipient is a node key. The owner-binding this writes is exactly the
-    /// `delegates_to(U → k)` edge [`is_owner_bound`] reads.
+    /// recipient is a node key. The steward-binding this writes is exactly the
+    /// `delegates_to(U → k)` edge [`is_steward_bound`] reads.
     ///
-    /// [`is_owner_bound`]: crate::federation::admission::is_owner_bound
+    /// [`is_steward_bound`]: crate::federation::admission::is_steward_bound
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn owner_bind(
+    pub async fn steward_bind(
         &self,
         signer: &crate::signing::LocalSigner,
         node_or_agent_key_id: &str,
@@ -2137,13 +2137,13 @@ impl Engine {
     /// holds IFF the `signer` is in the community's authority set
     /// (founder / consensus signer per
     /// [`community_authority_set`](crate::federation::admission)) AND
-    /// owner-bound — the appointment edge `signer → moderator` is the
+    /// steward-bound — the appointment edge `signer → moderator` is the
     /// root-out-edge the §11.10 duty walk traverses.
     ///
     /// `community_id` rides the appointment **implicitly**: the §11.10 walk
     /// resolves the community → its authority roots, then walks `root →*
     /// moderator` over `duty`-scoped `delegates_to` edges — so the binding
-    /// is "this owner-bound community authority delegated `duty` to the
+    /// is "this steward-bound community authority delegated `duty` to the
     /// moderator", NOT a `community_id` field on the edge. The caller is
     /// therefore responsible for `signer` BEING a community authority (this
     /// helper emits the edge; admissibility is the authority-set membership,
@@ -2174,7 +2174,7 @@ impl Engine {
     /// [`withdraws_attestation_envelope`](crate::federation::withdraws_attestation_envelope)
     /// referencing the target edge, and `attested_key_id = delegate_key_id`
     /// — the recipient the original edge named, so the §11.10 walk's
-    /// per-edge retraction bucketing (and `is_owner_bound`'s) recognize the
+    /// per-edge retraction bucketing (and `is_steward_bound`'s) recognize the
     /// retraction (both match a `withdraws` by `attested_key_id == k`).
     /// Returns the `attestation_id`.
     ///
@@ -3431,16 +3431,35 @@ impl Engine {
         .await
     }
 
-    /// #249 Cut B — the `user`-role key(s) that owner-bind `key_id`. See
-    /// [`admission::owner_bindings_of`](crate::federation::admission::owner_bindings_of).
+    /// #249 Cut B — the `user`-role key(s) that steward-bind `key_id`. See
+    /// [`admission::steward_bindings_of`](crate::federation::admission::steward_bindings_of).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn owner_bindings_of(
+    pub async fn steward_bindings_of(
         &self,
         key_id: &str,
     ) -> Result<Vec<String>, crate::federation::Error> {
-        crate::federation::admission::owner_bindings_of(
+        crate::federation::admission::steward_bindings_of(
             self.federation_directory().as_ref(),
             key_id,
+        )
+        .await
+    }
+
+    /// CIRISPersist#299 — the **outbound** steward-binding reader: the nodes
+    /// `steward_user_key_id` owns. The exact inverse of [`Self::steward_bindings_of`]
+    /// (`n ∈ nodes_stewarded_by(U)` ⟺ `U ∈ steward_bindings_of(n)`), so "list the
+    /// nodes I own" (the client node-switcher) is one substrate call instead of
+    /// a consumer-side scan-then-confirm. Inherits the
+    /// liveness/`withdraws`-`recants`-retraction/live-`user`-role-anchor logic
+    /// verbatim (membership is decided by `steward_bindings_of` itself). See
+    /// [`crate::federation::admission::nodes_stewarded_by`].
+    pub async fn nodes_stewarded_by(
+        &self,
+        steward_user_key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        crate::federation::admission::nodes_stewarded_by(
+            self.federation_directory().as_ref(),
+            steward_user_key_id,
         )
         .await
     }
@@ -3504,15 +3523,15 @@ impl Engine {
         .await
     }
 
-    /// #249 Cut B — the owner-binding PATH (`user → … → key_id`, anchor-
+    /// #249 Cut B — the steward-binding PATH (`user → … → key_id`, anchor-
     /// first) for audit. See
-    /// [`admission::owner_binding_chain`](crate::federation::admission::owner_binding_chain).
+    /// [`admission::steward_binding_chain`](crate::federation::admission::steward_binding_chain).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn owner_binding_chain(
+    pub async fn steward_binding_chain(
         &self,
         key_id: &str,
     ) -> Result<Vec<String>, crate::federation::Error> {
-        crate::federation::admission::owner_binding_chain(
+        crate::federation::admission::steward_binding_chain(
             self.federation_directory().as_ref(),
             key_id,
         )
@@ -8189,15 +8208,15 @@ mod tests {
     // `emit_attestation` (no re-hand-roll), so the attester/scrub key is the
     // signer's DERIVED key_id (#247 floor); we additionally assert the
     // emitted edge is ADMISSIBLE by the reader gate it targets
-    // (`is_named_moderator` / `is_owner_bound` / the moderation `scores`
+    // (`is_named_moderator` / `is_steward_bound` / the moderation `scores`
     // gate) — proving the moderate-scope tokens match the duty walk.
 
     /// A `user`-role `federation_keys` row keyed by `derived_key_id` but
     /// carrying `pubkey_label`'s REAL deterministic hybrid pubkeys — so a
     /// federation-tier row attested as `derived_key_id` and signed by
     /// `pubkey_label`'s keys both FK-resolves AND hybrid-verifies, while the
-    /// `user` identity_type makes the key owner-bound (clause 1 of
-    /// `is_owner_bound`). The owner-bound-authority shape the §11.10
+    /// `user` identity_type makes the key steward-bound (clause 1 of
+    /// `is_steward_bound`). The steward-bound-authority shape the §11.10
     /// named-moderator walk requires at the root.
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn user_test_key_derived_for(
@@ -8210,7 +8229,7 @@ mod tests {
     }
 
     /// Seed a `founder_only` community whose sole founder is
-    /// `founder_key_id` (already registered + owner-bound). The community's
+    /// `founder_key_id` (already registered + steward-bound). The community's
     /// own key is registered too (required by `community_authority_set`).
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn seed_community_with_founder(
@@ -8290,14 +8309,14 @@ mod tests {
         assert!(by.iter().any(|a| a.attestation_id == att_id));
     }
 
-    /// #249 — `owner_bind` emits an `infra:*`-only `delegates_to` from an
-    /// owner-bound (user) signer to a node-ONLY key: it PASSES the CC
+    /// #249 — `steward_bind` emits an `infra:*`-only `delegates_to` from an
+    /// steward-bound (user) signer to a node-ONLY key: it PASSES the CC
     /// 4.4.3.4.3 node-agency gate (so it stores), and afterward
-    /// `is_owner_bound(node)` is true (the edge the reader walks).
+    /// `is_steward_bound(node)` is true (the edge the reader walks).
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn owner_bind_infra_only_passes_node_agency_and_owner_binds_sqlite() {
-        use crate::federation::admission::is_owner_bound;
+    async fn steward_bind_infra_only_passes_node_agency_and_steward_binds_sqlite() {
+        use crate::federation::admission::is_steward_bound;
         use crate::federation::types::delegation_scope;
         use crate::federation::FederationDirectory;
         let signer = crate::federation::tier_ingest::test_support::local_signer("owner");
@@ -8306,7 +8325,7 @@ mod tests {
             .await
             .expect("engine");
         let sq = engine.sqlite_backend().expect("sqlite").clone();
-        // Owner is user-role (owner-bound) + verifies at the ingest gate.
+        // Owner is user-role (steward-bound) + verifies at the ingest gate.
         sq.put_public_key(user_test_key_derived_for(&derived, "owner"))
             .await
             .expect("seed owner");
@@ -8315,9 +8334,9 @@ mod tests {
         node_key.record.identity_type = crate::federation::types::identity_type::NODE.into();
         sq.put_public_key(node_key).await.expect("seed node");
 
-        // infra:*-only owner-binding → admissible on a node key.
+        // infra:*-only steward-binding → admissible on a node key.
         let att_id = engine
-            .owner_bind(
+            .steward_bind(
                 &signer,
                 "node-1",
                 vec![
@@ -8326,7 +8345,7 @@ mod tests {
                 ],
             )
             .await
-            .expect("owner_bind infra:* admitted on node key");
+            .expect("steward_bind infra:* admitted on node key");
         let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
         // Edge carries infra:* only (passed the node-agency gate).
         let scope = row.attestation_envelope["scope"].as_array().unwrap();
@@ -8334,12 +8353,12 @@ mod tests {
             scope
                 .iter()
                 .all(|s| s.as_str().unwrap().starts_with("infra:")),
-            "owner_bind edge is infra:*-only"
+            "steward_bind edge is infra:*-only"
         );
-        // The node is now owner-bound (a live delegates_to(U → node), U user).
+        // The node is now steward-bound (a live delegates_to(U → node), U user).
         assert!(
-            is_owner_bound(&*sq, "node-1").await.unwrap(),
-            "node is owner-bound after owner_bind"
+            is_steward_bound(&*sq, "node-1").await.unwrap(),
+            "node is steward-bound after steward_bind"
         );
 
         // Negative control: an agency:* scope on the SAME node key is REJECTED
@@ -8358,7 +8377,7 @@ mod tests {
     }
 
     /// #249 — the add_moderator ↔ is_named_moderator round-trip: an
-    /// owner-bound community founder appoints a moderator with the
+    /// steward-bound community founder appoints a moderator with the
     /// `moderate` duty; `is_named_moderator(moderator, community, moderate)`
     /// is true after — proving SCOPE_MODERATE matches the §11.10 duty walk.
     /// Then `remove_moderator` revokes it and the authority no longer holds.
@@ -8374,7 +8393,7 @@ mod tests {
             .await
             .expect("engine");
         let sq = engine.sqlite_backend().expect("sqlite").clone();
-        // Founder: owner-bound (user) authority root of the community.
+        // Founder: steward-bound (user) authority root of the community.
         sq.put_public_key(user_test_key_derived_for(&derived, "founder"))
             .await
             .expect("seed founder");
@@ -9058,7 +9077,7 @@ mod tests {
 
         // G4 rekey/events don't verify member signatures, so members are
         // registered as PRIMITIVE keys (sweeper_test_key) — non-node/agent, so
-        // they pass the CC 3.2 community owner-binding gate without owner-binds.
+        // they pass the CC 3.2 community steward-binding gate without steward-binds.
         let joined: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
 
         // ── §7 community rekey-on-revoke (epoch bump) ──
@@ -9252,7 +9271,7 @@ mod tests {
         seed_community_with_founder(&engine, "comm-1", &derived).await;
 
         // The founder IS a named moderator (community authority root,
-        // owner-bound) → as-self duty-holder → ADMIT.
+        // steward-bound) → as-self duty-holder → ADMIT.
         let content_sha = "a".repeat(64);
         let att_id = engine
             .file_moderation(&signer, &content_sha, "comm-1", "moderate", "rogue_action")

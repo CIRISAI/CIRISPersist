@@ -4053,11 +4053,11 @@ impl PyEngine {
         })
     }
 
-    /// v9.3.0 (#249, CC 4.4.3.4.3) — owner-bind a node/agent occurrence by
+    /// v9.3.0 (#249, CC 4.4.3.4.3) — steward-bind a node/agent occurrence by
     /// granting it `infra:*`-only scopes (passes the node-agency gate on a
     /// node-only key). A `grant_delegation` specialization,
     /// `sub_delegation=false`.
-    fn owner_bind(
+    fn steward_bind(
         &self,
         py: Python<'_>,
         node_or_agent_key_id: &str,
@@ -4076,7 +4076,7 @@ impl PyEngine {
                 );
                 runtime.block_on(async move {
                     engine
-                        .owner_bind(&local_signer, &key, infra_scopes)
+                        .steward_bind(&local_signer, &key, infra_scopes)
                         .await
                         .map_err(federation_err_to_py)
                 })
@@ -4087,7 +4087,7 @@ impl PyEngine {
     /// v9.3.0 (#249, §11.10/§11.11) — appoint `moderator_key_id` a named
     /// moderator of `community_id` for `duty` (`moderate`/`takedown`/
     /// `review`). Admissible IFF the engine's signer is a community
-    /// authority (founder/consensus signer) AND owner-bound.
+    /// authority (founder/consensus signer) AND steward-bound.
     fn add_moderator(
         &self,
         py: Python<'_>,
@@ -6643,15 +6643,15 @@ impl PyEngine {
         })
     }
 
-    /// #249 Cut A — is `key_id` **owner-bound** (resolves to a `user`-role
+    /// #249 Cut A — is `key_id` **steward-bound** (resolves to a `user`-role
     /// human identity, directly / via occurrence / via a live `delegates_to`
     /// from a user-role granter)? Returns JSON `true` / `false`. Wraps the
     /// free function
-    /// [`admission::is_owner_bound`](crate::federation::admission::is_owner_bound) —
+    /// [`admission::is_steward_bound`](crate::federation::admission::is_steward_bound) —
     /// fail-closed (a key whose chain to a `user` identity cannot be shown is
-    /// not owner-bound). The most-reconstructed walk; exposing it stops
+    /// not steward-bound). The most-reconstructed walk; exposing it stops
     /// consumers re-deriving the §5.6.8.10 graph.
-    fn is_owner_bound_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+    fn is_steward_bound_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
@@ -6662,7 +6662,7 @@ impl PyEngine {
                         let backend = pg.clone();
                         runtime.block_on(async move {
                             use crate::federation::FederationDirectory;
-                            crate::federation::admission::is_owner_bound(
+                            crate::federation::admission::is_steward_bound(
                                 &*backend as &dyn FederationDirectory,
                                 &key_id,
                             )
@@ -6675,7 +6675,7 @@ impl PyEngine {
                         let backend = sq.clone();
                         runtime.block_on(async move {
                             use crate::federation::FederationDirectory;
-                            crate::federation::admission::is_owner_bound(
+                            crate::federation::admission::is_steward_bound(
                                 &*backend as &dyn FederationDirectory,
                                 &key_id,
                             )
@@ -6685,7 +6685,7 @@ impl PyEngine {
                     }
                 };
                 serde_json::to_string(&bound)
-                    .map_err(|e| PyValueError::new_err(format!("is_owner_bound serialize: {e}")))
+                    .map_err(|e| PyValueError::new_err(format!("is_steward_bound serialize: {e}")))
             })
         })
     }
@@ -6693,11 +6693,11 @@ impl PyEngine {
     /// #249 Cut A — the **duty-holders** of a bare community-scoped action
     /// (a `moderation:*` / `reconsideration:*` over `community_id` with no
     /// content subject) for `duty` (`moderate` / `takedown` / `review`): the
-    /// owner-bound authority roots of the community. Returns a JSON array of
+    /// steward-bound authority roots of the community. Returns a JSON array of
     /// key-id strings (the underlying `HashSet<String>` sorted for a stable
     /// payload). Wraps
     /// [`admission::duty_holders_for_community`](crate::federation::admission::duty_holders_for_community).
-    /// Empty community / no owner-bound authority ⇒ `[]`.
+    /// Empty community / no steward-bound authority ⇒ `[]`.
     fn duty_holders_for_community_json(
         &self,
         py: Python<'_>,
@@ -16159,7 +16159,7 @@ impl PyEngine {
     }
 
     /// #249 Cut B — the FULL named-moderator set of `community_key_id` for
-    /// `duty` (`moderate` / `takedown` / `review`): owner-bound authority
+    /// `duty` (`moderate` / `takedown` / `review`): steward-bound authority
     /// roots ∪ their duty-scoped delegates. Returns a JSON array of key_ids.
     fn moderators_of_json(
         &self,
@@ -16206,10 +16206,10 @@ impl PyEngine {
         })
     }
 
-    /// #249 Cut B — the `user`-role key(s) that owner-bind `key_id` (who
-    /// `key_id` is owner-bound TO). Returns a JSON array of key_ids; empty
-    /// when `key_id` is not owner-bound.
-    fn owner_bindings_of_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+    /// #249 Cut B — the `user`-role key(s) that steward-bind `key_id` (who
+    /// `key_id` is steward-bound TO). Returns a JSON array of key_ids; empty
+    /// when `key_id` is not steward-bound.
+    fn steward_bindings_of_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
@@ -16219,7 +16219,7 @@ impl PyEngine {
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
-                            crate::federation::admission::owner_bindings_of(&*backend, &key_id)
+                            crate::federation::admission::steward_bindings_of(&*backend, &key_id)
                                 .await
                                 .map_err(federation_err_to_py)
                         })?
@@ -16228,22 +16228,66 @@ impl PyEngine {
                     BackendDispatch::Sqlite(sq) => {
                         let backend = sq.clone();
                         runtime.block_on(async move {
-                            crate::federation::admission::owner_bindings_of(&*backend, &key_id)
+                            crate::federation::admission::steward_bindings_of(&*backend, &key_id)
                                 .await
                                 .map_err(federation_err_to_py)
                         })?
                     }
                 };
-                serde_json::to_string(&bindings)
-                    .map_err(|e| PyValueError::new_err(format!("owner_bindings_of serialize: {e}")))
+                serde_json::to_string(&bindings).map_err(|e| {
+                    PyValueError::new_err(format!("steward_bindings_of serialize: {e}"))
+                })
             })
         })
     }
 
-    /// #249 Cut B — the owner-binding PATH (`user → … → key_id`,
+    /// CIRISPersist#299 — the OUTBOUND steward-binding reader: the nodes
+    /// `steward_user_key_id` owns (exact inverse of `steward_bindings_of_json` —
+    /// `n ∈ nodes_stewarded_by(U)` ⟺ `U ∈ steward_bindings_of(n)`). Returns a JSON
+    /// array of key_ids; empty when `U` owns nothing. Inherits the
+    /// liveness/retraction/role logic verbatim (membership decided by
+    /// `steward_bindings_of`). `U` itself appears iff `U` is `user`-role — a
+    /// consumer wanting "nodes other than me" filters it client-side.
+    fn nodes_stewarded_by_json(
+        &self,
+        py: Python<'_>,
+        steward_user_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let owner = steward_user_key_id.to_owned();
+            py.detach(move || {
+                let nodes: Vec<String> = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::nodes_stewarded_by(&*backend, &owner)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::nodes_stewarded_by(&*backend, &owner)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&nodes).map_err(|e| {
+                    PyValueError::new_err(format!("nodes_stewarded_by serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// #249 Cut B — the steward-binding PATH (`user → … → key_id`,
     /// anchor-first) for audit — the chain, not just the endpoints. Returns
-    /// a JSON array of key_ids; empty when `key_id` is not owner-bound.
-    fn owner_binding_chain_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+    /// a JSON array of key_ids; empty when `key_id` is not steward-bound.
+    fn steward_binding_chain_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
@@ -16253,7 +16297,7 @@ impl PyEngine {
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
-                            crate::federation::admission::owner_binding_chain(&*backend, &key_id)
+                            crate::federation::admission::steward_binding_chain(&*backend, &key_id)
                                 .await
                                 .map_err(federation_err_to_py)
                         })?
@@ -16262,14 +16306,14 @@ impl PyEngine {
                     BackendDispatch::Sqlite(sq) => {
                         let backend = sq.clone();
                         runtime.block_on(async move {
-                            crate::federation::admission::owner_binding_chain(&*backend, &key_id)
+                            crate::federation::admission::steward_binding_chain(&*backend, &key_id)
                                 .await
                                 .map_err(federation_err_to_py)
                         })?
                     }
                 };
                 serde_json::to_string(&chain).map_err(|e| {
-                    PyValueError::new_err(format!("owner_binding_chain serialize: {e}"))
+                    PyValueError::new_err(format!("steward_binding_chain serialize: {e}"))
                 })
             })
         })
@@ -22971,11 +23015,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // node-only key is caller-side authorization failure; ValueError
         // (4xx). "Infrastructure must not have agency."
         crate::federation::Error::NodeAgencyForbidden { .. } => PyValueError::new_err(kind),
-        // v9.0.0 (CC 3.2 / CC 3.4.7.1) — admitting an unowned node/agent to
+        // v9.0.0 (CC 3.2 / CC 3.4.7.1) — admitting an unstewarded node/agent to
         // a non-infrastructure community is a caller-side authorization
         // failure (non-infra membership is an authority act that must root
         // in an owner); ValueError (4xx).
-        crate::federation::Error::UnownedCommunityMember { .. } => PyValueError::new_err(kind),
+        crate::federation::Error::UnstewardedCommunityMember { .. } => PyValueError::new_err(kind),
         // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — a federation-tier
         // attestation rejected at the bulk ingest gate (missing ML-DSA-65
         // half / tampered signature / canonicalizer mismatch /
