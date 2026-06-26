@@ -2503,6 +2503,15 @@ impl PyEngine {
     /// role-tag conceptual leak. The old name is fully removed —
     /// callers must update to `local_key_id`.
     ///
+    /// ⚠️ **This is the BARE keystore alias — NOT the federation key_id.**
+    /// The federation floor (#247/#275) registers and verifies every self
+    /// key under its DERIVED id (`derive_key_id(<alias>, <ed25519 pubkey>)`
+    /// = `"<label>-<fingerprint>"`). Anything the substrate later verifies
+    /// (seal/scrub/emit `key_id`s, audit actor refs) MUST use
+    /// [`Self::local_derived_key_id`] — stamping this bare alias gets
+    /// rejected with `verify_unknown_key` (the recurring footgun behind
+    /// CIRISEdge#203 / CIRISServer#93 / CIRISServer#118 / CIRISPersist#295).
+    ///
     /// Raises `ValueError` if no local signing identity is configured.
     fn local_key_id(&self, _py: Python<'_>) -> PyResult<String> {
         self.ensure_usable()?;
@@ -2517,6 +2526,52 @@ impl PyEngine {
                      to the Engine constructor)",
                     )
                 })
+        })
+    }
+
+    /// v10.6.0 (CIRISPersist#295) — Return this Engine's **registered
+    /// (derived) federation key_id**: `derive_key_id(<keystore alias>,
+    /// <ed25519 pubkey>)` = `"<label>-<fingerprint>"`. This is the value
+    /// that FKs to `federation_keys(key_id)` after CIRISVerify FSD-003, and
+    /// the id the substrate verifies against — distinct from
+    /// [`Self::local_key_id`] (the bare keystore alias, the `derive_key_id`
+    /// *input*).
+    ///
+    /// **Use this for anything the substrate later verifies** — seal/scrub
+    /// `key_id`s, `emit_*` attester ids, audit actor refs. It removes the
+    /// recurring "stamp the bare alias → `verify_unknown_key`" footgun
+    /// (CIRISEdge#203 / CIRISServer#93 / CIRISServer#118): every consumer was
+    /// re-implementing `derive_key_id` (decode the b64 pubkey, call
+    /// `ciris_verify_core::fedcode::derive_key_id`) to recover the id persist
+    /// already computes internally. Now it's one call, zero re-derivation.
+    ///
+    /// Drives the same `Engine::local_derived_key_id` the Rust surface uses
+    /// (single source of truth, incl. the #275 32-byte-Ed25519 fail-loud
+    /// guard), so software and hardware-hybrid engines behave identically.
+    ///
+    /// Raises `ValueError` if no signing identity is configured or the
+    /// composed signer is not a 32-byte Ed25519 key (a non-Ed25519 fallback
+    /// would mint an unverifiable id — #275).
+    fn local_derived_key_id(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = match &self.backend {
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .local_derived_key_id()
+                        .await
+                        .map_err(|e| PyValueError::new_err(format!("{e}")))
+                })
+            })
         })
     }
 

@@ -5,6 +5,38 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.6.0] — 2026-06-26
+
+### Added — #295: expose `local_derived_key_id()` on the pyo3 `Engine` (kills a recurring seal↔verify footgun)
+
+The pyo3 `Engine` exposed `local_key_id()` (the **bare keystore alias**) but not
+`local_derived_key_id()` — yet the federation floor (#247/#275) registers and
+verifies every self key under its **derived** id
+(`derive_key_id(<alias>, <ed25519 pubkey>)` = `"<label>-<fingerprint>"`). So any
+Python/cohabitation consumer that stamped `engine.local_key_id()` onto something
+the substrate later verifies got `verify_unknown_key`. This was the **third**
+instance of the same class (CIRISEdge#203 stamped the bare alias; CIRISServer#93
+audit actor_id; CIRISServer#118 lens seal-sign), each having to re-implement
+`derive_key_id` to recover the id persist already computes internally.
+
+`Engine.local_derived_key_id()` is now bound to Python, driving the existing
+`Engine::local_derived_key_id` Rust method (single source of truth, including the
+#275 32-byte-Ed25519 fail-loud guard) — software and hardware-hybrid engines
+behave identically. Consumers now call one method and get the registered/verified
+id with **zero re-derivation**; CIRISServer's lens-core interim re-derive helper
+(#118) collapses to a single call. `local_key_id()`'s doc now loudly flags it as
+the bare alias and points at `local_derived_key_id()` for anything verified.
+Raises `ValueError` if no signing identity is configured or the composed signer
+is not 32-byte Ed25519 (a non-Ed25519 fallback would mint an unverifiable id).
+
+### Changed — re-pin CIRISVerify v7.5.0 → v7.6.0 (wheel concurrence)
+
+All six verify crate pins (`ciris-keyring` ×4 incl. tpm/ios/android targets,
+`ciris-verify-core`, `ciris-crypto`) flip to `v7.6.0` — the TPM runtime-plugin
+line (dlopen client + plugin-backed secure blob storage + the wheel-shipped
+plugin, CIRISVerify #130 / v7.5.1 + v7.6.0). Minor bump, no MAJOR; the wheel
+`Requires-Dist ciris-verify>=7,<8` is unchanged.
+
 ## [10.5.0] — 2026-06-25
 
 ### Fixed — #293: `emit_attestation`/`emit_attestation_self` admitted non-lowercase-hex `subject_key_ids[]` (CC 2.6.3 / §0.6) — residual of #288
