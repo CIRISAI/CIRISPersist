@@ -270,7 +270,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         // walk runs BEFORE the INSERT closure takes the conn lock (no
         // deadlock). Admit IFF the author IS a duty-holder over the target
         // (the content's declared subjects ∪ the target community's named
-        // moderators) or is reached by an owner-bound duty-holder via a
+        // moderators) or is reached by an steward-bound duty-holder via a
         // live `takedown`-scoped chain. Absence ⇒ REJECT.
         if takedown.is_some() {
             let directory =
@@ -511,7 +511,7 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         // FederationDirectory for the delegates_to + community walks; admit
         // IFF the accuser IS a duty-holder over the target (declared
         // subjects ∪ the target community's named moderators) or is reached
-        // by an owner-bound duty-holder via a live `moderate`-scoped chain.
+        // by an steward-bound duty-holder via a live `moderate`-scoped chain.
         // Absence ⇒ REJECT. Runs BEFORE the INSERT closure takes the lock.
         {
             let directory =
@@ -3650,7 +3650,7 @@ mod tests {
     }
 
     /// Seed a `federation_keys` row for `key_id` with identity_type=user
-    /// (owner-bound by clause (1) of `is_owner_bound`).
+    /// (steward-bound by clause (1) of `is_steward_bound`).
     async fn seed_user_key(backend: &SqliteBackend, key_id: &str) {
         use crate::federation::FederationDirectory;
         // v9.0.0 (CC 5.3.2.4.3.1) — register REAL deterministic hybrid
@@ -3909,7 +3909,7 @@ mod tests {
         .await
         .expect("(b1) subject-delegated moderation admitted");
 
-        // (b2) named-moderator (community founder, owner-bound) → ADMIT.
+        // (b2) named-moderator (community founder, steward-bound) → ADMIT.
         // No establishing content needed — community-scoped duty.
         cn.put_moderation_event(build_moderation_event(
             &founder_key,
@@ -4061,7 +4061,7 @@ mod tests {
             "fail-secure: undetermined subject_of must REJECT subject-self"
         );
 
-        // named-mod path (b) still ADMITs a real owner-bound founder.
+        // named-mod path (b) still ADMITs a real steward-bound founder.
         cn.put_moderation_event(build_moderation_event(
             &founder_key,
             "target",
@@ -4158,7 +4158,7 @@ mod tests {
         assert_eq!(err.kind(), "cirisnode_delegated_scope_unauthorized");
 
         // (e) chain beyond the §11.10 depth cap (5) → REJECTED. Root k0 is
-        // the owner-bound subject; every edge takedown-scoped + sub_delegation.
+        // the steward-bound subject; every edge takedown-scoped + sub_delegation.
         let depth = crate::federation::admission::MAX_MODERATION_DELEGATION_DEPTH;
         let n = depth + 2;
         let chain_keys: Vec<ed25519_dalek::SigningKey> = (0..n)

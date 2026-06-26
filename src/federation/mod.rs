@@ -3333,12 +3333,12 @@ pub enum Error {
     /// §5.6.8.10; CIRISRegistry#95). A moderation / takedown / review
     /// primitive emission was refused: the `signer` is NOT a duty-holder
     /// over the target (it is neither a subject of the target content nor a
-    /// named moderator of the target community) AND no owner-bound
+    /// named moderator of the target community) AND no steward-bound
     /// duty-holder reaches it via a live `delegates_to` chain bearing the
     /// governing `scope` (`moderate` / `takedown` / `review`, with
     /// `⊆`-parent attenuation + `sub_delegation`-gated deputization + depth
     /// ≤ 5 + no `withdraws`-revoked edge). The row is not stored. This is
-    /// the §11.10 "the principal is the owner-bound chain root discovered by
+    /// the §11.10 "the principal is the steward-bound chain root discovered by
     /// walking up, and only then" gate — the child-safety scope-isolation
     /// property (a `consent_revocation`-scoped delegation cannot drive a
     /// `takedown`). **Absence is never an admit condition** (the v8.7.0
@@ -3350,7 +3350,7 @@ pub enum Error {
     #[error(
         "moderation emission by signer {signer:?} over target {on_behalf_of:?} \
          is not admitted: signer is neither a {scope:?} duty-holder as-self \
-         nor reached by an owner-bound duty-holder via a live {scope:?}-scoped \
+         nor reached by an steward-bound duty-holder via a live {scope:?}-scoped \
          delegates_to chain (CEG §11.10)"
     )]
     DelegatedScopeUnauthorized {
@@ -3436,31 +3436,31 @@ pub enum Error {
     /// v9.0.0 (CC 3.4.7.1 / CC 3.2). A `community` admission was REFUSED
     /// because one of its roster members resolves to a `node`- or
     /// `agent`-role identity ([`crate::federation::types::identity_type`])
-    /// that is **not owner-bound** — there is no live, unrevoked path from
+    /// that is **not steward-bound** — there is no live, unrevoked path from
     /// the member key to a `user`-role identity
-    /// ([`admission::is_owner_bound`]). Per the CC 3.2 "owner-binding gate
+    /// ([`admission::is_steward_bound`]). Per the CC 3.2 "steward-binding gate
     /// for non-infrastructure membership", non-infra community membership
     /// is an authority act that MUST root in an accountable human; a fresh,
-    /// unowned node/agent is canonical-trust-and-serve only. The gate is a
+    /// unstewarded node/agent is canonical-trust-and-serve only. The gate is a
     /// **precondition** to (not a substitute for) the community's own
     /// `consensus_protocol` vote. `cohort_subkind: infrastructure`
     /// communities are EXEMPT (trust + serve needs no owner). The row is
     /// NOT stored (verify-before-mutation, AV-9). Distinct from
     /// [`Error::InvalidArgument`] so consumers can pattern-match the
     /// rejection deterministically (stable `kind()` token
-    /// `federation_unowned_community_member`). See
-    /// [`admission::check_community_membership_owner_binding`].
+    /// `federation_unstewarded_community_member`). See
+    /// [`admission::check_community_membership_steward_binding`].
     #[error(
         "community {community_key_id:?} cannot admit member {member_key_id:?}: a {member_role} \
-         key MUST be owner-bound (a live delegates_to/identity_occurrence path to a user-role \
+         key MUST be steward-bound (a live delegates_to/identity_occurrence path to a user-role \
          identity) before admission to a non-infrastructure community \
          (CC 3.2 / CC 3.4.7.1 — non-infra membership is an authority act)"
     )]
-    UnownedCommunityMember {
+    UnstewardedCommunityMember {
         /// The community's `community_key_id` whose admission was refused.
         community_key_id: String,
         /// The roster member key that resolved to node/agent without a
-        /// live owner-binding.
+        /// live steward-binding.
         member_key_id: String,
         /// The offending role token (`node` or `agent`) — whichever was
         /// present in the member's `identity_type` set.
@@ -3531,7 +3531,7 @@ impl Error {
             Error::WithdrawsNotAdmitted { .. } => "federation_withdraws_not_admitted",
             Error::DelegatedScopeUnauthorized { .. } => "federation_delegated_scope_unauthorized",
             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
-            Error::UnownedCommunityMember { .. } => "federation_unowned_community_member",
+            Error::UnstewardedCommunityMember { .. } => "federation_unstewarded_community_member",
             Error::FederationTierUnverified { .. } => "federation_federation_tier_unverified",
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",

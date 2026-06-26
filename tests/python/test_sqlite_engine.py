@@ -432,8 +432,8 @@ def test_put_community_json_round_trip_290() -> None:
     try:
         # The community_key_id + each member must FK a registered
         # federation_keys row. Register as `primitive` — the put_community
-        # owner-binding gate (CC 3.2 UnownedCommunityMember) is exempt for
-        # primitive identities; agent/node members would need an owner-
+        # steward-binding gate (CC 3.2 UnstewardedCommunityMember) is exempt for
+        # primitive identities; agent/node members would need a steward-
         # binding chain (which the conformance harness supplies in the real
         # moderation flow, but isn't needed to prove the FFI admits a row).
         kid = eng.register_self_federation_key("primitive", "ref", None, None, None)
@@ -531,6 +531,47 @@ def test_emit_attestation_self_rejects_uppercase_subject_key_id_293():
                 }
             )
         )
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()
+
+
+def test_nodes_stewarded_by_json_pyo3_299():
+    """#299 — the outbound steward-binding reader nodes_stewarded_by_json() is bound
+    to Python and returns valid JSON. A freshly registered user-role key owns
+    itself (clause-1 self-binding, the exact inverse of steward_bindings_of);
+    an unrelated key owns nothing. Skips on a non-sqlite wheel."""
+    import json
+    import os
+    import secrets
+    import tempfile
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    seed = os.path.join(tempfile.mkdtemp(), "seed")
+    with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    alias = "user-" + secrets.token_hex(8)
+    try:
+        eng = ciris_persist.Engine(
+            "sqlite::memory:", alias, local_key_id=alias, local_key_path=seed
+        )
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        kid = eng.register_self_federation_key("user", "ref", None, None, None)
+        # A user-role key owns itself (exact inverse: kid ∈ nodes_stewarded_by(kid)
+        # ⟺ kid ∈ steward_bindings_of(kid), the clause-1 self-binding).
+        owned = json.loads(eng.nodes_stewarded_by_json(kid))
+        assert isinstance(owned, list)
+        assert kid in owned, owned
+        # The inverse holds the other way too.
+        assert kid in json.loads(eng.steward_bindings_of_json(kid))
+        # An unknown key owns nothing.
+        assert json.loads(eng.nodes_stewarded_by_json("nobody-" + secrets.token_hex(4))) == []
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()

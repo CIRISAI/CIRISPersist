@@ -151,7 +151,7 @@ impl NodeCoreService for PostgresBackend {
         // FederationDirectory, so `self` walks the delegates_to + community
         // graph. Admit IFF the author IS a duty-holder over the target
         // (declared subjects ∪ the target community's named moderators) or
-        // is reached by an owner-bound duty-holder via a live `takedown`-
+        // is reached by an steward-bound duty-holder via a live `takedown`-
         // scoped chain. Absence ⇒ REJECT. Runs BEFORE the INSERT — a
         // rejected emission leaves no trace.
         if takedown.is_some() {
@@ -357,7 +357,7 @@ impl NodeCoreService for PostgresBackend {
         // v8.7.1 (CIRISPersist#233, CEG §11.10) — FULL moderation gate for
         // the `ModerationEvent` primitive. Admit IFF the accuser (signer)
         // IS a duty-holder over the target (declared subjects ∪ the target
-        // community's named moderators) or is reached by an owner-bound
+        // community's named moderators) or is reached by an steward-bound
         // duty-holder via a live `moderate`-scoped chain. Absence ⇒ REJECT.
         // Runs AFTER signature verify, BEFORE INSERT.
         // v8.7.2: authority over the SIGNED content provenance — the
@@ -3129,7 +3129,7 @@ mod tests {
             .await
             .expect("(b1) subject-delegated moderation admitted");
 
-        // (b2) named-moderator (community founder, owner-bound) → ADMIT.
+        // (b2) named-moderator (community founder, steward-bound) → ADMIT.
         backend
             .put_moderation_event(build_moderation_event_pg(
                 &founder_key,
@@ -3289,7 +3289,7 @@ mod tests {
             "fail-secure: undetermined subject_of must REJECT subject-self"
         );
 
-        // named-mod path (b) still ADMITs the owner-bound founder.
+        // named-mod path (b) still ADMITs the steward-bound founder.
         backend
             .put_moderation_event(build_moderation_event_pg(
                 &founder_key,

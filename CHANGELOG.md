@@ -5,6 +5,52 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.0.0] — 2026-06-26
+
+### BREAKING — owner → steward rename across the steward-binding surface (CC 0.5.1 §3.2 alignment)
+
+CIRIS Constitution 0.5.1 §3.2 makes "owner" the **wrong word** for node/agent
+stewardship: *"Steward-binding is **responsibility, not property** — a steward is
+responsible for a ward, never a holder of one … You never steward a node, an
+agent, or a person as a possession"* (the **structural no-slavery guarantee**).
+The constitution names the predicate **`is_steward_bound(K)`** and the concept
+**steward-binding**; persist's `owner_*` naming was the property framing the
+constitution rejects. This renames the whole surface — **clean break, no aliases**.
+
+**Renamed public API (downstream MUST update — CIRISServer / Agent):**
+
+| Was | Now |
+|---|---|
+| `Engine::owner_bind` / pyo3 `owner_bind` | `steward_bind` |
+| `Engine::owner_bindings_of` + `admission::owner_bindings_of` + pyo3 `owner_bindings_of_json` | `steward_bindings_of` / `steward_bindings_of_json` |
+| `Engine::owner_binding_chain` + `admission::owner_binding_chain` + pyo3 `owner_binding_chain_json` | `steward_binding_chain` / `steward_binding_chain_json` |
+| `admission::is_owner_bound` + pyo3 `is_owner_bound_json` | `is_steward_bound` / `is_steward_bound_json` |
+| `Error::UnownedCommunityMember` (kind `federation_unowned_community_member`) | `UnstewardedCommunityMember` (kind `federation_unstewarded_community_member`) |
+
+Consumers matching the `federation_unowned_community_member` error kind (e.g.
+CIRISConformance) must update to `federation_unstewarded_community_member`. The
+gate function `check_community_membership_steward_binding` was already
+steward-named — only its error lagged. Doc/threat-model prose updated in lockstep.
+
+**Preserved (genuinely different "owner" concepts, NOT renamed):** the
+`SharedInstanceLease` leader-election owner (`owner_pid` / `owner_hostname` —
+real lease ownership, CIRISEdge#100); the `EngineCell` lifecycle owner; the
+cohabitation consumer-ownership declarations; the at-rest-cascade
+`owner_or_family_key_id` (data recipient, not stewardship).
+
+### Added — #299: `Engine::nodes_stewarded_by` (the outbound steward-binding reader)
+
+Folded into this cut (so it ships steward-named, never `owner`). The exact
+inverse of `steward_bindings_of` (`n ∈ nodes_stewarded_by(U)` ⟺
+`U ∈ steward_bindings_of(n)`): "list the nodes I steward" is now one substrate
+call instead of CIRISServer's hand-rolled scan-then-confirm. Enumerates candidate
+nodes (U's outgoing `delegates_to` + occurrences + self) and **confirms each via
+`steward_bindings_of`** — so the liveness/`withdraws`-`recants`-retraction/
+live-`user`-role-anchor logic is inherited verbatim (never re-derived) and
+read-after-write correctness lives in the substrate. Exposed on the Rust `Engine`
+and pyo3 (`nodes_stewarded_by_json`). Rust (memory + sqlite, both directions) +
+Python regression tests; 78 community/steward/node-agency tests green.
+
 ## [10.7.0] — 2026-06-26
 
 ### Changed — re-pin CIRISVerify v7.6.0 → v8.0.0 (verify MAJOR; tss-esapi deleted from the keyring)

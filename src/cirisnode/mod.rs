@@ -158,7 +158,7 @@ pub enum Error {
     /// (`ModerationEvent` / `takedown_notice`) emission was refused: the
     /// signer neither holds the duty as-self (it is NOT a subject of the
     /// target content nor a named moderator of the target community) NOR is
-    /// reached by an owner-bound duty-holder via a live `delegates_to`
+    /// reached by an steward-bound duty-holder via a live `delegates_to`
     /// chain bearing the governing scope (`moderate` / `takedown`). The row
     /// is not stored. This is the cirisnode-surface
     /// image of [`crate::federation::Error::DelegatedScopeUnauthorized`] —
@@ -233,11 +233,11 @@ impl Error {
 /// `community_id` is the producer-declared target community (whose named
 /// moderators hold the duty). `duty` is `moderate` / `takedown` / `review`.
 /// `target_descriptor` is an audit string naming the target. Admit IFF the
-/// signer is a duty-holder (as-self) or an owner-bound holder reaches the
+/// signer is a duty-holder (as-self) or an steward-bound holder reaches the
 /// signer via a live `duty`-scoped chain; the v8.7.0 absent-⇒-admit bypass
 /// is GONE (no duty-holder ⇒ REJECT). Delegates to
 /// [`crate::federation::admission::check_moderation_admission`] so the
-/// scope-isolation + attenuation + sub_delegation + depth-cap + owner-bound
+/// scope-isolation + attenuation + sub_delegation + depth-cap + steward-bound
 /// properties are identical to the report-`scores` path.
 ///
 /// A federation [`Backend`](crate::federation::Error::Backend) error from
@@ -285,7 +285,7 @@ pub async fn check_moderation_or_reject(
             scope,
         }) => Err(Error::DelegatedScopeUnauthorized(format!(
             "signer {signer} holds neither the {scope} duty as-self over {target} nor a live \
-             {scope}-scoped delegates_to chain from an owner-bound duty-holder (CEG §11.10)"
+             {scope}-scoped delegates_to chain from an steward-bound duty-holder (CEG §11.10)"
         ))),
         Err(crate::federation::Error::Backend(e)) => Err(Error::Backend(e)),
         Err(e) => Err(Error::Internal(format!(

@@ -18,7 +18,7 @@ v0.2.0–v0.3.6 attack surface in §3.7..§3.10 (AV-28..AV-39);
 holonomic surface in §3.14 (AV-59..AV-66);
 constitution-alignment surface in §3.15 (AV-67..AV-72) — PQC-mandatory
 federation-tier per-trace ingest (CC 5.3.2.4.3.1), the node/agency
-delegation split (CC 4.4.3.4.3 / CC 1.13.5), owner-binding community
+delegation split (CC 4.4.3.4.3 / CC 1.13.5), steward-binding community
 membership (CC 3.2), the community-DEK rotation cascade (CC 4.4.3.2.2),
 and the four adversarial-review bypasses those gates initially carried.
 **RC17 compliance:** persist is COMPLIANT and rolls no §19 crypto —
@@ -246,7 +246,7 @@ divergence-router / anti-rollback / WW-2 leaf filter, aggregation-meta
 and member-commitment integrity, rarity-vs-revocation). AV-67..AV-72
 (§3.15) cover the v9.0.0 CIRIS Constitution 0.1.5 alignment surface
 (PQC-mandatory federation-tier per-trace ingest, the node/agency
-delegation split, owner-binding community membership, community-DEK
+delegation split, steward-binding community membership, community-DEK
 rotation, and the four adversarial-review bypasses those gates carried).
 Each AV lists the attack, the primary mitigation, the secondary
 mitigation, and the residual risk.
@@ -2091,32 +2091,32 @@ invariant is "a node-only key's delegation literally cannot carry agency,"
 which is the structural property CC 1.13.5 names. **Closed v9.0.0; see
 AV-71 for the duplicate-token bypass closed in the same cut.**
 
-#### AV-69: Unowned node/agent admitted to a non-infra community (CC 3.2 / CC 3.4.7.1)
+#### AV-69: Unstewarded node/agent admitted to a non-infra community (CC 3.2 / CC 3.4.7.1)
 
 **Attack**: an adversary writes a `put_community` whose roster includes a
-`node`- or `agent`-role key with **no owner-binding to an accountable
-human** — granting a bare, unowned node standing to speak AS the group.
+`node`- or `agent`-role key with **no steward-binding to an accountable
+human** — granting a bare, unstewarded node standing to speak AS the group.
 Per CC 3.2, non-infra community membership is an **authority act** and
 CC 1.13.2 requires authority to root in a `user`-role human; pre-v9.0.0
 `put_community` ran only `check_consensus_protocol_form` + the geographic
-gate and admitted the unowned member.
+gate and admitted the unstewarded member.
 
 **Mitigation v9.0.0 (#235, CC 3.2 / CC 3.4.7.1)**:
-`federation::admission::check_community_membership_owner_binding`, wired
+`federation::admission::check_community_membership_steward_binding`, wired
 into `put_community` on all three backends after the geographic gate and
 before the write lock / `persist_row_hash` / INSERT (verify-before-mutation,
-AV-9). It reuses the `is_owner_bound(K)` predicate (CC 3.4.7.1 — a live,
+AV-9). It reuses the `is_steward_bound(K)` predicate (CC 3.4.7.1 — a live,
 unrevoked path from `K` to a `user`-role identity); **only members
 resolving to `node` or `agent`** are constrained — the first such member
-lacking a live owner-binding REJECTS the whole write with typed
-`Error::UnownedCommunityMember` (token
-`federation_unowned_community_member`), not stored. A `user`-role member
-is trivially owner-bound.
+lacking a live steward-binding REJECTS the whole write with typed
+`Error::UnstewardedCommunityMember` (token
+`federation_unstewarded_community_member`), not stored. A `user`-role member
+is trivially steward-bound.
 
 **Secondary**: the **infrastructure carve-out** (CC 3.2 "Trust ≠
 membership") — a community whose `policy_blob.cohort_subkind ==
 "infrastructure"` is exempt (a node MAY trust + serve an infra community
-with no owner). The gate is a **precondition**, NOT a substitute for the
+with no steward). The gate is a **precondition**, NOT a substitute for the
 community's own `consensus_protocol` vote.
 
 **Residual**: an unresolved or non-node/agent member is out of scope (no
@@ -2186,7 +2186,7 @@ match the CC 3.4.7.1 `identity_type`-is-a-set definition.
 **Attack (four sub-vectors, all closed v9.0.0 by the adversarial review)**:
 
 - **F2 — self-labeled `cohort_subkind: infrastructure`.** Any caller could
-  self-label a community `infrastructure` to skip the AV-69 owner-binding
+  self-label a community `infrastructure` to skip the AV-69 steward-binding
   precondition AND force its content to Commons-plaintext (no DEK,
   AV-70) — both gates honored the label with **no authority check**.
   **Mitigation**: `is_authorized_infrastructure_community` honors the
@@ -2194,16 +2194,16 @@ match the CC 3.4.7.1 `identity_type`-is-a-set definition.
   `lookup_public_key`) has an `identity_type` set containing
   **`substrate_persist`** (the reserved governance/substrate authority).
   Used in BOTH gates; **fail-secure** — an unauthorized infra-labeled
-  community falls through to the STRICTER non-infra path (owner-binding
+  community falls through to the STRICTER non-infra path (steward-binding
   REQUIRED + DEK cascade APPLIES).
-- **F3 — `is_owner_bound` honored revoked/expired delegations.** Clause 3
+- **F3 — `is_steward_bound` honored revoked/expired delegations.** Clause 3
   ("∃ a live `delegates_to(U → k)` from a `user`-role granter") accepted
   ANY `delegates_to` — a `withdraws`/`recants`-retracted or lapsed
-  delegation still conferred owner-binding (AV-69 bypass). **Mitigation**:
+  delegation still conferred steward-binding (AV-69 bypass). **Mitigation**:
   an edge is now skipped if the granter has a `withdraws`/`recants`
   against `k` (the §11.10 edge-retraction model, recipient named as
   `attested_key_id`) or if `expires_at <= now`; only a genuinely live edge
-  confers owner-binding.
+  confers steward-binding.
 - **F4 — rotation forward-secrecy hole for future-dated `effective_at`.**
   `put_community_membership_revocation` bumped the epoch at write time, but
   `resolve_community_members` only dropped a member once `effective_at <=
@@ -2303,10 +2303,10 @@ the same reserved governance role that already owns `system:` /
 | AV-66 | Rarity-driven retention resurrecting revoked content (N5) | v8.1.0/v8.2.0 `evict_fountain_content_hard_delete` is a SEPARATE path that NEVER consults `retention_priority` — drops all symbols, manifest stays `EnvelopeOnly`; `resolve_retention_action` drives `retention_decision`/`ejection_verdict` (Withdrawn → `EjectHardDelete` regardless of `is_rare`). Revocation overrides rarity by construction, not by comparison. | N6 `holding_claim_counts` gates rarity on possession-proven claims (unverified claim can't lower another peer's priority). | **✓ Mitigated v8.1.0/v8.2.0** | CIRISPersist#228 |
 | AV-67 | Federation-tier forge-later via unverified per-trace ingest (CC 5.3.2.4.3.1 — the CC 5.3.2.4.3 `tier=federation ⟹ hybrid present` invariant enforced at the bulk testimony corpus; same forge-later class as AV-59 at the trace-store path, previously unmodeled at the per-trace `put_attestation` grain) | v9.0.0 `verify_federation_tier_ingest` (`ceg_produce_canonicalize` JCS → `SHA-256 == original_content_hash` → `lookup_public_key` REGISTERED pubkeys → `verify_hybrid`(`Strict`), BOTH halves REQUIRED) wired into `put_attestation` on all three backends BEFORE `persist_row_hash`+INSERT (verify-before-mutation, AV-9); rejected ⇒ zero rows, typed `FederationTierUnverified`. Composed with — not replacing — `check_federation`. | **Local-tier EXEMPT** (CC 5.3.2.2 deferred sig; matrix arm (e) proves no over-reject). Exposed + fixed the classical-only `withdraws` emitter gap (evict/sweeper/takedown now hybrid-sign via `LocalSigner`; non-PQC engine fails honest, no silent skip). | **✓ Mitigated v9.0.0** (BREAKING — classical-only fed rows non-conformant; non-PQC producers local-tier-only) | CIRISPersist#237 |
 | AV-68 | Node-only key receiving agency via `delegates_to` (CC 4.4.3.4.3 "Partnership WITHOUT agency" / CC 1.13.5 "infrastructure must not have agency") | v9.0.0 `check_node_agency_admission` wired into `put_attestation` (3 backends, verify-before-mutation): a `delegates_to` to a `node`-ONLY recipient (resolved via `lookup_public_key`, CC 3.4.7.1) MUST be `scopes_are_infra_only` (non-empty, every token `infra:`), else REJECTED `NodeAgencyForbidden` + not stored. Published `identity_type::NODE` + `delegation_scope` (`infra:*`/`agency:*` + `LEGACY_AGENCY_KINDS`). | No over-reject: `agent`/brain key MAY carry `agency:*`; `{node,agent}` hybrid not constrained; unresolved recipient FK-rejected by `put_attestation` anyway. CIRISServer `ownership.rs` becomes a thin wrapper. | **✓ Mitigated v9.0.0** (see AV-71 for the dup-token bypass) | CIRISPersist#235/#236 |
-| AV-69 | Unowned node/agent admitted to a non-infra community (CC 3.2 owner-binding gate / CC 3.4.7.1; authority must root in a human, CC 1.13.2) | v9.0.0 `check_community_membership_owner_binding` wired into `put_community` (3 backends) after the geographic gate, before write lock/INSERT (verify-before-mutation): a `node`/`agent` roster member lacking a live `is_owner_bound(K)` path to a `user`-role identity REJECTS the write `UnownedCommunityMember` + not stored. Precondition, NOT a substitute for the `consensus_protocol` vote. | Infra carve-out (CC 3.2 "Trust ≠ membership"): `cohort_subkind: infrastructure` community admits an unowned node. `user` member trivially owner-bound; unresolved/non-node-agent out of scope (no over-reject). | **✓ Mitigated v9.0.0** (see AV-72/F2 self-label, AV-72/F3 revoked-delegation bypasses) | CIRISPersist#235 |
+| AV-69 | Unstewarded node/agent admitted to a non-infra community (CC 3.2 steward-binding gate / CC 3.4.7.1; authority must root in a human, CC 1.13.2) | v9.0.0 `check_community_membership_steward_binding` wired into `put_community` (3 backends) after the geographic gate, before write lock/INSERT (verify-before-mutation): a `node`/`agent` roster member lacking a live `is_steward_bound(K)` path to a `user`-role identity REJECTS the write `UnstewardedCommunityMember` + not stored. Precondition, NOT a substitute for the `consensus_protocol` vote. | Infra carve-out (CC 3.2 "Trust ≠ membership"): `cohort_subkind: infrastructure` community admits an unstewarded node. `user` member trivially steward-bound; unresolved/non-node-agent out of scope (no over-reject). | **✓ Mitigated v9.0.0** (see AV-72/F2 self-label, AV-72/F3 revoked-delegation bypasses) | CIRISPersist#235 |
 | AV-70 | Community-DEK not rotated on member removal — removed member decrypts NEW community content (CC 4.4.3.2.2 forward secrecy; community-DEK is content's SOLE confidentiality boundary, CC 4.4.3.2.1) | v9.0.0 `put_community_membership_revocation` bumps the community DEK epoch (`community_dek_bump_epoch`, 3 backends) as part of the revocation write; next emission mints a FRESH DEK wrapped only to remaining members (active roster = `lookup_community` ∖ effective revocations); removed member can't unwrap. **Exposure window = zero.** All wraps `wrap_algorithm: v2` (FIPS-203 hybrid) — NEVER v1 (CC 4.4.3.4.1 / CC 5.2 HNDL); keyless member fail-secure EXCLUDED + `hard_case:recipient_excluded` (V087 CHECK makes v1 unrepresentable). | Forward-only (old-epoch blobs keep grants); flat per-member re-wrap, deliberately NOT MLS TreeKEM (CC 5.1, RET-layer OQ). Infra communities opt OUT (Commons plaintext, no DEK — trust root publicly auditable). | **✓ Mitigated v9.0.0** (see AV-72/F4 future-dated `effective_at`, AV-72/F5 atomicity) | CIRISPersist (CC 4.4.3.2.2) |
 | AV-71 | Node-agency gate (AV-68) bypass via duplicate `identity_type` token `"node,node"` (CC 1.13.5 / CC 4.4.3.4.3) | v9.0.0 (adversarial review F1) the gate now tests the identity_type **set** via `HashSet<&str>` (`len()==1 && contains(NODE)`), robust to duplicate/whitespace/order — `"node,node"` no longer evades node-only detection. | `node,agent` hybrid still ADMITTED (no over-reject); regression-tested on 3 backends (`"node,node"`/`"node, node"` + `agency:*` → REJECTED + not stored). | **✓ Mitigated v9.0.0** | CIRISPersist#237 (F1) |
-| AV-72 | Authority/forward-secrecy bypasses in the new v9.0.0 community gates (CC 3.2 / CC 4.4.3.2.1 / CC 3.4.7.1 / CC 4.4.3.2.2) | v9.0.0 (adversarial review F2–F5): **F2** self-labeled `cohort_subkind: infrastructure` skipped owner-binding + forced plaintext → `is_authorized_infrastructure_community` honors the carve-out ONLY if `community_key_id` is `substrate_persist`-roled (fail-secure to the stricter path). **F3** `is_owner_bound` honored revoked/expired delegations → edge skipped on `withdraws`/`recants` against `k` (§11.10) or `expires_at <= now`. **F4** future-dated `effective_at` kept wrapping a "removed" member → community revocation now immediate (future-dated beyond 60s skew REJECTED before write). **F5** non-atomic revoke+hard_case+bump → ONE transaction per backend. | Each fix has a fails-without/passes-with test on all backends where the path runs; no new substrate authority (`substrate_persist` is the existing reserved governance role, §3.7). | **✓ Mitigated v9.0.0** | CIRISPersist#237 (F2–F5) |
+| AV-72 | Authority/forward-secrecy bypasses in the new v9.0.0 community gates (CC 3.2 / CC 4.4.3.2.1 / CC 3.4.7.1 / CC 4.4.3.2.2) | v9.0.0 (adversarial review F2–F5): **F2** self-labeled `cohort_subkind: infrastructure` skipped steward-binding + forced plaintext → `is_authorized_infrastructure_community` honors the carve-out ONLY if `community_key_id` is `substrate_persist`-roled (fail-secure to the stricter path). **F3** `is_steward_bound` honored revoked/expired delegations → edge skipped on `withdraws`/`recants` against `k` (§11.10) or `expires_at <= now`. **F4** future-dated `effective_at` kept wrapping a "removed" member → community revocation now immediate (future-dated beyond 60s skew REJECTED before write). **F5** non-atomic revoke+hard_case+bump → ONE transaction per backend. | Each fix has a fails-without/passes-with test on all backends where the path runs; no new substrate authority (`substrate_persist` is the existing reserved governance role, §3.7). | **✓ Mitigated v9.0.0** | CIRISPersist#237 (F2–F5) |
 
 ---
 

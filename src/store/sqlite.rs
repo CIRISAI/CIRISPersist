@@ -2149,7 +2149,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // no-op for any non-matching row; for a moderation/review report it
         // admits IFF the signer IS a duty-holder over the target (the row's
         // subject_key_ids ∪ the envelope community_id's named moderators) or
-        // is reached by an owner-bound duty-holder via a live scoped
+        // is reached by an steward-bound duty-holder via a live scoped
         // delegates_to chain. Absence ⇒ REJECT. Runs AFTER the withdraws
         // gate and BEFORE persist_row_hash + INSERT — a rejected emission
         // leaves no trace.
@@ -3034,11 +3034,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
         )
         .await?;
-        // v9.0.0 (CC 3.2 / CC 3.4.7.1) — owner-binding precondition for
+        // v9.0.0 (CC 3.2 / CC 3.4.7.1) — steward-binding precondition for
         // non-infrastructure community membership. Directory reads run
         // before the write lock below. No-op for infrastructure
         // communities and for rosters with no node/agent members.
-        crate::federation::admission::check_community_membership_owner_binding(self, &row).await?;
+        crate::federation::admission::check_community_membership_steward_binding(self, &row)
+            .await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let members_json = serde_json::to_string(&row.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
@@ -24467,7 +24468,7 @@ mod tests {
         assert_eq!(stored[0].attestation_id, id);
     }
 
-    // ── v9.0.0 (CC 3.2 / CC 3.4.7.1) — owner-binding precondition for
+    // ── v9.0.0 (CC 3.2 / CC 3.4.7.1) — steward-binding precondition for
     // non-infrastructure community membership (sqlite parity).
 
     /// Seed the community's own key + submit a community with `members`
@@ -24525,15 +24526,15 @@ mod tests {
             .await
     }
 
-    /// UNOWNED node member of a non-infra community → REJECTED + not stored.
+    /// UNSTEWARDED node member of a non-infra community → REJECTED + not stored.
     #[tokio::test]
-    async fn community_unowned_node_member_rejected_sqlite() {
+    async fn community_unstewarded_node_member_rejected_sqlite() {
         let backend = bootstrap_node_agency_sqlite().await;
         let err = put_community_ob_sqlite(&backend, "comm-ob-1", vec!["node-key"], None)
             .await
             .unwrap_err();
         match err {
-            crate::federation::Error::UnownedCommunityMember {
+            crate::federation::Error::UnstewardedCommunityMember {
                 ref community_key_id,
                 ref member_key_id,
                 member_role,
@@ -24542,9 +24543,9 @@ mod tests {
                 assert_eq!(member_key_id, "node-key");
                 assert_eq!(member_role, crate::federation::types::identity_type::NODE);
             }
-            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+            other => panic!("expected UnstewardedCommunityMember, got {other:?}"),
         }
-        assert_eq!(err.kind(), "federation_unowned_community_member");
+        assert_eq!(err.kind(), "federation_unstewarded_community_member");
         assert!(backend
             .lookup_community("comm-ob-1")
             .await
@@ -24552,18 +24553,18 @@ mod tests {
             .is_none());
     }
 
-    /// UNOWNED agent member → REJECTED (role reported as `agent`).
+    /// UNSTEWARDED agent member → REJECTED (role reported as `agent`).
     #[tokio::test]
-    async fn community_unowned_agent_member_rejected_sqlite() {
+    async fn community_unstewarded_agent_member_rejected_sqlite() {
         let backend = bootstrap_node_agency_sqlite().await;
         let err = put_community_ob_sqlite(&backend, "comm-ob-2", vec!["agent-key"], None)
             .await
             .unwrap_err();
         match err {
-            crate::federation::Error::UnownedCommunityMember { member_role, .. } => {
+            crate::federation::Error::UnstewardedCommunityMember { member_role, .. } => {
                 assert_eq!(member_role, crate::federation::types::identity_type::AGENT);
             }
-            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+            other => panic!("expected UnstewardedCommunityMember, got {other:?}"),
         }
         assert!(backend
             .lookup_community("comm-ob-2")
@@ -24572,10 +24573,10 @@ mod tests {
             .is_none());
     }
 
-    /// OWNER-BOUND node member (live `delegates_to(user → node, infra:*)`)
+    /// STEWARD-BOUND node member (live `delegates_to(user → node, infra:*)`)
     /// → ADMITTED.
     #[tokio::test]
-    async fn community_owner_bound_node_member_admitted_sqlite() {
+    async fn community_steward_bound_node_member_admitted_sqlite() {
         use crate::federation::types::delegation_scope as ds;
         let backend = bootstrap_node_agency_sqlite().await;
         backend
@@ -24590,7 +24591,7 @@ mod tests {
             .unwrap();
         put_community_ob_sqlite(&backend, "comm-ob-3", vec!["node-key"], None)
             .await
-            .expect("owner-bound node admitted");
+            .expect("steward-bound node admitted");
         assert!(backend
             .lookup_community("comm-ob-3")
             .await
@@ -24599,10 +24600,10 @@ mod tests {
     }
 
     /// SecReview F3: a WITHDRAWN `delegates_to(user → node)` no longer
-    /// confers owner-binding (sqlite parity) — admitted while live, REJECTED
+    /// confers steward-binding (sqlite parity) — admitted while live, REJECTED
     /// after the granter withdraws the edge.
     #[tokio::test]
-    async fn community_owner_binding_withdrawn_delegation_not_live_sqlite() {
+    async fn community_steward_binding_withdrawn_delegation_not_live_sqlite() {
         use crate::federation::types::{attestation_type, delegation_scope as ds};
         let backend = bootstrap_node_agency_sqlite().await;
         let d = node_delegates_to_sqlite(
@@ -24617,7 +24618,7 @@ mod tests {
             .unwrap();
         put_community_ob_sqlite(&backend, "comm-ob-wd-live", vec!["node-key"], None)
             .await
-            .expect("owner-bound (live) node admitted");
+            .expect("steward-bound (live) node admitted");
 
         // owner withdraws the edge (issuer-against-recipient: attested = node-key).
         let mut w = topo_attestation(
@@ -24642,7 +24643,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::federation::Error::UnownedCommunityMember { .. }
+            crate::federation::Error::UnstewardedCommunityMember { .. }
         ));
         assert!(backend
             .lookup_community("comm-ob-wd-dead")
@@ -24652,9 +24653,9 @@ mod tests {
     }
 
     /// SecReview F3: an EXPIRED `delegates_to(user → node)` does NOT confer
-    /// owner-binding (sqlite parity) — unowned node REJECTED.
+    /// steward-binding (sqlite parity) — unstewarded node REJECTED.
     #[tokio::test]
-    async fn community_owner_binding_expired_delegation_not_live_sqlite() {
+    async fn community_steward_binding_expired_delegation_not_live_sqlite() {
         use crate::federation::types::delegation_scope as ds;
         let backend = bootstrap_node_agency_sqlite().await;
         let mut d = node_delegates_to_sqlite(
@@ -24672,7 +24673,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::federation::Error::UnownedCommunityMember { .. }
+            crate::federation::Error::UnstewardedCommunityMember { .. }
         ));
         assert!(backend
             .lookup_community("comm-ob-exp")
@@ -24681,10 +24682,10 @@ mod tests {
             .is_none());
     }
 
-    /// OWNER-BOUND agent member (live `delegates_to(user → agent)`) →
+    /// STEWARD-BOUND agent member (live `delegates_to(user → agent)`) →
     /// ADMITTED.
     #[tokio::test]
-    async fn community_owner_bound_agent_member_admitted_sqlite() {
+    async fn community_steward_bound_agent_member_admitted_sqlite() {
         let backend = bootstrap_node_agency_sqlite().await;
         backend
             .put_attestation(SignedAttestation {
@@ -24699,7 +24700,7 @@ mod tests {
             .unwrap();
         put_community_ob_sqlite(&backend, "comm-ob-4", vec!["agent-key"], None)
             .await
-            .expect("owner-bound agent admitted");
+            .expect("steward-bound agent admitted");
         assert!(backend
             .lookup_community("comm-ob-4")
             .await
@@ -24707,9 +24708,9 @@ mod tests {
             .is_some());
     }
 
-    /// `cohort_subkind: infrastructure` → UNOWNED node admitted (carve-out).
+    /// `cohort_subkind: infrastructure` → UNSTEWARDED node admitted (carve-out).
     #[tokio::test]
-    async fn community_infrastructure_exempts_unowned_node_sqlite() {
+    async fn community_infrastructure_exempts_unstewarded_node_sqlite() {
         let backend = bootstrap_node_agency_sqlite().await;
         put_community_ob_sqlite(
             &backend,
@@ -24726,38 +24727,38 @@ mod tests {
             .is_some());
     }
 
-    /// #249 Cut A — the owner-binding + duty-holders readers
-    /// (`is_owner_bound_json` / `duty_holders_for_community_json`) the FFI
-    /// exposes: a `user`-role key IS owner-bound, a bare `node` key is NOT,
+    /// #249 Cut A — the steward-binding + duty-holders readers
+    /// (`is_steward_bound_json` / `duty_holders_for_community_json`) the FFI
+    /// exposes: a `user`-role key IS steward-bound, a bare `node` key is NOT,
     /// and the duty-holder set of a MAJORITY community (whole roster =
-    /// authority) is exactly its owner-bound members — proven through the
+    /// authority) is exactly its steward-bound members — proven through the
     /// serde_json array shape the wrapper emits (HashSet sorted to a stable
     /// `Vec`), the #104 PERSIST_DELEGATES_TO blocker's by-construction view.
     #[tokio::test]
-    async fn cut_a_owner_binding_and_duty_holders_json_sqlite() {
-        use crate::federation::admission::{duty_holders_for_community, is_owner_bound};
+    async fn cut_a_steward_binding_and_duty_holders_json_sqlite() {
+        use crate::federation::admission::{duty_holders_for_community, is_steward_bound};
         use crate::federation::FederationDirectory;
         let backend = bootstrap_node_agency_sqlite().await;
 
-        // is_owner_bound: `owner` (USER) is bound; `node-key` (NODE, no
+        // is_steward_bound: `owner` (USER) is bound; `node-key` (NODE, no
         // delegation) is not — the exact bools the JSON wrapper serializes.
-        let owner_bound = is_owner_bound(&backend as &dyn FederationDirectory, "owner")
+        let steward_bound = is_steward_bound(&backend as &dyn FederationDirectory, "owner")
             .await
             .unwrap();
-        let node_bound = is_owner_bound(&backend as &dyn FederationDirectory, "node-key")
+        let node_bound = is_steward_bound(&backend as &dyn FederationDirectory, "node-key")
             .await
             .unwrap();
         assert!(
-            serde_json::from_str::<bool>(&serde_json::to_string(&owner_bound).unwrap()).unwrap()
+            serde_json::from_str::<bool>(&serde_json::to_string(&steward_bound).unwrap()).unwrap()
         );
         assert!(
             !serde_json::from_str::<bool>(&serde_json::to_string(&node_bound).unwrap()).unwrap()
         );
 
         // A MAJORITY community whose whole roster is the authority set; only
-        // the owner-bound member surfaces as a duty-holder. Seed the
-        // community's own key, then a single owner-bound member (`owner`) —
-        // owner-binding admission accepts it (`owner` is a USER).
+        // the steward-bound member surfaces as a duty-holder. Seed the
+        // community's own key, then a single steward-bound member (`owner`) —
+        // steward-binding admission accepts it (`owner` is a USER).
         backend
             .put_public_key(SignedKeyRecord {
                 record: fed_key("duty-comm", "duty-comm", "duty-comm"),
@@ -24775,7 +24776,7 @@ mod tests {
                 ),
             })
             .await
-            .expect("owner-bound member admitted under MAJORITY");
+            .expect("steward-bound member admitted under MAJORITY");
 
         // duty_holders_for_community → exactly {owner}, through the sorted
         // JSON array the FFI wrapper returns.
@@ -24804,11 +24805,11 @@ mod tests {
     }
 
     /// SecReview F2: an `infrastructure`-LABELED community whose own key is
-    /// NOT `substrate_persist` does NOT get the carve-out — owner-binding is
-    /// STILL enforced, so an UNOWNED node member is REJECTED + not stored
+    /// NOT `substrate_persist` does NOT get the carve-out — steward-binding is
+    /// STILL enforced, so an UNSTEWARDED node member is REJECTED + not stored
     /// (fail-secure: a self-applied infra label can never skip the gate).
     #[tokio::test]
-    async fn community_unauthorized_infra_label_still_enforces_owner_binding_sqlite() {
+    async fn community_unauthorized_infra_label_still_enforces_steward_binding_sqlite() {
         let backend = bootstrap_node_agency_sqlite().await;
         let err = put_community_ob_sqlite_authority(
             &backend,
@@ -24820,7 +24821,7 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            crate::federation::Error::UnownedCommunityMember {
+            crate::federation::Error::UnstewardedCommunityMember {
                 ref member_key_id,
                 member_role,
                 ..
@@ -24828,7 +24829,7 @@ mod tests {
                 assert_eq!(member_key_id, "node-key");
                 assert_eq!(member_role, crate::federation::types::identity_type::NODE);
             }
-            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+            other => panic!("expected UnstewardedCommunityMember, got {other:?}"),
         }
         assert!(backend
             .lookup_community("comm-ob-fakeinfra")
@@ -24837,7 +24838,7 @@ mod tests {
             .is_none());
     }
 
-    /// Pure `user`-role member → NOT over-rejected (trivially owner-bound).
+    /// Pure `user`-role member → NOT over-rejected (trivially steward-bound).
     #[tokio::test]
     async fn community_user_member_not_over_rejected_sqlite() {
         let backend = bootstrap_node_agency_sqlite().await;
@@ -27835,7 +27836,7 @@ mod tests {
 
     // ── #249 Cut B — enumerators + add_community_member (sqlite parity).
 
-    /// Seed `n` user-role keys `pfx-0..` (trivially owner-bound) + a fresh
+    /// Seed `n` user-role keys `pfx-0..` (trivially steward-bound) + a fresh
     /// migrated backend; returns the backend.
     async fn cutb_backend_with_users(pfx: &str, n: usize) -> SqliteBackend {
         use crate::federation::types::identity_type;
@@ -28112,14 +28113,14 @@ mod tests {
         assert!(!set.contains("mod-outsider"));
     }
 
-    /// owner_bindings_of: owner-bound node (live infra:* delegation) →
+    /// steward_bindings_of: steward-bound node (live infra:* delegation) →
     /// [owner]; unbound → empty.
     #[tokio::test]
-    async fn owner_bindings_of_returns_user_anchors_sqlite() {
+    async fn steward_bindings_of_returns_user_anchors_sqlite() {
         use crate::federation::types::delegation_scope as ds;
         let backend = bootstrap_node_agency_sqlite().await;
         assert!(
-            crate::federation::admission::owner_bindings_of(&backend, "node-key")
+            crate::federation::admission::steward_bindings_of(&backend, "node-key")
                 .await
                 .unwrap()
                 .is_empty()
@@ -28135,27 +28136,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            crate::federation::admission::owner_bindings_of(&backend, "node-key")
+            crate::federation::admission::steward_bindings_of(&backend, "node-key")
                 .await
                 .unwrap(),
             vec!["owner".to_string()]
         );
     }
 
-    /// owner_binding_chain: the audit PATH. clause 1 → [self]; clause 3 →
+    /// CIRISPersist#299 — `nodes_stewarded_by` is the EXACT inverse of
+    /// `steward_bindings_of` (`n ∈ nodes_stewarded_by(U)` ⟺ `U ∈ steward_bindings_of(n)`):
+    /// pre-delegation the user owns only itself (clause-1 user-role self-bind);
+    /// after `delegates_to(owner → node-key)` it owns `{node-key, owner}`; a
+    /// node owns nothing (sqlite parity).
+    #[tokio::test]
+    async fn nodes_stewarded_by_is_inverse_of_steward_bindings_sqlite() {
+        use crate::federation::admission::{nodes_stewarded_by, steward_bindings_of};
+        use crate::federation::types::delegation_scope as ds;
+        let backend = bootstrap_node_agency_sqlite().await;
+        // Pre-delegation: owner owns only itself (user-role self-binding).
+        assert_eq!(
+            nodes_stewarded_by(&backend, "owner").await.unwrap(),
+            vec!["owner".to_string()]
+        );
+        // A node owns nothing (it is not user-role, so it self-binds nobody).
+        assert!(nodes_stewarded_by(&backend, "node-key")
+            .await
+            .unwrap()
+            .is_empty());
+
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: node_delegates_to_sqlite(
+                    "owner",
+                    "node-key",
+                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                ),
+            })
+            .await
+            .unwrap();
+
+        // Post-delegation: owns node-key + self (deduped, sorted).
+        assert_eq!(
+            nodes_stewarded_by(&backend, "owner").await.unwrap(),
+            vec!["node-key".to_string(), "owner".to_string()]
+        );
+        // Exact-inverse invariant: node-key ∈ nodes_stewarded_by(owner) ⟺
+        // owner ∈ steward_bindings_of(node-key).
+        assert!(steward_bindings_of(&backend, "node-key")
+            .await
+            .unwrap()
+            .contains(&"owner".to_string()));
+    }
+
+    /// steward_binding_chain: the audit PATH. clause 1 → [self]; clause 3 →
     /// [user, node]; unbound → empty (sqlite parity).
     #[tokio::test]
-    async fn owner_binding_chain_returns_audit_path_sqlite() {
+    async fn steward_binding_chain_returns_audit_path_sqlite() {
         use crate::federation::types::delegation_scope as ds;
         let backend = bootstrap_node_agency_sqlite().await;
         assert!(
-            crate::federation::admission::owner_binding_chain(&backend, "node-key")
+            crate::federation::admission::steward_binding_chain(&backend, "node-key")
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            crate::federation::admission::owner_binding_chain(&backend, "owner")
+            crate::federation::admission::steward_binding_chain(&backend, "owner")
                 .await
                 .unwrap(),
             vec!["owner".to_string()]
@@ -28171,7 +28217,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            crate::federation::admission::owner_binding_chain(&backend, "node-key")
+            crate::federation::admission::steward_binding_chain(&backend, "node-key")
                 .await
                 .unwrap(),
             vec!["owner".to_string(), "node-key".to_string()]

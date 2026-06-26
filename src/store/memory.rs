@@ -1272,7 +1272,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // A no-op for any non-matching row; for a moderation/review report
         // it admits IFF the signer IS a duty-holder over the target (the
         // row's subject_key_ids ∪ the envelope community_id's named
-        // moderators) or is reached by an owner-bound duty-holder via a live
+        // moderators) or is reached by an steward-bound duty-holder via a live
         // scoped delegates_to chain. Absence ⇒ REJECT. Runs BEFORE the state
         // lock for the same deadlock reason as the withdraws gate (the walk
         // calls list_attestations_by on self).
@@ -1883,13 +1883,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             chrono::Utc::now(),
         )
         .await?;
-        // v9.0.0 (CC 3.2 / CC 3.4.7.1) — owner-binding precondition for
+        // v9.0.0 (CC 3.2 / CC 3.4.7.1) — steward-binding precondition for
         // non-infrastructure community membership. Resolves member
-        // identity_type + owner-binding via the directory (locks state
+        // identity_type + steward-binding via the directory (locks state
         // itself), so it MUST run before the state lock below to avoid a
         // re-entrant deadlock. No-op for infrastructure communities and
         // for rosters with no node/agent members.
-        crate::federation::admission::check_community_membership_owner_binding(self, &row).await?;
+        crate::federation::admission::check_community_membership_steward_binding(self, &row)
+            .await?;
         let mut state = self.state.lock().expect("memory backend lock");
         if !state.federation_keys.contains_key(&row.community_key_id) {
             return Err(crate::federation::Error::InvalidArgument(format!(
@@ -6035,9 +6036,9 @@ mod tests {
     // (c2) nothing → REJECT (the bypass-closed guard), (d) scope isolation,
     // (e) depth>5, (f) ⊆-parent attenuation violation, (g) deputization
     // without sub_delegation, (h) withdraws on mid-chain edge, (i)
-    // non-owner-bound root.
+    // non-steward-bound root.
 
-    /// A `user`-role key (owner-bound by clause (1) of `is_owner_bound`).
+    /// A `user`-role key (steward-bound by clause (1) of `is_steward_bound`).
     fn fix_user_key(key_id: &str) -> KeyRecord {
         let mut k = fix_key(key_id, "primitive", key_id);
         k.identity_type = crate::federation::types::identity_type::USER.into();
@@ -6122,9 +6123,9 @@ mod tests {
     #[tokio::test]
     async fn memory_moderation_scores_review_full_matrix() {
         let backend = MemoryBackend::new();
-        // `subject` is a user (owner-bound), the content's own subject.
+        // `subject` is a user (steward-bound), the content's own subject.
         // `delegate`/`deep` are agent keys; `founder` is the community's
-        // owner-bound authority; `rando`/`modkey` are unauthorized.
+        // steward-bound authority; `rando`/`modkey` are unauthorized.
         backend
             .put_public_key(SignedKeyRecord {
                 record: fix_user_key("subject"),
@@ -6188,7 +6189,7 @@ mod tests {
             .expect("(b1) subject-delegated review admitted");
         assert!(backend.get_attestation("r-deleg").await.unwrap().is_some());
 
-        // (b2) named-moderator: community founder (owner-bound authority)
+        // (b2) named-moderator: community founder (steward-bound authority)
         // → ADMIT as-self (community-moderation case #95 unblocked).
         backend
             .put_attestation(SignedAttestation {
@@ -6352,7 +6353,7 @@ mod tests {
         // (MAX_MODERATION_DELEGATION_DEPTH = 5) is refused.
         let backend = MemoryBackend::new();
         let depth = crate::federation::admission::MAX_MODERATION_DELEGATION_DEPTH;
-        // k0 (the owner-bound subject root) → k1 → ... → k(depth+1).
+        // k0 (the steward-bound subject root) → k1 → ... → k(depth+1).
         let n = depth + 2;
         backend
             .put_public_key(SignedKeyRecord {
@@ -6405,7 +6406,7 @@ mod tests {
     async fn memory_moderation_scores_attenuation_and_subdelegation() {
         // (f) ⊆-parent attenuation violation → REJECT; (g) deputization
         // without sub_delegation → REJECT; (h) withdraws on a mid-chain
-        // edge → downstream REJECT; (i) non-owner-bound root → REJECT (b).
+        // edge → downstream REJECT; (i) non-steward-bound root → REJECT (b).
         let backend = MemoryBackend::new();
         backend
             .put_public_key(SignedKeyRecord {
@@ -6480,8 +6481,8 @@ mod tests {
             .await
             .expect("(g) direct delegate (mid) is admitted");
 
-        // (i) non-owner-bound root: agentroot (NOT user-role) → agdel
-        // (review). agentroot reaches agdel, but is NOT owner-bound, and is
+        // (i) non-steward-bound root: agentroot (NOT user-role) → agdel
+        // (review). agentroot reaches agdel, but is NOT steward-bound, and is
         // not in any community authority set → agdel REJECT under (b).
         backend
             .put_attestation(SignedAttestation {
@@ -6509,7 +6510,7 @@ mod tests {
         assert_eq!(
             err.kind(),
             "federation_delegated_scope_unauthorized",
-            "(i) non-owner-bound root cannot confer a delegated duty"
+            "(i) non-steward-bound root cannot confer a delegated duty"
         );
 
         // (h) withdraws on a mid-chain edge: subject → h_mid (review, sub),
@@ -6659,10 +6660,10 @@ mod tests {
         );
     }
 
-    // ── v9.0.0 (CC 3.2 / CC 3.4.7.1) — owner-binding precondition for
+    // ── v9.0.0 (CC 3.2 / CC 3.4.7.1) — steward-binding precondition for
     // non-infrastructure community membership (memory backend; 3-backend
     // parity with sqlite + postgres). A node/agent roster member of a
-    // non-infra community MUST be owner-bound; infra communities + pure
+    // non-infra community MUST be steward-bound; infra communities + pure
     // user/canonical participation are not over-rejected.
 
     /// Submit a community `community_id` (its own key seeded) with the
@@ -6753,17 +6754,17 @@ mod tests {
             .unwrap();
     }
 
-    /// An UNOWNED node member of a non-infra community → REJECTED + not
+    /// An UNSTEWARDED node member of a non-infra community → REJECTED + not
     /// stored (the load-bearing CC 3.2 gate).
     #[tokio::test]
-    async fn community_unowned_node_member_rejected() {
+    async fn community_unstewarded_node_member_rejected() {
         let backend = MemoryBackend::new();
         seed_ob_keys(&backend).await;
         let err = put_community_with(&backend, "comm-ob-1", vec![member("ob-node")], None)
             .await
             .unwrap_err();
         match err {
-            crate::federation::Error::UnownedCommunityMember {
+            crate::federation::Error::UnstewardedCommunityMember {
                 ref community_key_id,
                 ref member_key_id,
                 member_role,
@@ -6772,9 +6773,9 @@ mod tests {
                 assert_eq!(member_key_id, "ob-node");
                 assert_eq!(member_role, crate::federation::types::identity_type::NODE);
             }
-            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+            other => panic!("expected UnstewardedCommunityMember, got {other:?}"),
         }
-        assert_eq!(err.kind(), "federation_unowned_community_member");
+        assert_eq!(err.kind(), "federation_unstewarded_community_member");
         // Verify-before-mutation: nothing stored.
         assert!(backend
             .lookup_community("comm-ob-1")
@@ -6783,19 +6784,19 @@ mod tests {
             .is_none());
     }
 
-    /// An UNOWNED agent member → REJECTED (role reported as `agent`).
+    /// An UNSTEWARDED agent member → REJECTED (role reported as `agent`).
     #[tokio::test]
-    async fn community_unowned_agent_member_rejected() {
+    async fn community_unstewarded_agent_member_rejected() {
         let backend = MemoryBackend::new();
         seed_ob_keys(&backend).await;
         let err = put_community_with(&backend, "comm-ob-2", vec![member("ob-agent")], None)
             .await
             .unwrap_err();
         match err {
-            crate::federation::Error::UnownedCommunityMember { member_role, .. } => {
+            crate::federation::Error::UnstewardedCommunityMember { member_role, .. } => {
                 assert_eq!(member_role, crate::federation::types::identity_type::AGENT);
             }
-            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+            other => panic!("expected UnstewardedCommunityMember, got {other:?}"),
         }
         assert!(backend
             .lookup_community("comm-ob-2")
@@ -6804,15 +6805,15 @@ mod tests {
             .is_none());
     }
 
-    /// An OWNER-BOUND node member (live `delegates_to(user → node, infra:*)`)
+    /// An STEWARD-BOUND node member (live `delegates_to(user → node, infra:*)`)
     /// → ADMITTED. The infra-only scope both stores the delegation (past
-    /// the node-agency gate) and satisfies `is_owner_bound` clause (3).
+    /// the node-agency gate) and satisfies `is_steward_bound` clause (3).
     #[tokio::test]
-    async fn community_owner_bound_node_member_admitted() {
+    async fn community_steward_bound_node_member_admitted() {
         use crate::federation::types::delegation_scope as ds;
         let backend = MemoryBackend::new();
         seed_ob_keys(&backend).await;
-        // owner (user) delegates infra:* to the node → owner-binding.
+        // owner (user) delegates infra:* to the node → steward-binding.
         backend
             .put_attestation(SignedAttestation {
                 attestation: fix_node_delegates_to(
@@ -6827,7 +6828,7 @@ mod tests {
             .unwrap();
         put_community_with(&backend, "comm-ob-3", vec![member("ob-node")], None)
             .await
-            .expect("owner-bound node admitted");
+            .expect("steward-bound node admitted");
         assert!(backend
             .lookup_community("comm-ob-3")
             .await
@@ -6836,15 +6837,15 @@ mod tests {
     }
 
     /// SecReview F3: a `delegates_to(user → node)` that the granter has
-    /// WITHDRAWN no longer confers owner-binding. The node is admitted while
+    /// WITHDRAWN no longer confers steward-binding. The node is admitted while
     /// the delegation is live, then a second community (same owner-withdrawn
     /// node) is REJECTED — the withdrawn edge is not "live".
     #[tokio::test]
-    async fn community_owner_binding_withdrawn_delegation_not_live() {
+    async fn community_steward_binding_withdrawn_delegation_not_live() {
         use crate::federation::types::delegation_scope as ds;
         let backend = MemoryBackend::new();
         seed_ob_keys(&backend).await;
-        // owner (user) delegates infra:* → node → owner-binding (live).
+        // owner (user) delegates infra:* → node → steward-binding (live).
         backend
             .put_attestation(SignedAttestation {
                 attestation: fix_node_delegates_to(
@@ -6860,7 +6861,7 @@ mod tests {
         // Live → admitted.
         put_community_with(&backend, "comm-ob-wd-live", vec![member("ob-node")], None)
             .await
-            .expect("owner-bound (live delegation) node admitted");
+            .expect("steward-bound (live delegation) node admitted");
 
         // owner WITHDRAWS the delegation edge (issuer-against-recipient: the
         // withdraws' attested_key_id is the recipient `ob-node`).
@@ -6879,13 +6880,13 @@ mod tests {
             .await
             .expect("owner withdraws own delegation edge");
 
-        // Withdrawn → NOT owner-bound → REJECTED.
+        // Withdrawn → NOT steward-bound → REJECTED.
         let err = put_community_with(&backend, "comm-ob-wd-dead", vec![member("ob-node")], None)
             .await
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::federation::Error::UnownedCommunityMember { .. }
+            crate::federation::Error::UnstewardedCommunityMember { .. }
         ));
         assert!(backend
             .lookup_community("comm-ob-wd-dead")
@@ -6895,10 +6896,10 @@ mod tests {
     }
 
     /// SecReview F3: an EXPIRED `delegates_to(user → node)` (`expires_at` in
-    /// the past) does NOT confer owner-binding — the unowned node is
+    /// the past) does NOT confer steward-binding — the unstewarded node is
     /// REJECTED.
     #[tokio::test]
-    async fn community_owner_binding_expired_delegation_not_live() {
+    async fn community_steward_binding_expired_delegation_not_live() {
         use crate::federation::types::delegation_scope as ds;
         let backend = MemoryBackend::new();
         seed_ob_keys(&backend).await;
@@ -6919,7 +6920,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::federation::Error::UnownedCommunityMember { .. }
+            crate::federation::Error::UnstewardedCommunityMember { .. }
         ));
         assert!(backend
             .lookup_community("comm-ob-exp")
@@ -6928,11 +6929,11 @@ mod tests {
             .is_none());
     }
 
-    /// An OWNER-BOUND agent member (live `delegates_to(user → agent)`) →
+    /// An STEWARD-BOUND agent member (live `delegates_to(user → agent)`) →
     /// ADMITTED. Agent is not node-only, so the delegation needs no infra
     /// scope to store.
     #[tokio::test]
-    async fn community_owner_bound_agent_member_admitted() {
+    async fn community_steward_bound_agent_member_admitted() {
         let backend = MemoryBackend::new();
         seed_ob_keys(&backend).await;
         backend
@@ -6948,7 +6949,7 @@ mod tests {
             .unwrap();
         put_community_with(&backend, "comm-ob-4", vec![member("ob-agent")], None)
             .await
-            .expect("owner-bound agent admitted");
+            .expect("steward-bound agent admitted");
         assert!(backend
             .lookup_community("comm-ob-4")
             .await
@@ -6956,10 +6957,10 @@ mod tests {
             .is_some());
     }
 
-    /// `cohort_subkind: infrastructure` community → an UNOWNED node member
+    /// `cohort_subkind: infrastructure` community → an UNSTEWARDED node member
     /// is ADMITTED (trust + serve needs no owner — CC 3.2 carve-out).
     #[tokio::test]
-    async fn community_infrastructure_exempts_unowned_node() {
+    async fn community_infrastructure_exempts_unstewarded_node() {
         let backend = MemoryBackend::new();
         seed_ob_keys(&backend).await;
         put_community_with(
@@ -6969,7 +6970,7 @@ mod tests {
             Some("infrastructure"),
         )
         .await
-        .expect("infrastructure community exempt from owner-binding");
+        .expect("infrastructure community exempt from steward-binding");
         assert!(backend
             .lookup_community("comm-ob-infra")
             .await
@@ -6978,11 +6979,11 @@ mod tests {
     }
 
     /// SecReview F2: an `infrastructure`-LABELED community whose own key is
-    /// NOT `substrate_persist` does NOT get the carve-out — owner-binding is
-    /// STILL enforced, so an UNOWNED node member is REJECTED + not stored
+    /// NOT `substrate_persist` does NOT get the carve-out — steward-binding is
+    /// STILL enforced, so an UNSTEWARDED node member is REJECTED + not stored
     /// (fail-secure: a self-applied infra label can never skip the gate).
     #[tokio::test]
-    async fn community_unauthorized_infra_label_still_enforces_owner_binding() {
+    async fn community_unauthorized_infra_label_still_enforces_steward_binding() {
         let backend = MemoryBackend::new();
         seed_ob_keys(&backend).await;
         let err = put_community_with_authority(
@@ -6995,7 +6996,7 @@ mod tests {
         .await
         .unwrap_err();
         match err {
-            crate::federation::Error::UnownedCommunityMember {
+            crate::federation::Error::UnstewardedCommunityMember {
                 ref member_key_id,
                 member_role,
                 ..
@@ -7003,7 +7004,7 @@ mod tests {
                 assert_eq!(member_key_id, "ob-node");
                 assert_eq!(member_role, crate::federation::types::identity_type::NODE);
             }
-            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+            other => panic!("expected UnstewardedCommunityMember, got {other:?}"),
         }
         assert!(backend
             .lookup_community("comm-ob-fakeinfra")
@@ -7021,7 +7022,7 @@ mod tests {
         seed_ob_keys(&backend).await;
         put_community_with(&backend, "comm-ob-user", vec![member("ob-owner")], None)
             .await
-            .expect("user member admitted (trivially owner-bound)");
+            .expect("user member admitted (trivially steward-bound)");
         assert!(backend
             .lookup_community("comm-ob-user")
             .await
@@ -8029,8 +8030,8 @@ mod tests {
 
     // ── #249 Cut B — CEG-native graph DX enumerators + add_community_member.
 
-    /// Register `n` user-role keys `pfx-0..pfx-(n-1)` (trivially owner-bound,
-    /// so a community of them passes the owner-binding gate).
+    /// Register `n` user-role keys `pfx-0..pfx-(n-1)` (trivially steward-bound,
+    /// so a community of them passes the steward-binding gate).
     async fn seed_user_keys(backend: &MemoryBackend, pfx: &str, n: usize) -> Vec<String> {
         let mut ids = Vec::new();
         for i in 0..n {
@@ -8204,7 +8205,7 @@ mod tests {
                 .add_community_member("no-such-comm", member("addc-2"))
                 .await
                 .unwrap_err(),
-            crate::federation::Error::UnownedCommunityMember { .. }
+            crate::federation::Error::UnstewardedCommunityMember { .. }
                 | crate::federation::Error::InvalidArgument(_)
         ));
     }
@@ -8216,7 +8217,7 @@ mod tests {
     async fn moderators_of_enumerates_roots_and_delegates() {
         use crate::federation::admission::DELEGATION_SCOPE_MODERATE;
         let backend = MemoryBackend::new();
-        // founder is a user-role key (owner-bound + authority root).
+        // founder is a user-role key (steward-bound + authority root).
         let mut founder = fix_key("mod-founder", "user", "mod-founder");
         founder.identity_type = crate::federation::types::identity_type::USER.into();
         backend
@@ -8299,21 +8300,21 @@ mod tests {
         .unwrap());
     }
 
-    /// owner_bindings_of: an owner-bound node (live `delegates_to(user →
+    /// steward_bindings_of: an steward-bound node (live `delegates_to(user →
     /// node, infra:*)`) → returns the binding user; an unbound node → empty.
     #[tokio::test]
-    async fn owner_bindings_of_returns_user_anchors() {
+    async fn steward_bindings_of_returns_user_anchors() {
         use crate::federation::types::delegation_scope as ds;
         let backend = MemoryBackend::new();
         seed_ob_keys(&backend).await; // ob-owner (user), ob-node (node), ob-agent
                                       // Unbound node → empty.
         assert!(
-            crate::federation::admission::owner_bindings_of(&backend, "ob-node")
+            crate::federation::admission::steward_bindings_of(&backend, "ob-node")
                 .await
                 .unwrap()
                 .is_empty()
         );
-        // Live delegates_to(user → node, infra:*) → owner-bound to ob-owner.
+        // Live delegates_to(user → node, infra:*) → steward-bound to ob-owner.
         backend
             .put_attestation(SignedAttestation {
                 attestation: fix_node_delegates_to(
@@ -8326,43 +8327,84 @@ mod tests {
             })
             .await
             .unwrap();
-        let bindings = crate::federation::admission::owner_bindings_of(&backend, "ob-node")
+        let bindings = crate::federation::admission::steward_bindings_of(&backend, "ob-node")
             .await
             .unwrap();
         assert_eq!(bindings, vec!["ob-owner".to_string()]);
-        // The user key owner-binds itself (clause 1).
+        // The user key steward-binds itself (clause 1).
         assert_eq!(
-            crate::federation::admission::owner_bindings_of(&backend, "ob-owner")
+            crate::federation::admission::steward_bindings_of(&backend, "ob-owner")
                 .await
                 .unwrap(),
             vec!["ob-owner".to_string()]
         );
         // Consistency with the predicate.
         assert!(
-            crate::federation::admission::is_owner_bound(&backend, "ob-node")
+            crate::federation::admission::is_steward_bound(&backend, "ob-node")
                 .await
                 .unwrap()
         );
     }
 
-    /// owner_binding_chain: the PATH (anchor-first), not just endpoints.
+    /// CIRISPersist#299 — `nodes_stewarded_by` is the exact inverse of
+    /// `steward_bindings_of` (memory-backend parity): pre-delegation the user
+    /// owns only itself; after `delegates_to(ob-owner → ob-node)` it owns
+    /// `{ob-node, ob-owner}`; a node owns nothing.
+    #[tokio::test]
+    async fn nodes_stewarded_by_is_inverse_of_steward_bindings() {
+        use crate::federation::admission::nodes_stewarded_by;
+        use crate::federation::types::delegation_scope as ds;
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await; // ob-owner (user), ob-node (node), ob-agent
+                                      // Pre-delegation: owner owns only itself.
+        assert_eq!(
+            nodes_stewarded_by(&backend, "ob-owner").await.unwrap(),
+            vec!["ob-owner".to_string()]
+        );
+        // A node owns nothing.
+        assert!(nodes_stewarded_by(&backend, "ob-node")
+            .await
+            .unwrap()
+            .is_empty());
+
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "ob-bind",
+                    "ob-owner",
+                    "ob-node",
+                    "ob-owner",
+                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                ),
+            })
+            .await
+            .unwrap();
+
+        // Post-delegation: owns ob-node + self (deduped, sorted).
+        assert_eq!(
+            nodes_stewarded_by(&backend, "ob-owner").await.unwrap(),
+            vec!["ob-node".to_string(), "ob-owner".to_string()]
+        );
+    }
+
+    /// steward_binding_chain: the PATH (anchor-first), not just endpoints.
     /// clause 1 (user key) → [self]; clause 3 (delegated node) → [user, k];
     /// unbound → empty.
     #[tokio::test]
-    async fn owner_binding_chain_returns_audit_path() {
+    async fn steward_binding_chain_returns_audit_path() {
         use crate::federation::types::delegation_scope as ds;
         let backend = MemoryBackend::new();
         seed_ob_keys(&backend).await;
         // Unbound → empty.
         assert!(
-            crate::federation::admission::owner_binding_chain(&backend, "ob-node")
+            crate::federation::admission::steward_binding_chain(&backend, "ob-node")
                 .await
                 .unwrap()
                 .is_empty()
         );
         // Clause 1: the user key is its own anchor → [self].
         assert_eq!(
-            crate::federation::admission::owner_binding_chain(&backend, "ob-owner")
+            crate::federation::admission::steward_binding_chain(&backend, "ob-owner")
                 .await
                 .unwrap(),
             vec!["ob-owner".to_string()]
@@ -8381,18 +8423,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            crate::federation::admission::owner_binding_chain(&backend, "ob-node")
+            crate::federation::admission::steward_binding_chain(&backend, "ob-node")
                 .await
                 .unwrap(),
             vec!["ob-owner".to_string(), "ob-node".to_string()]
         );
-        // Predicate consistency: a non-empty chain ⟺ owner-bound.
+        // Predicate consistency: a non-empty chain ⟺ steward-bound.
         let chain_nonempty =
-            !crate::federation::admission::owner_binding_chain(&backend, "ob-node")
+            !crate::federation::admission::steward_binding_chain(&backend, "ob-node")
                 .await
                 .unwrap()
                 .is_empty();
-        let bound = crate::federation::admission::is_owner_bound(&backend, "ob-node")
+        let bound = crate::federation::admission::is_steward_bound(&backend, "ob-node")
             .await
             .unwrap();
         assert_eq!(chain_nonempty, bound);

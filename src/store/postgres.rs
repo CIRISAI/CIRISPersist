@@ -2461,7 +2461,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // no-op for any non-matching row; for a moderation/review report it
         // admits IFF the signer IS a duty-holder over the target (the row's
         // subject_key_ids ∪ the envelope community_id's named moderators) or
-        // is reached by an owner-bound duty-holder via a live scoped
+        // is reached by an steward-bound duty-holder via a live scoped
         // delegates_to chain. Absence ⇒ REJECT. Runs AFTER the withdraws
         // gate and BEFORE persist_row_hash + INSERT — a rejected emission
         // leaves no trace.
@@ -3380,11 +3380,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             chrono::Utc::now(),
         )
         .await?;
-        // v9.0.0 (CC 3.2 / CC 3.4.7.1) — owner-binding precondition for
+        // v9.0.0 (CC 3.2 / CC 3.4.7.1) — steward-binding precondition for
         // non-infrastructure community membership. No-op for
         // infrastructure communities and rosters with no node/agent
         // members.
-        crate::federation::admission::check_community_membership_owner_binding(self, &row).await?;
+        crate::federation::admission::check_community_membership_steward_binding(self, &row)
+            .await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let members_value = serde_json::to_value(&row.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
@@ -16853,7 +16854,7 @@ mod tests {
         let bob = format!("bob-root-{suffix}");
         let carol = format!("carol-root-{suffix}");
         // The community key itself is infra-class; the `*-root` members are
-        // user-role human identities (trivially owner-bound — the v9.0.0
+        // user-role human identities (trivially steward-bound — the v9.0.0
         // CC 3.2 / CC 3.4.7.1 non-infra membership precondition).
         backend
             .put_public_key(crate::federation::SignedKeyRecord {
@@ -17247,7 +17248,7 @@ mod tests {
         for kid in [&comm, &infra, &fakeinfra, &alice, &bob, &alice_p, &bob_p] {
             let mut record = fix_section_i_key(kid, "acme", now, true);
             // Community members (alice/bob) are user-role humans — trivially
-            // owner-bound, satisfying the v9.0.0 G3 owner-binding precondition
+            // steward-bound, satisfying the v9.0.0 G3 steward-binding precondition
             // for non-infra community membership (CC 3.4.7.1). The DEK cascade
             // under test is orthogonal to membership authority.
             if kid == &alice || kid == &bob {
@@ -20631,17 +20632,17 @@ mod tests {
         assert_eq!(on_hybrid[0].attestation_id, id);
     }
 
-    /// v9.0.0 (CC 3.2 / CC 3.4.7.1) — owner-binding precondition for
+    /// v9.0.0 (CC 3.2 / CC 3.4.7.1) — steward-binding precondition for
     /// non-infrastructure community membership, PG backend (3-backend
-    /// parity with memory + sqlite). Covers: UNOWNED node → REJECTED + not
-    /// stored, UNOWNED agent → REJECTED, OWNER-BOUND node (infra delegation)
-    /// → ADMITTED, OWNER-BOUND agent → ADMITTED, `infrastructure` carve-out
-    /// admits an unowned node, pure-user member not over-rejected. Each
+    /// parity with memory + sqlite). Covers: UNSTEWARDED node → REJECTED + not
+    /// stored, UNSTEWARDED agent → REJECTED, STEWARD-BOUND node (infra delegation)
+    /// → ADMITTED, STEWARD-BOUND agent → ADMITTED, `infrastructure` carve-out
+    /// admits an unstewarded node, pure-user member not over-rejected. Each
     /// community uses a run-scoped uuid-suffixed key id and asserts only on
     /// its own row.
     #[tokio::test]
     #[serial_test::serial(postgres)]
-    async fn pg_community_owner_binding_matrix() {
+    async fn pg_community_steward_binding_matrix() {
         use crate::federation::types::delegation_scope as ds;
         use crate::federation::FederationDirectory;
         let Some(dsn) = pg_dsn() else {
@@ -20657,14 +20658,17 @@ mod tests {
         let agent = format!("ob-agent-{suffix}");
         let node_wd = format!("ob-node-wd-{suffix}");
         let node_exp = format!("ob-node-exp-{suffix}");
-        let node_unowned = format!("ob-node-unowned-{suffix}");
+        let node_unstewarded = format!("ob-node-unstewarded-{suffix}");
         for (kid, ity) in [
             (&owner, crate::federation::types::identity_type::USER),
             (&node, crate::federation::types::identity_type::NODE),
             (&agent, crate::federation::types::identity_type::AGENT),
             (&node_wd, crate::federation::types::identity_type::NODE),
             (&node_exp, crate::federation::types::identity_type::NODE),
-            (&node_unowned, crate::federation::types::identity_type::NODE),
+            (
+                &node_unstewarded,
+                crate::federation::types::identity_type::NODE,
+            ),
         ] {
             let mut k = fix_section_i_key(kid, "x", now, true);
             k.identity_type = ity.into();
@@ -20700,8 +20704,8 @@ mod tests {
             }
         };
         // Seed every community key up front.
-        let comm_unowned_node = format!("ob-c1-{suffix}");
-        let comm_unowned_agent = format!("ob-c2-{suffix}");
+        let comm_unstewarded_node = format!("ob-c1-{suffix}");
+        let comm_unstewarded_agent = format!("ob-c2-{suffix}");
         let comm_node_ok = format!("ob-c3-{suffix}");
         let comm_agent_ok = format!("ob-c4-{suffix}");
         let comm_infra = format!("ob-cinfra-{suffix}");
@@ -20711,8 +20715,8 @@ mod tests {
         let comm_wd_dead = format!("ob-cwddead-{suffix}");
         let comm_exp = format!("ob-cexp-{suffix}");
         for cid in [
-            &comm_unowned_node,
-            &comm_unowned_agent,
+            &comm_unstewarded_node,
+            &comm_unstewarded_agent,
             &comm_node_ok,
             &comm_agent_ok,
             &comm_infra,
@@ -20737,47 +20741,47 @@ mod tests {
                 .unwrap();
         }
 
-        // UNOWNED node → REJECTED + not stored.
+        // UNSTEWARDED node → REJECTED + not stored.
         let err = backend
-            .put_community(put_comm(&comm_unowned_node, vec![&node], None))
+            .put_community(put_comm(&comm_unstewarded_node, vec![&node], None))
             .await
             .unwrap_err();
         match err {
-            crate::federation::Error::UnownedCommunityMember {
+            crate::federation::Error::UnstewardedCommunityMember {
                 ref community_key_id,
                 ref member_key_id,
                 member_role,
             } => {
-                assert_eq!(community_key_id, &comm_unowned_node);
+                assert_eq!(community_key_id, &comm_unstewarded_node);
                 assert_eq!(member_key_id, &node);
                 assert_eq!(member_role, crate::federation::types::identity_type::NODE);
             }
-            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+            other => panic!("expected UnstewardedCommunityMember, got {other:?}"),
         }
-        assert_eq!(err.kind(), "federation_unowned_community_member");
+        assert_eq!(err.kind(), "federation_unstewarded_community_member");
         assert!(backend
-            .lookup_community(&comm_unowned_node)
+            .lookup_community(&comm_unstewarded_node)
             .await
             .unwrap()
             .is_none());
 
-        // UNOWNED agent → REJECTED (role reported as agent).
+        // UNSTEWARDED agent → REJECTED (role reported as agent).
         let err = backend
-            .put_community(put_comm(&comm_unowned_agent, vec![&agent], None))
+            .put_community(put_comm(&comm_unstewarded_agent, vec![&agent], None))
             .await
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::federation::Error::UnownedCommunityMember { member_role, .. }
+            crate::federation::Error::UnstewardedCommunityMember { member_role, .. }
                 if member_role == crate::federation::types::identity_type::AGENT
         ));
         assert!(backend
-            .lookup_community(&comm_unowned_agent)
+            .lookup_community(&comm_unstewarded_agent)
             .await
             .unwrap()
             .is_none());
 
-        // OWNER-BOUND node (live delegates_to(user → node, infra:*)) → ADMITTED.
+        // STEWARD-BOUND node (live delegates_to(user → node, infra:*)) → ADMITTED.
         backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: pg_delegates_to(
@@ -20792,14 +20796,14 @@ mod tests {
         backend
             .put_community(put_comm(&comm_node_ok, vec![&node], None))
             .await
-            .expect("owner-bound node admitted");
+            .expect("steward-bound node admitted");
         assert!(backend
             .lookup_community(&comm_node_ok)
             .await
             .unwrap()
             .is_some());
 
-        // OWNER-BOUND agent (live delegates_to(user → agent)) → ADMITTED.
+        // STEWARD-BOUND agent (live delegates_to(user → agent)) → ADMITTED.
         backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: pg_delegates_to(&owner, &agent, serde_json::json!(["share"]), false),
@@ -20809,14 +20813,14 @@ mod tests {
         backend
             .put_community(put_comm(&comm_agent_ok, vec![&agent], None))
             .await
-            .expect("owner-bound agent admitted");
+            .expect("steward-bound agent admitted");
         assert!(backend
             .lookup_community(&comm_agent_ok)
             .await
             .unwrap()
             .is_some());
 
-        // `infrastructure` carve-out → unowned node admitted (AUTHORIZED:
+        // `infrastructure` carve-out → unstewarded node admitted (AUTHORIZED:
         // comm_infra's key is substrate_persist).
         backend
             .put_community(put_comm(&comm_infra, vec![&node], Some("infrastructure")))
@@ -20829,26 +20833,26 @@ mod tests {
             .is_some());
 
         // SecReview F2: an `infrastructure`-LABELED community whose own key
-        // is NOT substrate_persist does NOT get the carve-out — owner-binding
-        // is STILL enforced, so the UNOWNED node is REJECTED + not stored.
+        // is NOT substrate_persist does NOT get the carve-out — steward-binding
+        // is STILL enforced, so the UNSTEWARDED node is REJECTED + not stored.
         let err = backend
             .put_community(put_comm(
                 &comm_fakeinfra,
-                vec![&node_unowned],
+                vec![&node_unstewarded],
                 Some("infrastructure"),
             ))
             .await
             .unwrap_err();
         match err {
-            crate::federation::Error::UnownedCommunityMember {
+            crate::federation::Error::UnstewardedCommunityMember {
                 ref member_key_id,
                 member_role,
                 ..
             } => {
-                assert_eq!(member_key_id, &node_unowned);
+                assert_eq!(member_key_id, &node_unstewarded);
                 assert_eq!(member_role, crate::federation::types::identity_type::NODE);
             }
-            other => panic!("expected UnownedCommunityMember, got {other:?}"),
+            other => panic!("expected UnstewardedCommunityMember, got {other:?}"),
         }
         assert!(backend
             .lookup_community(&comm_fakeinfra)
@@ -20857,7 +20861,7 @@ mod tests {
             .is_none());
 
         // SecReview F3: a WITHDRAWN delegation no longer confers
-        // owner-binding. owner delegates infra:* → node_wd (admitted while
+        // steward-binding. owner delegates infra:* → node_wd (admitted while
         // live); owner then withdraws the edge → a fresh community with
         // node_wd is REJECTED.
         let d_wd = pg_delegates_to(
@@ -20874,7 +20878,7 @@ mod tests {
         backend
             .put_community(put_comm(&comm_wd_live, vec![&node_wd], None))
             .await
-            .expect("owner-bound (live) node admitted");
+            .expect("steward-bound (live) node admitted");
         // owner withdraws the edge (issuer-against-recipient: attested = node_wd).
         let mut w = pg_scores_attestation(&owner, &node_wd, &owner, "x");
         w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
@@ -20890,7 +20894,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::federation::Error::UnownedCommunityMember { .. }
+            crate::federation::Error::UnstewardedCommunityMember { .. }
         ));
         assert!(backend
             .lookup_community(&comm_wd_dead)
@@ -20898,7 +20902,7 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // SecReview F3: an EXPIRED delegation does NOT confer owner-binding.
+        // SecReview F3: an EXPIRED delegation does NOT confer steward-binding.
         let mut d_exp = pg_delegates_to(
             &owner,
             &node_exp,
@@ -20916,7 +20920,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            crate::federation::Error::UnownedCommunityMember { .. }
+            crate::federation::Error::UnstewardedCommunityMember { .. }
         ));
         assert!(backend.lookup_community(&comm_exp).await.unwrap().is_none());
 
@@ -20955,7 +20959,7 @@ mod tests {
         let rando = format!("rando-{suffix}");
         let founder = format!("founder-{suffix}");
         let comm = format!("comm-{suffix}");
-        // subject + founder are user-role (owner-bound); the rest agents.
+        // subject + founder are user-role (steward-bound); the rest agents.
         for kid in [&subject, &founder, &comm] {
             let mut k = fix_section_i_key(kid, "u", now, true);
             k.identity_type = crate::federation::types::identity_type::USER.into();
@@ -21032,7 +21036,7 @@ mod tests {
             .await
             .expect("(b1) subject-delegated admitted");
 
-        // (b2) named-moderator (community founder, owner-bound) → ADMIT.
+        // (b2) named-moderator (community founder, steward-bound) → ADMIT.
         backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: report(&founder, &[], Some(&comm)),
@@ -28251,7 +28255,7 @@ mod tests {
         let now = chrono::Utc::now();
         let s = uuid_like();
         // Run-scoped key ids. All members are user-role (trivially
-        // owner-bound) so put_community passes the owner-binding gate.
+        // steward-bound) so put_community passes the steward-binding gate.
         let comm = format!("cb-comm-{s}");
         let u0 = format!("cb-u0-{s}");
         let u1 = format!("cb-u1-{s}");
@@ -28410,10 +28414,10 @@ mod tests {
         assert!(mods.contains(&deputy));
         assert!(!mods.contains(&outsider));
 
-        // ── owner_bindings_of ── unbound node → empty; live infra
+        // ── steward_bindings_of ── unbound node → empty; live infra
         //    delegation → [owner=founder].
         assert!(
-            crate::federation::admission::owner_bindings_of(&backend, &node)
+            crate::federation::admission::steward_bindings_of(&backend, &node)
                 .await
                 .unwrap()
                 .is_empty()
@@ -28430,22 +28434,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            crate::federation::admission::owner_bindings_of(&backend, &node)
+            crate::federation::admission::steward_bindings_of(&backend, &node)
                 .await
                 .unwrap(),
             vec![founder.clone()]
         );
 
-        // ── owner_binding_chain ── the audit PATH. founder (user) → [self];
+        // ── steward_binding_chain ── the audit PATH. founder (user) → [self];
         //    node (via the live infra delegation above) → [founder, node].
         assert_eq!(
-            crate::federation::admission::owner_binding_chain(&backend, &founder)
+            crate::federation::admission::steward_binding_chain(&backend, &founder)
                 .await
                 .unwrap(),
             vec![founder.clone()]
         );
         assert_eq!(
-            crate::federation::admission::owner_binding_chain(&backend, &node)
+            crate::federation::admission::steward_binding_chain(&backend, &node)
                 .await
                 .unwrap(),
             vec![founder.clone(), node.clone()]
