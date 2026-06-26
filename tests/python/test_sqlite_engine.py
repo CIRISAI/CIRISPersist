@@ -353,6 +353,51 @@ def test_register_self_then_put_blob_signing_275() -> None:
             "2026-05-28T13:45:09.000Z",
             str(uuid.uuid4()),
         )
+
+        # #295 — local_derived_key_id() returns the SAME registered/verified
+        # derived id (the footgun-free one), distinct from the bare alias.
+        assert eng.local_derived_key_id() == kid
+        assert eng.local_derived_key_id() != eng.local_key_id()
+        assert eng.local_key_id() == alias
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()
+
+
+def test_local_derived_key_id_pyo3_295():
+    """#295 — the pyo3 Engine exposes local_derived_key_id(): the DERIVED
+    federation key_id (`<label>-<fp>`) the substrate registers + verifies,
+    so consumers stop re-implementing derive_key_id. Distinct from the bare
+    local_key_id() alias. Skips on a non-sqlite wheel."""
+    import os
+    import secrets
+    import tempfile
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    seed = os.path.join(tempfile.mkdtemp(), "seed")
+    with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    alias = "node-" + secrets.token_hex(8)
+    try:
+        eng = ciris_persist.Engine(
+            "sqlite::memory:", alias, local_key_id=alias, local_key_path=seed
+        )
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        derived = eng.local_derived_key_id()
+        # Shape: <alias>-<fingerprint>, NOT the bare alias.
+        assert derived != alias
+        assert derived.startswith(alias + "-"), f"derived shape <label>-<fp>: {derived!r}"
+        assert eng.local_key_id() == alias
+        # Stable across calls (pure derivation over the composed signer).
+        assert eng.local_derived_key_id() == derived
+        # It is exactly the id register_self registers + returns (the FK target).
+        assert eng.register_self_federation_key("agent", "ref", None, None, None) == derived
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
