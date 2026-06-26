@@ -43,6 +43,14 @@ permissions:
   # PR comment for regression alerts.
   pull-requests: write
 
+# CIRISPersist#297 — same crates.io registry-flake resilience as ci.yml so the
+# bench suite's `cargo metadata` doesn't fail fast on a sparse-index / HTTP2
+# download hiccup. See ci.yml's env block for the rationale.
+env:
+  CARGO_NET_RETRY: '10'                 # retry registry/network requests (default 3)
+  CARGO_HTTP_MULTIPLEXING: 'false'      # HTTP/1.1 — sidesteps the HTTP/2 framing flake
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'  # git CLI for the 6 CIRISVerify git-dep pins
+
 jobs:
   bench:
     name: Criterion bench suite
