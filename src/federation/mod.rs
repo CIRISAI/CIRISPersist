@@ -277,6 +277,36 @@ fn assert_change_envelope_matches(
     Ok(())
 }
 
+/// CIRISPersist#293 (CC 2.6.3 / CEG §0.6) — reject any `subject_key_ids[]`
+/// element that is not in canonical (all-lowercase) form. A subject id is a
+/// federation key_id — on real nodes the derived `"<label>-<fingerprint>"`
+/// shape, which is all-lowercase by construction — so the rule is exactly
+/// the §0.6/§0.8 lowercase-canonical rejection already enforced on adjacent
+/// fields (`location.rs` `cell_id`, `media_sharing.rs` hashes): an uppercase
+/// or otherwise non-canonical subject id breaks byte-identical
+/// canonicalization for downstream verifiers (two encodings of the same
+/// subject would both admit). We reject ASCII-uppercase rather than a strict
+/// `0-9a-f` charset because a derived key_id legitimately carries a `-` and a
+/// lowercase alphabetic label — the operative canonical invariant is "no
+/// uppercase", matching the precedent validators.
+///
+/// Gated to the backends that have an emit path: the sole caller
+/// (`Engine::emit_attestation_assemble`) is
+/// `#[cfg(any(feature = "postgres", feature = "sqlite"))]`, so without a
+/// backend feature this function would be dead code (the crate denies it).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn validate_subject_key_ids(subject_key_ids: &[String]) -> Result<(), Error> {
+    for sid in subject_key_ids {
+        if sid.is_empty() || sid.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Err(Error::InvalidArgument(format!(
+                "subject_key_ids element must be a canonical lowercase key_id \
+                 (CC 2.6.3 / §0.6); got {sid:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Federation directory trait — the registry/lens/agent's read+write
 /// surface over persist's three federation tables.
 ///

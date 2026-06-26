@@ -414,3 +414,78 @@ def test_put_community_json_round_trip_290() -> None:
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
+
+
+def test_emit_attestation_self_rejects_uppercase_subject_key_id_293():
+    """#293 (CC 2.6.3 / §0.6) — emit_attestation_self must REFUSE a
+    non-lowercase subject_key_ids[] element (uppercase-hex from the issue
+    repro), while the canonical lowercase form of the same id is admitted.
+    The rule rejects the encoding, not the subject."""
+    import json
+    import os
+    import secrets
+    import tempfile
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    d = tempfile.mkdtemp()
+    seed = os.path.join(d, "s")
+    with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    pqc = os.path.join(d, "p")
+    with open(pqc, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    alias = "n" + secrets.token_hex(6)
+    try:
+        eng = ciris_persist.Engine(
+            "sqlite::memory:",
+            alias,
+            local_key_id=alias,
+            local_key_path=seed,
+            local_pqc_key_id=alias + "-pqc",
+            local_pqc_key_path=pqc,
+        )
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        eng.register_self_federation_key("agent", "ref", None, None, None)
+        upper = "FF7C5632DAE6EF3AE7F6283BD35268BC7910332414AA8A1C35A1645CA0295F61"
+
+        # Uppercase-hex subject id — must be refused (was admitted on 10.4.0).
+        with pytest.raises(ValueError):
+            eng.emit_attestation_self(
+                json.dumps(
+                    {
+                        "attestation_type": "scores:x",
+                        "subject_key_ids": [upper],
+                        "attestation_envelope": {
+                            "id": "e293",
+                            "dimension": "identity_binding:v1",
+                            "score": 1.0,
+                            "confidence": 0.9,
+                        },
+                    }
+                )
+            )
+
+        # The canonical lowercase form of the SAME id is admitted.
+        eng.emit_attestation_self(
+            json.dumps(
+                {
+                    "attestation_type": "scores:x",
+                    "subject_key_ids": [upper.lower()],
+                    "attestation_envelope": {
+                        "id": "e293ok",
+                        "dimension": "identity_binding:v1",
+                        "score": 1.0,
+                        "confidence": 0.9,
+                    },
+                }
+            )
+        )
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()
