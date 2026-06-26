@@ -92,12 +92,8 @@ jobs:
           restore-keys: |
             bench-${{ runner.os }}-
 
-      - name: Install libtss2-dev (TPM build dep for ciris-keyring `tpm`)
-        # v1.10.0 (CIRISPersist#87) — the Linux `tpm` keyring feature
-        # builds `tss-esapi`, which needs the libtss2 headers +
-        # pkg-config files at build time, not just the runtime .so
-        # (libtss2-dev pulls the runtime libs as dependencies).
-        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+      # v10.7.0 (CIRISVerify v8.0.0, #141) — no libtss2-dev: ciris-keyring
+      # deleted the link-time tss-esapi backend; nothing to apt-install.
 
       - name: System info
         run: |

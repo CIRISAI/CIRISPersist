@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "10.6.0"
+version = "10.7.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -490,14 +490,14 @@ tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 # ciris-crypto invariant (FSD §7.5a) means persist takes ZERO direct
 # deps on AES-GCM/PBKDF2/HKDF/HMAC primitive crates ever — the
 # `src/secrets/crypto.rs` facade lands as a single import-site change.
-ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v7.6.0", version = "7", features = ["pqc-ml-dsa"] }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v7.6.0", version = "7" }
+ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.0.0", version = "8", features = ["pqc-ml-dsa"] }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.0.0", version = "8" }
 # v0.3.6 (CIRISPersist#14) — direct ciris-crypto dep for HybridVerifier
 # in `Engine.verify_hybrid`. Same git source / tag as ciris-keyring +
 # ciris-verify-core so versions are workspace-coherent. Features
 # `ed25519` + `pqc-ml-dsa` light up the concrete Ed25519Verifier +
 # MlDsa65Verifier impls used by HybridVerifier::verify.
-ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v7.6.0", version = "7", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant"] }
+ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.0.0", version = "8", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant"] }
 async-trait   = "0.1"
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,
@@ -735,9 +735,13 @@ tokio-stream = "0.1"
 # features from `[dependencies]` (`pqc-ml-dsa`) with any matching
 # `[target.*]` table, so each build target picks up the right backend
 # automatically with no per-target maturin config:
-#   - Linux   → `tpm`     (TPM 2.0 via tss-esapi — needs libtss2 at
-#                          BUILD time; the CI Linux jobs apt-install
-#                          `libtss2-dev`)
+#   - Linux   → base set  (TPM 2.0 via the runtime `dlopen` plugin, which
+#                          is a DEFAULT ciris-keyring feature as of verify
+#                          v8.0.0 — CIRISVerify #141 deleted the link-time
+#                          `tss-esapi` backend. The keyring link-binds NO
+#                          libtss2 on any target, so there is no longer a
+#                          BUILD dep; hardware TPM needs only the runtime
+#                          `libciris_tpm_plugin.so`, dlopen'd if present.)
 #   - iOS     → `ios`     (Secure Enclave / Keychain — pulls no extra
 #                          crates; `ios` is a cfg-only keyring feature)
 #   - Android → `android` (Keystore / StrongBox)
@@ -745,16 +749,16 @@ tokio-stream = "0.1"
 # ciris-keyring exposes no hardware backend for them.
 #
 # `create_platform_storage` runtime-detects the hardware and falls
-# back to software storage where there is none, so a `tpm`-built
-# binary still runs on a no-TPM host (`migrate_to_hardware_key` then
-# returns `HardwareKeyUnavailable` and the caller keeps the software
-# master key). Placed AFTER every platform-independent dep — see the
-# v0.9.0 bug note on the rusqlite target table above.
+# back to software storage where there is none, so the binary still
+# runs on a no-TPM host (`migrate_to_hardware_key` then returns
+# `HardwareKeyUnavailable` and the caller keeps the software master
+# key). Placed AFTER every platform-independent dep — see the v0.9.0
+# bug note on the rusqlite target table above.
 [target.'cfg(target_os = "linux")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v7.6.0", version = "7", features = ["pqc-ml-dsa", "tpm"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.0.0", version = "8", features = ["pqc-ml-dsa"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v7.6.0", version = "7", features = ["pqc-ml-dsa", "ios"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.0.0", version = "8", features = ["pqc-ml-dsa", "ios"] }
 # v2.0.4 — vendored openssl for iOS PyO3 cross-compilation. The `pyo3`
 # feature implies `postgres` which depends on `openssl`. On iOS there is
 # no system libssl; vendored build-from-source handles it (ARM64 has no
@@ -765,7 +769,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 # v3.5.2 (#132) — rusqlite `bundled` for Android. See comment block
 # before the iOS entry (~line 628) for the rationale.
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"], optional = true }
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v7.6.0", version = "7", features = ["pqc-ml-dsa", "android"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.0.0", version = "8", features = ["pqc-ml-dsa", "android"] }
 # v2.0.3 — vendored openssl for Android cross-compilation. refinery-core
 # unconditionally pulls postgres-native-tls → native-tls → openssl-sys
 # regardless of which backend feature is active. On desktop builds the
