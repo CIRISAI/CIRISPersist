@@ -16,6 +16,15 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # CIRISPersist#297 — network resilience for recurring crates.io registry
+  # flakes during `cargo metadata` (start of nextest/clippy + install-action),
+  # which fail fast before compilation. Two observed signatures, same class:
+  # "no matching package named X" (sparse-index hiccup) and "[16] Error in the
+  # HTTP2 framing layer" / "unable to update registry" (download flake).
+  # Prevention to complement auto-retry.yml's reaction (saves a rerun cycle).
+  CARGO_NET_RETRY: '10'                 # retry registry/network requests (default 3)
+  CARGO_HTTP_MULTIPLEXING: 'false'      # HTTP/1.1 — sidesteps the HTTP/2 framing flake
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'  # git CLI for the 6 CIRISVerify git-dep pins
 
 permissions:
   contents: read
