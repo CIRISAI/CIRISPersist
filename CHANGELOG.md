@@ -5,6 +5,40 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [10.7.0] — 2026-06-26
+
+### Changed — re-pin CIRISVerify v7.6.0 → v8.0.0 (verify MAJOR; tss-esapi deleted from the keyring)
+
+CIRISVerify v8.0.0 is a MAJOR: **#141 deletes the link-time `tss-esapi` TPM backend
+from `ciris-keyring`**. The keyring's only TPM backend is now the runtime `dlopen`
+plugin (`PluginTpmSigner` / `PluginTpmSecureBlobStorage`), and the keyring
+link-binds **no** libtss2 on any target. Persist consumes the keyring abstractly
+(the `HardwareSigner` trait + `create_platform_storage` runtime-detect/fallback),
+so there are **no persist code changes** — but two build-surface knobs had to move:
+
+- **`tpm` keyring feature removed.** `--features tpm` no longer exists; the
+  TPM-plugin path is a **default** keyring feature. The Linux
+  `[target.'cfg(target_os = "linux")']` pin drops `"tpm"` from its feature list
+  (keeping `"pqc-ml-dsa"`) — leaving it in would fail to compile against v8.0.0.
+  iOS/android features are unchanged (only `tpm` was deleted).
+- **`libtss2-dev` build dependency removed from CI.** The keyring is now
+  libtss2-free (verified: the built wheel `.so` has **0 libtss2 `DT_NEEDED`**), so
+  the four `ci.yml` apt-install steps + the `bench.yml` step are deleted; the
+  combined wheel-build step keeps only `libsqlite3-dev`. Hardware TPM needs only
+  the runtime `libciris_tpm_plugin.so`, dlopen'd if present (none in CI → software
+  fallback, as before).
+
+All six verify pins (`ciris-keyring` ×4 incl. ios/android targets,
+`ciris-verify-core`, `ciris-crypto`) flip to `v8.0.0` with `version = "8"`, and the
+wheel `Requires-Dist` floor moves to `ciris-verify>=8.0.0,<9` in lockstep (the
+verify-MAJOR cohab-firewall knob — same class as the v2.0.1 / v4.10.0 / v9.0.3
+metadata bumps). The `TpmDiscrete` custody-attestation evidence shapes persist
+admits are `ciris-verify-core` data types, untouched by the keyring deletion. 188
+verify/tpm/custody-touching sqlite tests + the Rust/Python regression suite green
+on v8.0.0; full clippy (`-D warnings`) + fmt + the `--features server` no-backend
+leg clean. Legacy-key rotation (when federation turns on) rides persist's existing
+`supersede` surface — nothing to re-sign today.
+
 ## [10.6.0] — 2026-06-26
 
 ### Added — #295: expose `local_derived_key_id()` on the pyo3 `Engine` (kills a recurring seal↔verify footgun)
