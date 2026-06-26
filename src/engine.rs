@@ -3453,6 +3453,7 @@ impl Engine {
     /// liveness/`withdraws`-`recants`-retraction/live-`user`-role-anchor logic
     /// verbatim (membership is decided by `steward_bindings_of` itself). See
     /// [`crate::federation::admission::nodes_stewarded_by`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn nodes_stewarded_by(
         &self,
         steward_user_key_id: &str,
