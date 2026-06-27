@@ -2701,9 +2701,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // Map a "group does not exist" sentinel back to a typed error.
         let not_found = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let nf = not_found.clone();
+        // CC 4.4.3.2.8 / #308: `affiliations` records its version history under
+        // its own `cohort.as_str()` discriminator while sharing the
+        // `federation_communities` storage path below.
         let cohort_str = match cohort {
-            Cohort::Family => "family",
-            Cohort::Community => "community",
             Cohort::SelfId => {
                 return Err(Error::InvalidArgument(
                     "supersede: the `self` cohort is not versioned (manage occurrences via \
@@ -2711,6 +2712,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         .to_string(),
                 ))
             }
+            Cohort::Family | Cohort::Community | Cohort::Affiliations => cohort.as_str(),
         };
 
         let new_version = match cohort {
@@ -2781,7 +2783,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     Ok(next)
                 })()
             }
-            Cohort::Community => {
+            Cohort::Community | Cohort::Affiliations => {
                 let mut new_comm: crate::federation::Community =
                     serde_json::from_value(new_snapshot).map_err(|e| {
                         Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
@@ -2822,7 +2824,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         "INSERT INTO federation_group_versions \
                             (cohort, group_key_id, version, snapshot, change_authorization, \
                              superseded_at, persist_row_hash) \
-                         VALUES ('community', ?1, ?2, ?3, ?4, ?5, ?6)",
+                         VALUES (?7, ?1, ?2, ?3, ?4, ?5, ?6)",
                         rusqlite::params![
                             new_comm.community_key_id,
                             prior_version,
@@ -2830,6 +2832,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                             auth_json,
                             now,
                             prior_comm.persist_row_hash,
+                            cohort_str,
                         ],
                     )?;
                     let next = prior_version + 1;
@@ -2881,11 +2884,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "list_group_versions: the `self` cohort is not versioned".to_string(),
             ));
         }
-        let cohort_str = if cohort == Cohort::Family {
-            "family"
-        } else {
-            "community"
-        };
+        // CC 4.4.3.2.8 / #308: `affiliations` reads its own history chain
+        // (`cohort.as_str()`) distinct from `community`.
+        let cohort_str = cohort.as_str();
         let conn = self.conn.clone();
         let key = group_key_id.to_owned();
         let cs = cohort_str.to_owned();
@@ -17833,6 +17834,86 @@ mod tests {
             backend.community_dek_current_epoch("comm").await.unwrap(),
             1
         );
+    }
+
+    /// CC 4.4.3.2.8 / #308 — the `affiliations` cohort runs the full membership
+    /// lifecycle (add → active-members → revoke + epoch bump) through the SAME
+    /// community machinery on the SQLite backend (pg/sqlite/memory parity).
+    #[tokio::test]
+    async fn affiliations_cohort_membership_lifecycle_sqlite() {
+        use crate::federation::cohort::{Cohort, RevokeSpec, RosterMember};
+        use crate::federation::{BlobStorage, FederationDirectory};
+        let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
+        // Register a fresh PRIMITIVE key to admit via the affiliations cohort.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("carol", "carol", "carol"),
+            })
+            .await
+            .unwrap();
+
+        let added = backend
+            .add_member(
+                Cohort::Affiliations,
+                "comm",
+                RosterMember {
+                    key_id: "carol".into(),
+                    joined_at: chrono::Utc::now(),
+                    role: Some("member".into()),
+                },
+            )
+            .await
+            .expect("affiliations add_member");
+        assert!(added);
+
+        let active: Vec<String> = backend
+            .active_members(Cohort::Affiliations, "comm")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert!(active.contains(&"carol".to_string()));
+        // Shared roster: reading via `community` is identical.
+        let via_community: Vec<String> = backend
+            .active_members(Cohort::Community, "comm")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert_eq!(active, via_community);
+
+        assert_eq!(
+            backend.community_dek_current_epoch("comm").await.unwrap(),
+            0
+        );
+        backend
+            .revoke_member(
+                Cohort::Affiliations,
+                "comm",
+                "carol",
+                RevokeSpec {
+                    effective_at: chrono::Utc::now(),
+                    reason: Some("left".into()),
+                    witness_set: vec![],
+                },
+            )
+            .await
+            .expect("affiliations revoke_member");
+        assert_eq!(
+            backend.community_dek_current_epoch("comm").await.unwrap(),
+            1,
+            "affiliations removal bumps the CommunityDek epoch (forward secrecy)"
+        );
+        let active_after: Vec<String> = backend
+            .active_members(Cohort::Affiliations, "comm")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert!(!active_after.contains(&"carol".to_string()));
     }
 
     /// #249 Cut A — the JSON-shape contract the FFI active-variant

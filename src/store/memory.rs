@@ -1712,13 +1712,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     ) -> Result<u32, crate::federation::Error> {
         use crate::federation::cohort::{Cohort, GroupVersion};
         use crate::federation::Error;
+        // CC 4.4.3.2.8 / #308: `affiliations` keys its version history under its
+        // own discriminator while sharing the `federation_communities` storage.
         let cohort_str = match cohort {
-            Cohort::Family => "family".to_string(),
-            Cohort::Community => "community".to_string(),
             Cohort::SelfId => {
                 return Err(Error::InvalidArgument(
                     "supersede: the `self` cohort is not versioned".to_string(),
                 ))
+            }
+            Cohort::Family | Cohort::Community | Cohort::Affiliations => {
+                cohort.as_str().to_string()
             }
         };
         let now = chrono::Utc::now();
@@ -1766,7 +1769,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .insert((cohort_str, key), next);
                 Ok(next)
             }
-            Cohort::Community => {
+            Cohort::Community | Cohort::Affiliations => {
                 let mut new_comm: crate::federation::Community =
                     serde_json::from_value(new_snapshot).map_err(|e| {
                         Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
@@ -1825,11 +1828,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 "list_group_versions: the `self` cohort is not versioned".to_string(),
             ));
         }
-        let cohort_str = if cohort == Cohort::Family {
-            "family".to_string()
-        } else {
-            "community".to_string()
-        };
+        // CC 4.4.3.2.8 / #308: `affiliations` reads its own history chain.
+        let cohort_str = cohort.as_str().to_string();
         let state = self.state.lock().expect("memory backend lock");
         let mut out: Vec<GroupVersion> = state
             .federation_group_versions
@@ -1845,7 +1845,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .federation_families
                 .get(group_key_id)
                 .map(|f| serde_json::to_value(f).unwrap_or(serde_json::Value::Null)),
-            Cohort::Community => state
+            // CC 4.4.3.2.8 / #308: `affiliations` reads the shared community row.
+            Cohort::Community | Cohort::Affiliations => state
                 .federation_communities
                 .get(group_key_id)
                 .map(|c| serde_json::to_value(c).unwrap_or(serde_json::Value::Null)),
@@ -7366,6 +7367,130 @@ mod tests {
             .await
             .expect("non-future revocation accepted");
         assert_eq!(backend.community_dek_epoch("ob-owner"), 1);
+    }
+
+    /// CC 4.4.3.2.8 / #308 — the `affiliations` cohort runs the FULL membership
+    /// lifecycle (add → active-members → revoke) through the SAME community
+    /// machinery as `community`, including the epoch bump (forward secrecy) on
+    /// removal. Asserted via the uniform [`FederationDirectory`] cohort surface.
+    #[tokio::test]
+    async fn affiliations_cohort_membership_lifecycle_mirrors_community() {
+        use crate::federation::cohort::{Cohort, RevokeSpec, RosterMember};
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await; // ob-owner (user), ob-node, ob-agent
+                                      // A second user-role key to add to the roster.
+        let mut joiner = fix_key("ob-joiner", "owner", "ob-joiner");
+        joiner.identity_type = crate::federation::types::identity_type::USER.into();
+        backend
+            .put_public_key(SignedKeyRecord { record: joiner })
+            .await
+            .unwrap();
+        // The affiliations group is a community row (shared storage), founded
+        // by the user-role member ob-owner.
+        let group = "aff-grp";
+        put_community_with(&backend, group, vec![member("ob-owner")], None)
+            .await
+            .expect("affiliations group (community row) created");
+
+        // ── add via the affiliations cohort ────────────────────────────────
+        let added = backend
+            .add_member(
+                Cohort::Affiliations,
+                group,
+                RosterMember {
+                    key_id: "ob-joiner".into(),
+                    joined_at: chrono::Utc::now(),
+                    role: Some("member".into()),
+                },
+            )
+            .await
+            .expect("affiliations add_member");
+        assert!(added, "genuine add returns true");
+
+        // active_members(affiliations) reads the shared community roster.
+        let active: Vec<String> = backend
+            .active_members(Cohort::Affiliations, group)
+            .await
+            .expect("affiliations active_members")
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert!(active.contains(&"ob-owner".to_string()));
+        assert!(
+            active.contains(&"ob-joiner".to_string()),
+            "added member visible via the affiliations cohort"
+        );
+        // Identical to reading via the `community` cohort (shared machinery).
+        let active_via_community: Vec<String> = backend
+            .active_members(Cohort::Community, group)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert_eq!(
+            active, active_via_community,
+            "affiliations and community read the SAME roster"
+        );
+
+        // ── revoke via the affiliations cohort → epoch bump (forward secrecy) ─
+        assert_eq!(backend.community_dek_epoch(group), 0, "epoch starts 0");
+        backend
+            .revoke_member(
+                Cohort::Affiliations,
+                group,
+                "ob-joiner",
+                RevokeSpec {
+                    effective_at: chrono::Utc::now(),
+                    reason: Some("left".into()),
+                    witness_set: vec![],
+                },
+            )
+            .await
+            .expect("affiliations revoke_member");
+        assert_eq!(
+            backend.community_dek_epoch(group),
+            1,
+            "affiliations removal bumps the CommunityDek epoch (CC 4.4.3.2.2 forward secrecy)"
+        );
+        let active_after: Vec<String> = backend
+            .active_members(Cohort::Affiliations, group)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert!(
+            !active_after.contains(&"ob-joiner".to_string()),
+            "revoked member dropped from the active affiliations roster"
+        );
+    }
+
+    /// CC 4.4.3.2.8 / #308 — `affiliations` resolves to the `CommunityDek`
+    /// crypto tier (the same tier as `community`), and the negative-default
+    /// holds: `self`/`family` → InvisibleEncrypted, an unknown scope →
+    /// Plaintext, infrastructure-subkind → Plaintext.
+    #[test]
+    fn affiliations_resolves_to_community_dek_tier() {
+        use crate::federation::types::cohort_scope::{crypto_tier, CryptoTier, AFFILIATIONS};
+        assert_eq!(
+            crypto_tier(AFFILIATIONS, None),
+            CryptoTier::CommunityDek,
+            "affiliations → CommunityDek (CC 4.4.3.2.8)"
+        );
+        // Same tier as community (shared machinery).
+        assert_eq!(crypto_tier("community", None), CryptoTier::CommunityDek);
+        // Infrastructure carve-out → Plaintext even for affiliations.
+        assert_eq!(
+            crypto_tier(AFFILIATIONS, Some("infrastructure")),
+            CryptoTier::Plaintext
+        );
+        // self/family → InvisibleEncrypted; unknown → Plaintext (negative default).
+        assert_eq!(crypto_tier("self", None), CryptoTier::InvisibleEncrypted);
+        assert_eq!(crypto_tier("family", None), CryptoTier::InvisibleEncrypted);
+        assert_eq!(crypto_tier("federation", None), CryptoTier::Plaintext);
+        assert_eq!(crypto_tier("nonsense-scope", None), CryptoTier::Plaintext);
     }
 
     // ── v3.1.0 (CIRISPersist#117) — peer-mutation surface ──────────

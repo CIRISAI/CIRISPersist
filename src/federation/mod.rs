@@ -1161,7 +1161,8 @@ pub trait FederationDirectory: Send + Sync {
                 .into_iter()
                 .map(cohort::RosterMember::from)
                 .collect(),
-            cohort::Cohort::Community => self
+            // CC 4.4.3.2.8 / #308: `affiliations` shares the community roster.
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => self
                 .active_community_members(group_key_id)
                 .await?
                 .into_iter()
@@ -1221,7 +1222,8 @@ pub trait FederationDirectory: Send + Sync {
                 .lookup_family(group_key_id)
                 .await?
                 .map(cohort::GroupRef::from),
-            cohort::Cohort::Community => self
+            // CC 4.4.3.2.8 / #308: `affiliations` resolves via the community row.
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => self
                 .lookup_community(group_key_id)
                 .await?
                 .map(cohort::GroupRef::from),
@@ -1256,7 +1258,8 @@ pub trait FederationDirectory: Send + Sync {
                 .into_iter()
                 .map(cohort::GroupRef::from)
                 .collect(),
-            cohort::Cohort::Community => self
+            // CC 4.4.3.2.8 / #308: `affiliations` shares the community reverse lookup.
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => self
                 .list_communities_for_member_active(member_key_id)
                 .await?
                 .into_iter()
@@ -1307,7 +1310,8 @@ pub trait FederationDirectory: Send + Sync {
                 .await?,
                 hard_case::kind::FAMILY_MEMBERSHIP_CHANGE,
             ),
-            cohort::Cohort::Community => (
+            // CC 4.4.3.2.8 / #308: `affiliations` admits via the community roster.
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => (
                 self.add_community_member(
                     group_key_id,
                     types::CommunityMember {
@@ -1374,7 +1378,10 @@ pub trait FederationDirectory: Send + Sync {
         // path, which carries its own events). `None` ⇒ no membership event.
         let change_kind = match cohort {
             cohort::Cohort::Family => Some(hard_case::kind::FAMILY_MEMBERSHIP_CHANGE),
-            cohort::Cohort::Community => Some(hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE),
+            // CC 4.4.3.2.8 / #308: `affiliations` shares the community event kind.
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => {
+                Some(hard_case::kind::COMMUNITY_MEMBERSHIP_CHANGE)
+            }
             cohort::Cohort::SelfId => None,
         };
         match cohort {
@@ -1392,7 +1399,10 @@ pub trait FederationDirectory: Send + Sync {
                 })
                 .await?;
             }
-            cohort::Cohort::Community => {
+            // CC 4.4.3.2.8 / #308: `affiliations` removal rides the community
+            // revocation table — which bumps the CommunityDek epoch at write
+            // time (forward secrecy, CC 4.4.3.2.2), inherited for free.
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => {
                 self.put_community_membership_revocation(
                     types::SignedCommunityMembershipRevocation {
                         community_membership_revocation: types::CommunityMembershipRevocation {
@@ -1547,6 +1557,24 @@ pub trait FederationDirectory: Send + Sync {
         let snapshot = serde_json::to_value(&new.community)
             .map_err(|e| Error::Backend(format!("supersede_community snapshot serialize: {e}")))?;
         self.supersede_group_row(cohort::Cohort::Community, snapshot, authorization)
+            .await
+    }
+
+    /// CC 4.4.3.2.8 / #308 — supersede an `affiliations` group. Identical to
+    /// [`Self::supersede_community`] (affiliations share the
+    /// `federation_communities` storage + the `Community` row type) but records
+    /// the version under the `affiliations` discriminator so the version chain
+    /// stays separable per tier.
+    async fn supersede_affiliations(
+        &self,
+        new: types::SignedCommunity,
+        authorization: Option<serde_json::Value>,
+    ) -> Result<u32, Error> {
+        check_consensus_protocol_form(&new.community.consensus_protocol)?;
+        let snapshot = serde_json::to_value(&new.community).map_err(|e| {
+            Error::Backend(format!("supersede_affiliations snapshot serialize: {e}"))
+        })?;
+        self.supersede_group_row(cohort::Cohort::Affiliations, snapshot, authorization)
             .await
     }
 
@@ -1708,7 +1736,9 @@ pub trait FederationDirectory: Send + Sync {
                     "consensus_protocol_entrenched": f.consensus_protocol_entrenched,
                 }))
             }
-            cohort::Cohort::Community => {
+            // CC 4.4.3.2.8 / #308: `affiliations` derives its prior envelope
+            // from the shared community row.
+            cohort::Cohort::Community | cohort::Cohort::Affiliations => {
                 let c = self.lookup_community(group_key_id).await?.ok_or_else(|| {
                     Error::InvalidArgument(format!("unknown community group {group_key_id:?}"))
                 })?;
@@ -1833,6 +1863,42 @@ pub trait FederationDirectory: Send + Sync {
             "quorum_signatures": signatures,
         });
         self.supersede_community(new, Some(authorization)).await
+    }
+
+    /// CC 4.4.3.2.8 / #308 — quorum-gated `affiliations` supersede. Mirror of
+    /// [`Self::supersede_community_with_quorum`]; the quorum is verified against
+    /// the shared community row and the new version is recorded under the
+    /// `affiliations` discriminator via [`Self::supersede_affiliations`].
+    async fn supersede_affiliations_with_quorum(
+        &self,
+        new: types::SignedCommunity,
+        change_envelope: serde_json::Value,
+        signatures: Vec<ciris_verify_core::threshold::ThresholdSignature>,
+    ) -> Result<u32, Error> {
+        let members: std::collections::BTreeSet<&str> = new
+            .community
+            .members
+            .iter()
+            .map(|m| m.key_id.as_str())
+            .collect();
+        assert_change_envelope_matches(
+            &new.community.community_key_id,
+            &members,
+            &new.community.consensus_protocol,
+            &change_envelope,
+        )?;
+        self.verify_membership_quorum(
+            cohort::Cohort::Affiliations,
+            &new.community.community_key_id,
+            &change_envelope,
+            &signatures,
+        )
+        .await?;
+        let authorization = serde_json::json!({
+            "change_envelope": change_envelope,
+            "quorum_signatures": signatures,
+        });
+        self.supersede_affiliations(new, Some(authorization)).await
     }
 
     /// #249 Cut B — the INBOUND delegation walk: every key that holds a

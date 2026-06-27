@@ -3062,8 +3062,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     "supersede: the `self` cohort is not versioned".to_string(),
                 ))
             }
-            Cohort::Family | Cohort::Community => {}
+            // CC 4.4.3.2.8 / #308: `affiliations` supersedes via the community
+            // storage path below, recorded under the `affiliations` discriminator.
+            Cohort::Family | Cohort::Community | Cohort::Affiliations => {}
         }
+        // The version-history discriminator: `cohort.as_str()` keeps the
+        // `affiliations` chain separable from `community` even though they
+        // share the `federation_communities` live row.
+        let cohort_discriminator = cohort.as_str();
         let now = chrono::Utc::now();
         let mut client = self
             .get_client()
@@ -3143,7 +3149,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     .map_err(|e| Error::Backend(format!("commit: {e}")))?;
                 next
             }
-            Cohort::Community => {
+            Cohort::Community | Cohort::Affiliations => {
                 let mut new_comm: crate::federation::Community =
                     serde_json::from_value(new_snapshot).map_err(|e| {
                         Error::InvalidArgument(format!("supersede community snapshot decode: {e}"))
@@ -3179,7 +3185,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     "INSERT INTO cirislens.federation_group_versions \
                         (cohort, group_key_id, version, snapshot, change_authorization, \
                          superseded_at, persist_row_hash) \
-                     VALUES ('community', $1, $2, $3, $4, $5, $6)",
+                     VALUES ($7, $1, $2, $3, $4, $5, $6)",
                     &[
                         &new_comm.community_key_id,
                         &prior_version,
@@ -3187,6 +3193,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                         &authorization,
                         &now,
                         &prior_comm.persist_row_hash,
+                        &cohort_discriminator,
                     ],
                 )
                 .await
@@ -3234,11 +3241,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "list_group_versions: the `self` cohort is not versioned".to_string(),
             ));
         }
-        let cohort_str = if cohort == Cohort::Family {
-            "family"
-        } else {
-            "community"
-        };
+        // CC 4.4.3.2.8 / #308: `affiliations` filters its own history chain
+        // (`cohort.as_str()`), distinct from `community` though they share the
+        // live `federation_communities` row read below.
+        let cohort_str = cohort.as_str();
         let client = self
             .get_client()
             .await
@@ -17976,6 +17982,121 @@ mod tests {
             .await
             .expect("non-future revocation accepted");
         assert_eq!(backend.community_dek_current_epoch(&comm).await.unwrap(), 1);
+    }
+
+    /// CC 4.4.3.2.8 / #308 (PG parity): the `affiliations` cohort runs the full
+    /// membership lifecycle (add → active-members → revoke + epoch bump) through
+    /// the SAME community machinery on the Postgres backend.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn affiliations_cohort_membership_lifecycle_pg() {
+        use crate::federation::cohort::{Cohort, RevokeSpec, RosterMember};
+        use crate::federation::{BlobStorage, FederationDirectory};
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let suffix = uuid_like();
+        let coop = format!("aff-coop-{suffix}");
+        let alice = format!("aff-alice-{suffix}");
+        let carol = format!("aff-carol-{suffix}");
+        // Community key (infra-class) + two user-role human members.
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(&coop, "acme", now, true),
+            })
+            .await
+            .unwrap();
+        for kid in [&alice, &carol] {
+            let mut k = fix_section_i_key(kid, "acme", now, true);
+            k.identity_type = crate::federation::types::identity_type::USER.into();
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord { record: k })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_community(crate::federation::SignedCommunity {
+                community: crate::federation::Community {
+                    community_key_id: coop.clone(),
+                    community_name: "Affiliations Co-op".into(),
+                    members: vec![crate::federation::CommunityMember {
+                        key_id: alice.clone(),
+                        joined_at: now,
+                        role: None,
+                    }],
+                    founded_at: now,
+                    consensus_protocol: "majority".into(),
+                    policy_blob: Some(serde_json::json!({ "cohort_scope": "affiliations" })),
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+
+        // add via the affiliations cohort.
+        let added = backend
+            .add_member(
+                Cohort::Affiliations,
+                &coop,
+                RosterMember {
+                    key_id: carol.clone(),
+                    joined_at: now,
+                    role: Some("member".into()),
+                },
+            )
+            .await
+            .expect("affiliations add_member");
+        assert!(added);
+
+        let active: Vec<String> = backend
+            .active_members(Cohort::Affiliations, &coop)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert!(active.contains(&carol));
+        // Shared roster: identical via the `community` cohort.
+        let via_community: Vec<String> = backend
+            .active_members(Cohort::Community, &coop)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert_eq!(active, via_community);
+
+        assert_eq!(backend.community_dek_current_epoch(&coop).await.unwrap(), 0);
+        backend
+            .revoke_member(
+                Cohort::Affiliations,
+                &coop,
+                &carol,
+                RevokeSpec {
+                    effective_at: chrono::Utc::now(),
+                    reason: Some("left".into()),
+                    witness_set: vec![],
+                },
+            )
+            .await
+            .expect("affiliations revoke_member");
+        assert_eq!(
+            backend.community_dek_current_epoch(&coop).await.unwrap(),
+            1,
+            "affiliations removal bumps the CommunityDek epoch (forward secrecy)"
+        );
+        let active_after: Vec<String> = backend
+            .active_members(Cohort::Affiliations, &coop)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        assert!(!active_after.contains(&carol));
     }
 
     /// SecReview F5 (PG parity): INSERT + hard_case + epoch-bump are ONE

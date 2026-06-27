@@ -17,27 +17,39 @@
 //! (pg / sqlite / memory) is inherited for free and no backend override is
 //! needed.
 //!
-//! ## Cohort coverage (CIRISServer #249 Q1/Q4)
-//! `affiliations` / `species` / `biosphere` / `federation` are audience scopes
-//! with **no roster table** today, so they are NOT cohorts here. Whether
-//! `affiliations` should become a first-class rostered group (a managed set of
-//! org affiliations mirroring family/community) is an open CEG/constitution
-//! shape question (CIRISServer #249 Q1). [`Cohort`] is therefore
-//! `#[non_exhaustive]`: a future decision to add `affiliations` extends the
-//! enum without a breaking change, and this whole surface covers it the moment
-//! the roster table exists.
+//! ## Cohort coverage (CIRISServer #249 Q1/Q4; CC 4.4.3.2.8 / #308)
+//! As of v11.4.0 (CC 4.4.3.2.8, CIRISPersist#308) `affiliations` is the
+//! **fourth** rostered group. The Q1 "open shape question" resolved in its
+//! favor: `affiliations` shares the `community` machinery EXACTLY — the same
+//! `federation_communities` storage + `*_community_*` lifecycle, and the same
+//! [`CommunityDek`](crate::federation::types::cohort_scope::CryptoTier::CommunityDek)
+//! crypto tier with epoch-bump-on-removal forward secrecy (CC 4.4.3.2.2). It is
+//! distinguished only by its visibility-gradient position on the wire
+//! (`cohort_scope: "affiliations"`). `species` / `biosphere` / `federation`
+//! remain audience scopes with **no roster table**, so they are NOT cohorts.
+//! [`Cohort`] stays `#[non_exhaustive]` so any further tier joins later without
+//! a breaking change.
+//!
+//! The compartments[] / per-compartment-DEK / per-member-exclusion limb of
+//! CC 4.4.3.2.8 is a separate larger Rust-lane item and is NOT in #308.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::types;
 
-/// One of the three rostered-group kinds. Serializes to the wire scope token
-/// (`"self"` / `"family"` / `"community"`) so the cohort dispatch is portable
-/// over FFI / JSON.
+/// One of the four rostered-group kinds. Serializes to the wire scope token
+/// (`"self"` / `"family"` / `"community"` / `"affiliations"`) so the cohort
+/// dispatch is portable over FFI / JSON.
 ///
-/// `#[non_exhaustive]` — see the module docs (CIRISServer #249 Q1: `affiliations`
-/// may join later without breaking callers).
+/// `#[non_exhaustive]` — see the module docs. As of v11.4.0 (CC 4.4.3.2.8,
+/// CIRISPersist#308) `affiliations` is the **fourth** rostered tier, sharing
+/// the `community` machinery exactly (same `federation_communities` storage,
+/// same per-`(group, epoch)` [`CommunityDek`] cascade with epoch-bump-on-
+/// removal forward secrecy). The enum stays `#[non_exhaustive]` so any further
+/// tier joins later without breaking callers.
+///
+/// [`CommunityDek`]: crate::federation::types::cohort_scope::CryptoTier::CommunityDek
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Cohort {
@@ -52,25 +64,50 @@ pub enum Cohort {
     /// A `community` (`federation_communities`).
     #[serde(rename = "community")]
     Community,
+    /// An `affiliations` group (CC 4.4.3.2.8, CIRISPersist#308) — the fourth
+    /// rostered tier. Shares the `community` machinery EXACTLY: the same
+    /// `federation_communities` rows / `*_community_*` membership lifecycle and
+    /// the same [`CommunityDek`] crypto tier (epoch-bump-on-removal forward
+    /// secrecy). It differs from `community` only in its visibility-gradient
+    /// position on the wire (`cohort_scope: "affiliations"`).
+    ///
+    /// [`CommunityDek`]: crate::federation::types::cohort_scope::CryptoTier::CommunityDek
+    #[serde(rename = "affiliations")]
+    Affiliations,
 }
 
 impl Cohort {
-    /// The wire scope token (`"self"` / `"family"` / `"community"`).
+    /// The wire scope token (`"self"` / `"family"` / `"community"` /
+    /// `"affiliations"`).
     pub fn as_str(&self) -> &'static str {
         match self {
             Cohort::SelfId => "self",
             Cohort::Family => "family",
             Cohort::Community => "community",
+            Cohort::Affiliations => "affiliations",
         }
     }
 
+    /// `true` iff this cohort shares the `community` rostered machinery — the
+    /// `federation_communities` storage + the [`CommunityDek`] cascade. Both
+    /// `community` and `affiliations` (CC 4.4.3.2.8) resolve `true`; `self` and
+    /// `family` resolve `false`. The single predicate every community-routing
+    /// dispatch arm consults, so the two tiers never fork.
+    ///
+    /// [`CommunityDek`]: crate::federation::types::cohort_scope::CryptoTier::CommunityDek
+    pub fn shares_community_machinery(&self) -> bool {
+        matches!(self, Cohort::Community | Cohort::Affiliations)
+    }
+
     /// Parse the wire scope token. `Err` (the offending token) for anything
-    /// that is not a rostered cohort (e.g. `"affiliations"` today — Q1).
+    /// that is not a rostered cohort (e.g. `"species"` / `"federation"` — those
+    /// are audience scopes with no roster table).
     pub fn from_token(s: &str) -> Result<Cohort, String> {
         match s {
             "self" => Ok(Cohort::SelfId),
             "family" => Ok(Cohort::Family),
             "community" => Ok(Cohort::Community),
+            "affiliations" => Ok(Cohort::Affiliations),
             other => Err(other.to_string()),
         }
     }
@@ -218,20 +255,35 @@ mod tests {
 
     #[test]
     fn cohort_token_roundtrips_and_rejects_non_rostered() {
-        for c in [Cohort::SelfId, Cohort::Family, Cohort::Community] {
+        for c in [
+            Cohort::SelfId,
+            Cohort::Family,
+            Cohort::Community,
+            Cohort::Affiliations,
+        ] {
             assert_eq!(Cohort::from_token(c.as_str()), Ok(c));
         }
         // `self` serializes to the wire token, not the Rust ident.
         assert_eq!(Cohort::SelfId.as_str(), "self");
-        // audience scopes with no roster are not cohorts (Q1).
-        assert_eq!(
-            Cohort::from_token("affiliations"),
-            Err("affiliations".to_string())
-        );
+        // CC 4.4.3.2.8 / #308: `affiliations` is now an admitted rostered
+        // cohort (no longer rejected at the boundary).
+        assert_eq!(Cohort::from_token("affiliations"), Ok(Cohort::Affiliations));
+        assert_eq!(Cohort::Affiliations.as_str(), "affiliations");
+        // audience scopes with no roster table are still not cohorts.
         assert_eq!(
             Cohort::from_token("federation"),
             Err("federation".to_string())
         );
+        assert_eq!(Cohort::from_token("species"), Err("species".to_string()));
+    }
+
+    #[test]
+    fn affiliations_shares_community_machinery() {
+        // The single predicate every community-routing dispatch arm consults.
+        assert!(Cohort::Community.shares_community_machinery());
+        assert!(Cohort::Affiliations.shares_community_machinery());
+        assert!(!Cohort::Family.shares_community_machinery());
+        assert!(!Cohort::SelfId.shares_community_machinery());
     }
 
     #[test]
@@ -241,7 +293,13 @@ mod tests {
             serde_json::to_string(&Cohort::Community).unwrap(),
             "\"community\""
         );
+        assert_eq!(
+            serde_json::to_string(&Cohort::Affiliations).unwrap(),
+            "\"affiliations\""
+        );
         let c: Cohort = serde_json::from_str("\"family\"").unwrap();
         assert_eq!(c, Cohort::Family);
+        let a: Cohort = serde_json::from_str("\"affiliations\"").unwrap();
+        assert_eq!(a, Cohort::Affiliations);
     }
 }
