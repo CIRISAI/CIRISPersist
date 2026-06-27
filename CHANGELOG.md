@@ -5,6 +5,60 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.4.0] — 2026-06-27
+
+### Added — #308 (CC 4.4.3.2.8): `affiliations` as the 4th rostered `cohort_scope` + a `crypto_tier` resolver on the PyO3 surface
+
+CC 0.5.1 §4.4.3.2.8 makes `affiliations` the **fourth** rostered `cohort_scope`
+tier (alongside `self` / `family` / `community`), sharing the community
+machinery and resolving to the **CommunityDek** crypto tier. Previously every
+affiliations cohort op was rejected at the boundary with
+`ValueError: unknown cohort "affiliations" (...)`. Two asks landed:
+
+**(a) `affiliations` admitted as a rostered cohort + membership lifecycle.**
+`Cohort::Affiliations` (wire token `"affiliations"`) joins the
+`#[non_exhaustive]` `Cohort` enum. It shares the `community` machinery
+**exactly** — the same `federation_communities` storage, the same
+`active_community_members` / `add_community_member` /
+`put_community_membership_revocation` lifecycle, and the same per-`(group,
+epoch)` **CommunityDek** cascade. Critically, a member **removal bumps the
+CommunityDek epoch** (forward secrecy, CC 4.4.3.2.2), inherited for free because
+affiliations revocation rides the community revocation table (which bumps the
+epoch transactionally at write time). Every cohort-routing dispatch arm in the
+`FederationDirectory` trait (`active_members` / `lookup_group` / `groups_of` /
+`add_member` / `revoke_member` / `group_prior_envelope`) and the three backends
+(memory / sqlite / postgres) routes `Affiliations` through the identical
+community path — no PG/sqlite/memory asymmetry. Supersede/versioning records the
+`affiliations` chain under its own `cohort.as_str()` discriminator (keeping it
+separable from `community` though they share the live row), with new
+`supersede_affiliations` / `supersede_affiliations_with_quorum` trait wrappers.
+The new `Cohort::shares_community_machinery()` predicate is the single source of
+truth the two tiers fold through.
+
+**(b) `crypto_tier` resolver exposed on the Engine/PyO3 surface.** The internal
+`cohort_scope::crypto_tier(...)` mapping already resolved
+`affiliations → CommunityDek`; this exposes it from Python via the new
+`EngineCell.cohort_scope_crypto_tier(cohort_scope, cohort_subkind=None) -> str`
+method, returning the lowercase tier name
+(`"invisible_encrypted"` / `"community_dek"` / `"plaintext"`). It accepts any
+`cohort_scope` token (negative-default: unknown → `"plaintext"`) and needs no
+database round-trip, so `affiliations → community_dek` is checkable from Python.
+
+The FFI error token now reads `expected one of: self | family | community |
+affiliations`.
+
+**Out of scope (deferred):** the `compartments[]` / per-compartment-DEK /
+per-member-exclusion / disclosure limb of CC 4.4.3.2.8 is a separate larger
+Rust-lane item and is NOT in #308.
+
+Rust unit tests added (memory = fast, mirrored in sqlite + postgres):
+`Cohort::from_token("affiliations")` now `Ok`; a full affiliations
+add → active-members → revoke lifecycle with the epoch bump on revoke, asserted
+to read the SAME roster as `community`; and a `crypto_tier`-resolver test
+proving `affiliations → CommunityDek` is reachable.
+
+No version re-pin (CIRISVerify stays **v8.3.0**).
+
 ## [11.3.0] — 2026-06-27
 
 ### Added — #307 (CC 3.4.11): refuse `age_self_declared:level:*` (self rung carries a `{band}`, never a `{level}`)

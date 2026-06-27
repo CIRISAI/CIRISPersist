@@ -15868,12 +15868,38 @@ impl PyEngine {
     // ── #249 Cut G1 ── uniform cohort FFI (CIRISServer #249 §1/§2/§6) ──
     //
     // One cohort-parameterized surface (`cohort` ∈ {"self","family",
-    // "community"}) over the rostered-group read+write methods, so the
-    // KMP/Python consumers write rostered-group ops once instead of
-    // branching family-vs-community-vs-self. Each composes the
+    // "community","affiliations"}) over the rostered-group read+write methods,
+    // so the KMP/Python consumers write rostered-group ops once instead of
+    // branching family-vs-community-vs-self-vs-affiliations. Each composes the
     // [`crate::federation::cohort`] default methods (backend parity
     // inherited). A hardware-hybrid engine needs no extra signer here —
     // these are admission/read, not emit.
+
+    /// CC 4.4.3.2.8 / #308 — resolve a `cohort_scope` wire token to its at-rest
+    /// crypto tier, exposing [`crate::federation::types::cohort_scope::crypto_tier`]
+    /// on the Python surface. Returns the lowercase tier name:
+    /// `"invisible_encrypted"` (`self`/`family`), `"community_dek"`
+    /// (`community`/`affiliations`, unless `cohort_subkind == "infrastructure"`),
+    /// or `"plaintext"` (Commons / infrastructure / any unrecognized scope).
+    ///
+    /// Accepts ANY `cohort_scope` token (not just the rostered cohorts) — the
+    /// resolver is a closed-set negative-default dispatch, so unknown tokens
+    /// return `"plaintext"`. This makes `affiliations → community_dek`
+    /// (CC 4.4.3.2.8) checkable from Python without a database round-trip.
+    #[pyo3(signature = (cohort_scope, cohort_subkind=None))]
+    fn cohort_scope_crypto_tier(
+        &self,
+        cohort_scope: &str,
+        cohort_subkind: Option<&str>,
+    ) -> PyResult<String> {
+        use crate::federation::types::cohort_scope::{crypto_tier, CryptoTier};
+        let tier = match crypto_tier(cohort_scope, cohort_subkind) {
+            CryptoTier::InvisibleEncrypted => "invisible_encrypted",
+            CryptoTier::CommunityDek => "community_dek",
+            CryptoTier::Plaintext => "plaintext",
+        };
+        Ok(tier.to_string())
+    }
 
     /// #249 Cut G1 (§1) — active roster of `group_key_id` in `cohort`. Returns
     /// a JSON array of [`crate::federation::cohort::RosterMember`].
@@ -16205,8 +16231,10 @@ impl PyEngine {
             }),
             _ => None,
         };
+        // CC 4.4.3.2.8 / #308: `affiliations` decodes as a community row (shared
+        // `SignedCommunity` shape + `federation_communities` storage).
         let community: Option<crate::federation::SignedCommunity> = match cohort {
-            Cohort::Community => Some(crate::federation::SignedCommunity {
+            Cohort::Community | Cohort::Affiliations => Some(crate::federation::SignedCommunity {
                 community: serde_json::from_str(new_group_json)
                     .map_err(|e| PyValueError::new_err(format!("supersede community JSON: {e}")))?,
             }),
@@ -16235,6 +16263,13 @@ impl PyEngine {
                                 }
                                 Cohort::Community => {
                                     b.supersede_community(
+                                        community.clone().unwrap(),
+                                        authorization.clone(),
+                                    )
+                                    .await
+                                }
+                                Cohort::Affiliations => {
+                                    b.supersede_affiliations(
                                         community.clone().unwrap(),
                                         authorization.clone(),
                                     )
@@ -16473,8 +16508,9 @@ impl PyEngine {
             }),
             _ => None,
         };
+        // CC 4.4.3.2.8 / #308: `affiliations` decodes as a community row.
         let community: Option<crate::federation::SignedCommunity> = match cohort {
-            Cohort::Community => Some(crate::federation::SignedCommunity {
+            Cohort::Community | Cohort::Affiliations => Some(crate::federation::SignedCommunity {
                 community: serde_json::from_str(new_group_json)
                     .map_err(|e| PyValueError::new_err(format!("supersede community JSON: {e}")))?,
             }),
@@ -16504,6 +16540,14 @@ impl PyEngine {
                                 }
                                 Cohort::Community => {
                                     b.supersede_community_with_quorum(
+                                        community.clone().unwrap(),
+                                        change_envelope.clone(),
+                                        signatures.clone(),
+                                    )
+                                    .await
+                                }
+                                Cohort::Affiliations => {
+                                    b.supersede_affiliations_with_quorum(
                                         community.clone().unwrap(),
                                         change_envelope.clone(),
                                         signatures.clone(),
@@ -23296,12 +23340,13 @@ fn base64_encode(bytes: &[u8]) -> String {
     B64.encode(bytes)
 }
 
-/// #249 Cut G1 — parse a cohort wire token (`"self"`/`"family"`/`"community"`)
-/// for the uniform cohort FFI. `ValueError` for a non-rostered scope.
+/// #249 Cut G1 / CC 4.4.3.2.8 #308 — parse a cohort wire token
+/// (`"self"`/`"family"`/`"community"`/`"affiliations"`) for the uniform cohort
+/// FFI. `ValueError` for a non-rostered scope.
 fn cohort_from_token(cohort: &str) -> PyResult<crate::federation::cohort::Cohort> {
     crate::federation::cohort::Cohort::from_token(cohort).map_err(|bad| {
         PyValueError::new_err(format!(
-            "unknown cohort {bad:?} (expected one of: self | family | community)"
+            "unknown cohort {bad:?} (expected one of: self | family | community | affiliations)"
         ))
     })
 }
