@@ -175,6 +175,17 @@ struct State {
     /// community-DEK rotation *state* (`federation_community_dek_epoch`) is
     /// carried on memory while its crypto half is BlobStorage-only.
     federation_scope_blobs: HashMap<([u8; 32], u16), MemScopeBlob>,
+    /// #302 (FSD-004) — accord live-quorum storage, parity with the
+    /// pg/sqlite V091 tables. Proposals keyed by `proposal_digest`;
+    /// participations a flat vec (deduped by `(proposal_digest,
+    /// pinned_pubkey)` at write time, M6); decisions keyed by
+    /// `proposal_digest` (immutable, M2); active halts keyed by family (H2);
+    /// issued nonces a `(family_key_id, nonce)` set (M4).
+    accord_proposals: HashMap<String, crate::federation::accord_quorum::StoredProposal>,
+    accord_participations: Vec<crate::federation::accord_quorum::StoredParticipation>,
+    accord_decisions: HashMap<String, crate::federation::accord_quorum::StoredDecision>,
+    accord_active_halts: HashMap<String, crate::federation::accord_quorum::ActiveHalt>,
+    accord_issued_nonces: std::collections::HashSet<(String, String)>,
 }
 
 /// v9.1.0 (CIRISPersist#243) — one in-memory scope-blob symbol + its LRU
@@ -227,6 +238,11 @@ impl Default for MemoryBackend {
                 wholeness_witnesses: HashMap::new(),
                 content_aggregations: HashMap::new(),
                 federation_scope_blobs: HashMap::new(),
+                accord_proposals: HashMap::new(),
+                accord_participations: Vec::new(),
+                accord_decisions: HashMap::new(),
+                accord_active_halts: HashMap::new(),
+                accord_issued_nonces: std::collections::HashSet::new(),
             }),
         }
     }
@@ -1926,6 +1942,271 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .collect();
         rows.sort_by(|a, b| a.community_key_id.cmp(&b.community_key_id));
         Ok(rows)
+    }
+
+    // ─── #302 (FSD-004) accord live-quorum storage ──────────────────────
+
+    async fn put_accord_proposal(
+        &self,
+        proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
+        authority_signature: Option<serde_json::Value>,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        // M4 fail-closed (self.accord_nonce_issued locks state — run before).
+        if !self
+            .accord_nonce_issued(&proposal.family_key_id, &proposal.nonce)
+            .await?
+        {
+            return Err(Error::InvalidArgument(format!(
+                "accord proposal nonce {:?} not issued for family {:?} (M4 fail-closed)",
+                proposal.nonce, proposal.family_key_id
+            )));
+        }
+        let prep = crate::federation::accord_quorum::prepare_proposal(
+            &proposal,
+            authority_signature,
+            chrono::Utc::now(),
+        )?;
+        let crate::federation::accord_quorum::PreparedProposal {
+            proposal_digest,
+            persist_row_hash,
+            created_at,
+            authority_signature,
+            ..
+        } = prep;
+        let stored = crate::federation::accord_quorum::StoredProposal {
+            proposal,
+            authority_signature,
+            persist_row_hash,
+            created_at,
+        };
+        let mut state = self.state.lock().expect("memory backend lock");
+        // Content-derived digest ⇒ insert-if-absent is idempotent.
+        state
+            .accord_proposals
+            .entry(proposal_digest)
+            .or_insert(stored);
+        Ok(())
+    }
+
+    async fn get_accord_proposal(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Option<crate::federation::accord_quorum::StoredProposal>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state.accord_proposals.get(proposal_digest).cloned())
+    }
+
+    async fn list_accord_proposals_by_anchor(
+        &self,
+        action: &str,
+        prior_family_digest: &str,
+    ) -> Result<Vec<crate::federation::accord_quorum::StoredProposal>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .accord_proposals
+            .values()
+            .filter(|p| {
+                p.proposal.action.as_str() == action
+                    && p.proposal.prior_family_digest == prior_family_digest
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.proposal.digest().cmp(&b.proposal.digest()))
+        });
+        Ok(rows)
+    }
+
+    async fn put_accord_participation(
+        &self,
+        participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
+        standing_roster: &[ciris_verify_core::threshold::ThresholdMember],
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        // Proposal must exist (get locks state — run before our lock).
+        let stored_proposal = self
+            .get_accord_proposal(&participation.proposal_digest)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "accord participation references unknown proposal {:?}",
+                    participation.proposal_digest
+                ))
+            })?;
+        let prep = crate::federation::accord_quorum::verify_and_prepare_participation(
+            &stored_proposal.proposal,
+            &participation,
+            standing_roster,
+            chrono::Utc::now(),
+        )?;
+        let crate::federation::accord_quorum::PreparedParticipation {
+            proposal_digest,
+            pinned_pubkey,
+            server_arrival_at,
+            persist_row_hash,
+            ..
+        } = prep;
+        let mut state = self.state.lock().expect("memory backend lock");
+        // M6 durable dedup by (proposal_digest, pinned_pubkey).
+        if let Some(existing) = state.accord_participations.iter().find(|p| {
+            p.participation.proposal_digest == proposal_digest && p.pinned_pubkey == pinned_pubkey
+        }) {
+            if existing.persist_row_hash == persist_row_hash {
+                return Ok(());
+            }
+            return Err(Error::Conflict(format!(
+                "accord participation: holder (pinned pubkey) already voted differently on proposal {proposal_digest:?} (M6 — one vote per holder)"
+            )));
+        }
+        state
+            .accord_participations
+            .push(crate::federation::accord_quorum::StoredParticipation {
+                participation,
+                pinned_pubkey,
+                server_arrival_at,
+                persist_row_hash,
+            });
+        Ok(())
+    }
+
+    async fn list_accord_participations(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Vec<crate::federation::accord_quorum::StoredParticipation>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .accord_participations
+            .iter()
+            .filter(|p| p.participation.proposal_digest == proposal_digest)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.server_arrival_at
+                .cmp(&b.server_arrival_at)
+                .then_with(|| a.pinned_pubkey.cmp(&b.pinned_pubkey))
+        });
+        Ok(rows)
+    }
+
+    async fn put_accord_decision(
+        &self,
+        decision: ciris_verify_core::accord_live_quorum::AccordDecision,
+        steward_signatures: Option<serde_json::Value>,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let prep = crate::federation::accord_quorum::prepare_decision(
+            &decision,
+            steward_signatures,
+            chrono::Utc::now(),
+        )?;
+        let crate::federation::accord_quorum::PreparedDecision {
+            proposal_digest,
+            persist_row_hash,
+            decided_at,
+            steward_signatures,
+            ..
+        } = prep;
+        let mut state = self.state.lock().expect("memory backend lock");
+        // Immutable (M2): identical re-PUT no-ops, a differing one conflicts.
+        if let Some(existing) = state.accord_decisions.get(&proposal_digest) {
+            if existing.persist_row_hash == persist_row_hash {
+                return Ok(());
+            }
+            return Err(Error::Conflict(format!(
+                "accord decision for proposal {proposal_digest:?} already recorded with different content (M2 — immutable)"
+            )));
+        }
+        state.accord_decisions.insert(
+            proposal_digest,
+            crate::federation::accord_quorum::StoredDecision {
+                decision,
+                steward_signatures,
+                persist_row_hash,
+                decided_at,
+            },
+        );
+        Ok(())
+    }
+
+    async fn get_accord_decision(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Option<crate::federation::accord_quorum::StoredDecision>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state.accord_decisions.get(proposal_digest).cloned())
+    }
+
+    async fn set_active_halt(
+        &self,
+        family_key_id: &str,
+        active_halt_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        state.accord_active_halts.insert(
+            family_key_id.to_owned(),
+            crate::federation::accord_quorum::ActiveHalt {
+                family_key_id: family_key_id.to_owned(),
+                active_halt_id: active_halt_id.to_owned(),
+                set_at: chrono::Utc::now(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn get_active_halt(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Option<crate::federation::accord_quorum::ActiveHalt>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state.accord_active_halts.get(family_key_id).cloned())
+    }
+
+    async fn clear_active_halt(
+        &self,
+        family_key_id: &str,
+        active_halt_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        // Only clear the matching halt (a stale-halt resume is a no-op).
+        let matches = state
+            .accord_active_halts
+            .get(family_key_id)
+            .is_some_and(|h| h.active_halt_id == active_halt_id);
+        if matches {
+            state.accord_active_halts.remove(family_key_id);
+        }
+        Ok(())
+    }
+
+    async fn issue_accord_nonce(
+        &self,
+        family_key_id: &str,
+        nonce: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        state
+            .accord_issued_nonces
+            .insert((family_key_id.to_owned(), nonce.to_owned()));
+        Ok(())
+    }
+
+    async fn accord_nonce_issued(
+        &self,
+        family_key_id: &str,
+        nonce: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .accord_issued_nonces
+            .contains(&(family_key_id.to_owned(), nonce.to_owned())))
     }
 
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
@@ -4195,6 +4476,21 @@ impl crate::derived::DerivedSchema for MemoryBackend {
         _version: i32,
     ) -> Result<Option<crate::derived::CalibrationBundle>, crate::derived::Error> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod accord_tests {
+    use super::*;
+
+    /// #302 — full accord live-quorum storage flow on the memory backend (M4
+    /// nonce / verify-before-mutation / M6 dedup / M2 immutability / H2 halt).
+    /// Shares the assertion body with the sqlite + pg parity tests.
+    #[tokio::test]
+    async fn accord_live_quorum_storage_flow() {
+        let backend = MemoryBackend::new();
+        crate::federation::accord_quorum::test_fixtures::exercise_accord_storage(&backend, "mem")
+            .await;
     }
 }
 

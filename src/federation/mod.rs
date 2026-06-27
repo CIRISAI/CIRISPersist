@@ -32,6 +32,7 @@
 //! and the registry-side `docs/FEDERATION_CLIENT.md` for the consumer
 //! complement.
 
+pub mod accord_quorum;
 pub mod admission;
 pub mod at_rest_cascade;
 #[cfg(feature = "cirisaudit")]
@@ -2856,6 +2857,105 @@ pub trait FederationDirectory: Send + Sync {
         content_id: &str,
         corpus_kind: &str,
     ) -> Result<u64, Error>;
+
+    // ── #302 (FSD-004) accord live-quorum storage ──────────────────────
+    //
+    // The durable substrate for the constitutional kill-switch's
+    // decimation-recovery live quorum (CIRISVerify#150 stateless machinery;
+    // CIRISServer#122 runtime writes through). Persist STORES the verify-core
+    // objects verbatim + dedups + verifies participations + holds nonce/halt
+    // state; the SERVER runs the tally. Recovery (H7) is absent (CIRISAccord#4
+    // gate). See [`crate::federation::accord_quorum`].
+
+    /// #302 — admit an `accord_proposal` (server-issued). M4 fail-closed: the
+    /// proposal's `nonce` MUST already be issued for its family
+    /// ([`Self::issue_accord_nonce`]) or the write is rejected. The digest is
+    /// derived via verify-core ([`AccordProposal::digest`](ciris_verify_core::accord_live_quorum::AccordProposal::digest));
+    /// the object is stored verbatim. Idempotent on a byte-identical re-PUT.
+    async fn put_accord_proposal(
+        &self,
+        proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
+        authority_signature: Option<serde_json::Value>,
+    ) -> Result<(), Error>;
+
+    /// #302 — the stored proposal for `proposal_digest`, or `None`.
+    async fn get_accord_proposal(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Option<accord_quorum::StoredProposal>, Error>;
+
+    /// #302 — proposals over `(action, prior_family_digest)` — the H4
+    /// coalescing index (collapse duplicate proposals over one standing
+    /// roster). `prior_family_digest` is the STANDING envelope digest (C3).
+    async fn list_accord_proposals_by_anchor(
+        &self,
+        action: &str,
+        prior_family_digest: &str,
+    ) -> Result<Vec<accord_quorum::StoredProposal>, Error>;
+
+    /// #302 — admit an `accord_participation`. Verify-before-mutation: the
+    /// proposal MUST exist, the member MUST be in `standing_roster` (C3), and
+    /// [`AccordParticipation::verify`](ciris_verify_core::accord_live_quorum::AccordParticipation::verify)
+    /// MUST pass (fail-closed). M6 durable dedup by PINNED pubkey: a second
+    /// participation by the same pinned key for the same proposal is an
+    /// idempotent no-op if byte-identical, else [`Error::Conflict`]
+    /// (one vote per holder per proposal). C2: persist stamps the
+    /// authoritative `server_arrival_at`.
+    async fn put_accord_participation(
+        &self,
+        participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
+        standing_roster: &[ciris_verify_core::threshold::ThresholdMember],
+    ) -> Result<(), Error>;
+
+    /// #302 — all stored participations for a proposal (the server's tally
+    /// input). Deduped by pinned pubkey at write time (M6).
+    async fn list_accord_participations(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Vec<accord_quorum::StoredParticipation>, Error>;
+
+    /// #302 — record the server's frozen-L decision (M2). IMMUTABLE: a
+    /// differing re-PUT for the same proposal is [`Error::Conflict`]; an
+    /// identical one is an idempotent no-op. `steward_signatures` carries the
+    /// |L|<L_FLOOR backstop (H6) when present.
+    async fn put_accord_decision(
+        &self,
+        decision: ciris_verify_core::accord_live_quorum::AccordDecision,
+        steward_signatures: Option<serde_json::Value>,
+    ) -> Result<(), Error>;
+
+    /// #302 — the stored decision for `proposal_digest`, or `None`.
+    async fn get_accord_decision(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Option<accord_quorum::StoredDecision>, Error>;
+
+    /// #302 (H2) — set the active CONSTITUTIONAL halt for a family (upsert;
+    /// at most one active halt per family).
+    async fn set_active_halt(&self, family_key_id: &str, active_halt_id: &str)
+        -> Result<(), Error>;
+
+    /// #302 (H2) — the active halt for a family, or `None`.
+    async fn get_active_halt(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Option<accord_quorum::ActiveHalt>, Error>;
+
+    /// #302 (H2) — clear the active halt iff it matches `active_halt_id` (a
+    /// resume un-fires the specific halt). A no-op if a different / no halt is
+    /// active, so a replayed resume against a stale halt has no effect.
+    async fn clear_active_halt(
+        &self,
+        family_key_id: &str,
+        active_halt_id: &str,
+    ) -> Result<(), Error>;
+
+    /// #302 (M4) — record a server-issued proposal nonce (idempotent).
+    async fn issue_accord_nonce(&self, family_key_id: &str, nonce: &str) -> Result<(), Error>;
+
+    /// #302 (M4) — has this `(family_key_id, nonce)` been issued? The
+    /// fail-closed gate `put_accord_proposal` consults.
+    async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error>;
 }
 
 /// Federation directory errors. Distinct from

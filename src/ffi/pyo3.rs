@@ -1008,6 +1008,49 @@ impl PyEngine {
     }
 }
 
+/// #302 — two-backend dispatch for the accord write-through methods: bind the
+/// backend as `$b`, run `$body` (which uses `$b` + `.await`) on the runtime,
+/// with the `FederationDirectory` trait in scope. Collapses the otherwise
+/// 2×-repeated pg/sqlite match for each of the dozen accord FFI methods.
+macro_rules! accord_dispatch {
+    ($self:ident, $runtime:ident, $b:ident, $body:expr) => {
+        match &$self.backend {
+            BackendDispatch::Postgres(pg) => {
+                let $b = pg.clone();
+                $runtime.block_on(async move {
+                    #[allow(unused_imports)]
+                    use crate::federation::FederationDirectory;
+                    $body
+                })
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(sq) => {
+                let $b = sq.clone();
+                $runtime.block_on(async move {
+                    #[allow(unused_imports)]
+                    use crate::federation::FederationDirectory;
+                    $body
+                })
+            }
+        }
+    };
+}
+
+/// #302 — serialize an optional read result to `Option<String>` JSON.
+fn accord_opt_json<T: serde::Serialize>(v: Option<T>) -> PyResult<Option<String>> {
+    match v {
+        Some(x) => Ok(Some(serde_json::to_string(&x).map_err(|e| {
+            PyValueError::new_err(format!("accord serialize: {e}"))
+        })?)),
+        None => Ok(None),
+    }
+}
+
+/// #302 — serialize a list read result to a JSON array string.
+fn accord_vec_json<T: serde::Serialize>(v: Vec<T>) -> PyResult<String> {
+    serde_json::to_string(&v).map_err(|e| PyValueError::new_err(format!("accord serialize: {e}")))
+}
+
 #[pymethods]
 impl PyEngine {
     /// Connect to Postgres, run migrations, instantiate the
@@ -6221,6 +6264,330 @@ impl PyEngine {
                             .map_err(federation_err_to_py)
                     })
                 }
+            })
+        })
+    }
+
+    // ── #302 (FSD-004) accord live-quorum write-through (CIRISServer#122) ──
+    //
+    // CIRISServer's Phase-3 runtime writes the verify-core wire objects +
+    // anti-replay state through these. JSON in/out; persist verifies +
+    // dedups + holds state (see `crate::federation::accord_quorum`).
+
+    /// #302 — admit an `accord_proposal`. `payload_json` =
+    /// `{ "proposal": <AccordProposal>, "authority_signature": <obj|null> }`.
+    /// M4 fail-closed on an unissued nonce.
+    fn put_accord_proposal_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let v: serde_json::Value = serde_json::from_str(payload_json)
+                .map_err(|e| PyValueError::new_err(format!("accord proposal decode: {e}")))?;
+            let proposal: ciris_verify_core::accord_live_quorum::AccordProposal =
+                serde_json::from_value(
+                    v.get("proposal")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )
+                .map_err(|e| PyValueError::new_err(format!("proposal decode: {e}")))?;
+            let authority_signature = v
+                .get("authority_signature")
+                .cloned()
+                .filter(|x| !x.is_null());
+            py.detach(move || {
+                accord_dispatch!(
+                    self,
+                    runtime,
+                    b,
+                    b.put_accord_proposal(proposal, authority_signature)
+                        .await
+                        .map_err(federation_err_to_py)
+                )
+            })
+        })
+    }
+
+    /// #302 — the stored proposal as JSON, or `None`.
+    fn get_accord_proposal_json(
+        &self,
+        py: Python<'_>,
+        proposal_digest: &str,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key = proposal_digest.to_owned();
+            py.detach(move || {
+                let stored = accord_dispatch!(
+                    self,
+                    runtime,
+                    b,
+                    b.get_accord_proposal(&key)
+                        .await
+                        .map_err(federation_err_to_py)
+                )?;
+                accord_opt_json(stored)
+            })
+        })
+    }
+
+    /// #302 — proposals over `(action, prior_family_digest)` (H4) as a JSON
+    /// array.
+    fn list_accord_proposals_by_anchor_json(
+        &self,
+        py: Python<'_>,
+        action: &str,
+        prior_family_digest: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let action = action.to_owned();
+            let anchor = prior_family_digest.to_owned();
+            py.detach(move || {
+                let rows = accord_dispatch!(
+                    self,
+                    runtime,
+                    b,
+                    b.list_accord_proposals_by_anchor(&action, &anchor)
+                        .await
+                        .map_err(federation_err_to_py)
+                )?;
+                accord_vec_json(rows)
+            })
+        })
+    }
+
+    /// #302 — admit an `accord_participation`. `payload_json` =
+    /// `{ "participation": <AccordParticipation>, "standing_roster":
+    /// [<ThresholdMember>...] }`. Verify-before-mutation + M6 dedup.
+    fn put_accord_participation_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let v: serde_json::Value = serde_json::from_str(payload_json)
+                .map_err(|e| PyValueError::new_err(format!("accord participation decode: {e}")))?;
+            let participation: ciris_verify_core::accord_live_quorum::AccordParticipation =
+                serde_json::from_value(
+                    v.get("participation")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )
+                .map_err(|e| PyValueError::new_err(format!("participation decode: {e}")))?;
+            let standing_roster: Vec<ciris_verify_core::threshold::ThresholdMember> =
+                serde_json::from_value(
+                    v.get("standing_roster")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )
+                .map_err(|e| PyValueError::new_err(format!("standing_roster decode: {e}")))?;
+            py.detach(move || {
+                accord_dispatch!(
+                    self,
+                    runtime,
+                    b,
+                    b.put_accord_participation(participation, &standing_roster)
+                        .await
+                        .map_err(federation_err_to_py)
+                )
+            })
+        })
+    }
+
+    /// #302 — all participations for a proposal as a JSON array.
+    fn list_accord_participations_json(
+        &self,
+        py: Python<'_>,
+        proposal_digest: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key = proposal_digest.to_owned();
+            py.detach(move || {
+                let rows = accord_dispatch!(
+                    self,
+                    runtime,
+                    b,
+                    b.list_accord_participations(&key)
+                        .await
+                        .map_err(federation_err_to_py)
+                )?;
+                accord_vec_json(rows)
+            })
+        })
+    }
+
+    /// #302 — record the server's frozen-L decision. `payload_json` =
+    /// `{ "decision": <AccordDecision>, "steward_signatures": <obj|null> }`.
+    /// Immutable (M2).
+    fn put_accord_decision_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let v: serde_json::Value = serde_json::from_str(payload_json)
+                .map_err(|e| PyValueError::new_err(format!("accord decision decode: {e}")))?;
+            let decision: ciris_verify_core::accord_live_quorum::AccordDecision =
+                serde_json::from_value(
+                    v.get("decision")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )
+                .map_err(|e| PyValueError::new_err(format!("decision decode: {e}")))?;
+            let steward_signatures = v
+                .get("steward_signatures")
+                .cloned()
+                .filter(|x| !x.is_null());
+            py.detach(move || {
+                accord_dispatch!(
+                    self,
+                    runtime,
+                    b,
+                    b.put_accord_decision(decision, steward_signatures)
+                        .await
+                        .map_err(federation_err_to_py)
+                )
+            })
+        })
+    }
+
+    /// #302 — the stored decision as JSON, or `None`.
+    fn get_accord_decision_json(
+        &self,
+        py: Python<'_>,
+        proposal_digest: &str,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key = proposal_digest.to_owned();
+            py.detach(move || {
+                let stored = accord_dispatch!(
+                    self,
+                    runtime,
+                    b,
+                    b.get_accord_decision(&key)
+                        .await
+                        .map_err(federation_err_to_py)
+                )?;
+                accord_opt_json(stored)
+            })
+        })
+    }
+
+    /// #302 (H2) — set the active CONSTITUTIONAL halt for a family.
+    fn set_active_halt(
+        &self,
+        py: Python<'_>,
+        family_key_id: &str,
+        active_halt_id: &str,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let fam = family_key_id.to_owned();
+            let halt = active_halt_id.to_owned();
+            py.detach(move || {
+                accord_dispatch!(
+                    self,
+                    runtime,
+                    b,
+                    b.set_active_halt(&fam, &halt)
+                        .await
+                        .map_err(federation_err_to_py)
+                )
+            })
+        })
+    }
+
+    /// #302 (H2) — the active halt for a family as JSON, or `None`.
+    fn get_active_halt_json(
+        &self,
+        py: Python<'_>,
+        family_key_id: &str,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let fam = family_key_id.to_owned();
+            py.detach(move || {
+                let halt = accord_dispatch!(
+                    self,
+                    runtime,
+                    b,
+                    b.get_active_halt(&fam).await.map_err(federation_err_to_py)
+                )?;
+                accord_opt_json(halt)
+            })
+        })
+    }
+
+    /// #302 (H2) — clear the active halt iff it matches (a resume).
+    fn clear_active_halt(
+        &self,
+        py: Python<'_>,
+        family_key_id: &str,
+        active_halt_id: &str,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let fam = family_key_id.to_owned();
+            let halt = active_halt_id.to_owned();
+            py.detach(move || {
+                accord_dispatch!(
+                    self,
+                    runtime,
+                    b,
+                    b.clear_active_halt(&fam, &halt)
+                        .await
+                        .map_err(federation_err_to_py)
+                )
+            })
+        })
+    }
+
+    /// #302 (M4) — record a server-issued proposal nonce.
+    fn issue_accord_nonce(&self, py: Python<'_>, family_key_id: &str, nonce: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let fam = family_key_id.to_owned();
+            let n = nonce.to_owned();
+            py.detach(move || {
+                accord_dispatch!(
+                    self,
+                    runtime,
+                    b,
+                    b.issue_accord_nonce(&fam, &n)
+                        .await
+                        .map_err(federation_err_to_py)
+                )
+            })
+        })
+    }
+
+    /// #302 (M4) — has `(family_key_id, nonce)` been issued?
+    fn accord_nonce_issued(
+        &self,
+        py: Python<'_>,
+        family_key_id: &str,
+        nonce: &str,
+    ) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let fam = family_key_id.to_owned();
+            let n = nonce.to_owned();
+            py.detach(move || {
+                accord_dispatch!(
+                    self,
+                    runtime,
+                    b,
+                    b.accord_nonce_issued(&fam, &n)
+                        .await
+                        .map_err(federation_err_to_py)
+                )
             })
         })
     }
