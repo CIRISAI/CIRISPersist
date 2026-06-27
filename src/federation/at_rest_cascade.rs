@@ -644,10 +644,31 @@ pub mod orchestrate {
             let dek =
                 unwrap_dek_for_persist(&content_master, &self_grant.1).map_err(map_at_rest_err)?;
 
+            // #304 — wrap-once-to-the-identity: CIRISServer 0.5.56+ DERIVES a
+            // user's content-KEM keypair (x25519 + ML-KEM-768) from the FedID
+            // Ed25519 seed (CIRISVerify#151 / verify v8.3.0), so every
+            // occurrence of one identity presents the IDENTICAL enc pubkey. The
+            // wrap is recipient-determined by those pubkeys, so encap ONCE per
+            // distinct pubkey pair and reuse the wrap for every occurrence that
+            // shares it — any holder of the shared (derived) private key opens
+            // it. This collapses N redundant ML-KEM-768 encaps to one per
+            // derived identity; the grant rows stay per-occurrence (the reader
+            // resolves by occurrence_key_id, unchanged). Non-derived (distinct)
+            // pubkeys are unaffected — one wrap each, as before.
+            let mut wrap_cache: std::collections::HashMap<(String, String), String> =
+                std::collections::HashMap::new();
             for i in needs {
                 let (occ_key_id, keys) = &keyed[i];
-                let wrapped = wrap_dek_v2(&keys.x25519_base64, &keys.ml_kem_768_base64, &dek)
-                    .map_err(map_at_rest_err)?;
+                let cache_key = (keys.x25519_base64.clone(), keys.ml_kem_768_base64.clone());
+                let wrapped = match wrap_cache.get(&cache_key) {
+                    Some(w) => w.clone(),
+                    None => {
+                        let w = wrap_dek_v2(&keys.x25519_base64, &keys.ml_kem_768_base64, &dek)
+                            .map_err(map_at_rest_err)?;
+                        wrap_cache.insert(cache_key, w.clone());
+                        w
+                    }
+                };
                 backend
                     .put_at_rest_grant(sha, occ_key_id, WRAP_ALGORITHM_V2, &wrapped, cohort_scope)
                     .await?;

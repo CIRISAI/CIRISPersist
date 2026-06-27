@@ -5,6 +5,45 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.2.0] — 2026-06-27
+
+### Added — #304: wrap-once-to-the-identity for the self-DEK cascade (derived content-KEM)
+
+CIRISServer 0.5.56+ **derives** a user's content-encryption keypair (X25519 +
+ML-KEM-768) deterministically from the FedID Ed25519 seed (CIRISVerify#151 /
+verify **v8.3.0**, re-pinned here). Consequence: every occurrence of one
+identity presents the **identical** enc pubkey.
+
+Two things confirmed/fixed:
+
+1. **The derived model is accepted** (it already was — documented + now
+   regression-tested): `federation_identity_occurrences` has no UNIQUE/CHECK on
+   the enc pubkeys, and `put_identity_occurrence` does not reject two occurrences
+   of one identity sharing the same `pubkey_x25519_base64` /
+   `pubkey_ml_kem_768_base64`. Duplicates admit.
+2. **Wrap-once optimization** (`rekey_for_newcomers`): the cascade wrapped the
+   DEK per-occurrence, so a derived-key identity with N occurrences ran the
+   expensive ML-KEM-768 encap N times over one pubkey. It now **memoizes the
+   wrap per distinct `(x25519, ml_kem)` pubkey pair** and reuses it for every
+   occurrence sharing that pubkey — any holder of the shared (derived) private
+   key opens it. Collapses N redundant encaps to one per derived identity. Grant
+   rows stay per-occurrence (the reader resolves by `occurrence_key_id`,
+   unchanged); non-derived (distinct) pubkeys are unaffected — one wrap each.
+
+Proven by `self_dek_wrap_once_for_derived_identity_pubkeys_304`: two occurrences
+sharing a derived pubkey get **byte-identical** grants (the wrap was reused),
+while a distinct-pubkey control gets a different wrap.
+
+The full "wrap once, stored once, new occurrence is a no-op rekey" shape would
+need a grant-keyed-by-identity model + reader change — deferred; per-occurrence
+grants with a deduped wrap is the low-risk win that keeps the at-rest reader
+untouched.
+
+### Changed — re-pin CIRISVerify v8.2.0 → v8.3.0
+
+All six pins → `v8.3.0` (ships #151, the self content-KEM derivation #304 rides).
+In-family minor; `Requires-Dist ciris-verify>=8.0.0,<9` unchanged.
+
 ## [11.1.0] — 2026-06-26
 
 ### Added — #302 (FSD-004): accord live-quorum storage substrate
