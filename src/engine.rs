@@ -10325,6 +10325,119 @@ mod tests {
         );
     }
 
+    /// #304 — the DERIVED content-KEM model: CIRISServer derives one
+    /// content-KEM keypair per identity (verify v8.3.0), so every occurrence
+    /// presents the IDENTICAL enc pubkey. Persist must (a) ACCEPT the
+    /// duplicate pubkeys across occurrences, and (b) wrap the self DEK ONCE
+    /// per distinct pubkey — proven here by byte-identical grants for the two
+    /// shared-pubkey occurrences, vs a distinct grant for a different-pubkey
+    /// control.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn self_dek_wrap_once_for_derived_identity_pubkeys_304() {
+        use crate::federation::types::{self, identity_type};
+        use crate::federation::BlobStorage;
+
+        let (signer, _alias) = self_login_signer();
+        let steward_derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        self_login_seed_key(&engine, &steward_derived, identity_type::STEWARD).await;
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let identity_key = format!("user-{suffix}");
+        self_login_seed_key(&engine, &identity_key, identity_type::USER).await;
+        let mk_keys = || {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            let (_xp, x_pub, _mp, ml_pub) =
+                crate::federation::identity_aggregate::mint_content_kem_keypair().expect("mint");
+            crate::federation::EncryptionPubkeys {
+                x25519_base64: B64.encode(x_pub),
+                ml_kem_768_base64: B64.encode(ml_pub),
+            }
+        };
+        // The DERIVED identity keypair — shared across occurrences A/B/C.
+        let derived = mk_keys();
+        // A distinct (non-derived) control keypair for occurrence D.
+        let control = mk_keys();
+
+        let seed_occ = |occ: String, keys: crate::federation::EncryptionPubkeys| {
+            let identity_key = identity_key.clone();
+            let engine = &engine;
+            async move {
+                self_login_seed_key(engine, &occ, identity_type::AGENT).await;
+                engine
+                    .federation_directory()
+                    .put_identity_occurrence(crate::federation::SignedIdentityOccurrence {
+                        identity_occurrence: types::IdentityOccurrence {
+                            identity_key_id: identity_key,
+                            occurrence_key_id: occ,
+                            device_class: types::device_class::SERVER.into(),
+                            hardware_attestation: None,
+                            asserted_at: chrono::Utc::now(),
+                            valid_until: None,
+                            encryption_pubkeys: Some(keys),
+                            persist_row_hash: String::new(),
+                        },
+                    })
+                    .await
+                    .expect("put_identity_occurrence");
+            }
+        };
+
+        let occ_a = format!("a-{suffix}");
+        seed_occ(occ_a.clone(), derived.clone()).await;
+
+        // Encrypt a self blob (grants occurrence A + self-retention).
+        let cascade = engine
+            .put_blob_encrypted_self_family("self", &identity_key, b"derived-model", None)
+            .await
+            .expect("encrypt self blob");
+        let sha = cascade.at_rest_sha256;
+
+        // Add B + C sharing the DERIVED pubkey, and D with the control pubkey.
+        let occ_b = format!("b-{suffix}");
+        let occ_c = format!("c-{suffix}");
+        let occ_d = format!("d-{suffix}");
+        seed_occ(occ_b.clone(), derived.clone()).await; // accepted despite duplicate pubkey
+        seed_occ(occ_c.clone(), derived.clone()).await;
+        seed_occ(occ_d.clone(), control.clone()).await;
+        let rekey = engine
+            .rekey_self_occurrence_add(
+                &identity_key,
+                &[occ_b.clone(), occ_c.clone(), occ_d.clone()],
+            )
+            .await
+            .expect("rekey");
+        assert!(rekey.excluded.is_empty(), "all keyed, none fail-secure");
+
+        let grant = |r: &str| {
+            let sq = sq.clone();
+            let r = r.to_owned();
+            async move {
+                sq.get_at_rest_grant(&sha, &r)
+                    .await
+                    .expect("grant")
+                    .expect("exists")
+            }
+        };
+        let (gb, gc, gd) = (
+            grant(&occ_b).await,
+            grant(&occ_c).await,
+            grant(&occ_d).await,
+        );
+        // Wrap-once: B and C share the derived pubkey → byte-identical wrap.
+        assert_eq!(
+            gb.1, gc.1,
+            "#304: derived-pubkey occurrences share one wrap"
+        );
+        // Control: D's distinct pubkey → a different wrap (dedup is by pubkey,
+        // not blanket).
+        assert_ne!(gb.1, gd.1, "distinct pubkey ⇒ distinct wrap");
+    }
+
     /// transport_destination is idempotent on the composite PK + a
     /// removed row is gone (drop+re-register reachability model).
     #[cfg(feature = "sqlite")]
