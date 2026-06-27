@@ -5,6 +5,38 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.3.0] — 2026-06-27
+
+### Added — #307 (CC 3.4.11): refuse `age_self_declared:level:*` (self rung carries a `{band}`, never a `{level}`)
+
+Conformance gap closure on the CC 0.5.1 floor (`tests/test_350_age_assurance_reservation.py`,
+the lone `xfail(strict)`). The age-assurance reservation has two rungs:
+
+- **witness rung** — `age_assurance:level:adult` / `age_assurance:provider:adult:v1`,
+  emittable only by a key with `identity_type="witness"` (a registered
+  age-assurance provider). Already gated via `default_reserved_prefix_rules`
+  (`age_assurance:` → witness).
+- **self rung** — `age_self_declared:band:adult`, subject-signed.
+
+The gap: the self rung's discriminator is `{band}`, **never** `{level}` — the
+`{level}` token belongs to the witness rung. `age_self_declared:level:adult`
+was previously **admitted**; it is now **refused structurally**, independent of
+emitter (no `identity_type` rescues the shape — even a witness must use the
+`age_assurance:` prefix to carry a level). A subject self-asserting a `level`
+is claiming the witness rung's authority on its own signature.
+
+- New `DimensionAdmissionPolicy::check` rule (**Layer 1c**), placed after the
+  reserved-prefix emitter loop and before the morally-charged-stem scan: a `dim`
+  equal to `age_self_declared:level` or prefixed `age_self_declared:level:` is
+  rejected with new reason token `self_declared_level_reserved`
+  (`Error::DimensionRejected` / `DimensionRejectionReason::SelfDeclaredLevelReserved`).
+- The rule lives in the single shared policy that **all three backends**
+  (memory / sqlite / postgres) call at the dimension gate, so it fires
+  identically on every `emit_attestation_self` → put path — no PG/sqlite
+  asymmetry, no new wiring.
+
+No version re-pin (CIRISVerify stays **v8.3.0**).
+
 ## [11.2.0] — 2026-06-27
 
 ### Added — #304: wrap-once-to-the-identity for the self-DEK cascade (derived content-KEM)
