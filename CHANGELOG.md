@@ -5,6 +5,80 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.5.0] — 2026-06-27
+
+### Fixed — #307 (CC 3.4.11): `age_self_declared:level:*` refusal was a no-op on the real emit path (moved to the attestation_type gate)
+
+v11.3.0 added the `age_self_declared:level:*` refusal but placed it ONLY in
+`DimensionAdmissionPolicy::check`, which gates the `scores` envelope
+**`dimension`** field. Age tokens, however, travel as the **`attestation_type`**
+string (e.g. `attestation_type = "age_self_declared:level:adult"` with an empty
+envelope), and `DimensionAdmissionPolicy::check` fast-exits for any
+`attestation_type != scores` — so the v11.3.0 rule never fired on the real
+`emit_attestation_self` → put path. The rule is now ALSO placed in
+`check_reserved_prefix_admission` (the `attestation_type`-namespace gate, where
+the witness `age_assurance:` reservation already lives), near the top after the
+`capacity:` self-emission check. A row whose `attestation_type` equals
+`age_self_declared:level` or is prefixed `age_self_declared:level:` is rejected
+structurally (independent of emitter) with `Error::DimensionRejected` /
+`DimensionRejectionReason::SelfDeclaredLevelReserved`. The dimension-side rule is
+kept too (defense-in-depth for the scores+dimension shape). Backend-symmetric
+(memory / sqlite / postgres — the gate is shared). No re-pin.
+
+### Added — #306 (CC 3.2): I1 age band + user-target steward-binding gate + minor liveness
+
+Three closely-coupled CC 3.2 / CC 3.3.12 / CC 1.15.6 substrate additions
+(downstream conformance signals: `tests/test_360_steward_binding_admission.py`,
+`tests/test_361_minor_stewardship_liveness.py`).
+
+- **I1 age band** (new `src/federation/age.rs`). `age_band(directory, k) ->
+  AgeBand { Minor | Adult | Unknown }` resolves a key's verified age from its
+  incoming age attestations. **Witness `age_assurance:*` OUTRANKS self-declared
+  `age_self_declared:*`**; a self-declared **adult is ignored** (the one-way
+  ratchet — a subject may self-declare MINOR to lower its own access, never
+  self-graduate to adult). The most-recent live witness band wins outright;
+  else a live self-declared minor → `Minor`; else `Unknown`. Liveness here is
+  `expires_at`-only (richer supersede/withdraw liveness deferred to #309).
+  **Presumption of sovereignty** (CC 1.15.6): a key with no usable age proof
+  resolves to `Unknown`, which the steward-binding axis treats as NON-minor
+  (un-stewardable). The three-valued band is exposed verbatim so #309 can layer
+  a content-protective `unknown → minor` resolution on the CONTENT axis without
+  changing this primitive.
+
+- **CC 3.2 user-target steward-binding gate**
+  (`check_user_target_steward_binding_admission`, wired into all three backends'
+  `put_attestation` immediately after `check_node_agency_admission`). A
+  `delegates_to` whose target resolves to a `user`-role identity is admissible
+  ONLY as **minor-guardianship**: the target must be a PROVEN minor AND the
+  granter a PROVEN adult `user`. Every other user-target binding is refused with
+  the new `Error::UserTargetStewardBindingForbidden` (kind
+  `federation_user_target_steward_binding_forbidden`): an adult target →
+  `target_is_self_sovereign` (un-stewardable, CC 1.15.6); an Unknown-age target
+  → `target_age_unverified`; an unresolved granter → `granter_unresolved`; a
+  non-user / non-adult granter → `granter_not_adult_user`. Node/agent targets
+  are untouched (still governed by `check_node_agency_admission` only).
+
+- **Minor-stewardship liveness fail-secure** (`is_steward_bound`,
+  `steward_bindings_of`, and `steward_binding_chain` for invariant parity). The
+  bug: a `user`-role key self-anchored via clause (1)/(2), so a steward-less
+  minor could not be detected. Fix: clauses (1)/(2) confer steward-binding only
+  when `age_band(k) != Minor`. A PROVEN minor does NOT self-anchor — it must
+  rely on a LIVE adult-steward `delegates_to` (clause 3), so when that edge is
+  withdrawn `is_steward_bound(minor)` flips to **false** (fail-secure, identical
+  posture to a steward-less node/agent). An adult/Unknown user still
+  self-anchors (sovereign). **Node/agent keys are never `user`-role, so clauses
+  (1)/(2) never fired for them — the node/agent path and the
+  `UnstewardedCommunityMember` gate that consumes `is_steward_bound` behave
+  exactly as before** (control test preserved).
+
+- **FFI**: new `Engine.age_band_json(key_id) -> "minor" | "adult" | "unknown"`
+  (modeled on `is_steward_bound_json`), plus a crate-level `Engine::age_band`
+  wrapper.
+
+No version re-pin (CIRISVerify stays **v8.3.0**). The CIRISConformance
+`test_350` / `test_360` / `test_361` updates (the `xfail(strict)` flips) are a
+downstream follow-up owned by the conformance maintainer.
+
 ## [11.4.0] — 2026-06-27
 
 ### Added — #308 (CC 4.4.3.2.8): `affiliations` as the 4th rostered `cohort_scope` + a `crypto_tier` resolver on the PyO3 surface

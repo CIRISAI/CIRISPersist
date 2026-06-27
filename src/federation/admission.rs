@@ -2134,18 +2134,29 @@ pub async fn is_steward_bound(
     directory: &dyn super::FederationDirectory,
     k: &str,
 ) -> Result<bool, Error> {
+    // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — minor-stewardship
+    // liveness fix. A PROVEN minor user does NOT self-anchor via clauses
+    // (1)/(2): a minor MUST rely on a LIVE adult-steward edge (clause 3), so
+    // when that edge is withdrawn `is_steward_bound(minor)` fails secure
+    // (false). An adult/unknown user (self-sovereign — its own steward) still
+    // self-anchors. Node/agent keys are never `user`-role, so (1)/(2) never
+    // fired for them regardless and this gate cannot change their result.
+    let k_band = super::age::age_band(directory, k).await?;
+    let k_self_anchors = k_band != super::age::AgeBand::Minor;
     // (1) k's own identity_type set contains `user`.
-    if let Some(rec) = directory.lookup_public_key(k).await? {
-        if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
-            return Ok(true);
-        }
-    }
-    // (2) k is an occurrence of a human identity — resolve the identity key
-    //     and check ITS identity_type set for `user`.
-    if let Some(occ) = directory.lookup_identity_for_occurrence(k).await? {
-        if let Some(id_rec) = directory.lookup_public_key(&occ.identity_key_id).await? {
-            if identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
+    if k_self_anchors {
+        if let Some(rec) = directory.lookup_public_key(k).await? {
+            if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
                 return Ok(true);
+            }
+        }
+        // (2) k is an occurrence of a human identity — resolve the identity
+        //     key and check ITS identity_type set for `user`.
+        if let Some(occ) = directory.lookup_identity_for_occurrence(k).await? {
+            if let Some(id_rec) = directory.lookup_public_key(&occ.identity_key_id).await? {
+                if identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
+                    return Ok(true);
+                }
             }
         }
     }
@@ -2215,17 +2226,24 @@ pub async fn steward_bindings_of(
     k: &str,
 ) -> Result<Vec<String>, Error> {
     let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // (1) k's own key is user-role.
-    if let Some(rec) = directory.lookup_public_key(k).await? {
-        if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
-            out.insert(k.to_owned());
+    // v11.5.0 (CIRISPersist#306) — mirror `is_steward_bound`'s minor gate so
+    // the invariant `is_steward_bound(k) ⟺ !steward_bindings_of(k).is_empty()`
+    // holds: a PROVEN minor user does NOT self-anchor (clauses 1/2 are
+    // suppressed); it must be carried by a live adult-steward edge (clause 3).
+    let k_self_anchors = super::age::age_band(directory, k).await? != super::age::AgeBand::Minor;
+    if k_self_anchors {
+        // (1) k's own key is user-role.
+        if let Some(rec) = directory.lookup_public_key(k).await? {
+            if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
+                out.insert(k.to_owned());
+            }
         }
-    }
-    // (2) k is an occurrence of a user-role identity.
-    if let Some(occ) = directory.lookup_identity_for_occurrence(k).await? {
-        if let Some(id_rec) = directory.lookup_public_key(&occ.identity_key_id).await? {
-            if identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
-                out.insert(occ.identity_key_id);
+        // (2) k is an occurrence of a user-role identity.
+        if let Some(occ) = directory.lookup_identity_for_occurrence(k).await? {
+            if let Some(id_rec) = directory.lookup_public_key(&occ.identity_key_id).await? {
+                if identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
+                    out.insert(occ.identity_key_id);
+                }
             }
         }
     }
@@ -2359,17 +2377,25 @@ pub async fn steward_binding_chain(
     directory: &dyn super::FederationDirectory,
     key_id: &str,
 ) -> Result<Vec<String>, Error> {
-    // (1) k's own key is user-role — k is the anchor.
-    if let Some(rec) = directory.lookup_public_key(key_id).await? {
-        if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
-            return Ok(vec![key_id.to_owned()]);
+    // v11.5.0 (CIRISPersist#306) — mirror `is_steward_bound`'s minor gate so
+    // `!steward_binding_chain(k).is_empty() ⟺ is_steward_bound(k)` holds: a
+    // PROVEN minor user does NOT self-anchor (clauses 1/2 suppressed); its
+    // chain must root in a live adult-steward edge (clause 3).
+    let k_self_anchors =
+        super::age::age_band(directory, key_id).await? != super::age::AgeBand::Minor;
+    if k_self_anchors {
+        // (1) k's own key is user-role — k is the anchor.
+        if let Some(rec) = directory.lookup_public_key(key_id).await? {
+            if identity_type::set_contains(&rec.identity_type, identity_type::USER) {
+                return Ok(vec![key_id.to_owned()]);
+            }
         }
-    }
-    // (2) k is an occurrence of a user-role identity — identity → k.
-    if let Some(occ) = directory.lookup_identity_for_occurrence(key_id).await? {
-        if let Some(id_rec) = directory.lookup_public_key(&occ.identity_key_id).await? {
-            if identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
-                return Ok(vec![occ.identity_key_id, key_id.to_owned()]);
+        // (2) k is an occurrence of a user-role identity — identity → k.
+        if let Some(occ) = directory.lookup_identity_for_occurrence(key_id).await? {
+            if let Some(id_rec) = directory.lookup_public_key(&occ.identity_key_id).await? {
+                if identity_type::set_contains(&id_rec.identity_type, identity_type::USER) {
+                    return Ok(vec![occ.identity_key_id, key_id.to_owned()]);
+                }
             }
         }
     }
@@ -3038,6 +3064,101 @@ pub async fn check_node_agency_admission(
     })
 }
 
+/// v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — the **user-target
+/// steward-binding gate**: the companion to [`check_node_agency_admission`]
+/// for `delegates_to` rows whose TARGET resolves to a `user`-role identity.
+///
+/// The node/agency gate constrains node-targets; user-targets ("stewarding a
+/// person") were otherwise unguarded. CC 3.2 narrows the admissible
+/// user-target set to exactly **minor-guardianship**:
+///
+/// ```text
+/// admit_user_steward_binding(delegates_to S -> T):
+///   require  age_band(T) == minor                # ward is a proven minor
+///   require  user ∈ S.identity_type              # steward is a user
+///   require  age_band(S) == adult                # steward is a proven adult
+///   require  S == delegates_to.attesting_key_id  # steward signed it
+///   otherwise REJECT
+/// ```
+///
+/// A no-op (`Ok(())`) for any row that is NOT a
+/// [`attestation_type::DELEGATES_TO`], for an unresolved target (FK-rejected
+/// downstream), or for a target that is NOT a `user`-role identity
+/// (node/agent targets are governed by [`check_node_agency_admission`]). For
+/// a user target:
+///
+/// - target age band `!= Minor` ⇒ REJECT (`target_is_self_sovereign` when
+///   Adult — an adult is un-stewardable, CC 1.15.6; `target_age_unverified`
+///   when Unknown — the presumption of sovereignty: no stewardship over
+///   someone not PROVEN a minor);
+/// - target is a proven Minor but the granter does not resolve ⇒ REJECT
+///   (`granter_unresolved`);
+/// - granter is not a `user` OR not a proven adult ⇒ REJECT
+///   (`granter_not_adult_user` — a minor cannot be a guardian, a non-user
+///   cannot be a guardian);
+/// - else ADMIT (the legal minor-guardianship binding). `S ==
+///   attesting_key_id` is structural on the emit path, so no separate signer
+///   check is needed.
+///
+/// Verify-before-mutation (AV-9): wired into every backend's
+/// `put_attestation` immediately AFTER [`check_node_agency_admission`], so a
+/// rejected emission leaves no trace. Backend-agnostic — resolution uses the
+/// trait's own `lookup_public_key` + [`super::age::age_band`].
+pub async fn check_user_target_steward_binding_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    use super::age::{age_band, AgeBand};
+    if row.attestation_type != attestation_type::DELEGATES_TO {
+        return Ok(());
+    }
+    // Resolve the target. An unresolved target is out of scope here (and
+    // FK-rejected downstream — it can never be persisted).
+    let Some(target) = directory.lookup_public_key(&row.attested_key_id).await? else {
+        return Ok(());
+    };
+    let target_set: std::collections::HashSet<&str> =
+        identity_type::parse_set(&target.identity_type)
+            .into_iter()
+            .collect();
+    // Only USER-role targets are governed by THIS rule; node/agent targets go
+    // through the node-agency gate.
+    if !target_set.contains(identity_type::USER) {
+        return Ok(());
+    }
+    // The target is a user. It must be a PROVEN minor to be stewardable.
+    let target_band = age_band(directory, &row.attested_key_id).await?;
+    if target_band != AgeBand::Minor {
+        let reason = match target_band {
+            AgeBand::Adult => "target_is_self_sovereign",
+            // Unknown (presumption of sovereignty).
+            _ => "target_age_unverified",
+        };
+        return Err(Error::UserTargetStewardBindingForbidden {
+            target_key_id: row.attested_key_id.clone(),
+            reason,
+        });
+    }
+    // Target is a proven minor — require the granter is a proven adult user.
+    let Some(granter) = directory.lookup_public_key(&row.attesting_key_id).await? else {
+        return Err(Error::UserTargetStewardBindingForbidden {
+            target_key_id: row.attested_key_id.clone(),
+            reason: "granter_unresolved",
+        });
+    };
+    let granter_is_adult_user =
+        identity_type::set_contains(&granter.identity_type, identity_type::USER)
+            && age_band(directory, &row.attesting_key_id).await? == AgeBand::Adult;
+    if !granter_is_adult_user {
+        return Err(Error::UserTargetStewardBindingForbidden {
+            target_key_id: row.attested_key_id.clone(),
+            reason: "granter_not_adult_user",
+        });
+    }
+    // Admit the minor-guardianship binding (S == attesting_key_id structural).
+    Ok(())
+}
+
 /// v10.3.0 (CIRISPersist#288, CC 3.4.1 / 3.4.3 / 3.4.5) — reserved-prefix
 /// admission on the **`attestation_type`** namespace, keyed on the attesting
 /// key's `identity_type`.
@@ -3077,6 +3198,23 @@ pub async fn check_reserved_prefix_admission(
         return Err(Error::CapacitySelfEmissionRejected {
             key_id: row.attesting_key_id.clone(),
             attestation_type: at.to_owned(),
+        });
+    }
+
+    // CC 3.4.11 (CIRISPersist#307) — the self-declared age rung carries a
+    // `{band}`, NEVER a `{level}`; a `{level}` token belongs to the
+    // witness `age_assurance:` rung. Age tokens travel as the
+    // `attestation_type` string (NOT the `scores` envelope `dimension`), so
+    // the v11.3.0 rule placed only in `DimensionAdmissionPolicy::check`
+    // (which fast-exits for any `attestation_type != scores`) was a no-op on
+    // the real emit path. Gate it HERE, on the `attestation_type` namespace,
+    // independent of emitter (no identity_type rescues the shape). The
+    // dimension-side rule is kept too (defense-in-depth for the
+    // scores+dimension shape).
+    if at == "age_self_declared:level" || at.starts_with("age_self_declared:level:") {
+        return Err(Error::DimensionRejected {
+            dimension: at.to_owned(),
+            reason: DimensionRejectionReason::SelfDeclaredLevelReserved.as_str(),
         });
     }
 

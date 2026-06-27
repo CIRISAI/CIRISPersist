@@ -34,6 +34,7 @@
 
 pub mod accord_quorum;
 pub mod admission;
+pub mod age;
 pub mod at_rest_cascade;
 #[cfg(feature = "cirisaudit")]
 pub mod backfill;
@@ -3633,6 +3634,47 @@ pub enum Error {
         member_role: &'static str,
     },
 
+    /// v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — a `delegates_to`
+    /// whose TARGET (`attested_key_id`) resolves to a `user`-role identity was
+    /// REFUSED by the CC 3.2 user-target steward-binding gate. "Stewarding a
+    /// person" is admissible only as **minor-guardianship**; the admissible
+    /// set is exactly: target is a PROVEN minor AND the granter
+    /// (`attesting_key_id`) is a PROVEN adult `user`. Every other user-target
+    /// binding is refused:
+    ///
+    /// - `target_is_self_sovereign` — the target is a proven ADULT user. An
+    ///   adult is un-stewardable (CC 1.15.6, no-slavery / self-sovereignty);
+    ///   rejected unconditionally.
+    /// - `target_age_unverified` — the target has no usable age proof
+    ///   ([`crate::federation::age::AgeBand::Unknown`]). The
+    ///   presumption-of-sovereignty default: you may not acquire stewardship
+    ///   over someone unless they are PROVEN a minor.
+    /// - `granter_unresolved` — the granter key does not resolve.
+    /// - `granter_not_adult_user` — the granter is not a `user`, or not a
+    ///   proven adult (a minor cannot be a guardian; a non-user cannot be a
+    ///   guardian).
+    ///
+    /// `node`/`agent`-target bindings are governed by
+    /// [`admission::check_node_agency_admission`] and are NOT affected by this
+    /// rule. The row is NOT stored (verify-before-mutation, AV-9). Stable
+    /// `kind()` token `federation_user_target_steward_binding_forbidden`. See
+    /// [`admission::check_user_target_steward_binding_admission`].
+    #[error(
+        "delegates_to to user-role target {target_key_id:?} refused ({reason}): a user-target \
+         steward-binding is admissible only as minor-guardianship — the target MUST be a proven \
+         minor and the granter a proven adult user (CC 3.2 / CC 1.15.6 — an adult is \
+         un-stewardable; presumption of sovereignty for an unverified age)"
+    )]
+    UserTargetStewardBindingForbidden {
+        /// The `attested_key_id` (target) that resolved to a `user`-role
+        /// identity and failed the minor-guardianship predicate.
+        target_key_id: String,
+        /// Which leg of the predicate failed (`target_is_self_sovereign` /
+        /// `target_age_unverified` / `granter_unresolved` /
+        /// `granter_not_adult_user`).
+        reason: &'static str,
+    },
+
     /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228 item 1 / #229 item 1)
     /// — a WholenessWitness was REJECTED at the verify-before-persist
     /// gate: the §19.0 PQC-mandatory hard cut (classical-only / missing
@@ -3698,6 +3740,9 @@ impl Error {
             Error::DelegatedScopeUnauthorized { .. } => "federation_delegated_scope_unauthorized",
             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
             Error::UnstewardedCommunityMember { .. } => "federation_unstewarded_community_member",
+            Error::UserTargetStewardBindingForbidden { .. } => {
+                "federation_user_target_steward_binding_forbidden"
+            }
             Error::FederationTierUnverified { .. } => "federation_federation_tier_unverified",
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",

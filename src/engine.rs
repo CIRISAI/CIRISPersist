@@ -3371,6 +3371,20 @@ impl Engine {
         }
     }
 
+    /// v11.5.0 (CIRISPersist#306, CC 3.3.12 / CC 1.15.6) — the **I1 age
+    /// band** of `key_id`, resolved from its incoming age attestations
+    /// (witness `age_assurance:*` OUTRANKS self-declared `age_self_declared:*`;
+    /// a self-declared adult is ignored — the one-way ratchet). A key with no
+    /// usable age proof resolves to [`crate::federation::age::AgeBand::Unknown`]
+    /// (presumption of sovereignty). See [`crate::federation::age::age_band`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn age_band(
+        &self,
+        key_id: &str,
+    ) -> Result<crate::federation::age::AgeBand, crate::federation::Error> {
+        crate::federation::age::age_band(&*self.federation_directory(), key_id).await
+    }
+
     // ── #249 Cut B ── CEG-native graph DX enumerators + community-roster
     //    grow, surfaced as Engine convenience wrappers over the
     //    `federation_directory()` reader + the admission free functions.
