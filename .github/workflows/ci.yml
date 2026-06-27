@@ -84,47 +84,14 @@ jobs:
       # the link-time tss-esapi backend (#141); the TPM plugin is dlopen'd at
       # runtime and the keyring link-binds no libtss2 on any target.
       - uses: dtolnay/rust-toolchain@stable
-      # CIRISCache (CIRISPersist#311) — the CANONICAL cross-repo key
-      # (CIRISServer#99): ciris-substrate-v1-<PLAT>-release-rustc<RUSTC>-p<persist>-e<edge>-v<verify>,
-      # NO -<target> suffix (the suffix defeated CIRISServer's cross-repo
-      # restore). This host job is ubuntu-x86_64 ⇒ PLAT=linux-x86_64; persist
-      # e=none (no ciris-edge dep).
-      #
-      # LAYERED restore (#311 follow-up): CIRISCache has NO always-on shared
-      # registry layer — one blob per key, no restore-keys fallback. So to
-      # actually pre-warm off the upstream, restore the UPSTREAM blob first.
-      # persist's only upstream substrate dep is ciris-verify (the start of the
-      # centipede), so the chain is 2 layers, widest→narrowest: verify's blob
-      # (`pnone-enone-v<verify>`, the leaf all repos share — its crypto/keyring
-      # registry deps persist pulls) restores FIRST, then persist's OWN blob
-      # restores LAST so it wins on any overlap. Both unconditional
-      # (continue-on-error). The 6 substrate legs share persist's one
-      # per-platform key — registry reuse is the reliable win; whole-dir target/
-      # reuse is fingerprint-sensitive (feature flags differ) and best-effort
-      # (#311 item 3) — so only the `core` leg saves (below) to avoid 6-way churn.
-      - name: Compute CIRISCache keys (canonical layered, CIRISServer#99 / #311)
-        shell: bash
-        run: |
-          RUSTC=$(rustc -V | awk '{print $2}')
-          # Source p/e/v from Cargo.toml (committed): persist GITIGNORES
-          # Cargo.lock, so it does not exist at compute time (this step runs
-          # before any cargo command generates it) — grepping Cargo.lock here
-          # yielded `-pnone-enone-vnone`, which never matched downstream's
-          # version-carrying keys (the #311 cross-repo restore was inert). P =
-          # the package version; V = the verify pin tag; e=none (no ciris-edge).
-          P=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
-          echo "CIRISCACHE_KEY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
-          # The upstream verify blob (same PLAT/rustc, p=e=none) to pre-warm from.
-          echo "CIRISCACHE_KEY_VERIFY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-pnone-enone-v${V:-none}" >> "$GITHUB_ENV"
-      - uses: CIRISAI/CIRISCache/restore@v1   # layer 1 (widest): verify upstream
-        continue-on-error: true
+      # CIRISCache (CIRISPersist#311/#316) — canonical key + layered
+      # verify→persist restore, via the shared composite (single source of
+      # truth). ubuntu-x86_64 ⇒ PLAT=linux-x86_64. The 6 substrate legs share
+      # persist's one per-platform key — only the `core` leg saves (below) to
+      # avoid 6-way churn; registry reuse is the reliable cross-repo win.
+      - uses: ./.github/actions/ciriscache
         with:
-          key: ${{ env.CIRISCACHE_KEY_VERIFY }}
-      - uses: CIRISAI/CIRISCache/restore@v1   # layer 2 (narrowest, wins): persist's own
-        continue-on-error: true
-        with:
-          key: ${{ env.CIRISCACHE_KEY }}
+          plat: linux-x86_64
       # v2.0.1 — nextest, not cargo test: streams per-test PASS/FAIL/
       # SLOW lines so a hung test surfaces in the live log as "the
       # last RUN with no follow-up" instead of disappearing into a
@@ -246,25 +213,10 @@ jobs:
       # `~/.cargo/bin/`. Disabling bin caching keeps the dtolnay-
       # installed cargo intact. Build cache (registry + target) is
       # unaffected. (v0.7.0/v0.7.1 main CI + v0.7.2 tag CI flakes.)
-      # CIRISCache (CIRISPersist#311) — canonical cross-repo key; this job runs
-      # on macos-14 (Apple silicon) ⇒ PLAT=macos-aarch64. Layered restore:
-      # verify's macos-aarch64 blob first (widest), then persist's own last.
-      - name: Compute CIRISCache keys (canonical layered, CIRISServer#99 / #311)
-        shell: bash
-        run: |
-          RUSTC=$(rustc -V | awk '{print $2}')
-          P=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
-          echo "CIRISCACHE_KEY=ciris-substrate-v1-macos-aarch64-release-rustc${RUSTC}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
-          echo "CIRISCACHE_KEY_VERIFY=ciris-substrate-v1-macos-aarch64-release-rustc${RUSTC}-pnone-enone-v${V:-none}" >> "$GITHUB_ENV"
-      - uses: CIRISAI/CIRISCache/restore@v1   # layer 1 (widest): verify upstream
-        continue-on-error: true
+      # CIRISCache (#316) — macos-14 (Apple silicon) ⇒ PLAT=macos-aarch64.
+      - uses: ./.github/actions/ciriscache
         with:
-          key: ${{ env.CIRISCACHE_KEY_VERIFY }}
-      - uses: CIRISAI/CIRISCache/restore@v1   # layer 2 (narrowest, wins): persist's own
-        continue-on-error: true
-        with:
-          key: ${{ env.CIRISCACHE_KEY }}
+          plat: macos-aarch64
       - name: Repair toolchain if rustup-init shadow (cache-poison heal)
         # macOS runners can restore a `~/.cargo/bin/cargo` that IS the
         # rustup-init shim binary. The shim passes `cargo --version` through
@@ -351,22 +303,12 @@ jobs:
       # targets are distinct platform tokens, so no -<target> suffix is needed.
       # iOS isn't in CIRISServer#99's <PLAT> table (no cross-repo sibling), so
       # the fail-safe keeps the target triple as the token.
-      - name: Compute CIRISCache key (canonical, CIRISServer#99 / #311)
-        shell: bash
-        run: |
-          RUSTC=$(rustc -V | awk '{print $2}')
-          P=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
-          case "${{ matrix.target }}" in
-            aarch64-apple-ios)     PLAT="ios-aarch64" ;;
-            aarch64-apple-ios-sim) PLAT="ios-aarch64-sim" ;;
-            *) PLAT="${{ matrix.target }}" ;;
-          esac
-          echo "CIRISCACHE_KEY=ciris-substrate-v1-${PLAT}-release-rustc${RUSTC}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
-      - uses: CIRISAI/CIRISCache/restore@v1
-        continue-on-error: true
+      # CIRISCache (#316) — PLAT=ios-<target triple>, byte-identical to verify's
+      # `ios-${{ matrix.target }}` token (#316 aligned this: was `ios-aarch64`,
+      # which never matched verify's `ios-aarch64-apple-ios` blob).
+      - uses: ./.github/actions/ciriscache
         with:
-          key: ${{ env.CIRISCACHE_KEY }}
+          plat: ios-${{ matrix.target }}
       - name: Repair toolchain if rustup-init shadow (cache-poison heal)
         # macOS runners can restore a `~/.cargo/bin/cargo` that IS the
         # rustup-init shim binary. The shim passes `cargo --version` through
@@ -539,17 +481,10 @@ jobs:
       # CIRISCache (CIRISPersist#311) — canonical cross-repo key; PLAT token is
       # `android-<abi>` per CIRISServer#99's table (distinct per ABI, no
       # -<target> suffix needed).
-      - name: Compute CIRISCache key (canonical, CIRISServer#99 / #311)
-        shell: bash
-        run: |
-          RUSTC=$(rustc -V | awk '{print $2}')
-          P=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
-          echo "CIRISCACHE_KEY=ciris-substrate-v1-android-${{ matrix.abi }}-release-rustc${RUSTC}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
-      - uses: CIRISAI/CIRISCache/restore@v1
-        continue-on-error: true
+      # CIRISCache (#316) — PLAT=android-<abi> (matches verify's token).
+      - uses: ./.github/actions/ciriscache
         with:
-          key: ${{ env.CIRISCACHE_KEY }}
+          plat: android-${{ matrix.abi }}
       - name: setup Android NDK
         uses: nttld/setup-ndk@v1
         id: setup-ndk
@@ -808,27 +743,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      # CIRISCache (CIRISPersist#311) — canonical cross-repo key; this job runs
-      # on ubuntu-latest ⇒ PLAT=linux-x86_64, the SAME key the linux-x86_64-test
-      # `core` leg saves. Layered restore (verify upstream → persist's own); this
-      # job RESTORES but does not save — `core` is the single linux-x86_64 saver,
-      # so the two don't race.
-      - name: Compute CIRISCache keys (canonical layered, CIRISServer#99 / #311)
-        shell: bash
-        run: |
-          RUSTC=$(rustc -V | awk '{print $2}')
-          P=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
-          echo "CIRISCACHE_KEY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
-          echo "CIRISCACHE_KEY_VERIFY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-pnone-enone-v${V:-none}" >> "$GITHUB_ENV"
-      - uses: CIRISAI/CIRISCache/restore@v1   # layer 1 (widest): verify upstream
-        continue-on-error: true
+      # CIRISCache (#316) — PLAT=linux-x86_64, the SAME key the linux-x86_64-test
+      # `core` leg saves. RESTORE-only (no save below) — `core` is the single
+      # linux-x86_64 saver, so the two don't race on GHCR.
+      - uses: ./.github/actions/ciriscache
         with:
-          key: ${{ env.CIRISCACHE_KEY_VERIFY }}
-      - uses: CIRISAI/CIRISCache/restore@v1   # layer 2 (narrowest, wins): persist's own
-        continue-on-error: true
-        with:
-          key: ${{ env.CIRISCACHE_KEY }}
+          plat: linux-x86_64
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       # v2.0 — clippy over the same widened feature set as the test
@@ -968,6 +888,25 @@ jobs:
         with:
           toolchain: ${{ env.NIGHTLY_PIN }}
           components: rust-src
+      # CIRISCache (#316) — layered restore for the RELEASE wheel build so the
+      # cross-repo registry (verify crypto/keyring) + persist's own prior wheel
+      # blob warm it instead of cold-recompiling. Placed AFTER the toolchain so
+      # `rustc -V` is the right channel (nightly on Windows for the Tier-3 win7
+      # `-Zbuild-std`, stable elsewhere) and BEFORE the per-label rust-cache
+      # below (which wins on the wheel's own target/). Sets CIRISCACHE_KEY for
+      # the save@v1 at the end of the job (#314, linux-aarch64 + windows-x64).
+      - name: Resolve CIRISCache PLAT from wheel label
+        shell: bash
+        run: |
+          case "${{ matrix.label }}" in
+            darwin-aarch64) P=macos-aarch64 ;;
+            windows-x86_64) P=windows-x64 ;;
+            *)              P="${{ matrix.label }}" ;;
+          esac
+          echo "WHEEL_PLAT=$P" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: ${{ env.WHEEL_PLAT }}
       # Non-Windows: rust-cache handles the registry + target dep
       # artifacts (linux/darwin wheels recompile the verify+pyo3+postgres
       # graph cold otherwise). Keyed per label so entries don't thrash.
@@ -1245,25 +1184,10 @@ jobs:
           path: target/wheels/*.whl
 
       # CIRISCache (CIRISPersist#314) — publish persist's release blob for the
-      # two PLATs no other job saves: linux-aarch64 + windows-x64 (label
-      # windows-x86_64 → canonical windows-x64). linux-x86_64 + darwin-aarch64
-      # are already saved by the test/darwin jobs upstream, so no duplicate.
-      # Closes the cross-repo gap (#311 follow-up): edge/server restore the
-      # persist layer on these PLATs instead of cold-compiling. Source p/v from
-      # Cargo.toml (Cargo.lock is gitignored). `shell: bash` ⇒ Git Bash on the
-      # Windows runner. Top-level `permissions: packages: write` covers the save.
-      - name: Compute CIRISCache key (canonical, CIRISServer#99 / #314)
-        if: github.ref == 'refs/heads/main' && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
-        shell: bash
-        run: |
-          RUSTC=$(rustc -V | awk '{print $2}')
-          P=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
-          case "${{ matrix.label }}" in
-            windows-x86_64) PLAT="windows-x64" ;;
-            *)              PLAT="${{ matrix.label }}" ;;
-          esac
-          echo "CIRISCACHE_KEY=ciris-substrate-v1-${PLAT}-release-rustc${RUSTC}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
+      # two PLATs no other job saves: linux-aarch64 + windows-x64. (linux-x86_64
+      # + darwin-aarch64 wheel entries are saved by the test/darwin jobs.) The
+      # CIRISCACHE_KEY was already computed by the composite restore near the top
+      # of this job (same PLAT, same toolchain), so reuse it.
       - name: Save CIRISCache (linux-aarch64 + windows-x64 — #314)
         if: github.ref == 'refs/heads/main' && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
         uses: CIRISAI/CIRISCache/save@v1

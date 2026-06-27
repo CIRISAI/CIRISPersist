@@ -1,0 +1,45 @@
+name: "CIRISCache layered restore"
+description: >
+  Compute the canonical CIRISCache key (CIRISServer#99) and do the layered,
+  widest→narrowest restore so every compile job inherits the warmed substrate
+  cache from one source (CIRISPersist#311). persist depends only on
+  ciris-verify (the start of the centipede), so it's a 2-layer restore: verify's
+  leaf blob first (its crypto/keyring registry deps), then persist's own blob
+  last (wins on overlap). Sets `CIRISCACHE_KEY` in the job env so a later
+  `save@v1` (where present) reuses it.
+
+inputs:
+  plat:
+    description: >
+      The canonical <PLAT> token, byte-identical to what verify/server save under
+      (linux-x86_64, linux-aarch64, macos-aarch64, macos-x86_64, windows-x64,
+      android-<abi>, ios-<target-triple>). The caller resolves it (literal for
+      host jobs; matrix interpolation for android/ios; a label case for the wheel).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # Source p/v from Cargo.toml (committed): persist GITIGNORES Cargo.lock, so
+    # it does not exist at compute time — grepping it yielded `-pnone-vnone`,
+    # which never matched downstream's version-carrying keys (CIRISPersist#311
+    # key-fix). P = the package version; V = the verify pin tag; e=none.
+    - name: Compute CIRISCache keys (canonical, CIRISServer#99)
+      shell: bash
+      run: |
+        RUSTC=$(rustc -V | awk '{print $2}')
+        P=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+        V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
+        BASE="ciris-substrate-v1-${{ inputs.plat }}-release-rustc${RUSTC}"
+        echo "CIRISCACHE_KEY=${BASE}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
+        echo "CIRISCACHE_KEY_VERIFY=${BASE}-pnone-enone-v${V:-none}" >> "$GITHUB_ENV"
+        echo "CIRISCache: persist=${BASE}-p${P:-none}-enone-v${V:-none}"
+        echo "CIRISCache: verify =${BASE}-pnone-enone-v${V:-none}"
+    - uses: CIRISAI/CIRISCache/restore@v1   # layer 1 (widest): verify upstream
+      continue-on-error: true
+      with:
+        key: ${{ env.CIRISCACHE_KEY_VERIFY }}
+    - uses: CIRISAI/CIRISCache/restore@v1   # layer 2 (narrowest, wins): persist's own
+      continue-on-error: true
+      with:
+        key: ${{ env.CIRISCACHE_KEY }}
