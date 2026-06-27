@@ -3129,6 +3129,416 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_communities_for_member: {e}")))
     }
 
+    // ─── #302 (FSD-004) accord live-quorum storage ──────────────────────
+
+    async fn put_accord_proposal(
+        &self,
+        proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
+        authority_signature: Option<serde_json::Value>,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        // M4 fail-closed: the nonce must already be issued for this family.
+        if !self
+            .accord_nonce_issued(&proposal.family_key_id, &proposal.nonce)
+            .await?
+        {
+            return Err(Error::InvalidArgument(format!(
+                "accord proposal nonce {:?} not issued for family {:?} (M4 fail-closed)",
+                proposal.nonce, proposal.family_key_id
+            )));
+        }
+        let prep = crate::federation::accord_quorum::prepare_proposal(
+            &proposal,
+            authority_signature,
+            chrono::Utc::now(),
+        )?;
+        let proposal_json = serde_json::to_string(&prep.proposal_json)
+            .map_err(|e| Error::Backend(format!("proposal_json encode: {e}")))?;
+        let auth_sig = match &prep.authority_signature {
+            Some(v) => Some(
+                serde_json::to_string(v)
+                    .map_err(|e| Error::Backend(format!("authority_signature encode: {e}")))?,
+            ),
+            None => None,
+        };
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            // ON CONFLICT DO NOTHING — the digest is content-derived, so a
+            // re-PUT of the same proposal is idempotent and a different
+            // proposal cannot collide.
+            conn.execute(
+                "INSERT INTO accord_proposal (\
+                    proposal_digest, family_key_id, action, nonce, window_until, \
+                    prior_family_digest, payload_sha256, proposal_json, \
+                    authority_signature, persist_row_hash, created_at\
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+                 ON CONFLICT(proposal_digest) DO NOTHING",
+                rusqlite::params![
+                    prep.proposal_digest,
+                    prep.family_key_id,
+                    prep.action,
+                    prep.nonce,
+                    prep.window_until.to_rfc3339(),
+                    prep.prior_family_digest,
+                    prep.payload_sha256,
+                    proposal_json,
+                    auth_sig,
+                    prep.persist_row_hash,
+                    prep.created_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
+        Ok(())
+    }
+
+    async fn get_accord_proposal(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Option<crate::federation::accord_quorum::StoredProposal>, crate::federation::Error>
+    {
+        let conn = self.conn.clone();
+        let key = proposal_digest.to_owned();
+        (move || -> Result<Option<crate::federation::accord_quorum::StoredProposal>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
+                 FROM accord_proposal WHERE proposal_digest = ?1",
+                [&key],
+                sqlite_row_to_stored_proposal,
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("get_accord_proposal: {e}")))
+    }
+
+    async fn list_accord_proposals_by_anchor(
+        &self,
+        action: &str,
+        prior_family_digest: &str,
+    ) -> Result<Vec<crate::federation::accord_quorum::StoredProposal>, crate::federation::Error>
+    {
+        let conn = self.conn.clone();
+        let action = action.to_owned();
+        let anchor = prior_family_digest.to_owned();
+        (move || -> Result<Vec<crate::federation::accord_quorum::StoredProposal>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
+                 FROM accord_proposal WHERE action = ?1 AND prior_family_digest = ?2 \
+                 ORDER BY created_at ASC, proposal_digest ASC",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![action, anchor],
+                sqlite_row_to_stored_proposal,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_accord_proposals_by_anchor: {e}")))
+    }
+
+    async fn put_accord_participation(
+        &self,
+        participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
+        standing_roster: &[ciris_verify_core::threshold::ThresholdMember],
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        // The proposal MUST exist (verify-before-mutation needs it to verify
+        // the participation binding).
+        let stored = self
+            .get_accord_proposal(&participation.proposal_digest)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "accord participation references unknown proposal {:?}",
+                    participation.proposal_digest
+                ))
+            })?;
+        let prep = crate::federation::accord_quorum::verify_and_prepare_participation(
+            &stored.proposal,
+            &participation,
+            standing_roster,
+            chrono::Utc::now(),
+        )?;
+        let participation_json = serde_json::to_string(&prep.participation_json)
+            .map_err(|e| Error::Backend(format!("participation_json encode: {e}")))?;
+        let conn = self.conn.clone();
+        let outcome = (move || -> Result<&'static str, rusqlite::Error> {
+            let conn = conn.lock();
+            // M6 durable dedup by (proposal_digest, pinned_pubkey): a second
+            // participation by the same pinned holder is idempotent if
+            // byte-identical, else a conflict (one vote per holder).
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT persist_row_hash FROM accord_participation \
+                     WHERE proposal_digest = ?1 AND pinned_pubkey = ?2",
+                    rusqlite::params![prep.proposal_digest, prep.pinned_pubkey],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(h) = existing {
+                return Ok(if h == prep.persist_row_hash {
+                    "noop"
+                } else {
+                    "conflict"
+                });
+            }
+            conn.execute(
+                "INSERT INTO accord_participation (\
+                    proposal_digest, member_id, pinned_pubkey, vote, window_until, \
+                    signed_at, server_arrival_at, participation_json, persist_row_hash\
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                rusqlite::params![
+                    prep.proposal_digest,
+                    prep.member_id,
+                    prep.pinned_pubkey,
+                    prep.vote,
+                    prep.window_until.to_rfc3339(),
+                    prep.signed_at.to_rfc3339(),
+                    prep.server_arrival_at.to_rfc3339(),
+                    participation_json,
+                    prep.persist_row_hash,
+                ],
+            )?;
+            Ok("inserted")
+        })()
+        .map_err(|e| Error::Backend(format!("insert accord_participation: {e}")))?;
+        if outcome == "conflict" {
+            return Err(Error::Conflict(format!(
+                "accord participation: holder (pinned pubkey) already voted differently on proposal {:?} (M6 — one vote per holder)",
+                participation.proposal_digest
+            )));
+        }
+        Ok(())
+    }
+
+    async fn list_accord_participations(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Vec<crate::federation::accord_quorum::StoredParticipation>, crate::federation::Error>
+    {
+        let conn = self.conn.clone();
+        let key = proposal_digest.to_owned();
+        (move || -> Result<Vec<crate::federation::accord_quorum::StoredParticipation>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT participation_json, pinned_pubkey, server_arrival_at, persist_row_hash \
+                 FROM accord_participation WHERE proposal_digest = ?1 \
+                 ORDER BY server_arrival_at ASC, pinned_pubkey ASC",
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_stored_participation)?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_accord_participations: {e}")))
+    }
+
+    async fn put_accord_decision(
+        &self,
+        decision: ciris_verify_core::accord_live_quorum::AccordDecision,
+        steward_signatures: Option<serde_json::Value>,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let prep = crate::federation::accord_quorum::prepare_decision(
+            &decision,
+            steward_signatures,
+            chrono::Utc::now(),
+        )?;
+        let live_set = serde_json::to_string(&prep.live_set)
+            .map_err(|e| Error::Backend(format!("live_set encode: {e}")))?;
+        let decision_json = serde_json::to_string(&prep.decision_json)
+            .map_err(|e| Error::Backend(format!("decision_json encode: {e}")))?;
+        let steward = match &prep.steward_signatures {
+            Some(v) => Some(
+                serde_json::to_string(v)
+                    .map_err(|e| Error::Backend(format!("steward_signatures encode: {e}")))?,
+            ),
+            None => None,
+        };
+        let digest_for_err = prep.proposal_digest.clone();
+        let conn = self.conn.clone();
+        let outcome = (move || -> Result<&'static str, rusqlite::Error> {
+            let conn = conn.lock();
+            // Immutable (M2): identical re-PUT is a no-op, a differing one is
+            // a conflict.
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT persist_row_hash FROM accord_decision WHERE proposal_digest = ?1",
+                    [&prep.proposal_digest],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(h) = existing {
+                return Ok(if h == prep.persist_row_hash {
+                    "noop"
+                } else {
+                    "conflict"
+                });
+            }
+            conn.execute(
+                "INSERT INTO accord_decision (\
+                    proposal_digest, family_key_id, authorized, yes, no, abstain, \
+                    live_set, window_until, steward_signatures, decision_json, \
+                    persist_row_hash, decided_at\
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                rusqlite::params![
+                    prep.proposal_digest,
+                    prep.family_key_id,
+                    prep.authorized as i64,
+                    prep.yes,
+                    prep.no,
+                    prep.abstain,
+                    live_set,
+                    prep.window_until.to_rfc3339(),
+                    steward,
+                    decision_json,
+                    prep.persist_row_hash,
+                    prep.decided_at.to_rfc3339(),
+                ],
+            )?;
+            Ok("inserted")
+        })()
+        .map_err(|e| Error::Backend(format!("insert accord_decision: {e}")))?;
+        if outcome == "conflict" {
+            return Err(Error::Conflict(format!(
+                "accord decision for proposal {digest_for_err:?} already recorded with different content (M2 — immutable)"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn get_accord_decision(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Option<crate::federation::accord_quorum::StoredDecision>, crate::federation::Error>
+    {
+        let conn = self.conn.clone();
+        let key = proposal_digest.to_owned();
+        (move || -> Result<Option<crate::federation::accord_quorum::StoredDecision>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT decision_json, steward_signatures, persist_row_hash, decided_at \
+                 FROM accord_decision WHERE proposal_digest = ?1",
+                [&key],
+                sqlite_row_to_stored_decision,
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("get_accord_decision: {e}")))
+    }
+
+    async fn set_active_halt(
+        &self,
+        family_key_id: &str,
+        active_halt_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let conn = self.conn.clone();
+        let fam = family_key_id.to_owned();
+        let halt = active_halt_id.to_owned();
+        let now = chrono::Utc::now().to_rfc3339();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO accord_active_halt (family_key_id, active_halt_id, set_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(family_key_id) DO UPDATE SET \
+                    active_halt_id = excluded.active_halt_id, set_at = excluded.set_at",
+                rusqlite::params![fam, halt, now],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("set_active_halt: {e}")))?;
+        Ok(())
+    }
+
+    async fn get_active_halt(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Option<crate::federation::accord_quorum::ActiveHalt>, crate::federation::Error>
+    {
+        let conn = self.conn.clone();
+        let fam = family_key_id.to_owned();
+        (move || -> Result<Option<crate::federation::accord_quorum::ActiveHalt>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT family_key_id, active_halt_id, set_at FROM accord_active_halt \
+                 WHERE family_key_id = ?1",
+                [&fam],
+                sqlite_row_to_active_halt,
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("get_active_halt: {e}")))
+    }
+
+    async fn clear_active_halt(
+        &self,
+        family_key_id: &str,
+        active_halt_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let conn = self.conn.clone();
+        let fam = family_key_id.to_owned();
+        let halt = active_halt_id.to_owned();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            // Clear only the matching halt — a replayed resume against a stale
+            // halt id is a no-op (0 rows).
+            conn.execute(
+                "DELETE FROM accord_active_halt \
+                 WHERE family_key_id = ?1 AND active_halt_id = ?2",
+                rusqlite::params![fam, halt],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("clear_active_halt: {e}")))?;
+        Ok(())
+    }
+
+    async fn issue_accord_nonce(
+        &self,
+        family_key_id: &str,
+        nonce: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let conn = self.conn.clone();
+        let fam = family_key_id.to_owned();
+        let n = nonce.to_owned();
+        let now = chrono::Utc::now().to_rfc3339();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO accord_issued_nonce (family_key_id, nonce, issued_at) \
+                 VALUES (?1, ?2, ?3) ON CONFLICT(family_key_id, nonce) DO NOTHING",
+                rusqlite::params![fam, n, now],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("issue_accord_nonce: {e}")))?;
+        Ok(())
+    }
+
+    async fn accord_nonce_issued(
+        &self,
+        family_key_id: &str,
+        nonce: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let fam = family_key_id.to_owned();
+        let n = nonce.to_owned();
+        (move || -> Result<bool, rusqlite::Error> {
+            let conn = conn.lock();
+            let found: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM accord_issued_nonce WHERE family_key_id = ?1 AND nonce = ?2",
+                    rusqlite::params![fam, n],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(found.is_some())
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("accord_nonce_issued: {e}")))
+    }
+
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
 
     async fn put_identity_occurrence_revocation(
@@ -9481,6 +9891,84 @@ fn sqlite_row_to_family(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::fede
     })
 }
 
+/// #302 — map a serde decode failure on a stored JSON column to a rusqlite
+/// conversion error (the accord `*_json` columns round-trip to verify-core
+/// objects).
+fn accord_json_err(e: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+    )
+}
+
+/// #302 — sqlite row → `StoredProposal` (verbatim proposal + authority sig).
+fn sqlite_row_to_stored_proposal(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::accord_quorum::StoredProposal> {
+    let proposal_json: String = row.get("proposal_json")?;
+    let proposal = serde_json::from_str(&proposal_json).map_err(accord_json_err)?;
+    let auth_text: Option<String> = row.get("authority_signature")?;
+    let authority_signature = match auth_text {
+        Some(t) => Some(serde_json::from_str(&t).map_err(accord_json_err)?),
+        None => None,
+    };
+    let created_at: String = row.get("created_at")?;
+    Ok(crate::federation::accord_quorum::StoredProposal {
+        proposal,
+        authority_signature,
+        persist_row_hash: row.get("persist_row_hash")?,
+        created_at: parse_rfc3339(&created_at),
+    })
+}
+
+/// #302 — sqlite row → `StoredParticipation` (verbatim + server arrival).
+fn sqlite_row_to_stored_participation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::accord_quorum::StoredParticipation> {
+    let participation_json: String = row.get("participation_json")?;
+    let participation = serde_json::from_str(&participation_json).map_err(accord_json_err)?;
+    let server_arrival_at: String = row.get("server_arrival_at")?;
+    Ok(crate::federation::accord_quorum::StoredParticipation {
+        participation,
+        pinned_pubkey: row.get("pinned_pubkey")?,
+        server_arrival_at: parse_rfc3339(&server_arrival_at),
+        persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+/// #302 — sqlite row → `StoredDecision` (verbatim frozen-L snapshot).
+fn sqlite_row_to_stored_decision(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::accord_quorum::StoredDecision> {
+    let decision_json: String = row.get("decision_json")?;
+    let decision = serde_json::from_str(&decision_json).map_err(accord_json_err)?;
+    let steward_text: Option<String> = row.get("steward_signatures")?;
+    let steward_signatures = match steward_text {
+        Some(t) => Some(serde_json::from_str(&t).map_err(accord_json_err)?),
+        None => None,
+    };
+    let decided_at: String = row.get("decided_at")?;
+    Ok(crate::federation::accord_quorum::StoredDecision {
+        decision,
+        steward_signatures,
+        persist_row_hash: row.get("persist_row_hash")?,
+        decided_at: parse_rfc3339(&decided_at),
+    })
+}
+
+/// #302 — sqlite row → `ActiveHalt`.
+fn sqlite_row_to_active_halt(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::accord_quorum::ActiveHalt> {
+    let set_at: String = row.get("set_at")?;
+    Ok(crate::federation::accord_quorum::ActiveHalt {
+        family_key_id: row.get("family_key_id")?,
+        active_halt_id: row.get("active_halt_id")?,
+        set_at: parse_rfc3339(&set_at),
+    })
+}
+
 fn sqlite_row_to_community(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<crate::federation::Community> {
@@ -13997,6 +14485,21 @@ impl crate::derived::DerivedSchema for SqliteBackend {
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod accord_tests {
+    use super::*;
+
+    /// #302 — accord live-quorum storage parity on sqlite (shares the
+    /// assertion body with memory + pg).
+    #[tokio::test]
+    async fn accord_live_quorum_storage_flow_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::accord_quorum::test_fixtures::exercise_accord_storage(&backend, "sq")
+            .await;
+    }
+}
 
 #[cfg(test)]
 mod tests {

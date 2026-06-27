@@ -5,6 +5,50 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.1.0] — 2026-06-26
+
+### Added — #302 (FSD-004): accord live-quorum storage substrate
+
+The durable half of the constitutional kill-switch's decimation-recovery live
+quorum. CIRISVerify ships the stateless machinery in
+`ciris_verify_core::accord_live_quorum` (CIRISVerify#150, re-pinned here to
+**v8.2.0**); the CIRISServer Phase-3 runtime (CIRISServer#122) writes the wire
+objects + anti-replay state **through** persist. Division of labour: **persist
+stores + dedups + verifies participations + holds nonce/halt state; the server
+runs the tally.**
+
+**V091 migrations (pg + sqlite lockstep), five append-only tables + the
+`accord_quorum` module + `FederationDirectory` surface (12 methods, 3 backends:
+postgres/sqlite/memory) + pyo3 write-through:**
+
+- **`accord_proposal`** — server-issued proposals, stored VERBATIM; the digest
+  is derived via verify-core (`AccordProposal::digest`), never caller-supplied.
+  Indexed by `(action, prior_family_digest)` for proposal coalescing (H4).
+- **`accord_participation`** — proof-of-life + vote. **Verify-before-mutation**:
+  the proposal must exist, the member must be in the caller-supplied standing
+  roster (C3), and `AccordParticipation::verify` must pass (fail-closed) before
+  the row lands. **M6 durable dedup by PINNED pubkey** (PK
+  `(proposal_digest, pinned_pubkey)`, not the self-attested `member_id`). **C2**:
+  persist stamps the authoritative `server_arrival_at`; `signed_at` is advisory.
+- **`accord_decision`** — the frozen-L snapshot, **immutable** (M2): a differing
+  re-PUT is rejected, an identical one no-ops.
+- **`accord_active_halt`** (H2) — the active CONSTITUTIONAL halt per family; a
+  resume clears only the matching halt (a stale-halt resume is a no-op).
+- **`accord_issued_nonce`** (M4) — `put_accord_proposal` is fail-closed on an
+  unissued nonce.
+
+The anti-replay anchor is the STANDING roster's `prior_family_digest` (C3),
+never the live set L. **Recovery (`verify_recovery_supersede`, H7) is
+deliberately absent** — it bends entrenchment for the captured-roster case and
+cannot go live until the Constitution sanctions it (CIRISAccord#4); only
+`fire` / `roster_change` / `resume` objects are handled.
+
+Parity proven from one shared `exercise_accord_storage` body across memory +
+sqlite + postgres (the pg test gated on `CIRIS_PERSIST_TEST_PG_URL`), with real
+hybrid-signed participations; full clippy (`-D warnings`) + fmt clean. Also
+re-pins CIRISVerify v8.1.0 → **v8.2.0** (the tag that first ships #150);
+`Requires-Dist ciris-verify>=8.0.0,<9` unchanged.
+
 ## [11.0.1] — 2026-06-26
 
 ### Changed — re-pin CIRISVerify v8.0.0 → v8.1.0 (wheel concurrence)

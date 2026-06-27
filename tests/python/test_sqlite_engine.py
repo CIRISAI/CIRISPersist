@@ -575,3 +575,67 @@ def test_nodes_stewarded_by_json_pyo3_299():
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
+
+
+def test_accord_live_quorum_ffi_302():
+    """#302 — the accord live-quorum write-through FFI is bound and routes
+    JSON through the backend: M4 nonce gate (issue + fail-closed reject +
+    admit), proposal round-trip via the anchor index, and active-halt H2
+    set/clear semantics. The verify-before-mutation participation path needs
+    real hybrid signatures and is covered exhaustively by the Rust tests."""
+    import json
+    import os
+    import secrets
+    import tempfile
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    seed = os.path.join(tempfile.mkdtemp(), "seed")
+    with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    alias = "n" + secrets.token_hex(6)
+    try:
+        eng = ciris_persist.Engine(
+            "sqlite::memory:", alias, local_key_id=alias, local_key_path=seed
+        )
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        # M4: nonce gate.
+        assert eng.accord_nonce_issued("fam", "n1") is False
+        proposal = {
+            "family_key_id": "fam",
+            "action": "fire",
+            "nonce": "n1",
+            "window_until": "2031-01-01T00:00:00Z",
+            "prior_family_digest": "pfd-abc",
+            "payload_sha256": "psh-def",
+        }
+        # Proposal before the nonce is issued → ValueError (M4 fail-closed).
+        with pytest.raises(ValueError):
+            eng.put_accord_proposal_json(
+                json.dumps({"proposal": proposal, "authority_signature": None})
+            )
+        eng.issue_accord_nonce("fam", "n1")
+        assert eng.accord_nonce_issued("fam", "n1") is True
+        # Now admitted; the anchor index returns it (verbatim round-trip).
+        eng.put_accord_proposal_json(
+            json.dumps({"proposal": proposal, "authority_signature": None})
+        )
+        rows = json.loads(eng.list_accord_proposals_by_anchor_json("fire", "pfd-abc"))
+        assert len(rows) == 1
+        assert rows[0]["proposal"]["nonce"] == "n1"
+
+        # H2 active halt: set, wrong-id resume no-ops, right-id clears.
+        eng.set_active_halt("fam", "halt-X")
+        assert json.loads(eng.get_active_halt_json("fam"))["active_halt_id"] == "halt-X"
+        eng.clear_active_halt("fam", "halt-WRONG")
+        assert eng.get_active_halt_json("fam") is not None
+        eng.clear_active_halt("fam", "halt-X")
+        assert eng.get_active_halt_json("fam") is None
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()

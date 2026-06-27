@@ -3471,6 +3471,380 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_community).collect()
     }
 
+    // ─── #302 (FSD-004) accord live-quorum storage ──────────────────────
+
+    async fn put_accord_proposal(
+        &self,
+        proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
+        authority_signature: Option<serde_json::Value>,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        if !self
+            .accord_nonce_issued(&proposal.family_key_id, &proposal.nonce)
+            .await?
+        {
+            return Err(Error::InvalidArgument(format!(
+                "accord proposal nonce {:?} not issued for family {:?} (M4 fail-closed)",
+                proposal.nonce, proposal.family_key_id
+            )));
+        }
+        let prep = crate::federation::accord_quorum::prepare_proposal(
+            &proposal,
+            authority_signature,
+            chrono::Utc::now(),
+        )?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.accord_proposal (\
+                    proposal_digest, family_key_id, action, nonce, window_until, \
+                    prior_family_digest, payload_sha256, proposal_json, \
+                    authority_signature, persist_row_hash, created_at\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+                 ON CONFLICT (proposal_digest) DO NOTHING",
+                &[
+                    &prep.proposal_digest,
+                    &prep.family_key_id,
+                    &prep.action,
+                    &prep.nonce,
+                    &prep.window_until,
+                    &prep.prior_family_digest,
+                    &prep.payload_sha256,
+                    &prep.proposal_json,
+                    &prep.authority_signature,
+                    &prep.persist_row_hash,
+                    &prep.created_at,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert accord_proposal: {e}")))?;
+        Ok(())
+    }
+
+    async fn get_accord_proposal(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Option<crate::federation::accord_quorum::StoredProposal>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
+                 FROM cirislens.accord_proposal WHERE proposal_digest = $1",
+                &[&proposal_digest],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("get_accord_proposal: {e}")))?;
+        row_opt.map(pg_row_to_stored_proposal).transpose()
+    }
+
+    async fn list_accord_proposals_by_anchor(
+        &self,
+        action: &str,
+        prior_family_digest: &str,
+    ) -> Result<Vec<crate::federation::accord_quorum::StoredProposal>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT proposal_json, authority_signature, persist_row_hash, created_at \
+                 FROM cirislens.accord_proposal WHERE action = $1 AND prior_family_digest = $2 \
+                 ORDER BY created_at ASC, proposal_digest ASC",
+                &[&action, &prior_family_digest],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_accord_proposals_by_anchor: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_stored_proposal).collect()
+    }
+
+    async fn put_accord_participation(
+        &self,
+        participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
+        standing_roster: &[ciris_verify_core::threshold::ThresholdMember],
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let stored = self
+            .get_accord_proposal(&participation.proposal_digest)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "accord participation references unknown proposal {:?}",
+                    participation.proposal_digest
+                ))
+            })?;
+        let prep = crate::federation::accord_quorum::verify_and_prepare_participation(
+            &stored.proposal,
+            &participation,
+            standing_roster,
+            chrono::Utc::now(),
+        )?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        // M6 dedup by (proposal_digest, pinned_pubkey): idempotent if
+        // identical, conflict if a different vote.
+        let existing: Option<String> = client
+            .query_opt(
+                "SELECT persist_row_hash FROM cirislens.accord_participation \
+                 WHERE proposal_digest = $1 AND pinned_pubkey = $2",
+                &[&prep.proposal_digest, &prep.pinned_pubkey],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("accord_participation dedup check: {e}")))?
+            .map(|r| r.safe_get_with("persist_row_hash", Error::Backend))
+            .transpose()?;
+        if let Some(h) = existing {
+            if h == prep.persist_row_hash {
+                return Ok(());
+            }
+            return Err(Error::Conflict(format!(
+                "accord participation: holder (pinned pubkey) already voted differently on proposal {:?} (M6 — one vote per holder)",
+                participation.proposal_digest
+            )));
+        }
+        client
+            .execute(
+                "INSERT INTO cirislens.accord_participation (\
+                    proposal_digest, member_id, pinned_pubkey, vote, window_until, \
+                    signed_at, server_arrival_at, participation_json, persist_row_hash\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                &[
+                    &prep.proposal_digest,
+                    &prep.member_id,
+                    &prep.pinned_pubkey,
+                    &prep.vote,
+                    &prep.window_until,
+                    &prep.signed_at,
+                    &prep.server_arrival_at,
+                    &prep.participation_json,
+                    &prep.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert accord_participation: {e}")))?;
+        Ok(())
+    }
+
+    async fn list_accord_participations(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Vec<crate::federation::accord_quorum::StoredParticipation>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT participation_json, pinned_pubkey, server_arrival_at, persist_row_hash \
+                 FROM cirislens.accord_participation WHERE proposal_digest = $1 \
+                 ORDER BY server_arrival_at ASC, pinned_pubkey ASC",
+                &[&proposal_digest],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_accord_participations: {e}"))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_stored_participation)
+            .collect()
+    }
+
+    async fn put_accord_decision(
+        &self,
+        decision: ciris_verify_core::accord_live_quorum::AccordDecision,
+        steward_signatures: Option<serde_json::Value>,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        let prep = crate::federation::accord_quorum::prepare_decision(
+            &decision,
+            steward_signatures,
+            chrono::Utc::now(),
+        )?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        // Immutable (M2).
+        let existing: Option<String> = client
+            .query_opt(
+                "SELECT persist_row_hash FROM cirislens.accord_decision WHERE proposal_digest = $1",
+                &[&prep.proposal_digest],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("accord_decision immutability check: {e}")))?
+            .map(|r| r.safe_get_with("persist_row_hash", Error::Backend))
+            .transpose()?;
+        if let Some(h) = existing {
+            if h == prep.persist_row_hash {
+                return Ok(());
+            }
+            return Err(Error::Conflict(format!(
+                "accord decision for proposal {:?} already recorded with different content (M2 — immutable)",
+                prep.proposal_digest
+            )));
+        }
+        client
+            .execute(
+                "INSERT INTO cirislens.accord_decision (\
+                    proposal_digest, family_key_id, authorized, yes, no, abstain, \
+                    live_set, window_until, steward_signatures, decision_json, \
+                    persist_row_hash, decided_at\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+                &[
+                    &prep.proposal_digest,
+                    &prep.family_key_id,
+                    &prep.authorized,
+                    &prep.yes,
+                    &prep.no,
+                    &prep.abstain,
+                    &prep.live_set,
+                    &prep.window_until,
+                    &prep.steward_signatures,
+                    &prep.decision_json,
+                    &prep.persist_row_hash,
+                    &prep.decided_at,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("insert accord_decision: {e}")))?;
+        Ok(())
+    }
+
+    async fn get_accord_decision(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Option<crate::federation::accord_quorum::StoredDecision>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT decision_json, steward_signatures, persist_row_hash, decided_at \
+                 FROM cirislens.accord_decision WHERE proposal_digest = $1",
+                &[&proposal_digest],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("get_accord_decision: {e}")))?;
+        row_opt.map(pg_row_to_stored_decision).transpose()
+    }
+
+    async fn set_active_halt(
+        &self,
+        family_key_id: &str,
+        active_halt_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.accord_active_halt (family_key_id, active_halt_id, set_at) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (family_key_id) DO UPDATE SET \
+                    active_halt_id = EXCLUDED.active_halt_id, set_at = EXCLUDED.set_at",
+                &[&family_key_id, &active_halt_id, &chrono::Utc::now()],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("set_active_halt: {e}")))?;
+        Ok(())
+    }
+
+    async fn get_active_halt(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Option<crate::federation::accord_quorum::ActiveHalt>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT family_key_id, active_halt_id, set_at FROM cirislens.accord_active_halt \
+                 WHERE family_key_id = $1",
+                &[&family_key_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("get_active_halt: {e}")))?;
+        row_opt.map(pg_row_to_active_halt).transpose()
+    }
+
+    async fn clear_active_halt(
+        &self,
+        family_key_id: &str,
+        active_halt_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "DELETE FROM cirislens.accord_active_halt \
+                 WHERE family_key_id = $1 AND active_halt_id = $2",
+                &[&family_key_id, &active_halt_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("clear_active_halt: {e}")))?;
+        Ok(())
+    }
+
+    async fn issue_accord_nonce(
+        &self,
+        family_key_id: &str,
+        nonce: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.accord_issued_nonce (family_key_id, nonce, issued_at) \
+                 VALUES ($1, $2, $3) ON CONFLICT (family_key_id, nonce) DO NOTHING",
+                &[&family_key_id, &nonce, &chrono::Utc::now()],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("issue_accord_nonce: {e}")))?;
+        Ok(())
+    }
+
+    async fn accord_nonce_issued(
+        &self,
+        family_key_id: &str,
+        nonce: &str,
+    ) -> Result<bool, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row_opt = client
+            .query_opt(
+                "SELECT 1 FROM cirislens.accord_issued_nonce \
+                 WHERE family_key_id = $1 AND nonce = $2",
+                &[&family_key_id, &nonce],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("accord_nonce_issued: {e}")))?;
+        Ok(row_opt.is_some())
+    }
+
     // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — membership revocations.
 
     async fn put_identity_occurrence_revocation(
@@ -9601,6 +9975,67 @@ fn pg_row_to_family(
     })
 }
 
+/// #302 — pg row → `StoredProposal`.
+fn pg_row_to_stored_proposal(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::accord_quorum::StoredProposal, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let proposal_json: serde_json::Value = row.safe_get_with("proposal_json", mk_err)?;
+    let proposal = serde_json::from_value(proposal_json)
+        .map_err(|e| crate::federation::Error::Backend(format!("proposal deserialize: {e}")))?;
+    Ok(crate::federation::accord_quorum::StoredProposal {
+        proposal,
+        authority_signature: row.safe_get_with("authority_signature", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+        created_at: row.safe_get_with("created_at", mk_err)?,
+    })
+}
+
+/// #302 — pg row → `StoredParticipation`.
+fn pg_row_to_stored_participation(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::accord_quorum::StoredParticipation, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let participation_json: serde_json::Value = row.safe_get_with("participation_json", mk_err)?;
+    let participation = serde_json::from_value(participation_json).map_err(|e| {
+        crate::federation::Error::Backend(format!("participation deserialize: {e}"))
+    })?;
+    Ok(crate::federation::accord_quorum::StoredParticipation {
+        participation,
+        pinned_pubkey: row.safe_get_with("pinned_pubkey", mk_err)?,
+        server_arrival_at: row.safe_get_with("server_arrival_at", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+/// #302 — pg row → `StoredDecision`.
+fn pg_row_to_stored_decision(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::accord_quorum::StoredDecision, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let decision_json: serde_json::Value = row.safe_get_with("decision_json", mk_err)?;
+    let decision = serde_json::from_value(decision_json)
+        .map_err(|e| crate::federation::Error::Backend(format!("decision deserialize: {e}")))?;
+    Ok(crate::federation::accord_quorum::StoredDecision {
+        decision,
+        steward_signatures: row.safe_get_with("steward_signatures", mk_err)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+        decided_at: row.safe_get_with("decided_at", mk_err)?,
+    })
+}
+
+/// #302 — pg row → `ActiveHalt`.
+fn pg_row_to_active_halt(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::accord_quorum::ActiveHalt, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    Ok(crate::federation::accord_quorum::ActiveHalt {
+        family_key_id: row.safe_get_with("family_key_id", mk_err)?,
+        active_halt_id: row.safe_get_with("active_halt_id", mk_err)?,
+        set_at: row.safe_get_with("set_at", mk_err)?,
+    })
+}
+
 fn pg_row_to_community(
     row: tokio_postgres::Row,
 ) -> Result<crate::federation::Community, crate::federation::Error> {
@@ -14390,6 +14825,23 @@ mod tests {
 
     fn pg_dsn() -> Option<String> {
         env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
+    }
+
+    /// #302 — accord live-quorum storage parity on postgres (shares the
+    /// assertion body with memory + sqlite). A unique suffix scopes the
+    /// fixtures so the shared test DB doesn't collide across runs.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn accord_live_quorum_storage_flow_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::accord_quorum::test_fixtures::exercise_accord_storage(&backend, &suffix)
+            .await;
     }
 
     /// Smoke: connect + run_migrations. Skipped if no test DB is
