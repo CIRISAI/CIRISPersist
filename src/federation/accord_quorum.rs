@@ -50,6 +50,7 @@ fn parse_rfc3339(field: &str, value: &str) -> Result<DateTime<Utc>, Error> {
 
 /// The indexed + verbatim columns for an `accord_proposal` INSERT, derived
 /// from a verify-core [`AccordProposal`].
+#[allow(dead_code)] // #302: fields are the SQL write contract (sqlite/postgres); memory ignores some via `..`
 pub(crate) struct PreparedProposal {
     pub proposal_digest: String,
     pub family_key_id: String,
@@ -92,6 +93,7 @@ pub(crate) fn prepare_proposal(
 
 /// The columns for an `accord_participation` INSERT, after a fail-closed
 /// verify-core verification.
+#[allow(dead_code)] // #302: fields are the SQL write contract (sqlite/postgres); memory ignores some via `..`
 pub(crate) struct PreparedParticipation {
     pub proposal_digest: String,
     pub member_id: String,
@@ -162,6 +164,7 @@ pub(crate) fn verify_and_prepare_participation(
 }
 
 /// The columns for an `accord_decision` INSERT (the frozen-L snapshot, M2).
+#[allow(dead_code)] // #302: fields are the SQL write contract (sqlite/postgres); memory ignores some via `..`
 pub(crate) struct PreparedDecision {
     pub proposal_digest: String,
     pub family_key_id: String,
