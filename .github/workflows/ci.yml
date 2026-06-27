@@ -88,12 +88,21 @@ jobs:
       # (CIRISServer#99): ciris-substrate-v1-<PLAT>-release-rustc<RUSTC>-p<persist>-e<edge>-v<verify>,
       # NO -<target> suffix (the suffix defeated CIRISServer's cross-repo
       # restore). This host job is ubuntu-x86_64 ⇒ PLAT=linux-x86_64; persist
-      # e=none (no ciris-edge dep). The 6 substrate legs share this one
-      # per-platform key — they share the always-on ~/.cargo registry blob (the
-      # reliable cross-repo win); whole-dir target/ reuse is fingerprint-
-      # sensitive (feature flags differ per leg) and best-effort (#311 item 3),
-      # so only the `core` leg saves (below) to avoid 6-way save churn.
-      - name: Compute CIRISCache key (canonical, CIRISServer#99 / #311)
+      # e=none (no ciris-edge dep).
+      #
+      # LAYERED restore (#311 follow-up): CIRISCache has NO always-on shared
+      # registry layer — one blob per key, no restore-keys fallback. So to
+      # actually pre-warm off the upstream, restore the UPSTREAM blob first.
+      # persist's only upstream substrate dep is ciris-verify (the start of the
+      # centipede), so the chain is 2 layers, widest→narrowest: verify's blob
+      # (`pnone-enone-v<verify>`, the leaf all repos share — its crypto/keyring
+      # registry deps persist pulls) restores FIRST, then persist's OWN blob
+      # restores LAST so it wins on any overlap. Both unconditional
+      # (continue-on-error). The 6 substrate legs share persist's one
+      # per-platform key — registry reuse is the reliable win; whole-dir target/
+      # reuse is fingerprint-sensitive (feature flags differ) and best-effort
+      # (#311 item 3) — so only the `core` leg saves (below) to avoid 6-way churn.
+      - name: Compute CIRISCache keys (canonical layered, CIRISServer#99 / #311)
         shell: bash
         run: |
           RUSTC=$(rustc -V | awk '{print $2}')
@@ -103,7 +112,13 @@ jobs:
           ver() { { grep -A1 "name = \"$1\"" Cargo.lock | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/'; } || true; }
           P=$(ver ciris-persist); E=$(ver ciris-edge); V=$(ver ciris-verify-core)
           echo "CIRISCACHE_KEY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${P:-none}-e${E:-none}-v${V:-none}" >> "$GITHUB_ENV"
-      - uses: CIRISAI/CIRISCache/restore@v1
+          # The upstream verify blob (same PLAT/rustc, p=e=none) to pre-warm from.
+          echo "CIRISCACHE_KEY_VERIFY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-pnone-enone-v${V:-none}" >> "$GITHUB_ENV"
+      - uses: CIRISAI/CIRISCache/restore@v1   # layer 1 (widest): verify upstream
+        continue-on-error: true
+        with:
+          key: ${{ env.CIRISCACHE_KEY_VERIFY }}
+      - uses: CIRISAI/CIRISCache/restore@v1   # layer 2 (narrowest, wins): persist's own
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -229,15 +244,21 @@ jobs:
       # installed cargo intact. Build cache (registry + target) is
       # unaffected. (v0.7.0/v0.7.1 main CI + v0.7.2 tag CI flakes.)
       # CIRISCache (CIRISPersist#311) — canonical cross-repo key; this job runs
-      # on macos-14 (Apple silicon) ⇒ PLAT=macos-aarch64.
-      - name: Compute CIRISCache key (canonical, CIRISServer#99 / #311)
+      # on macos-14 (Apple silicon) ⇒ PLAT=macos-aarch64. Layered restore:
+      # verify's macos-aarch64 blob first (widest), then persist's own last.
+      - name: Compute CIRISCache keys (canonical layered, CIRISServer#99 / #311)
         shell: bash
         run: |
           RUSTC=$(rustc -V | awk '{print $2}')
           ver() { { grep -A1 "name = \"$1\"" Cargo.lock | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/'; } || true; }
           P=$(ver ciris-persist); E=$(ver ciris-edge); V=$(ver ciris-verify-core)
           echo "CIRISCACHE_KEY=ciris-substrate-v1-macos-aarch64-release-rustc${RUSTC}-p${P:-none}-e${E:-none}-v${V:-none}" >> "$GITHUB_ENV"
-      - uses: CIRISAI/CIRISCache/restore@v1
+          echo "CIRISCACHE_KEY_VERIFY=ciris-substrate-v1-macos-aarch64-release-rustc${RUSTC}-pnone-enone-v${V:-none}" >> "$GITHUB_ENV"
+      - uses: CIRISAI/CIRISCache/restore@v1   # layer 1 (widest): verify upstream
+        continue-on-error: true
+        with:
+          key: ${{ env.CIRISCACHE_KEY_VERIFY }}
+      - uses: CIRISAI/CIRISCache/restore@v1   # layer 2 (narrowest, wins): persist's own
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -786,16 +807,22 @@ jobs:
           components: clippy, rustfmt
       # CIRISCache (CIRISPersist#311) — canonical cross-repo key; this job runs
       # on ubuntu-latest ⇒ PLAT=linux-x86_64, the SAME key the linux-x86_64-test
-      # `core` leg saves. This job RESTORES it (registry-blob win) but does not
-      # save — `core` is the single linux-x86_64 saver, so the two don't race.
-      - name: Compute CIRISCache key (canonical, CIRISServer#99 / #311)
+      # `core` leg saves. Layered restore (verify upstream → persist's own); this
+      # job RESTORES but does not save — `core` is the single linux-x86_64 saver,
+      # so the two don't race.
+      - name: Compute CIRISCache keys (canonical layered, CIRISServer#99 / #311)
         shell: bash
         run: |
           RUSTC=$(rustc -V | awk '{print $2}')
           ver() { { grep -A1 "name = \"$1\"" Cargo.lock | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/'; } || true; }
           P=$(ver ciris-persist); E=$(ver ciris-edge); V=$(ver ciris-verify-core)
           echo "CIRISCACHE_KEY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${P:-none}-e${E:-none}-v${V:-none}" >> "$GITHUB_ENV"
-      - uses: CIRISAI/CIRISCache/restore@v1
+          echo "CIRISCACHE_KEY_VERIFY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-pnone-enone-v${V:-none}" >> "$GITHUB_ENV"
+      - uses: CIRISAI/CIRISCache/restore@v1   # layer 1 (widest): verify upstream
+        continue-on-error: true
+        with:
+          key: ${{ env.CIRISCACHE_KEY_VERIFY }}
+      - uses: CIRISAI/CIRISCache/restore@v1   # layer 2 (narrowest, wins): persist's own
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
