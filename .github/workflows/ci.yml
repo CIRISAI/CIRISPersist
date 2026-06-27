@@ -106,12 +106,15 @@ jobs:
         shell: bash
         run: |
           RUSTC=$(rustc -V | awk '{print $2}')
-          # `|| true` so a crate absent from Cargo.lock (persist has no
-          # ciris-edge) yields empty instead of grep's exit-1 aborting under
-          # `set -e -o pipefail`; ${X:-none} then fills the slot.
-          ver() { { grep -A1 "name = \"$1\"" Cargo.lock | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/'; } || true; }
-          P=$(ver ciris-persist); E=$(ver ciris-edge); V=$(ver ciris-verify-core)
-          echo "CIRISCACHE_KEY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${P:-none}-e${E:-none}-v${V:-none}" >> "$GITHUB_ENV"
+          # Source p/e/v from Cargo.toml (committed): persist GITIGNORES
+          # Cargo.lock, so it does not exist at compute time (this step runs
+          # before any cargo command generates it) — grepping Cargo.lock here
+          # yielded `-pnone-enone-vnone`, which never matched downstream's
+          # version-carrying keys (the #311 cross-repo restore was inert). P =
+          # the package version; V = the verify pin tag; e=none (no ciris-edge).
+          P=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
+          echo "CIRISCACHE_KEY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
           # The upstream verify blob (same PLAT/rustc, p=e=none) to pre-warm from.
           echo "CIRISCACHE_KEY_VERIFY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-pnone-enone-v${V:-none}" >> "$GITHUB_ENV"
       - uses: CIRISAI/CIRISCache/restore@v1   # layer 1 (widest): verify upstream
@@ -250,9 +253,9 @@ jobs:
         shell: bash
         run: |
           RUSTC=$(rustc -V | awk '{print $2}')
-          ver() { { grep -A1 "name = \"$1\"" Cargo.lock | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/'; } || true; }
-          P=$(ver ciris-persist); E=$(ver ciris-edge); V=$(ver ciris-verify-core)
-          echo "CIRISCACHE_KEY=ciris-substrate-v1-macos-aarch64-release-rustc${RUSTC}-p${P:-none}-e${E:-none}-v${V:-none}" >> "$GITHUB_ENV"
+          P=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
+          echo "CIRISCACHE_KEY=ciris-substrate-v1-macos-aarch64-release-rustc${RUSTC}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
           echo "CIRISCACHE_KEY_VERIFY=ciris-substrate-v1-macos-aarch64-release-rustc${RUSTC}-pnone-enone-v${V:-none}" >> "$GITHUB_ENV"
       - uses: CIRISAI/CIRISCache/restore@v1   # layer 1 (widest): verify upstream
         continue-on-error: true
@@ -352,14 +355,14 @@ jobs:
         shell: bash
         run: |
           RUSTC=$(rustc -V | awk '{print $2}')
-          ver() { { grep -A1 "name = \"$1\"" Cargo.lock | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/'; } || true; }
-          P=$(ver ciris-persist); E=$(ver ciris-edge); V=$(ver ciris-verify-core)
+          P=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
           case "${{ matrix.target }}" in
             aarch64-apple-ios)     PLAT="ios-aarch64" ;;
             aarch64-apple-ios-sim) PLAT="ios-aarch64-sim" ;;
             *) PLAT="${{ matrix.target }}" ;;
           esac
-          echo "CIRISCACHE_KEY=ciris-substrate-v1-${PLAT}-release-rustc${RUSTC}-p${P:-none}-e${E:-none}-v${V:-none}" >> "$GITHUB_ENV"
+          echo "CIRISCACHE_KEY=ciris-substrate-v1-${PLAT}-release-rustc${RUSTC}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
       - uses: CIRISAI/CIRISCache/restore@v1
         continue-on-error: true
         with:
@@ -540,9 +543,9 @@ jobs:
         shell: bash
         run: |
           RUSTC=$(rustc -V | awk '{print $2}')
-          ver() { { grep -A1 "name = \"$1\"" Cargo.lock | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/'; } || true; }
-          P=$(ver ciris-persist); E=$(ver ciris-edge); V=$(ver ciris-verify-core)
-          echo "CIRISCACHE_KEY=ciris-substrate-v1-android-${{ matrix.abi }}-release-rustc${RUSTC}-p${P:-none}-e${E:-none}-v${V:-none}" >> "$GITHUB_ENV"
+          P=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
+          echo "CIRISCACHE_KEY=ciris-substrate-v1-android-${{ matrix.abi }}-release-rustc${RUSTC}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
       - uses: CIRISAI/CIRISCache/restore@v1
         continue-on-error: true
         with:
@@ -814,9 +817,9 @@ jobs:
         shell: bash
         run: |
           RUSTC=$(rustc -V | awk '{print $2}')
-          ver() { { grep -A1 "name = \"$1\"" Cargo.lock | grep -m1 '^version' | sed -E 's/.*"([^"]+)".*/\1/'; } || true; }
-          P=$(ver ciris-persist); E=$(ver ciris-edge); V=$(ver ciris-verify-core)
-          echo "CIRISCACHE_KEY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${P:-none}-e${E:-none}-v${V:-none}" >> "$GITHUB_ENV"
+          P=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
+          echo "CIRISCACHE_KEY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
           echo "CIRISCACHE_KEY_VERIFY=ciris-substrate-v1-linux-x86_64-release-rustc${RUSTC}-pnone-enone-v${V:-none}" >> "$GITHUB_ENV"
       - uses: CIRISAI/CIRISCache/restore@v1   # layer 1 (widest): verify upstream
         continue-on-error: true
@@ -1240,6 +1243,34 @@ jobs:
         with:
           name: ciris_persist-wheel-${{ matrix.label }}
           path: target/wheels/*.whl
+
+      # CIRISCache (CIRISPersist#314) — publish persist's release blob for the
+      # two PLATs no other job saves: linux-aarch64 + windows-x64 (label
+      # windows-x86_64 → canonical windows-x64). linux-x86_64 + darwin-aarch64
+      # are already saved by the test/darwin jobs upstream, so no duplicate.
+      # Closes the cross-repo gap (#311 follow-up): edge/server restore the
+      # persist layer on these PLATs instead of cold-compiling. Source p/v from
+      # Cargo.toml (Cargo.lock is gitignored). `shell: bash` ⇒ Git Bash on the
+      # Windows runner. Top-level `permissions: packages: write` covers the save.
+      - name: Compute CIRISCache key (canonical, CIRISServer#99 / #314)
+        if: github.ref == 'refs/heads/main' && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
+        shell: bash
+        run: |
+          RUSTC=$(rustc -V | awk '{print $2}')
+          P=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
+          case "${{ matrix.label }}" in
+            windows-x86_64) PLAT="windows-x64" ;;
+            *)              PLAT="${{ matrix.label }}" ;;
+          esac
+          echo "CIRISCACHE_KEY=ciris-substrate-v1-${PLAT}-release-rustc${RUSTC}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
+      - name: Save CIRISCache (linux-aarch64 + windows-x64 — #314)
+        if: github.ref == 'refs/heads/main' && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
+        uses: CIRISAI/CIRISCache/save@v1
+        continue-on-error: true
+        with:
+          key: ${{ env.CIRISCACHE_KEY }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # v0.1.12 — publish abi3 wheel to PyPI on every tag push.
   #
