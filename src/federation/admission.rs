@@ -217,6 +217,13 @@ pub enum DimensionRejectionReason {
     /// requires a `<namespace-prefix>:<scoped-leaf>` value;
     /// emptiness is malformed.
     EmptyOrMissingDimension,
+    /// CC 3.4.11 — the self-declared age rung carries a `{band}`
+    /// (`age_self_declared:band:*`), never a `{level}`. The `{level}`
+    /// token is reserved to the witness-attested `age_assurance:` rung,
+    /// so a `level` discriminator on the self-declared prefix is a
+    /// subject claiming the witness rung's authority on its own
+    /// signature. Refused structurally, independent of emitter.
+    SelfDeclaredLevelReserved,
 }
 
 impl DimensionRejectionReason {
@@ -227,6 +234,7 @@ impl DimensionRejectionReason {
             Self::MorallyChargedStem => "morally_charged_stem",
             Self::MissingVersionSegment => "missing_version_segment",
             Self::EmptyOrMissingDimension => "empty_or_missing_dimension",
+            Self::SelfDeclaredLevelReserved => "self_declared_level_reserved",
         }
     }
 }
@@ -493,6 +501,23 @@ impl DimensionAdmissionPolicy {
                 // Match satisfied — stop scanning further rules.
                 break;
             }
+        }
+
+        // Layer 1c — CC 3.4.11 token-structure rule for the self-declared
+        // age rung. The self rung carries a `{band}`
+        // (`age_self_declared:band:adult`), NEVER a `{level}`; the `{level}`
+        // discriminator is reserved to the witness-attested `age_assurance:`
+        // rung (`age_assurance:level:adult`). A subject self-asserting a
+        // `level` is claiming the witness rung's authority on its own
+        // signature, so the shape is refused structurally — independent of
+        // emitter (even a witness must use the `age_assurance:` prefix to
+        // carry a level). Mirrors the witness-rung positive gate in
+        // `default_reserved_prefix_rules` (`age_assurance:` → witness).
+        if dim == "age_self_declared:level" || dim.starts_with("age_self_declared:level:") {
+            return Err(Error::DimensionRejected {
+                dimension: dim.to_string(),
+                reason: DimensionRejectionReason::SelfDeclaredLevelReserved.as_str(),
+            });
         }
 
         // Layer 2a — the morally-charged-stem deny-list.
@@ -3633,6 +3658,45 @@ mod tests {
             attestation_type::SCORES,
             Some("age_assurance:thirteen_plus:v1"),
             identity_type::WITNESS,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn self_declared_age_rung_refuses_level_token() {
+        // CC 3.4.11 (CIRISPersist#307): the self-declared rung carries a
+        // `{band}`, never a `{level}`. `age_self_declared:level:*` is reserved
+        // to the witness `age_assurance:` rung and must be refused structurally
+        // — independent of emitter (no identity_type rescues the shape).
+        let p = default_policy();
+        for emitter in [
+            identity_type::AGENT,
+            identity_type::WITNESS,
+            identity_type::SUBSTRATE_PERSIST,
+        ] {
+            for dim in ["age_self_declared:level:adult", "age_self_declared:level"] {
+                let err = p
+                    .check(attestation_type::SCORES, Some(dim), emitter)
+                    .expect_err(&format!("{dim:?} must be refused for emitter {emitter:?}"));
+                match err {
+                    Error::DimensionRejected { reason, .. } => assert_eq!(
+                        reason,
+                        DimensionRejectionReason::SelfDeclaredLevelReserved.as_str(),
+                        "{dim:?} should refuse with self_declared_level_reserved",
+                    ),
+                    other => panic!("expected DimensionRejected, got {other:?}"),
+                }
+            }
+        }
+        // The `{band}` shape is NOT caught by the level rule — a versioned
+        // band self-assertion admits (subject-signed). (The bare
+        // `age_self_declared:band:adult` form the conformance suite uses is
+        // admitted on the production path; here it would trip the orthogonal
+        // version-segment rule, so the versioned form isolates the level gate.)
+        p.check(
+            attestation_type::SCORES,
+            Some("age_self_declared:band:adult:v1"),
+            identity_type::AGENT,
         )
         .unwrap();
     }
