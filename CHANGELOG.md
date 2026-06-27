@@ -5,6 +5,15 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.0.1] — 2026-06-26
+
+### Changed — re-pin CIRISVerify v8.0.0 → v8.1.0 (wheel concurrence)
+
+All six verify pins flip to `v8.1.0`. v8.1.0 is a **docs-only** verify minor
+("sync FSD-004 to CC 0.5 — ratified §4.2.6 + bias-gradient / reverse-quorum",
+CIRISVerify #147) — no API change, so persist needs only the pin bump to stay
+current. In-family minor; `Requires-Dist ciris-verify>=8.0.0,<9` unchanged.
+
 ## [11.0.0] — 2026-06-26
 
 ### BREAKING — owner → steward rename across the steward-binding surface (CC 0.5.1 §3.2 alignment)
