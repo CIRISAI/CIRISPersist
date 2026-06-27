@@ -74,6 +74,16 @@ jobs:
           # against, not whatever stable happens to be on the runner.
           toolchain: stable
 
+      # CIRISCache (#316) — warm the substrate registry/target from the
+      # verify→persist layers so the bench build doesn't cold-compile the
+      # ML-DSA / ML-KEM / keyring / tokio-postgres graph every run. ubuntu ⇒
+      # PLAT=linux-x86_64. Restore-only (anonymous GHCR pull, no save). Runs
+      # BEFORE the criterion actions/cache below, which keeps the per-bench
+      # baseline + the bench's own incremental (wins on overlap).
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
+
       - name: Cache cargo + criterion baseline
         uses: actions/cache@v5
         with:
