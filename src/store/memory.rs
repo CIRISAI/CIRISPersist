@@ -1305,6 +1305,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // emission leaves no trace.
         crate::federation::admission::check_node_agency_admission(self, &row).await?;
 
+        // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — the user-target
+        // steward-binding gate: a `delegates_to` onto a `user`-role target is
+        // admissible ONLY as minor-guardianship (proven-minor target +
+        // proven-adult-user granter). Backend-symmetric with SQLite +
+        // Postgres; verify-before-mutation.
+        crate::federation::admission::check_user_target_steward_binding_admission(self, &row)
+            .await?;
+
         // v10.3.0 (CIRISPersist#288, CC 3.4.1/3.4.3/3.4.5) — reserved-prefix
         // admission on the attestation_TYPE namespace, keyed on the attesting
         // key's identity_type. Backend-symmetric with SQLite + Postgres.
@@ -9215,5 +9223,421 @@ mod tests {
         check_reserved_prefix_admission(&backend, &row("delegates_to", "rp-agent", "rp-accord"))
             .await
             .expect("delegates_to is not a reserved type");
+
+        // #307 (CC 3.4.11) — the age_self_declared:level:* refusal lives on
+        // the attestation_TYPE gate (the REAL emit path), not just the
+        // dimension gate. age tokens travel as the attestation_type string.
+        for at in ["age_self_declared:level:adult", "age_self_declared:level"] {
+            let e = check_reserved_prefix_admission(&backend, &row(at, "rp-agent", "rp-agent"))
+                .await
+                .expect_err("age_self_declared:level:* must be refused on the type gate");
+            assert_eq!(
+                e.kind(),
+                "federation_dimension_rejected",
+                "{at:?} should refuse with DimensionRejected",
+            );
+            match e {
+                crate::federation::Error::DimensionRejected { reason, .. } => assert_eq!(
+                    reason,
+                    crate::federation::admission::DimensionRejectionReason::SelfDeclaredLevelReserved
+                        .as_str(),
+                ),
+                other => panic!("expected DimensionRejected, got {other:?}"),
+            }
+        }
+        // The `{band}` self rung still admits; a witness `age_assurance:*`
+        // token also fast-exits this gate (its emitter rule is identity-gated
+        // and not exercised here for an unregistered attester — use a
+        // registered witness-free shape that simply isn't level-reserved).
+        check_reserved_prefix_admission(
+            &backend,
+            &row("age_self_declared:band:adult", "rp-agent", "rp-agent"),
+        )
+        .await
+        .expect("age_self_declared:band:* is admitted (subject-signed self rung)");
+    }
+
+    // ── v11.5.0 (CIRISPersist#306, CC 3.2 / CC 3.3.12 / CC 1.15.6) ──────────
+    //    I1 age band + user-target steward-binding gate + minor liveness.
+
+    /// Register a key with a chosen `identity_type` (e.g. `user` / `witness` /
+    /// `agent` / `node`).
+    async fn put_typed_key(backend: &MemoryBackend, key_id: &str, it: &str) {
+        let mut rec = fix_key(key_id, "ref", key_id);
+        rec.identity_type = it.to_owned();
+        backend
+            .put_public_key(SignedKeyRecord { record: rec })
+            .await
+            .unwrap();
+    }
+
+    /// Build a live age attestation ABOUT `subject` (attested_key_id ==
+    /// subject) from `emitter`, carrying the given age `attestation_type`
+    /// token + empty envelope. Properly hybrid-signed (CC 5.3.2.4.3.1).
+    fn fix_age_attestation(id: &str, emitter: &str, subject: &str, token: &str) -> Attestation {
+        let mut a = fix_attestation(id, emitter, subject, emitter);
+        a.attestation_type = token.to_owned();
+        a.attestation_envelope = serde_json::json!({ "id": id });
+        a.expires_at = None;
+        resign_fix(&mut a);
+        a
+    }
+
+    /// age_band resolution: witness adult OUTRANKS self minor; self minor
+    /// alone → Minor; self adult alone → Unknown (ratchet ignores self-adult);
+    /// witness minor → Minor; no attestation → Unknown; expired witness
+    /// attestation ignored.
+    #[tokio::test]
+    async fn age_band_resolution_witness_outranks_self_and_ratchets() {
+        use crate::federation::age::{age_band, AgeBand};
+        let backend = MemoryBackend::new();
+        put_typed_key(&backend, "ab-witness", "witness").await;
+        put_typed_key(&backend, "ab-subj", "user").await;
+
+        // No attestation → Unknown (presumption of sovereignty).
+        assert_eq!(
+            age_band(&backend, "ab-subj").await.unwrap(),
+            AgeBand::Unknown
+        );
+
+        // Self-declared adult alone → Unknown (the one-way ratchet ignores a
+        // self-declared adult).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_age_attestation(
+                    "ab-self-adult",
+                    "ab-subj",
+                    "ab-subj",
+                    "age_self_declared:band:adult",
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            age_band(&backend, "ab-subj").await.unwrap(),
+            AgeBand::Unknown,
+            "a self-declared adult must NOT graduate the subject to Adult",
+        );
+
+        // Add a self-declared MINOR → Minor (a subject may ratchet DOWN).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_age_attestation(
+                    "ab-self-minor",
+                    "ab-subj",
+                    "ab-subj",
+                    "age_self_declared:band:minor",
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(age_band(&backend, "ab-subj").await.unwrap(), AgeBand::Minor);
+
+        // A witness ADULT attestation OUTRANKS the self-declared minor → Adult.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_age_attestation(
+                    "ab-witness-adult",
+                    "ab-witness",
+                    "ab-subj",
+                    "age_assurance:provider:adult:v1",
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            age_band(&backend, "ab-subj").await.unwrap(),
+            AgeBand::Adult,
+            "the witness rung must outrank a self-declared minor",
+        );
+    }
+
+    /// age_band: a witness MINOR resolves Minor; an EXPIRED witness adult is
+    /// ignored (liveness = expires_at only).
+    #[tokio::test]
+    async fn age_band_witness_minor_and_expired_witness_ignored() {
+        use crate::federation::age::{age_band, AgeBand};
+        let backend = MemoryBackend::new();
+        put_typed_key(&backend, "abe-witness", "witness").await;
+        put_typed_key(&backend, "abe-subj", "user").await;
+
+        // Witness minor → Minor.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_age_attestation(
+                    "abe-w-minor",
+                    "abe-witness",
+                    "abe-subj",
+                    "age_assurance:provider:minor:v1",
+                ),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            age_band(&backend, "abe-subj").await.unwrap(),
+            AgeBand::Minor
+        );
+
+        // An EXPIRED witness adult is ignored — Minor still wins (it is live).
+        let mut expired = fix_age_attestation(
+            "abe-w-adult-exp",
+            "abe-witness",
+            "abe-subj",
+            "age_assurance:provider:adult:v1",
+        );
+        expired.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap());
+        resign_fix(&mut expired);
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: expired,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            age_band(&backend, "abe-subj").await.unwrap(),
+            AgeBand::Minor,
+            "an expired witness adult must be ignored (liveness = expires_at)",
+        );
+    }
+
+    /// CC 3.2 user-target gate decision table, exercised through the REAL
+    /// `put_attestation` admission path on the memory backend.
+    #[tokio::test]
+    async fn user_target_steward_binding_gate_decision_table() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = MemoryBackend::new();
+        // S = adult-user steward; the witness that attests adulthood.
+        put_typed_key(&backend, "ut-witness", "witness").await;
+        put_typed_key(&backend, "ut-S", "user").await;
+        // Adult target A (witness-attested adult), unknown-age user U,
+        // minor target M (witness-attested minor), node N.
+        put_typed_key(&backend, "ut-A", "user").await;
+        put_typed_key(&backend, "ut-U", "user").await;
+        put_typed_key(&backend, "ut-M", "user").await;
+        put_typed_key(&backend, "ut-N", "node").await;
+
+        // Witness-attest S and A as adults; M as a minor.
+        for (id, subj, token) in [
+            ("uw-S", "ut-S", "age_assurance:provider:adult:v1"),
+            ("uw-A", "ut-A", "age_assurance:provider:adult:v1"),
+            ("uw-M", "ut-M", "age_assurance:provider:minor:v1"),
+        ] {
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: fix_age_attestation(id, "ut-witness", subj, token),
+                })
+                .await
+                .unwrap();
+        }
+
+        let deleg =
+            |id: &str, s: &str, t: &str| fix_node_delegates_to(id, s, t, s, &[ds::INFRA_SERVE]);
+
+        // S(adult user) → A(adult user) : REJECTED (target_is_self_sovereign).
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: deleg("utd-A", "ut-S", "ut-A"),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), "federation_user_target_steward_binding_forbidden");
+        match e {
+            crate::federation::Error::UserTargetStewardBindingForbidden { reason, .. } => {
+                assert_eq!(reason, "target_is_self_sovereign");
+            }
+            other => panic!("expected UserTargetStewardBindingForbidden, got {other:?}"),
+        }
+
+        // S(adult) → U(no age = Unknown) : REJECTED (target_age_unverified).
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: deleg("utd-U", "ut-S", "ut-U"),
+            })
+            .await
+            .unwrap_err();
+        match e {
+            crate::federation::Error::UserTargetStewardBindingForbidden { reason, .. } => {
+                assert_eq!(reason, "target_age_unverified");
+            }
+            other => panic!("expected UserTargetStewardBindingForbidden, got {other:?}"),
+        }
+
+        // S(adult user) → M(witness minor) : ADMITTED (legal guardianship).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: deleg("utd-M", "ut-S", "ut-M"),
+            })
+            .await
+            .expect("adult-user steward → witness-minor ward is admitted");
+        // (The granter-not-adult-user leg + node-target no-op are covered by
+        // `user_target_gate_granter_must_be_adult_and_nodes_unaffected`.)
+    }
+
+    /// CC 3.2 user-target gate: a non-adult (Unknown-age) granter cannot
+    /// steward even a proven minor (granter_not_adult_user); a node/agent
+    /// target is unaffected by this gate (goes through node-agency only).
+    #[tokio::test]
+    async fn user_target_gate_granter_must_be_adult_and_nodes_unaffected() {
+        use crate::federation::types::delegation_scope as ds;
+        let backend = MemoryBackend::new();
+        put_typed_key(&backend, "ug-witness", "witness").await;
+        put_typed_key(&backend, "ug-U", "user").await; // unknown-age user (granter)
+        put_typed_key(&backend, "ug-M", "user").await; // witness-minor ward
+        put_typed_key(&backend, "ug-N", "node").await; // node target
+
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_age_attestation(
+                    "ugw-M",
+                    "ug-witness",
+                    "ug-M",
+                    "age_assurance:provider:minor:v1",
+                ),
+            })
+            .await
+            .unwrap();
+
+        // U(unknown-age user) → M(minor) : REJECTED (granter not proven adult).
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "ugd-UM",
+                    "ug-U",
+                    "ug-M",
+                    "ug-U",
+                    &[ds::INFRA_SERVE],
+                ),
+            })
+            .await
+            .unwrap_err();
+        match e {
+            crate::federation::Error::UserTargetStewardBindingForbidden { reason, .. } => {
+                assert_eq!(reason, "granter_not_adult_user");
+            }
+            other => panic!("expected UserTargetStewardBindingForbidden, got {other:?}"),
+        }
+
+        // U(unknown-age user) → N(node) : the user-target gate is a no-op for a
+        // node target (infra:* scope clears the node-agency gate) → ADMITTED.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "ugd-UN",
+                    "ug-U",
+                    "ug-N",
+                    "ug-U",
+                    &[ds::INFRA_SERVE],
+                ),
+            })
+            .await
+            .expect("a node target is governed by the node-agency gate, not the user-target gate");
+    }
+
+    /// Minor-stewardship liveness fail-secure (CC 3.2): a minor user bound by
+    /// an adult (live edge) is steward-bound; after the granter withdraws it,
+    /// is_steward_bound flips to false (the minor does NOT self-anchor). A
+    /// node is unchanged; an adult user self-anchors with no edge.
+    #[tokio::test]
+    async fn minor_stewardship_liveness_fails_secure_nodes_and_adults_unchanged() {
+        use crate::federation::admission::{is_steward_bound, steward_bindings_of};
+        use crate::federation::types::delegation_scope as ds;
+        let backend = MemoryBackend::new();
+        put_typed_key(&backend, "ml-witness", "witness").await;
+        put_typed_key(&backend, "ml-S", "user").await; // adult-user steward
+        put_typed_key(&backend, "ml-M", "user").await; // minor-user ward
+        put_typed_key(&backend, "ml-A", "user").await; // adult-user (self-sovereign)
+        put_typed_key(&backend, "ml-N", "node").await; // node control
+
+        // Attest S and A as adults, M as a minor.
+        for (id, subj, token) in [
+            ("mlw-S", "ml-S", "age_assurance:provider:adult:v1"),
+            ("mlw-A", "ml-A", "age_assurance:provider:adult:v1"),
+            ("mlw-M", "ml-M", "age_assurance:provider:minor:v1"),
+        ] {
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: fix_age_attestation(id, "ml-witness", subj, token),
+                })
+                .await
+                .unwrap();
+        }
+
+        // An adult user with no edge self-anchors (sovereign — its own steward).
+        assert!(
+            is_steward_bound(&backend, "ml-A").await.unwrap(),
+            "an adult user is its own steward anchor",
+        );
+
+        // A steward-less minor does NOT self-anchor (fail-secure).
+        assert!(
+            !is_steward_bound(&backend, "ml-M").await.unwrap(),
+            "a steward-less minor must NOT self-anchor (CC 3.2 fail-secure)",
+        );
+
+        // Bind the minor to the adult steward (live edge) → steward-bound.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "ml-bind",
+                    "ml-S",
+                    "ml-M",
+                    "ml-S",
+                    &[ds::INFRA_SERVE],
+                ),
+            })
+            .await
+            .expect("adult-user steward → minor ward admitted");
+        assert!(is_steward_bound(&backend, "ml-M").await.unwrap());
+        assert_eq!(
+            steward_bindings_of(&backend, "ml-M").await.unwrap(),
+            vec!["ml-S".to_string()],
+            "while bound, the minor is anchored only to the adult steward (NOT self)",
+        );
+
+        // The adult withdraws the binding → the minor fails secure again.
+        let mut w = fix_attestation("ml-withdraw", "ml-S", "ml-M", "ml-S");
+        w.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+        w.attestation_envelope = serde_json::json!({ "id": "ml-withdraw" });
+        resign_fix(&mut w);
+        backend
+            .put_attestation(SignedAttestation { attestation: w })
+            .await
+            .unwrap();
+        assert!(
+            !is_steward_bound(&backend, "ml-M").await.unwrap(),
+            "a minor whose only adult steward was withdrawn must be steward-less (fail-secure)",
+        );
+        assert!(steward_bindings_of(&backend, "ml-M")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Control: a node bound then withdrawn is unchanged (bound→true,
+        // withdrawn→false) — the node path never used clauses (1)/(2).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "ml-nbind",
+                    "ml-S",
+                    "ml-N",
+                    "ml-S",
+                    &[ds::INFRA_SERVE],
+                ),
+            })
+            .await
+            .unwrap();
+        assert!(is_steward_bound(&backend, "ml-N").await.unwrap());
+        let mut wn = fix_attestation("ml-nwithdraw", "ml-S", "ml-N", "ml-S");
+        wn.attestation_type = crate::federation::types::attestation_type::WITHDRAWS.into();
+        wn.attestation_envelope = serde_json::json!({ "id": "ml-nwithdraw" });
+        resign_fix(&mut wn);
+        backend
+            .put_attestation(SignedAttestation { attestation: wn })
+            .await
+            .unwrap();
+        assert!(
+            !is_steward_bound(&backend, "ml-N").await.unwrap(),
+            "the node/agent fail-secure path is unchanged by the minor gate",
+        );
     }
 }

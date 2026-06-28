@@ -7057,6 +7057,53 @@ impl PyEngine {
         })
     }
 
+    /// v11.5.0 (CIRISPersist#306, CC 3.3.12 / CC 1.15.6) — the **I1 age band**
+    /// of `key_id`, resolved from its incoming age attestations (witness
+    /// `age_assurance:*` OUTRANKS self-declared `age_self_declared:*`; a
+    /// self-declared adult is ignored — the one-way ratchet). Returns one of
+    /// `"minor"` / `"adult"` / `"unknown"` (a key with no usable age proof
+    /// resolves to `"unknown"` — presumption of sovereignty). Wraps
+    /// [`age_band`](crate::federation::age::age_band). The three-valued band
+    /// is exposed verbatim so a consumer (#309) can layer a content-protective
+    /// `unknown → minor` resolution on the CONTENT axis without changing this
+    /// primitive.
+    fn age_band_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(move || {
+                let band = match &self.backend {
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::age::age_band(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::age::age_band(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(band.as_str())
+                    .map_err(|e| PyValueError::new_err(format!("age_band serialize: {e}")))
+            })
+        })
+    }
+
     /// #249 Cut A — the **duty-holders** of a bare community-scoped action
     /// (a `moderation:*` / `reconsideration:*` over `community_id` with no
     /// content subject) for `duty` (`moderate` / `takedown` / `review`): the
@@ -23432,6 +23479,13 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // failure (non-infra membership is an authority act that must root
         // in an owner); ValueError (4xx).
         crate::federation::Error::UnstewardedCommunityMember { .. } => PyValueError::new_err(kind),
+        // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — a refused
+        // user-target steward-binding (target is a self-sovereign adult / its
+        // age is unverified / the granter is not a proven adult user) is a
+        // caller-side authorization failure; ValueError (4xx).
+        crate::federation::Error::UserTargetStewardBindingForbidden { .. } => {
+            PyValueError::new_err(kind)
+        }
         // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — a federation-tier
         // attestation rejected at the bulk ingest gate (missing ML-DSA-65
         // half / tampered signature / canonicalizer mismatch /

@@ -2479,6 +2479,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // no trace.
         crate::federation::admission::check_node_agency_admission(self, &row).await?;
 
+        // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — the user-target
+        // steward-binding gate: a `delegates_to` onto a `user`-role target is
+        // admissible ONLY as minor-guardianship (proven-minor target +
+        // proven-adult-user granter). Backend-symmetric with memory + SQLite;
+        // verify-before-mutation.
+        crate::federation::admission::check_user_target_steward_binding_admission(self, &row)
+            .await?;
+
         // v10.3.0 (CIRISPersist#288, CC 3.4.1/3.4.3/3.4.5) — reserved-prefix
         // admission on the attestation_TYPE namespace (accord:* → accord_holder;
         // system:*/audit_chain:*/… → substrate-self-report; hard_case:* →

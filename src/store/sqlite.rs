@@ -2166,6 +2166,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // trace.
         crate::federation::admission::check_node_agency_admission(self, &row).await?;
 
+        // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — the user-target
+        // steward-binding gate: a `delegates_to` onto a `user`-role target is
+        // admissible ONLY as minor-guardianship (proven-minor target +
+        // proven-adult-user granter). Backend-symmetric with memory + Postgres;
+        // verify-before-mutation.
+        crate::federation::admission::check_user_target_steward_binding_admission(self, &row)
+            .await?;
+
         // v10.3.0 (CIRISPersist#288, CC 3.4.1/3.4.3/3.4.5) — reserved-prefix
         // admission on the attestation_TYPE namespace (accord:* → accord_holder;
         // system:*/audit_chain:*/… → substrate-self-report; hard_case:* →
@@ -25181,6 +25189,113 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// v11.5.0 (CIRISPersist#306, CC 3.2 / CC 3.3.12 / CC 1.15.6) — sqlite
+    /// parity for the I1 age band, the user-target steward-binding gate, and
+    /// the minor-stewardship liveness fail-secure.
+    #[tokio::test]
+    async fn user_target_gate_and_minor_liveness_sqlite() {
+        use crate::federation::admission::{is_steward_bound, steward_bindings_of};
+        use crate::federation::age::{age_band, AgeBand};
+        use crate::federation::types::{attestation_type, delegation_scope as ds, identity_type};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        for (k, ity) in [
+            ("sl-witness", identity_type::WITNESS),
+            ("sl-S", identity_type::USER), // adult-user steward
+            ("sl-A", identity_type::USER), // self-sovereign adult user
+            ("sl-M", identity_type::USER), // minor-user ward
+            ("sl-N", identity_type::NODE), // node control
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key_with_identity_type(k, k, k, ity),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Age-attest S + A as adults (witness rung), M as a minor.
+        let age = |emitter: &str, subj: &str, token: &str| {
+            let mut a = topo_attestation(
+                emitter,
+                subj,
+                token,
+                None,
+                None,
+                &[],
+                None,
+                chrono::Utc::now(),
+            );
+            a.attestation_envelope = serde_json::json!({ "id": token });
+            resign_fed(&mut a);
+            a
+        };
+        for (subj, token) in [
+            ("sl-S", "age_assurance:provider:adult:v1"),
+            ("sl-A", "age_assurance:provider:adult:v1"),
+            ("sl-M", "age_assurance:provider:minor:v1"),
+        ] {
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: age("sl-witness", subj, token),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(age_band(&backend, "sl-A").await.unwrap(), AgeBand::Adult);
+        assert_eq!(age_band(&backend, "sl-M").await.unwrap(), AgeBand::Minor);
+
+        // user-target gate: S(adult) → A(adult user) REJECTED (self-sovereign).
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: node_delegates_to_sqlite("sl-S", "sl-A", &[ds::INFRA_SERVE]),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), "federation_user_target_steward_binding_forbidden");
+
+        // A steward-less minor does NOT self-anchor (fail-secure).
+        assert!(!is_steward_bound(&backend, "sl-M").await.unwrap());
+        // An adult user self-anchors with no edge.
+        assert!(is_steward_bound(&backend, "sl-A").await.unwrap());
+
+        // S(adult) → M(minor) ADMITTED; minor becomes steward-bound to S only.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: node_delegates_to_sqlite("sl-S", "sl-M", &[ds::INFRA_SERVE]),
+            })
+            .await
+            .expect("adult-user steward → minor ward admitted");
+        assert!(is_steward_bound(&backend, "sl-M").await.unwrap());
+        assert_eq!(
+            steward_bindings_of(&backend, "sl-M").await.unwrap(),
+            vec!["sl-S".to_string()],
+        );
+
+        // S withdraws → the minor fails secure (false).
+        let mut w = topo_attestation(
+            "sl-S",
+            "sl-M",
+            attestation_type::WITHDRAWS,
+            None,
+            None,
+            &[],
+            None,
+            chrono::Utc::now(),
+        );
+        w.attestation_envelope = serde_json::json!({ "id": "sl-withdraw" });
+        resign_fed(&mut w);
+        backend
+            .put_attestation(SignedAttestation { attestation: w })
+            .await
+            .unwrap();
+        assert!(
+            !is_steward_bound(&backend, "sl-M").await.unwrap(),
+            "a minor whose only adult steward was withdrawn must fail secure",
+        );
     }
 
     /// SecReview F3: a WITHDRAWN `delegates_to(user → node)` no longer
