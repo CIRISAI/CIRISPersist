@@ -84,20 +84,27 @@ jobs:
         with:
           plat: linux-x86_64
 
-      - name: Cache cargo + criterion baseline
+      - name: Cache criterion baseline
         uses: actions/cache@v5
         with:
+          # CIRISPersist#335 — cache ONLY the criterion baseline, NOT the
+          # full compiled `target/`. The heavy dep artifacts (ML-DSA /
+          # ML-KEM / keyring / tokio-postgres graph) are already warmed by
+          # the GHCR `ciriscache` restore above (which lives OUTSIDE the
+          # 10 GB GitHub-cache budget), so caching all of `target/` here
+          # was ~3 GB of pure redundancy — and its two branch-scoped copies
+          # pushed the repo cache to 13.9 GB / 10 GB, LRU-evicting the small
+          # vcpkg-OpenSSL (28 MB) + wheel `target/` blobs and forcing a
+          # 382 s OpenSSL rebuild + cold wheel compiles every run. Scoping
+          # to `target/criterion` (the per-bench `base` snapshot the
+          # regression analysis compares against) drops this blob from ~3 GB
+          # to a few MB. Registry/git stay cached (cheap, high-value).
+          # Cargo.lock is gitignored (library convention), so the key hashes
+          # Cargo.toml — version bumps + new deps invalidate cleanly.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          # Cargo.lock is gitignored (library convention), so the
-          # cache key hashes Cargo.toml — version bumps + new deps
-          # invalidate cleanly. The criterion target dir is
-          # included so subsequent runs see the previous baseline
-          # (criterion writes a per-bench `base` snapshot; the
-          # action's regression analysis works without it but is
-          # nicer with it).
+            target/criterion
           key: bench-${{ runner.os }}-${{ hashFiles('Cargo.toml') }}
           restore-keys: |
             bench-${{ runner.os }}-
