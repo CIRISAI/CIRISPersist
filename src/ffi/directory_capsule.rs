@@ -349,6 +349,63 @@ pub enum DirectoryOp {
         /// Depth cap for the walk.
         max_depth: u32,
     },
+    /// [`FederationDirectory::add_peer_record`](crate::federation::
+    /// FederationDirectory::add_peer_record) — insert a peer row
+    /// (CIRISPersist#333; the 6 peer-mutation ops edge's
+    /// `federation_directory_for_edge` invokes via UniFFI `peer_*` +
+    /// `reseed_canonical_bootstrap_peers`).
+    AddPeerRecord {
+        /// The peer's key id.
+        key_id: String,
+        /// Base64 Ed25519 public key.
+        pubkey_ed25519_base64: String,
+        /// The `federation_keys.identity_type` for the row.
+        identity_type: String,
+        /// Optional transport identity (RNS/Reticulum address).
+        transport_identity: Option<String>,
+    },
+    /// [`FederationDirectory::remove_peer_record`](crate::federation::
+    /// FederationDirectory::remove_peer_record) — soft (`hard=false`) or
+    /// hard delete of a peer row.
+    RemovePeerRecord {
+        /// The peer's key id.
+        key_id: String,
+        /// `true` = DELETE the federation_keys row (CASCADE); `false` =
+        /// mark `removed_at`.
+        hard: bool,
+    },
+    /// [`FederationDirectory::update_peer_alias`](crate::federation::
+    /// FederationDirectory::update_peer_alias).
+    UpdatePeerAlias {
+        /// The peer's key id.
+        key_id: String,
+        /// New alias, or `None` to clear.
+        alias: Option<String>,
+    },
+    /// [`FederationDirectory::update_peer_trust`](crate::federation::
+    /// FederationDirectory::update_peer_trust).
+    UpdatePeerTrust {
+        /// The peer's key id.
+        key_id: String,
+        /// The new trust class.
+        trust: types::TrustClass,
+    },
+    /// [`FederationDirectory::update_peer_notes`](crate::federation::
+    /// FederationDirectory::update_peer_notes).
+    UpdatePeerNotes {
+        /// The peer's key id.
+        key_id: String,
+        /// New operator notes, or `None` to clear.
+        notes: Option<String>,
+    },
+    /// [`FederationDirectory::update_peer_policy`](crate::federation::
+    /// FederationDirectory::update_peer_policy).
+    UpdatePeerPolicy {
+        /// The peer's key id.
+        key_id: String,
+        /// The opaque consumer-owned policy blob (round-tripped JSON).
+        policy: types::PeerPolicyBlob,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -609,6 +666,53 @@ pub async fn dispatch_directory_op(
             .await
             {
                 Ok(g) => DirectoryOpResult::DelegationGraph(g),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::AddPeerRecord {
+            key_id,
+            pubkey_ed25519_base64,
+            identity_type,
+            transport_identity,
+        } => match dir
+            .add_peer_record(
+                &key_id,
+                &pubkey_ed25519_base64,
+                &identity_type,
+                transport_identity,
+            )
+            .await
+        {
+            Ok(()) => DirectoryOpResult::Unit,
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::RemovePeerRecord { key_id, hard } => {
+            match dir.remove_peer_record(&key_id, hard).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::UpdatePeerAlias { key_id, alias } => {
+            match dir.update_peer_alias(&key_id, alias).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::UpdatePeerTrust { key_id, trust } => {
+            match dir.update_peer_trust(&key_id, trust).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::UpdatePeerNotes { key_id, notes } => {
+            match dir.update_peer_notes(&key_id, notes).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::UpdatePeerPolicy { key_id, policy } => {
+            match dir.update_peer_policy(&key_id, policy).await {
+                Ok(()) => DirectoryOpResult::Unit,
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -1212,6 +1316,119 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::PeerMetadata(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    // CIRISPersist#333 — the 6 peer-mutation methods override the trait
+    // defaults (which return `Backend("… not implemented")`) so the proxy
+    // routes them through persist's `.so` like every other covered op.
+    // Edge's `federation_directory_for_edge` calls all six via UniFFI
+    // `peer_*` + `reseed_canonical_bootstrap_peers` at init.
+    async fn add_peer_record(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        identity_type: &str,
+        transport_identity: Option<String>,
+    ) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::AddPeerRecord {
+                key_id: key_id.to_string(),
+                pubkey_ed25519_base64: pubkey_ed25519_base64.to_string(),
+                identity_type: identity_type.to_string(),
+                transport_identity,
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn remove_peer_record(&self, key_id: &str, hard: bool) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::RemovePeerRecord {
+                key_id: key_id.to_string(),
+                hard,
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn update_peer_alias(&self, key_id: &str, alias: Option<String>) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::UpdatePeerAlias {
+                key_id: key_id.to_string(),
+                alias,
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn update_peer_trust(&self, key_id: &str, trust: types::TrustClass) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::UpdatePeerTrust {
+                key_id: key_id.to_string(),
+                trust,
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn update_peer_notes(&self, key_id: &str, notes: Option<String>) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::UpdatePeerNotes {
+                key_id: key_id.to_string(),
+                notes,
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn update_peer_policy(
+        &self,
+        key_id: &str,
+        policy: types::PeerPolicyBlob,
+    ) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::UpdatePeerPolicy {
+                key_id: key_id.to_string(),
+                policy,
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -1960,6 +2177,105 @@ mod tests {
         assert_eq!(via_capsule.expect("some").key_id, "primitive-abc");
 
         // Keep `directory.data` owned by us; drop it through the vtable.
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+    }
+
+    #[test]
+    fn peer_mutation_ops_round_trip() {
+        // CIRISPersist#333 — the 6 peer-mutation ops that edge's
+        // `federation_directory_for_edge` invokes. Each must dispatch to
+        // the real backend method (NOT the `Backend("… not implemented")`
+        // trait default the proxy would otherwise inherit).
+        let rt = test_runtime();
+        let (dir, directory) = memory_directory();
+
+        // AddPeerRecord → Unit, and the row is really there.
+        let added = run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::AddPeerRecord {
+                key_id: "peer-333".into(),
+                pubkey_ed25519_base64: "AAAA".into(),
+                identity_type: "agent".into(),
+                transport_identity: Some("rns://abc".into()),
+            },
+        );
+        assert!(
+            matches!(added, DirectoryOpResult::Unit),
+            "add_peer_record ⇒ Unit, got {added:?}"
+        );
+        let meta = rt
+            .block_on(dir.peer_metadata_for("peer-333"))
+            .expect("metadata query")
+            .expect("peer row present");
+        assert_eq!(meta.transport_identity.as_deref(), Some("rns://abc"));
+        assert_eq!(meta.trust, types::TrustClass::Untrusted);
+
+        // The four field-update ops each → Unit and mutate the row.
+        for (op, label) in [
+            (
+                DirectoryOp::UpdatePeerAlias {
+                    key_id: "peer-333".into(),
+                    alias: Some("alias-1".into()),
+                },
+                "update_peer_alias",
+            ),
+            (
+                DirectoryOp::UpdatePeerTrust {
+                    key_id: "peer-333".into(),
+                    trust: types::TrustClass::Trusted,
+                },
+                "update_peer_trust",
+            ),
+            (
+                DirectoryOp::UpdatePeerNotes {
+                    key_id: "peer-333".into(),
+                    notes: Some("noted".into()),
+                },
+                "update_peer_notes",
+            ),
+            (
+                DirectoryOp::UpdatePeerPolicy {
+                    key_id: "peer-333".into(),
+                    policy: types::PeerPolicyBlob(serde_json::json!({ "k": "v" })),
+                },
+                "update_peer_policy",
+            ),
+        ] {
+            let r = run_op(&rt, &directory, &op);
+            assert!(
+                matches!(r, DirectoryOpResult::Unit),
+                "{label} ⇒ Unit, got {r:?}"
+            );
+        }
+        let meta = rt
+            .block_on(dir.peer_metadata_for("peer-333"))
+            .expect("metadata query")
+            .expect("peer row present");
+        assert_eq!(meta.trust, types::TrustClass::Trusted, "trust updated");
+        assert_eq!(meta.alias.as_deref(), Some("alias-1"), "alias updated");
+
+        // RemovePeerRecord (soft) → Unit; the row is then hidden from reads.
+        let removed = run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::RemovePeerRecord {
+                key_id: "peer-333".into(),
+                hard: false,
+            },
+        );
+        assert!(
+            matches!(removed, DirectoryOpResult::Unit),
+            "remove_peer_record ⇒ Unit, got {removed:?}"
+        );
+        assert!(
+            rt.block_on(dir.peer_metadata_for("peer-333"))
+                .expect("metadata query")
+                .is_none(),
+            "soft-removed peer is hidden from reads"
+        );
+
         // SAFETY: single-drop, matched vtable.
         unsafe { (directory.vtable.drop)(directory.data) };
     }

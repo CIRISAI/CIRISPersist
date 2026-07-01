@@ -5,6 +5,36 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.8.2] — 2026-07-01
+
+### Added — #333: 6 peer-mutation DirectoryOp variants complete the ops-proxy surface (CIRISEdge#245)
+
+Appends `AddPeerRecord`, `RemovePeerRecord`, `UpdatePeerAlias`, `UpdatePeerTrust`,
+`UpdatePeerNotes`, `UpdatePeerPolicy` to `DirectoryOp` (and the matching
+`build_op` dispatch arms + `OpsDirectory` impl overrides). These are the last 6
+methods edge's `federation_directory_for_edge` invokes that had **no** op —
+tracing the v11.8.1 `build_ops_directory` swap against edge's real call surface
+surfaced them: the proxy inherited the `FederationDirectory` default bodies, each
+returning `Backend("… not implemented for this backend")`, so a swap would have
+hard-failed. `reseed_canonical_bootstrap_peers` calls three (`add_peer_record` +
+`update_peer_alias` + `update_peer_notes`) at edge init, so this gap would have
+broken startup outright — the exact "flag the uncovered call site → persist adds
+the op" loop CIRISEdge#245 anticipates.
+
+All six return `Result<(), Error>` → `DirectoryOpResult::Unit` (no new result
+variant). `TrustClass` and `PeerPolicyBlob` cross the JSON op boundary; both
+already derive `Serialize`/`Deserialize` (confirmed, unchanged). New round-trip
+test `peer_mutation_ops_round_trip` drives all six through the C-ABI against a
+`MemoryBackend` and asserts real mutation (add → update alias/trust/notes/policy →
+soft-remove), not just a `Unit` echo.
+
+With these appended the ops proxy is a complete drop-in for edge's directory
+handle, and CIRISEdge#245 becomes the staged ~15-line `init_edge_runtime` swap.
+Every other method on that handle was already a covered op
+(`try_acquire_shared_instance` = `AcquireSharedInstanceLease`, etc.).
+`verify_dir`/`rooting_dir` stay on the concrete `BackendDispatch` (not raw-`dyn`),
+so they are out of scope. Verify pin unchanged at v8.3.0.
+
 ## [11.8.1] — 2026-07-01
 
 ### Added — #329: build_ops_directory consumer-side FederationDirectory proxy (unblocks CIRISEdge#245)
