@@ -526,8 +526,19 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       # x86_64 only: OpenSSL 3.6.x SM4-NI workaround
-      - name: pre-build OpenSSL for x86_64-android (SM4-NI workaround)
+      # v11.7.0 CI-perf — x86_64-android also built OpenSSL from source every
+      # run (the SM4-NI workaround). Cache the install dir keyed on the pinned
+      # OpenSSL version; build only on a miss. The env-export step below runs
+      # regardless (points the linker at the cached-or-built dir).
+      - name: cache pre-built OpenSSL (x86_64-android)
         if: matrix.needs_openssl
+        id: android-openssl
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/openssl-x86_64-android
+          key: openssl-x86_64-android-3.4.1-no-sm4-v1
+      - name: pre-build OpenSSL for x86_64-android (SM4-NI workaround)
+        if: matrix.needs_openssl && steps.android-openssl.outputs.cache-hit != 'true'
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
@@ -889,12 +900,33 @@ jobs:
       # is the proven CIRISEdge#90 approach (Strawberry-Perl/openssl-src
       # and Chocolatey both failed there — perl @INC clash / wrong lib
       # layout respectively).
-      - name: install OpenSSL via vcpkg (static, x64-windows-static)
+      # v11.7.0 CI-perf — the vcpkg static OpenSSL was rebuilt FROM SOURCE
+      # every Windows run (~369s, measured). Cache the installed tree and
+      # build only on a miss; on a hit we bypass `vcpkg install` entirely and
+      # point openssl-sys straight at the restored libs (~369s → ~10s). Bump
+      # the key's `-vN` if the runner's vcpkg OpenSSL major ever changes.
+      - name: resolve vcpkg OpenSSL path (Windows)
         if: runner.os == 'Windows'
+        shell: bash
+        run: echo "VCPKG_OPENSSL_ROOT=$(cygpath -w "$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static")" >> "$GITHUB_ENV"
+      - name: cache vcpkg OpenSSL (x64-windows-static)
+        if: runner.os == 'Windows'
+        id: vcpkg-openssl
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.VCPKG_OPENSSL_ROOT }}
+          key: vcpkg-openssl-x64-windows-static-v1
+      - name: install OpenSSL via vcpkg (cache miss only)
+        if: runner.os == 'Windows' && steps.vcpkg-openssl.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
           "$VCPKG_INSTALLATION_ROOT/vcpkg" install openssl:x64-windows-static --x-install-root="$VCPKG_INSTALLATION_ROOT/installed"
+      - name: export OpenSSL env (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
           ROOT="$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static"
           win_root=$(cygpath -w "$ROOT")
           {
@@ -904,7 +936,7 @@ jobs:
             echo "OPENSSL_STATIC=1"
             echo "OPENSSL_NO_VENDOR=1"
           } >> "$GITHUB_ENV"
-          echo "::notice::OPENSSL_DIR=${win_root} (vcpkg static x64-windows-static)"
+          echo "::notice::OPENSSL_DIR=${win_root} (vcpkg static, cache-hit=${{ steps.vcpkg-openssl.outputs.cache-hit }})"
           ls -la "${ROOT}/lib/libssl.lib" "${ROOT}/lib/libcrypto.lib"
       # Non-Windows: stable. Windows: nightly + rust-src, because the
       # Tier-3 `x86_64-win7-windows-msvc` target ships no precompiled std,
