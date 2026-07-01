@@ -842,14 +842,9 @@ jobs:
           - { os: ubuntu-latest,    label: linux-x86_64,   tag: manylinux_2_34_x86_64 }
           - { os: ubuntu-24.04-arm, label: linux-aarch64,  tag: manylinux_2_34_aarch64 }
           - { os: macos-14,         label: darwin-aarch64, tag: macosx_11_0_arm64 }
-          # v5.5.4 (CIRISPersist#205) — windows-x86_64 wheel, Win7-capable
-          # FROM DAY ONE. persist shipped no Windows wheel before this; #205
-          # asks us to bake Win7 in rather than retrofit. Built with the
-          # Tier-3 `x86_64-win7-windows-msvc` target (nightly + `-Zbuild-std`)
-          # so std keeps the Win7 fallback paths (keyed events,
-          # GetSystemTimeAsFileTime, RtlGenRandom) instead of stable ≥1.78's
-          # hard-imported Win8/Win10 APIs (WaitOnAddress /
-          # GetSystemTimePreciseAsFileTime / ProcessPrng). The artifact runs
+          # windows-x86_64 wheel — standard `x86_64-pc-windows-msvc` target
+          # on stable (Win10+ baseline; Win7 support dropped, which
+          # removed the Tier-3 win7 target + `-Zbuild-std` machinery). Runs
           # unchanged on Win10/11. openssl-sys is satisfied by vcpkg static
           # x64-windows-static (the `pyo3`→`postgres`→`dep:openssl` chain),
           # mirroring the proven CIRISEdge#90 setup.
@@ -866,14 +861,6 @@ jobs:
           # bearing for the lens cutover. Add back via manual upload
           # if a real consumer materializes.
     runs-on: ${{ matrix.os }}
-    # ci-perf — single source of truth for the pinned Windows nightly. It
-    # is used in TWO places that MUST agree: the rust-src install below and
-    # RUSTUP_TOOLCHAIN in the build step. If they diverge, `-Zbuild-std`
-    # looks for std source in a toolchain that has no rust-src and fails
-    # ("…/library/Cargo.lock does not exist"). Bump deliberately; the date
-    # is the known-good nightly the v5.5.4 Win7 wheel shipped on.
-    env:
-      NIGHTLY_PIN: nightly-2026-06-12
     steps:
       - uses: actions/checkout@v6
       # v3.5.3 (CIRISPersist#133) — libsqlite3-dev for the dynamic
@@ -938,28 +925,17 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "::notice::OPENSSL_DIR=${win_root} (vcpkg static, cache-hit=${{ steps.vcpkg-openssl.outputs.cache-hit }})"
           ls -la "${ROOT}/lib/libssl.lib" "${ROOT}/lib/libcrypto.lib"
-      # Non-Windows: stable. Windows: nightly + rust-src, because the
-      # Tier-3 `x86_64-win7-windows-msvc` target ships no precompiled std,
-      # so the wheel must `-Zbuild-std` it from source (CIRISPersist#205).
+      # Win7 support dropped. The Windows wheel now builds the
+      # STANDARD `x86_64-pc-windows-msvc` target (ships precompiled std) on
+      # STABLE, like every other platform. The pinned nightly + `rust-src` +
+      # `-Zbuild-std` existed ONLY for the Tier-3 `x86_64-win7-windows-msvc`
+      # target (no precompiled std) — all removed with win7 support.
       - uses: dtolnay/rust-toolchain@stable
-        if: runner.os != 'Windows'
-      # ci-perf — PIN the Windows nightly (don't track `@nightly`). Two
-      # reasons: (1) the rust-cache key below includes the rustc version,
-      # so a daily-rotating nightly would bust the build-std cache every
-      # day — pinning keeps it warm across days; (2) reproducible Win7
-      # wheels (no surprise nightly std/codegen regressions). Bump this
-      # date deliberately when a std/build-std fix is needed; the date
-      # below is the known-good nightly the v5.5.4 Win7 wheel shipped on.
-      - uses: dtolnay/rust-toolchain@master
-        if: runner.os == 'Windows'
-        with:
-          toolchain: ${{ env.NIGHTLY_PIN }}
-          components: rust-src
       # CIRISCache (#316) — layered restore for the RELEASE wheel build so the
       # cross-repo registry (verify crypto/keyring) + persist's own prior wheel
       # blob warm it instead of cold-recompiling. Placed AFTER the toolchain so
-      # `rustc -V` is the right channel (nightly on Windows for the Tier-3 win7
-      # `-Zbuild-std`, stable elsewhere) and BEFORE the per-label rust-cache
+      # `rustc -V` is the right channel (stable on every platform now) and
+      # BEFORE the per-label rust-cache
       # below (which wins on the wheel's own target/). Sets CIRISCACHE_KEY for
       # the save@v1 at the end of the job (#314, linux-aarch64 + windows-x64).
       - name: Resolve CIRISCache PLAT from wheel label
@@ -977,31 +953,15 @@ jobs:
       # Non-Windows: rust-cache handles the registry + target dep
       # artifacts (linux/darwin wheels recompile the verify+pyo3+postgres
       # graph cold otherwise). Keyed per label so entries don't thrash.
+      # rust-cache now handles EVERY wheel platform (Windows too):
+      # the standard `x86_64-pc-windows-msvc` target ships precompiled std,
+      # so there's no from-source std to preserve — the bespoke win7
+      # `-Zbuild-std` target cache (keyed on Cargo.toml, so it missed every
+      # version bump) is gone. Deps warm via ciriscache (above) + rust-cache.
       - uses: Swatinem/rust-cache@v2
-        if: runner.os != 'Windows'
         with:
           key: wheel-${{ matrix.label }}
           cache-bin: false
-        continue-on-error: true
-      # Windows: an EXPLICIT cache, not rust-cache. rust-cache prunes
-      # target/ down to registry-dep artifacts, which drops the
-      # from-source std/core/alloc that `-Zbuild-std` compiles into the
-      # win7 target dir — the bulk of the ~20m. So cache ~/.cargo + the
-      # whole win7 target tree (std + deps + our crate; cargo refingerprints
-      # the changed crate, so the wheel stays identical to a clean build).
-      # Keyed on the PINNED nightly + Cargo.toml (Cargo.lock is gitignored).
-      # GH Actions cache is branch-scoped: the speedup lands once a run on
-      # `main` populates the key; PR/tag runs then restore via restore-keys.
-      - uses: actions/cache@v5
-        if: runner.os == 'Windows'
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/x86_64-win7-windows-msvc
-          key: win7-buildstd-${{ env.NIGHTLY_PIN }}-${{ hashFiles('Cargo.toml') }}
-          restore-keys: |
-            win7-buildstd-${{ env.NIGHTLY_PIN }}-
         continue-on-error: true
       - uses: actions/setup-python@v6
         with:
@@ -1030,50 +990,15 @@ jobs:
       #
       # On macOS, `--auditwheel skip` is a no-op (auditwheel doesn't
       # run there).
-      - name: maturin build (Linux/macOS)
-        if: runner.os != 'Windows'
+      # ONE build for every wheel platform. Win7 support dropped,
+      # so Windows builds the standard `x86_64-pc-windows-msvc` target
+      # (precompiled std, stable toolchain) — no `-Zbuild-std`, no win7
+      # target, no LNK1181 `windows.*.lib` LIB fixup (the linker
+      # auto-discovers import libs with precompiled std). On Windows
+      # `--auditwheel skip` is a no-op (auditwheel is Linux-only); the
+      # vcpkg-OpenSSL env for the postgres backend is already exported above.
+      - name: maturin build
         run: maturin build --release --strip --auditwheel skip
-      # v5.5.4 (CIRISPersist#205) — Windows Win7-capable build. nightly +
-      # `-Zbuild-std` (via CARGO_UNSTABLE_BUILD_STD) compiles std from
-      # source for the Tier-3 `x86_64-win7-windows-msvc` target, retaining
-      # the Win7 fallback paths. RUSTUP_TOOLCHAIN pins to the SAME dated
-      # nightly we installed rust-src on above (NIGHTLY_PIN) — using bare
-      # `nightly` here would resolve to a different, auto-installed toolchain
-      # with no rust-src and break build-std. CARGO_BUILD_TARGET routes the
-      # build to the win7 triple (maturin tags it win_amd64 — x86_64 +
-      # windows). The `confirm wheel shape` gate below asserts cp310-abi3.
-      - name: maturin build (Windows — Tier-3 Win7 via build-std)
-        if: runner.os == 'Windows'
-        shell: bash
-        env:
-          RUSTUP_TOOLCHAIN: ${{ env.NIGHTLY_PIN }}
-          CARGO_BUILD_TARGET: x86_64-win7-windows-msvc
-          CARGO_UNSTABLE_BUILD_STD: std,panic_abort
-        run: |
-          set -euo pipefail
-          if ! rustc --print target-list | grep -qx 'x86_64-win7-windows-msvc'; then
-            echo "::error::x86_64-win7-windows-msvc not in nightly target-list — target may have been renamed; check rustc release notes"
-            exit 1
-          fi
-          # LNK1181 workaround: under -Zbuild-std the linker doesn't
-          # auto-discover the per-version import library that a transitive
-          # `windows-targets` pulls (e.g. `windows.0.48.5.lib`, shipped
-          # inside the `windows_x86_64_msvc-0.48.5` crate). Pre-fetch so
-          # those crates are extracted, then put every
-          # `windows_x86_64_msvc-*/lib` dir on LIB (which link.exe
-          # searches) — covers whatever versions the graph resolves.
-          cargo fetch
-          extra=""
-          while IFS= read -r d; do
-            extra="${extra};$(cygpath -w "$d")"
-          done < <(find "$HOME/.cargo/registry/src" -type d -path '*windows_x86_64_msvc-*/lib' 2>/dev/null | sort -u)
-          if [ -n "$extra" ]; then
-            export LIB="${LIB:-}${extra}"
-            echo "::notice::LIB augmented with windows_x86_64_msvc import-lib dirs:${extra}"
-          else
-            echo "::warning::no windows_x86_64_msvc import-lib dirs found under cargo registry"
-          fi
-          maturin build --release --strip --auditwheel skip
       # v3.6.2 (CIRISPersist#136) — explicit auditwheel-repair with
       # libsqlite3 excluded from the bundling pass. This is the same
       # pattern `pyarrow` uses (excludes libssl/libcrypto/libz) and
@@ -1611,9 +1536,8 @@ jobs:
             ["ciris_persist-wheel-linux-x86_64"]="x86_64-unknown-linux-gnu"
             ["ciris_persist-wheel-linux-aarch64"]="aarch64-unknown-linux-gnu"
             ["ciris_persist-wheel-darwin-aarch64"]="aarch64-apple-darwin"
-            # v5.5.4 (CIRISPersist#205) — Win7-capable wheel signs under the
-            # consumer-facing windows triple (the win7 build triple is an
-            # implementation detail; consumers match x86_64-pc-windows-msvc).
+            # windows-x86_64 wheel signs under the standard windows triple
+            # (win7 support dropped).
             ["ciris_persist-wheel-windows-x86_64"]="x86_64-pc-windows-msvc"
           )
           SIGNED_BINARY_TARGETS=()
