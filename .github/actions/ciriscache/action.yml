@@ -32,14 +32,31 @@ runs:
         V=$(grep -m1 'tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
         BASE="ciris-substrate-v1-${{ inputs.plat }}-release-rustc${RUSTC}"
         echo "CIRISCACHE_KEY=${BASE}-p${P:-none}-enone-v${V:-none}" >> "$GITHUB_ENV"
+        # CIRISPersist#320-followup — a ROLLING "most-recent persist build" key.
+        # The versioned key above misses on every version bump (p11.6.0 →
+        # p11.6.1 never existed), so before this only the verify layer restored
+        # and persist's OWN deps (pyo3/rusqlite/tokio-postgres/candle…) — which
+        # the verify blob does NOT hold — recompiled from scratch every release.
+        # `phead` is version-INDEPENDENT (still pinned on plat+rustc+verify so
+        # it's ABI-compatible) and overwritten each build, so a version bump
+        # restores the last persist `target/` (verify + all persist deps +
+        # persist crate) and cargo recompiles only CHANGED files. The versioned
+        # blob still exists for edge's cross-repo exact-pin.
+        echo "CIRISCACHE_KEY_HEAD=${BASE}-phead-enone-v${V:-none}" >> "$GITHUB_ENV"
         echo "CIRISCACHE_KEY_VERIFY=${BASE}-pnone-enone-v${V:-none}" >> "$GITHUB_ENV"
         echo "CIRISCache: persist=${BASE}-p${P:-none}-enone-v${V:-none}"
+        echo "CIRISCache: head   =${BASE}-phead-enone-v${V:-none}"
         echo "CIRISCache: verify =${BASE}-pnone-enone-v${V:-none}"
-    - uses: CIRISAI/CIRISCache/restore@v1   # layer 1 (widest): verify upstream
+    # Widest → narrowest; each overlays the previous (later wins on overlap).
+    - uses: CIRISAI/CIRISCache/restore@v1   # layer 1 (widest): verify upstream (first-ever-build fallback)
       continue-on-error: true
       with:
         key: ${{ env.CIRISCACHE_KEY_VERIFY }}
-    - uses: CIRISAI/CIRISCache/restore@v1   # layer 2 (narrowest, wins): persist's own
+    - uses: CIRISAI/CIRISCache/restore@v1   # layer 2: most-recent persist build (the cross-version warm target/)
+      continue-on-error: true
+      with:
+        key: ${{ env.CIRISCACHE_KEY_HEAD }}
+    - uses: CIRISAI/CIRISCache/restore@v1   # layer 3 (narrowest, wins): this exact version (same-version re-run)
       continue-on-error: true
       with:
         key: ${{ env.CIRISCACHE_KEY }}
