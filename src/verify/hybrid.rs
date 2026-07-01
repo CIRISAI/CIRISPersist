@@ -53,7 +53,7 @@ use ciris_crypto::{
 /// trust-level. Strict for high-stakes domains; SoftFreshness for
 /// general-purpose with bounded soft-PQC window; Ed25519Fallback for
 /// development / sovereign-mode where the cold-path may never run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HybridPolicy {
     /// Reject hybrid-pending rows. Both signatures REQUIRED.
     /// Production posture for high-stakes domains.
@@ -74,7 +74,7 @@ pub enum HybridPolicy {
 /// Outcome of a successful `verify_hybrid` call. Distinguishes
 /// hybrid-verified (both signatures passed) from Ed25519-only
 /// (PQC absent, accepted by policy).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VerifyOutcome {
     /// Both Ed25519 and ML-DSA-65 signatures verified.
     HybridVerified,
@@ -297,7 +297,11 @@ pub async fn verify_hybrid_via_directory<F>(
     row_age: Option<Duration>,
 ) -> Result<VerifyOutcome, VerifyError>
 where
-    F: crate::federation::FederationDirectory,
+    // `?Sized` so `&dyn FederationDirectory` (e.g. the ABI-stable
+    // `directory_ops_capsule` dispatcher, CIRISPersist#320) can call this
+    // directly, not just concrete backends. Existing `&ConcreteBackend`
+    // callers are unaffected.
+    F: crate::federation::FederationDirectory + ?Sized,
 {
     let key_record = directory
         .lookup_public_key(signing_key_id)
