@@ -485,7 +485,7 @@ pub fn build_persist_signer(handle: KeyringSignerHandle) -> Signer {
 /// The capsule payload pointer is a `Box::into_raw`'d `Box<Signer>`. The
 /// destructor reconstructs the box and invokes `vtable.drop(data)` before
 /// deallocating the envelope.
-#[cfg(feature = "pyo3")]
+#[cfg(feature = "_pyffi")]
 pub fn build_capsule_with_destructor<'py>(
     py: pyo3::Python<'py>,
     handle: KeyringSignerHandle,

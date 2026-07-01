@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "11.7.0"
+version = "11.8.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -21,8 +21,21 @@ default = []
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:bytes", "dep:postgres-types", "dep:refinery", "dep:openssl"]
 server   = ["dep:axum", "dep:tower", "dep:http-body-util"]
 # pyo3 implies postgres — the lens FastAPI integration shape (FSD §3.5)
-# needs the Postgres backend to be available.
-pyo3     = ["dep:pyo3", "postgres"]
+# needs the Postgres backend to be available. This is the published-wheel
+# shape (both backends) — UNCHANGED by #328.
+pyo3     = ["_pyffi", "postgres"]
+# v11.8.0 (CIRISPersist#328) — postgres-free PyEngine FFI. Same PyO3
+# surface as `pyo3` but WITHOUT the Postgres backend, so it does not pull
+# `postgres → openssl`. Sqlite-only. Postgres-requiring PyEngine methods
+# error cleanly at runtime (a `postgresql://` dsn is rejected; postgres-only
+# methods raise a `PyRuntimeError`). Downstream (CIRISEdge) points its
+# Windows/mobile wheels here to drop the vcpkg + vendored-openssl builds.
+pyo3-sqlite = ["_pyffi"]
+# Internal shared feature: the ~13 FFI module-compilation gates fire for
+# BOTH public pyo3 shapes via `feature = "_pyffi"`. Not meant to be enabled
+# directly (it would give a PyEngine with no backend). Enabling `dep:pyo3`
+# lives here so both `pyo3` and `pyo3-sqlite` inherit it.
+_pyffi   = ["dep:pyo3"]
 # v1.13.0 (CIRISPersist#92) — `extension-module` is its OWN feature,
 # enabled by maturin (see `pyproject.toml [tool.maturin] features`),
 # NOT folded into `pyo3`.

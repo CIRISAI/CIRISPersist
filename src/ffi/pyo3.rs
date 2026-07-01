@@ -39,10 +39,26 @@ use tokio::runtime::Runtime;
 
 use crate::ingest::{IngestError, IngestPipeline};
 use crate::scrub::{NullScrubber, ScrubError, Scrubber};
+use crate::store::Backend;
+#[cfg(feature = "postgres")]
+use crate::store::PostgresBackend;
 #[cfg(feature = "sqlite")]
 use crate::store::SqliteBackend;
-use crate::store::{Backend, PostgresBackend};
 use crate::verify::PythonJsonDumpsCanonicalizer;
+
+// v11.8.0 (CIRISPersist#328) — postgres-free `pyo3-sqlite` build. The
+// `pyo3-sqlite` feature enables this whole FFI surface (same as `pyo3`)
+// but WITHOUT the `postgres` feature, so `PostgresBackend`, the
+// `BackendDispatch::Postgres` variant, and every postgres match arm are
+// `#[cfg(feature = "postgres")]`-gated out (sqlite is the floor). A
+// `postgresql://` dsn is rejected at construction with this message.
+// Method bodies never break: every `match &self.backend` already carries a
+// `Sqlite` arm (Group 1 = native sqlite impl, Group 2 = a stable
+// `…is Postgres-only` runtime error), so gating the `Postgres` arm out
+// leaves a clean, exhaustive sqlite floor — no silent no-ops.
+#[cfg(not(feature = "postgres"))]
+const POSTGRES_ONLY_MSG: &str = "this build has no postgres backend — build \
+ciris-persist with feature `pyo3` (not `pyo3-sqlite`) for postgres";
 
 // ---------------------------------------------------------------------------
 // v1.0.0-scaffold (CIRISPersist#193 + #194) — backend dispatch, typed
@@ -73,6 +89,7 @@ use crate::verify::PythonJsonDumpsCanonicalizer;
 /// `PyEngine` handle).
 #[derive(Clone)]
 pub(crate) enum BackendDispatch {
+    #[cfg(feature = "postgres")]
     Postgres(Arc<PostgresBackend>),
     /// v1.5.1 — every PyEngine method body now reads this arm via
     /// `match &self.backend { … }` dispatch. Group 1 methods call the
@@ -809,6 +826,7 @@ impl PyEngine {
                 })?;
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -860,6 +878,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             py.detach(move || {
                 let ids: Vec<String> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -1015,6 +1034,7 @@ impl PyEngine {
 macro_rules! accord_dispatch {
     ($self:ident, $runtime:ident, $b:ident, $body:expr) => {
         match &$self.backend {
+            #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(pg) => {
                 let $b = pg.clone();
                 $runtime.block_on(async move {
@@ -1181,23 +1201,36 @@ impl PyEngine {
         // primitive is Postgres-only today; on the SQLite arm we
         // simply skip the sweep (it's a Postgres-table migration
         // artifact that doesn't exist on the SQLite schema).
+        #[cfg(feature = "postgres")]
         #[allow(unused_variables)] // borrowed only when local_signer + sweep are wired
         let pg_backend_for_sweep: Option<Arc<PostgresBackend>>;
         let backend: BackendDispatch =
             if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
-                let pg = py.detach(|| {
-                    runtime.block_on(async {
-                        let pg = PostgresBackend::connect(dsn)
-                            .await
-                            .map_err(|e| PyRuntimeError::new_err(format!("connect: {e}")))?;
-                        pg.run_migrations()
-                            .await
-                            .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
-                        Ok::<_, PyErr>(Arc::new(pg))
-                    })
-                })?;
-                pg_backend_for_sweep = Some(pg.clone());
-                BackendDispatch::Postgres(pg)
+                #[cfg(feature = "postgres")]
+                {
+                    let pg = py.detach(|| {
+                        runtime.block_on(async {
+                            let pg = PostgresBackend::connect(dsn)
+                                .await
+                                .map_err(|e| PyRuntimeError::new_err(format!("connect: {e}")))?;
+                            pg.run_migrations()
+                                .await
+                                .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
+                            Ok::<_, PyErr>(Arc::new(pg))
+                        })
+                    })?;
+                    pg_backend_for_sweep = Some(pg.clone());
+                    BackendDispatch::Postgres(pg)
+                }
+                // v11.8.0 (CIRISPersist#328) — sqlite-only build: no postgres
+                // backend compiled in, so a `postgresql://` dsn is rejected
+                // cleanly rather than silently falling through.
+                #[cfg(not(feature = "postgres"))]
+                {
+                    return Err(PyValueError::new_err(format!(
+                        "dsn `{dsn}` uses a postgres:// scheme but {POSTGRES_ONLY_MSG}"
+                    )));
+                }
             } else if dsn.starts_with("sqlite://") || dsn == "sqlite::memory:" {
                 #[cfg(feature = "sqlite")]
                 {
@@ -1239,7 +1272,10 @@ impl PyEngine {
                             Ok::<_, PyErr>(Arc::new(sq))
                         })
                     })?;
-                    pg_backend_for_sweep = None;
+                    #[cfg(feature = "postgres")]
+                    {
+                        pg_backend_for_sweep = None;
+                    }
                     BackendDispatch::Sqlite(sq)
                 }
                 #[cfg(not(feature = "sqlite"))]
@@ -1457,6 +1493,11 @@ impl PyEngine {
         // On the SQLite arm `pg_backend_for_sweep` is `None` and the
         // sweep is silently skipped — same observable shape as
         // `pqc_sweep_on_init=false`.
+        // Sqlite-only build: the sweep is postgres-only, so the flag is
+        // consumed to a no-op rather than warned as unused.
+        #[cfg(not(feature = "postgres"))]
+        let _ = pqc_sweep_on_init;
+        #[cfg(feature = "postgres")]
         if pqc_sweep_on_init {
             if let (Some(pqc_signer), Some(backend_for_sweep)) = (
                 local_signer.as_ref().and_then(|s| s.pqc_signer()),
@@ -1497,9 +1538,10 @@ impl PyEngine {
                 }
                 Some(audit)
             }
+            #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(_) => None,
         };
-        #[cfg(feature = "cirisaudit")]
+        #[cfg(all(feature = "cirisaudit", feature = "postgres"))]
         if let BackendDispatch::Postgres(pg) = &backend {
             if let Some(signer) = local_signer.as_ref() {
                 pg.set_merkle_signer(Some(signer.clone()));
@@ -2600,6 +2642,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
@@ -2774,6 +2817,7 @@ impl PyEngine {
 
                 // Content-KEM role — persist-minted + sealed (stable).
                 let content = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -3016,6 +3060,7 @@ impl PyEngine {
 
             let key_id_for_dict = key_id.clone();
             let outcome = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -3114,6 +3159,7 @@ impl PyEngine {
             };
 
             let summary = py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -3260,6 +3306,7 @@ impl PyEngine {
                     });
 
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -3408,6 +3455,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
                 })?;
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -3527,6 +3575,7 @@ impl PyEngine {
             // the shared backend + signer (the `attestation_promote` /
             // `emit_attestation` cohabitation pattern) and call it.
             let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
@@ -3562,6 +3611,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let key_id = key_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -3632,6 +3682,7 @@ impl PyEngine {
             let claimed = claimed_pubkey_ed25519_base64.to_owned();
             py.detach(move || {
                 let verdict = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -3675,6 +3726,7 @@ impl PyEngine {
             let key_id = key_id.to_owned();
             py.detach(move || {
                 let result = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -3707,6 +3759,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let identity_ref = identity_ref.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -3763,6 +3816,7 @@ impl PyEngine {
                     });
 
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -3928,6 +3982,7 @@ impl PyEngine {
             // Convert the PyO3 dispatch to the crate-level engine dispatch
             // (same shape `federation_directory()` produces).
             let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
@@ -3977,6 +4032,7 @@ impl PyEngine {
             // Convert the PyO3 dispatch to the crate-level engine dispatch
             // (same shape `attestation_promote` reconstructs).
             let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
@@ -4030,6 +4086,7 @@ impl PyEngine {
             })?;
             let runtime = self.runtime.clone();
             let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
@@ -4281,6 +4338,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let attesting_key_id = attesting_key_id.to_owned();
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -4337,6 +4395,7 @@ impl PyEngine {
                     });
 
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -4458,6 +4517,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let revoked_key_id = revoked_key_id.to_owned();
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -4522,6 +4582,7 @@ impl PyEngine {
                 decode_role_authority_inputs(key_directory_json, root_stewards_json)?;
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -4568,6 +4629,7 @@ impl PyEngine {
                 decode_role_authority_inputs(key_directory_json, root_stewards_json)?;
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -4617,6 +4679,7 @@ impl PyEngine {
                 })?;
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -4745,6 +4808,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -4772,6 +4836,7 @@ impl PyEngine {
             let mldsa_pk = pubkey_ml_dsa_65_base64.to_owned();
             let pqc_sig = scrub_signature_pqc.to_owned();
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -4811,6 +4876,7 @@ impl PyEngine {
             let attestation_id = attestation_id.to_owned();
             let pqc_sig = scrub_signature_pqc.to_owned();
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -4850,6 +4916,7 @@ impl PyEngine {
             let revocation_id = revocation_id.to_owned();
             let pqc_sig = scrub_signature_pqc.to_owned();
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -4909,6 +4976,7 @@ impl PyEngine {
             let payload: AddPeerRecordPayload = serde_json::from_str(payload_json)
                 .map_err(|e| PyValueError::new_err(format!("add_peer_record_json decode: {e}")))?;
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -4955,6 +5023,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let key_id = key_id.to_owned();
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -4991,6 +5060,7 @@ impl PyEngine {
             let alias: Option<String> = serde_json::from_str(alias_json)
                 .map_err(|e| PyValueError::new_err(format!("alias_json decode: {e}")))?;
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5033,6 +5103,7 @@ impl PyEngine {
                     ))
                 })?;
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5068,6 +5139,7 @@ impl PyEngine {
             let notes: Option<String> = serde_json::from_str(notes_json)
                 .map_err(|e| PyValueError::new_err(format!("notes_json decode: {e}")))?;
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5106,6 +5178,7 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("policy_json decode: {e}")))?;
             let policy = crate::federation::PeerPolicyBlob(value);
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5145,6 +5218,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let key_id = key_id.to_owned();
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5211,6 +5285,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5273,6 +5348,7 @@ impl PyEngine {
                 None => None,
             };
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5306,6 +5382,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let identity_owned = identity_hash.to_vec();
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5340,6 +5417,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let identity_owned = identity_hash.to_vec();
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5376,6 +5454,7 @@ impl PyEngine {
                 .map(|t| t.with_timezone(&chrono::Utc))
                 .map_err(|e| PyValueError::new_err(format!("now_iso parse: {e}")))?;
             py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5442,6 +5521,7 @@ impl PyEngine {
             // proceed.
             self.disk_pressure_refuse_proxy_accept(&payload.attestation.attesting_key_id)?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5494,6 +5574,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let (sha256, body, media_type) = parse_store_blob_local_payload(payload_json)?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5535,6 +5616,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let (manifest, chunks) = parse_put_blob_chunks_payload(payload_json)?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5591,6 +5673,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let stream_id = stream_id.to_string();
             let sha = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5630,6 +5713,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let stream_id = stream_id.to_string();
             let sha = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5684,6 +5768,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let producer_key_id = producer_key_id.to_string();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5718,6 +5803,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let stream_id = stream_id.to_string();
             let sth_opt = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5768,6 +5854,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let stream_id = stream_id.to_string();
             let proof_opt = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5818,6 +5905,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let stream_id = stream_id.to_string();
             let proof_opt = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5870,6 +5958,7 @@ impl PyEngine {
                 })?;
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -5909,6 +5998,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let stream_id = stream_id.to_string();
             let receipts = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -6060,6 +6150,7 @@ impl PyEngine {
                 identity_occurrence: occurrence,
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -6099,6 +6190,7 @@ impl PyEngine {
             let identity_key_id = identity_key_id.to_owned();
             py.detach(move || {
                 let rows: Vec<crate::federation::IdentityOccurrence> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -6142,6 +6234,7 @@ impl PyEngine {
             let occurrence_key_id = occurrence_key_id.to_owned();
             py.detach(move || {
                 let row: Option<crate::federation::IdentityOccurrence> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -6199,6 +6292,7 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("family decode: {e}")))?;
             let signed = crate::federation::SignedFamily { family };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -6243,6 +6337,7 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("community decode: {e}")))?;
             let signed = crate::federation::SignedCommunity { community };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -6601,6 +6696,7 @@ impl PyEngine {
             let family_key_id = family_key_id.to_owned();
             py.detach(move || {
                 let row: Option<crate::federation::Family> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -6645,6 +6741,7 @@ impl PyEngine {
             let member_identity_key_id = member_identity_key_id.to_owned();
             py.detach(move || {
                 let rows: Vec<crate::federation::Family> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -6697,6 +6794,7 @@ impl PyEngine {
             let community_key_id = community_key_id.to_owned();
             py.detach(move || {
                 let row: Option<crate::federation::Community> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -6744,6 +6842,7 @@ impl PyEngine {
             let member_identity_key_id = member_identity_key_id.to_owned();
             py.detach(move || {
                 let rows: Vec<crate::federation::Community> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -6788,6 +6887,7 @@ impl PyEngine {
             let member_identity_key_id = member_identity_key_id.to_owned();
             py.detach(move || {
                 let rows: Vec<crate::federation::Family> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -6832,6 +6932,7 @@ impl PyEngine {
             let member_identity_key_id = member_identity_key_id.to_owned();
             py.detach(move || {
                 let rows: Vec<crate::federation::Community> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -6876,6 +6977,7 @@ impl PyEngine {
             let family_key_id = family_key_id.to_owned();
             py.detach(move || {
                 let rows: Vec<crate::federation::FamilyMembershipRevocation> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -6922,6 +7024,7 @@ impl PyEngine {
             py.detach(move || {
                 let rows: Vec<crate::federation::CommunityMembershipRevocation> =
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => {
                             let backend = pg.clone();
                             runtime.block_on(async move {
@@ -6973,6 +7076,7 @@ impl PyEngine {
             let duty = duty.to_owned();
             py.detach(move || {
                 let is_mod: bool = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -7025,6 +7129,7 @@ impl PyEngine {
             let key_id = key_id.to_owned();
             py.detach(move || {
                 let bound: bool = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -7074,6 +7179,7 @@ impl PyEngine {
             let key_id = key_id.to_owned();
             py.detach(move || {
                 let band = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -7125,6 +7231,7 @@ impl PyEngine {
             let duty = duty.to_owned();
             py.detach(move || {
                 let holders: std::collections::HashSet<String> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -7187,6 +7294,7 @@ impl PyEngine {
             let duty = duty.to_owned();
             py.detach(move || {
                 let holders: std::collections::HashSet<String> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -7241,6 +7349,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let sha = parse_sha256_hex(sha256_hex)?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -7329,6 +7438,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let sha = parse_sha256_hex(sha256_hex)?;
             let range_opt = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -7418,6 +7528,7 @@ impl PyEngine {
                     ))
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -7477,6 +7588,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let record_id = parse_fixed_bytes::<32>(record_id, "record_id")?;
             let sym_opt = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -7523,6 +7635,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let sha = parse_sha256_hex(sha256_hex)?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -7550,6 +7663,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let sha = parse_sha256_hex(sha256_hex)?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -7596,6 +7710,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let sha = parse_sha256_hex(sha256_hex)?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -7642,6 +7757,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let actor = attesting_key_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -7707,6 +7823,7 @@ impl PyEngine {
                 )
             })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -7849,6 +7966,7 @@ impl PyEngine {
             let media_type_owned = media_type.map(str::to_owned);
 
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -7915,6 +8033,7 @@ impl PyEngine {
             let grant: crate::federation::TrustGrant = serde_json::from_str(trust_grant_json)
                 .map_err(|e| PyValueError::new_err(format!("TrustGrant JSON decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -7949,6 +8068,7 @@ impl PyEngine {
             let key = key.to_owned();
             let revoked_by = revoked_by.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -7983,6 +8103,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let key = key.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -8062,6 +8183,7 @@ impl PyEngine {
                 include_expired: wire.include_expired,
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -8122,6 +8244,7 @@ impl PyEngine {
             let goal: crate::federation::Goal = serde_json::from_str(goal_json)
                 .map_err(|e| PyValueError::new_err(format!("Goal JSON decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -8152,6 +8275,7 @@ impl PyEngine {
             let goal_uuid = uuid::Uuid::parse_str(goal_id)
                 .map_err(|e| PyValueError::new_err(format!("goal_id is not a valid UUID: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -8223,6 +8347,7 @@ impl PyEngine {
                 include_retired: wire.include_retired,
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -8277,6 +8402,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("retired_at is not valid RFC3339: {e}"))
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -8368,6 +8494,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
 
             let summary = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -8460,6 +8587,7 @@ impl PyEngine {
             let signature_key_id = signature_key_id.to_owned();
 
             let summary = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -8542,6 +8670,7 @@ impl PyEngine {
             let agent_id_hash = agent_id_hash.to_owned();
 
             let summary = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -8616,6 +8745,7 @@ impl PyEngine {
 
             let rows: Vec<(i64, crate::store::types::TraceEventRow)> = py
                 .detach(move || match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -8719,6 +8849,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -8770,6 +8901,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -8811,6 +8943,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -8862,6 +8995,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             py.detach(move || {
                 match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -8904,6 +9038,7 @@ impl PyEngine {
         let content = catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -8981,6 +9116,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -9020,6 +9156,7 @@ impl PyEngine {
         let record = catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -9061,6 +9198,7 @@ impl PyEngine {
         let records = catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -9144,6 +9282,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -9201,6 +9340,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -9360,6 +9500,7 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("CompleteTrace JSON decode: {e}")))?;
             let runtime = self.runtime.clone();
             match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let key_dir = TraceKeyDirectory {
                         backend: pg.clone(),
@@ -9447,6 +9588,7 @@ impl PyEngine {
 
             let outcome = py
             .detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -9728,6 +9870,7 @@ impl PyEngine {
             let esv = edge_schema_version.to_owned();
             let env_bytes = envelope_bytes.to_vec();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -9794,6 +9937,7 @@ impl PyEngine {
             let claimed_by_owned = claimed_by.to_owned();
             let rows = py
                 .detach(move || match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -9842,6 +9986,7 @@ impl PyEngine {
             let qid = queue_id.to_owned();
             let transport = transport.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -9886,6 +10031,7 @@ impl PyEngine {
             let transport = transport.to_owned();
             let outcome = py
                 .detach(move || match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -9943,6 +10089,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -9983,6 +10130,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let row_opt = py
                 .detach(move || match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -10021,6 +10169,7 @@ impl PyEngine {
             let qid = queue_id.to_owned();
             let ack = ack_envelope_bytes.to_vec();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10048,6 +10197,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10074,6 +10224,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10101,6 +10252,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10134,6 +10286,7 @@ impl PyEngine {
             let qid = queue_id.to_owned();
             let row_opt = py
                 .detach(move || match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -10205,6 +10358,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let rows = py
                 .detach(move || match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -10233,6 +10387,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10261,6 +10416,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let qid = queue_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10323,6 +10479,7 @@ impl PyEngine {
             let ml_dsa_b64 = base64_encode(&event.ml_dsa_65_sig);
 
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10423,6 +10580,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("EdgeDetectionEvent JSON decode: {e}"))
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10476,6 +10634,7 @@ impl PyEngine {
                 }
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10555,6 +10714,7 @@ impl PyEngine {
                 }
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10608,6 +10768,7 @@ impl PyEngine {
             let ml_dsa_b64 = base64_encode(&bundle.ml_dsa_65_sig);
 
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10692,6 +10853,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10744,6 +10906,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10828,6 +10991,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10879,6 +11043,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -10946,6 +11111,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11017,6 +11183,7 @@ impl PyEngine {
             let trace_id = trace_id.to_owned();
             let thought_id = thought_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11072,6 +11239,7 @@ impl PyEngine {
             let trace_id = trace_id.to_owned();
             let thought_id = thought_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11129,6 +11297,7 @@ impl PyEngine {
             let features: crate::pipeline::extract::Features = serde_json::from_str(features_json)
                 .map_err(|e| PyValueError::new_err(format!("Features JSON decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11181,6 +11350,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("classifications JSON decode: {e}"))
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11243,6 +11413,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11313,6 +11484,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11373,6 +11545,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11450,6 +11623,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11509,6 +11683,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11578,6 +11753,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11655,6 +11831,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11724,6 +11901,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11794,6 +11972,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11861,6 +12040,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11931,6 +12111,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -11995,6 +12176,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12056,6 +12238,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12117,6 +12300,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12189,6 +12373,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12260,6 +12445,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12370,6 +12556,7 @@ impl PyEngine {
                     true
                 };
                 let summary = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -12438,6 +12625,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12491,6 +12679,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12544,6 +12733,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12598,6 +12788,7 @@ impl PyEngine {
             let dispatch = self.engine_dispatch();
             let signer = self.signer.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12665,6 +12856,7 @@ impl PyEngine {
             let value = value.to_owned();
             let accessor = accessor.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12706,6 +12898,7 @@ impl PyEngine {
             let key = key.to_owned();
             let accessor = accessor.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12750,6 +12943,7 @@ impl PyEngine {
             let purpose = purpose.to_owned();
             let accessor = accessor.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12805,6 +12999,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("SecretsListFilter JSON decode: {e}"))
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12846,6 +13041,7 @@ impl PyEngine {
             let uuid = uuid.to_owned();
             let accessor = accessor.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -12924,6 +13120,7 @@ impl PyEngine {
             let smi = source_message_id.to_owned();
             let accessor = accessor.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13015,6 +13212,7 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("DetectedSecret decode: {e}")))?;
             let accessor = accessor.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13072,6 +13270,7 @@ impl PyEngine {
             let ctx: crate::secrets::DecapsulationContext = serde_json::from_str(ctx_json)
                 .map_err(|e| PyValueError::new_err(format!("DecapsulationContext decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13113,6 +13312,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let pt = plaintext.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13147,6 +13347,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let ct = ciphertext.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13181,6 +13382,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13229,6 +13431,7 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("FilterUpdateRequest decode: {e}")))?;
             let accessor = accessor.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13269,6 +13472,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13308,6 +13512,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13348,6 +13553,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let uuid = secret_uuid.map(str::to_owned);
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13397,6 +13603,7 @@ impl PyEngine {
                     .map_err(|e| PyValueError::new_err(format!("MasterKeyRef decode: {e}")))?;
             let accessor = accessor.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13454,6 +13661,7 @@ impl PyEngine {
             };
             let accessor = accessor.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13493,6 +13701,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13529,6 +13738,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let accessor = accessor.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13579,6 +13789,7 @@ impl PyEngine {
                 PyValueError::new_err(format!("ContributionEnvelope decode: {e}"))
             })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13614,6 +13825,7 @@ impl PyEngine {
             let env: crate::cirisnode::VoteEnvelope = serde_json::from_str(envelope_json)
                 .map_err(|e| PyValueError::new_err(format!("VoteEnvelope decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13649,6 +13861,7 @@ impl PyEngine {
             let update: crate::cirisnode::CreditsUpdate = serde_json::from_str(update_json)
                 .map_err(|e| PyValueError::new_err(format!("CreditsUpdate decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13684,6 +13897,7 @@ impl PyEngine {
             let update: crate::cirisnode::ExpertiseUpdate = serde_json::from_str(update_json)
                 .map_err(|e| PyValueError::new_err(format!("ExpertiseUpdate decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13719,6 +13933,7 @@ impl PyEngine {
             let event: crate::cirisnode::ModerationEvent = serde_json::from_str(event_json)
                 .map_err(|e| PyValueError::new_err(format!("ModerationEvent decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13754,6 +13969,7 @@ impl PyEngine {
             let att: crate::cirisnode::SlashingAttestation = serde_json::from_str(att_json)
                 .map_err(|e| PyValueError::new_err(format!("SlashingAttestation decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13795,6 +14011,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("ReconsiderationRequest decode: {e}"))
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13836,6 +14053,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("ReconsiderationAttestation decode: {e}"))
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13876,6 +14094,7 @@ impl PyEngine {
             let att: crate::cirisnode::PromotionAttestation = serde_json::from_str(att_json)
                 .map_err(|e| PyValueError::new_err(format!("PromotionAttestation decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13917,6 +14136,7 @@ impl PyEngine {
             let domain = domain.to_owned();
             let language = language.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -13969,6 +14189,7 @@ impl PyEngine {
             let language = language.to_owned();
             let subject = subject.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -14032,6 +14253,7 @@ impl PyEngine {
                 ),
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -14087,6 +14309,7 @@ impl PyEngine {
                 ),
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -14137,6 +14360,7 @@ impl PyEngine {
             let language = language.to_owned();
             let subject = subject.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -14191,6 +14415,7 @@ impl PyEngine {
             let domain = domain.to_owned();
             let language = language.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -14253,6 +14478,7 @@ impl PyEngine {
             let att: crate::cirisnode::DeliveryAttestation = serde_json::from_str(attestation_json)
                 .map_err(|e| PyValueError::new_err(format!("DeliveryAttestation decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -14293,6 +14519,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let announcement_id = announcement_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -14338,6 +14565,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let announcement_id = announcement_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -14379,6 +14607,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let sha = content_sha256.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -14453,6 +14682,7 @@ impl PyEngine {
                     crate::engine::media_validate_limit(limit)
                         .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
                     let rows = match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => pg.list_takedowns_for(&target).await,
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => {
@@ -14529,9 +14759,11 @@ impl PyEngine {
                         .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
                     let content = filter.content_sha256.as_deref();
                     let rows = match (&self.backend, content) {
+                        #[cfg(feature = "postgres")]
                         (BackendDispatch::Postgres(pg), Some(sha)) => {
                             pg.list_key_grants_for_content(sha, &recipient).await
                         }
+                        #[cfg(feature = "postgres")]
                         (BackendDispatch::Postgres(pg), None) => {
                             pg.list_key_grants_for(&recipient).await
                         }
@@ -14583,6 +14815,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let recipient = recipient_key_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -14629,6 +14862,7 @@ impl PyEngine {
             let sha = content_sha256.to_owned();
             let recipient = recipient_key_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -14676,6 +14910,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let stream = stream_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -14793,6 +15028,7 @@ impl PyEngine {
             // emission; match it against the local alias.
             let signer = self.select_signer(&actor);
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -14882,6 +15118,7 @@ impl PyEngine {
                 .unwrap_or_else(|p| p.into_inner())
                 .clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     let cfg = cfg_snapshot.clone();
@@ -14958,6 +15195,7 @@ impl PyEngine {
                 Some(m) => Some(Arc::new(PyPerceptualHashMatcher::new(m))),
             };
             match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     pg.set_perceptual_hash_matcher(matcher_arc);
                 }
@@ -14999,6 +15237,7 @@ impl PyEngine {
             let node: crate::graph::GraphNode = serde_json::from_str(node_json)
                 .map_err(|e| PyValueError::new_err(format!("GraphNode decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15043,6 +15282,7 @@ impl PyEngine {
             let edge: crate::graph::GraphEdge = serde_json::from_str(edge_json)
                 .map_err(|e| PyValueError::new_err(format!("GraphEdge decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15085,6 +15325,7 @@ impl PyEngine {
             let scope = crate::graph::GraphScope::from_sql_str(scope)
                 .ok_or_else(|| PyValueError::new_err(format!("unknown GraphScope: {scope}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15126,6 +15367,7 @@ impl PyEngine {
             let scope = crate::graph::GraphScope::from_sql_str(scope)
                 .ok_or_else(|| PyValueError::new_err(format!("unknown GraphScope: {scope}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15192,6 +15434,7 @@ impl PyEngine {
                 })?),
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15242,6 +15485,7 @@ impl PyEngine {
             let cfg: crate::graph::TraversalConfig = serde_json::from_str(config_json)
                 .map_err(|e| PyValueError::new_err(format!("TraversalConfig decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15296,6 +15540,7 @@ impl PyEngine {
                 ),
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15338,6 +15583,7 @@ impl PyEngine {
             let filter: crate::graph::NodeFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("NodeFilter decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15373,6 +15619,7 @@ impl PyEngine {
             let scope_parsed = crate::graph::GraphScope::from_sql_str(scope)
                 .ok_or_else(|| PyValueError::new_err(format!("unknown scope: {scope}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15409,6 +15656,7 @@ impl PyEngine {
             let scope_parsed = crate::graph::GraphScope::from_sql_str(scope)
                 .ok_or_else(|| PyValueError::new_err(format!("unknown scope: {scope}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15540,6 +15788,7 @@ impl PyEngine {
             let entry: crate::audit::AuditEntry = serde_json::from_str(entry_json)
                 .map_err(|e| PyValueError::new_err(format!("AuditEntry decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15588,6 +15837,7 @@ impl PyEngine {
                 ),
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15635,6 +15885,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15749,6 +16000,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("FederationDirectoryFilter decode: {e}"))
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15797,6 +16049,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let from_key = from_key.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -15845,6 +16098,7 @@ impl PyEngine {
             let community_key_id = community_key_id.to_owned();
             py.detach(move || {
                 let rows: Vec<crate::federation::types::CommunityMember> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -15883,6 +16137,7 @@ impl PyEngine {
             let family_key_id = family_key_id.to_owned();
             py.detach(move || {
                 let rows: Vec<crate::federation::types::FamilyMember> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -15979,6 +16234,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -16022,6 +16278,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -16065,6 +16322,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -16104,6 +16362,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -16143,6 +16402,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -16184,6 +16444,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -16236,6 +16497,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -16328,6 +16590,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -16367,6 +16630,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -16409,6 +16673,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -16466,6 +16731,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -16518,6 +16784,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -16607,6 +16874,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -16632,6 +16900,7 @@ impl PyEngine {
             let duty = duty.to_owned();
             py.detach(move || {
                 let mods: Vec<String> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -16674,6 +16943,7 @@ impl PyEngine {
             let key_id = key_id.to_owned();
             py.detach(move || {
                 let bindings: Vec<String> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -16717,6 +16987,7 @@ impl PyEngine {
             let owner = steward_user_key_id.to_owned();
             py.detach(move || {
                 let nodes: Vec<String> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -16752,6 +17023,7 @@ impl PyEngine {
             let key_id = key_id.to_owned();
             py.detach(move || {
                 let chain: Vec<String> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -16797,6 +17069,7 @@ impl PyEngine {
             let target_key_id = target_key_id.to_owned();
             let scope = scope.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -16852,6 +17125,7 @@ impl PyEngine {
             let target_key_id = target_key_id.to_owned();
             let scope = scope.to_owned();
             let verdict = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -16909,6 +17183,7 @@ impl PyEngine {
             let key_id = key_id.to_owned();
             py.detach(move || {
                 let rows: Vec<crate::federation::Attestation> = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -16956,6 +17231,7 @@ impl PyEngine {
                 serde_json::from_str(member_json)
                     .map_err(|e| PyValueError::new_err(format!("CommunityMember decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17078,6 +17354,7 @@ impl PyEngine {
                 )
             })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17159,6 +17436,7 @@ impl PyEngine {
                 )
             })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17229,6 +17507,7 @@ impl PyEngine {
                     )
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17285,6 +17564,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("TrustGrantFilter JSON decode: {e}"))
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17329,6 +17609,7 @@ impl PyEngine {
                 .parse()
                 .map_err(|e| PyValueError::new_err(format!("grant_id must be UUID: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17379,6 +17660,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17443,6 +17725,7 @@ impl PyEngine {
             let tenant_id = tenant_id.to_owned();
             py.detach(move || {
                 let pos = match &self.backend {
+                    #[cfg(feature = "postgres")]
                     BackendDispatch::Postgres(pg) => {
                         let backend = pg.clone();
                         runtime.block_on(async move {
@@ -17495,6 +17778,7 @@ impl PyEngine {
                 .parse()
                 .map_err(|e| PyValueError::new_err(format!("grant_id must be UUID: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17553,6 +17837,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let tenant_id = tenant_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17621,6 +17906,7 @@ impl PyEngine {
                 )
             })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17665,6 +17951,7 @@ impl PyEngine {
             let obs: crate::telemetry::MetricObservation = serde_json::from_str(obs_json)
                 .map_err(|e| PyValueError::new_err(format!("MetricObservation decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17702,6 +17989,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("Vec<MetricObservation> decode: {e}"))
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17750,6 +18038,7 @@ impl PyEngine {
                 ),
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17793,6 +18082,7 @@ impl PyEngine {
             let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
                 .map_err(|e| PyValueError::new_err(format!("ConsolidationRequest decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17861,6 +18151,7 @@ impl PyEngine {
                     .map_err(|e| PyValueError::new_err(format!("to parse: {e}")))?
                     .with_timezone(&chrono::Utc);
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17917,6 +18208,7 @@ impl PyEngine {
                     .map_err(|e| PyValueError::new_err(format!("period_start parse: {e}")))?
                     .with_timezone(&chrono::Utc);
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -17978,6 +18270,7 @@ impl PyEngine {
                     .map_err(|e| PyValueError::new_err(format!("before parse: {e}")))?
                     .with_timezone(&chrono::Utc);
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18021,6 +18314,7 @@ impl PyEngine {
             let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
                 .map_err(|e| PyValueError::new_err(format!("ConsolidationRequest decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18068,6 +18362,7 @@ impl PyEngine {
             let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
                 .map_err(|e| PyValueError::new_err(format!("ConsolidationRequest decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18114,6 +18409,7 @@ impl PyEngine {
             let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
                 .map_err(|e| PyValueError::new_err(format!("ConsolidationRequest decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18160,6 +18456,7 @@ impl PyEngine {
             let req: crate::telemetry::ConsolidationRequest = serde_json::from_str(req_json)
                 .map_err(|e| PyValueError::new_err(format!("ConsolidationRequest decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18232,6 +18529,7 @@ impl PyEngine {
                     .map_err(|e| PyValueError::new_err(format!("to parse: {e}")))?
                     .with_timezone(&chrono::Utc);
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18286,6 +18584,7 @@ impl PyEngine {
                     .map_err(|e| PyValueError::new_err(format!("to parse: {e}")))?
                     .with_timezone(&chrono::Utc);
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18337,6 +18636,7 @@ impl PyEngine {
             let inc: crate::incident::Incident = serde_json::from_str(incident_json)
                 .map_err(|e| PyValueError::new_err(format!("Incident decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18373,6 +18673,7 @@ impl PyEngine {
             let t: crate::incident::IncidentTransition = serde_json::from_str(transition_json)
                 .map_err(|e| PyValueError::new_err(format!("IncidentTransition decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18421,6 +18722,7 @@ impl PyEngine {
                     })?),
                 };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18463,6 +18765,7 @@ impl PyEngine {
             let tenant_id = tenant_id.to_owned();
             let key = key.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18522,6 +18825,7 @@ impl PyEngine {
             let task: crate::tasks::Task = serde_json::from_str(task_json)
                 .map_err(|e| PyValueError::new_err(format!("Task decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18563,6 +18867,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let task_id = task_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18623,6 +18928,7 @@ impl PyEngine {
                 ),
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18682,6 +18988,7 @@ impl PyEngine {
             };
             let task_id = task_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18718,6 +19025,7 @@ impl PyEngine {
             let task: crate::tasks::Task = serde_json::from_str(task_json)
                 .map_err(|e| PyValueError::new_err(format!("Task decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18763,6 +19071,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let task_id = task_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18808,6 +19117,7 @@ impl PyEngine {
             let thought: crate::thoughts::Thought = serde_json::from_str(thought_json)
                 .map_err(|e| PyValueError::new_err(format!("Thought decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18843,6 +19153,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let thought_id = thought_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18904,6 +19215,7 @@ impl PyEngine {
                 ),
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -18964,6 +19276,7 @@ impl PyEngine {
             };
             let thought_id = thought_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19004,6 +19317,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let thought_id = thought_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19041,6 +19355,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let thought_id = thought_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19096,6 +19411,7 @@ impl PyEngine {
                 serde_json::from_str(correlation_json)
                     .map_err(|e| PyValueError::new_err(format!("Correlation decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19137,6 +19453,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let correlation_id = correlation_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19206,6 +19523,7 @@ impl PyEngine {
             };
             let correlation_id = correlation_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19260,6 +19578,7 @@ impl PyEngine {
                 })?),
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19313,6 +19632,7 @@ impl PyEngine {
             let task: crate::scheduled_tasks::ScheduledTask = serde_json::from_str(task_json)
                 .map_err(|e| PyValueError::new_err(format!("ScheduledTask decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19364,6 +19684,7 @@ impl PyEngine {
                 .with_timezone(&chrono::Utc);
             let occ = agent_occurrence_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19457,6 +19778,7 @@ impl PyEngine {
                 };
             let task_id_owned = task_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19520,6 +19842,7 @@ impl PyEngine {
             let ticket: crate::tickets::Ticket = serde_json::from_str(ticket_json)
                 .map_err(|e| PyValueError::new_err(format!("Ticket decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19553,6 +19876,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let ticket_id = ticket_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19618,6 +19942,7 @@ impl PyEngine {
                 ),
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19679,6 +20004,7 @@ impl PyEngine {
             let ticket_id_owned = ticket_id.to_owned();
             let user_identifier_owned = user_identifier.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19749,6 +20075,7 @@ impl PyEngine {
             let ticket_id_owned = ticket_id.to_owned();
             let notes_owned = notes.map(|s| s.to_owned());
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19820,6 +20147,7 @@ impl PyEngine {
             let report: crate::deferral_reports::DeferralReport = serde_json::from_str(report_json)
                 .map_err(|e| PyValueError::new_err(format!("DeferralReport decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19863,6 +20191,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let message_id = message_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19922,6 +20251,7 @@ impl PyEngine {
             let filter: crate::deferral_reports::DeferralFilter = serde_json::from_str(filter_json)
                 .map_err(|e| PyValueError::new_err(format!("DeferralFilter decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -19979,6 +20309,7 @@ impl PyEngine {
             let message_id_owned = message_id.to_owned();
             let resolution_notes_owned = resolution_notes.map(|s| s.to_owned());
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20060,6 +20391,7 @@ impl PyEngine {
                 ),
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20112,6 +20444,7 @@ impl PyEngine {
             let lock_key = lock_key.to_owned();
             let locked_by = locked_by.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20151,6 +20484,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let lock_key = lock_key.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20217,6 +20551,7 @@ impl PyEngine {
                 serde_json::from_str(ceremony_json)
                     .map_err(|e| PyValueError::new_err(format!("CreationCeremony decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20261,6 +20596,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let ceremony_id = ceremony_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20317,6 +20653,7 @@ impl PyEngine {
                 serde_json::from_str(filter_json)
                     .map_err(|e| PyValueError::new_err(format!("CeremonyFilter decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20377,6 +20714,7 @@ impl PyEngine {
             })?;
             let ceremony_id_owned = ceremony_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20436,6 +20774,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("ContinuityAwareness decode: {e}"))
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20480,6 +20819,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let agent_id = agent_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20532,6 +20872,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let agent_id = agent_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20590,6 +20931,7 @@ impl PyEngine {
                 serde_json::from_str(feedback_json)
                     .map_err(|e| PyValueError::new_err(format!("FeedbackMapping decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20640,6 +20982,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let thought_id = thought_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20689,6 +21032,7 @@ impl PyEngine {
                 serde_json::from_str(filter_json)
                     .map_err(|e| PyValueError::new_err(format!("FeedbackFilter decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20753,6 +21097,7 @@ impl PyEngine {
             let cert: crate::wa_cert::WaCert = serde_json::from_str(cert_json)
                 .map_err(|e| PyValueError::new_err(format!("WaCert decode: {e}")))?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20788,6 +21133,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let wa_id = wa_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20836,6 +21182,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let kid = jwt_kid.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20891,6 +21238,7 @@ impl PyEngine {
             let provider = oauth_provider.to_owned();
             let ext = oauth_external_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20945,6 +21293,7 @@ impl PyEngine {
                 ))
             })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -20987,6 +21336,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let wa_id = wa_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -21035,6 +21385,7 @@ impl PyEngine {
                 })?
                 .with_timezone(&chrono::Utc);
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -21095,6 +21446,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("RevokedServiceToken decode: {e}"))
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -21134,6 +21486,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -21187,6 +21540,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let token_hash = token_hash.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -21255,6 +21609,7 @@ impl PyEngine {
             let identity = identity.to_owned();
             let stream = stream.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -21293,6 +21648,7 @@ impl PyEngine {
             let identity = identity.to_owned();
             let stream = stream.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -21363,6 +21719,7 @@ impl PyEngine {
                 })?),
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -21408,6 +21765,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let occurrence_id = occurrence_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -21446,6 +21804,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let occurrence_id = occurrence_id.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -21487,6 +21846,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let identity = identity.to_owned();
             let records = py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -21560,6 +21920,7 @@ impl PyEngine {
                     PyValueError::new_err(format!("LegacyMigrationOptions decode: {e}"))
                 })?;
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
@@ -21613,6 +21974,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let svc =
                         crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
@@ -21666,6 +22028,7 @@ impl PyEngine {
                 Some(seconds) => crate::maintenance::ArchiveWindow::Custom { seconds },
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let svc =
                         crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
@@ -21723,6 +22086,7 @@ impl PyEngine {
                 })?
                 .with_timezone(&chrono::Utc);
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let svc =
                         crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
@@ -21766,6 +22130,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let svc =
                         crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
@@ -21856,6 +22221,7 @@ impl PyEngine {
                 interval_secs,
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let svc =
                         crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
@@ -21890,6 +22256,7 @@ impl PyEngine {
             let runtime = self.runtime.clone();
             let table_name = table_name.to_owned();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let svc =
                         crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
@@ -21938,6 +22305,7 @@ impl PyEngine {
         catch_panic(|| {
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let svc =
                         crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
@@ -21992,6 +22360,7 @@ impl PyEngine {
                     .with_timezone(&chrono::Utc),
             };
             py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let svc =
                         crate::maintenance::postgres::PostgresMaintenanceBackend::new(pg.clone());
@@ -22539,6 +22908,7 @@ impl PyEngine {
         py: Python<'py>,
     ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
         let gate = match &self.backend {
+            #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => b.admission_gate(),
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => b.admission_gate(),
@@ -22763,6 +23133,7 @@ impl PyEngine {
         Arc<crate::signing::LocalSigner>,
     )> {
         let backend = match &self.backend {
+            #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
@@ -22823,6 +23194,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -22887,6 +23259,7 @@ impl PyEngine {
                         }};
                     }
                     match &self.backend {
+                        #[cfg(feature = "postgres")]
                         BackendDispatch::Postgres(pg) => dispatch!(pg),
                         #[cfg(feature = "sqlite")]
                         BackendDispatch::Sqlite(sq) => dispatch!(sq),
@@ -24603,6 +24976,7 @@ struct BootAuditBreak {
 async fn boot_audit_self_verify(backend: &BackendDispatch) -> Result<BootAuditSummary, String> {
     use crate::audit::AuditService;
     let tenant_ids: Vec<String> = match backend {
+        #[cfg(feature = "postgres")]
         BackendDispatch::Postgres(pg) => pg
             .pool()
             .get()
@@ -24643,6 +25017,7 @@ async fn boot_audit_self_verify(backend: &BackendDispatch) -> Result<BootAuditSu
 
     for tid in &tenant_ids {
         let verif = match backend {
+            #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(pg) => pg.verify_chain(tid, 1, None).await,
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(sq) => {
@@ -24716,6 +25091,7 @@ async fn build_audit_chain_proof(
     // the "first time persist saw this trace" anchor the UI cares
     // about.
     let located: Option<(String, i64)> = match backend {
+        #[cfg(feature = "postgres")]
         BackendDispatch::Postgres(pg) => {
             let client = pg.pool().get().await.map_err(|e| format!("pool: {e}"))?;
             let rows = client
@@ -24778,6 +25154,7 @@ async fn build_audit_chain_proof(
     // the matched tenant. Mirrors `audit_verify_all_chains`'s
     // per-backend dispatch.
     let entries: Vec<AuditChainEntry> = match backend {
+        #[cfg(feature = "postgres")]
         BackendDispatch::Postgres(pg) => {
             let client = pg.pool().get().await.map_err(|e| format!("pool: {e}"))?;
             let rows = client
@@ -24879,6 +25256,7 @@ async fn build_audit_chain_proof(
     // We tolerate `NotImplemented` / `None` cleanly — UIs that don't
     // need the proof can ignore the field.
     let head_signature: Option<String> = match backend {
+        #[cfg(feature = "postgres")]
         BackendDispatch::Postgres(pg) => match pg.current_sth(&tenant_id).await {
             Ok(Some(sth)) => Some(
                 serde_json::to_string(&sth).map_err(|e| format!("SignedTreeHead encode: {e}"))?,
@@ -26112,6 +26490,7 @@ impl EngineCell {
     /// **no second pool**.
     fn engine_backend_dispatch(&self) -> crate::engine::BackendDispatch {
         match &self.backend {
+            #[cfg(feature = "postgres")]
             BackendDispatch::Postgres(pg) => crate::engine::BackendDispatch::Postgres(pg.clone()),
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(sq) => crate::engine::BackendDispatch::Sqlite(sq.clone()),

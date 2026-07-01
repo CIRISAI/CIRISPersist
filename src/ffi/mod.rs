@@ -74,7 +74,7 @@ pub mod outbound_queue_capsule;
 
 pub mod signer_capsule;
 
-#[cfg(feature = "pyo3")]
+#[cfg(feature = "_pyffi")]
 pub mod pyo3;
 
 // v3.8.0 (CIRISPersist#151) — wheel-surface modules wrapping
@@ -85,17 +85,17 @@ pub mod pyo3;
 // verify primitive its own ABI uses so downstream Python consumers
 // can call them through `ciris-persist` natively.
 
-#[cfg(feature = "pyo3")]
+#[cfg(feature = "_pyffi")]
 pub mod wheel_hybrid_kex;
 
-#[cfg(feature = "pyo3")]
+#[cfg(feature = "_pyffi")]
 pub mod wheel_key_grant;
 
-#[cfg(feature = "pyo3")]
+#[cfg(feature = "_pyffi")]
 pub mod wheel_locale_merkle;
 
-#[cfg(feature = "pyo3")]
+#[cfg(feature = "_pyffi")]
 pub mod wheel_reconsider_dos;
 
-#[cfg(feature = "pyo3")]
+#[cfg(feature = "_pyffi")]
 pub mod wheel_skill_import;

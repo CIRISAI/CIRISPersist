@@ -189,7 +189,7 @@ pub use derived::{
 pub use federation::FederationDirectory;
 #[cfg(feature = "sqlite")]
 pub use federation::FederationDirectorySqlite;
-#[cfg(feature = "pyo3")]
+#[cfg(feature = "_pyffi")]
 pub use ffi::pyo3::{current_runtime_handle, current_rust_engine};
 pub use ingest::{BatchSummary, IngestError, IngestPipeline};
 pub use journal::{Journal, JournalError};
@@ -209,7 +209,7 @@ pub use retention::{ArchiveHandle, RetentionError, StorageSummary, TableUsage};
 
 // Phase 1 surfaces still pending implementation:
 //   #[cfg(feature = "server")] pub mod server;
-//   #[cfg(feature = "pyo3")]   pub mod ffi;
+//   #[cfg(feature = "_pyffi")]   pub mod ffi;
 
 /// Crate-wide error type.
 ///
