@@ -1535,7 +1535,12 @@ pub async fn reachable_under_scope(
 ///
 /// `#[non_exhaustive]` — future walk refinements may add reasons (or
 /// attach payloads to the existing ones) without a further major bump.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` (CIRISPersist#320) so the verdict rides
+/// back across the ABI-stable directory dispatch capsule
+/// ([`crate::ffi::directory_capsule`]) as the
+/// `DirectoryOpResult::Reachability` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ReachabilityVerdict {
     /// A `delegates_to` chain from the issuer reaches the target where

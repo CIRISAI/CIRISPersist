@@ -36,7 +36,14 @@ use super::types::FountainManifestV1;
 
 /// The five fountain eviction tiers (CIRISPersist#227 keep-count table).
 /// Severity order: `Full < T2 < T3 < T4 < T5` (tighter = more evicted).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// `Serialize`/`Deserialize` (CIRISPersist#320) so this rides the
+/// `DirectoryOp::EvictFountainContentToTier` argument across the
+/// ABI-stable directory dispatch capsule
+/// ([`crate::ffi::directory_capsule`]).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum FountainTier {
     /// Keep `n_source + k_repair` — lossless + FEC headroom.
     Full,
