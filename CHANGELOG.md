@@ -5,6 +5,56 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.6.0] — 2026-07-01
+
+### Added — #320: ABI-stable FederationDirectory dispatch capsule (fixes the cross-cdylib vtable-skew class)
+
+**Root cause.** `PyEngine::federation_directory_capsule` hands a consumer wheel
+(CIRISEdge) a raw `Arc<dyn FederationDirectory>` across the cdylib boundary. The
+consumer then calls trait methods on it using ITS OWN statically-compiled vtable
+slot indices — but Rust does NOT guarantee a `dyn Trait` vtable's slot order is
+stable across builds/versions. A consumer built against persist v11.2.0 running
+against a v11.5.0 wheel computes the wrong slot for a method (e.g. its index for
+`put_transport_destination` lands on the wheel's `lookup_shared_instance_lease`),
+misdispatches, and hangs — the #320 symptom (and, in the general case, memory-
+unsafe argument reinterpretation). Same structural class as the cross-tokio
+aliasing #156/#157 and the libsqlite3 cross-cdylib SIGSEGV #141: a Rust type
+whose in-memory contract is not guaranteed stable, passed by-value across the
+static-vs-wheel boundary.
+
+**Fix.** New `src/ffi/directory_capsule.rs` — a C-ABI serialized-op dispatcher,
+modeled on `executor_capsule` (#157). The consumer serializes a persist-owned,
+append-only `DirectoryOp` enum (one variant per `FederationDirectory` operation
+edge uses), hands the bytes through `DirectoryVTable::build_op` (a `#[repr(C)]`
+vtable + `abi_version` + opaque-data pattern), which runs **inside persist's
+`.so`** — so the concrete method dispatch uses persist's OWN matching vtable, the
+only vtable guaranteed to line up with the trait object. The result rides back as
+a serialized `DirectoryOpResult` enum through a completion callback. Every
+heterogeneous method — puts, lookups, list-since cursors, fountain eviction,
+`reachable_under_scope_with_reasons` — flows through the ONE `bytes → DirectoryOp
+→ dispatch → DirectoryOpResult → bytes` path, so there is exactly one ABI surface
+to audit. `Error` is flattened to `DirectoryOpResult::Err(String)` (the structured
+error is not guaranteed serde-round-trippable; the consumer maps it back to a
+generic error).
+
+**Spawn reuse.** `build_op` returns a type-erased boxed future
+(`executor_capsule::TaskOpaque`) that the consumer spawns through the EXISTING
+`executor_capsule` — the op-future is polled by persist's tokio worker pool. No
+new runtime/spawn machinery. `DIRECTORY_ABI_VERSION = 1` (independent of
+`DirectoryOp`'s append-only growth, which does not change the vtable shape).
+
+**Surface.** New `PyEngine::directory_ops_capsule` (`#[pyo3]`) wraps a `Directory`
+in a `PyCapsule` named `ciris_persist::directory_ops_v1`. The old
+`federation_directory_capsule` is **retained but deprecated** (doc comment names
+the vtable-skew hazard and points to the new capsule) so edge can migrate first;
+consumers (CIRISEdge) MUST adopt `directory_ops_capsule` — an adoption issue will
+be filed. Backend-agnostic by construction (works over any
+`Arc<dyn FederationDirectory>`: memory / sqlite / postgres). All `unsafe` is
+confined to `directory_capsule.rs` with per-use safety contracts; the crate-wide
+`#![deny(unsafe_code)]` is untouched elsewhere. `Serialize`/`Deserialize` derives
+added to `FountainTier` and `ReachabilityVerdict` so they ride the op wire. No
+re-pin — CIRISVerify stays v8.3.0.
+
 ## [11.5.0] — 2026-06-27
 
 ### Fixed — #307 (CC 3.4.11): `age_self_declared:level:*` refusal was a no-op on the real emit path (moved to the attestation_type gate)

@@ -22063,6 +22063,22 @@ impl PyEngine {
     /// ```
     ///
     /// Name tag: `ciris_persist::federation_directory`.
+    ///
+    /// # DEPRECATED (CIRISPersist#320) — vtable-skew hazard
+    ///
+    /// This capsule hands the consumer a raw `Arc<dyn
+    /// FederationDirectory>`. The consumer then calls trait methods on it
+    /// using ITS OWN statically-compiled vtable slot indices — but a
+    /// `dyn Trait` vtable's slot order is NOT guaranteed stable across
+    /// persist builds/versions. A consumer built against an older persist
+    /// running against a newer persist wheel misdispatches (a call for
+    /// one method lands on another method's slot) → the #320 hang.
+    ///
+    /// Retained for the migration window; consumers MUST move to
+    /// [`Self::directory_ops_capsule_py`] (`directory_ops_capsule`), the
+    /// ABI-stable C-vtable serialized-op surface that dispatches the
+    /// method INSIDE persist's `.so`. An adoption issue tracks CIRISEdge's
+    /// migration.
     #[pyo3(name = "federation_directory_capsule")]
     fn federation_directory_capsule_py<'py>(
         &self,
@@ -22078,6 +22094,44 @@ impl PyEngine {
             .map_err(|e| {
                 PyErr::new::<LensQueryError, _>(format!("federation_directory_capsule: {e}"))
             })
+    }
+
+    /// v11.6.0 (CIRISPersist#320) — the ABI-stable replacement for
+    /// [`Self::federation_directory_capsule_py`]. Returns a `PyCapsule`
+    /// wrapping a
+    /// [`Directory`](crate::ffi::directory_capsule::Directory) — a C-ABI
+    /// vtable + opaque data — instead of a raw `Arc<dyn
+    /// FederationDirectory>`.
+    ///
+    /// The consumer never calls a trait method through its own vtable.
+    /// Instead it serializes a
+    /// [`DirectoryOp`](crate::ffi::directory_capsule::DirectoryOp), calls
+    /// `vtable.build_op(...)` (which runs inside persist's `.so`, so the
+    /// concrete method dispatch uses persist's own matching vtable),
+    /// spawns the returned future via the `executor_capsule`, and receives
+    /// the serialized
+    /// [`DirectoryOpResult`](crate::ffi::directory_capsule::DirectoryOpResult)
+    /// through a callback. This closes the cross-cdylib vtable-skew class
+    /// (#320), the same structural fix `executor_capsule` (#157) applied
+    /// to task spawning.
+    ///
+    /// Consumers MUST check `vtable.abi_version ==
+    /// DIRECTORY_ABI_VERSION` at receive time.
+    ///
+    /// Name tag: `ciris_persist::directory_ops_v1`.
+    #[pyo3(name = "directory_ops_capsule")]
+    fn directory_ops_capsule_py<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        let arc: Arc<dyn crate::federation::FederationDirectory> = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.clone(),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.clone(),
+        };
+        crate::ffi::directory_capsule::build_capsule_with_destructor(py, arc)
+            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("directory_ops_capsule: {e}")))
     }
 
     /// v2.7.0 (CIRISPersist#109) — cross-module accessor for the

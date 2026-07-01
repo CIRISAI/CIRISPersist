@@ -26,6 +26,21 @@
 // PyEngine in src/ffi/pyo3.rs.
 pub mod executor_capsule;
 
+// v11.6.0 (CIRISPersist#320) — ABI-stable FederationDirectory dispatch
+// capsule. A raw `Arc<dyn FederationDirectory>` handed across the cdylib
+// boundary dispatches through the CONSUMER's statically-resolved vtable
+// slot indices, which are not guaranteed stable across persist
+// versions → the consumer misdispatches (the #320 hang). This module
+// crosses the boundary with a C-ABI serialized-op dispatcher instead:
+// the consumer serializes a `DirectoryOp`, `build_op` runs the concrete
+// method inside persist's `.so` (persist's own matching vtable), and the
+// result rides back as serialized bytes. Reuses `executor_capsule` for
+// the spawn. Same class as #156/#157 (cross-tokio) and #141 (libsqlite3).
+//
+// Available without `pyo3` (the C-ABI shape is pure Rust); the only
+// current packaging surface is the PyCapsule on PyEngine below.
+pub mod directory_capsule;
+
 #[cfg(feature = "pyo3")]
 pub mod pyo3;
 
