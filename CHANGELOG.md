@@ -5,6 +5,68 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.7.0] — 2026-07-01
+
+### Added — #320 audit: ABI-stable outbound_queue + signer capsules (close the remaining raw-Rust-type cross-cdylib surfaces)
+
+The #320 cohabitation audit (fixed the `FederationDirectory` vtable-skew that
+hung CIRISEdge) flagged two more `PyEngine` capsules that still hand a cohabiting
+Rust consumer a raw persist Rust type by-value across the cdylib boundary — the
+same structural class (#141 libsqlite3 SIGSEGV / #156 cross-tokio deadlock / #320
+directory vtable-skew: a type whose in-memory contract is not guaranteed stable
+across persist versions, passed static-vs-wheel). Both are now closed with
+ABI-stable C-vtable serialized-op capsules that dispatch INSIDE persist's `.so`,
+exactly mirroring `directory_capsule` (#322/#323) and reusing the existing
+`executor_capsule` (#157) for the spawn. The old capsules are **retained +
+deprecated** for the migration window; **CIRISEdge must adopt** (CIRISEdge#245
+extends).
+
+- **`outbound_queue_ops_capsule`** (`src/ffi/outbound_queue_capsule.rs`, name tag
+  `ciris_persist::outbound_queue_ops_v1`). The pre-audit `outbound_queue_capsule`
+  handed over a raw `BackendDispatch` enum; because
+  [`OutboundQueue`](crate::outbound::OutboundQueue) uses `-> impl Future + Send`
+  RPITIT methods it is **not object-safe**, so the consumer `match`ed the variant
+  and **static-dispatched** the trait method against ITS compiled view of
+  persist's `PostgresBackend` / `SqliteBackend` struct layout → layout skew across
+  versions → memory corruption. The new capsule serializes an `OutboundQueueOp`
+  (one variant per trait method — the full surface), runs it inside persist's
+  `.so` against persist's own compiled backend via a single generic dispatcher,
+  and returns a serialized `OutboundQueueOpResult`. Postgres and Sqlite dispatch
+  **identically** (no backend asymmetry). Gated on at least one backend feature
+  (a backend-less `server`-only build has no concrete queue to hand out); the
+  signer capsule below has no such dependency.
+
+- **`signer_ops_capsule`** (`src/ffi/signer_capsule.rs`, name tag
+  `ciris_persist::signer_ops_v1`) — **SECURITY-CRITICAL**, the highest-stakes
+  capsule in the crate. The pre-audit `keyring_signer_capsule` handed over raw
+  `Arc<dyn HardwareSigner>` + optional `Arc<dyn PqcSigner>` trait objects. A
+  `dyn` vtable's method-slot order is **not ABI-stable** across persist versions,
+  so a consumer built against an older persist could call `.sign()` through a slot
+  index that, in the wheel's vtable, resolves to a DIFFERENT method — or, across
+  the classical (`HardwareSigner`) vs PQC (`PqcSigner`) trait boundary, to the
+  wrong signer/algorithm entirely. Unlike the directory case (which merely hung),
+  a misdispatch here **signs**: it emits bytes computed with the wrong key or
+  under the wrong algorithm (Ed25519 where ML-DSA-65 was intended, or vice versa)
+  that still verify as a valid CIRIS signature — a silent forged-signature /
+  key-confusion bug. The new capsule serializes a `SignerOp`
+  (`Sign` / `PqcSign` / `PublicKey` / `PqcPublicKey` / `KeyId`) and dispatches the
+  exact signer + method INSIDE persist's `.so`, where persist's own code
+  statically maps each op to its trait method — the classical-vs-PQC and
+  method-slot selection can never be skewed by a consumer's stale layout. Results
+  are raw signature / public-key **bytes** (`Vec<u8>`); persist does NOT
+  round-trip `ciris_crypto` types across the ABI, and the consumer receives bytes
+  byte-identical to a direct in-`.so` call. An absent PQC signer is `Ok(None)`
+  inside the `Maybe*` result variants (not an error).
+
+Both capsule ops enums are append-only (same discipline as `DirectoryOp`); each
+carries `OUTBOUND_QUEUE_ABI_VERSION` / `SIGNER_ABI_VERSION` (both `1`) which
+consumers MUST check at capsule-receive time. All `unsafe` is confined to the two
+new modules with per-use safety contracts (directory_capsule audit style);
+`#![deny(unsafe_code)]` is untouched elsewhere. Five outbound types gained
+persist-internal serde derives (`OutboundStatus`, `AbandonedReason`,
+`OutboundFailureOutcome`, `OutboundFilter`, `OutboundRow`) so op args/results
+round-trip. Verify pins stay v8.3.0.
+
 ## [11.6.1] — 2026-07-01
 
 ### Added — #320 audit follow-up: two composite `DirectoryOp`s (verify + delegation graph) close the ABI-stable surface

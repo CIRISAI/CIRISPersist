@@ -41,6 +41,39 @@ pub mod executor_capsule;
 // current packaging surface is the PyCapsule on PyEngine below.
 pub mod directory_capsule;
 
+// v11.7.0 (CIRISPersist#320 audit follow-up) — two more ABI-stable
+// dispatch capsules closing the remaining raw-Rust-type cross-cdylib
+// surfaces the #320 audit flagged:
+//
+// - `outbound_queue_capsule`: the pre-audit `outbound_queue_capsule`
+//   handed a consumer wheel a raw `BackendDispatch` enum; the consumer
+//   static-dispatched `OutboundQueue` (RPITIT / NOT object-safe) against
+//   ITS view of persist's backend struct layout → layout skew. The
+//   C-ABI serialized-op dispatcher runs the method inside persist's `.so`
+//   against persist's own compiled backend instead.
+//
+// - `signer_capsule` (SECURITY-CRITICAL): the pre-audit
+//   `keyring_signer_capsule` handed over raw `Arc<dyn HardwareSigner>` /
+//   `Arc<dyn PqcSigner>` trait objects; a consumer-side `dyn` vtable-order
+//   skew could dispatch `.sign()` to the wrong method/algorithm → a
+//   silent forged-signature / key-confusion bug. Dispatching inside
+//   persist's `.so` (persist's own vtable) eliminates that.
+//
+// Both reuse `executor_capsule` for the spawn. Same class as #156/#157
+// (cross-tokio), #141 (libsqlite3), and #320 (directory vtable-skew).
+//
+// `outbound_queue_capsule` references `crate::engine::BackendDispatch`,
+// whose variants are gated behind the `postgres`/`sqlite` features; with
+// no backend feature there is no concrete `OutboundQueue` to dispatch to,
+// so the module is gated on at least one backend being present (a
+// backend-less `server`-only build has nothing to hand out). The signer
+// capsule has no backend dependency, so it is available ungated like
+// `directory_capsule`.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub mod outbound_queue_capsule;
+
+pub mod signer_capsule;
+
 #[cfg(feature = "pyo3")]
 pub mod pyo3;
 
