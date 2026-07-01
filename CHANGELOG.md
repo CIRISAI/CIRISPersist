@@ -5,6 +5,43 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.8.0] — 2026-07-01
+
+### Added — #328: postgres-free `pyo3-sqlite` feature (PyEngine FFI without postgres→openssl)
+
+Additive Cargo feature so the `PyEngine` FFI can be built **without** dragging in
+`postgres → openssl`. This unblocks CIRISEdge's Windows/mobile wheels dropping the
+vcpkg + vendored-openssl builds. The published-wheel shape is **unchanged**.
+
+- **`pyo3` is untouched** — it still implies `postgres` (both backends, the lens /
+  published-wheel shape, `pyproject.toml` keeps `pyo3`). The new `pyo3-sqlite`
+  feature enables the **same** PyO3 FFI surface but sqlite-only, so it does not
+  pull `postgres` and therefore never pulls `openssl`. Feature graph:
+  `pyo3 = ["_pyffi", "postgres"]`, `pyo3-sqlite = ["_pyffi"]`,
+  `_pyffi = ["dep:pyo3"]` — the internal `_pyffi` feature is what the ~13 FFI
+  module-compilation gates fire on (`#[cfg(feature = "_pyffi")]`), so the modules
+  compile under either public shape.
+- **`src/ffi/pyo3.rs` postgres-gating (~353 sites)** — every `PostgresBackend`
+  import, the FFI `BackendDispatch::Postgres` enum variant, ~341 `match &self.backend`
+  Postgres arms (the ~12 already gated stay), the URL-sniff constructor's postgres
+  branch, the cold-path PQC sweep, and the boot-audit Merkle-signer `if let` are all
+  `#[cfg(feature = "postgres")]`-gated. Sqlite is the floor: the `Postgres` variant
+  is itself cfg'd out under `pyo3-sqlite`, so every `match` stays exhaustive on the
+  lone `Sqlite` arm. Mirrors the core-crate `engine::BackendDispatch` pattern.
+- **Postgres-requiring paths error cleanly** under `pyo3-sqlite` — a `postgresql://`
+  dsn is rejected at construction with a `PyValueError` (`this build has no postgres
+  backend — build ciris-persist with feature pyo3 (not pyo3-sqlite) for postgres`).
+  No new postgres-only method stubs were needed: every `PyEngine` method already
+  carries a `Sqlite` arm (Group 1 = native sqlite impl, Group 2 = a stable
+  `…is Postgres-only` runtime error), so no method silently no-ops.
+- **Proof**: `cargo tree --features "pyo3-sqlite sqlite" -i openssl` → *nothing to
+  print* (only pure-Rust `openssl-probe` remains, via `rustls-native-certs`);
+  `cargo tree --features "pyo3 sqlite" -i openssl` → `openssl v0.10.x` retained.
+- **Follow-ups (out of scope here)**: the CIRISEdge wheel repointing at
+  `ciris-persist/pyo3-sqlite`, and removing the mobile/Windows
+  `[target.'cfg(target_os="ios"/"android")']` vendored-openssl entries, are
+  downstream follow-ups — this PR only adds the feature. Verify stays **v8.3.0**.
+
 ## [11.7.0] — 2026-07-01
 
 ### Added — #320 audit: ABI-stable outbound_queue + signer capsules (close the remaining raw-Rust-type cross-cdylib surfaces)

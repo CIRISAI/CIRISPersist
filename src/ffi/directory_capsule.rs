@@ -833,7 +833,7 @@ pub fn build_persist_directory(dir: Arc<dyn FederationDirectory>) -> Directory {
 /// The capsule payload pointer is a `Box::into_raw`'d `Box<Directory>`.
 /// The destructor reconstructs the box and invokes `vtable.drop(data)`
 /// before deallocating the envelope.
-#[cfg(feature = "pyo3")]
+#[cfg(feature = "_pyffi")]
 pub fn build_capsule_with_destructor<'py>(
     py: pyo3::Python<'py>,
     dir: Arc<dyn FederationDirectory>,
