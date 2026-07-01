@@ -588,7 +588,10 @@ pub async fn dispatch_directory_op(
             .await;
             DirectoryOpResult::HybridVerify(outcome.map_err(|e| e.to_string()))
         }
-        DirectoryOp::BuildDelegationGraph { from_key, max_depth } => {
+        DirectoryOp::BuildDelegationGraph {
+            from_key,
+            max_depth,
+        } => {
             match crate::federation::topology::build_delegation_graph(
                 dir,
                 &from_key,
