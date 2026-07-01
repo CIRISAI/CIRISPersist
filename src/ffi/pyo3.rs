@@ -24045,6 +24045,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::WitnessAdmit(_) => PyValueError::new_err(kind),
         // Server-fault → RuntimeError (5xx).
         crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
+        // v11.8.1 (CIRISPersist#329) — the directory-ops proxy was asked
+        // for a method with no DirectoryOp. This is a persist-side contract
+        // gap (add the op), not caller-fault; RuntimeError (5xx).
+        crate::federation::Error::Unsupported { .. } => PyRuntimeError::new_err(kind),
     }
 }
 

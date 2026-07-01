@@ -107,13 +107,22 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::federation::admission::{reachable_under_scope_with_reasons, ReachabilityVerdict};
-use crate::federation::operational::{OrgMembership, Organization};
-use crate::federation::types::{KeyRecord, PeerMetadataRow};
-use crate::federation::{self_at_login, shared_instance};
+use crate::federation::operational::{
+    OrgMembership, Organization, PartnerRecord, SignedOrgMembership, SignedOrganization,
+    SignedPartnerRecord,
+};
+use crate::federation::types::{
+    Attestation, Community, CommunityMembershipRevocation, Family, FamilyMembershipRevocation,
+    HybridPendingRow, IdentityOccurrence, IdentityOccurrenceRevocation, KeyRecord, LocationProof,
+    PeerMetadataRow, Revocation, SignedCommunityMembershipRevocation,
+    SignedFamilyMembershipRevocation, SignedIdentityOccurrenceRevocation,
+};
+use crate::federation::{accord_quorum, cohort, self_at_login, shared_instance, types, Error};
 use crate::federation::{
     FederationDirectory, SignedAttestation, SignedCommunity, SignedFamily,
     SignedIdentityOccurrence, SignedKeyRecord, SignedLocationProof, SignedRevocation,
 };
+use crate::ffi::executor_capsule::AsyncExecutor;
 use crate::fountain::{FountainHeldMeta, FountainTier};
 
 // Reuse the executor capsule's type-erased future pointer + the boxed
@@ -867,6 +876,945 @@ pub fn build_capsule_with_destructor<'py>(
     }
 }
 
+// ── #329: consumer-side FederationDirectory proxy ──────────────────
+
+/// The consumer-side `FederationDirectory` proxy — the mirror of
+/// [`build_persist_directory`] (the producer half).
+///
+/// A consumer (CIRISEdge#245) receives a [`Directory`] capsule (through a
+/// `PyCapsule`) and an [`AsyncExecutor`] capsule from persist. Wrapping
+/// them in an `OpsDirectory` yields a drop-in
+/// `Arc<dyn FederationDirectory>`: every trait call is serialized to a
+/// [`DirectoryOp`], routed through the capsule's `build_op` (which runs
+/// the concrete method inside persist's `.so`, against persist's own
+/// vtable), spawned on persist's runtime via the executor capsule, and
+/// its [`DirectoryOpResult`] mapped back to the method's return — so the
+/// consumer never hand-writes a single trait-method stub, and never
+/// dispatches through a skewed `dyn` vtable (the #320 hazard).
+///
+/// Only the methods with a [`DirectoryOp`] variant are routed; every
+/// other REQUIRED method returns [`Error::Unsupported`] (the remedy is to
+/// add the op in persist). Methods with a trait DEFAULT body that have no
+/// op are left inherited — their default bodies compose other trait
+/// methods, which themselves route (or surface `Unsupported`).
+struct OpsDirectory {
+    /// The received directory capsule handle (opaque `data` + `&'static`
+    /// vtable). `Directory` is already `Send + Sync`.
+    directory: Directory,
+    /// The executor capsule used to spawn each op's `TaskOpaque` onto
+    /// persist's tokio runtime. `AsyncExecutor` is already `Send + Sync`.
+    executor: Arc<AsyncExecutor>,
+}
+
+// `OpsDirectory` auto-derives `Send + Sync`: `Directory` carries explicit
+// `unsafe impl Send/Sync`, and `Arc<AsyncExecutor>` is `Send + Sync`
+// because `AsyncExecutor` is. No additional `unsafe impl` is required.
+
+impl OpsDirectory {
+    /// The C-ABI completion callback persist invokes exactly once, from a
+    /// persist worker thread, when an op's future finishes. It delivers
+    /// the serialized [`DirectoryOpResult`] back to the awaiting proxy
+    /// method through the boxed [`tokio::sync::oneshot::Sender`] stashed
+    /// in `ctx`.
+    ///
+    /// # Safety
+    /// Invoked only as the `result_cb` handed to `build_op` in
+    /// [`OpsDirectory::run_op`]; that pairing is the only provenance of
+    /// `ctx`/`(ptr, len)`. MUST NOT be called directly.
+    unsafe extern "C" fn result_trampoline(ctx: *mut c_void, ptr: *const u8, len: usize) {
+        // SAFETY: `ctx` is the `Box::into_raw`'d
+        // `oneshot::Sender<Vec<u8>>` created in `run_op` for THIS op. The
+        // `build_op` contract fires the callback exactly once, so we
+        // reclaim (and drop) the Box exactly once here — no leak, no
+        // double-free.
+        let tx = unsafe { Box::from_raw(ctx as *mut tokio::sync::oneshot::Sender<Vec<u8>>) };
+        // SAFETY: per the `ResultCallback` contract, `(ptr, len)` name
+        // `len` readable, initialized bytes valid ONLY for the duration
+        // of this call. `.to_vec()` copies them out before we return;
+        // nothing retains the borrow past this function.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+        // The receiver may have been dropped (the proxy method's future
+        // was cancelled). Ignore the send error — the copied bytes are
+        // simply discarded.
+        let _ = tx.send(bytes);
+    }
+
+    /// Serialize `op`, route it through the directory capsule's
+    /// `build_op`, spawn the returned task on persist's runtime via the
+    /// executor capsule, and await the serialized [`DirectoryOpResult`].
+    ///
+    /// The `tokio::sync::oneshot` tx/rx used here live in THIS
+    /// (consumer-side) proxy method — never inside the spawned future —
+    /// so the cross-tokio constraint documented in
+    /// [`crate::ffi::executor_capsule`] is not engaged: send/recv is
+    /// waker-based with no runtime affinity. A blocking `std` channel is
+    /// deliberately avoided; the proxy methods are `async` and must not
+    /// park a consumer worker thread.
+    async fn run_op(&self, op: &DirectoryOp) -> Result<DirectoryOpResult, Error> {
+        let op_bytes = serde_json::to_vec(op).map_err(|e| {
+            Error::Backend(format!("directory ops proxy: op serialize failure: {e}"))
+        })?;
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        // Hand the Sender to persist as an opaque `*mut c_void`; the
+        // trampoline reclaims it exactly once when the op completes.
+        let ctx: *mut c_void = Box::into_raw(Box::new(tx)) as *mut c_void;
+
+        // SAFETY: `self.directory` was produced by
+        // `build_persist_directory` and its `abi_version` was asserted to
+        // match `DIRECTORY_ABI_VERSION` at `build_ops_directory` time, so
+        // `data` ↔ `vtable` are a matched pair. `op_bytes` names readable,
+        // initialized bytes that stay alive until after this call returns
+        // (`build_op` reads them synchronously). `result_trampoline` +
+        // `ctx` satisfy the callback contract: `ctx` is the Send-able
+        // boxed Sender, valid until the callback fires exactly once from a
+        // persist worker thread.
+        let task: *mut TaskOpaque = unsafe {
+            (self.directory.vtable.build_op)(
+                self.directory.data,
+                op_bytes.as_ptr(),
+                op_bytes.len(),
+                Self::result_trampoline,
+                ctx,
+            )
+        };
+        // `build_op` has read `op_bytes` synchronously; drop it now.
+        drop(op_bytes);
+
+        // SAFETY: `task` is the `*mut TaskOpaque` just returned by this
+        // directory's `build_op` (the exact boxed-future shape
+        // `executor_capsule::spawn` reconstructs), spawned exactly once.
+        // `self.executor` is a matched persist executor capsule whose
+        // `Arc<Runtime>` is alive for the duration of this call.
+        unsafe { (self.executor.vtable.spawn)(self.executor.data, task) };
+
+        // Await the result. A closed channel means the op-future was
+        // dropped before firing the callback — surface a clean error
+        // rather than hang or panic.
+        let result_bytes = rx.await.map_err(|_| {
+            Error::Backend(
+                "directory ops proxy: directory op producer dropped without responding".into(),
+            )
+        })?;
+
+        serde_json::from_slice::<DirectoryOpResult>(&result_bytes).map_err(|e| {
+            Error::Backend(format!(
+                "directory ops proxy: result deserialize failure: {e}"
+            ))
+        })
+    }
+}
+
+/// Build a consumer-side [`FederationDirectory`] proxy over a received
+/// [`Directory`] capsule + an [`AsyncExecutor`] capsule (CIRISPersist#329).
+///
+/// The mirror of [`build_persist_directory`]: where that wraps persist's
+/// backend into a capsule for export, this wraps a *received* capsule back
+/// into an `Arc<dyn FederationDirectory>` the consumer calls like any
+/// other. Covered methods route through the `build_op` ABI; uncovered
+/// required methods return [`Error::Unsupported`].
+///
+/// # Errors
+/// Returns [`Error::Backend`] if `directory.vtable.abi_version` does not
+/// equal [`DIRECTORY_ABI_VERSION`]. (The issue floated `-> Arc<dyn ...>`,
+/// but the ABI-version assertion needs a fallible return, so this yields a
+/// `Result` and refuses a skewed capsule cleanly instead of risking a
+/// mismatched-layout dispatch.)
+pub fn build_ops_directory(
+    directory: Directory,
+    executor: Arc<AsyncExecutor>,
+) -> Result<Arc<dyn FederationDirectory>, Error> {
+    if directory.vtable.abi_version != DIRECTORY_ABI_VERSION {
+        return Err(Error::Backend(format!(
+            "directory ops proxy: directory capsule ABI version mismatch \
+             (capsule={}, expected={DIRECTORY_ABI_VERSION}) — pin floor too low",
+            directory.vtable.abi_version
+        )));
+    }
+    Ok(Arc::new(OpsDirectory {
+        directory,
+        executor,
+    }))
+}
+
+// `unused_variables` is allowed impl-wide: the ~53 uncovered REQUIRED
+// methods are `Error::Unsupported` stubs that necessarily ignore their
+// typed arguments. The covered methods DO consume their args, and a
+// mistyped covered arg is a compile error (not a warning), so this allow
+// cannot mask a routing bug.
+#[allow(unused_variables)]
+#[async_trait::async_trait]
+impl FederationDirectory for OpsDirectory {
+    // ── covered: routed through DirectoryOp ────────────────────────
+
+    async fn put_public_key(&self, record: SignedKeyRecord) -> Result<(), Error> {
+        match self.run_op(&DirectoryOp::PutPublicKey { record }).await? {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn lookup_public_key(&self, key_id: &str) -> Result<Option<KeyRecord>, Error> {
+        match self
+            .run_op(&DirectoryOp::LookupPublicKey {
+                key_id: key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::PublicKey(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn list_keys_by_identity_type(
+        &self,
+        identity_type: &str,
+    ) -> Result<Vec<KeyRecord>, Error> {
+        // Only the ACCORD_HOLDER set has an op (the constitutional 2-of-3
+        // verification set); any other identity_type is not routable.
+        if identity_type != crate::federation::types::identity_type::ACCORD_HOLDER {
+            return Err(Error::Unsupported {
+                method: "list_keys_by_identity_type(non-accord)",
+            });
+        }
+        match self.run_op(&DirectoryOp::ListAccordHolders {}).await? {
+            DirectoryOpResult::KeyRecords(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn put_attestation(&self, attestation: SignedAttestation) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::PutAttestation { attestation })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn put_revocation(&self, revocation: SignedRevocation) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::PutRevocation { revocation })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn put_identity_occurrence(
+        &self,
+        occurrence: SignedIdentityOccurrence,
+    ) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::PutIdentityOccurrence { occurrence })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn put_family(&self, family: SignedFamily) -> Result<(), Error> {
+        match self.run_op(&DirectoryOp::PutFamily { family }).await? {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn put_community(&self, community: SignedCommunity) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::PutCommunity { community })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn put_location_proof(&self, proof: SignedLocationProof) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::PutLocationProof { proof })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn list_organizations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<Organization>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListOrganizationsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::Organizations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn list_org_memberships_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<OrgMembership>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListOrgMembershipsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::OrgMemberships(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn peer_metadata_for(&self, key_id: &str) -> Result<Option<PeerMetadataRow>, Error> {
+        match self
+            .run_op(&DirectoryOp::PeerMetadataFor {
+                key_id: key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::PeerMetadata(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn try_acquire_shared_instance(
+        &self,
+        instance_name: &str,
+        owner_pid: i32,
+        owner_hostname: &str,
+        stale_after: Option<std::time::Duration>,
+    ) -> Result<Option<shared_instance::SharedInstanceLease>, Error> {
+        match self
+            .run_op(&DirectoryOp::AcquireSharedInstanceLease {
+                instance_name: instance_name.to_string(),
+                owner_pid,
+                owner_hostname: owner_hostname.to_string(),
+                stale_after,
+            })
+            .await?
+        {
+            DirectoryOpResult::SharedLease(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn heartbeat_shared_instance(
+        &self,
+        lease: &shared_instance::SharedInstanceLease,
+    ) -> Result<Option<shared_instance::SharedInstanceLease>, Error> {
+        match self
+            .run_op(&DirectoryOp::HeartbeatSharedInstance {
+                lease: lease.clone(),
+            })
+            .await?
+        {
+            DirectoryOpResult::SharedLease(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn lookup_shared_instance_lease(
+        &self,
+        instance_name: &str,
+    ) -> Result<Option<shared_instance::SharedInstanceLease>, Error> {
+        match self
+            .run_op(&DirectoryOp::LookupSharedInstanceLease {
+                instance_name: instance_name.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::SharedLease(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn release_shared_instance_lease(
+        &self,
+        lease: &shared_instance::SharedInstanceLease,
+    ) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::ReleaseSharedInstanceLease {
+                lease: lease.clone(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn put_transport_destination(
+        &self,
+        destination: &self_at_login::TransportDestination,
+    ) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::PutTransportDestination {
+                destination: destination.clone(),
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn list_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListTransportDestinationsFor {
+                occurrence_key_id: occurrence_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::TransportDestinations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn list_held_fountain_content(
+        &self,
+        publisher_key_id: &str,
+    ) -> Result<Vec<crate::fountain::FountainHeldMeta>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListHeldFountainContent {
+                publisher_key_id: publisher_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::FountainHeld(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn evict_fountain_content_to_tier(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+        tier: crate::fountain::FountainTier,
+    ) -> Result<u64, Error> {
+        match self
+            .run_op(&DirectoryOp::EvictFountainContentToTier {
+                content_id: content_id.to_string(),
+                corpus_kind: corpus_kind.to_string(),
+                tier,
+            })
+            .await?
+        {
+            DirectoryOpResult::U64(n) => Ok(n),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn evict_fountain_content_hard_delete(
+        &self,
+        content_id: &str,
+        corpus_kind: &str,
+    ) -> Result<u64, Error> {
+        match self
+            .run_op(&DirectoryOp::EvictFountainContentHardDelete {
+                content_id: content_id.to_string(),
+                corpus_kind: corpus_kind.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::U64(n) => Ok(n),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    // ── uncovered REQUIRED methods: no DirectoryOp → Unsupported ────
+
+    async fn lookup_keys_for_identity(&self, identity_ref: &str) -> Result<Vec<KeyRecord>, Error> {
+        Err(Error::Unsupported {
+            method: "lookup_keys_for_identity",
+        })
+    }
+    async fn attestation_upsert_local(
+        &self,
+        input: crate::federation::types::LocalAttestationInput,
+    ) -> Result<String, Error> {
+        Err(Error::Unsupported {
+            method: "attestation_upsert_local",
+        })
+    }
+    async fn attestation_insert_local(
+        &self,
+        input: crate::federation::types::LocalAttestationInput,
+    ) -> Result<String, Error> {
+        Err(Error::Unsupported {
+            method: "attestation_insert_local",
+        })
+    }
+    async fn list_attestations_for(
+        &self,
+        attested_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        Err(Error::Unsupported {
+            method: "list_attestations_for",
+        })
+    }
+    async fn list_attestations_by(
+        &self,
+        attesting_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        Err(Error::Unsupported {
+            method: "list_attestations_by",
+        })
+    }
+    async fn attestations_binding_content(
+        &self,
+        content_sha256: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        Err(Error::Unsupported {
+            method: "attestations_binding_content",
+        })
+    }
+    async fn revocations_for(&self, revoked_key_id: &str) -> Result<Vec<Revocation>, Error> {
+        Err(Error::Unsupported {
+            method: "revocations_for",
+        })
+    }
+    async fn list_identity_occurrences_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrence>, Error> {
+        Err(Error::Unsupported {
+            method: "list_identity_occurrences_for",
+        })
+    }
+    async fn lookup_identity_for_occurrence(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<IdentityOccurrence>, Error> {
+        Err(Error::Unsupported {
+            method: "lookup_identity_for_occurrence",
+        })
+    }
+    async fn add_family_member(
+        &self,
+        family_key_id: &str,
+        member: types::FamilyMember,
+    ) -> Result<bool, Error> {
+        Err(Error::Unsupported {
+            method: "add_family_member",
+        })
+    }
+    async fn lookup_family(&self, family_key_id: &str) -> Result<Option<Family>, Error> {
+        Err(Error::Unsupported {
+            method: "lookup_family",
+        })
+    }
+    async fn list_families_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<Family>, Error> {
+        Err(Error::Unsupported {
+            method: "list_families_for_member",
+        })
+    }
+    async fn lookup_community(&self, community_key_id: &str) -> Result<Option<Community>, Error> {
+        Err(Error::Unsupported {
+            method: "lookup_community",
+        })
+    }
+    async fn list_communities_for_member(
+        &self,
+        member_identity_key_id: &str,
+    ) -> Result<Vec<Community>, Error> {
+        Err(Error::Unsupported {
+            method: "list_communities_for_member",
+        })
+    }
+    async fn put_identity_occurrence_revocation(
+        &self,
+        revocation: SignedIdentityOccurrenceRevocation,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "put_identity_occurrence_revocation",
+        })
+    }
+    async fn put_family_membership_revocation(
+        &self,
+        revocation: SignedFamilyMembershipRevocation,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "put_family_membership_revocation",
+        })
+    }
+    async fn put_community_membership_revocation(
+        &self,
+        revocation: SignedCommunityMembershipRevocation,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "put_community_membership_revocation",
+        })
+    }
+    async fn list_identity_occurrence_revocations_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<IdentityOccurrenceRevocation>, Error> {
+        Err(Error::Unsupported {
+            method: "list_identity_occurrence_revocations_for",
+        })
+    }
+    async fn list_family_membership_revocations_for(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Vec<FamilyMembershipRevocation>, Error> {
+        Err(Error::Unsupported {
+            method: "list_family_membership_revocations_for",
+        })
+    }
+    async fn list_community_membership_revocations_for(
+        &self,
+        community_key_id: &str,
+    ) -> Result<Vec<CommunityMembershipRevocation>, Error> {
+        Err(Error::Unsupported {
+            method: "list_community_membership_revocations_for",
+        })
+    }
+    async fn list_location_proofs_for(
+        &self,
+        subject_key_id: &str,
+    ) -> Result<Vec<LocationProof>, Error> {
+        Err(Error::Unsupported {
+            method: "list_location_proofs_for",
+        })
+    }
+    async fn communities_containing(&self, cell_id: &str) -> Result<Vec<Community>, Error> {
+        Err(Error::Unsupported {
+            method: "communities_containing",
+        })
+    }
+    async fn put_organization(
+        &self,
+        signed: SignedOrganization,
+        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
+        root_stewards: &[String],
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "put_organization",
+        })
+    }
+    async fn put_org_membership(
+        &self,
+        signed: SignedOrgMembership,
+        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
+        root_stewards: &[String],
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "put_org_membership",
+        })
+    }
+    async fn put_partner_record(
+        &self,
+        signed: SignedPartnerRecord,
+        steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "put_partner_record",
+        })
+    }
+    async fn list_organizations_for(&self, org_id: &str) -> Result<Vec<Organization>, Error> {
+        Err(Error::Unsupported {
+            method: "list_organizations_for",
+        })
+    }
+    async fn list_org_memberships_for(&self, org_id: &str) -> Result<Vec<OrgMembership>, Error> {
+        Err(Error::Unsupported {
+            method: "list_org_memberships_for",
+        })
+    }
+    async fn list_partner_records_for(
+        &self,
+        license_id: &str,
+    ) -> Result<Vec<PartnerRecord>, Error> {
+        Err(Error::Unsupported {
+            method: "list_partner_records_for",
+        })
+    }
+    async fn list_partner_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<PartnerRecord>, Error> {
+        Err(Error::Unsupported {
+            method: "list_partner_records_since",
+        })
+    }
+    async fn list_signed_partner_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedPartnerRecord>, Error> {
+        Err(Error::Unsupported {
+            method: "list_signed_partner_records_since",
+        })
+    }
+    async fn add_community_member(
+        &self,
+        community_key_id: &str,
+        member: types::CommunityMember,
+    ) -> Result<bool, Error> {
+        Err(Error::Unsupported {
+            method: "add_community_member",
+        })
+    }
+    async fn supersede_group_row(
+        &self,
+        cohort: cohort::Cohort,
+        new_snapshot: serde_json::Value,
+        authorization: Option<serde_json::Value>,
+    ) -> Result<u32, Error> {
+        Err(Error::Unsupported {
+            method: "supersede_group_row",
+        })
+    }
+    async fn list_group_versions(
+        &self,
+        cohort: cohort::Cohort,
+        group_key_id: &str,
+    ) -> Result<Vec<cohort::GroupVersion>, Error> {
+        Err(Error::Unsupported {
+            method: "list_group_versions",
+        })
+    }
+    async fn attach_key_pqc_signature(
+        &self,
+        key_id: &str,
+        pubkey_ml_dsa_65_base64: &str,
+        scrub_signature_pqc: &str,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "attach_key_pqc_signature",
+        })
+    }
+    async fn attach_attestation_pqc_signature(
+        &self,
+        attestation_id: &str,
+        scrub_signature_pqc: &str,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "attach_attestation_pqc_signature",
+        })
+    }
+    async fn attach_revocation_pqc_signature(
+        &self,
+        revocation_id: &str,
+        scrub_signature_pqc: &str,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "attach_revocation_pqc_signature",
+        })
+    }
+    async fn get_attestation(&self, attestation_id: &str) -> Result<Option<Attestation>, Error> {
+        Err(Error::Unsupported {
+            method: "get_attestation",
+        })
+    }
+    async fn promote_attestation(
+        &self,
+        attestation_id: &str,
+        scrub_signature_classical: &str,
+        scrub_signature_pqc: Option<&str>,
+        original_content_hash_hex: &str,
+        scrub_key_id: &str,
+        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, Error> {
+        Err(Error::Unsupported {
+            method: "promote_attestation",
+        })
+    }
+    async fn list_hybrid_pending_keys(&self, limit: i64) -> Result<Vec<HybridPendingRow>, Error> {
+        Err(Error::Unsupported {
+            method: "list_hybrid_pending_keys",
+        })
+    }
+    async fn list_hybrid_pending_attestations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<HybridPendingRow>, Error> {
+        Err(Error::Unsupported {
+            method: "list_hybrid_pending_attestations",
+        })
+    }
+    async fn list_hybrid_pending_revocations(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<HybridPendingRow>, Error> {
+        Err(Error::Unsupported {
+            method: "list_hybrid_pending_revocations",
+        })
+    }
+    async fn put_accord_proposal(
+        &self,
+        proposal: ciris_verify_core::accord_live_quorum::AccordProposal,
+        authority_signature: Option<serde_json::Value>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "put_accord_proposal",
+        })
+    }
+    async fn get_accord_proposal(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Option<accord_quorum::StoredProposal>, Error> {
+        Err(Error::Unsupported {
+            method: "get_accord_proposal",
+        })
+    }
+    async fn list_accord_proposals_by_anchor(
+        &self,
+        action: &str,
+        prior_family_digest: &str,
+    ) -> Result<Vec<accord_quorum::StoredProposal>, Error> {
+        Err(Error::Unsupported {
+            method: "list_accord_proposals_by_anchor",
+        })
+    }
+    async fn put_accord_participation(
+        &self,
+        participation: ciris_verify_core::accord_live_quorum::AccordParticipation,
+        standing_roster: &[ciris_verify_core::threshold::ThresholdMember],
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "put_accord_participation",
+        })
+    }
+    async fn list_accord_participations(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Vec<accord_quorum::StoredParticipation>, Error> {
+        Err(Error::Unsupported {
+            method: "list_accord_participations",
+        })
+    }
+    async fn put_accord_decision(
+        &self,
+        decision: ciris_verify_core::accord_live_quorum::AccordDecision,
+        steward_signatures: Option<serde_json::Value>,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "put_accord_decision",
+        })
+    }
+    async fn get_accord_decision(
+        &self,
+        proposal_digest: &str,
+    ) -> Result<Option<accord_quorum::StoredDecision>, Error> {
+        Err(Error::Unsupported {
+            method: "get_accord_decision",
+        })
+    }
+    async fn set_active_halt(
+        &self,
+        family_key_id: &str,
+        active_halt_id: &str,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "set_active_halt",
+        })
+    }
+    async fn get_active_halt(
+        &self,
+        family_key_id: &str,
+    ) -> Result<Option<accord_quorum::ActiveHalt>, Error> {
+        Err(Error::Unsupported {
+            method: "get_active_halt",
+        })
+    }
+    async fn clear_active_halt(
+        &self,
+        family_key_id: &str,
+        active_halt_id: &str,
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "clear_active_halt",
+        })
+    }
+    async fn issue_accord_nonce(&self, family_key_id: &str, nonce: &str) -> Result<(), Error> {
+        Err(Error::Unsupported {
+            method: "issue_accord_nonce",
+        })
+    }
+    async fn accord_nonce_issued(&self, family_key_id: &str, nonce: &str) -> Result<bool, Error> {
+        Err(Error::Unsupported {
+            method: "accord_nonce_issued",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1245,5 +2193,104 @@ mod tests {
         // SAFETY: single-drop, matched vtables.
         unsafe { (executor.vtable.drop)(executor.data) };
         unsafe { (directory.vtable.drop)(directory.data) };
+    }
+
+    // ── #329: build_ops_directory consumer-proxy ───────────────────
+
+    #[test]
+    fn build_ops_directory_rejects_abi_skew() {
+        // A capsule whose vtable advertises a newer ABI than this build
+        // understands MUST be refused cleanly, never dispatched (a
+        // mismatched layout could misdispatch). The proxy checks
+        // `abi_version` before touching `data`/`build_op`, so a null data
+        // pointer + dummy fns are safe here.
+        unsafe extern "C" fn dummy_build_op(
+            _: *mut c_void,
+            _: *const u8,
+            _: usize,
+            _: ResultCallback,
+            _: *mut c_void,
+        ) -> *mut TaskOpaque {
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn dummy_drop(_: *mut c_void) {}
+        static BAD_VTABLE: DirectoryVTable = DirectoryVTable {
+            abi_version: DIRECTORY_ABI_VERSION + 1,
+            _reserved: 0,
+            build_op: dummy_build_op,
+            drop: dummy_drop,
+        };
+        let bad = Directory {
+            data: std::ptr::null_mut(),
+            vtable: &BAD_VTABLE,
+        };
+        let rt = test_runtime();
+        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+            rt.clone(),
+        ));
+        let res = build_ops_directory(bad, executor);
+        assert!(res.is_err(), "abi skew must be refused");
+    }
+
+    #[test]
+    fn ops_directory_put_then_lookup_round_trips() {
+        // End-to-end proof: op → build_op → spawn → trampoline → oneshot
+        // → deserialize. Drive the proxy futures on the same multi-thread
+        // runtime that spawns the op-future (block_on on the caller
+        // thread; the op-future runs on a worker; the oneshot bridges).
+        let rt = test_runtime();
+        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> = backend;
+        let directory = build_persist_directory(dir.clone());
+        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+            rt.clone(),
+        ));
+        let proxy = build_ops_directory(directory, executor).expect("abi ok");
+
+        let rec = sample_key_record("primitive-ops");
+        rt.block_on(proxy.put_public_key(SignedKeyRecord {
+            record: rec.clone(),
+        }))
+        .expect("proxy put_public_key");
+
+        let via_proxy = rt
+            .block_on(proxy.lookup_public_key("primitive-ops"))
+            .expect("proxy lookup_public_key");
+        let via_direct = rt
+            .block_on(dir.lookup_public_key("primitive-ops"))
+            .expect("direct lookup");
+        assert_eq!(
+            via_proxy, via_direct,
+            "proxy result must equal a direct backend call"
+        );
+        assert_eq!(via_proxy.expect("some").key_id, "primitive-ops");
+    }
+
+    #[test]
+    fn ops_directory_unsupported_method_errors() {
+        // A REQUIRED method with no DirectoryOp must surface
+        // `Error::Unsupported`, not route garbage.
+        let rt = test_runtime();
+        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> = backend;
+        let directory = build_persist_directory(dir);
+        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+            rt.clone(),
+        ));
+        let proxy = build_ops_directory(directory, executor).expect("abi ok");
+
+        let err = rt
+            .block_on(proxy.get_attestation("att-x"))
+            .expect_err("get_attestation has no op → Unsupported");
+        assert!(
+            matches!(
+                err,
+                Error::Unsupported {
+                    method: "get_attestation"
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(err.kind(), "federation_ops_proxy_unsupported");
     }
 }

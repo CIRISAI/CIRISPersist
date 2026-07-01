@@ -5,6 +5,51 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.8.1] — 2026-07-01
+
+### Added — #329: build_ops_directory consumer-side FederationDirectory proxy (unblocks CIRISEdge#245)
+
+`ciris_persist::ffi::directory_capsule::build_ops_directory` — the **consumer-side**
+mirror of `build_persist_directory` (the producer half). It wraps a received
+`Directory` capsule plus an `executor_capsule::AsyncExecutor` into a drop-in
+`Arc<dyn FederationDirectory>`, so a cohabiting consumer wheel (CIRISEdge#245) gets a
+working directory proxy **without hand-writing 100+ trait-method stubs** and without
+dispatching through a skewed `dyn` vtable (the #320 hazard the whole capsule exists
+to close). Adoption on the edge side becomes a ~10-line swap: receive the two
+capsules, call `build_ops_directory`, hold the `Arc<dyn FederationDirectory>`.
+
+- **Mirror of `build_persist_directory`.** Where the producer wraps persist's backend
+  into a capsule for export, this wraps a *received* capsule back into an
+  `Arc<dyn FederationDirectory>` the consumer calls like any other. Same module
+  (`src/ffi/directory_capsule.rs`), same `DirectoryOp` / `DirectoryOpResult` wire
+  contract — `build_ops_directory` simply INVERTS `dispatch_directory_op`.
+- **The async trampoline.** Each covered method builds its `DirectoryOp`, then a
+  private `run_op` serializes it, creates a `tokio::sync::oneshot` channel (works
+  across the two tokios — waker-based, no runtime affinity; the tx/rx live in the
+  proxy method, never inside the spawned future), boxes the `Sender` into a
+  `*mut c_void`, calls the capsule's `build_op` (reads the op bytes synchronously),
+  spawns the returned `TaskOpaque` on persist's runtime via `executor_capsule`, and
+  `.await`s the result bytes. A single `extern "C"` `result_trampoline` — fired
+  exactly once from a persist worker thread — reclaims the boxed `Sender`, copies the
+  result bytes out (valid only for the call), and delivers them. Every `unsafe` is
+  documented with its contract, matching the module's existing audit style.
+- **Covered ops route; everything else is honest.** The 21 `FederationDirectory`
+  methods that have a `DirectoryOp` variant are routed through the ABI
+  (`lookup_public_key`, the `put_*` writes, the shared-instance-lease trio +
+  acquire, transport destinations, `peer_metadata_for`, the org/membership `*_since`
+  readers, the fountain eviction/listing ops, and `list_keys_by_identity_type` for
+  the `accord_holder` set only). Every other REQUIRED method returns the new
+  `Error::Unsupported { method }` (kind `federation_ops_proxy_unsupported`) — a static
+  contract gap whose remedy is to add the op in persist, never a silent wrong answer.
+  `list_keys_by_identity_type` with a non-`accord_holder` type also returns
+  `Unsupported`. Methods with a trait DEFAULT body and no op are left inherited.
+- **Deviation from the issue sketch.** The issue floated `-> Arc<dyn ...>`, but
+  `build_ops_directory` asserts `directory.vtable.abi_version == DIRECTORY_ABI_VERSION`
+  and refuses a skewed capsule cleanly, so it returns
+  `Result<Arc<dyn FederationDirectory>, Error>`.
+
+Verify stays **v8.3.0**. Backend-agnostic (no pg/sqlite asymmetry).
+
 ## [11.8.0] — 2026-07-01
 
 ### Added — #328: postgres-free `pyo3-sqlite` feature (PyEngine FFI without postgres→openssl)

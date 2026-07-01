@@ -3691,6 +3691,23 @@ pub enum Error {
     /// String-typed because each backend has its own error tree.
     #[error("backend: {0}")]
     Backend(String),
+
+    /// v11.8.1 (CIRISPersist#329). The consumer-side
+    /// [`crate::ffi::directory_capsule::build_ops_directory`] proxy was
+    /// asked for a `FederationDirectory` method that has no corresponding
+    /// [`crate::ffi::directory_capsule::DirectoryOp`] variant, so it
+    /// cannot be routed across the ABI. The remedy is on the persist side:
+    /// add the missing op (and its dispatch arm) so the proxy can carry
+    /// the call. This is a static contract gap, never a runtime data
+    /// condition.
+    #[error(
+        "directory ops proxy: method {method} has no DirectoryOp — \
+         the consumer needs it; add the op in persist (CIRISPersist#329)"
+    )]
+    Unsupported {
+        /// The `FederationDirectory` method name the proxy could not route.
+        method: &'static str,
+    },
 }
 
 impl Error {
@@ -3746,6 +3763,7 @@ impl Error {
             Error::FederationTierUnverified { .. } => "federation_federation_tier_unverified",
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",
+            Error::Unsupported { .. } => "federation_ops_proxy_unsupported",
         }
     }
 }
