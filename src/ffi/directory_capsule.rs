@@ -308,6 +308,38 @@ pub enum DirectoryOp {
         /// Depth cap for the delegation walk.
         max_depth: u32,
     },
+    /// The **security-critical** composite verify (CIRISPersist#320 audit /
+    /// CIRISEdge#245). The free fn
+    /// [`verify_hybrid_via_directory`](crate::verify::hybrid::verify_hybrid_via_directory)`(dir,
+    /// …)` does MULTIPLE directory lookups + the Ed25519/ML-DSA-65 hybrid
+    /// verification internally — a raw-`dyn` vtable misdispatch here would
+    /// silently verify against the wrong method (accept a forged signature),
+    /// so this MUST run inside persist's `.so`. `canonical_bytes` is the
+    /// exact bytes the signatures cover.
+    VerifyHybridViaDirectory {
+        /// The canonical bytes the signatures were computed over.
+        canonical_bytes: Vec<u8>,
+        /// The claimed signing key id (resolved against the directory).
+        signing_key_id: String,
+        /// Base64 Ed25519 signature.
+        ed25519_sig_b64: String,
+        /// Base64 ML-DSA-65 signature (absent for classical-only rows).
+        ml_dsa_65_sig_b64: Option<String>,
+        /// The hybrid-verification policy.
+        policy: crate::verify::hybrid::HybridPolicy,
+        /// Optional row age for the replay / freshness window.
+        row_age: Option<std::time::Duration>,
+    },
+    /// The free fn
+    /// [`build_delegation_graph`](crate::federation::topology::build_delegation_graph)`(dir,
+    /// from_key, max_depth)` — walks the delegation graph via multiple
+    /// directory lookups (CIRISNodeCore trust-depth; CIRISPersist#320 audit).
+    BuildDelegationGraph {
+        /// The key the delegation walk seeds from.
+        from_key: String,
+        /// Depth cap for the walk.
+        max_depth: u32,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -359,6 +391,16 @@ pub enum DirectoryOpResult {
     U64(u64),
     /// `reachable_under_scope_with_reasons`.
     Reachability(ReachabilityVerdict),
+    /// `verify_hybrid_via_directory` — the verify VERDICT is preserved
+    /// intact (`Ok(VerifyOutcome)`); an operational `VerifyError` is
+    /// flattened to `Err(String)` INSIDE this variant (NOT the top-level
+    /// `Err`), so the consumer always distinguishes "verification ran and
+    /// produced this outcome" from "verify could not run". A wrong-method
+    /// misdispatch is impossible: the whole verify executed in persist's
+    /// `.so` against persist's own vtable.
+    HybridVerify(Result<crate::verify::hybrid::VerifyOutcome, String>),
+    /// `build_delegation_graph`.
+    DelegationGraph(crate::federation::topology::DelegationGraph),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -522,6 +564,45 @@ pub async fn dispatch_directory_op(
             Ok(v) => DirectoryOpResult::Reachability(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
+        DirectoryOp::VerifyHybridViaDirectory {
+            canonical_bytes,
+            signing_key_id,
+            ed25519_sig_b64,
+            ml_dsa_65_sig_b64,
+            policy,
+            row_age,
+        } => {
+            // The verify runs entirely here — inside persist's `.so`, against
+            // persist's own vtable — so no consumer-side vtable skew can
+            // reach the signature-check lookups. The VerifyOutcome verdict is
+            // preserved intact; a VerifyError flattens INSIDE HybridVerify.
+            let outcome = crate::verify::hybrid::verify_hybrid_via_directory(
+                dir,
+                &canonical_bytes,
+                &signing_key_id,
+                &ed25519_sig_b64,
+                ml_dsa_65_sig_b64.as_deref(),
+                policy,
+                row_age,
+            )
+            .await;
+            DirectoryOpResult::HybridVerify(outcome.map_err(|e| e.to_string()))
+        }
+        DirectoryOp::BuildDelegationGraph {
+            from_key,
+            max_depth,
+        } => {
+            match crate::federation::topology::build_delegation_graph(
+                dir,
+                &from_key,
+                max_depth as usize,
+            )
+            .await
+            {
+                Ok(g) => DirectoryOpResult::DelegationGraph(g),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
     }
 }
 
@@ -1012,6 +1093,91 @@ mod tests {
         match verdict {
             DirectoryOpResult::Reachability(v) => assert_eq!(v, via_direct),
             other => panic!("expected Reachability, got {other:?}"),
+        }
+
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+    }
+
+    #[test]
+    fn verify_hybrid_via_directory_round_trips_and_preserves_verdict() {
+        // CIRISPersist#320 audit / CIRISEdge#245 — the security-critical op.
+        // Unknown key → verify_hybrid_via_directory returns Err(Crypto
+        // "verify_unknown_key"); the op must preserve it INSIDE HybridVerify
+        // (not collapse to the top-level Err), byte-identical to the direct
+        // call — proving the verify ran entirely inside persist's `.so`.
+        let rt = test_runtime();
+        let (dir, directory) = memory_directory();
+
+        let op = DirectoryOp::VerifyHybridViaDirectory {
+            canonical_bytes: b"canonical".to_vec(),
+            signing_key_id: "no-such-key".into(),
+            ed25519_sig_b64: "AAAA".into(),
+            ml_dsa_65_sig_b64: None,
+            policy: crate::verify::hybrid::HybridPolicy::Strict,
+            row_age: None,
+        };
+        let res = run_op(&rt, &directory, &op);
+        let via_direct = rt.block_on(crate::verify::hybrid::verify_hybrid_via_directory(
+            dir.as_ref(),
+            b"canonical",
+            "no-such-key",
+            "AAAA",
+            None,
+            crate::verify::hybrid::HybridPolicy::Strict,
+            None,
+        ));
+        match res {
+            DirectoryOpResult::HybridVerify(got) => {
+                // Byte-identical to the direct call (verdict preserved intact).
+                assert_eq!(got, via_direct.map_err(|e| e.to_string()));
+                // And it's the stable unknown-key token, INSIDE HybridVerify —
+                // not the top-level Err (which is reserved for other ops).
+                match got {
+                    Err(s) => assert!(s.contains("verify_unknown_key"), "got {s}"),
+                    Ok(o) => panic!("expected verify Err for unknown key, got {o:?}"),
+                }
+            }
+            other => panic!("expected HybridVerify, got {other:?}"),
+        }
+
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+    }
+
+    #[test]
+    fn build_delegation_graph_round_trips() {
+        // CIRISNodeCore trust-depth path (CIRISPersist#320 audit). An empty
+        // directory yields a root-only graph; the op result must equal the
+        // direct call, serialized through the ABI.
+        let rt = test_runtime();
+        let (dir, directory) = memory_directory();
+
+        let res = run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::BuildDelegationGraph {
+                from_key: "root-key".into(),
+                max_depth: 3,
+            },
+        );
+        let via_direct = rt
+            .block_on(crate::federation::topology::build_delegation_graph(
+                dir.as_ref(),
+                "root-key",
+                3,
+            ))
+            .expect("direct build_delegation_graph");
+        match res {
+            DirectoryOpResult::DelegationGraph(g) => {
+                // Compare via JSON (DelegationGraph is Serialize) — the ABI
+                // path serialized it, so structural equality is the contract.
+                assert_eq!(
+                    serde_json::to_value(&g).unwrap(),
+                    serde_json::to_value(&via_direct).unwrap()
+                );
+            }
+            other => panic!("expected DelegationGraph, got {other:?}"),
         }
 
         // SAFETY: single-drop, matched vtable.

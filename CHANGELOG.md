@@ -5,6 +5,43 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.6.1] — 2026-07-01
+
+### Added — #320 audit follow-up: two composite `DirectoryOp`s (verify + delegation graph) close the ABI-stable surface
+
+A cohabitation audit (CIRISEdge#245 flagged the first; the rest from sweeping
+every consumer) confirmed the cohabiting Rust consumers subject to the
+vtable-skew class are exactly **CIRISEdge** and **CIRISNodeCore** — CIRISServer
+and the CEWPOS spikes link persist **directly** (single binary, no skew),
+CIRISConformance validates via edge (Python harness), CEWP is spec/docs. Two
+composite free-fn paths those consumers reach through the raw `dyn` were not yet
+expressible as `DirectoryOp`s; both are now added (append-only), completing the
+ABI-stable directory surface:
+
+- **`VerifyHybridViaDirectory`** (the **security-critical** one, CIRISEdge#245).
+  `verify_hybrid_via_directory` does multiple directory lookups + the
+  Ed25519/ML-DSA-65 hybrid verification internally — a raw-`dyn` misdispatch here
+  wouldn't just hang (like #320's `put_transport_destination`), it would silently
+  verify against the wrong method → **accept a forged signature**. The op runs
+  the entire verify inside persist's `.so` (persist's own vtable). Result variant
+  `HybridVerify(Result<VerifyOutcome, String>)` preserves the verify VERDICT
+  intact (`Ok(VerifyOutcome)`); an operational `VerifyError` flattens to
+  `Err(String)` **inside** `HybridVerify` (not the top-level `Err`), so the
+  consumer always distinguishes "verify ran → this outcome" from "verify could
+  not run". `verify_hybrid_via_directory`'s `F` bound relaxed to
+  `FederationDirectory + ?Sized` so the `&dyn` dispatcher can call it (existing
+  concrete-backend callers unaffected). `HybridPolicy` + `VerifyOutcome` gained
+  `Serialize`/`Deserialize`.
+- **`BuildDelegationGraph`** (CIRISNodeCore trust-depth). `build_delegation_graph`
+  walks the delegation graph via multiple lookups; result variant
+  `DelegationGraph(DelegationGraph)` (already `Serialize`).
+
+`sign_envelope` (edge, 9 calls) takes **no** directory → not vtable-fragile;
+excluded. `DIRECTORY_ABI_VERSION` stays `1` (the `build_op` C-ABI is unchanged;
+the op enum is append-only, so an older consumer that can't construct these
+variants is unaffected, and an op unknown to an older persist fails cleanly at
+`serde` parse). CIRISVerify stays v8.3.0.
+
 ## [11.6.0] — 2026-07-01
 
 ### Added — #320: ABI-stable FederationDirectory dispatch capsule (fixes the cross-cdylib vtable-skew class)
