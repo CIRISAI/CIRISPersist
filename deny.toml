@@ -79,6 +79,15 @@ ignore = [
     "RUSTSEC-2024-0436",  # paste unmaintained — transitive via candle / ort macros
     # v6.0.1 — RUSTSEC-2026-0176 + 0177 (pyo3 < 0.29) genuinely CLEARED by
     # the 0.29 re-land; the v5.5.2 ignores are removed, not just unneeded.
+    #
+    # v11.6.1 — anyhow 1.0.102 `Error::downcast_mut()` Stacked-Borrows
+    # unsoundness (dtolnay/anyhow#451, fix pending upstream). anyhow is
+    # transitive ONLY via the NER/scrub-ner ML stack (candle / hf-hub);
+    # persist never calls `downcast_mut` (the unsound path). Not on the
+    # ingest hot path, not exploitable here. Remove when anyhow ships the
+    # fix and cargo picks it up. Was blocking pre-push cargo-deny → forcing
+    # `--no-verify` bypasses (which let a rustfmt slip reach CI on #323).
+    "RUSTSEC-2026-0190",  # anyhow downcast_mut unsound — transitive via candle NER stack
 ]
 
 [sources]
