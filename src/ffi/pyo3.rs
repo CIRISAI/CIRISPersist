@@ -22146,6 +22146,21 @@ impl PyEngine {
     /// pattern the Option-B pub-fn (#95) uses.
     ///
     /// Name tag: `ciris_persist::outbound_queue`.
+    ///
+    /// # Deprecation (v11.7.0, CIRISPersist#320 audit)
+    ///
+    /// Structurally unsound under cdylib cohabitation — this hands the
+    /// consumer a raw `BackendDispatch` whose `OutboundQueue` methods the
+    /// consumer static-dispatches against ITS compiled view of persist's
+    /// `PostgresBackend` / `SqliteBackend` struct layout. When the wheel's
+    /// backend layout has moved relative to the consumer's build, every
+    /// field access / method call reinterprets memory at the wrong offset
+    /// → corruption. Same class as the directory vtable-skew (#320) and
+    /// the cross-tokio deadlock (#156). New consumers MUST migrate to
+    /// [`Self::outbound_queue_ops_capsule_py`]
+    /// (`outbound_queue_ops_capsule`), the ABI-stable C-vtable
+    /// serialized-op surface that dispatches the method INSIDE persist's
+    /// `.so`. Retained for the migration window (CIRISEdge#245 extends).
     #[pyo3(name = "outbound_queue_capsule")]
     fn outbound_queue_capsule_py<'py>(
         &self,
@@ -22161,6 +22176,44 @@ impl PyEngine {
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("outbound_queue_capsule: {e}")))
     }
 
+    /// v11.7.0 (CIRISPersist#320 audit) — the ABI-stable replacement for
+    /// [`Self::outbound_queue_capsule_py`]. Returns a `PyCapsule` wrapping
+    /// an
+    /// [`OutboundQueueHandle`](crate::ffi::outbound_queue_capsule::OutboundQueueHandle)
+    /// — a C-ABI vtable + opaque data — instead of a raw `BackendDispatch`.
+    ///
+    /// The consumer never static-dispatches an `OutboundQueue` method
+    /// against persist's backend struct layout. Instead it serializes an
+    /// [`OutboundQueueOp`](crate::ffi::outbound_queue_capsule::OutboundQueueOp),
+    /// calls `vtable.build_op(...)` (which runs inside persist's `.so`, so
+    /// the concrete method dispatch uses persist's own compiled backend),
+    /// spawns the returned future via the `executor_capsule`, and receives
+    /// the serialized
+    /// [`OutboundQueueOpResult`](crate::ffi::outbound_queue_capsule::OutboundQueueOpResult)
+    /// through a callback. Postgres and Sqlite dispatch identically (no
+    /// backend asymmetry). This closes the cross-cdylib layout-skew class
+    /// the #320 audit flagged.
+    ///
+    /// Consumers MUST check `vtable.abi_version ==
+    /// OUTBOUND_QUEUE_ABI_VERSION` at receive time.
+    ///
+    /// Name tag: `ciris_persist::outbound_queue_ops_v1`.
+    #[pyo3(name = "outbound_queue_ops_capsule")]
+    fn outbound_queue_ops_capsule_py<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        let dispatch = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+        };
+        crate::ffi::outbound_queue_capsule::build_capsule_with_destructor(py, dispatch).map_err(
+            |e| PyErr::new::<LensQueryError, _>(format!("outbound_queue_ops_capsule: {e}")),
+        )
+    }
+
     /// v2.7.0 (CIRISPersist#109) — cross-module accessor for the
     /// federation keyring signer parts. Returns a `PyCapsule` wrapping
     /// the same `KeyringSignerHandle` the Option-B pub-fn (#95)
@@ -22170,6 +22223,26 @@ impl PyEngine {
     /// (docs/COHABITATION.md rule 1).
     ///
     /// Name tag: `ciris_persist::keyring_signer`.
+    ///
+    /// # Deprecation (v11.7.0, CIRISPersist#320 audit) — SECURITY-CRITICAL
+    ///
+    /// Structurally unsound under cdylib cohabitation, with the highest
+    /// stakes of any capsule: this hands the consumer raw
+    /// `Arc<dyn HardwareSigner>` / `Arc<dyn PqcSigner>` trait objects. A
+    /// `dyn` vtable's method-slot order is NOT ABI-stable across persist
+    /// versions, so a consumer built against an older persist can call
+    /// `.sign()` through a slot index that, in the wheel's vtable, points
+    /// at a DIFFERENT method — or, across the classical-vs-PQC trait
+    /// boundary, at the wrong signer/algorithm entirely. The result is a
+    /// signature computed with the wrong key or algorithm that still
+    /// verifies as a valid CIRIS signature: a silent forged-signature /
+    /// key-confusion bug. New consumers MUST migrate to
+    /// [`Self::signer_ops_capsule_py`] (`signer_ops_capsule`), the
+    /// ABI-stable C-vtable serialized-op surface that dispatches the
+    /// exact signer + method INSIDE persist's `.so` (persist's own
+    /// vtable), where the classical-vs-PQC and method-slot selection can
+    /// never be skewed. Retained for the migration window (CIRISEdge#245
+    /// extends).
     #[pyo3(name = "keyring_signer_capsule")]
     fn keyring_signer_capsule_py<'py>(
         &self,
@@ -22182,6 +22255,43 @@ impl PyEngine {
         };
         pyo3::types::PyCapsule::new_with_value(py, handle, c"ciris_persist::keyring_signer")
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("keyring_signer_capsule: {e}")))
+    }
+
+    /// v11.7.0 (CIRISPersist#320 audit) — the **SECURITY-CRITICAL**
+    /// ABI-stable replacement for [`Self::keyring_signer_capsule_py`].
+    /// Returns a `PyCapsule` wrapping a
+    /// [`Signer`](crate::ffi::signer_capsule::Signer) — a C-ABI vtable +
+    /// opaque data — instead of raw `Arc<dyn HardwareSigner>` /
+    /// `Arc<dyn PqcSigner>` trait objects.
+    ///
+    /// The consumer never calls `.sign()` / `.public_key()` through its
+    /// own (possibly skewed) `dyn` vtable. Instead it serializes a
+    /// [`SignerOp`](crate::ffi::signer_capsule::SignerOp), calls
+    /// `vtable.build_op(...)` (which runs inside persist's `.so`, so the
+    /// classical-vs-PQC signer and the concrete method are selected by
+    /// persist's own statically-resolved code), spawns the returned future
+    /// via the `executor_capsule`, and receives the raw signature /
+    /// public-key **bytes** through a callback as a serialized
+    /// [`SignerOpResult`](crate::ffi::signer_capsule::SignerOpResult).
+    /// This eliminates the wrong-method / wrong-algorithm signing hazard
+    /// the old raw-`dyn` surface carried.
+    ///
+    /// Consumers MUST check `vtable.abi_version == SIGNER_ABI_VERSION` at
+    /// receive time.
+    ///
+    /// Name tag: `ciris_persist::signer_ops_v1`.
+    #[pyo3(name = "signer_ops_capsule")]
+    fn signer_ops_capsule_py<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        let handle = crate::signing::KeyringSignerHandle {
+            signer: self.signer.clone(),
+            pqc_signer: self.local_signer.as_ref().and_then(|ls| ls.pqc_signer()),
+            key_id: self.signer_key_id.clone(),
+        };
+        crate::ffi::signer_capsule::build_capsule_with_destructor(py, handle)
+            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("signer_ops_capsule: {e}")))
     }
 
     /// v2.8.0 (CIRISPersist#111) — cross-cdylib accessor for the tokio

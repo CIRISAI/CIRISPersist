@@ -1,6 +1,13 @@
 //! Outbound queue row + filter shapes (CIRISPersist#16).
 
 use chrono::{DateTime, Utc};
+// v11.7.0 (CIRISPersist#320 audit) — these types cross the ABI-stable
+// `outbound_queue_ops_capsule` boundary as serialized op args/results
+// (`src/ffi/outbound_queue_capsule.rs`). They are serialized inside
+// persist's `.so` and deserialized by the same persist code on the way
+// back, so the derives are a persist-internal wire contract, not a
+// cross-version-stable public schema.
+use serde::{Deserialize, Serialize};
 
 /// Server-generated outbound row identifier (UUID, hex+dashes).
 /// Returned to callers as `DurableHandle::queue_id`. Persist
@@ -12,7 +19,7 @@ pub type QueueId = String;
 /// values; schema CHECK enforces it. Two terminal states
 /// (`delivered`, `abandoned`); three working states (`pending`,
 /// `sending`, `awaiting_ack`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OutboundStatus {
     /// Row is queued, eligible for `claim_pending_outbound`.
     Pending,
@@ -66,7 +73,7 @@ impl OutboundStatus {
 
 /// Why a row reached `Abandoned`. Mirrors the schema's
 /// `abandoned_reason` CHECK constraint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AbandonedReason {
     /// `attempt_count >= max_attempts` after a transport failure.
     MaxAttempts,
@@ -102,7 +109,7 @@ impl AbandonedReason {
 /// the row stays alive (attempt_count++, scheduled for next try);
 /// `Abandoned` when the failure pushed past `max_attempts` or
 /// `ttl_seconds`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutboundFailureOutcome {
     /// The row survives this failure; will be re-claimed at
     /// `next_attempt_after`. `attempt` is the new attempt_count
@@ -118,7 +125,7 @@ pub enum OutboundFailureOutcome {
 
 /// Filter for `list_outbound`. All fields optional; combine with
 /// AND. Used by ops dashboards.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OutboundFilter {
     /// Restrict to rows with this status.
     pub status: Option<OutboundStatus>,
@@ -135,7 +142,7 @@ pub struct OutboundFilter {
 /// Row shape returned by `claim_pending_outbound`,
 /// `outbound_status`, `list_outbound`, `match_ack_to_outbound`. Maps
 /// 1:1 onto `cirislens.edge_outbound_queue` columns.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutboundRow {
     /// Server-generated row identifier (UUID).
     pub queue_id: QueueId,
