@@ -5,6 +5,45 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.9.0] — 2026-07-01
+
+### Added — #337: CC 0.7 wire-vocabulary range-steward surface (ratify `0x0005_0001` + publish `WIRE_VOCABULARY_KINDS.md`)
+
+Discharges CIRISPersist's CC 0.7 §3.3 range-steward duty for the Tier-2 range
+`0x0005_0000..=0x0005_FFFF` ("persist-tier telemetry") assigned in
+`CIRISConstitution/manifests/WIRE_VOCABULARY.md` v1.0.1 §3.1.
+
+- **`WIRE_VOCABULARY_KINDS.md`** (repo root) — the authoritative `kind →
+  semantics` table for persist's range.
+- **`src/wire_vocabulary.rs`** (new module, re-exported at the crate root):
+  - `TRACE_BATCH_KIND = 0x0005_0001` — ratifies the §3.3 migrant of the retired
+    `MessageType::AccordEventsBatch`. Payload = canonical JSON of
+    `schema::BatchEnvelope` (the bytes the HTTP ingest posts /
+    `receive_and_persist` consumes). Reconciles CIRISServer/lens-core's
+    provisional `ACCORD_EVENTS_KIND` — they repin onto this constant.
+  - `trace_batch_payload_bytes(&BatchEnvelope)` — the produce half of the §3.3
+    shared canonicalization; `BatchEnvelope::from_json` is the
+    verify-before-persist receive half.
+  - `PERSIST_KIND_RANGE` + `is_persist_kind()` — the §3.1 range membership test.
+  - `WIRE_VOCABULARY_HASH` — pins the §4 vocabulary hash
+    `c6bd6aa4…9346c`, byte-identical to `CIRISEdge::WIRE_VOCABULARY_HASH`
+    (CIRISEdge#241) and the CIRISRegistry artifact copy (verified: it is the
+    SHA-256 of the manifest's canonical bytes). A pin test guards drift.
+
+**DSAR stays Tier-1** (not migrated): §3.3 keeps `DSARRequest`/`DSARResponse`
+closed because erasure is rights-bearing and rides Durable+requires-ack, which
+the opaque channels cannot express. The DSAR sub-range is documented as
+reserved-not-allocated.
+
+**No `send_trace_batch(edge, …)` wrapper here by design:** persist sits *below*
+edge (edge links persist), so wrapping `edge.send_opaque_event` in persist would
+invert the dependency. Persist owns the shared definition (kind + schema +
+canonicalization); the emitter (CIRISAgent#904) and receiver (CIRISServer/
+lens-core) — which depend on both — compose it with edge's generic opaque send.
+
+Verify pin unchanged at v8.3.0. No behavior change to any existing path — purely
+additive public surface + a governance doc.
+
 ## [11.8.2] — 2026-07-01
 
 ### Added — #333: 6 peer-mutation DirectoryOp variants complete the ops-proxy surface (CIRISEdge#245)

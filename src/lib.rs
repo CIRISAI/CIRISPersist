@@ -123,6 +123,7 @@ pub mod tickets;
 pub mod verify;
 #[cfg(feature = "cirislens_wa_cert")]
 pub mod wa_cert;
+pub mod wire_vocabulary;
 pub mod witness;
 
 /// v4.12.1 (CIRISPersist#189) — verify-style embedded version literal for
@@ -169,6 +170,15 @@ pub use engine::AuditDispatch;
 #[cfg(all(feature = "cirisnode", any(feature = "postgres", feature = "sqlite")))]
 pub use engine::NodeCoreDispatch;
 pub use engine::{BackendDispatch, Engine, EngineError};
+// v11.9.0 (CIRISPersist#337) — CC 0.7 wire-vocabulary range-steward surface
+// at the crate root so consumers `use ciris_persist::{TRACE_BATCH_KIND,
+// WIRE_VOCABULARY_HASH}` alongside `Engine`. CIRISServer/lens-core repins its
+// provisional `ACCORD_EVENTS_KIND` onto `TRACE_BATCH_KIND`; CIRISAgent#904
+// (emitter) shares `trace_batch_payload_bytes`. See `WIRE_VOCABULARY_KINDS.md`.
+pub use wire_vocabulary::{
+    is_persist_kind, trace_batch_payload_bytes, PERSIST_KIND_RANGE, TRACE_BATCH_KIND,
+    WIRE_VOCABULARY_HASH,
+};
 // v2.13.0 (CIRISPersist#113) — Engine detection-events read + subscribe
 // facade. Re-export the filter / row types + the derived Error at the
 // crate root so consumers can `use ciris_persist::{Engine,
