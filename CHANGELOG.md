@@ -5,6 +5,51 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [12.0.0] — 2026-07-02
+
+### Security / BREAKING — #344: rooting anchors to the HUMANITY_ACCORD holder keyset (v12.0 genesis mesh, centipede body)
+
+The AV-42 cold-start rooting primitive now pins trust to the pinned accord-holder
+anchor and — critically — verifies scrub-signatures over the bytes that were
+actually signed. Part of the v12.0 genesis-mesh centipede (CIRISVerify#160 →
+**this** → CIRISEdge#252 → CIRISServer#139/#140).
+
+**Closes the spoof-a-steward gap.** `root_binding` previously accepted a chain
+terminating at *any* self-signed `steward` row, and edge's announce path never
+wired verify's anchor check — so a peer that got a self-signed `steward` row
+admitted could root to it. `root_binding` now enforces **anchor membership**:
+the terminus's Ed25519 pubkey MUST be one of the pinned HUMANITY_ACCORD holder
+keys (`ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor`), else
+`RootingRejection::TerminusNotInAnchor`. This is secure-by-default — every
+existing `root_binding` caller (edge's cold-start) gets the gate with no code
+change. `root_binding_anchored(…, anchor)` is the injectable core (tests / other
+pinning).
+
+**`accord_holder` termini** (the seeded A1/B1/C1 shape) now qualify alongside
+`steward` — the accord holders ARE the trusted primitive keyset. Safe *because*
+the anchor gate is the load-bearing check; identity-type is a coarse shape gate.
+
+**Fixes a latent showstopper (empirically confirmed).** `verify_chain_signatures`
+verified each scrub-signature over the **hash bytes** (`hex(original_content_hash)`),
+but the real producer (`produce_self_key_record` → `sign_bound(&canonical)`) and
+the write-path `verify_key_registration` sign/verify over the **canonical
+`registration_envelope`**. Verified against the real A1 ceremony record: its
+Ed25519 scrub-signature verifies over `canonical(envelope)` = TRUE, over the hash
+= false. Rooting would have rejected *every* real record; latent only because
+nothing roots yet. Rooting now canonicalizes `registration_envelope` (same
+`ceg_produce_canonicalize` as `register`), cross-checks its SHA-256 against the
+declared `original_content_hash`, and verifies over those bytes.
+
+**API changes (MAJOR):**
+- `RootingRejection` gains `TerminusNotInAnchor` (kind `rooting_terminus_not_in_anchor`).
+- `ProvenanceLink` gains `registration_envelope: serde_json::Value` (`#[serde(default)]`).
+- New `pub async fn root_binding_anchored(dir, key_id, pubkey, &[[u8;32]])`.
+- `root_binding` behavior change: now enforces the accord anchor.
+
+Verify re-pinned v8.3.0 → **v8.4.0** (the `accord_holder_bootstrap_anchor` accessor;
+minor, within `ciris-verify>=8,<9`). No seeding yet — a fresh node still roots
+nothing (fail-secure); seeding of the signed A1/B1/C1 records lands in v12.0.1.
+
 ## [11.9.1] — 2026-07-02
 
 ### Fixed — #339: sqlite-only builds no longer pull openssl (retires mobile vendored-openssl)
