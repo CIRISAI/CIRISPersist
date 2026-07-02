@@ -5,6 +5,43 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [11.9.1] — 2026-07-02
+
+### Fixed — #339: sqlite-only builds no longer pull openssl (retires mobile vendored-openssl)
+
+A `pyo3-sqlite` / sqlite-only build no longer drags `openssl-sys` into the
+dependency tree on **any** target, letting CIRISEdge#246 drop the
+vendored-openssl-from-source builds on iOS/Android (the flakiest part of the
+mobile matrix, pure build-time cost for a NoTls path never exercised).
+
+**Corrected root cause.** #339 (and the prior in-code comments at the android/
+iOS target tables) diagnosed the openssl as transitive via
+`refinery → tokio-postgres → postgres-native-tls → native-tls → openssl-sys`.
+That chain **does not exist** — verified with `cargo tree -i native-tls`
+(absent on every target; refinery's `tokio-postgres` backend uses `NoTls`).
+The openssl was **self-inflicted**: the `[target.'cfg(target_os = "ios")']` and
+`[target.'cfg(target_os = "android")']` tables declared
+`openssl = { features = ["vendored"] }` as an **unconditional hard dep**, so
+cargo unioned it into an always-on openssl on mobile regardless of feature.
+
+**Fix.**
+- Both mobile target-table `openssl` entries are now `optional = true`, so they
+  activate only when the `postgres` feature enables `dep:openssl` (+ union the
+  `vendored` feature on mobile). A sqlite-only mobile wheel pulls no openssl.
+- `refinery` base dep → `default-features = false` (drops the unused `toml`
+  config feature and the previously-hardcoded `tokio-postgres` backend); each
+  backend feature now opts into its own refinery backend: `sqlite` →
+  `refinery/rusqlite`, `postgres` → `refinery/tokio-postgres`. This also
+  removes the dead `tokio-postgres` compile from sqlite-only builds. Migrations
+  are compile-time `embed_migrations!`, so `toml` was never used.
+- Corrected the misleading target-table comments.
+
+**Verified** (`cargo tree -i openssl-sys`): absent under `pyo3-sqlite sqlite` on
+host / android / ios; present under `pyo3 sqlite` on host / android / ios
+(postgres path intact). `tokio-postgres` absent from the sqlite-only tree.
+sqlite migrations run clean (`migrations_run_clean_in_memory` + 295 sqlite
+tests) with the reduced refinery. Verify pin unchanged at v8.3.0.
+
 ## [11.9.0] — 2026-07-01
 
 ### Added — #337: CC 0.7 wire-vocabulary range-steward surface (ratify `0x0005_0001` + publish `WIRE_VOCABULARY_KINDS.md`)
