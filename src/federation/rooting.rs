@@ -77,6 +77,8 @@
 
 use std::collections::HashSet;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use super::{FederationDirectory, KeyRecord};
@@ -94,10 +96,31 @@ use crate::verify::hybrid::{verify_hybrid, HybridPolicy};
 /// chain.
 pub const MAX_PROVENANCE_DEPTH: usize = 64;
 
-/// `identity_type` value marking a row as a steward — the trust-root
-/// class. The recursive-provenance walk terminates only at a
-/// **self-signed steward** row (the bootstrap).
+/// `identity_type` values that mark a self-signed row as a legitimate
+/// **trust-root terminus** for the provenance walk. Historically only
+/// `steward`; CIRISPersist#344 (v12.0) adds `accord_holder` because the
+/// HUMANITY_ACCORD holders (A1/B1/C1) ARE the trusted primitive keyset —
+/// the mesh roots to them directly.
+///
+/// **This identity check is only a coarse sanity gate.** The load-bearing
+/// trust decision is [`root_binding`]'s **anchor-membership** check: the
+/// terminus's Ed25519 pubkey MUST be one of the pinned accord-holder anchor
+/// keys ([`ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor`]).
+/// A self-signed `steward`/`accord_holder` row that a peer merely *asserts*
+/// (pubkey not in the anchor) is rejected with
+/// [`RootingRejection::TerminusNotInAnchor`] — closing the spoof-a-steward
+/// gap that an identity-type-only check leaves open.
 const STEWARD_IDENTITY_TYPE: &str = super::types::identity_type::STEWARD;
+const ACCORD_HOLDER_IDENTITY_TYPE: &str = super::types::identity_type::ACCORD_HOLDER;
+
+/// `true` iff `identity_type` (a CEG 1.0-RC5 §7.0.1 comma-joined role SET,
+/// read by set-membership — e.g. `"steward,accord_holder"`) carries a
+/// trust-root role (`steward` or `accord_holder`).
+fn is_trusted_root_identity(identity_type: &str) -> bool {
+    identity_type
+        .split(',')
+        .any(|role| role == STEWARD_IDENTITY_TYPE || role == ACCORD_HOLDER_IDENTITY_TYPE)
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Cross-repo contract types — ratification surface
@@ -140,14 +163,25 @@ pub struct ProvenanceLink {
     /// `identity_ref` of the row (steward role / primitive name / …).
     pub identity_ref: String,
     /// Four-tuple #1 — `sha256(canonical(registration_envelope))`,
-    /// hex-encoded. The bytes the scrub-signature covers.
+    /// hex-encoded. Cross-checked against the recomputed canonical hash;
+    /// NOT itself the signed bytes (see [`Self::registration_envelope`]).
     pub original_content_hash: String,
+    /// The row's `registration_envelope` — the object the scrub-signature
+    /// actually covers (via its JCS canonicalization). CIRISPersist#344:
+    /// the signature is over `canonical(registration_envelope)`, matching
+    /// the producer (`ciris_verify_core::produce_self_key_record`,
+    /// `sign_bound(&canonical)`) and the write-path
+    /// [`verify_key_registration`](super::register) — NOT over the hash.
+    /// `#[serde(default)]` for back-compat of older serialized chains
+    /// (which then cannot re-verify signatures, only structure).
+    #[serde(default)]
+    pub registration_envelope: serde_json::Value,
     /// Four-tuple #2a — Ed25519 scrub-signature over
-    /// `original_content_hash`, base64 standard. Always present.
+    /// `canonical(registration_envelope)`, base64 standard. Always present.
     pub scrub_signature_classical: String,
     /// Four-tuple #2b — ML-DSA-65 scrub-signature over
-    /// `original_content_hash || classical_sig` (bound signature),
-    /// base64 standard. `None` while the row is hybrid-pending.
+    /// `canonical || classical_sig` (bound signature), base64 standard.
+    /// `None` while the row is hybrid-pending.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrub_signature_pqc: Option<String>,
     /// Four-tuple #3 — `key_id` of the parent row that signed this
@@ -172,6 +206,7 @@ impl ProvenanceLink {
             identity_type: record.identity_type.clone(),
             identity_ref: record.identity_ref.clone(),
             original_content_hash: record.original_content_hash.clone(),
+            registration_envelope: record.registration_envelope.clone(),
             scrub_signature_classical: record.scrub_signature_classical.clone(),
             scrub_signature_pqc: record.scrub_signature_pqc.clone(),
             scrub_key_id: record.scrub_key_id.clone(),
@@ -269,13 +304,28 @@ pub enum RootingRejection {
         detail: String,
     },
     /// The walk reached a self-signed row, but that row's
-    /// `identity_type` is not `steward` — the chain terminates
-    /// somewhere other than a steward bootstrap.
+    /// `identity_type` carries neither a `steward` nor an
+    /// `accord_holder` role — the chain terminates somewhere other than
+    /// a trust-root bootstrap.
     NotRootedAtSteward {
         /// The self-signed row the chain terminated at.
         key_id: String,
-        /// That row's `identity_type` (anything but `steward`).
+        /// That row's `identity_type` (no trust-root role).
         identity_type: String,
+    },
+    /// The chain terminated at a self-signed trust-root-typed row whose
+    /// Ed25519 pubkey is **not** one of the pinned accord-holder anchor
+    /// keys (CIRISPersist#344). This is the load-bearing anti-spoof gate:
+    /// an identity-type check alone would let a peer root to a
+    /// `steward`/`accord_holder` row it merely self-asserted; requiring
+    /// the terminus pubkey ∈ the pinned anchor means only the real
+    /// HUMANITY_ACCORD holders (A1/B1/C1) — whose keys a peer cannot
+    /// forge — are valid roots.
+    TerminusNotInAnchor {
+        /// The self-signed terminus row.
+        key_id: String,
+        /// Its Ed25519 pubkey (base64) — absent from the trusted anchor.
+        terminus_pubkey_ed25519_base64: String,
     },
     /// A `key_id` was encountered twice on the same walk — the
     /// provenance graph contains a cycle. Rejected rather than looped.
@@ -310,6 +360,7 @@ impl RootingRejection {
             Self::BrokenProvenanceLink { .. } => "rooting_broken_provenance_link",
             Self::UnsignedProvenanceLink { .. } => "rooting_unsigned_provenance_link",
             Self::NotRootedAtSteward { .. } => "rooting_not_rooted_at_steward",
+            Self::TerminusNotInAnchor { .. } => "rooting_terminus_not_in_anchor",
             Self::CycleDetected { .. } => "rooting_cycle_detected",
             Self::OverDepth { .. } => "rooting_over_depth",
             Self::DirectoryError { .. } => "rooting_directory_error",
@@ -470,7 +521,11 @@ where
         chain.push(link);
 
         if is_self_signed {
-            let terminates_at_steward_bootstrap = terminus_identity_type == STEWARD_IDENTITY_TYPE;
+            // CIRISPersist#344: a trust-root terminus carries `steward` OR
+            // `accord_holder` (set-membership, comma-joined roles). The
+            // *pubkey-in-anchor* gate in `root_binding` is what actually
+            // pins trust; this only classifies the terminus shape.
+            let terminates_at_steward_bootstrap = is_trusted_root_identity(&terminus_identity_type);
             return Ok(ProvenanceChain {
                 key_id: key_id.to_owned(),
                 chain,
@@ -490,9 +545,16 @@ where
 ///
 /// On first contact with a federation peer, confirm the claimed
 /// `(key_id, pubkey)` binding against the `federation_keys` directory
-/// and verify the row's recursive-provenance chain up to a steward
-/// bootstrap. **This replaces trust-on-first-use** — CIRISEdge's
-/// `PeerResolver` calls it on its cold-start path.
+/// and verify the row's recursive-provenance chain up to a **pinned
+/// trust-root** bootstrap. **This replaces trust-on-first-use** —
+/// CIRISEdge's `PeerResolver` calls it on its cold-start path.
+///
+/// This wrapper pins the trusted terminus anchor to the HUMANITY_ACCORD
+/// holder keyset (A1/B1/C1) via
+/// [`ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor`] —
+/// the accord holders ARE the mesh's trusted primitive keyset
+/// (CIRISPersist#344). Use [`root_binding_anchored`] to supply a different
+/// anchor (tests).
 ///
 /// Returns [`RootingVerdict::Confirmed`] iff ALL hold:
 ///
@@ -501,9 +563,13 @@ where
 ///     `pubkey_ed25519_base64` (exact string match — both are base64
 ///     standard of the 32 raw bytes).
 ///  3. The recursive-provenance chain assembles (no break, no cycle,
-///     within depth) and terminates at a **self-signed steward**
-///     bootstrap.
-///  4. Every link's scrub-signature verifies cryptographically: each
+///     within depth) and terminates at a **self-signed** row carrying a
+///     trust-root role (`steward` or `accord_holder`).
+///  4. **The terminus's Ed25519 pubkey is one of the pinned anchor keys**
+///     — the load-bearing anti-spoof gate (step 3 is only a coarse
+///     identity-shape check; this is what actually pins trust to the
+///     un-forgeable accord holders).
+///  5. Every link's scrub-signature verifies cryptographically: each
 ///     row's `scrub_signature_*` over its `original_content_hash`,
 ///     checked against the **parent** row's pubkey (the self-signed
 ///     bootstrap is checked against its own pubkey).
@@ -532,6 +598,34 @@ pub async fn root_binding<F>(
     directory: &F,
     key_id: &str,
     claimed_pubkey_ed25519_base64: &str,
+) -> RootingVerdict
+where
+    F: FederationDirectory,
+{
+    // Secure by default: the trusted anchor is the pinned HUMANITY_ACCORD
+    // holder keyset (A1/B1/C1). Every existing caller (CIRISEdge's cold-start
+    // announce path) therefore gets anchor enforcement with no code change —
+    // the terminus MUST be one of the real accord holders, not any
+    // self-signed steward a peer asserts. Tests inject their own anchor via
+    // [`root_binding_anchored`].
+    let anchor = ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor();
+    root_binding_anchored(directory, key_id, claimed_pubkey_ed25519_base64, &anchor).await
+}
+
+/// [`root_binding`] with an explicit trusted-terminus **anchor** — the core
+/// primitive. The terminus's Ed25519 pubkey must appear in `trusted_anchor`
+/// (a slice of raw 32-byte keys) or the binding is rejected with
+/// [`RootingRejection::TerminusNotInAnchor`]. Production callers use the
+/// [`root_binding`] wrapper (accord-holder anchor); this form exists so tests
+/// (and any alternative pinning) can supply their own anchor.
+///
+/// See [`root_binding`] for the full step-by-step contract; this adds **step
+/// 5**: terminus-pubkey ∈ `trusted_anchor`.
+pub async fn root_binding_anchored<F>(
+    directory: &F,
+    key_id: &str,
+    claimed_pubkey_ed25519_base64: &str,
+    trusted_anchor: &[[u8; 32]],
 ) -> RootingVerdict
 where
     F: FederationDirectory,
@@ -574,9 +668,9 @@ where
         Err(rejection) => return RootingVerdict::Rejected { rejection },
     };
 
-    // The chain must terminate at a steward bootstrap. A structurally
-    // valid chain that roots at, e.g., a self-signed `agent` row is
-    // NOT rooted — fail-honest rather than accept.
+    // The chain must terminate at a trust-root bootstrap (a self-signed
+    // `steward` or `accord_holder` row). A structurally valid chain that
+    // roots at, e.g., a self-signed `agent` row is NOT rooted — fail-honest.
     if !chain.terminates_at_steward_bootstrap {
         // `chain` is non-empty (provenance_chain always pushes the
         // leaf) and its last element is self-signed.
@@ -587,6 +681,40 @@ where
                 identity_type: terminus.identity_type.clone(),
             },
         };
+    }
+
+    // Step 3b (CIRISPersist#344 — the load-bearing anti-spoof gate): the
+    // terminus's Ed25519 pubkey MUST be a pinned trusted-anchor key. The
+    // identity-type check above is only a coarse shape gate — WITHOUT this,
+    // a peer that gets a self-signed `steward`/`accord_holder` row admitted
+    // (self-signed registration is permitted) could root to it and spoof a
+    // rooted binding. Pinning the terminus to the un-forgeable accord-holder
+    // anchor (A1/B1/C1) means only the real holders are valid roots.
+    let terminus = chain.chain.last().expect("chain is non-empty");
+    match BASE64.decode(terminus.pubkey_ed25519_base64.as_bytes()) {
+        Ok(raw) if raw.len() == 32 => {
+            let mut ed = [0u8; 32];
+            ed.copy_from_slice(&raw);
+            if !trusted_anchor.contains(&ed) {
+                return RootingVerdict::Rejected {
+                    rejection: RootingRejection::TerminusNotInAnchor {
+                        key_id: terminus.key_id.clone(),
+                        terminus_pubkey_ed25519_base64: terminus.pubkey_ed25519_base64.clone(),
+                    },
+                };
+            }
+        }
+        // A terminus whose pubkey cannot be decoded to 32 bytes can never be
+        // in the anchor — reject fail-secure (same token; the decode fault
+        // and the not-in-anchor case both mean "not a pinned root").
+        _ => {
+            return RootingVerdict::Rejected {
+                rejection: RootingRejection::TerminusNotInAnchor {
+                    key_id: terminus.key_id.clone(),
+                    terminus_pubkey_ed25519_base64: terminus.pubkey_ed25519_base64.clone(),
+                },
+            };
+        }
     }
 
     // Step 4: verify every link's scrub-signature. Each row was
@@ -632,14 +760,38 @@ fn verify_chain_signatures(chain: &ProvenanceChain) -> Result<(), RootingRejecti
             }
         })?;
 
-        // The bytes the scrub-signature covers: original_content_hash.
-        let signed_bytes = hex::decode(&link.original_content_hash).map_err(|e| {
-            RootingRejection::UnsignedProvenanceLink {
+        // The bytes the scrub-signature covers: the JCS-canonicalized
+        // `registration_envelope` — the SAME bytes the producer signed
+        // (`ciris_verify_core::produce_self_key_record` → `sign_bound(&canonical)`)
+        // and the write-path `verify_key_registration` verifies. This was
+        // empirically confirmed against the real A1 accord-holder record:
+        // its Ed25519 scrub-signature verifies over `canonical(envelope)`,
+        // NOT over the hash bytes (CIRISPersist#344). Verifying over the
+        // hash — as this did before — rejected every real record.
+        let signed_bytes =
+            crate::verify::canonical::ceg_produce_canonicalize(&link.registration_envelope)
+                .map_err(|e| RootingRejection::UnsignedProvenanceLink {
+                    key_id: link.key_id.clone(),
+                    signed_by_key_id: link.scrub_key_id.clone(),
+                    detail: format!("registration_envelope canonicalize: {e}"),
+                })?;
+
+        // Integrity: the declared `original_content_hash` MUST equal the
+        // recomputed canonical hash, or the envelope was tampered relative
+        // to the row's hash (a canonicalizer disagreement or a swapped
+        // envelope). Fail-secure — same discipline as `verify_key_registration`.
+        let computed_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&signed_bytes));
+        if computed_hash != link.original_content_hash {
+            return Err(RootingRejection::UnsignedProvenanceLink {
                 key_id: link.key_id.clone(),
                 signed_by_key_id: link.scrub_key_id.clone(),
-                detail: format!("original_content_hash hex decode: {e}"),
-            }
-        })?;
+                detail: format!(
+                    "original_content_hash mismatch: envelope canonicalizes to {computed_hash}, \
+                     row declares {}",
+                    link.original_content_hash
+                ),
+            });
+        }
 
         // Crypto through the CIRISVerify path. Ed25519Fallback: a
         // hybrid-pending link verifies on Ed25519 alone; a link that
@@ -770,6 +922,13 @@ mod conformance_helpers {
         pub fn pubkey_b64(&self) -> String {
             B64.encode(self.signing_key.verifying_key().to_bytes())
         }
+
+        /// The raw 32-byte Ed25519 pubkey — for use as a test rooting
+        /// anchor via [`root_binding_anchored`] (production uses the
+        /// accord-holder anchor; tests pin their own steward).
+        pub fn pubkey_anchor(&self) -> [u8; 32] {
+            self.signing_key.verifying_key().to_bytes()
+        }
     }
 
     fn ts() -> DateTime<Utc> {
@@ -785,16 +944,15 @@ mod conformance_helpers {
     /// steward bootstrap.
     pub fn signed_record(subject: &TestKey, signer: &TestKey, identity_type: &str) -> KeyRecord {
         let envelope = serde_json::json!({ "key_id": subject.key_id });
-        // original_content_hash = sha256(canonical(envelope)). The
-        // exact canonical form does not matter for the rooting test
-        // as long as the signature is computed over the same bytes
-        // that land in original_content_hash — which is the contract.
-        let canonical = serde_json::to_vec(&envelope).unwrap();
-        let digest = Sha256::digest(&canonical);
-        let original_content_hash = hex::encode(digest);
+        // Sign over `canonical(registration_envelope)` using the SAME
+        // canonicalizer rooting + register + the real producer use
+        // (CIRISPersist#344) — NOT over the hash. `original_content_hash`
+        // is sha256 of those same bytes.
+        let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope).unwrap();
+        let original_content_hash = hex::encode(Sha256::digest(&canonical));
 
-        // scrub-signature: Ed25519 over the original_content_hash bytes.
-        let sig = signer.signing_key.sign(digest.as_slice());
+        // scrub-signature: Ed25519 over the canonical envelope bytes.
+        let sig = signer.signing_key.sign(&canonical);
 
         KeyRecord {
             key_id: subject.key_id.clone(),
@@ -881,7 +1039,15 @@ mod sqlite_conformance {
         .await;
         put(&backend, signed_record(&agent_k, &primitive_k, agent())).await;
 
-        let verdict = root_binding(&backend, "agent-leaf", &agent_k.pubkey_b64()).await;
+        // Pin the test steward as the anchor (production uses the accord
+        // holders; this test roots to its own bootstrap steward).
+        let verdict = root_binding_anchored(
+            &backend,
+            "agent-leaf",
+            &agent_k.pubkey_b64(),
+            &[steward_k.pubkey_anchor()],
+        )
+        .await;
         assert!(
             verdict.is_confirmed(),
             "expected Confirmed, got {verdict:?}"
@@ -892,6 +1058,92 @@ mod sqlite_conformance {
         assert_eq!(chain.chain[2].key_id, "steward-root");
         assert!(chain.terminates_at_steward_bootstrap);
         assert!(chain.chain[2].is_self_signed);
+    }
+
+    /// SECURITY (CIRISPersist#344): a **cryptographically valid** chain that
+    /// terminates at a self-signed `steward` the peer merely *asserted* — one
+    /// whose pubkey is NOT a pinned accord-holder anchor key — is REJECTED by
+    /// the default [`root_binding`]. Without the anchor gate this would
+    /// Confirm (structure + signatures are all valid), letting any peer that
+    /// gets a self-signed steward row admitted spoof a rooted binding. This is
+    /// the closed gap: the un-forgeable accord anchor is the trust boundary,
+    /// not the self-asserted `identity_type`.
+    #[tokio::test]
+    async fn sqlite_rejects_valid_chain_to_non_anchor_steward() {
+        let backend = fresh().await;
+        // A perfectly-formed steward + agent, all signatures valid …
+        let steward_k = TestKey::new("attacker-steward", 0x31);
+        let agent_k = TestKey::new("attacker-agent", 0x32);
+        put(&backend, signed_record(&steward_k, &steward_k, steward())).await;
+        put(&backend, signed_record(&agent_k, &steward_k, agent())).await;
+
+        // … but rooted via the DEFAULT anchor (the real accord holders), to
+        // which this fabricated steward does not belong.
+        let verdict = root_binding(&backend, "attacker-agent", &agent_k.pubkey_b64()).await;
+        match verdict.rejection() {
+            Some(RootingRejection::TerminusNotInAnchor { key_id, .. }) => {
+                assert_eq!(key_id, "attacker-steward");
+            }
+            other => panic!("spoofed steward must be rejected TerminusNotInAnchor, got {other:?}"),
+        }
+
+        // Same chain roots iff the fabricated steward IS the pinned anchor —
+        // proving the anchor set is exactly what gates trust.
+        let ok = root_binding_anchored(
+            &backend,
+            "attacker-agent",
+            &agent_k.pubkey_b64(),
+            &[steward_k.pubkey_anchor()],
+        )
+        .await;
+        assert!(ok.is_confirmed(), "roots when the terminus IS the anchor");
+    }
+
+    /// A self-signed accord-holder terminus (the seeded A1/B1/C1 shape) roots
+    /// when its pubkey is the pinned anchor — confirming the identity-type
+    /// relaxation (CIRISPersist#344). Seeded as `steward,accord_holder`: the
+    /// `accord_holder` role proves the relaxation via set-membership, and the
+    /// multi-role string sidesteps the orthogonal exact-match hardware-
+    /// attestation admission gate (which the real ceremony records satisfy
+    /// with their custody evidence — an admission concern, not a rooting one).
+    #[tokio::test]
+    async fn sqlite_accord_holder_terminus_roots_when_anchored() {
+        let backend = fresh().await;
+        let holder_k = TestKey::new("A1", 0x41);
+        let agent_k = TestKey::new("node-under-a1", 0x42);
+        put(
+            &backend,
+            signed_record(&holder_k, &holder_k, "steward,accord_holder"),
+        )
+        .await;
+        put(&backend, signed_record(&agent_k, &holder_k, agent())).await;
+
+        let verdict = root_binding_anchored(
+            &backend,
+            "node-under-a1",
+            &agent_k.pubkey_b64(),
+            &[holder_k.pubkey_anchor()],
+        )
+        .await;
+        assert!(
+            verdict.is_confirmed(),
+            "accord_holder terminus must root when anchored, got {verdict:?}"
+        );
+        assert!(verdict.chain().unwrap().terminates_at_steward_bootstrap);
+    }
+
+    /// The trust-root identity classifier (CIRISPersist#344): a pure
+    /// `accord_holder` terminus (the real A1/B1/C1 shape), `steward`, and the
+    /// multi-role set all qualify; non-root roles do not.
+    #[test]
+    fn trusted_root_identity_accepts_steward_and_accord_holder() {
+        assert!(is_trusted_root_identity("steward"));
+        assert!(is_trusted_root_identity("accord_holder"));
+        assert!(is_trusted_root_identity("steward,accord_holder"));
+        assert!(is_trusted_root_identity("witness,accord_holder"));
+        assert!(!is_trusted_root_identity("agent"));
+        assert!(!is_trusted_root_identity("primitive"));
+        assert!(!is_trusted_root_identity("node,witness"));
     }
 
     /// Rejected: unknown key_id.
@@ -938,7 +1190,15 @@ mod sqlite_conformance {
         )
         .await;
 
-        let verdict = root_binding(&backend, "agent-leaf", &agent_k.pubkey_b64()).await;
+        // Anchor the real steward so the walk reaches the signature check
+        // (the anchor gate passes; the corrupt agent link is the rejection).
+        let verdict = root_binding_anchored(
+            &backend,
+            "agent-leaf",
+            &agent_k.pubkey_b64(),
+            &[steward_k.pubkey_anchor()],
+        )
+        .await;
         match verdict.rejection() {
             Some(RootingRejection::UnsignedProvenanceLink { key_id, .. }) => {
                 assert_eq!(key_id, "agent-leaf");
@@ -1153,7 +1413,13 @@ mod postgres_conformance {
         .await;
         put(&backend, signed_record(&agent_k, &primitive_k, agent())).await;
 
-        let verdict = root_binding(&backend, "rooting-pg-agent", &agent_k.pubkey_b64()).await;
+        let verdict = root_binding_anchored(
+            &backend,
+            "rooting-pg-agent",
+            &agent_k.pubkey_b64(),
+            &[steward_k.pubkey_anchor()],
+        )
+        .await;
         assert!(
             verdict.is_confirmed(),
             "expected Confirmed, got {verdict:?}"
@@ -1217,7 +1483,15 @@ mod postgres_conformance {
             corrupt_signed_record(&agent_k, &steward_k, agent()),
         )
         .await;
-        let verdict = root_binding(&backend, "rooting-pg-u-agent", &agent_k.pubkey_b64()).await;
+        // Anchor the real steward so the walk reaches the signature check
+        // (the anchor gate passes; the corrupt agent link is the rejection).
+        let verdict = root_binding_anchored(
+            &backend,
+            "rooting-pg-u-agent",
+            &agent_k.pubkey_b64(),
+            &[steward_k.pubkey_anchor()],
+        )
+        .await;
         assert!(matches!(
             verdict.rejection(),
             Some(RootingRejection::UnsignedProvenanceLink { .. })
