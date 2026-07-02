@@ -1483,7 +1483,15 @@ mod postgres_conformance {
             corrupt_signed_record(&agent_k, &steward_k, agent()),
         )
         .await;
-        let verdict = root_binding(&backend, "rooting-pg-u-agent", &agent_k.pubkey_b64()).await;
+        // Anchor the real steward so the walk reaches the signature check
+        // (the anchor gate passes; the corrupt agent link is the rejection).
+        let verdict = root_binding_anchored(
+            &backend,
+            "rooting-pg-u-agent",
+            &agent_k.pubkey_b64(),
+            &[steward_k.pubkey_anchor()],
+        )
+        .await;
         assert!(matches!(
             verdict.rejection(),
             Some(RootingRejection::UnsignedProvenanceLink { .. })
