@@ -1028,6 +1028,8 @@ impl Backend for MemoryBackend {
                     min_viable_symbols: m.min_viable_symbols,
                     symbol_size: m.symbol_size,
                     held_symbols: held,
+                    content_bytes: u64::from(held) * u64::from(m.symbol_size),
+                    cohort_scope: crate::fountain::cohort_scope_from_envelope(&m.envelope),
                     recoverable: held >= m.min_viable_symbols,
                     admitted_at: String::new(),
                 }

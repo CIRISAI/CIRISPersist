@@ -1190,7 +1190,8 @@ impl Backend for SqliteBackend {
                         m.original_content_length, m.n_source, m.k_repair, \
                         m.min_viable_symbols, m.symbol_size, m.admitted_at, \
                         (SELECT COUNT(*) FROM content_symbols s \
-                         WHERE s.content_id = m.content_id) AS held \
+                         WHERE s.content_id = m.content_id) AS held, \
+                        m.envelope \
                  FROM content_manifest m WHERE m.pqc_key_id = ?1 \
                  ORDER BY m.admitted_at DESC, m.content_id ASC",
             )?;
@@ -1198,6 +1199,13 @@ impl Backend for SqliteBackend {
                 .query_map(rusqlite::params![publisher], |row| {
                     let min_viable: i64 = row.get(6)?;
                     let held: i64 = row.get(9)?;
+                    let symbol_size = u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0);
+                    // cohort_scope: #349 — read from the signed envelope; a
+                    // parse fault or a missing key yields None (unscoped).
+                    let envelope_text: String = row.get(10)?;
+                    let cohort_scope = serde_json::from_str::<serde_json::Value>(&envelope_text)
+                        .ok()
+                        .and_then(|v| crate::fountain::cohort_scope_from_envelope(&v));
                     Ok(crate::fountain::FountainHeldMeta {
                         content_id: row.get(0)?,
                         corpus_kind: row.get(1)?,
@@ -1206,8 +1214,10 @@ impl Backend for SqliteBackend {
                         n_source: u32::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
                         k_repair: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
                         min_viable_symbols: u32::try_from(min_viable).unwrap_or(0),
-                        symbol_size: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                        symbol_size,
                         held_symbols: u32::try_from(held).unwrap_or(0),
+                        content_bytes: u64::try_from(held).unwrap_or(0) * u64::from(symbol_size),
+                        cohort_scope,
                         recoverable: held >= min_viable,
                         admitted_at: row.get(8)?,
                     })

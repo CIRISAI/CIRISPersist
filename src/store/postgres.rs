@@ -1617,7 +1617,8 @@ impl Backend for PostgresBackend {
                         m.original_content_length, m.n_source, m.k_repair, \
                         m.min_viable_symbols, m.symbol_size, m.admitted_at, \
                         (SELECT COUNT(*) FROM cirislens.content_symbols s \
-                         WHERE s.content_id = m.content_id) AS held \
+                         WHERE s.content_id = m.content_id) AS held, \
+                        m.envelope \
                  FROM cirislens.content_manifest m WHERE m.pqc_key_id = $1 \
                  ORDER BY m.admitted_at DESC, m.content_id ASC",
                 &[&publisher_key_id],
@@ -1630,6 +1631,13 @@ impl Backend for PostgresBackend {
             let held: i64 = r.safe_get_with("held", Error::Backend)?;
             let admitted_at: chrono::DateTime<chrono::Utc> =
                 r.safe_get_with("admitted_at", Error::Backend)?;
+            let symbol_size =
+                u32::try_from(r.safe_get_with::<i64, _, _, _>("symbol_size", Error::Backend)?)
+                    .unwrap_or(0);
+            // cohort_scope: #349 — read from the signed envelope (JSONB → Value);
+            // a missing key yields None (unscoped / legacy content).
+            let envelope: serde_json::Value = r.safe_get_with("envelope", Error::Backend)?;
+            let cohort_scope = crate::fountain::cohort_scope_from_envelope(&envelope);
             out.push(crate::fountain::FountainHeldMeta {
                 content_id: r.safe_get_with("content_id", Error::Backend)?,
                 corpus_kind: r.safe_get_with("corpus_kind", Error::Backend)?,
@@ -1647,11 +1655,10 @@ impl Backend for PostgresBackend {
                 )
                 .unwrap_or(0),
                 min_viable_symbols: u32::try_from(min_viable).unwrap_or(0),
-                symbol_size: u32::try_from(
-                    r.safe_get_with::<i64, _, _, _>("symbol_size", Error::Backend)?,
-                )
-                .unwrap_or(0),
+                symbol_size,
                 held_symbols: u32::try_from(held).unwrap_or(0),
+                content_bytes: u64::try_from(held).unwrap_or(0) * u64::from(symbol_size),
+                cohort_scope,
                 recoverable: held >= min_viable,
                 admitted_at: admitted_at.to_rfc3339(),
             });
