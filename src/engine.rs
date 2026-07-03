@@ -4359,6 +4359,16 @@ async fn build_backend(dsn: &str) -> Result<BackendDispatch, EngineError> {
                 .await
                 .map_err(EngineError::Store)?;
             pg.run_migrations().await.map_err(EngineError::Store)?;
+            // v12.0.2 (CIRISPersist#347) — first-boot-seed the HUMANITY_ACCORD
+            // holder rooting-anchor rows (idempotent), then fail-secure verify.
+            pg.seed_genesis_accord_holders(
+                crate::federation::genesis::accord_holder_genesis_records(),
+            )
+            .await
+            .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
+            crate::federation::genesis::verify_anchor_seeded(&pg)
+                .await
+                .map_err(EngineError::GenesisSeed)?;
             Ok(BackendDispatch::Postgres(Arc::new(pg)))
         }
         #[cfg(not(feature = "postgres"))]
@@ -4388,6 +4398,16 @@ async fn build_backend(dsn: &str) -> Result<BackendDispatch, EngineError> {
                     .map_err(EngineError::Store)?
             };
             sq.run_migrations().await.map_err(EngineError::Store)?;
+            // v12.0.2 (CIRISPersist#347) — first-boot-seed the HUMANITY_ACCORD
+            // holder rooting-anchor rows (idempotent), then fail-secure verify.
+            sq.seed_genesis_accord_holders(
+                crate::federation::genesis::accord_holder_genesis_records(),
+            )
+            .await
+            .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
+            crate::federation::genesis::verify_anchor_seeded(&sq)
+                .await
+                .map_err(EngineError::GenesisSeed)?;
             Ok(BackendDispatch::Sqlite(Arc::new(sq)))
         }
         #[cfg(not(feature = "sqlite"))]
@@ -4434,6 +4454,14 @@ pub enum EngineError {
     /// wasn't a 32-byte Ed25519 key).
     #[error("local signer: {0}")]
     LocalSigner(#[from] crate::signing::LocalSignerError),
+
+    /// v12.0.2 (CIRISPersist#347) — the HUMANITY_ACCORD holder genesis
+    /// rooting-anchor rows could not be seeded or verified at boot.
+    /// **Fail-secure**: a node that cannot establish its constitutional
+    /// rooting anchor (the pinned accord holders) must not come up — else
+    /// it would silently root nothing (or, worse, honor a divergent anchor).
+    #[error("genesis accord-holder seed: {0}")]
+    GenesisSeed(String),
 }
 
 #[cfg(test)]
