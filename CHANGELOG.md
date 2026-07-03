@@ -5,6 +5,18 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [12.0.1] — 2026-07-02
+
+### Changed — re-pin ciris-verify* v8.4.0 → v8.5.0
+
+Verify-only re-pin (ciris-verify-core / ciris-crypto / ciris-keyring, all 6 Cargo
+tags). No persist code change — the v12.0 genesis-mesh rooting substrate is
+unchanged. This tracks the verify v8.5.0 cut (the `produce_scrubbed_key_record`
+holder-scrub-sign primitive the CIRISServer#140 op needs). **The genesis seed is
+NOT in this cut** — seeding of the signed A1/B1/C1 records lands in a later cut
+once the holder-app op has produced them. Verify bound `ciris-verify>=8,<9`
+unchanged (minor).
+
 ## [12.0.0] — 2026-07-02
 
 ### Security / BREAKING — #344: rooting anchors to the HUMANITY_ACCORD holder keyset (v12.0 genesis mesh, centipede body)
