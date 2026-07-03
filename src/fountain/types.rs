@@ -207,6 +207,37 @@ pub enum FountainReadClass {
 mod tests {
     use super::*;
 
+    /// #349 — cohort_scope is read from the envelope's string `cohort_scope`
+    /// key; absent / non-string / non-object envelopes yield `None` (unscoped),
+    /// never an error.
+    #[test]
+    fn cohort_scope_extraction() {
+        assert_eq!(
+            cohort_scope_from_envelope(&serde_json::json!({ "cohort_scope": "community" })),
+            Some("community".to_owned())
+        );
+        assert_eq!(
+            cohort_scope_from_envelope(
+                &serde_json::json!({ "cohort_scope": "affiliations", "x": 1 })
+            ),
+            Some("affiliations".to_owned())
+        );
+        assert_eq!(
+            cohort_scope_from_envelope(&serde_json::json!({ "x": 1 })),
+            None,
+            "no cohort_scope key ⇒ None"
+        );
+        assert_eq!(
+            cohort_scope_from_envelope(&serde_json::json!({ "cohort_scope": 42 })),
+            None,
+            "non-string ⇒ None"
+        );
+        assert_eq!(
+            cohort_scope_from_envelope(&serde_json::json!("scalar")),
+            None
+        );
+    }
+
     #[test]
     fn classify_boundaries() {
         // n_source = 10, min_viable = 3.
@@ -296,9 +327,35 @@ pub struct FountainHeldMeta {
     /// Symbols CURRENTLY retained for this content (post-eviction /
     /// degradation) — `COUNT(content_symbols)`.
     pub held_symbols: u32,
+    /// The durable byte footprint **actually held** for this content unit —
+    /// `held_symbols × symbol_size` (CIRISPersist#349, for CC 6.1.5.2 §Q B5
+    /// consumption accounting). Recomputed from what persist currently holds,
+    /// so an owner's declared consumption reconciles against real bytes;
+    /// shrinks under eviction/degradation exactly as `held_symbols` does.
+    pub content_bytes: u64,
+    /// The CC 5.2 lattice `cohort_scope` this content's storage budget draws
+    /// from (`community` / `affiliations` / `species` / …), read from the
+    /// content's signed `envelope`'s `cohort_scope` key (CIRISPersist#349).
+    /// `None` when the envelope declares no scope (legacy / unscoped content) —
+    /// the §Q consumer treats that as unattributed budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cohort_scope: Option<String>,
     /// `held_symbols >= min_viable_symbols` — is the content still decodable
     /// from what persist currently holds?
     pub recoverable: bool,
     /// Admission timestamp (ISO-8601 UTC, as stored in `admitted_at`).
     pub admitted_at: String,
+}
+
+/// Extract the CC 5.2 `cohort_scope` a content unit's storage budget draws
+/// from, read from the `cohort_scope` string key of its signed `envelope`
+/// (CIRISPersist#349). `None` when absent or non-string (legacy / unscoped).
+/// Persist does not interpret the value — it round-trips the producer's
+/// signed declaration to the §Q consumer.
+#[must_use]
+pub fn cohort_scope_from_envelope(envelope: &serde_json::Value) -> Option<String> {
+    envelope
+        .get("cohort_scope")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
 }

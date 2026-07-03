@@ -5,6 +5,34 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [12.1.0] — 2026-07-03
+
+### Added — #349: per-`cohort_scope` byte size on the held-content surface (for CC 6.1.5.2 §Q B5)
+
+`FountainHeldMeta` (from `list_held_fountain_content`) gains two fields so edge's
+§Q storage-contention arbitration (CIRISEdge#257) can recompute per-scope byte
+consumption from what persist actually holds:
+
+- **`content_bytes: u64`** — the durable footprint **actually held** for the
+  content unit = `held_symbols × symbol_size`. Recomputed from current holdings
+  (shrinks under eviction/degradation with `held_symbols`), so an owner's
+  declared consumption reconciles against real bytes — the B5
+  consumption-challengeability guarantee. (Both inputs were already on the
+  struct; this makes the byte figure explicit rather than an edge-side product.)
+- **`cohort_scope: Option<String>`** — the CC 5.2 lattice scope the content's
+  storage budget draws from, read from the content's **signed `envelope`**'s
+  `cohort_scope` key (`community` / `affiliations` / `species` / …). `None` when
+  the envelope declares none (legacy / unscoped). New
+  `fountain::cohort_scope_from_envelope`.
+
+**No schema migration** — the scope rides the already-stored signed `envelope`
+(`content_manifest.envelope`), extracted at list time; existing content whose
+envelope declares a scope surfaces it immediately. Persist doesn't interpret the
+value — it round-trips the producer's signed declaration; edge keeps the B5
+arbitration edge-internal (never trusted from the wire). All three backends
+(memory/sqlite/postgres) compute both fields; the PyEngine FFI surfaces them via
+serde automatically. Verify pin unchanged v8.5.0.
+
 ## [12.0.2] — 2026-07-03
 
 ### Added — #347: first-boot-seed the HUMANITY_ACCORD holder rooting-anchor rows (the anchor goes LIVE)
