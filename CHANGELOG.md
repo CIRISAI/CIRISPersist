@@ -5,6 +5,42 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [12.0.2] — 2026-07-03
+
+### Added — #347: first-boot-seed the HUMANITY_ACCORD holder rooting-anchor rows (the anchor goes LIVE)
+
+Since v12.0.0 `root_binding` anchors to the HUMANITY_ACCORD holder keyset, but
+the anchor **rows** were never seeded (deferred through v12.0.0 / v12.0.1) — so a
+fresh node rooted nothing. This cut **bakes the already-signed #268 ceremony
+records** (the real 3-holder FIPS-YubiKey trio, captured to the CEG outbox) and
+first-boot-seeds them. **Bake-what-exists — no new ceremony, no new signatures.**
+
+- **`src/federation/genesis/`** — embeds the 3 self-signed `accord_holder`
+  `SignedKeyRecord`s (A1/B1/C1) from `CIRISVerify/accord_ceremony_artifacts/
+  holders/*.json`, with each ceremony `custody_attestation` merged into
+  `attestation_evidence`. `accord_holder_genesis_records()` +
+  `verify_anchor_seeded()`.
+- **`SqliteBackend`/`PostgresBackend::seed_genesis_accord_holders`** — idempotent
+  (`ON CONFLICT (key_id) DO NOTHING`) genesis-trusted insert that skips ONLY the
+  per-registration `accord_holder` fresh-nonce hardware gate (the pinned bake IS
+  the trust root; re-verifying its nonce at every boot is a category error). The
+  V048 `attestation_evidence IS NOT NULL` CHECK is satisfied by the seeded
+  custody proof; every other invariant (32-byte key, hybrid, self-sig) holds.
+- **First-boot seed at every Engine construction** — both `Engine::build_backend`
+  (DSN path) and the `PyEngine` FFI path seed + fail-secure verify right after
+  `run_migrations`. New `EngineError::GenesisSeed` — a node that cannot establish
+  its rooting anchor **does not come up** (#347 req 3).
+
+**End-to-end proof against the genuine artifact**: `seeded_real_holder_roots_via_root_binding`
+seeds the real records and confirms the seeded A1 **roots** via the default
+`root_binding` — self-signed `accord_holder` ∈ anchor, the real ceremony
+scrub-signature verifying over its canonical envelope (the v12.0.0 canonical-bytes
+path, now exercised against a real record, not a fixture). Postgres twin included.
+1046 sqlite tests green — no auto-seed ripple. Verify pin unchanged at v8.5.0.
+
+Unblocks the canonical mesh: a node scrub-signed by A1 (CIRISServer#140 admit-node
+card) now chains to the seeded anchor and roots.
+
 ## [12.0.1] — 2026-07-02
 
 ### Changed — re-pin ciris-verify* v8.4.0 → v8.5.0

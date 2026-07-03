@@ -1749,6 +1749,95 @@ fn llm_status_str(s: crate::schema::LlmCallStatus) -> &'static str {
 //     the persist boundary.
 //   - UUID columns are TEXT — rusqlite passes UUID strings as TEXT.
 
+impl SqliteBackend {
+    /// Genesis-trusted seed of the HUMANITY_ACCORD holder rooting-anchor rows
+    /// (CIRISPersist#347). Admits each baked `accord_holder` `SignedKeyRecord`
+    /// into `federation_keys`, idempotent (`ON CONFLICT (key_id) DO NOTHING`).
+    ///
+    /// Skips ONLY the per-registration `accord_holder` fresh-nonce hardware
+    /// gate that `put_public_key` enforces — the pinned #268 ceremony bake IS
+    /// the trust root, so re-verifying its (months-stale-by-design) nonce at
+    /// every boot is a category error. Every OTHER invariant still applies:
+    /// the pubkey must decode to 32 bytes and the algorithm must be hybrid.
+    /// The scrub-signatures + anchor membership are what actually gate trust,
+    /// verified later by `root_binding`.
+    pub async fn seed_genesis_accord_holders(
+        &self,
+        records: &[crate::federation::SignedKeyRecord],
+    ) -> Result<(), crate::federation::Error> {
+        for sr in records {
+            let mut row = sr.record.clone();
+            crate::federation::register::validate_registration_pubkey(&row)?;
+            if row.algorithm != crate::federation::types::algorithm::HYBRID {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "genesis seed algorithm must be 'hybrid' (got '{}')",
+                    row.algorithm
+                )));
+            }
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            let envelope_text = serde_json::to_string(&row.registration_envelope)
+                .map_err(|e| crate::federation::Error::Backend(format!("envelope: {e}")))?;
+            let attestation_text: Option<String> =
+                match &row.attestation_evidence {
+                    Some(v) => Some(serde_json::to_string(v).map_err(|e| {
+                        crate::federation::Error::Backend(format!("attestation: {e}"))
+                    })?),
+                    None => None,
+                };
+            let roles_text: Option<String> = if row.roles.is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::to_string(&row.roles)
+                        .map_err(|e| crate::federation::Error::Backend(format!("roles: {e}")))?,
+                )
+            };
+            let conn = self.conn.clone();
+            let kid = row.key_id.clone();
+            (move || -> Result<(), rusqlite::Error> {
+                let conn = conn.lock();
+                conn.execute(
+                    "INSERT INTO federation_keys (\
+                        key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                        identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                        attestation_evidence\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) \
+                     ON CONFLICT (key_id) DO NOTHING",
+                    rusqlite::params![
+                        row.key_id,
+                        row.pubkey_ed25519_base64,
+                        row.pubkey_ml_dsa_65_base64,
+                        row.algorithm,
+                        row.identity_type,
+                        row.identity_ref,
+                        row.valid_from.to_rfc3339(),
+                        row.valid_until.map(|t| t.to_rfc3339()),
+                        envelope_text,
+                        hex::decode(&row.original_content_hash).map_err(|_| {
+                            rusqlite::Error::InvalidQuery
+                        })?,
+                        row.scrub_signature_classical,
+                        row.scrub_signature_pqc,
+                        row.scrub_key_id,
+                        row.scrub_timestamp.to_rfc3339(),
+                        row.pqc_completed_at.map(|t| t.to_rfc3339()),
+                        row.persist_row_hash,
+                        roles_text,
+                        attestation_text,
+                    ],
+                )?;
+                Ok(())
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("genesis seed insert {kid}: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for SqliteBackend {
     async fn put_public_key(

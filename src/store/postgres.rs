@@ -2085,6 +2085,84 @@ impl PostgresBackend {
 //     hex-decoded raw bytes; the wire shape uses hex/base64 strings,
 //     decoded at the persist boundary.
 
+impl PostgresBackend {
+    /// Genesis-trusted seed of the HUMANITY_ACCORD holder rooting-anchor rows
+    /// (CIRISPersist#347) — Postgres twin of
+    /// [`SqliteBackend::seed_genesis_accord_holders`]. Idempotent
+    /// (`ON CONFLICT (key_id) DO NOTHING`); skips ONLY the per-registration
+    /// `accord_holder` fresh-nonce hardware gate (the pinned #268 bake is the
+    /// trust root), keeps every other invariant.
+    pub async fn seed_genesis_accord_holders(
+        &self,
+        records: &[crate::federation::SignedKeyRecord],
+    ) -> Result<(), crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        for sr in records {
+            let mut row = sr.record.clone();
+            crate::federation::register::validate_registration_pubkey(&row)?;
+            if row.algorithm != crate::federation::types::algorithm::HYBRID {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "genesis seed algorithm must be 'hybrid' (got '{}')",
+                    row.algorithm
+                )));
+            }
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "original_content_hash hex decode: {e}"
+                ))
+            })?;
+            let roles_param: Option<&Vec<String>> = if row.roles.is_empty() {
+                None
+            } else {
+                Some(&row.roles)
+            };
+            client
+                .execute(
+                    "INSERT INTO cirislens.federation_keys (\
+                        key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                        identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                        attestation_evidence\
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+                     ON CONFLICT (key_id) DO NOTHING",
+                    &[
+                        &row.key_id,
+                        &row.pubkey_ed25519_base64,
+                        &row.pubkey_ml_dsa_65_base64,
+                        &row.algorithm,
+                        &row.identity_type,
+                        &row.identity_ref,
+                        &row.valid_from,
+                        &row.valid_until,
+                        &row.registration_envelope,
+                        &original_content_hash,
+                        &row.scrub_signature_classical,
+                        &row.scrub_signature_pqc,
+                        &row.scrub_key_id,
+                        &row.scrub_timestamp,
+                        &row.pqc_completed_at,
+                        &row.persist_row_hash,
+                        &roles_param,
+                        &row.attestation_evidence,
+                    ],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "genesis seed insert {}: {e}",
+                        row.key_id
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for PostgresBackend {
     async fn put_public_key(

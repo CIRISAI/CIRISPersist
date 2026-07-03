@@ -1204,93 +1204,116 @@ impl PyEngine {
         #[cfg(feature = "postgres")]
         #[allow(unused_variables)] // borrowed only when local_signer + sweep are wired
         let pg_backend_for_sweep: Option<Arc<PostgresBackend>>;
-        let backend: BackendDispatch =
-            if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
+        let backend: BackendDispatch = if dsn.starts_with("postgresql://")
+            || dsn.starts_with("postgres://")
+        {
+            #[cfg(feature = "postgres")]
+            {
+                let pg = py.detach(|| {
+                    runtime.block_on(async {
+                        let pg = PostgresBackend::connect(dsn)
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(format!("connect: {e}")))?;
+                        pg.run_migrations()
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
+                        // v12.0.2 (CIRISPersist#347) — first-boot-seed the
+                        // HUMANITY_ACCORD holder rooting-anchor rows, then
+                        // fail-secure verify.
+                        pg.seed_genesis_accord_holders(
+                            crate::federation::genesis::accord_holder_genesis_records(),
+                        )
+                        .await
+                        .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
+                        crate::federation::genesis::verify_anchor_seeded(&pg)
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(format!("genesis anchor: {e}")))?;
+                        Ok::<_, PyErr>(Arc::new(pg))
+                    })
+                })?;
+                pg_backend_for_sweep = Some(pg.clone());
+                BackendDispatch::Postgres(pg)
+            }
+            // v11.8.0 (CIRISPersist#328) — sqlite-only build: no postgres
+            // backend compiled in, so a `postgresql://` dsn is rejected
+            // cleanly rather than silently falling through.
+            #[cfg(not(feature = "postgres"))]
+            {
+                return Err(PyValueError::new_err(format!(
+                    "dsn `{dsn}` uses a postgres:// scheme but {POSTGRES_ONLY_MSG}"
+                )));
+            }
+        } else if dsn.starts_with("sqlite://") || dsn == "sqlite::memory:" {
+            #[cfg(feature = "sqlite")]
+            {
+                // URL parsing follows the SQLAlchemy / Python sqlite3
+                // convention the CIRISAgent ecosystem already uses:
+                //   `sqlite:///abs/path.db`  → file at `/abs/path.db`
+                //   `sqlite:///relative.db`  → file at `relative.db`
+                //                              (strip leading `/`)
+                //   `sqlite:///:memory:`     → in-memory
+                //   `sqlite::memory:`        → in-memory (compact form)
+                //
+                // The `sqlite://` prefix is the URL scheme;
+                // `sqlite:///` is scheme + empty authority + path.
+                let in_memory = dsn == "sqlite::memory:"
+                    || dsn == "sqlite:///:memory:"
+                    || dsn == "sqlite://:memory:";
+                let sq = py.detach(|| {
+                    runtime.block_on(async {
+                        let sq = if in_memory {
+                            SqliteBackend::open_in_memory()
+                                .await
+                                .map_err(|e| PyRuntimeError::new_err(format!("sqlite open: {e}")))?
+                        } else {
+                            // Strip the `sqlite:///` (3-slash) or
+                            // `sqlite://` (2-slash) prefix to recover
+                            // the on-disk path. rusqlite::open takes a
+                            // path verbatim.
+                            let path = dsn
+                                .strip_prefix("sqlite:///")
+                                .or_else(|| dsn.strip_prefix("sqlite://"))
+                                .unwrap_or(dsn);
+                            SqliteBackend::open(path)
+                                .await
+                                .map_err(|e| PyRuntimeError::new_err(format!("sqlite open: {e}")))?
+                        };
+                        sq.run_migrations()
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
+                        // v12.0.2 (CIRISPersist#347) — first-boot-seed the
+                        // HUMANITY_ACCORD holder rooting-anchor rows, then
+                        // fail-secure verify.
+                        sq.seed_genesis_accord_holders(
+                            crate::federation::genesis::accord_holder_genesis_records(),
+                        )
+                        .await
+                        .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
+                        crate::federation::genesis::verify_anchor_seeded(&sq)
+                            .await
+                            .map_err(|e| PyRuntimeError::new_err(format!("genesis anchor: {e}")))?;
+                        Ok::<_, PyErr>(Arc::new(sq))
+                    })
+                })?;
                 #[cfg(feature = "postgres")]
                 {
-                    let pg = py.detach(|| {
-                        runtime.block_on(async {
-                            let pg = PostgresBackend::connect(dsn)
-                                .await
-                                .map_err(|e| PyRuntimeError::new_err(format!("connect: {e}")))?;
-                            pg.run_migrations()
-                                .await
-                                .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
-                            Ok::<_, PyErr>(Arc::new(pg))
-                        })
-                    })?;
-                    pg_backend_for_sweep = Some(pg.clone());
-                    BackendDispatch::Postgres(pg)
+                    pg_backend_for_sweep = None;
                 }
-                // v11.8.0 (CIRISPersist#328) — sqlite-only build: no postgres
-                // backend compiled in, so a `postgresql://` dsn is rejected
-                // cleanly rather than silently falling through.
-                #[cfg(not(feature = "postgres"))]
-                {
-                    return Err(PyValueError::new_err(format!(
-                        "dsn `{dsn}` uses a postgres:// scheme but {POSTGRES_ONLY_MSG}"
-                    )));
-                }
-            } else if dsn.starts_with("sqlite://") || dsn == "sqlite::memory:" {
-                #[cfg(feature = "sqlite")]
-                {
-                    // URL parsing follows the SQLAlchemy / Python sqlite3
-                    // convention the CIRISAgent ecosystem already uses:
-                    //   `sqlite:///abs/path.db`  → file at `/abs/path.db`
-                    //   `sqlite:///relative.db`  → file at `relative.db`
-                    //                              (strip leading `/`)
-                    //   `sqlite:///:memory:`     → in-memory
-                    //   `sqlite::memory:`        → in-memory (compact form)
-                    //
-                    // The `sqlite://` prefix is the URL scheme;
-                    // `sqlite:///` is scheme + empty authority + path.
-                    let in_memory = dsn == "sqlite::memory:"
-                        || dsn == "sqlite:///:memory:"
-                        || dsn == "sqlite://:memory:";
-                    let sq = py.detach(|| {
-                        runtime.block_on(async {
-                            let sq = if in_memory {
-                                SqliteBackend::open_in_memory().await.map_err(|e| {
-                                    PyRuntimeError::new_err(format!("sqlite open: {e}"))
-                                })?
-                            } else {
-                                // Strip the `sqlite:///` (3-slash) or
-                                // `sqlite://` (2-slash) prefix to recover
-                                // the on-disk path. rusqlite::open takes a
-                                // path verbatim.
-                                let path = dsn
-                                    .strip_prefix("sqlite:///")
-                                    .or_else(|| dsn.strip_prefix("sqlite://"))
-                                    .unwrap_or(dsn);
-                                SqliteBackend::open(path).await.map_err(|e| {
-                                    PyRuntimeError::new_err(format!("sqlite open: {e}"))
-                                })?
-                            };
-                            sq.run_migrations()
-                                .await
-                                .map_err(|e| PyRuntimeError::new_err(format!("migrations: {e}")))?;
-                            Ok::<_, PyErr>(Arc::new(sq))
-                        })
-                    })?;
-                    #[cfg(feature = "postgres")]
-                    {
-                        pg_backend_for_sweep = None;
-                    }
-                    BackendDispatch::Sqlite(sq)
-                }
-                #[cfg(not(feature = "sqlite"))]
-                {
-                    return Err(PyValueError::new_err(format!(
-                        "dsn `{dsn}` uses sqlite:// scheme but the `sqlite` feature \
-                     was not compiled in for this ciris_persist build"
-                    )));
-                }
-            } else {
+                BackendDispatch::Sqlite(sq)
+            }
+            #[cfg(not(feature = "sqlite"))]
+            {
                 return Err(PyValueError::new_err(format!(
-                    "unrecognized dsn scheme: {dsn:?} \
-                 (expected `postgresql://…`, `postgres://…`, `sqlite:///…`, or `sqlite::memory:`)"
+                    "dsn `{dsn}` uses sqlite:// scheme but the `sqlite` feature \
+                     was not compiled in for this ciris_persist build"
                 )));
-            };
+            }
+        } else {
+            return Err(PyValueError::new_err(format!(
+                "unrecognized dsn scheme: {dsn:?} \
+                 (expected `postgresql://…`, `postgres://…`, `sqlite:///…`, or `sqlite::memory:`)"
+            )));
+        };
 
         // ciris-keyring: hardware-backed signer where available,
         // SoftwareSigner fallback otherwise. get_platform_signer

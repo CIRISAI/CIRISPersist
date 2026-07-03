@@ -44,6 +44,7 @@ pub mod cohort;
 pub mod community_dek;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
+pub mod genesis;
 pub mod goal;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
