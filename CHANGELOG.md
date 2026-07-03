@@ -59,6 +59,26 @@ so the fold's *effective* N is checkable at admission.
 Wheel `Requires-Dist: ciris-verify>=8.0.0,<9` unchanged (minor bump within
 major 8). Full suite green: 1049 sqlite / 882 postgres · aggregation_tier pg+sqlite.
 
+### Removed — #355: drop the dead vendored `openssl` + unused `bytes`
+
+`openssl = { "0.10", vendored }` was gated behind `postgres` (+ the android/ios
+target tables) but had **zero code references** — `cargo tree -i openssl`
+confirmed a leaf (only `ciris-persist`); the pool uses `NoTls` and TLS is the
+separate rustls path. Removed all three entries + `dep:openssl` from the
+`postgres` feature. This drops `openssl`/`-macros`/`-sys` + `foreign-types{,-shared}`
+**and the `openssl-src` build-dep that compiles OpenSSL 3.6.3 from C on every
+wheel platform** — the slowest, flakiest step in the build matrix (the mobile
+`#246` pain, plausibly behind the recurring Windows-installer failures). Also
+dropped the unused direct `bytes` dep (only a doc-comment reference; still
+transitive via tokio-postgres/reqwest). Inert leaf, no link consumer — both
+backends + the wheel feature set build green with `openssl` absent from the tree.
+
+### Deps
+- `deny.toml`: ignore RUSTSEC-2026-0118 (hickory-proto NSEC3 DNSSEC-validation
+  loop) — transitive via verify → hickory-resolver (reqwest's plain resolver);
+  persist does not enable DNSSEC/NSEC3 validation so the path is unreachable, and
+  no patched version exists. Sibling of the already-ignored RUSTSEC-2026-0119.
+
 ## [12.2.0] — 2026-07-03
 
 ### Added — #351: adopt-scrub-upgrade primitive (self-signed → anchor-scrubbed own-key row)
