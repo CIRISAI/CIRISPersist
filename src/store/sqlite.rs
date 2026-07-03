@@ -1846,6 +1846,142 @@ impl SqliteBackend {
         }
         Ok(())
     }
+
+    /// Gated self-signed → anchor-scrubbed **upgrade** of an existing own-key
+    /// row (CIRISPersist#351). Replaces a self-signed `federation_keys` row
+    /// with the granting-authority-scrubbed record for the SAME `key_id` +
+    /// SAME pubkey, so an in-place node's own row can be re-rooted to the
+    /// accord anchor (its self-signed boot row is otherwise sticky —
+    /// `put_public_key` is `DO NOTHING`). The scrub-signature is verified by
+    /// [`Engine::adopt_scrub_upgrade`](crate::engine::Engine::adopt_scrub_upgrade)
+    /// BEFORE this call (mirrors `register_federation_key` → `put_public_key`).
+    ///
+    /// Monotonic + identity-preserving guards:
+    /// - incoming MUST be granting-authority (`scrub_key_id != key_id`);
+    /// - the existing row MUST be self-signed (`scrub_key_id == key_id`) —
+    ///   a downgrade (anchored → self) or re-anchor is refused;
+    /// - the Ed25519 pubkey MUST be unchanged (a pubkey change is a different
+    ///   identity, refused);
+    /// - re-applying the exact same anchored record is idempotent
+    ///   ([`AdoptScrubOutcome::AlreadyAdopted`]).
+    pub async fn adopt_scrub_upgrade(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::AdoptScrubOutcome, crate::federation::Error> {
+        use crate::federation::register::AdoptScrubOutcome;
+        let mut row = record.record;
+
+        if row.scrub_key_id == row.key_id {
+            return Err(crate::federation::Error::InvalidArgument(
+                "adopt_scrub_upgrade requires a granting-authority record (scrub_key_id != key_id)"
+                    .into(),
+            ));
+        }
+        crate::federation::register::validate_registration_pubkey(&row)?;
+        if row.algorithm != crate::federation::types::algorithm::HYBRID {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "adopt_scrub_upgrade algorithm must be 'hybrid' (got '{}')",
+                row.algorithm
+            )));
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        // Resolve the existing row + classify the transition.
+        let existing = crate::federation::FederationDirectory::lookup_public_key(self, &row.key_id)
+            .await?
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "adopt_scrub_upgrade: no existing row for {} — use register_federation_key",
+                    row.key_id
+                ))
+            })?;
+        if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "adopt_scrub_upgrade {}: pubkey change refused (different identity)",
+                row.key_id
+            )));
+        }
+        if existing.scrub_key_id != existing.key_id {
+            // Already anchored: idempotent iff byte-identical, else refuse.
+            return if existing.persist_row_hash == row.persist_row_hash {
+                Ok(AdoptScrubOutcome::AlreadyAdopted)
+            } else {
+                Err(crate::federation::Error::Conflict(format!(
+                    "adopt_scrub_upgrade {}: already anchored to a different record (downgrade/replace refused)",
+                    row.key_id
+                )))
+            };
+        }
+
+        let envelope_text = serde_json::to_string(&row.registration_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("envelope: {e}")))?;
+        let attestation_text: Option<String> = match &row.attestation_evidence {
+            Some(v) => Some(
+                serde_json::to_string(v)
+                    .map_err(|e| crate::federation::Error::Backend(format!("attestation: {e}")))?,
+            ),
+            None => None,
+        };
+        let roles_text: Option<String> = if row.roles.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&row.roles)
+                    .map_err(|e| crate::federation::Error::Backend(format!("roles: {e}")))?,
+            )
+        };
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let conn = self.conn.clone();
+        let kid = row.key_id.clone();
+        let n = (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
+            // The WHERE re-asserts the guards atomically: self-signed + same
+            // pubkey. The Ed25519 pubkey is the guard, so it is NOT updated.
+            conn.execute(
+                "UPDATE federation_keys SET \
+                    pubkey_ml_dsa_65_base64 = ?2, algorithm = ?3, identity_type = ?4, \
+                    identity_ref = ?5, valid_from = ?6, valid_until = ?7, \
+                    registration_envelope = ?8, original_content_hash = ?9, \
+                    scrub_signature_classical = ?10, scrub_signature_pqc = ?11, \
+                    scrub_key_id = ?12, scrub_timestamp = ?13, pqc_completed_at = ?14, \
+                    persist_row_hash = ?15, roles = ?16, attestation_evidence = ?17 \
+                 WHERE key_id = ?1 AND scrub_key_id = key_id AND pubkey_ed25519_base64 = ?18",
+                rusqlite::params![
+                    row.key_id,
+                    row.pubkey_ml_dsa_65_base64,
+                    row.algorithm,
+                    row.identity_type,
+                    row.identity_ref,
+                    row.valid_from.to_rfc3339(),
+                    row.valid_until.map(|t| t.to_rfc3339()),
+                    envelope_text,
+                    original_content_hash,
+                    row.scrub_signature_classical,
+                    row.scrub_signature_pqc,
+                    row.scrub_key_id,
+                    row.scrub_timestamp.to_rfc3339(),
+                    row.pqc_completed_at.map(|t| t.to_rfc3339()),
+                    row.persist_row_hash,
+                    roles_text,
+                    attestation_text,
+                    row.pubkey_ed25519_base64,
+                ],
+            )
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("adopt_scrub_upgrade {kid}: {e}"))
+        })?;
+        if n == 0 {
+            // Guards passed the Rust checks but the atomic WHERE matched 0 —
+            // a concurrent mutation raced us. Fail-secure.
+            return Err(crate::federation::Error::Conflict(format!(
+                "adopt_scrub_upgrade {kid}: row changed concurrently"
+            )));
+        }
+        Ok(AdoptScrubOutcome::Upgraded)
+    }
 }
 
 #[async_trait::async_trait]
@@ -14924,6 +15060,119 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
         }
+    }
+
+    /// #351 — the backend adopt-scrub-upgrade gate: self-signed → anchored
+    /// succeeds, is idempotent, and refuses pubkey-change / downgrade /
+    /// no-such-row. (The scrub-signature is verified by the Engine layer; this
+    /// exercises the backend's monotonic DB gate directly.)
+    #[tokio::test]
+    async fn adopt_scrub_upgrade_gate_sqlite() {
+        use crate::federation::register::AdoptScrubOutcome;
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // The anchor holders must exist (scrub_key_must_exist FK; mirrors the
+        // real seed where A1/B1 are genesis rows).
+        for a in ["A1", "B1"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(a, a, a),
+                })
+                .await
+                .unwrap();
+        }
+        // A self-signed own-key row (the in-place boot state).
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("node-x", "node-x", "node-x"),
+            })
+            .await
+            .unwrap();
+
+        // Upgrade: same key_id + same pubkey, scrub_key_id = an anchor holder.
+        let scrubbed = SignedKeyRecord {
+            record: fed_key("node-x", "node-x", "A1"),
+        };
+        assert_eq!(
+            backend.adopt_scrub_upgrade(scrubbed.clone()).await.unwrap(),
+            AdoptScrubOutcome::Upgraded
+        );
+        let row = FederationDirectory::lookup_public_key(&backend, "node-x")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.scrub_key_id, "A1", "row is now anchor-scrubbed");
+        assert_ne!(row.scrub_key_id, row.key_id, "no longer self-signed");
+
+        // Idempotent re-adopt.
+        assert_eq!(
+            backend.adopt_scrub_upgrade(scrubbed).await.unwrap(),
+            AdoptScrubOutcome::AlreadyAdopted
+        );
+
+        // Downgrade / re-anchor to a DIFFERENT holder refused.
+        let err = backend
+            .adopt_scrub_upgrade(SignedKeyRecord {
+                record: fed_key("node-x", "node-x", "B1"),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::Conflict(_)),
+            "re-anchor refused, got {err:?}"
+        );
+
+        // A self-signed record is not an upgrade.
+        let err = backend
+            .adopt_scrub_upgrade(SignedKeyRecord {
+                record: fed_key("node-x", "node-x", "node-x"),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+    }
+
+    /// #351 — a pubkey change (different identity) is refused even with a
+    /// granting-authority scrub, and adopting a key with no existing row errors.
+    #[tokio::test]
+    async fn adopt_scrub_upgrade_pubkey_change_refused_sqlite() {
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("A1", "A1", "A1"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("node-y", "node-y", "node-y"),
+            })
+            .await
+            .unwrap();
+        // Same key_id, anchor-scrubbed, but a DIFFERENT pubkey.
+        let mut rec = fed_key("node-y", "node-y", "A1");
+        rec.pubkey_ed25519_base64 =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys("someone-else").0;
+        let err = backend
+            .adopt_scrub_upgrade(SignedKeyRecord { record: rec })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::Conflict(_)),
+            "pubkey change refused, got {err:?}"
+        );
+
+        // No existing row → InvalidArgument.
+        let err = backend
+            .adopt_scrub_upgrade(SignedKeyRecord {
+                record: fed_key("ghost", "ghost", "A1"),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
     }
 
     /// v9.3.0 (#247) — the DERIVED federation key_id for `alias`'s

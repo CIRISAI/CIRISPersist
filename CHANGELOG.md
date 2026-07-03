@@ -5,6 +5,35 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [12.2.0] — 2026-07-03
+
+### Added — #351: adopt-scrub-upgrade primitive (self-signed → anchor-scrubbed own-key row)
+
+The missing producer step for the **in-place** genesis mesh seed. An upgraded-in-
+place node holds its **self-signed** own-key row from `register_self_key` at boot;
+`register_federation_key` is `ON CONFLICT DO NOTHING`, so applying the accord-
+holder-**scrubbed** record for the same `key_id` was a no-op — the self-signed row
+won forever and no peer could root it. New `Engine::adopt_scrub_upgrade` (+ the
+`PyEngine` FFI mirror) does the gated in-place upgrade:
+
+- **`Engine::adopt_scrub_upgrade(record)`** — verifies the incoming scrub-signature
+  first (the same `verify_key_registration` Strict gate as
+  `register_federation_key`: granting-authority resolves the scrubber's pubkeys
+  from the directory), then the backend's monotonic gated UPDATE.
+- **`{Sqlite,Postgres}Backend::adopt_scrub_upgrade`** — `ON CONFLICT DO UPDATE`
+  restricted to the self-signed→anchored transition via an atomic WHERE guard
+  (`scrub_key_id = key_id AND pubkey_ed25519_base64 = <incoming>`). Refuses: a
+  pubkey change (different identity), an anchored→self **downgrade** / re-anchor
+  to a different holder, and a missing row. Re-applying the exact record is
+  idempotent (`AdoptScrubOutcome::AlreadyAdopted`).
+- **`federation::register::AdoptScrubOutcome`** (`Upgraded` / `AlreadyAdopted`),
+  serde-exposed; the FFI returns `"upgraded"` / `"already_adopted"`.
+
+Verify pin unchanged v8.5.0. Gate tests (upgrade · idempotent · pubkey-change
+refused · downgrade refused · no-row) green. Unblocks CIRISServer `admit-node`
+(target = local node) + the 0.5.78 Key plane (CIRISServer#144) + the genesis mesh
+seed (CIRISServer#139).
+
 ## [12.1.0] — 2026-07-03
 
 ### Added — #349: per-`cohort_scope` byte size on the held-content surface (for CC 6.1.5.2 §Q B5)
