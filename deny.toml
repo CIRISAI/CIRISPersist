@@ -65,6 +65,11 @@ ignore = [
     # None of these advisories touch persist's ingest hot path.
     "RUSTSEC-2026-0119",  # hickory-proto DNS encoding O(n²) — DoS during DNS encoding;
                            # persist talks to Postgres, no DNS encode path
+    "RUSTSEC-2026-0118",  # hickory-proto NSEC3 closest-encloser proof loop on cross-zone
+                           # responses — a DNSSEC-VALIDATION vuln. Transitive via
+                           # ciris-verify-core → hickory-resolver (reqwest's plain resolver);
+                           # persist does NOT enable DNSSEC/NSEC3 validation, so the vulnerable
+                           # path is unreachable. No patched version exists (patched=[]).
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained — transitive via reqwest/rustls
     "RUSTSEC-2026-0098",  # rustls-webpki URI-name constraint (we don't validate URI SANs)
     "RUSTSEC-2026-0099",  # rustls-webpki wildcard-DNS constraint (no name-constraint certs)
