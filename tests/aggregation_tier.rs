@@ -44,16 +44,33 @@ async fn signed_verify_inputs(
     tamper: bool,
     drop_pqc: bool,
 ) -> (AggregationMetaVerifyInputsV1, String) {
+    // §19.7.1.2 (#167): default to a balanced fold — n_eff == N — the honest
+    // case that clears the MIN_DOMINANCE_RATIO=0.5 admission gate.
+    signed_verify_inputs_n_eff(member_ids, tamper, drop_pqc, member_ids.len() as u32).await
+}
+
+/// As [`signed_verify_inputs`] but with an explicit signed `n_eff`, so a test
+/// can model a **dominated** fold (`n_eff` far below `source_count`) that the
+/// §19.7.1.2 dominance gate must reject.
+async fn signed_verify_inputs_n_eff(
+    member_ids: &[String],
+    tamper: bool,
+    drop_pqc: bool,
+    n_eff: u32,
+) -> (AggregationMetaVerifyInputsV1, String) {
     let (ed_sk, _ed_pk_b64, mldsa) = producer_pubkeys();
     let commitment = member_commitment(member_ids);
     let commitment_hex = hex_lower(&commitment);
+    // A signed version-2 tier. The signature covers n_eff because the
+    // version-2 signing_preimage appends u32(n_eff).
     let meta = ciris_verify_core::holonomic::AggregationMetaV1 {
-        version: 1,
+        version: 2,
         content_id: "content-root-agg".to_owned(),
         corpus_kind: "trace".to_owned(),
         tier: 2,
         aggregation_algorithm_id: "raptorq-pyramid-v1".to_owned(),
         source_count: member_ids.len() as u32,
+        n_eff,
         member_commitment: commitment,
         noise_floor_descriptor: "mean+stddev".to_owned(),
     };
@@ -72,6 +89,7 @@ async fn signed_verify_inputs(
         tier: signed_tier,
         aggregation_algorithm_id: meta.aggregation_algorithm_id.clone(),
         source_count: meta.source_count,
+        n_eff: meta.n_eff,
         member_commitment_hex: commitment_hex.clone(),
         noise_floor_descriptor: meta.noise_floor_descriptor.clone(),
         sig_ed25519_b64: BASE64.encode(ed_sig),
@@ -300,6 +318,59 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
     assert!(
         backend.get_aggregation(&bad_cid).await.unwrap().is_none(),
         "(b) rejected composite wrote ZERO content_aggregation rows"
+    );
+
+    // ── (b2) §19.7.1.2 dominance gate (CIRISVerify#167 / #357): a fully
+    //        HYBRID-signed composite whose authenticated n_eff is below the
+    //        MIN_DOMINANCE_RATIO=0.5 floor (n_eff=1, source_count=3 → 0.33)
+    //        is REJECTED at admission — the 900/1000 dominated-fold case —
+    //        with zero rows written.
+    let dom_cid = format!("agg-dominated-{suffix}");
+    let (m_dom, s_dom) = build_manifest_and_symbols(
+        &dom_cid,
+        &composite_corpus,
+        n_source,
+        k_repair,
+        symbol_size,
+        true, // hybrid-signed: clears the #225 hard cut, reaches the dominance gate
+    )
+    .await;
+    let (verif_dom, commitment_dom) =
+        signed_verify_inputs_n_eff(&member_ids, false, false, 1).await;
+    let agg_dom = AggregationMetaV1 {
+        aggregate_content_id: dom_cid.clone(),
+        source_corpus_kind: source_corpus.to_owned(),
+        aggregation_level: 1,
+        fan_in: 3,
+        member_commitment: commitment_dom,
+        aggregation_meta: vec![0x02],
+        verification: verif_dom,
+    };
+    let dom_err = backend
+        .put_aggregated_tier(&m_dom, &s_dom, &agg_dom, 2_500)
+        .await
+        .expect_err("(b2) dominated fold (n_eff below the floor) MUST be rejected");
+    assert!(
+        matches!(dom_err, StoreError::AggregationMetaRejected(_)),
+        "(b2) reject is an AggregationMetaRejected error, got {dom_err:?}"
+    );
+    assert_eq!(
+        dom_err.kind(),
+        "aggregation_meta_dominated",
+        "(b2) §19.7.1.2 dominance token"
+    );
+    // verify-before-mutation: NOTHING written for the dominated composite.
+    assert!(
+        backend
+            .get_fountain_content(&dom_cid, &composite_corpus)
+            .await
+            .unwrap()
+            .is_none(),
+        "(b2) rejected dominated composite wrote ZERO content_manifest rows"
+    );
+    assert!(
+        backend.get_aggregation(&dom_cid).await.unwrap().is_none(),
+        "(b2) rejected dominated composite wrote ZERO content_aggregation rows"
     );
 
     // ── (b2) §19.7.1 store-path gate: a valid composite manifest but a

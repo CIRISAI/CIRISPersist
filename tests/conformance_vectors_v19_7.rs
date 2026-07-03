@@ -78,43 +78,58 @@ fn domain_separator_matches_vector() {
 /// `aggregation_meta/canonical_bytes.json` — build the verify-core
 /// `AggregationMetaV1` from the vector inputs and assert `signing_preimage()`
 /// equals the expected §19.7.1 canonical bytes byte-for-byte.
+/// Covers BOTH the v1 golden AND the §19.7.1.2 v2 golden (CIRISVerify#167):
+/// the v2 preimage appends a trailing big-endian `u32(n_eff)`, while the v1
+/// preimage is byte-identical to the pre-#167 layout. Persist reproduces each
+/// byte-for-byte — the cross-impl guarantee that a v2 aggregator's signature
+/// verifies here.
 #[test]
 fn aggregation_meta_canonical_bytes_reproduced() {
-    let v = load("aggregation_meta/canonical_bytes.json");
+    for rel in [
+        "aggregation_meta/canonical_bytes.json",
+        "aggregation_meta/canonical_bytes_v2.json",
+    ] {
+        let v = load(rel);
 
-    // member_commitment is itself reproduced from the source ids (and equals
-    // the vector's member_commitment_hex).
-    let source_ids = str_list(&v, "source_member_ids");
-    let mc = member_commitment(&source_ids);
-    assert_eq!(
-        hex_lower(&mc),
-        v["member_commitment_hex"].as_str().unwrap(),
-        "member_commitment over source_member_ids reproduces the vector"
-    );
+        // member_commitment is itself reproduced from the source ids (and equals
+        // the vector's member_commitment_hex).
+        let source_ids = str_list(&v, "source_member_ids");
+        let mc = member_commitment(&source_ids);
+        assert_eq!(
+            hex_lower(&mc),
+            v["member_commitment_hex"].as_str().unwrap(),
+            "{rel}: member_commitment over source_member_ids reproduces the vector"
+        );
 
-    let meta = AggregationMetaV1 {
-        version: v["version"].as_u64().unwrap() as u32,
-        content_id: v["content_id"].as_str().unwrap().to_owned(),
-        corpus_kind: v["corpus_kind"].as_str().unwrap().to_owned(),
-        tier: v["tier"].as_u64().unwrap() as u32,
-        aggregation_algorithm_id: v["aggregation_algorithm_id"].as_str().unwrap().to_owned(),
-        source_count: v["source_count"].as_u64().unwrap() as u32,
-        member_commitment: mc,
-        noise_floor_descriptor: v["noise_floor_descriptor"].as_str().unwrap().to_owned(),
-    };
+        let meta = AggregationMetaV1 {
+            version: v["version"].as_u64().unwrap() as u32,
+            content_id: v["content_id"].as_str().unwrap().to_owned(),
+            corpus_kind: v["corpus_kind"].as_str().unwrap().to_owned(),
+            tier: v["tier"].as_u64().unwrap() as u32,
+            aggregation_algorithm_id: v["aggregation_algorithm_id"].as_str().unwrap().to_owned(),
+            source_count: v["source_count"].as_u64().unwrap() as u32,
+            // §19.7.1.2 (#167): signed n_eff from the vector (version-2 golden)
+            // or the v1 neutral placeholder (source_count) when absent.
+            n_eff: v["n_eff"]
+                .as_u64()
+                .unwrap_or_else(|| v["source_count"].as_u64().unwrap()) as u32,
+            member_commitment: mc,
+            noise_floor_descriptor: v["noise_floor_descriptor"].as_str().unwrap().to_owned(),
+        };
 
-    let expected = hex_decode(v["expected_canonical_bytes_hex"].as_str().unwrap());
-    assert_eq!(
-        meta.signing_preimage(),
-        expected,
-        "§19.7.1 canonical signing preimage reproduced byte-for-byte"
-    );
-    // The domain separator the preimage starts with also matches the vector.
-    assert!(
-        meta.signing_preimage()
-            .starts_with(&hex_decode(v["domain_separator_hex"].as_str().unwrap())),
-        "preimage begins with the §19.7.1 domain separator"
-    );
+        let expected = hex_decode(v["expected_canonical_bytes_hex"].as_str().unwrap());
+        assert_eq!(
+            meta.signing_preimage(),
+            expected,
+            "{rel}: §19.7.1 canonical signing preimage reproduced byte-for-byte"
+        );
+        // The domain separator the preimage starts with also matches the vector.
+        assert!(
+            meta.signing_preimage()
+                .starts_with(&hex_decode(v["domain_separator_hex"].as_str().unwrap())),
+            "{rel}: preimage begins with the §19.7.1 domain separator"
+        );
+    }
 }
 
 /// `member_commitment/{single,three_unsorted,empty}.json` — each reproduces
@@ -184,6 +199,12 @@ async fn verify_aggregation_meta_admit_and_reject() {
         tier: v["tier"].as_u64().unwrap() as u32,
         aggregation_algorithm_id: v["aggregation_algorithm_id"].as_str().unwrap().to_owned(),
         source_count: v["source_count"].as_u64().unwrap() as u32,
+        // §19.7.1.2 (#167): read the signed n_eff when the vector carries it
+        // (version-2 golden); default to source_count for a v1 vector (neutral
+        // placeholder — a v1 preimage excludes n_eff).
+        n_eff: v["n_eff"]
+            .as_u64()
+            .unwrap_or_else(|| v["source_count"].as_u64().unwrap()) as u32,
         member_commitment: member_commitment(&source_ids),
         noise_floor_descriptor: v["noise_floor_descriptor"].as_str().unwrap().to_owned(),
     };
