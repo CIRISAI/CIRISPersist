@@ -3516,6 +3516,71 @@ impl PyEngine {
         })
     }
 
+    /// v12.2.0 (CIRISPersist#351) — adopt-scrub-**upgrade** this node's own
+    /// key row: replace its self-signed record with the accord-anchor-scrubbed
+    /// one (same `key_id` + pubkey) so it can root. FFI mirror of
+    /// [`Engine::adopt_scrub_upgrade`](crate::engine::Engine::adopt_scrub_upgrade)
+    /// — the `admit-node`/boot "adopt my scrubbed record from the outbox" step.
+    ///
+    /// `signed_key_record_json` is the granting-authority-scrubbed
+    /// `SignedKeyRecord` (`scrub_key_id` = an accord holder). Verifies the
+    /// scrub-signature (`Strict`, same gate as `register_federation_key`) THEN
+    /// the backend's monotonic gated UPDATE. Returns `"upgraded"` or
+    /// `"already_adopted"`; a pubkey change / anchored→self downgrade / missing
+    /// row is a `ValueError`. Fail-secure: a reject never mutates the row.
+    fn adopt_scrub_upgrade(
+        &self,
+        py: Python<'_>,
+        signed_key_record_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let record: crate::federation::SignedKeyRecord =
+                serde_json::from_str(signed_key_record_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
+                })?;
+            let outcome = py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::verify_key_registration(
+                            backend.as_ref(),
+                            &record.record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
+                        backend
+                            .adopt_scrub_upgrade(record)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::verify_key_registration(
+                            backend.as_ref(),
+                            &record.record,
+                        )
+                        .await
+                        .map_err(federation_err_to_py)?;
+                        backend
+                            .adopt_scrub_upgrade(record)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })?;
+            serde_json::to_value(outcome)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .ok_or_else(|| PyValueError::new_err("adopt_scrub_upgrade outcome serialize"))
+        })
+    }
+
     /// v1.5.3 — One-call helper that registers THIS engine's local
     /// pubkey as a `federation_keys` row of the specified
     /// `identity_type`. Composes the existing primitives

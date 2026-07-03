@@ -94,6 +94,19 @@ use super::{Error, FederationDirectory};
 use crate::verify::canonical::ceg_produce_canonicalize;
 use crate::verify::{verify_hybrid, HybridPolicy, VerifyOutcome};
 
+/// Outcome of an [`adopt_scrub_upgrade`](crate::engine::Engine::adopt_scrub_upgrade)
+/// — the self-signed → anchor-scrubbed upgrade of a node's own key row
+/// (CIRISPersist#351).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdoptScrubOutcome {
+    /// The self-signed row was replaced by the anchor-scrubbed record.
+    Upgraded,
+    /// The row already carried this exact anchor-scrubbed record — idempotent
+    /// no-op (re-applying the outbox record on a second boot).
+    AlreadyAdopted,
+}
+
 /// v10.1.0 (CIRISPersist#275 hardening) — the **write-path admission
 /// invariant** for a `federation_keys` row's classical public key: it
 /// MUST base64-decode to exactly 32 bytes (a valid Ed25519 key).

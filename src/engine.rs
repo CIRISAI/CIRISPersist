@@ -3600,6 +3600,36 @@ impl Engine {
         directory.put_public_key(record).await
     }
 
+    /// v12.2.0 (CIRISPersist#351) — adopt-scrub-**upgrade**: replace this
+    /// node's **self-signed** own-key row with the accord-anchor-**scrubbed**
+    /// record (same `key_id`, same pubkey) so it can root against the seeded
+    /// A1/B1/C1 anchor. The in-place seed's missing primitive:
+    /// `register_federation_key` is `ON CONFLICT DO NOTHING`, so the boot-time
+    /// self-signed row is otherwise sticky and no peer can root it.
+    ///
+    /// Verifies the incoming scrub-signature first (same
+    /// [`verify_key_registration`](crate::federation::verify_key_registration)
+    /// gate as `register_federation_key` — granting-authority resolves the
+    /// scrubber's pubkeys from the directory), THEN applies the backend's
+    /// monotonic gated UPDATE (self-signed → anchored only; pubkey change and
+    /// anchored→self downgrade refused; re-applying the same record is
+    /// idempotent — see [`AdoptScrubOutcome`](crate::federation::register::AdoptScrubOutcome)).
+    /// Fail-secure: a reject never mutates the row.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn adopt_scrub_upgrade(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::AdoptScrubOutcome, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::verify_key_registration(directory.as_ref(), &record.record).await?;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.adopt_scrub_upgrade(record).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.adopt_scrub_upgrade(record).await,
+        }
+    }
+
     /// v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the
     /// symmetric **deregister** path: the revocation teeth a withdrawn
     /// `consent:replication` relies on.

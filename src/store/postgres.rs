@@ -2168,6 +2168,117 @@ impl PostgresBackend {
         }
         Ok(())
     }
+
+    /// Gated self-signed → anchor-scrubbed **upgrade** of an own-key row —
+    /// Postgres twin of [`SqliteBackend::adopt_scrub_upgrade`]
+    /// (CIRISPersist#351). Same monotonic + identity-preserving guards; the
+    /// scrub-signature is verified by `Engine::adopt_scrub_upgrade` first.
+    pub async fn adopt_scrub_upgrade(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::AdoptScrubOutcome, crate::federation::Error> {
+        use crate::federation::register::AdoptScrubOutcome;
+        let mut row = record.record;
+
+        if row.scrub_key_id == row.key_id {
+            return Err(crate::federation::Error::InvalidArgument(
+                "adopt_scrub_upgrade requires a granting-authority record (scrub_key_id != key_id)"
+                    .into(),
+            ));
+        }
+        crate::federation::register::validate_registration_pubkey(&row)?;
+        if row.algorithm != crate::federation::types::algorithm::HYBRID {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "adopt_scrub_upgrade algorithm must be 'hybrid' (got '{}')",
+                row.algorithm
+            )));
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        let existing = crate::federation::FederationDirectory::lookup_public_key(self, &row.key_id)
+            .await?
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "adopt_scrub_upgrade: no existing row for {} — use register_federation_key",
+                    row.key_id
+                ))
+            })?;
+        if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "adopt_scrub_upgrade {}: pubkey change refused (different identity)",
+                row.key_id
+            )));
+        }
+        if existing.scrub_key_id != existing.key_id {
+            return if existing.persist_row_hash == row.persist_row_hash {
+                Ok(AdoptScrubOutcome::AlreadyAdopted)
+            } else {
+                Err(crate::federation::Error::Conflict(format!(
+                    "adopt_scrub_upgrade {}: already anchored to a different record (downgrade/replace refused)",
+                    row.key_id
+                )))
+            };
+        }
+
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let roles_param: Option<&Vec<String>> = if row.roles.is_empty() {
+            None
+        } else {
+            Some(&row.roles)
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // WHERE re-asserts the guards atomically: self-signed + same pubkey.
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_keys SET \
+                    pubkey_ml_dsa_65_base64 = $2, algorithm = $3, identity_type = $4, \
+                    identity_ref = $5, valid_from = $6, valid_until = $7, \
+                    registration_envelope = $8, original_content_hash = $9, \
+                    scrub_signature_classical = $10, scrub_signature_pqc = $11, \
+                    scrub_key_id = $12, scrub_timestamp = $13, pqc_completed_at = $14, \
+                    persist_row_hash = $15, roles = $16, attestation_evidence = $17 \
+                 WHERE key_id = $1 AND scrub_key_id = key_id AND pubkey_ed25519_base64 = $18",
+                &[
+                    &row.key_id,
+                    &row.pubkey_ml_dsa_65_base64,
+                    &row.algorithm,
+                    &row.identity_type,
+                    &row.identity_ref,
+                    &row.valid_from,
+                    &row.valid_until,
+                    &row.registration_envelope,
+                    &original_content_hash,
+                    &row.scrub_signature_classical,
+                    &row.scrub_signature_pqc,
+                    &row.scrub_key_id,
+                    &row.scrub_timestamp,
+                    &row.pqc_completed_at,
+                    &row.persist_row_hash,
+                    &roles_param,
+                    &row.attestation_evidence,
+                    &row.pubkey_ed25519_base64,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "adopt_scrub_upgrade {}: {e}",
+                    row.key_id
+                ))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "adopt_scrub_upgrade {}: row changed concurrently",
+                row.key_id
+            )));
+        }
+        Ok(AdoptScrubOutcome::Upgraded)
+    }
 }
 
 #[async_trait::async_trait]
