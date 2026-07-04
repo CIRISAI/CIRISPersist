@@ -2769,6 +2769,148 @@ impl PyEngine {
         })
     }
 
+    /// #356 (CC 6.1.5.2 §Q / CIRISVerify#170) — build a signed `StorageBudgetV1`
+    /// wire JSON from a payload JSON, bound-hybrid signing its CC 6.1.3 preimage
+    /// with the engine's local signer. `payload_json` carries
+    /// `{node_id, epoch_id, revision, scopes:[{cohort_scope,budget_bytes,
+    /// pin_reserve_bytes}], pinned_class:[..]}`; returns the same fields plus
+    /// `signature_ed25519_base64` / `signature_ml_dsa_65_base64`. Raises
+    /// `ValueError` on a malformed / structurally-invalid payload (a `self` /
+    /// `family` scope, `pin_reserve > budget`, or unsorted lists), or if no
+    /// local signing key is configured.
+    #[pyo3(name = "build_storage_budget_v1")]
+    fn build_storage_budget_v1_py(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            let preimage =
+                crate::fountain::storage_contention::storage_budget_preimage(payload_json)
+                    .map_err(storage_contention_err_to_py)?;
+            let (ed_sig, pqc_sig) =
+                bound_hybrid_sign_qshape(self.local_signer.as_ref(), &self.runtime, py, &preimage)?;
+            crate::fountain::storage_contention::assemble_storage_budget_wire(
+                payload_json,
+                B64.encode(ed_sig),
+                B64.encode(pqc_sig),
+            )
+            .map_err(storage_contention_err_to_py)
+        })
+    }
+
+    /// #356 — build a signed `CorpusWantV1` wire JSON from a payload JSON.
+    /// `payload_json` carries `{node_id, epoch_id, cohort_scope, size_cap_bytes,
+    /// remaining_budget_bytes, want:[content_id,..]}`.
+    #[pyo3(name = "build_corpus_want_v1")]
+    fn build_corpus_want_v1_py(&self, py: Python<'_>, payload_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            let preimage = crate::fountain::storage_contention::corpus_want_preimage(payload_json)
+                .map_err(storage_contention_err_to_py)?;
+            let (ed_sig, pqc_sig) =
+                bound_hybrid_sign_qshape(self.local_signer.as_ref(), &self.runtime, py, &preimage)?;
+            crate::fountain::storage_contention::assemble_corpus_want_wire(
+                payload_json,
+                B64.encode(ed_sig),
+                B64.encode(pqc_sig),
+            )
+            .map_err(storage_contention_err_to_py)
+        })
+    }
+
+    /// #356 — verify a signed `StorageBudgetV1` wire JSON at ingest (structure +
+    /// PQC-mandatory bound-hybrid signature) against the owner's raw pubkeys
+    /// (base64). Returns `True` iff both halves verify AND the shape is
+    /// structurally valid; `False` on a structural or signature failure. Raises
+    /// `ValueError` only on malformed JSON / base64 (un-parseable input).
+    #[pyo3(name = "verify_storage_budget_v1")]
+    fn verify_storage_budget_v1_py(
+        &self,
+        wire_json: &str,
+        ed25519_pubkey_base64: &str,
+        ml_dsa_65_pubkey_base64: &str,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            use crate::fountain::storage_contention::StorageContentionError as E;
+            match crate::fountain::storage_contention::verify_storage_budget_wire(
+                wire_json,
+                ed25519_pubkey_base64,
+                ml_dsa_65_pubkey_base64,
+            ) {
+                Ok(()) => Ok(true),
+                Err(E::Invalid(_)) | Err(E::SignatureFailed) => Ok(false),
+                Err(e @ (E::MalformedJson(_) | E::MalformedBase64(_))) => {
+                    Err(storage_contention_err_to_py(e))
+                }
+            }
+        })
+    }
+
+    /// #356 — verify a signed `CorpusWantV1` wire JSON at ingest. Same contract
+    /// as [`Self::verify_storage_budget_v1_py`].
+    #[pyo3(name = "verify_corpus_want_v1")]
+    fn verify_corpus_want_v1_py(
+        &self,
+        wire_json: &str,
+        ed25519_pubkey_base64: &str,
+        ml_dsa_65_pubkey_base64: &str,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            use crate::fountain::storage_contention::StorageContentionError as E;
+            match crate::fountain::storage_contention::verify_corpus_want_wire(
+                wire_json,
+                ed25519_pubkey_base64,
+                ml_dsa_65_pubkey_base64,
+            ) {
+                Ok(()) => Ok(true),
+                Err(E::Invalid(_)) | Err(E::SignatureFailed) => Ok(false),
+                Err(e @ (E::MalformedJson(_) | E::MalformedBase64(_))) => {
+                    Err(storage_contention_err_to_py(e))
+                }
+            }
+        })
+    }
+
+    /// #356 (§Q B3 anti-rollback) — does `candidate` supersede `existing`? Both
+    /// are signed `StorageBudgetV1` wire JSONs; `True` iff same `node_id` and
+    /// strictly-higher `revision`. Callers MUST reject a non-superseding
+    /// candidate from the same node (a rollback). Raises on malformed JSON.
+    #[pyo3(name = "storage_budget_supersedes")]
+    fn storage_budget_supersedes_py(
+        &self,
+        candidate_json: &str,
+        existing_json: &str,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            crate::fountain::storage_contention::storage_budget_supersedes(
+                candidate_json,
+                existing_json,
+            )
+            .map_err(storage_contention_err_to_py)
+        })
+    }
+
+    /// #356 (§Q B4 wanted-then-pulled) — may a producer push `content_id` of
+    /// `object_bytes` against this signed `CorpusWantV1` wire JSON? `True` iff
+    /// the id is wanted AND within the advertised `size_cap_bytes`. Raises on
+    /// malformed JSON.
+    #[pyo3(name = "corpus_want_admits")]
+    fn corpus_want_admits_py(
+        &self,
+        wire_json: &str,
+        content_id: &str,
+        object_bytes: u64,
+    ) -> PyResult<bool> {
+        catch_panic(|| {
+            crate::fountain::storage_contention::corpus_want_admits(
+                wire_json,
+                content_id,
+                object_bytes,
+            )
+            .map_err(storage_contention_err_to_py)
+        })
+    }
+
     /// v1.4.0 (CIRISPersist#51) — Return the local-process ML-DSA-65
     /// public key (base64) for publishing to consumers
     /// (federation_keys.pubkey_ml_dsa_65_base64, peer pinning,
@@ -23809,6 +23951,41 @@ fn local_signer_err_to_py(e: crate::signing::LocalSignerError) -> PyErr {
             PyRuntimeError::new_err(format!("{e}"))
         }
     }
+}
+
+/// #356 — convert a §Q storage-contention wrapper error to a typed PyErr
+/// (carrying the stable `kind()` token for consumer-side sanitization).
+fn storage_contention_err_to_py(
+    e: crate::fountain::storage_contention::StorageContentionError,
+) -> PyErr {
+    PyErr::new::<LensQueryError, _>(format!("{e} (kind={})", e.kind()))
+}
+
+/// #356 — bound-hybrid sign a §Q CC 6.1.3 preimage with the engine's local
+/// signer: Ed25519 over `preimage`, ML-DSA-65 over `preimage ‖ ed25519_sig`.
+/// Returns `(ed25519_sig, ml_dsa_65_sig)`. Raises if no local signer / PQC key.
+fn bound_hybrid_sign_qshape(
+    local_signer: Option<&std::sync::Arc<crate::signing::LocalSigner>>,
+    runtime: &tokio::runtime::Runtime,
+    py: Python<'_>,
+    preimage: &[u8],
+) -> PyResult<(Vec<u8>, Vec<u8>)> {
+    let signer = local_signer.ok_or_else(|| {
+        PyValueError::new_err(
+            "no local signing key configured (pass local_key_id + local_key_path \
+             to the Engine constructor)",
+        )
+    })?;
+    let ed_sig = signer
+        .sign_ed25519(preimage)
+        .map_err(local_signer_err_to_py)?;
+    let mut bound = preimage.to_vec();
+    bound.extend_from_slice(&ed_sig);
+    let signer_c = signer.clone();
+    let pqc_sig = py
+        .detach(|| runtime.block_on(async move { signer_c.sign_ml_dsa_65(&bound).await }))
+        .map_err(local_signer_err_to_py)?;
+    Ok((ed_sig.to_vec(), pqc_sig))
 }
 
 /// v0.4.0 — outbound::Error → PyErr at the FFI boundary. Same
