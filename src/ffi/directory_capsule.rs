@@ -442,6 +442,16 @@ pub enum DirectoryOp {
         /// The opaque consumer-owned policy blob (round-tripped JSON).
         policy: types::PeerPolicyBlob,
     },
+    /// [`FederationDirectory::apply_replicated_key_record`] (#375) — the
+    /// #371 upgrade-aware, `owner_of`-gated replicated Key-plane apply.
+    /// Routed so capsule consumers (CIRISEdge's anti-entropy bridge, which
+    /// holds an `Arc<dyn FederationDirectory>` = [`OpsDirectory`]) reach the
+    /// real backend upgrade path instead of the trait default's insert-only
+    /// `put_public_key` DO-NOTHING. APPEND-ONLY: added at the end.
+    ApplyReplicatedKeyRecord {
+        /// The signed pubkey row to apply (fresh insert or scrub-upgrade).
+        record: SignedKeyRecord,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -503,6 +513,12 @@ pub enum DirectoryOpResult {
     HybridVerify(Result<crate::verify::hybrid::VerifyOutcome, String>),
     /// `build_delegation_graph`.
     DelegationGraph(crate::federation::topology::DelegationGraph),
+    /// `apply_replicated_key_record` (#375) — the upgrade-aware apply
+    /// OUTCOME (`Inserted` / `Upgraded` / `Unchanged` / `Refused`). A
+    /// `Refused` is a *policy* outcome carried HERE, NOT flattened to the
+    /// top-level [`DirectoryOpResult::Err`] (which is reserved for a real
+    /// backend error that means the apply could not run). APPEND-ONLY.
+    ReplicatedKeyOutcome(crate::federation::register::ReplicatedKeyOutcome),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -583,6 +599,15 @@ pub async fn dispatch_directory_op(
             Ok(()) => DirectoryOpResult::Unit,
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
+        // #375 — the whole apply (plan + adopt_scrub_upgrade) runs INSIDE
+        // persist's .so against persist's own vtable, so the capsule
+        // consumer gets the real upgrade-aware outcome, not DO-NOTHING.
+        DirectoryOp::ApplyReplicatedKeyRecord { record } => {
+            match dir.apply_replicated_key_record(record).await {
+                Ok(outcome) => DirectoryOpResult::ReplicatedKeyOutcome(outcome),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
         DirectoryOp::PutLocationProof { proof } => match dir.put_location_proof(proof).await {
             Ok(()) => DirectoryOpResult::Unit,
             Err(e) => DirectoryOpResult::Err(e.to_string()),
@@ -1212,6 +1237,25 @@ impl FederationDirectory for OpsDirectory {
     async fn put_public_key(&self, record: SignedKeyRecord) -> Result<(), Error> {
         match self.run_op(&DirectoryOp::PutPublicKey { record }).await? {
             DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    // #375 — override so the capsule routes to the real upgrade-aware apply
+    // (the trait default would run put_public_key DO-NOTHING here, silently
+    // dropping an anchor-scrubbed record for an existing self-signed key_id).
+    async fn apply_replicated_key_record(
+        &self,
+        record: SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, Error> {
+        match self
+            .run_op(&DirectoryOp::ApplyReplicatedKeyRecord { record })
+            .await?
+        {
+            DirectoryOpResult::ReplicatedKeyOutcome(outcome) => Ok(outcome),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
@@ -2247,6 +2291,89 @@ mod tests {
         assert_eq!(via_capsule.expect("some").key_id, "primitive-abc");
 
         // Keep `directory.data` owned by us; drop it through the vtable.
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+    }
+
+    /// #375 — the anti-entropy-critical proof: an anchor-scrubbed record
+    /// for an EXISTING self-signed key_id UPGRADES *through the C-ABI
+    /// capsule* (the shape CIRISEdge's replication bridge holds). Backed by
+    /// a real SqliteBackend so the upgrade plane exists — `Upgraded` is an
+    /// outcome the pre-#375 default (`put_public_key` DO-NOTHING → `Unit`)
+    /// could never produce, so reaching it proves the capsule now routes to
+    /// the real upgrade-aware backend apply, not the insert-only fallback.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn apply_replicated_key_record_via_capsule_upgrades_sqlite() {
+        use crate::federation::register::ReplicatedKeyOutcome as O;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type;
+        use crate::store::backend::Backend;
+
+        let rt = test_runtime();
+        let backend = rt.block_on(async {
+            let b = crate::store::sqlite::SqliteBackend::open_in_memory()
+                .await
+                .expect("open sqlite");
+            b.run_migrations().await.expect("migrate");
+            Arc::new(b)
+        });
+        let dir: Arc<dyn FederationDirectory> = backend.clone();
+        let directory = build_persist_directory(dir.clone());
+
+        // Seed the granting anchor, the node's single `user`-role owner, the
+        // self-signed boot row, and the single-owner binding (owner_of).
+        rt.block_on(async {
+            ts::register_hybrid_key(dir.as_ref(), "cap-anchor").await;
+            ts::register_identity_key(dir.as_ref(), "cap-owner", identity_type::USER).await;
+            dir.apply_replicated_key_record(SignedKeyRecord {
+                record: ts::replicated_key_record(
+                    "cap-node",
+                    identity_type::NODE,
+                    "cap-node",
+                    "cap-node",
+                    "v1",
+                ),
+            })
+            .await
+            .expect("seed self-signed");
+            dir.put_attestation(crate::federation::SignedAttestation {
+                attestation: ts::owner_binding_attestation(
+                    &uuid::Uuid::new_v4().to_string(),
+                    "cap-owner",
+                    "cap-node",
+                ),
+            })
+            .await
+            .expect("owner-binding");
+        });
+
+        // The UPGRADE, driven entirely through the capsule build_op path.
+        let scrubbed = ts::replicated_key_record(
+            "cap-node",
+            identity_type::NODE,
+            "cap-anchor",
+            "cap-anchor",
+            "v1",
+        );
+        let res = run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ApplyReplicatedKeyRecord {
+                record: SignedKeyRecord { record: scrubbed },
+            },
+        );
+        assert!(
+            matches!(res, DirectoryOpResult::ReplicatedKeyOutcome(O::Upgraded)),
+            "capsule apply must UPGRADE (not DO-NOTHING), got {res:?}"
+        );
+        // The backend row is really anchor-scrubbed now.
+        let row = rt
+            .block_on(dir.lookup_public_key("cap-node"))
+            .expect("lookup")
+            .expect("row");
+        assert_eq!(row.scrub_key_id, "cap-anchor");
+
         // SAFETY: single-drop, matched vtable.
         unsafe { (directory.vtable.drop)(directory.data) };
     }
