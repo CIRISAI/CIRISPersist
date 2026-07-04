@@ -2527,11 +2527,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // so a rejected emission leaves no trace.
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
-        // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
-        // federate FEDERATION-APPLY re-check (point ii). A federation-tier row
-        // keyed on a community (`community_id`) is refused if C has lost its
-        // last live `moderate`-holder. No-op for local-tier rows, no
-        // community_id, or an unknown community. Backend-symmetric.
+        // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11; keying broadened by
+        // #369) — no-moderator-no-federate FEDERATION-APPLY re-check (point
+        // ii). A federation-tier row keyed on a community under ANY substrate
+        // shape (envelope `community_id`/`community_key_id`/`cohort_key_id`,
+        // a row endpoint or subject_key_ids entry resolving as a stored
+        // community) is refused if C has lost its last live
+        // `moderate`-holder. No-op for local-tier rows, rows referencing no
+        // known community. Backend-symmetric.
         crate::federation::admission::check_no_moderator_federate_apply(self, &row).await?;
 
         // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
@@ -26184,6 +26187,152 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// #369 (CC 4.5.4 / §11.11) — no-moderator federation-APPLY gate,
+    /// broadened keying, END-TO-END through `put_attestation` (sqlite; parity
+    /// with memory's decision table + the postgres twin). A federation-tier
+    /// row attested TO a stored moderator-less community (the membership
+    /// shape — NO `community_id` envelope field) is refused fail-secure;
+    /// the same shape onto a moderatored community lands; local-tier +
+    /// storage-only community ops stay untouched.
+    #[tokio::test]
+    async fn no_moderator_federate_apply_broadened_keying_sqlite() {
+        use crate::federation::admission::MEMBER_ROLE_FOUNDER;
+        use crate::federation::types::{consensus_protocol, identity_type};
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // Keys: a USER founder (steward-bound ⇒ zero-hop moderator), a
+        // PRIMITIVE founder (passes the storage steward-binding gate — not
+        // node/agent — but is NOT steward-bound ⇒ no moderator), + the two
+        // community keys.
+        for (kid, ity) in [
+            ("nm-user", identity_type::USER),
+            ("nm-prim", identity_type::PRIMITIVE),
+            ("nm-ok", identity_type::PRIMITIVE),
+            ("nm-no", identity_type::PRIMITIVE),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key_with_identity_type(kid, "nm", kid, ity),
+                })
+                .await
+                .unwrap();
+        }
+        let put_comm = |cid: &str, founder: &str| crate::federation::SignedCommunity {
+            community: crate::federation::Community {
+                community_key_id: cid.into(),
+                community_name: "nm-test".into(),
+                members: vec![crate::federation::CommunityMember {
+                    key_id: founder.into(),
+                    joined_at: "2026-06-04T00:00:00Z".parse().unwrap(),
+                    role: Some(MEMBER_ROLE_FOUNDER.into()),
+                }],
+                founded_at: "2026-06-04T00:00:00Z".parse().unwrap(),
+                consensus_protocol: consensus_protocol::FOUNDER_ONLY.into(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        };
+        // Storage-only put_community is NOT the federate gate — both records
+        // (moderatored AND moderator-less) store fine.
+        backend
+            .put_community(put_comm("nm-ok", "nm-user"))
+            .await
+            .unwrap();
+        backend
+            .put_community(put_comm("nm-no", "nm-prim"))
+            .await
+            .unwrap();
+
+        // (1) Membership shape onto the moderator-less community → REFUSED
+        //     fail-secure, nothing stored.
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fed_attestation("nm-a1", "nm-prim", "nm-no", "nm-prim"),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::CommunityHasNoModerator { .. }
+            ),
+            "federation apply keyed on a moderator-less community must refuse, got {err:?}"
+        );
+        assert_eq!(err.kind(), "federation_community_no_moderator");
+        assert!(
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "nm-no")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // (2) Same shape onto the MODERATORED community → ADMITTED + stored.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fed_attestation("nm-a2", "nm-user", "nm-ok", "nm-user"),
+            })
+            .await
+            .expect("moderatored community continues to federate");
+        assert_eq!(
+            crate::federation::FederationDirectory::list_attestations_for(&backend, "nm-ok")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // (3) LOCAL-tier row keyed on the moderator-less community →
+        //     untouched (not a federation apply step).
+        let mut local = fed_attestation("nm-a3", "nm-prim", "nm-no", "nm-prim");
+        local.tier = crate::federation::types::attestation_tier::LOCAL.into();
+        local.cohort_scope = crate::federation::types::cohort_scope::SELF.into();
+        backend
+            .put_attestation(SignedAttestation { attestation: local })
+            .await
+            .expect("local-tier row is not a federation apply step");
+
+        // (4) Storage-only membership op on the moderator-less community →
+        //     untouched (loss-processing / recovery must not be blocked).
+        backend
+            .put_community_membership_revocation(
+                crate::federation::SignedCommunityMembershipRevocation {
+                    community_membership_revocation:
+                        crate::federation::CommunityMembershipRevocation {
+                            community_key_id: "nm-no".into(),
+                            removed_identity_key_id: "nm-prim".into(),
+                            removed_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                            effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                            reason: None,
+                            witness_set: Vec::new(),
+                            persist_row_hash: String::new(),
+                        },
+                },
+            )
+            .await
+            .expect("membership revocation is storage, not a federation apply step");
+
+        // (5) The drivable verdict mirrors the apply decision.
+        let v = crate::federation::admission::no_moderator_federate_verdict(&backend, "nm-no")
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "admitted": false, "community_known": true,
+                "reason": "federation_community_no_moderator"
+            })
+        );
+        let v = crate::federation::admission::no_moderator_federate_verdict(&backend, "nm-ok")
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "admitted": true, "community_known": true })
+        );
     }
 
     /// v11.5.0 (CIRISPersist#306, CC 3.2 / CC 3.3.12 / CC 1.15.6) — sqlite

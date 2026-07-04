@@ -3041,16 +3041,47 @@ pub async fn check_no_moderator_federate_admission_by_id(
 
 /// v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — the `put_attestation` entry
 /// point for the §11.11 federation-apply re-check (point ii). A
-/// **federation-tier** attestation carrying a `community_id` in its envelope is
-/// a "federation apply step keyed on C"; it is refused if `C` has no live
-/// `moderate`-holder ([`check_no_moderator_federate_admission_by_id`]).
+/// **federation-tier** attestation keyed on a community `C` is a "federation
+/// apply step keyed on C"; it is refused if `C` has no live `moderate`-holder
+/// ([`check_no_moderator_federate_admission_by_id`]).
+///
+/// # Keying — what "keyed on C" means for an attestation row (v12.7.0, #369)
+///
+/// §11.11 requires the re-check on **every** federation apply step keyed on
+/// `C`, not only rows that ride one envelope convention. A federation-tier
+/// row is keyed on `C` when it references `C` under ANY of the substrate's
+/// own community-reference shapes:
+///
+/// 1. **Envelope fields** — `community_id` (the CEG §11.10 moderation-gate
+///    shape, [`check_delegated_duty_scores_admission`]'s keying),
+///    `community_key_id` (the [`Community`](crate::federation::types::Community)
+///    record / CC 3.2 steward-binding-gate field name), and `cohort_key_id`
+///    (the #249 Cut G4 membership-change event field name). Each is honored
+///    when present as a string.
+/// 2. **Row endpoints** — `attesting_key_id` / `attested_key_id` resolving as
+///    a stored community (`lookup_community` hit). This is how
+///    community-MEMBERSHIP attestations reference their community with no
+///    literal envelope field: a community's own key IS a `federation_keys`
+///    row, and the scope read-gate already treats the attestation *subject*
+///    as the membership target ("`federation_attestations` carries
+///    `cohort_scope` but no separate `cohort_target_id`, so the subject
+///    doubles as the membership target" — `list_attestations_for`). A row
+///    attested TO `C` (membership / scores-on-community) or emitted BY `C`
+///    (community-signed roster claims) is a federation apply step keyed on
+///    `C`.
+/// 3. **`subject_key_ids` entries** resolving as stored communities — the
+///    CEG 0.6 §4.2 consent-subject shape (the same subject set the §11.10
+///    duty-holder composition folds community moderators into).
 ///
 /// A no-op (`Ok(())`) for:
 /// - **local-tier** rows — a local-tier write is private to the producing
 ///   occurrence and not a federation apply step (CC 5.3.2.2), and
-/// - rows carrying **no** `community_id` (not keyed on a community), and
-/// - a `community_id` **not locally known** (out of scope — fail-open, per
-///   [`check_no_moderator_federate_admission_by_id`]).
+/// - rows referencing **no** community under any shape above (not keyed on a
+///   community: every candidate either absent or **not locally known** —
+///   out of scope, fail-open, per
+///   [`check_no_moderator_federate_admission_by_id`]; an ordinary
+///   key-to-key attestation costs two `lookup_community` misses and passes
+///   untouched).
 ///
 /// A founder appointment (`delegates_to(moderate)` keyed on C) is NOT
 /// chicken-and-egg-blocked: a steward-bound founder is already a zero-hop named
@@ -3067,12 +3098,66 @@ pub async fn check_no_moderator_federate_apply(
     if row.tier != crate::federation::types::attestation_tier::FEDERATION {
         return Ok(());
     }
-    let community_id = row
-        .attestation_envelope
-        .get("community_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    check_no_moderator_federate_admission_by_id(directory, community_id).await
+    // Collect every community reference the row carries (deduplicated —
+    // a row naming C under several shapes re-checks it once).
+    let mut candidates: Vec<&str> = Vec::new();
+    for field in ["community_id", "community_key_id", "cohort_key_id"] {
+        if let Some(cid) = row.attestation_envelope.get(field).and_then(|v| v.as_str()) {
+            if !cid.is_empty() && !candidates.contains(&cid) {
+                candidates.push(cid);
+            }
+        }
+    }
+    for endpoint in [row.attesting_key_id.as_str(), row.attested_key_id.as_str()] {
+        if !endpoint.is_empty() && !candidates.contains(&endpoint) {
+            candidates.push(endpoint);
+        }
+    }
+    for sid in &row.subject_key_ids {
+        if !sid.is_empty() && !candidates.contains(&sid.as_str()) {
+            candidates.push(sid);
+        }
+    }
+    for cid in candidates {
+        check_no_moderator_federate_admission_by_id(directory, cid).await?;
+    }
+    Ok(())
+}
+
+/// v12.7.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
+/// federate-admission **verdict** over one community id: exactly the decision
+/// [`check_no_moderator_federate_apply`] takes for a federation apply step
+/// keyed on `community_id`, returned as data instead of an error so a
+/// conformance/consumer layer can stage the gate without constructing a full
+/// federation flow. Verdict JSON:
+///
+/// - `{"admitted": true, "community_known": false}` — not locally known ⇒
+///   out of scope, fail-open (the peer's own admission gate governs it);
+/// - `{"admitted": true, "community_known": true}` — a live `moderate`-holder
+///   resolves (or the authorized-infrastructure carve-out applies) ⇒ `C` may
+///   federate at moderated capability;
+/// - `{"admitted": false, "community_known": true, "reason":
+///   "federation_community_no_moderator"}` — §11.11 rule-3 fail-secure: no
+///   live steward-bound authority root ⇒ MUST NOT federate at moderated
+///   capability.
+///
+/// Read-only — never mutates; substrate read errors propagate as `Err`.
+pub async fn no_moderator_federate_verdict(
+    directory: &dyn super::FederationDirectory,
+    community_id: &str,
+) -> Result<serde_json::Value, Error> {
+    let Some(community) = directory.lookup_community(community_id).await? else {
+        return Ok(serde_json::json!({ "admitted": true, "community_known": false }));
+    };
+    match check_no_moderator_federate_admission(directory, &community).await {
+        Ok(()) => Ok(serde_json::json!({ "admitted": true, "community_known": true })),
+        Err(err @ Error::CommunityHasNoModerator { .. }) => Ok(serde_json::json!({
+            "admitted": false,
+            "community_known": true,
+            "reason": err.kind(),
+        })),
+        Err(other) => Err(other),
+    }
 }
 
 /// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §11.11) — is key `k` a **named

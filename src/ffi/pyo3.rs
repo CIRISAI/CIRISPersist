@@ -7467,6 +7467,64 @@ impl PyEngine {
         })
     }
 
+    /// v12.7.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
+    /// no-moderator-no-federate admission VERDICT for one community: exactly
+    /// the decision the federation-apply gate
+    /// ([`admission::check_no_moderator_federate_apply`](crate::federation::admission::check_no_moderator_federate_apply),
+    /// wired into every backend's `put_attestation`) takes for a federation
+    /// apply step keyed on `community_id`, returned as JSON instead of a
+    /// refusal so the gate can be staged without constructing a full
+    /// federation flow. Returns
+    /// `{"admitted": true, "community_known": false}` (not locally known —
+    /// out of scope, fail-open), `{"admitted": true, "community_known": true}`
+    /// (a live `moderate`-holder resolves, or the authorized-infrastructure
+    /// carve-out applies), or `{"admitted": false, "community_known": true,
+    /// "reason": "federation_community_no_moderator"}` (§11.11 rule-3
+    /// fail-secure). Read-only. Wraps the free function
+    /// [`admission::no_moderator_federate_verdict`](crate::federation::admission::no_moderator_federate_verdict).
+    fn check_no_moderator_federate_json(
+        &self,
+        py: Python<'_>,
+        community_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let community_id = community_id.to_owned();
+            py.detach(move || {
+                let verdict: serde_json::Value = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::no_moderator_federate_verdict(
+                                &*backend,
+                                &community_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::no_moderator_federate_verdict(
+                                &*backend,
+                                &community_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&verdict).map_err(|e| {
+                    PyValueError::new_err(format!("no_moderator_federate_verdict serialize: {e}"))
+                })
+            })
+        })
+    }
+
     /// #249 Cut A — is `key_id` **steward-bound** (resolves to a `user`-role
     /// human identity, directly / via occurrence / via a live `delegates_to`
     /// from a user-role granter)? Returns JSON `true` / `false`. Wraps the

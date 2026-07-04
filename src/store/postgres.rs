@@ -150,6 +150,8 @@ impl PostgresBackend {
     /// - `postgres://user:pass@host:5432/dbname`
     /// - `host=db user=lens password=… dbname=cirislens`
     pub async fn connect(dsn: &str) -> Result<Self, Error> {
+        #[cfg(feature = "tls")]
+        ensure_rustls_provider();
         let pg_config: tokio_postgres::Config = dsn
             .parse()
             .map_err(|e: tokio_postgres::Error| Error::Backend(format!("dsn parse: {e}")))?;
@@ -522,6 +524,7 @@ impl PostgresBackend {
     async fn dedicated_connect(&self) -> Result<tokio_postgres::Client, Error> {
         use rustls::ClientConfig;
         use tokio_postgres_rustls::MakeRustlsConnect;
+        ensure_rustls_provider();
         let mut roots = rustls::RootCertStore::empty();
         let cert_result = rustls_native_certs::load_native_certs();
         for cert in cert_result.certs {
@@ -553,6 +556,23 @@ impl PostgresBackend {
         });
         Ok(client)
     }
+}
+
+/// AV-18 `tls` feature — idempotently install the process-level rustls
+/// [`CryptoProvider`](rustls::crypto::CryptoProvider) before building a
+/// `ClientConfig`. The dependency graph compiles BOTH providers — `ring`
+/// (via the verify/reqwest stack) and `aws-lc-rs` (rustls' own default) —
+/// so rustls 0.23 cannot infer a process default and
+/// `ClientConfig::builder()` PANICS unless one was installed. We install
+/// `aws-lc-rs` (rustls' preferred provider; with `prefer-post-quantum` in
+/// the graph it negotiates the X25519MLKEM768 hybrid, matching the
+/// federation's PQC posture). `Err(_)` from `install_default` means a
+/// provider is already installed — ours from an earlier connect, or the
+/// host application's — and first-install-wins is exactly the rustls
+/// contract, so it is deliberately ignored.
+#[cfg(feature = "tls")]
+fn ensure_rustls_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 /// Walk the std::error::Error source chain; if a tokio-postgres
@@ -2795,11 +2815,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // attesting key's identity_type. Backend-symmetric with SQLite + memory.
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
-        // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
-        // federate FEDERATION-APPLY re-check (point ii). A federation-tier row
-        // keyed on a community (`community_id`) is refused if C has lost its
-        // last live `moderate`-holder. No-op for local-tier rows, no
-        // community_id, or an unknown community. Backend-symmetric.
+        // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11; keying broadened by
+        // #369) — no-moderator-no-federate FEDERATION-APPLY re-check (point
+        // ii). A federation-tier row keyed on a community under ANY substrate
+        // shape (envelope `community_id`/`community_key_id`/`cohort_key_id`,
+        // a row endpoint or subject_key_ids entry resolving as a stored
+        // community) is refused if C has lost its last live
+        // `moderate`-holder. No-op for local-tier rows, rows referencing no
+        // known community. Backend-symmetric.
         crate::federation::admission::check_no_moderator_federate_apply(self, &row).await?;
 
         // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
@@ -21565,6 +21588,158 @@ mod tests {
         });
         pg_resign(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         a
+    }
+
+    /// #369 (CC 4.5.4 / §11.11) — no-moderator federation-APPLY gate,
+    /// broadened keying, END-TO-END through `put_attestation` (PG backend;
+    /// 3-backend parity with memory's decision table + the sqlite twin). A
+    /// federation-tier row attested TO a stored moderator-less community
+    /// (the membership shape — NO `community_id` envelope field) is refused
+    /// fail-secure; the same shape onto a moderatored community lands;
+    /// storage-only community ops stay untouched. Run-scoped uuid-suffixed
+    /// key ids (shared test DB).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_no_moderator_federate_apply_broadened_keying() {
+        use crate::federation::admission::MEMBER_ROLE_FOUNDER;
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let suffix = uuid_like();
+        let founder_user = format!("nm-user-{suffix}");
+        let founder_prim = format!("nm-prim-{suffix}");
+        let comm_ok = format!("nm-ok-{suffix}");
+        let comm_no = format!("nm-no-{suffix}");
+        for (kid, ity) in [
+            (&founder_user, crate::federation::types::identity_type::USER),
+            (
+                &founder_prim,
+                crate::federation::types::identity_type::PRIMITIVE,
+            ),
+            (&comm_ok, crate::federation::types::identity_type::PRIMITIVE),
+            (&comm_no, crate::federation::types::identity_type::PRIMITIVE),
+        ] {
+            let mut k = fix_section_i_key(kid, "nm", now, true);
+            k.identity_type = ity.into();
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord { record: k })
+                .await
+                .unwrap();
+        }
+        let put_comm = |cid: &str, founder: &str| crate::federation::SignedCommunity {
+            community: crate::federation::Community {
+                community_key_id: cid.to_owned(),
+                community_name: "nm-test".into(),
+                members: vec![crate::federation::CommunityMember {
+                    key_id: founder.to_owned(),
+                    joined_at: now,
+                    role: Some(MEMBER_ROLE_FOUNDER.into()),
+                }],
+                founded_at: now,
+                consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
+                    .into(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        };
+        // Storage-only put_community is NOT the federate gate — both records
+        // (moderatored AND moderator-less) store fine.
+        backend
+            .put_community(put_comm(&comm_ok, &founder_user))
+            .await
+            .unwrap();
+        backend
+            .put_community(put_comm(&comm_no, &founder_prim))
+            .await
+            .unwrap();
+
+        // (1) Membership shape onto the moderator-less community → REFUSED
+        //     fail-secure, nothing stored.
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_scores_attestation(
+                    &founder_prim,
+                    &comm_no,
+                    &founder_prim,
+                    "identity_binding:v1",
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::CommunityHasNoModerator { .. }
+            ),
+            "federation apply keyed on a moderator-less community must refuse, got {err:?}"
+        );
+        assert_eq!(err.kind(), "federation_community_no_moderator");
+        assert!(backend
+            .list_attestations_for(&comm_no)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // (2) Same shape onto the MODERATORED community → ADMITTED + stored.
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_scores_attestation(
+                    &founder_user,
+                    &comm_ok,
+                    &founder_user,
+                    "identity_binding:v1",
+                ),
+            })
+            .await
+            .expect("moderatored community continues to federate");
+        assert_eq!(
+            backend.list_attestations_for(&comm_ok).await.unwrap().len(),
+            1
+        );
+
+        // (3) Storage-only membership op on the moderator-less community →
+        //     untouched (loss-processing / recovery must not be blocked).
+        backend
+            .put_community_membership_revocation(
+                crate::federation::SignedCommunityMembershipRevocation {
+                    community_membership_revocation:
+                        crate::federation::CommunityMembershipRevocation {
+                            community_key_id: comm_no.clone(),
+                            removed_identity_key_id: founder_prim.clone(),
+                            removed_at: now,
+                            effective_at: now,
+                            reason: None,
+                            witness_set: Vec::new(),
+                            persist_row_hash: String::new(),
+                        },
+                },
+            )
+            .await
+            .expect("membership revocation is storage, not a federation apply step");
+
+        // (4) The drivable verdict mirrors the apply decision.
+        let v = crate::federation::admission::no_moderator_federate_verdict(&backend, &comm_no)
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "admitted": false, "community_known": true,
+                "reason": "federation_community_no_moderator"
+            })
+        );
+        let v = crate::federation::admission::no_moderator_federate_verdict(&backend, &comm_ok)
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "admitted": true, "community_known": true })
+        );
     }
 
     /// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
