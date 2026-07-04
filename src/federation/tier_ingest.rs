@@ -423,6 +423,132 @@ pub(crate) mod test_support {
             Some(B64.encode(&pqc_sig)),
         )
     }
+
+    /// #371 — register `key_id` with its REAL deterministic hybrid pubkeys
+    /// and an explicit `identity_type` (the [`register_hybrid_key`] shape,
+    /// but e.g. `user`-role for `owner_of` granters or `node`-role for
+    /// owned-node rows). Self-signed, deterministic timestamps so a rebuilt
+    /// record is byte-identical.
+    pub async fn register_identity_key<D: crate::federation::FederationDirectory + ?Sized>(
+        dir: &D,
+        key_id: &str,
+        identity_type: &str,
+    ) {
+        let record = replicated_key_record(
+            key_id,
+            identity_type,
+            key_id, // self-signed
+            key_id,
+            "register",
+        );
+        dir.put_public_key(crate::federation::SignedKeyRecord { record })
+            .await
+            .expect("register identity key");
+    }
+
+    /// #371 — build a fully-formed [`KeyRecord`](crate::federation::KeyRecord)
+    /// for `key_id` carrying `key_id`'s REAL deterministic hybrid pubkeys,
+    /// whose registration envelope is hybrid-signed by `signer_key_id`'s
+    /// deterministic keys (through [`sign_envelope`], the exact shape
+    /// `verify_key_registration` Strict-verifies). Deterministic timestamps,
+    /// so building the same record twice is byte-identical (drives the
+    /// idempotent-`Unchanged` arm of the #371 decision table).
+    ///
+    /// - `scrub_key_id == key_id` + `signer_key_id == key_id` ⇒ a verifiable
+    ///   **self-signed** record (the in-place boot state).
+    /// - `scrub_key_id != key_id` + `signer_key_id == scrub_key_id` ⇒ a
+    ///   verifiable **granting-authority (anchor-scrubbed)** record —
+    ///   register the scrubber first ([`register_hybrid_key`] /
+    ///   [`register_identity_key`]) so the Strict gate resolves its pubkeys.
+    /// - `signer_key_id != scrub_key_id` ⇒ a record whose scrub does NOT
+    ///   verify (the bad-signer decision-table row).
+    ///
+    /// `nonce` is folded into the signed envelope, so two records for the
+    /// same `key_id` with different nonces are distinct-but-valid versions
+    /// (drives the conflicting-second-version / duplicity rows).
+    pub fn replicated_key_record(
+        key_id: &str,
+        identity_type: &str,
+        scrub_key_id: &str,
+        signer_key_id: &str,
+        nonce: &str,
+    ) -> crate::federation::KeyRecord {
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
+        let envelope = serde_json::json!({
+            "key_id": key_id,
+            "purpose": "federation-peering",
+            "nonce": nonce,
+        });
+        let (och, classical, pqc) = sign_envelope(signer_key_id, &envelope);
+        let ts: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+        crate::federation::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: identity_type.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: ts,
+            valid_until: None,
+            registration_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            scrub_key_id: scrub_key_id.to_owned(),
+            scrub_timestamp: ts,
+            pqc_completed_at: Some(ts),
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+        }
+    }
+
+    /// #371 — build a LIVE **owner-binding** `delegates_to(owner → node)`
+    /// (the CC 1.13.3.3 / CC 3.2 ownership dimension the v12.6.0
+    /// single-owner gate + `owner_of` key on), federation-tier
+    /// hybrid-signed by `owner`'s deterministic keys so
+    /// `verify_federation_tier_ingest` admits it. Register `owner` as a
+    /// `user`-role key ([`register_identity_key`]) first.
+    pub fn owner_binding_attestation(
+        id: &str,
+        owner: &str,
+        node: &str,
+    ) -> crate::federation::Attestation {
+        use crate::federation::types::{
+            attestation_tier, attestation_type, delegation_scope as ds, owner_binding,
+        };
+        let envelope = serde_json::json!({
+            "id": id,
+            "kind": "delegates_to",
+            "dimension": owner_binding::DIMENSION,
+            "delegation_purpose": owner_binding::PURPOSE,
+            "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+        });
+        let (och, classical, pqc) = sign_envelope(owner, &envelope);
+        let ts: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+        crate::federation::Attestation {
+            attestation_id: id.to_owned(),
+            attesting_key_id: owner.to_owned(),
+            attested_key_id: node.to_owned(),
+            attestation_type: attestation_type::DELEGATES_TO.to_owned(),
+            weight: Some(1.0),
+            asserted_at: ts,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            scrub_key_id: owner.to_owned(),
+            scrub_timestamp: ts,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".to_owned(),
+            tier: attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+        }
+    }
 }
 
 #[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]

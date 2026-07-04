@@ -2293,6 +2293,49 @@ impl PostgresBackend {
         }
         Ok(AdoptScrubOutcome::Upgraded)
     }
+
+    /// v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
+    /// apply** — Postgres twin of
+    /// [`SqliteBackend::apply_replicated_key_record`](crate::store::sqlite::SqliteBackend::apply_replicated_key_record).
+    /// All policy lives in the shared, backend-agnostic
+    /// [`plan_replicated_key_apply`](crate::federation::register::plan_replicated_key_apply)
+    /// (fresh insert via `put_public_key` with every direct-registration
+    /// gate intact; self-signed → anchor-scrubbed upgrade via
+    /// [`adopt_scrub_upgrade`](Self::adopt_scrub_upgrade) only after the
+    /// `verify_key_registration` Strict scrub gate + the v12.6.0 `owner_of`
+    /// single-owner gate pass; everything else `Unchanged` / `Refused`),
+    /// so the two backends cannot drift. A store-step `Conflict` (a row
+    /// that changed between plan and act) resolves to `Refused` —
+    /// fail-closed + re-offerable on the anti-entropy plane, never fatal.
+    pub async fn apply_replicated_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        use crate::federation::register::{
+            plan_replicated_key_apply, AdoptScrubOutcome, ReplicatedKeyOutcome, ReplicatedKeyPlan,
+        };
+        match plan_replicated_key_apply(self, &record.record).await? {
+            ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
+            ReplicatedKeyPlan::Refused => Ok(ReplicatedKeyOutcome::Refused),
+            ReplicatedKeyPlan::Insert => {
+                match crate::federation::FederationDirectory::put_public_key(self, record).await {
+                    Ok(()) => Ok(ReplicatedKeyOutcome::Inserted),
+                    // A row appeared between plan and act with different
+                    // content — first-seen wins on the replication plane.
+                    Err(crate::federation::Error::Conflict(_)) => Ok(ReplicatedKeyOutcome::Refused),
+                    Err(e) => Err(e),
+                }
+            }
+            ReplicatedKeyPlan::Upgrade => match self.adopt_scrub_upgrade(record).await {
+                Ok(AdoptScrubOutcome::Upgraded) => Ok(ReplicatedKeyOutcome::Upgraded),
+                Ok(AdoptScrubOutcome::AlreadyAdopted) => Ok(ReplicatedKeyOutcome::Unchanged),
+                // The atomic WHERE (or its Rust pre-checks) saw different
+                // state than the plan — a concurrent mutation. Fail-closed.
+                Err(crate::federation::Error::Conflict(_)) => Ok(ReplicatedKeyOutcome::Refused),
+                Err(e) => Err(e),
+            },
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -29633,5 +29676,118 @@ mod tests {
             .map(|a| a.attesting_key_id.as_str())
             .collect();
         assert!(granters.contains(dt_g1.as_str()) && granters.contains(dt_g2.as_str()));
+    }
+
+    /// v12.7.0 (#371) — postgres twin of
+    /// `store::sqlite::tests::apply_replicated_key_record_ambiguous_owner_refused_sqlite`:
+    /// a node carrying TWO live owner-bindings (the second a PRE-GATE
+    /// anomaly, raw-SQL-inserted past the v12.6.0 single-owner admission
+    /// gate) resolves `AmbiguousNodeOwner`, so a replicated anchor-scrubbed
+    /// record for it is Refused (fail-closed) and the self-signed row is
+    /// untouched. The rest of the #371 decision table runs Engine-level on
+    /// both backends in `federation::register::tests`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn apply_replicated_key_record_ambiguous_owner_refused_postgres() {
+        use crate::federation::register::ReplicatedKeyOutcome;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type;
+        use crate::federation::FederationDirectory as _;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+
+        // Run-scoped unique ids (shared test DB).
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let anchor = format!("apply-amb-anchor-{tag}");
+        let owner1 = format!("apply-amb-owner1-{tag}");
+        let owner2 = format!("apply-amb-owner2-{tag}");
+        let node = format!("apply-amb-node-{tag}");
+
+        ts::register_hybrid_key(&backend, &anchor).await;
+        ts::register_identity_key(&backend, &owner1, identity_type::USER).await;
+        ts::register_identity_key(&backend, &owner2, identity_type::USER).await;
+        // The node's self-signed boot row.
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: ts::replicated_key_record(&node, identity_type::NODE, &node, &node, "v1"),
+            })
+            .await
+            .unwrap();
+
+        // owner1 binds through the admission gate…
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: ts::owner_binding_attestation(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &owner1,
+                    &node,
+                ),
+            })
+            .await
+            .unwrap();
+        // …owner2's binding is the PRE-GATE anomaly, inserted via raw SQL
+        // (bypassing check_single_node_owner_admission, exactly the state a
+        // pre-v12.6.0 corpus can hold).
+        {
+            let anomaly =
+                ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner2, &node);
+            let anomaly_uuid = uuid::Uuid::parse_str(&anomaly.attestation_id).unwrap();
+            let ts_stamp: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+            let hash_bytes: Vec<u8> = vec![0u8];
+            let client = backend.get_client().await.expect("client");
+            client
+                .execute(
+                    "INSERT INTO cirislens.federation_attestations (\
+                        attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        asserted_at, attestation_envelope, original_content_hash, \
+                        scrub_signature_classical, scrub_key_id, scrub_timestamp, \
+                        persist_row_hash\
+                     ) VALUES ($1, $2, $3, 'delegates_to', $4, $5, $6, 'c2ln', $2, $4, '0')",
+                    &[
+                        &anomaly_uuid,
+                        &owner2,
+                        &node,
+                        &ts_stamp,
+                        &anomaly.attestation_envelope,
+                        &hash_bytes,
+                    ],
+                )
+                .await
+                .expect("raw anomaly insert");
+        }
+        // The anomaly is real: owner_of fails AmbiguousNodeOwner.
+        let err = crate::federation::admission::owner_of(&backend, &node)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::AmbiguousNodeOwner { .. }),
+            "expected AmbiguousNodeOwner, got {err:?}"
+        );
+
+        // A VERIFIABLE anchor-scrubbed record for the node ⇒ Refused
+        // (fail-closed), self-signed row untouched.
+        let scrubbed =
+            ts::replicated_key_record(&node, identity_type::NODE, &anchor, &anchor, "v1");
+        assert_eq!(
+            backend
+                .apply_replicated_key_record(crate::federation::SignedKeyRecord {
+                    record: scrubbed
+                })
+                .await
+                .unwrap(),
+            ReplicatedKeyOutcome::Refused
+        );
+        let row = crate::federation::FederationDirectory::lookup_public_key(&backend, &node)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.scrub_key_id, node,
+            "ambiguous-owner refusal must leave the self-signed row untouched"
+        );
     }
 }

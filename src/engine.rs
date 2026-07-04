@@ -3637,6 +3637,51 @@ impl Engine {
         }
     }
 
+    /// v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
+    /// apply**: the anti-entropy apply the edge replication bridge routes
+    /// `apply_key` to instead of raw
+    /// [`put_public_key`](crate::federation::FederationDirectory::put_public_key)
+    /// (which keeps its insert-only semantics for direct
+    /// claim/peering/registration — no behavior change there). With this,
+    /// an accord-holder-scrubbed record for a node the receiver already
+    /// holds a **self-signed** row for auto-upgrades that row in place, so
+    /// the genesis-mesh seed becomes pure owned-node replication and stale
+    /// self-signed copies on sibling nodes heal — no per-node
+    /// `adopt-scrubbed` endpoint call ([`adopt_scrub_upgrade`](Self::adopt_scrub_upgrade)
+    /// itself is unchanged and remains available; consumers retire the
+    /// endpoint separately).
+    ///
+    /// Decision table + gate composition live in the shared
+    /// [`plan_replicated_key_apply`](crate::federation::register::plan_replicated_key_apply):
+    /// fresh `key_id` ⇒ insert with every `put_public_key` admission gate
+    /// intact; existing self-signed row + incoming anchor-scrubbed record ⇒
+    /// upgrade iff same hybrid pubkeys AND the scrub verifies through the
+    /// [`verify_key_registration`](crate::federation::verify_key_registration)
+    /// `Strict` gate (scrubber resolved from the directory — the seeded
+    /// HUMANITY_ACCORD anchor) AND
+    /// [`owner_of`](crate::federation::admission::owner_of) resolves exactly
+    /// one live owner (v12.6.0; unowned/ambiguous ⇒ fail-closed);
+    /// byte-identical ⇒ `Unchanged`; anything else (downgrade, re-scrub,
+    /// pubkey swap, conflicting version) ⇒ `Refused`, row untouched.
+    ///
+    /// Unlike [`adopt_scrub_upgrade`](Self::adopt_scrub_upgrade)'s
+    /// Engine-layer verify split, the verification is INSIDE the backend
+    /// method (it only binds on the upgrade transition — a fresh insert
+    /// keeps `put_public_key`'s as-today semantics), so no caller can reach
+    /// the upgrade unverified. This wrapper is pure dispatch.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn apply_replicated_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.apply_replicated_key_record(record).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.apply_replicated_key_record(record).await,
+        }
+    }
+
     /// v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the
     /// symmetric **deregister** path: the revocation teeth a withdrawn
     /// `consent:replication` relies on.

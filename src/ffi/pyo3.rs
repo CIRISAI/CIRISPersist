@@ -3767,6 +3767,66 @@ impl PyEngine {
         })
     }
 
+    /// v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
+    /// apply**. FFI mirror of
+    /// [`Engine::apply_replicated_key_record`](crate::engine::Engine::apply_replicated_key_record)
+    /// — the apply the replication bridge routes `apply_key` to instead of
+    /// raw `put_public_key` (which keeps its insert-only semantics for
+    /// direct registration).
+    ///
+    /// `signed_key_record_json` is the replicated `SignedKeyRecord`. Returns
+    /// the outcome token: `"inserted"` (new key_id, every `put_public_key`
+    /// admission gate intact), `"upgraded"` (existing self-signed row
+    /// adopted the anchor-scrubbed record — same hybrid pubkeys, scrub
+    /// Strict-verified against the directory-resolved scrubber, and the
+    /// v12.6.0 `owner_of(key_id)` gate resolved exactly one live owner),
+    /// `"unchanged"` (byte-identical re-apply), or `"refused"` (pubkey swap
+    /// / downgrade / re-scrub / conflicting version / unverifiable scrub /
+    /// unowned or ambiguous owner — fail-closed, row untouched). Refusals
+    /// are outcomes, not exceptions, so an apply loop stays total.
+    fn apply_replicated_key_record(
+        &self,
+        py: Python<'_>,
+        signed_key_record_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let record: crate::federation::SignedKeyRecord =
+                serde_json::from_str(signed_key_record_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
+                })?;
+            let outcome = py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        backend
+                            .apply_replicated_key_record(record)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        backend
+                            .apply_replicated_key_record(record)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })?;
+            serde_json::to_value(outcome)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .ok_or_else(|| {
+                    PyValueError::new_err("apply_replicated_key_record outcome serialize")
+                })
+        })
+    }
+
     /// v1.5.3 — One-call helper that registers THIS engine's local
     /// pubkey as a `federation_keys` row of the specified
     /// `identity_type`. Composes the existing primitives
