@@ -5,6 +5,72 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [12.5.0] — 2026-07-04 — CC 0.9.3 conformance batch
+
+Read against the now-standalone **CIRISConstitution v0.9.3**. Three conformance
+issues, one release.
+
+### Added — #309: 4-band age + capacity assurance + adult-incapacity steward-binding + fail-to-liberty (CC 3.4.11–13 / 3.2)
+
+- **Four-band age** (`src/federation/age.rs`): `AgeBandFine { Under13, EarlyTeen13_15,
+  OlderTeen16_17, Adult, Unknown }` (tokens `under_13`/`13_15`/`16_17`/`adult`;
+  `minor` = union of the three sub-bands) + `age_band_fine()` resolver (witness-
+  outranks-self ratchet). The binary `AgeBand`/`age_band()` predicate is preserved
+  so the CC 3.2 minor gate keeps working; `Engine.age_band_fine_json` added.
+- **Capacity assurance** (new `src/federation/capacity.rs`): recognizes
+  `capacity_assurance:{level}:{domain}:{band}:v1` (level ∈ provider/panel/government;
+  band ∈ capacitated/incapacitated) + `reversible_excluded/pending:{domain}`;
+  witness-reserved (subject MUST NOT emit; steward MUST NOT attest);
+  `capacity_state()` resolver (presumption of capacity, one-way ratchet, `valid_until`
+  freshness); `Engine.capacity_state_json`.
+- **Adult-incapacity steward-binding** (`check_adult_incapacity_binding` in
+  admission.rs): admits an adult target ONLY under a live incapacitated capacity
+  attestation with `reversible_excluded` (or a T1 `reversible_pending` emergency
+  path), attester ∉ {steward, petitioner}, delegated scope ⊆ attested domains,
+  scope ∩ `PROTECTED_NON_TRANSFERABLE` (`contact`/`relational`/`voting`/`marriage`/
+  `reproduction`) = ∅, a mandatory `binding_legitimacy_source` ∈ {`prior_will_proxy`,
+  `wa_due_process_quorum`, `emergency_necessity_expedited`}, and a mandatory
+  `valid_until` ≤ `T2_REVIEW_CADENCE_DAYS` (90, operator-tunable). **Never the
+  steward's own signature alone.**
+- **Fail-to-liberty**: a lapsed `valid_until` makes the binding non-live and the
+  adult auto-re-sovereigns with no action required — wired into all three liveness
+  resolvers (`is_steward_bound` / `steward_bindings_of` / `steward_binding_chain`).
+- Deliberately deferred to higher layers (documented in-code): `panel` M-of-N
+  quorum *counting*, the T1 retrospective-WA-audit deadline timer, ward's-champion /
+  supported-vs-substituted wire shapes, `moderation:capacity_misattestation`
+  adjudication, and the `content_class:adult` visibility gate.
+
+### Added — #238: substrate no-moderator-no-federate gate + consent-revocation SLA (CC 4.5.4 / 5.3.2.2)
+
+0.9.3 makes both explicit and substrate-level:
+- **No-moderator gate** (§11.11): `check_no_moderator_federate_admission` +
+  `check_no_moderator_federate_apply` (wired into `put_attestation` on all three
+  backends) refuse to admit-to / continue federating a `community` with no live
+  `moderate`-holder — new `Error::CommunityHasNoModerator` (`kind =
+  federation_community_no_moderator`), fail-secure. The single federation-apply
+  chokepoint subsumes both admission (first apply) and the continue-to-federate
+  re-check (every subsequent apply); infrastructure communities exempt. Merit
+  auto-promotion / 48h recovery are signed appointment ceremonies (a higher layer;
+  persist provides the fail-secure floor, never fabricates a moderator).
+- **Consent-revocation SLA / AV-61** (§10.1.3): 0.9.3 ratifies the transit-not-rest
+  model — a subject-side revocation may transit local-tier but MUST NOT rest as a
+  durable local row; the substrate emits `hard_case:consent_revocation_promotion_overdue`
+  past the (default 24h) window. Closed the memory-backend `list_consent_revocations`
+  gap (was an erroring default → now scans subject-side revocations, matching
+  sqlite/postgres — no asymmetry) and rewrote the stale AV-61 comment.
+
+### Added — #359: §Q pin-never-defeats-revocation invariant, proven (CC 6.1.5.2 §Q B6 / N5)
+
+The spec mandates the invariant (revocation descends **regardless of pin state**),
+not a stored-pin override. persist verifies §Q shapes at ingest and stores no pin
+state, so `evict_fountain_content_hard_delete` (no pin parameter, no pin column,
+identical on both backends) can't consult a pin — the invariant holds by
+construction. Locked with a both-backend test: a verified `StorageBudgetV1` pinning
+`"trace"` does not prevent hard-delete of trace content. Also confirmed: the
+Constitution does **not** pin a dominance `min_ratio`, so persist's `0.5` stands.
+
+Verify pin unchanged (v8.7.0). Full suite green: **1306 pg+sqlite / 0 failed**.
+
 ## [12.4.0] — 2026-07-04
 
 ### Added — #356: StorageBudgetV1 / CorpusWantV1 build+verify on the wheel (CC 6.1.5.2 §Q)
