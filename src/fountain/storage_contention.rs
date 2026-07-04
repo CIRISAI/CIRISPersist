@@ -15,7 +15,7 @@
 //! `StorageBudgetV1` gained a pin-INSTALL surface in #370 (v12.7.0):
 //! [`Engine::install_storage_budget_v1`](crate::Engine::install_storage_budget_v1)
 //! verifies the bound-hybrid signature (PQC-mandatory — verify at the gate,
-//! BEFORE persistence) and upserts an [`InstalledStorageBudget`] row (V092,
+//! BEFORE persistence) and upserts an [`InstalledStorageBudget`] row (V093,
 //! both backends) under the §Q B3 anti-rollback rule (a lower/equal
 //! `revision` from the same `node_id` is refused). The installed budget is
 //! what makes §Q B5 real: the disk-pressure eviction sweep

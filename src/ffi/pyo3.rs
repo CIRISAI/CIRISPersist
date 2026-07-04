@@ -3941,7 +3941,6 @@ impl PyEngine {
         })
     }
 
-
     /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
     /// founding bootstrap server**? Returns `True` iff its `federation_keys`
     /// row's `identity_type` set contains `canonical`. Because the substrate
@@ -3973,7 +3972,6 @@ impl PyEngine {
             .map_err(federation_err_to_py)
         })
     }
-
 
     /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
     /// founding bootstrap servers** as a JSON array of `KeyRecord`s

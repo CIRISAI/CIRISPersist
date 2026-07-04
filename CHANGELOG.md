@@ -5,6 +5,60 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.0.0] — 2026-07-04 — CC 1.0 RC1 compliance cut
+
+Nine conformance issues, read against the standalone **CIRISConstitution v0.9.3**,
+landed as one major cut. This closes the remaining CC 1.0 RC1 substrate gaps.
+
+### ⚠ BREAKING (Rust-crate consumers only — wire/JSON stable)
+- **`KeyRecord` gained `consent_role: Option<String>`** (#365). Any Rust code that
+  constructs a `KeyRecord { .. }` literal must add `consent_role: None` (or a role).
+  `#[serde(default)]` — deserialization of pre-13 JSON is unchanged. **CIRISEdge
+  constructs `KeyRecord` literals and MUST update** (see the adoption issue).
+- **`check_local_tier_eligibility` now returns `Result<LocalTierDisposition, Error>`**
+  (`Durable | TransitRevocation`) and **`check_consent_record_admission`** returns the
+  same disposition (#171). `LocalAttestationInput` gained optional
+  `scrub_signature_classical` / `scrub_signature_pqc` fields (`#[serde(default)]`).
+- **`federation::Error` gained variants** (`CommunityHasNoModerator`,
+  `CanonicalRoleNotAccordConferred`, `AgeAssuranceSelfEmissionRejected`) and
+  `StorageContentionError::RevisionRollback`; `EvictionCandidate` gained `media_type`.
+  Exhaustive matchers must add arms.
+- **Reserved-prefix admission is now SET-membership** on `identity_type`, not scalar
+  equality (#366) — required by CC 3.4.7.1. Behavior-preserving for single-role keys;
+  newly ADMITS conformant folded multi-role keys (e.g. `{agent, lenscore_detector}`).
+
+verify pin **unchanged (v8.7.0)**; `Requires-Dist: ciris-verify>=8.0.0,<9` unchanged.
+
+### Added / Fixed
+- **#171** (CC 5.3.2.2 / §10.1.3) — crypto-gated **transit-write acceptance**: a
+  subject-side revocation (`consent:state:revoked` / subject `withdraws`) is accepted
+  as a non-durable transit local-tier row **iff its bound-hybrid signature verifies**,
+  making the `hard_case:consent_revocation_promotion_overdue` SLA fire end-to-end.
+  Also closed a `put_attestation` local-tier signature bypass.
+- **#227** (CC 4.4.3.5.1/5.6) — fountain **consent-decay eviction** (`sweep_consent_decay_once`):
+  disk-independent 14-day/90-day decay clock reusing the eviction mechanism.
+- **#365** (CC 3.4.7.2) — **`consent_role`** on the wire (Counter-RII): field + resolver
+  + `set_consent_role` (OQ-1 overwrite) + `consent_role_json`; hash-excluded.
+- **#366** (CC 3.4.8) — **`detection:*` admission gate** (`lenscore_detector`-only) + the
+  set-membership fix above; `truth_grounding:detection:*` cross-attestations stay ungated.
+- **#367 + #368** (CC 3.4.11–13 / 3.2) — **witness-targets-subject age_assurance** (a
+  witness graduates ANOTHER subject's I1 band via `attested_key_id`), which makes the CC
+  3.2 minor-guardianship admit drivable end-to-end; self-graduation rejected.
+- **#369** (CC 4.5.4 / §11.11) — **broadened no-moderator federate-apply gate keying** to
+  every substrate community-reference shape + `check_no_moderator_federate_json` probe.
+- **#370** (CC 6.1.5.2 §Q B2/B3/B5) — **pin-install surface** (`install_storage_budget_v1`,
+  V093 table, atomic anti-rollback) + B5 cache-before-pinned capacity-eviction ordering;
+  B6 hard-delete stays pin-blind (revocation still wins — the #359 test holds).
+- **#371** — **`apply_replicated_key_record`** (`owner_of`-gated upgrade-aware Key-plane
+  apply): an anchor-scrubbed record can auto-upgrade a stale self-signed row over
+  replication; monotonic, fail-closed on ambiguous owner.
+- **#372** (CC 3.4.7.1) — accord-conferred **`canonical`** identity_type role: admitted
+  only on an anchor-scrub-signed record, else `canonical_role_not_accord_conferred`
+  (fail-closed, monotonic across all write paths) + `is_canonical`/`list_canonical_servers`.
+
+Migrations V092 (`consent_role` index) + V093 (`storage_budget_installed`). Full suite
+green: **1355 pg+sqlite lib + integration + wheel + FFI smoke, 0 failed** (clean DB).
+
 ## [12.6.0] — 2026-07-04 — single-owner node invariant (CIRISConstitution#23)
 
 The `self` cohort boundary (CC 1.13.3.3 / CC 3.2) is defined by a node's owner,
