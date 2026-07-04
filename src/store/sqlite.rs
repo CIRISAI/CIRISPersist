@@ -1319,6 +1319,48 @@ impl Backend for SqliteBackend {
             .collect()
     }
 
+    // #227 (residual) — consent-decay clock enumerator (disk-independent).
+    async fn list_fountain_decay_candidates(
+        &self,
+    ) -> Result<Vec<crate::fountain::FountainDecayCandidate>, Error> {
+        let conn = self.conn.clone();
+        (move || -> Result<Vec<crate::fountain::FountainDecayCandidate>, Error> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT content_id, corpus_kind, envelope, admitted_at \
+                     FROM content_manifest",
+                )
+                .map_err(|e| Error::Backend(format!("list_fountain_decay_candidates: {e}")))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let content_id: String = row.get(0)?;
+                    let corpus_kind: String = row.get(1)?;
+                    let envelope_text: String = row.get(2)?;
+                    let admitted_at_text: String = row.get(3)?;
+                    Ok((content_id, corpus_kind, envelope_text, admitted_at_text))
+                })
+                .map_err(|e| Error::Backend(format!("list_fountain_decay_candidates: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Error::Backend(format!("list_fountain_decay_candidates: {e}")))?;
+            let mut out = Vec::with_capacity(rows.len());
+            for (content_id, corpus_kind, envelope_text, admitted_at_text) in rows {
+                let envelope: serde_json::Value = serde_json::from_str(&envelope_text)
+                    .map_err(|e| Error::Backend(format!("decay candidate envelope: {e}")))?;
+                let admitted_at = chrono::DateTime::parse_from_rfc3339(&admitted_at_text)
+                    .map_err(|e| Error::Backend(format!("decay candidate admitted_at: {e}")))?
+                    .with_timezone(&chrono::Utc);
+                out.push(crate::fountain::FountainDecayCandidate {
+                    content_id,
+                    corpus_kind,
+                    envelope,
+                    admitted_at,
+                });
+            }
+            Ok(out)
+        })()
+    }
+
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
 
     async fn put_aggregated_tier(

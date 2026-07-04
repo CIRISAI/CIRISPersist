@@ -471,6 +471,19 @@ pub trait Backend: Send + Sync {
     ) -> impl Future<
         Output = Result<Vec<crate::fountain::storage_contention::InstalledStorageBudget>, Error>,
     > + Send;
+    /// #227 (residual) — enumerate EVERY fountain content unit's decay
+    /// coordinates for the consent-decay clock: `(content_id, corpus_kind,
+    /// envelope, admitted_at)`. The signed `envelope` carries the decay
+    /// class ([`crate::fountain::consent_decay_class_from_envelope`]) and
+    /// `admitted_at` is the decay reference instant. No symbol bytes are
+    /// read; the sweep asks
+    /// [`consent_decay_target_tier`](crate::fountain::consent_decay_target_tier)
+    /// for a target tier and reuses the shared eviction mechanism
+    /// ([`Self::evict_fountain_content_to_tier`]). Unordered; empty when
+    /// nothing is stored. Disk-INDEPENDENT (never consults free bytes).
+    fn list_fountain_decay_candidates(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::fountain::FountainDecayCandidate>, Error>> + Send;
 
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
     //

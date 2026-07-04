@@ -1765,6 +1765,31 @@ impl Backend for PostgresBackend {
             .collect()
     }
 
+    // #227 (residual) — consent-decay clock enumerator (disk-independent).
+    async fn list_fountain_decay_candidates(
+        &self,
+    ) -> Result<Vec<crate::fountain::FountainDecayCandidate>, Error> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT content_id, corpus_kind, envelope, admitted_at \
+                 FROM cirislens.content_manifest",
+                &[],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("list_fountain_decay_candidates: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(crate::fountain::FountainDecayCandidate {
+                content_id: r.safe_get_with("content_id", Error::Backend)?,
+                corpus_kind: r.safe_get_with("corpus_kind", Error::Backend)?,
+                envelope: r.safe_get_with("envelope", Error::Backend)?,
+                admitted_at: r.safe_get_with("admitted_at", Error::Backend)?,
+            });
+        }
+        Ok(out)
+    }
+
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
 
     async fn put_aggregated_tier(

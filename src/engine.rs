@@ -1489,6 +1489,66 @@ impl Engine {
         }
     }
 
+    /// #227 (residual) — the **consent-decay sweep**: the time-driven twin
+    /// of the disk-pressure sweeper
+    /// ([`sweep_evictions_once`](Self::sweep_evictions_once)). Enumerate
+    /// EVERY fountain content unit
+    /// ([`list_fountain_decay_candidates`](crate::store::Backend::list_fountain_decay_candidates)),
+    /// read each unit's consent-decay class from its signed envelope, map
+    /// `now - admitted_at` through the per-class decay schedule
+    /// ([`consent_decay_target_tier`](crate::fountain::consent_decay_target_tier)
+    /// — TEMPORARY 14-day, pattern 90-day), and drive any unit whose clock
+    /// says it should be below its current tier down via the SAME eviction
+    /// mechanism the disk-pressure trigger uses
+    /// ([`evict_fountain_content_to_tier`](Self::evict_fountain_content_to_tier)).
+    ///
+    /// **Disk-INDEPENDENT** — fires regardless of free bytes (no watermark,
+    /// no `ReplicationConfig` gate). **Idempotent** — the eviction
+    /// mechanism only removes symbols down to a keep-count and is a no-op
+    /// once a unit is already at/below its decay tier, so re-running the
+    /// sweep at the same `now` evicts nothing further. Units that declare
+    /// no decay class in their envelope are left untouched (fail-safe).
+    ///
+    /// `now` is threaded for deterministic testing; the FFI wrapper passes
+    /// wall-clock `Utc::now()`. Manifests are NEVER touched (the
+    /// always-retained provenance).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn sweep_consent_decay_once(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::fountain::ConsentDecaySweepReport, crate::store::Error> {
+        use crate::store::Backend;
+        let candidates = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.list_fountain_decay_candidates().await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.list_fountain_decay_candidates().await?,
+        };
+        let mut report = crate::fountain::ConsentDecaySweepReport::default();
+        for c in candidates {
+            report.content_scanned += 1;
+            let Some(tier) =
+                crate::fountain::consent_decay_target_tier(&c.envelope, c.admitted_at, now)
+            else {
+                // No declared decay class ⇒ the time-clock opts out.
+                continue;
+            };
+            report.content_with_decay_class += 1;
+            if tier == crate::fountain::FountainTier::Full {
+                // Clock hasn't reached the first breakpoint yet.
+                continue;
+            }
+            let evicted = self
+                .evict_fountain_content_to_tier(&c.content_id, &c.corpus_kind, tier)
+                .await?;
+            report.symbols_evicted += evicted;
+            if evicted > 0 {
+                report.content_decayed += 1;
+            }
+        }
+        Ok(report)
+    }
+
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
 
     /// v8.3.0 (CEG 1.0-RC12 §19.7 / CIRISPersist#230) — admit an aggregate

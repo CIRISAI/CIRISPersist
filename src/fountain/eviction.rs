@@ -10,12 +10,11 @@
 //!      a [`FountainTier`] via [`FountainTier::from_pressure`].
 //!   2. **Consent decay** — the Consensual-Evolution clock (TEMPORARY
 //!      14-day, 90-day pattern decay) drives the tier down on a consent
-//!      schedule independent of disk. **NOTE (follow-on):** this cut
-//!      exposes the eviction MECHANISM as a callable
-//!      ([`crate::store::Backend::evict_fountain_content_to_tier`]); the
-//!      FULL Consensual-Evolution stream scheduling integration (per-
-//!      content_id consent clock → tier) is an explicit documented
-//!      follow-on and is intentionally NOT built here.
+//!      schedule independent of disk. The per-`content_id` consent clock →
+//!      tier mapping lives in [`crate::fountain::decay`] and is driven by
+//!      [`crate::Engine::sweep_consent_decay_once`]; it REUSES the same
+//!      eviction MECHANISM this module's tier×keep-count policy backs
+//!      ([`crate::store::Backend::evict_fountain_content_to_tier`]).
 //!
 //! **Revocation overrides rarity (CEG 1.0-RC11 §19 / CIRISPersist#228
 //! N5).** A withdrawn / `consent:state:revoked` content_id is HardDelete

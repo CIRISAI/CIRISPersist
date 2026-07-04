@@ -2021,6 +2021,37 @@ impl PyEngine {
         })
     }
 
+    /// #227 (residual) — drive one **consent-decay** sweep synchronously
+    /// (the time-driven twin of [`Self::sweep_evictions_once`]). Ages every
+    /// fountain content unit against its consent-decay schedule (TEMPORARY
+    /// 14-day, pattern 90-day) and evicts symbols down to the clock's
+    /// target tier via the SAME eviction mechanism disk-pressure uses.
+    /// Returns the number of symbol rows evicted this pass. Disk-independent
+    /// (no watermark) and idempotent (re-running evicts nothing further).
+    /// Sovereign callers (Pi-cron / k8s CronJob) drive this on their own
+    /// cadence.
+    fn sweep_consent_decay_once(&self, py: Python<'_>) -> PyResult<i64> {
+        self.ensure_usable()?;
+        let runtime = self.runtime.clone();
+        let slot = engine_slot();
+        let cell = slot
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
+        let engine = crate::Engine::from_shared_with_local(
+            cell.engine_backend_dispatch(),
+            cell.signer.clone(),
+            cell.local_signer.clone(),
+        );
+        drop(slot);
+        py.detach(move || {
+            let now = chrono::Utc::now();
+            runtime
+                .block_on(async move { engine.sweep_consent_decay_once(now).await })
+                .map(|report| report.symbols_evicted as i64)
+                .map_err(fountain_store_err_to_py)
+        })
+    }
+
     /// v6.8.0 (CIRISPersist#148) — current total local
     /// `federation_blobs` bytes (the cache usage). For ops monitoring.
     fn cache_usage_bytes(&self, py: Python<'_>) -> PyResult<u64> {

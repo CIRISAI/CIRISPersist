@@ -604,6 +604,363 @@ async fn postgres_fountain_content() {
     run_fountain_assertions(&backend, &suffix).await;
 }
 
+// ───────────────────────────────────────────────────────────────────
+// #227 (residual) — consent-decay clock, proven on BOTH durable backends.
+// ───────────────────────────────────────────────────────────────────
+
+/// Build + hybrid-sign a manifest whose signed envelope carries an extra
+/// object (e.g. the consent-decay class) merged over the producer pubkeys.
+async fn build_manifest_with_envelope(
+    content_id: &str,
+    n_source: u32,
+    k_repair: u32,
+    symbol_size: u32,
+    extra: serde_json::Value,
+) -> (FountainManifestV1, Vec<FountainSymbolV1>) {
+    let (ed_sk, ed_pk_b64, mldsa) = producer_pubkeys();
+    let (symbols, symbol_hashes) = synth_symbols(content_id, n_source, k_repair, symbol_size);
+    let pqc_pk = mldsa.public_key().await.unwrap();
+
+    let mut envelope = serde_json::json!({
+        "content_id": content_id,
+        "pubkey_ed25519": ed_pk_b64,
+        "pubkey_ml_dsa_65": BASE64.encode(&pqc_pk),
+    });
+    if let (Some(base), Some(add)) = (envelope.as_object_mut(), extra.as_object()) {
+        for (k, v) in add {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+
+    let mut manifest = FountainManifestV1 {
+        content_id: content_id.to_owned(),
+        corpus_kind: "trace".to_owned(),
+        manifest_version: MANIFEST_VERSION_V1,
+        n_source,
+        k_repair,
+        symbol_size,
+        original_content_length: u64::from(n_source) * u64::from(symbol_size) - 3,
+        min_viable_symbols: 2,
+        symbol_hashes,
+        envelope,
+        signature: String::new(),
+        signature_ml_dsa_65: String::new(),
+        pqc_key_id: "fountain-mldsa".to_owned(),
+    };
+    let canonical = manifest
+        .canonical_bytes(&PythonJsonDumpsCanonicalizer)
+        .unwrap();
+    let ed_sig = ed_sk.sign(&canonical).to_bytes();
+    manifest.signature = BASE64.encode(ed_sig);
+    let mut bound = Vec::with_capacity(canonical.len() + ed_sig.len());
+    bound.extend_from_slice(&canonical);
+    bound.extend_from_slice(&ed_sig);
+    let pqc_sig = mldsa.sign(&bound).await.unwrap();
+    manifest.signature_ml_dsa_65 = BASE64.encode(&pqc_sig);
+    (manifest, symbols)
+}
+
+/// Shared body: the consent-decay clock decisions the
+/// `sweep_consent_decay_once` loop makes, per candidate, exercised on a
+/// migrated backend and scoped to `suffix`ed content_ids (so it is
+/// self-isolating on the shared PG twin). Mirrors the Engine sweep:
+/// enumerate → read decay class + admitted_at → `consent_decay_target_tier`
+/// → reuse `evict_fountain_content_to_tier`.
+async fn run_consent_decay_assertions<B: Backend>(backend: &B, suffix: &str) {
+    use ciris_persist::fountain::{consent_decay_target_tier, FountainReadClass};
+    let (n, k, size) = (8u32, 4u32, 16u32);
+    let total = u64::from(n + k);
+
+    let cid_temp = format!("c-decay-temp-{suffix}");
+    let cid_pat = format!("c-decay-pat-{suffix}");
+    let cid_none = format!("c-decay-none-{suffix}");
+
+    let (m_temp, s_temp) = build_manifest_with_envelope(
+        &cid_temp,
+        n,
+        k,
+        size,
+        serde_json::json!({ "consent_decay_class": "temporary" }),
+    )
+    .await;
+    let (m_pat, s_pat) = build_manifest_with_envelope(
+        &cid_pat,
+        n,
+        k,
+        size,
+        serde_json::json!({ "decay_protocol": "ciris-agent-90day" }),
+    )
+    .await;
+    // No decay class declared ⇒ the clock never touches it (fail-safe).
+    let (m_none, s_none) =
+        build_manifest_with_envelope(&cid_none, n, k, size, serde_json::json!({})).await;
+
+    for (m, s) in [(&m_temp, &s_temp), (&m_pat, &s_pat), (&m_none, &s_none)] {
+        backend.put_fountain_content(m, s).await.expect("admit");
+    }
+
+    // The enumerate method returns our three units with their admitted_at
+    // + the signed decay-class envelope (both backends, identical shape).
+    let candidates = backend
+        .list_fountain_decay_candidates()
+        .await
+        .expect("enumerate decay candidates");
+    let mine: std::collections::HashMap<String, _> = candidates
+        .into_iter()
+        .filter(|c| c.content_id.ends_with(suffix))
+        .map(|c| (c.content_id.clone(), c))
+        .collect();
+    assert!(mine.contains_key(&cid_temp), "temp enumerated");
+    assert!(mine.contains_key(&cid_pat), "pattern enumerated");
+    assert!(mine.contains_key(&cid_none), "unclassed enumerated");
+    // The unclassed unit resolves to no target tier ⇒ never decayed.
+    let none_cand = &mine[&cid_none];
+    assert_eq!(
+        consent_decay_target_tier(
+            &none_cand.envelope,
+            none_cand.admitted_at,
+            none_cand.admitted_at + chrono::Duration::days(365)
+        ),
+        None,
+        "no decay class ⇒ clock opts out"
+    );
+
+    let temp_admitted = mine[&cid_temp].admitted_at;
+    let pat_admitted = mine[&cid_pat].admitted_at;
+    let temp_env = mine[&cid_temp].envelope.clone();
+    let pat_env = mine[&cid_pat].envelope.clone();
+
+    // A single per-candidate step, exactly as the sweep does it: resolve
+    // the target tier at `now`; evict via the shared mechanism unless the
+    // clock is still at `Full`. Returns symbols evicted this step.
+    async fn decay_step<B: Backend>(
+        backend: &B,
+        cid: &str,
+        env: &serde_json::Value,
+        admitted: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> u64 {
+        match consent_decay_target_tier(env, admitted, now) {
+            None => 0,
+            Some(FountainTier::Full) => 0,
+            Some(tier) => backend
+                .evict_fountain_content_to_tier(cid, "trace", tier)
+                .await
+                .expect("evict to decay tier"),
+        }
+    }
+    async fn read_class<B: Backend>(backend: &B, cid: &str, n: u32) -> FountainReadClass {
+        FountainContent::classify(
+            backend
+                .get_fountain_content(cid, "trace")
+                .await
+                .unwrap()
+                .unwrap()
+                .present(),
+            n,
+            2,
+        )
+    }
+
+    // (1) BELOW THRESHOLD stays: at +1d neither the 14d nor the 90d clock
+    //     has reached its first breakpoint ⇒ nothing evicted, both Full.
+    let now1 = temp_admitted + chrono::Duration::days(1);
+    assert_eq!(
+        decay_step(backend, &cid_temp, &temp_env, temp_admitted, now1).await,
+        0
+    );
+    assert_eq!(
+        decay_step(backend, &cid_pat, &pat_env, pat_admitted, now1).await,
+        0
+    );
+    assert_eq!(
+        read_class(backend, &cid_temp, n).await,
+        FountainReadClass::Full
+    );
+    assert_eq!(
+        read_class(backend, &cid_pat, n).await,
+        FountainReadClass::Full
+    );
+
+    // (2) TEMPORARY past 14d decays: at +20d the 14d clock is >= 1.0 ⇒ T5
+    //     (EnvelopeOnly). The 90d pattern at +20d is still < 0.25 ⇒ Full
+    //     (pattern-below-threshold stays).
+    let now2 = temp_admitted + chrono::Duration::days(20);
+    let temp_evicted = decay_step(backend, &cid_temp, &temp_env, temp_admitted, now2).await;
+    assert_eq!(
+        temp_evicted, total,
+        "TEMPORARY past 14d evicts every symbol (T5)"
+    );
+    assert_eq!(
+        decay_step(backend, &cid_pat, &pat_env, pat_admitted, now2).await,
+        0
+    );
+    assert_eq!(
+        read_class(backend, &cid_temp, n).await,
+        FountainReadClass::EnvelopeOnly,
+        "TEMPORARY decayed to EnvelopeOnly"
+    );
+    assert_eq!(
+        read_class(backend, &cid_pat, n).await,
+        FountainReadClass::Full
+    );
+
+    // (3) IDEMPOTENT: re-running the temporary step at the same `now`
+    //     evicts nothing further (already at/below the keep-count).
+    assert_eq!(
+        decay_step(backend, &cid_temp, &temp_env, temp_admitted, now2).await,
+        0,
+        "decay is idempotent at a fixed now"
+    );
+
+    // (4) PATTERN past 90d decays: at +100d the 90d clock is >= 1.0 ⇒ T5.
+    let now3 = pat_admitted + chrono::Duration::days(100);
+    let pat_evicted = decay_step(backend, &cid_pat, &pat_env, pat_admitted, now3).await;
+    assert_eq!(
+        pat_evicted, total,
+        "pattern past 90d evicts every symbol (T5)"
+    );
+    assert_eq!(
+        read_class(backend, &cid_pat, n).await,
+        FountainReadClass::EnvelopeOnly,
+        "pattern decayed to EnvelopeOnly"
+    );
+    // Idempotent again.
+    assert_eq!(
+        decay_step(backend, &cid_pat, &pat_env, pat_admitted, now3).await,
+        0
+    );
+
+    // The unclassed unit was NEVER touched by any step ⇒ still Full.
+    assert_eq!(
+        read_class(backend, &cid_none, n).await,
+        FountainReadClass::Full
+    );
+    let _ = s_none;
+}
+
+#[tokio::test]
+async fn sqlite_consent_decay() {
+    let backend = ciris_persist::store::SqliteBackend::open_in_memory()
+        .await
+        .expect("open sqlite");
+    backend
+        .run_migrations()
+        .await
+        .expect("sqlite migrations (incl. V084)");
+    run_consent_decay_assertions(&backend, "sqlite").await;
+}
+
+#[tokio::test]
+async fn postgres_consent_decay() {
+    let Some(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok() else {
+        eprintln!("postgres_consent_decay skipped: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+    let backend = ciris_persist::store::PostgresBackend::connect(&dsn)
+        .await
+        .expect("connect postgres");
+    backend
+        .run_migrations()
+        .await
+        .expect("pg migrations (incl. V084)");
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    run_consent_decay_assertions(&backend, &suffix).await;
+}
+
+/// The full `Engine::sweep_consent_decay_once` entry, end-to-end on an
+/// isolated in-memory SQLite engine (the sweep enumerates ALL manifests,
+/// so it is proven on the isolated backend; the per-candidate decisions +
+/// pg/sqlite parity are covered by `{sqlite,postgres}_consent_decay`).
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn engine_sweep_consent_decay_once_sqlite() {
+    use ciris_persist::fountain::FountainReadClass;
+    use ciris_persist::signing::LocalSigner;
+    use std::sync::Arc;
+
+    // A minimal plaintext signer — the engine signer plays no part in
+    // fountain admission (the manifest is producer-signed) or in the decay
+    // sweep (which emits nothing).
+    let signer = Arc::new(LocalSigner::from_parts(
+        SigningKey::from_bytes(&[0x5Au8; 32]),
+        "decay-test-engine".to_string(),
+        None,
+        None,
+    ));
+    let engine = ciris_persist::Engine::with_signer(signer, "sqlite::memory:")
+        .await
+        .expect("engine");
+
+    let (n, k, size) = (8u32, 4u32, 16u32);
+    let (m_temp, s_temp) = build_manifest_with_envelope(
+        "c-eng-temp",
+        n,
+        k,
+        size,
+        serde_json::json!({ "consent_decay_class": "temporary" }),
+    )
+    .await;
+    let (m_none, s_none) =
+        build_manifest_with_envelope("c-eng-none", n, k, size, serde_json::json!({})).await;
+    let t0 = chrono::Utc::now();
+    engine
+        .put_fountain_content(&m_temp, &s_temp)
+        .await
+        .expect("put temp");
+    engine
+        .put_fountain_content(&m_none, &s_none)
+        .await
+        .expect("put none");
+
+    // Below threshold: +1d ⇒ nothing decays.
+    let r = engine
+        .sweep_consent_decay_once(t0 + chrono::Duration::days(1))
+        .await
+        .expect("sweep +1d");
+    assert_eq!(r.symbols_evicted, 0, "below-threshold sweep evicts nothing");
+    assert_eq!(
+        r.content_with_decay_class, 1,
+        "only the temporary unit has a class"
+    );
+
+    // Past 14d: +20d ⇒ the temporary unit decays to EnvelopeOnly.
+    let r = engine
+        .sweep_consent_decay_once(t0 + chrono::Duration::days(20))
+        .await
+        .expect("sweep +20d");
+    assert_eq!(
+        r.symbols_evicted,
+        u64::from(n + k),
+        "TEMPORARY drops all symbols"
+    );
+    assert_eq!(r.content_decayed, 1);
+    let temp = engine
+        .get_fountain_content("c-eng-temp", "trace")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        FountainContent::classify(temp.present(), n, 2),
+        FountainReadClass::EnvelopeOnly
+    );
+
+    // Idempotent: an identical re-sweep evicts nothing further.
+    let r = engine
+        .sweep_consent_decay_once(t0 + chrono::Duration::days(20))
+        .await
+        .expect("sweep +20d again");
+    assert_eq!(r.symbols_evicted, 0, "decay sweep is idempotent");
+
+    // The unclassed unit is untouched (still Full).
+    let none = engine
+        .get_fountain_content("c-eng-none", "trace")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(none.present(), n + k, "unclassed unit never decays");
+}
+
 /// (h) DiskPressure tier → keep-count mapping (unit test, no backend).
 #[tokio::test]
 async fn disk_pressure_tier_maps_to_keep_count() {

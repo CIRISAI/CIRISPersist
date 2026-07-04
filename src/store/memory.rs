@@ -161,6 +161,11 @@ struct State {
     /// strictly-higher revision (§Q B3 anti-rollback).
     installed_storage_budgets:
         HashMap<String, crate::fountain::storage_contention::InstalledStorageBudget>,
+    /// #227 (residual) — the admission wall-clock per `(content_id,
+    /// corpus_kind)`, the decay reference instant for the consent-decay
+    /// clock. Parity with the pg/sqlite `content_manifest.admitted_at`
+    /// column (which memory's `FountainHeldMeta` view stubs to empty).
+    fountain_admitted_at: HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
     /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228) — WholenessWitness
     /// corpus, keyed by `peer_id`, inner vec the last-K verified witnesses
     /// (newest last). Parity with the postgres/sqlite
@@ -242,6 +247,7 @@ impl Default for MemoryBackend {
                 fountain_manifests: HashMap::new(),
                 fountain_symbols: HashMap::new(),
                 installed_storage_budgets: HashMap::new(),
+                fountain_admitted_at: HashMap::new(),
                 wholeness_witnesses: HashMap::new(),
                 content_aggregations: HashMap::new(),
                 federation_scope_blobs: HashMap::new(),
@@ -932,8 +938,14 @@ impl Backend for MemoryBackend {
         // manifest, mirroring ON CONFLICT DO NOTHING).
         state
             .fountain_manifests
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| manifest.clone());
+        // Record the admission instant once (the consent-decay clock's
+        // reference); idempotent re-admit keeps the first.
+        state
+            .fountain_admitted_at
+            .entry(key)
+            .or_insert_with(chrono::Utc::now);
         // Symbols: upsert by symbol_id (idempotent).
         let bucket = state
             .fountain_symbols
@@ -1109,6 +1121,31 @@ impl Backend for MemoryBackend {
         Ok(out)
     }
 
+    // #227 (residual) — consent-decay clock enumerator (disk-independent).
+    async fn list_fountain_decay_candidates(
+        &self,
+    ) -> Result<Vec<crate::fountain::FountainDecayCandidate>, Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let out = state
+            .fountain_manifests
+            .iter()
+            .map(|((content_id, corpus_kind), m)| {
+                let admitted_at = state
+                    .fountain_admitted_at
+                    .get(&(content_id.clone(), corpus_kind.clone()))
+                    .copied()
+                    .unwrap_or_else(chrono::Utc::now);
+                crate::fountain::FountainDecayCandidate {
+                    content_id: content_id.clone(),
+                    corpus_kind: corpus_kind.clone(),
+                    envelope: m.envelope.clone(),
+                    admitted_at,
+                }
+            })
+            .collect();
+        Ok(out)
+    }
+
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
 
     async fn put_aggregated_tier(
@@ -1137,8 +1174,12 @@ impl Backend for MemoryBackend {
         let key = (manifest.content_id.clone(), manifest.corpus_kind.clone());
         state
             .fountain_manifests
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| manifest.clone());
+        state
+            .fountain_admitted_at
+            .entry(key)
+            .or_insert_with(chrono::Utc::now);
         let bucket = state
             .fountain_symbols
             .entry(manifest.content_id.clone())
