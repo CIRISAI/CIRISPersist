@@ -20827,7 +20827,20 @@ mod tests {
         backend.run_migrations().await.unwrap();
         backend
             .put_public_key(SignedKeyRecord {
-                record: fed_key("registry-steward", "registry", "registry-steward"),
+                // CC 3.4.8 (CIRISPersist#366) — detector-only prefix. Exercise
+                // the SET-membership gate with a folded `{agent,
+                // lenscore_detector}` LensCore-fold key: `lenscore_detector ∈
+                // set` admits, the cohabiting `agent` role neither grants nor
+                // blocks (CC 3.4.8 worked example).
+                record: fed_key_with_identity_type(
+                    "registry-steward",
+                    "registry",
+                    "registry-steward",
+                    &crate::federation::types::identity_type::join_set([
+                        crate::federation::types::identity_type::AGENT,
+                        crate::federation::types::identity_type::LENSCORE_DETECTOR,
+                    ]),
+                ),
             })
             .await
             .unwrap();
@@ -20843,6 +20856,96 @@ mod tests {
             "k-a",
             "registry-steward",
             "detection:correlated_action:rights_asymmetry:v1",
+        );
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_rejects_detection_from_non_detector() {
+        // CC 3.4.8 (CIRISPersist#366) — a plain `agent` key (no
+        // `lenscore_detector` in its identity_type set) MUST be rejected on
+        // a `detection:correlated_action:*` primary emission.
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    "plain-agent",
+                    "registry",
+                    "plain-agent",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "plain-agent"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-nondetector-1",
+            "plain-agent",
+            "k-a",
+            "plain-agent",
+            "detection:correlated_action:rights_asymmetry:v1",
+        );
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::ReservedPrefixEmitterMismatch {
+                prefix, required, ..
+            } => {
+                assert_eq!(prefix, "detection:correlated_action:");
+                assert_eq!(
+                    required,
+                    vec![crate::federation::types::identity_type::LENSCORE_DETECTOR.to_owned()]
+                );
+            }
+            other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_admits_truth_grounding_cross_attestation() {
+        // CC 3.4.8 (CIRISPersist#366) — a non-detector peer cross-checking a
+        // detector verdict emits under the DISTINCT `truth_grounding:detection:*`
+        // prefix, which is UNGATED (does not start with `detection:`).
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    "plain-agent",
+                    "registry",
+                    "plain-agent",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "plain-agent"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-crosscheck-1",
+            "plain-agent",
+            "k-a",
+            "plain-agent",
+            "truth_grounding:detection:correlated_action:rights_asymmetry:v1",
         );
         backend
             .put_attestation(SignedAttestation { attestation: att })
@@ -25021,7 +25124,15 @@ mod tests {
         backend.run_migrations().await.unwrap();
         backend
             .put_public_key(SignedKeyRecord {
-                record: fed_key("rs", "registry", "rs"),
+                // CC 3.4.8 (CIRISPersist#366) — `detection:correlated_action:*`
+                // is a detector-only prefix; the emitter must hold
+                // `lenscore_detector`.
+                record: fed_key_with_identity_type(
+                    "rs",
+                    "registry",
+                    "rs",
+                    crate::federation::types::identity_type::LENSCORE_DETECTOR,
+                ),
             })
             .await
             .unwrap();
@@ -25123,7 +25234,16 @@ mod tests {
         backend.run_migrations().await.unwrap();
         backend
             .put_public_key(SignedKeyRecord {
-                record: fed_key("rs", "registry", "rs"),
+                // CC 3.4.8 (CIRISPersist#366) — detector-only prefix; the
+                // detection emitter must hold `lenscore_detector`. ("rs" also
+                // signs the schema blob below; put_blob does not gate
+                // identity_type, so this is inert for the blob path.)
+                record: fed_key_with_identity_type(
+                    "rs",
+                    "registry",
+                    "rs",
+                    crate::federation::types::identity_type::LENSCORE_DETECTOR,
+                ),
             })
             .await
             .unwrap();
@@ -25211,7 +25331,16 @@ mod tests {
         backend.run_migrations().await.unwrap();
         backend
             .put_public_key(SignedKeyRecord {
-                record: fed_key("rs", "registry", "rs"),
+                // CC 3.4.8 (CIRISPersist#366) — detector-only prefix; the
+                // detection emitter must hold `lenscore_detector` so the row
+                // reaches the schema validator (and gets rejected there for
+                // the missing envelope field, not at the emitter gate).
+                record: fed_key_with_identity_type(
+                    "rs",
+                    "registry",
+                    "rs",
+                    crate::federation::types::identity_type::LENSCORE_DETECTOR,
+                ),
             })
             .await
             .unwrap();

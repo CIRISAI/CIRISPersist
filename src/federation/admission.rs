@@ -355,18 +355,23 @@ impl Default for DimensionAdmissionPolicy {
 /// - `licensure:*` (CEG §7.3) is co-owned — the admission gate
 ///   doesn't reject single-source emissions; per §7.3, consumers
 ///   mark them `confidence ≤ 0.5` until the second co-owner attests.
-/// - `detection:correlated_action:*` / `detection:distributive:*`
-///   (CEG §7.4) are LensCore-only emission but the substrate accepts
-///   cross-attestations under a different prefix per §7.4's last
-///   sentence; mapping this to a substrate-admission rule requires
-///   knowing whether the row is a primary detection-emission vs a
-///   cross-attestation, which lives in the envelope shape. Deferred
-///   to consumer-side check pending CEG-side rule clarification.
+/// - `detection:correlated_action:*` / `detection:distributive:access:*`
+///   (CC 3.4.8) ARE gated here (v12.7.0, CIRISPersist#366): they are
+///   LensCore-only emission — emitter rule `lenscore_detector ∈
+///   attesting_key.identity_type`. Per CC 3.4.8 a cross-attestation by a
+///   non-LensCore peer MUST use the DISTINCT `truth_grounding:detection:*`
+///   prefix (which does not start with `detection:` and so stays ungated),
+///   so anything landing on `detection:*` is a **primary detector
+///   emission** — gate-able with NO envelope field, resolving the earlier
+///   "which shape is this?" ambiguity. Only these two exact families are
+///   gated; a bare `detection:` prefix is NOT (CC 3.4.8 names exactly
+///   these two).
 pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
     use super::types::identity_type;
     let substrate_persist = identity_type::SUBSTRATE_PERSIST.to_owned();
     let witness = identity_type::WITNESS.to_owned();
     let trusted_publisher = identity_type::TRUSTED_PUBLISHER.to_owned();
+    let lenscore_detector = identity_type::LENSCORE_DETECTOR.to_owned();
     vec![
         ReservedPrefixRule {
             pattern_prefix: "system:".into(),
@@ -429,6 +434,24 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
         ReservedPrefixRule {
             pattern_prefix: crate::federation::capacity::CAPACITY_ASSURANCE_PREFIX.into(),
             required_identity_types: vec![witness],
+        },
+        // v12.7.0 (CIRISPersist#366, CC 3.4.8) — the detector-only
+        // prefixes. `detection:correlated_action:*` and
+        // `detection:distributive:access:*` are LensCore-only emission:
+        // emitter rule `lenscore_detector ∈ attesting_key.identity_type`.
+        // Set-membership (not scalar equality) is the load-bearing test
+        // (CC 3.4.7.1) so a folded `{agent, lenscore_detector}` key passes.
+        // A non-detector peer wishing to cross-check the detector's verdict
+        // emits under the DISTINCT `truth_grounding:detection:*` prefix
+        // (ungated — it does not start with `detection:`), so every row on
+        // these two families is a primary detector emission.
+        ReservedPrefixRule {
+            pattern_prefix: "detection:correlated_action:".into(),
+            required_identity_types: vec![lenscore_detector.clone()],
+        },
+        ReservedPrefixRule {
+            pattern_prefix: "detection:distributive:access:".into(),
+            required_identity_types: vec![lenscore_detector],
         },
     ]
 }
@@ -496,10 +519,17 @@ impl DimensionAdmissionPolicy {
         // operator owns.
         for rule in &self.reserved_prefix_rules {
             if dim.starts_with(rule.pattern_prefix.as_str()) {
+                // CC 3.4.7.1 — `identity_type` is a SET; the gate is
+                // satisfied iff a required role is a MEMBER of the
+                // attester's role-set (not scalar equality). For a
+                // single-role key `X ∈ {X}` ≡ `X == X`, so this is
+                // behavior-preserving for every legacy single-role key;
+                // it only newly-admits conformant folded keys (e.g. a
+                // `{agent, lenscore_detector}` LensCore fold — CC 3.4.8).
                 if !rule
                     .required_identity_types
                     .iter()
-                    .any(|t| t == attesting_identity_type)
+                    .any(|t| identity_type::set_contains(attesting_identity_type, t))
                 {
                     let mut required = rule.required_identity_types.clone();
                     required.sort();
@@ -4082,7 +4112,17 @@ pub async fn check_reserved_prefix_admission(
         });
     }
     if let Some(rule) = matched_rule {
-        if !rule.required_identity_types.contains(&got) {
+        // CC 3.4.7.1 — set membership, not scalar equality: `got` is the
+        // stored (possibly comma-joined) `identity_type` set; the rule is
+        // satisfied iff a required role is one of its members. Single-role
+        // keys encode identically to scalar (`X ∈ {X}` ≡ `X == X`), so this
+        // is behavior-preserving for every existing reserved prefix and
+        // only newly-admits conformant folded keys (CC 3.4.8 detector fold).
+        if !rule
+            .required_identity_types
+            .iter()
+            .any(|t| identity_type::set_contains(&got, t))
+        {
             let mut required = rule.required_identity_types.clone();
             required.sort();
             return Err(Error::ReservedPrefixEmitterMismatch {
@@ -4203,14 +4243,84 @@ mod tests {
     #[test]
     fn admission_accepts_correlated_action_rights_asymmetry_v1() {
         // The v1.2 rename target itself — mechanism-descriptive
-        // + version-pinned. Should pass.
+        // + version-pinned. As of CC 3.4.8 (CIRISPersist#366) this is a
+        // detector-only prefix, so the emitter must hold `lenscore_detector`.
         let p = default_policy();
         p.check(
             attestation_type::SCORES,
             Some("detection:correlated_action:rights_asymmetry:v1"),
-            identity_type::STEWARD,
+            identity_type::LENSCORE_DETECTOR,
         )
         .unwrap();
+    }
+
+    // ── CC 3.4.8 (CIRISPersist#366) — detector-only prefix decision table
+    //    (dimension side; `DimensionAdmissionPolicy::check`) ────────────
+
+    #[test]
+    fn detector_prefix_decision_table_dimension_side() {
+        let p = default_policy();
+        let detector_dims = [
+            "detection:correlated_action:rights_asymmetry:v1",
+            "detection:distributive:access:disparity:v1",
+        ];
+
+        // 1. A plain `lenscore_detector` key is ADMITTED.
+        for dim in detector_dims {
+            p.check(
+                attestation_type::SCORES,
+                Some(dim),
+                identity_type::LENSCORE_DETECTOR,
+            )
+            .unwrap_or_else(|e| panic!("detector must admit {dim}: {e:?}"));
+        }
+
+        // 2. A folded `{agent, lenscore_detector}` key is ADMITTED by set
+        //    membership (CC 3.4.8 LensCore-fold worked example). Encode the
+        //    set as the canonical sorted comma-joined form.
+        let folded =
+            identity_type::join_set([identity_type::AGENT, identity_type::LENSCORE_DETECTOR]);
+        for dim in detector_dims {
+            p.check(attestation_type::SCORES, Some(dim), &folded)
+                .unwrap_or_else(|e| panic!("folded detector must admit {dim}: {e:?}"));
+        }
+
+        // 3. A plain `agent`/`steward` key is REJECTED — the cohabiting
+        //    non-detector role neither grants nor blocks; only the held
+        //    `lenscore_detector` role does.
+        for role in [identity_type::AGENT, identity_type::STEWARD] {
+            for dim in detector_dims {
+                let err = p
+                    .check(attestation_type::SCORES, Some(dim), role)
+                    .unwrap_err();
+                match err {
+                    Error::ReservedPrefixEmitterMismatch {
+                        required,
+                        got_identity_type,
+                        ..
+                    } => {
+                        assert_eq!(required, vec![identity_type::LENSCORE_DETECTOR.to_owned()]);
+                        assert_eq!(got_identity_type, role);
+                    }
+                    other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
+                }
+            }
+        }
+
+        // 4. A `truth_grounding:detection:*` cross-attestation from ANY key
+        //    is ADMITTED (ungated — a DIFFERENT prefix, shadowing-free).
+        for role in [
+            identity_type::AGENT,
+            identity_type::STEWARD,
+            identity_type::LENSCORE_DETECTOR,
+        ] {
+            p.check(
+                attestation_type::SCORES,
+                Some("truth_grounding:detection:correlated_action:rights_asymmetry:v1"),
+                role,
+            )
+            .unwrap_or_else(|e| panic!("cross-attestation must be ungated for {role}: {e:?}"));
+        }
     }
 
     // ── Ask 3 exemption: structural primitives bypass the gate ─────

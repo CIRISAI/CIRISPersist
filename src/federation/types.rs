@@ -152,6 +152,20 @@ pub mod identity_type {
     /// this publishes the canonical token so producer + verifier agree
     /// byte-for-byte.
     pub const NODE: &str = "node";
+    /// v12.7.0 (CIRISPersist#366, CC 3.4.8) — the LensCore-detector role.
+    /// Only `federation_keys` rows whose `identity_type` **set** contains
+    /// this token may emit the detector-only reserved prefixes
+    /// `detection:correlated_action:*` and `detection:distributive:access:*`
+    /// (see [`super::admission::default_reserved_prefix_rules`]). Per
+    /// CC 3.4.7.1 the gate is evaluated by **set membership** — a folded
+    /// LensCore occurrence whose key holds `{agent, lenscore_detector}`
+    /// satisfies the detector gate via `lenscore_detector ∈ set` while its
+    /// cohabiting `agent` role neither grants nor blocks the detector right
+    /// (CC 3.4.8 LensCore-fold worked example). Cross-attestations by
+    /// non-detector peers MUST use the distinct `truth_grounding:detection:*`
+    /// prefix (ungated here), so anything on `detection:*` is a primary
+    /// detector emission and gate-able with no envelope field.
+    pub const LENSCORE_DETECTOR: &str = "lenscore_detector";
 
     /// v6.5.0 (CEG §7.0.1) — join an `identity_type` **set** into the
     /// single TEXT column representation: sorted, de-duplicated,

@@ -23165,10 +23165,16 @@ mod tests {
         let agent_k = format!("pg-good-agt-§102-{}", uuid_like());
         backend
             .put_public_key(crate::federation::SignedKeyRecord {
+                // CC 3.4.8 (CIRISPersist#366) — `detection:correlated_action:*`
+                // is detector-only. Exercise the SET-membership gate with a
+                // folded `{agent, lenscore_detector}` LensCore-fold key.
                 record: pg_admission_key(
                     &steward,
                     "registry",
-                    crate::federation::types::identity_type::STEWARD,
+                    &crate::federation::types::identity_type::join_set([
+                        crate::federation::types::identity_type::AGENT,
+                        crate::federation::types::identity_type::LENSCORE_DETECTOR,
+                    ]),
                 ),
             })
             .await
@@ -23194,6 +23200,114 @@ mod tests {
             .await
             .unwrap();
         let rows = backend.list_attestations_for(&agent_k).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_rejects_detection_from_non_detector() {
+        // CC 3.4.8 (CIRISPersist#366) — a plain `agent` key (no
+        // `lenscore_detector` in its identity_type set) MUST be rejected on a
+        // `detection:correlated_action:*` primary emission.
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let agent = format!("pg-nondet-agt-§366-{}", uuid_like());
+        let subj = format!("pg-nondet-sub-§366-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent,
+                    "registry",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &subj,
+                    "primitive-nondet",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let att = pg_scores_attestation(
+            &agent,
+            &subj,
+            &agent,
+            "detection:correlated_action:rights_asymmetry:v1",
+        );
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::ReservedPrefixEmitterMismatch {
+                prefix, required, ..
+            } => {
+                assert_eq!(prefix, "detection:correlated_action:");
+                assert_eq!(
+                    required,
+                    vec![crate::federation::types::identity_type::LENSCORE_DETECTOR.to_owned()]
+                );
+            }
+            other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_admits_truth_grounding_cross_attestation() {
+        // CC 3.4.8 (CIRISPersist#366) — a non-detector peer cross-checking a
+        // detector verdict emits under the DISTINCT `truth_grounding:detection:*`
+        // prefix, which is UNGATED (does not start with `detection:`).
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let agent = format!("pg-cross-agt-§366-{}", uuid_like());
+        let subj = format!("pg-cross-sub-§366-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent,
+                    "registry",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &subj,
+                    "primitive-cross",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let att = pg_scores_attestation(
+            &agent,
+            &subj,
+            &agent,
+            "truth_grounding:detection:correlated_action:rights_asymmetry:v1",
+        );
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let rows = backend.list_attestations_for(&subj).await.unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -23788,10 +23902,12 @@ mod tests {
         let agent_k = format!("pg-sch-agt-§102-{}", uuid_like());
         backend
             .put_public_key(crate::federation::SignedKeyRecord {
+                // CC 3.4.8 (CIRISPersist#366) — detector-only prefix; the
+                // detection emitter must hold `lenscore_detector`.
                 record: pg_admission_key(
                     &steward,
                     "registry",
-                    crate::federation::types::identity_type::STEWARD,
+                    crate::federation::types::identity_type::LENSCORE_DETECTOR,
                 ),
             })
             .await
@@ -23878,10 +23994,14 @@ mod tests {
         let agent_k = format!("pg-bsch-agt-§102-{}", uuid_like());
         backend
             .put_public_key(crate::federation::SignedKeyRecord {
+                // CC 3.4.8 (CIRISPersist#366) — detector-only prefix; the
+                // detection emitter must hold `lenscore_detector` so the row
+                // reaches the schema validator (rejected there for the missing
+                // envelope field, not at the emitter gate).
                 record: pg_admission_key(
                     &steward,
                     "registry",
-                    crate::federation::types::identity_type::STEWARD,
+                    crate::federation::types::identity_type::LENSCORE_DETECTOR,
                 ),
             })
             .await
