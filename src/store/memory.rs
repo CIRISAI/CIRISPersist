@@ -155,6 +155,12 @@ struct State {
     /// pressure/decay evict (by `retention_priority DESC`). Parity with
     /// the postgres/sqlite `content_symbols` table (V084).
     fountain_symbols: HashMap<String, HashMap<u32, crate::fountain::FountainSymbolV1>>,
+    /// v12.7.0 (§Q / CIRISPersist#370) — installed `StorageBudgetV1` pin
+    /// state, keyed by owner `node_id`. Parity with the postgres/sqlite
+    /// `storage_budget_installed` table (V093). Replaced only by a
+    /// strictly-higher revision (§Q B3 anti-rollback).
+    installed_storage_budgets:
+        HashMap<String, crate::fountain::storage_contention::InstalledStorageBudget>,
     /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228) — WholenessWitness
     /// corpus, keyed by `peer_id`, inner vec the last-K verified witnesses
     /// (newest last). Parity with the postgres/sqlite
@@ -235,6 +241,7 @@ impl Default for MemoryBackend {
                 federation_hard_case_events: HashMap::new(),
                 fountain_manifests: HashMap::new(),
                 fountain_symbols: HashMap::new(),
+                installed_storage_budgets: HashMap::new(),
                 wholeness_witnesses: HashMap::new(),
                 content_aggregations: HashMap::new(),
                 federation_scope_blobs: HashMap::new(),
@@ -1061,6 +1068,44 @@ impl Backend for MemoryBackend {
             })
             .collect();
         out.sort_by(|a, b| b.content_id.cmp(&a.content_id));
+        Ok(out)
+    }
+
+    // ─── v12.7.0 — §Q pin-INSTALL surface (CIRISPersist#370) ─────────
+
+    async fn put_installed_storage_budget(
+        &self,
+        budget: &crate::fountain::storage_contention::InstalledStorageBudget,
+    ) -> Result<bool, Error> {
+        let mut state = self.state.lock().expect("memory backend lock");
+        // §Q B3 anti-rollback under the same lock the map lives behind —
+        // replace only on a STRICTLY higher revision (parity with the
+        // SQL dialects' conditional upsert).
+        match state.installed_storage_budgets.get(&budget.node_id) {
+            Some(existing) if existing.revision >= budget.revision => Ok(false),
+            _ => {
+                state
+                    .installed_storage_budgets
+                    .insert(budget.node_id.clone(), budget.clone());
+                Ok(true)
+            }
+        }
+    }
+
+    async fn get_installed_storage_budget(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<crate::fountain::storage_contention::InstalledStorageBudget>, Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state.installed_storage_budgets.get(node_id).cloned())
+    }
+
+    async fn list_installed_storage_budgets(
+        &self,
+    ) -> Result<Vec<crate::fountain::storage_contention::InstalledStorageBudget>, Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out: Vec<_> = state.installed_storage_budgets.values().cloned().collect();
+        out.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         Ok(out)
     }
 

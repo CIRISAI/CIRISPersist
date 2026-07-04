@@ -2839,9 +2839,12 @@ impl PyEngine {
             ) {
                 Ok(()) => Ok(true),
                 Err(E::Invalid(_)) | Err(E::SignatureFailed) => Ok(false),
-                Err(e @ (E::MalformedJson(_) | E::MalformedBase64(_))) => {
-                    Err(storage_contention_err_to_py(e))
-                }
+                // RevisionRollback is unreachable from a pure verify (it is
+                // the #370 install-path error) — grouped with the raising
+                // arm for exhaustiveness.
+                Err(
+                    e @ (E::MalformedJson(_) | E::MalformedBase64(_) | E::RevisionRollback { .. }),
+                ) => Err(storage_contention_err_to_py(e)),
             }
         })
     }
@@ -2864,9 +2867,12 @@ impl PyEngine {
             ) {
                 Ok(()) => Ok(true),
                 Err(E::Invalid(_)) | Err(E::SignatureFailed) => Ok(false),
-                Err(e @ (E::MalformedJson(_) | E::MalformedBase64(_))) => {
-                    Err(storage_contention_err_to_py(e))
-                }
+                // RevisionRollback is unreachable from a pure verify (it is
+                // the #370 install-path error) — grouped with the raising
+                // arm for exhaustiveness.
+                Err(
+                    e @ (E::MalformedJson(_) | E::MalformedBase64(_) | E::RevisionRollback { .. }),
+                ) => Err(storage_contention_err_to_py(e)),
             }
         })
     }
@@ -2908,6 +2914,83 @@ impl PyEngine {
                 object_bytes,
             )
             .map_err(storage_contention_err_to_py)
+        })
+    }
+
+    /// #370 (§Q B2/B3, CC 6.1.5.2) — INSTALL a signed `StorageBudgetV1` so
+    /// it governs this node's capacity eviction. Verifies the bound-hybrid
+    /// signature against the owner pubkeys (PQC-mandatory — verify at the
+    /// gate, BEFORE persistence), enforces §Q B3 anti-rollback (a
+    /// lower/equal `revision` from the same `node_id` than the installed
+    /// one is rejected), then persists the budget (V092, both backends).
+    /// The installed `pinned_class` / `pin_reserve_bytes` drive the B5
+    /// CACHE-BEFORE-PINNED ordering of the eviction sweep; revocation
+    /// (`evict_fountain_content_hard_delete`) stays pin-blind (§Q B6).
+    /// Returns the accepted `revision`. Raises `ValueError` on a
+    /// structural/signature failure or an anti-rollback rejection
+    /// (`storage_contention_revision_rollback`).
+    #[pyo3(name = "install_storage_budget_v1")]
+    fn install_storage_budget_v1_py(
+        &self,
+        py: Python<'_>,
+        wire_json: &str,
+        ed25519_pubkey_base64: &str,
+        ml_dsa_65_pubkey_base64: &str,
+    ) -> PyResult<u64> {
+        self.ensure_usable()?;
+        let wire_json = wire_json.to_owned();
+        let ed_pub = ed25519_pubkey_base64.to_owned();
+        let mldsa_pub = ml_dsa_65_pubkey_base64.to_owned();
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .install_storage_budget_v1(&wire_json, &ed_pub, &mldsa_pub)
+                        .await
+                })
+            })
+            .map_err(fountain_store_err_to_py)
+        })
+    }
+
+    /// #370 — the installed `StorageBudgetV1` wire JSON for `node_id`,
+    /// VERBATIM as accepted (re-verifiable with `verify_storage_budget_v1`).
+    /// `None` when no budget is installed for that node.
+    #[pyo3(name = "get_installed_storage_budget_json")]
+    fn get_installed_storage_budget_json_py(
+        &self,
+        py: Python<'_>,
+        node_id: &str,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        let node_id = node_id.to_owned();
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(
+                    async move { engine.get_installed_storage_budget_json(&node_id).await },
+                )
+            })
+            .map_err(fountain_store_err_to_py)
         })
     }
 
@@ -24133,6 +24216,7 @@ fn fountain_store_err_to_py(e: crate::store::Error) -> PyErr {
         Error::FountainAdmit(_)
         | Error::FountainIntegrity(_)
         | Error::AggregationMetaRejected(_)
+        | Error::StorageContention(_)
         | Error::Schema(_) => PyValueError::new_err(e.kind()),
         Error::NotImplemented(_) | Error::Backend(_) | Error::Migration { .. } => {
             PyRuntimeError::new_err(format!("{e}"))

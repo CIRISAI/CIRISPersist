@@ -1228,6 +1228,97 @@ impl Backend for SqliteBackend {
         .map_err(|e| Error::Backend(format!("list_held_fountain_content: {e}")))
     }
 
+    // ─── v12.7.0 — §Q pin-INSTALL surface (CIRISPersist#370) ─────────
+
+    async fn put_installed_storage_budget(
+        &self,
+        budget: &crate::fountain::storage_contention::InstalledStorageBudget,
+    ) -> Result<bool, Error> {
+        let revision = i64::try_from(budget.revision)
+            .map_err(|_| Error::Backend("storage budget revision exceeds i64".into()))?;
+        let scopes = serde_json::to_string(&budget.scopes)
+            .map_err(|e| Error::Backend(format!("serialize budget scopes: {e}")))?;
+        let pinned_class = serde_json::to_string(&budget.pinned_class)
+            .map_err(|e| Error::Backend(format!("serialize budget pinned_class: {e}")))?;
+        let node_id = budget.node_id.clone();
+        let epoch_id = budget.epoch_id.clone();
+        let wire_json = budget.wire_json.clone();
+        let installed_at = budget.installed_at.to_rfc3339();
+        let conn = self.conn.clone();
+        (move || -> Result<bool, rusqlite::Error> {
+            let conn = conn.lock();
+            // §Q B3 anti-rollback, ATOMIC at the row: the DO UPDATE only
+            // fires when the incoming revision is STRICTLY higher;
+            // changed-rows == 0 ⇒ refused (the Engine surfaces
+            // RevisionRollback). Identical semantics to the PG dialect.
+            let n = conn.execute(
+                "INSERT INTO storage_budget_installed (\
+                     node_id, revision, epoch_id, scopes, pinned_class, wire, installed_at\
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7) \
+                 ON CONFLICT (node_id) DO UPDATE SET \
+                     revision = excluded.revision, \
+                     epoch_id = excluded.epoch_id, \
+                     scopes = excluded.scopes, \
+                     pinned_class = excluded.pinned_class, \
+                     wire = excluded.wire, \
+                     installed_at = excluded.installed_at \
+                 WHERE storage_budget_installed.revision < excluded.revision",
+                rusqlite::params![
+                    node_id,
+                    revision,
+                    epoch_id,
+                    scopes,
+                    pinned_class,
+                    wire_json,
+                    installed_at
+                ],
+            )?;
+            Ok(n > 0)
+        })()
+        .map_err(|e| Error::Backend(format!("put_installed_storage_budget: {e}")))
+    }
+
+    async fn get_installed_storage_budget(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<crate::fountain::storage_contention::InstalledStorageBudget>, Error> {
+        let node_id = node_id.to_owned();
+        let conn = self.conn.clone();
+        let row = (move || -> Result<Option<InstalledBudgetColumns>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT node_id, revision, epoch_id, scopes, pinned_class, wire, installed_at \
+                 FROM storage_budget_installed WHERE node_id = ?1",
+            )?;
+            let mut rows =
+                stmt.query_map(rusqlite::params![node_id], sqlite_installed_budget_row)?;
+            rows.next().transpose()
+        })()
+        .map_err(|e| Error::Backend(format!("get_installed_storage_budget: {e}")))?;
+        row.map(decode_installed_storage_budget).transpose()
+    }
+
+    async fn list_installed_storage_budgets(
+        &self,
+    ) -> Result<Vec<crate::fountain::storage_contention::InstalledStorageBudget>, Error> {
+        let conn = self.conn.clone();
+        let rows = (move || -> Result<Vec<InstalledBudgetColumns>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT node_id, revision, epoch_id, scopes, pinned_class, wire, installed_at \
+                 FROM storage_budget_installed ORDER BY node_id ASC",
+            )?;
+            let rows = stmt
+                .query_map([], sqlite_installed_budget_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })()
+        .map_err(|e| Error::Backend(format!("list_installed_storage_budgets: {e}")))?;
+        rows.into_iter()
+            .map(decode_installed_storage_budget)
+            .collect()
+    }
+
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
 
     async fn put_aggregated_tier(
@@ -1698,6 +1789,49 @@ impl SqliteBackend {
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────
+
+/// #370 — raw `storage_budget_installed` column tuple
+/// (`node_id, revision, epoch_id, scopes, pinned_class, wire, installed_at`).
+type InstalledBudgetColumns = (String, i64, String, String, String, String, String);
+
+/// #370 — map one `storage_budget_installed` row to its raw column tuple
+/// (`node_id, revision, epoch_id, scopes, pinned_class, wire, installed_at`).
+fn sqlite_installed_budget_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<InstalledBudgetColumns, rusqlite::Error> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+/// #370 — decode the raw column tuple into an
+/// [`InstalledStorageBudget`](crate::fountain::storage_contention::InstalledStorageBudget).
+fn decode_installed_storage_budget(
+    (node_id, revision, epoch_id, scopes, pinned_class, wire, installed_at): InstalledBudgetColumns,
+) -> Result<crate::fountain::storage_contention::InstalledStorageBudget, Error> {
+    Ok(
+        crate::fountain::storage_contention::InstalledStorageBudget {
+            node_id,
+            revision: u64::try_from(revision)
+                .map_err(|_| Error::Backend("installed budget revision negative".into()))?,
+            epoch_id,
+            scopes: serde_json::from_str(&scopes)
+                .map_err(|e| Error::Backend(format!("decode budget scopes: {e}")))?,
+            pinned_class: serde_json::from_str(&pinned_class)
+                .map_err(|e| Error::Backend(format!("decode budget pinned_class: {e}")))?,
+            wire_json: wire,
+            installed_at: chrono::DateTime::parse_from_rfc3339(&installed_at)
+                .map_err(|e| Error::Backend(format!("decode budget installed_at: {e}")))?
+                .with_timezone(&chrono::Utc),
+        },
+    )
+}
 
 fn opt_text(v: Option<&str>) -> SqlValue {
     match v {
@@ -8773,7 +8907,7 @@ impl SqliteBackend {
         (move || -> Result<Vec<crate::federation::EvictionCandidate>, rusqlite::Error> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT sha256, size_bytes, access_count, last_accessed_at \
+                "SELECT sha256, size_bytes, access_count, last_accessed_at, media_type \
                      FROM federation_blobs \
                      ORDER BY last_accessed_at ASC, access_count ASC \
                      LIMIT ?1",
@@ -8783,11 +8917,12 @@ impl SqliteBackend {
                 let size_bytes: i64 = r.get(1)?;
                 let access_count: i64 = r.get(2)?;
                 let last_str: String = r.get(3)?;
-                Ok((sha_vec, size_bytes, access_count, last_str))
+                let media_type: Option<String> = r.get(4)?;
+                Ok((sha_vec, size_bytes, access_count, last_str, media_type))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (sha_vec, size_bytes, access_count, last_str) = row?;
+                let (sha_vec, size_bytes, access_count, last_str, media_type) = row?;
                 let mut sha = [0u8; 32];
                 if sha_vec.len() != 32 {
                     // Defense in depth — schema enforces 32-byte
@@ -8809,11 +8944,45 @@ impl SqliteBackend {
                     // from the signer's holds_bytes index, not the blob
                     // table (which has no attesting_key_id column).
                     attesting_key_id: None,
+                    // v12.7.0 (§Q B5, #370): the corpus-class token the
+                    // Engine matches against the installed pinned_class
+                    // set.
+                    media_type,
                 });
             }
             Ok(out)
         })()
         .map_err(|e| crate::federation::BlobError::Backend(format!("sweep_candidates: {e}")))
+    }
+
+    /// v12.7.0 (§Q B5 / CIRISPersist#370) — total bytes currently held by
+    /// blobs whose `media_type` is one of `media_types` (the installed
+    /// `pinned_class` set). §Q consumption accounting is edge-internal —
+    /// recomputed from held content, never taken from the wire. Empty set
+    /// ⇒ 0. PG parity: `PostgresBackend::pinned_blob_bytes`.
+    pub async fn pinned_blob_bytes(
+        &self,
+        media_types: &[String],
+    ) -> Result<u64, crate::federation::BlobError> {
+        if media_types.is_empty() {
+            return Ok(0);
+        }
+        let media_types = media_types.to_vec();
+        let conn = self.conn.clone();
+        (move || -> Result<u64, rusqlite::Error> {
+            let conn = conn.lock();
+            let placeholders = vec!["?"; media_types.len()].join(",");
+            let sql = format!(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM federation_blobs \
+                 WHERE media_type IN ({placeholders})"
+            );
+            let total: i64 =
+                conn.query_row(&sql, rusqlite::params_from_iter(media_types.iter()), |r| {
+                    r.get(0)
+                })?;
+            Ok(total.max(0) as u64)
+        })()
+        .map_err(|e| crate::federation::BlobError::Backend(format!("pinned_blob_bytes: {e}")))
     }
 
     /// v3.4.0 (CIRISPersist#123) — delete one `federation_blobs` row

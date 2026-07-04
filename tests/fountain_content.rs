@@ -28,6 +28,7 @@ use ed25519_dalek::{Signer as _, SigningKey};
 
 use ciris_persist::fountain::storage_contention::{
     assemble_storage_budget_wire, storage_budget_preimage, verify_storage_budget_wire,
+    InstalledStorageBudget,
 };
 use ciris_persist::fountain::{
     symbol_sha256_hex, FountainContent, FountainManifestV1, FountainSymbolV1, FountainTier,
@@ -140,18 +141,19 @@ async fn build_manifest_and_symbols(
 }
 
 /// §Q B6/N5 (CIRISPersist#359): build + VERIFY a signed `StorageBudgetV1`
-/// whose `pinned_class` covers `corpus_kind` with a non-zero
-/// `pin_reserve_bytes`. Returns the verified wire JSON. This proves a *valid,
-/// aggregator-signed* pin advertisement covering the subject_kind exists — the
-/// exact state B6 says must NOT shield content from revocation.
-async fn build_and_verify_trace_pin(corpus_kind: &str) -> String {
+/// bound to `node_id` whose `pinned_class` covers `corpus_kind` with a
+/// non-zero `pin_reserve_bytes`. Returns the verified wire JSON. This proves
+/// a *valid, aggregator-signed* pin advertisement covering the subject_kind
+/// exists — the exact state B6 says must NOT shield content from revocation.
+/// (#370: section (k) additionally INSTALLS one as durable pin state.)
+async fn build_and_verify_trace_pin(corpus_kind: &str, node_id: &str) -> String {
     let (ed_sk, ed_pk_b64, mldsa) = producer_pubkeys();
     let mldsa_pk_b64 = BASE64.encode(mldsa.public_key().await.unwrap());
 
     // A budget that PINS `corpus_kind` (in pinned_class) with a real byte
     // reserve — i.e. the strongest pin the §Q surface can express.
     let payload = format!(
-        r#"{{"node_id":"n-pin","epoch_id":"e1","revision":1,
+        r#"{{"node_id":"{node_id}","epoch_id":"e1","revision":1,
             "scopes":[{{"cohort_scope":"community","budget_bytes":100000,"pin_reserve_bytes":50000}}],
             "pinned_class":["{corpus_kind}"]}}"#
     );
@@ -379,13 +381,15 @@ async fn run_fountain_assertions<B: Backend>(backend: &B, suffix: &str) {
     // (j) §Q B6/N5 (CIRISPersist#359): PINNING NEVER DEFEATS REVOCATION.
     //     A *verified*, aggregator-signed StorageBudgetV1 whose pinned_class
     //     covers `corpus` ("trace") with pin_reserve_bytes > 0 does NOT shield
-    //     that content from hard-delete. The pin is a verified-at-ingest
-    //     advertisement, not stored pin STATE — there is no pin table and
-    //     evict_fountain_content_hard_delete has no §Q pin parameter, so the
-    //     pin structurally cannot reach the deletion path. B6: a pin holds
-    //     content above the floor against CAPACITY pressure only, never
-    //     against revocation.
-    let pin_wire = build_and_verify_trace_pin(corpus).await;
+    //     that content from hard-delete. Here the pin is a verified-at-ingest
+    //     ADVERTISEMENT only (never installed — the #359 thin form); as of
+    //     #370 durable pin STATE exists too, and section (k) below proves the
+    //     INSTALLED form is equally powerless against revocation. Either way,
+    //     evict_fountain_content_hard_delete has no §Q pin parameter and
+    //     reads no pin state, so a pin structurally cannot reach the deletion
+    //     path. B6: a pin holds content above the floor against CAPACITY
+    //     pressure only, never against revocation.
+    let pin_wire = build_and_verify_trace_pin(corpus, "n-pin").await;
     assert!(
         pin_wire.contains(corpus),
         "(j) the verified pin advertisement covers the subject_kind being revoked"
@@ -428,6 +432,84 @@ async fn run_fountain_assertions<B: Backend>(backend: &B, suffix: &str) {
     assert!(
         matches!(pin_revoked, FountainContent::EnvelopeOnly { .. }),
         "(j) pinned content → EnvelopeOnly after revocation, got {pin_revoked:?}"
+    );
+
+    // (k) §Q B6 with INSTALLED pin state (CIRISPersist#370): the pin-install
+    //     surface persists REAL pin state now (V092 storage_budget_installed
+    //     — the state the B5 capacity sweep honors), and revocation STILL
+    //     runs unconditionally: `evict_fountain_content_hard_delete` takes
+    //     only (content_id, corpus_kind) and reads no §Q state, so even an
+    //     installed, reserve-backed pin covering the class cannot shield it.
+    //     This is the staging the conformance B6 test wants: install a pin,
+    //     then prove revocation defeats it.
+    let pin_node = format!("n-pin-{suffix}");
+    let installed_wire = build_and_verify_trace_pin(corpus, &pin_node).await;
+    let installed = InstalledStorageBudget::from_wire_json(&installed_wire, chrono::Utc::now())
+        .expect("(k) verified wire denormalizes");
+    assert!(
+        backend
+            .put_installed_storage_budget(&installed)
+            .await
+            .expect("(k) install pin state"),
+        "(k) a fresh node_id installs"
+    );
+    // Read-back: the installed row is live pin state covering `corpus`.
+    let got = backend
+        .get_installed_storage_budget(&pin_node)
+        .await
+        .expect("(k) getter")
+        .expect("(k) installed row present");
+    assert_eq!(got.revision, 1);
+    assert!(
+        got.pinned_class.iter().any(|c| c == corpus),
+        "(k) the installed pin covers the subject_kind being revoked"
+    );
+    assert!(got.pin_reserve_total() > 0, "(k) a real byte reserve");
+    // §Q B3 anti-rollback at the row: an equal revision is refused.
+    assert!(
+        !backend
+            .put_installed_storage_budget(&installed)
+            .await
+            .expect("(k) re-put"),
+        "(k) equal revision refused (B3 anti-rollback)"
+    );
+    // Admit content of the PINNED class, then revoke — the INSTALLED pin
+    // must not shield it.
+    let kcid = format!("c-installed-pin-revoke-{suffix}");
+    let (kman, ksyms) =
+        build_manifest_and_symbols(&kcid, n_source, k_repair, symbol_size, true).await;
+    backend
+        .put_fountain_content(&kman, &ksyms)
+        .await
+        .expect("(k) admit installed-pinned-class content");
+    let kdropped = backend
+        .evict_fountain_content_hard_delete(&kcid, corpus)
+        .await
+        .expect("(k) hard delete over INSTALLED pinned class");
+    assert_eq!(
+        kdropped,
+        u64::from(total),
+        "(k) HardDelete drops ALL symbols even under an INSTALLED pin (§Q B6)"
+    );
+    assert_eq!(
+        backend
+            .get_fountain_content(&kcid, corpus)
+            .await
+            .unwrap()
+            .expect("(k) manifest survives as EnvelopeOnly")
+            .present(),
+        0,
+        "(k) installed pinning never defeats revocation — zero symbols survive"
+    );
+    // The pin state itself is untouched by the revocation (the two paths
+    // never meet): the row is still installed.
+    assert!(
+        backend
+            .get_installed_storage_budget(&pin_node)
+            .await
+            .unwrap()
+            .is_some(),
+        "(k) revocation neither consulted nor mutated the installed pin"
     );
 
     // (#227 publisher view) list_held_fountain_content — the publisher sees

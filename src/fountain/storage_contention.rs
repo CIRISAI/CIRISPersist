@@ -10,11 +10,20 @@
 //! [`crate::fountain::aggregation::AggregationMetaVerifyInputsV1`] wrapping the
 //! verify-core `AggregationMetaV1`.
 //!
-//! These shapes are **verified-at-ingest, not stored** (CC 6.1.3 store-path):
-//! there is no persist admit/put table for them — a consumer builds one to
-//! advertise / verifies one it received.
+//! `CorpusWantV1` remains **verified-at-ingest, not stored** (CC 6.1.3
+//! store-path): a consumer builds one to advertise / verifies one it received.
+//! `StorageBudgetV1` gained a pin-INSTALL surface in #370 (v12.7.0):
+//! [`Engine::install_storage_budget_v1`](crate::Engine::install_storage_budget_v1)
+//! verifies the bound-hybrid signature (PQC-mandatory — verify at the gate,
+//! BEFORE persistence) and upserts an [`InstalledStorageBudget`] row (V092,
+//! both backends) under the §Q B3 anti-rollback rule (a lower/equal
+//! `revision` from the same `node_id` is refused). The installed budget is
+//! what makes §Q B5 real: the disk-pressure eviction sweep
+//! ([`Engine::sweep_evictions_once`](crate::Engine::sweep_evictions_once))
+//! orders candidates **cache-before-pinned** against the installed
+//! `pinned_class` set and holds the `pin_reserve_bytes` floor.
 //!
-//! # §Q B6/N5 — pinning never defeats revocation (CIRISPersist#359)
+//! # §Q B6/N5 — pinning never defeats revocation (CIRISPersist#359 / #370)
 //!
 //! CC 6.1.5.2 §Q B6: *"Pinning never defeats consent: an active `withdraws` /
 //! `consent:state:revoked` still forces immediate descent below the noise floor
@@ -23,28 +32,26 @@
 //! 6.1.5: revocation is a content-level dominating signal that never competes
 //! inside the priority/rarity ordering.)
 //!
-//! persist satisfies this invariant **structurally**, and the THIN form the
-//! spec confirms is sufficient:
+//! With #370 there IS persisted pin state — so B6 no longer holds by the mere
+//! absence of a pin table. It holds **structurally at the deletion path**:
 //!
-//! - A `StorageBudgetV1.pinned_class` / `pin_reserve_bytes` is a **verified-at-
-//!   ingest advertisement**, not persisted pin STATE. There is no pin table, no
-//!   `pinned_class` column, and no migration — nothing a deletion path could
-//!   query.
 //! - The revocation path
 //!   [`crate::store::Backend::evict_fountain_content_hard_delete`] takes only
-//!   `(content_id, corpus_kind)`. It has **no §Q pin parameter and reads no pin
-//!   state**; it unconditionally drops every symbol (it does not even consult
-//!   `retention_priority`). A pin covering that `subject_kind` therefore cannot
-//!   reach the delete, so it cannot shield the content.
+//!   `(content_id, corpus_kind)`. It has **no §Q pin parameter and reads no
+//!   pin state** — no backend implementation touches
+//!   `storage_budget_installed` (it does not even consult
+//!   `retention_priority`). A pin covering that `subject_kind` therefore
+//!   cannot reach the delete, so it cannot shield the content.
+//! - Only the CAPACITY sweep consumes the installed pin state
+//!   ([`Engine::sweep_evictions_once`](crate::Engine::sweep_evictions_once)'s
+//!   B5 candidate ordering) — §Q is the positive inverse of N5 and is bounded
+//!   by it.
 //!
-//! Because the pin advertisement and the delete never share a code path, B6
-//! holds by construction. The proof is locked by
-//! `tests/fountain_content.rs` section (j): a *verified* `StorageBudgetV1` whose
-//! `pinned_class` covers `trace` with `pin_reserve_bytes > 0` does not prevent a
-//! subsequent `evict_fountain_content_hard_delete` from removing `trace`
-//! content. Making the gate "real" (a stored pin the delete overrides) would
-//! require adding the very pin STATE whose absence is what makes revocation
-//! unconditional today — so the thin form is the conformant one.
+//! The proof is locked by `tests/fountain_content.rs` sections (j) and (k):
+//! (j) a *verified* `StorageBudgetV1` whose `pinned_class` covers `trace`
+//! with `pin_reserve_bytes > 0`, and (k) the SAME budget **installed as
+//! durable pin state**, do not prevent a subsequent
+//! `evict_fountain_content_hard_delete` from removing `trace` content.
 
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +76,21 @@ pub enum StorageContentionError {
     /// ML-DSA-65 half — PQC-mandatory).
     #[error("storage-contention: bound-hybrid signature did not verify (PQC-mandatory)")]
     SignatureFailed,
+    /// #370 (§Q B3 anti-rollback) — the candidate budget's `revision` does
+    /// not supersede the installed one for the same `node_id` (lower OR
+    /// equal ⇒ rejected; only a strictly-higher revision replaces).
+    #[error(
+        "storage-contention: anti-rollback — candidate revision {candidate} does not \
+         supersede installed revision {installed} for node {node_id:?} (§Q B3)"
+    )]
+    RevisionRollback {
+        /// The owner node both budgets bind.
+        node_id: String,
+        /// The revision currently installed.
+        installed: u64,
+        /// The refused candidate revision.
+        candidate: u64,
+    },
 }
 
 impl StorageContentionError {
@@ -80,6 +102,7 @@ impl StorageContentionError {
             Self::Invalid(_) => "storage_contention_invalid",
             Self::MalformedBase64(_) => "storage_contention_malformed_base64",
             Self::SignatureFailed => "storage_contention_signature_failed",
+            Self::RevisionRollback { .. } => "storage_contention_revision_rollback",
         }
     }
 }
@@ -170,6 +193,73 @@ impl StorageBudgetWire {
     #[must_use]
     pub fn supersedes(&self, other: &StorageBudgetWire) -> bool {
         self.to_verify().supersedes(&other.to_verify())
+    }
+}
+
+/// #370 (§Q B2/B3/B5) — an **installed** `StorageBudgetV1`: the durable pin
+/// STATE row the pin-INSTALL surface
+/// ([`Engine::install_storage_budget_v1`](crate::Engine::install_storage_budget_v1))
+/// writes after the bound-hybrid signature verified, and the B5 capacity
+/// sweep reads back. One row per owner `node_id`; `wire_json` carries the
+/// signed wire VERBATIM so the installed budget stays re-verifiable
+/// end-to-end (persist never re-derives signed bytes).
+///
+/// The revocation path never reads this state — §Q B6 (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledStorageBudget {
+    /// The owner node this budget binds.
+    pub node_id: String,
+    /// Monotonic revision; strictly-higher supersedes (anti-rollback).
+    pub revision: u64,
+    /// Epoch keying (CC 5.1).
+    pub epoch_id: String,
+    /// Per-`cohort_scope` allotments (denormalized from the wire).
+    pub scopes: Vec<ScopeBudgetWire>,
+    /// Corpus `subject_kind`s the owner elects to pin (B2-ii).
+    pub pinned_class: Vec<String>,
+    /// The signed `StorageBudgetV1` wire JSON, verbatim.
+    pub wire_json: String,
+    /// When this revision was accepted locally.
+    pub installed_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl InstalledStorageBudget {
+    /// Build the install row from a signed wire JSON. Parses AND
+    /// structurally re-validates the payload (defense in depth — the caller
+    /// must already have run [`verify_storage_budget_wire`]; this never
+    /// admits a shape `validate()` rejects even on a buggy call path).
+    ///
+    /// # Errors
+    /// [`StorageContentionError::MalformedJson`] /
+    /// [`StorageContentionError::Invalid`].
+    pub fn from_wire_json(
+        wire_json: &str,
+        installed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Self, StorageContentionError> {
+        let wire: StorageBudgetWire = serde_json::from_str(wire_json)
+            .map_err(|e| StorageContentionError::MalformedJson(e.to_string()))?;
+        wire.to_verify()
+            .validate()
+            .map_err(|e| StorageContentionError::Invalid(e.to_string()))?;
+        Ok(InstalledStorageBudget {
+            node_id: wire.node_id,
+            revision: wire.revision,
+            epoch_id: wire.epoch_id,
+            scopes: wire.scopes,
+            pinned_class: wire.pinned_class,
+            wire_json: wire_json.to_owned(),
+            installed_at,
+        })
+    }
+
+    /// The total `pin_reserve_bytes` floor this budget declares (sum over
+    /// its per-scope allotments) — the bytes the B5 sweep holds for the
+    /// pinned classes under capacity pressure.
+    #[must_use]
+    pub fn pin_reserve_total(&self) -> u64 {
+        self.scopes
+            .iter()
+            .fold(0u64, |acc, s| acc.saturating_add(s.pin_reserve_bytes))
     }
 }
 
@@ -561,5 +651,52 @@ mod tests {
             verify_storage_budget_wire("{not json", "", ""),
             Err(StorageContentionError::MalformedJson(_))
         ));
+    }
+
+    /// #370 — `InstalledStorageBudget::from_wire_json` denormalizes the
+    /// wire, keeps the signed JSON verbatim, and re-runs the structural
+    /// validation (defense in depth).
+    #[test]
+    fn installed_budget_from_wire_json() {
+        let id = id();
+        let wire = build_budget(&id, BUDGET_PAYLOAD); // revision 3
+        let now = chrono::Utc::now();
+        let installed = InstalledStorageBudget::from_wire_json(&wire, now).unwrap();
+        assert_eq!(installed.node_id, "n1");
+        assert_eq!(installed.revision, 3);
+        assert_eq!(installed.epoch_id, "e1");
+        assert_eq!(installed.pinned_class, vec!["av_chunk", "trace"]);
+        assert_eq!(
+            installed.pin_reserve_total(),
+            200,
+            "summed pin_reserve_bytes over scopes"
+        );
+        assert_eq!(installed.wire_json, wire, "signed wire kept verbatim");
+        assert_eq!(installed.installed_at, now);
+
+        // Structural invalidity is refused even when signatures aren't
+        // checked here (a suppressed `self` scope).
+        let bad = r#"{"node_id":"n1","epoch_id":"e1","revision":1,
+            "scopes":[{"cohort_scope":"self","budget_bytes":1,"pin_reserve_bytes":0}],
+            "pinned_class":[],
+            "signature_ed25519_base64":"","signature_ml_dsa_65_base64":""}"#;
+        assert!(matches!(
+            InstalledStorageBudget::from_wire_json(bad, now),
+            Err(StorageContentionError::Invalid(_))
+        ));
+    }
+
+    /// #370 — the anti-rollback error carries a stable telemetry token.
+    #[test]
+    fn revision_rollback_kind_token() {
+        let e = StorageContentionError::RevisionRollback {
+            node_id: "n1".into(),
+            installed: 5,
+            candidate: 3,
+        };
+        assert_eq!(e.kind(), "storage_contention_revision_rollback");
+        let msg = e.to_string();
+        assert!(msg.contains("candidate revision 3"));
+        assert!(msg.contains("installed revision 5"));
     }
 }

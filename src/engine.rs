@@ -841,14 +841,77 @@ impl Engine {
             }
         };
 
+        // v12.7.0 (§Q B5 / CIRISPersist#370) — fold the INSTALLED
+        // StorageBudgetV1 state (V092; written only after the PQC-mandatory
+        // verify + B3 anti-rollback in `install_storage_budget_v1`) into
+        // this cycle's pin classification:
+        //   * `pinned_classes` — the union of every installed budget's
+        //     `pinned_class` set (a node typically installs exactly one —
+        //     its own; folding the union + summed reserve is the
+        //     most-protective composition when several owners' budgets are
+        //     present: ambiguity fails toward retention, mirroring how
+        //     B4 dedup retains while ANY scope pins).
+        //   * `pin_reserve_floor` — the summed `pin_reserve_bytes` over all
+        //     scopes: the byte floor the pinned classes hold under CAPACITY
+        //     pressure.
+        // A candidate is PINNED iff its `media_type` (the substrate's
+        // per-blob corpus-class token) is in `pinned_classes`. With no
+        // installed budget both are empty ⇒ this entire block is inert and
+        // the pre-#370 ordering is byte-identical.
+        let installed_budgets = self.list_installed_storage_budgets().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "sweeper: list_installed_storage_budgets failed: {e}"
+            ))
+        })?;
+        let mut pinned_classes: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut pin_reserve_floor: u64 = 0;
+        for budget in &installed_budgets {
+            pinned_classes.extend(budget.pinned_class.iter().cloned());
+            pin_reserve_floor = pin_reserve_floor.saturating_add(budget.pin_reserve_total());
+        }
+        let is_pinned = |candidate: &crate::federation::EvictionCandidate| -> bool {
+            candidate
+                .media_type
+                .as_deref()
+                .is_some_and(|m| pinned_classes.contains(m))
+        };
+        // §Q B5 consumption accounting: recomputed from HELD content (the
+        // full table, not just this batch), never trusted from the wire.
+        // Decremented as pinned rows are shed so the reserve floor holds
+        // within the cycle.
+        let mut pinned_bytes_held: u64 = if pinned_classes.is_empty() {
+            0
+        } else {
+            let media_types: Vec<String> = pinned_classes.iter().cloned().collect();
+            self.pinned_blob_bytes(&media_types).await?
+        };
+
         // Rust-side re-rank applies on both backends. PG already ranks
         // in SQL by full decay score; SQLite ranks by the monotone
         // bound. Re-ranking is idempotent on PG (no-op reorder) and
         // load-bearing on SQLite. Sorting ascending so lowest-score
-        // evicts first. When `force_evict_proxy_first` is set (crit/stop
-        // disk-pressure tiers), proxy candidates sort entirely ahead of
-        // local/family ones regardless of decay score.
+        // evicts first.
+        //
+        // Key order (outermost first):
+        //   1. §Q B5 CACHE BEFORE PINNED (#370) — unpinned candidates sort
+        //      entirely ahead of pinned ones; pinned content is reached
+        //      only once unpinned is exhausted. This is the NORMATIVE
+        //      descent order (CC 6.1.2.3), so it outranks…
+        //   2. …the #149 force-evict-proxy-first hint (crit/stop
+        //      disk-pressure tiers): a local operational reordering that
+        //      applies WITHIN a pin class only.
+        //   3. Decay score (popularity × freshness), ascending — the
+        //      standing rarity stand-in within each (pin, proxy) band
+        //      (blob-level rarity scoring is PIN-AS-RECOMMENDATION /
+        //      edge-internal per CC 6.1.3; the decay order is persist's
+        //      deterministic local proxy for "lowest rarity first").
         candidates.sort_by(|a, b| {
+            // unpinned/cache (false) sorts before pinned (true).
+            match is_pinned(a).cmp(&is_pinned(b)) {
+                std::cmp::Ordering::Equal => {}
+                non_eq => return non_eq,
+            }
             if force_evict_proxy_first {
                 let pa = is_proxy(a);
                 let pb = is_proxy(b);
@@ -871,6 +934,21 @@ impl Engine {
         for candidate in candidates {
             if bytes_freed >= target_freed {
                 break;
+            }
+            // §Q B5 (#370): a PINNED candidate is evictable under CAPACITY
+            // pressure only down to the `pin_reserve_bytes` floor — the
+            // reserve the owner elected to hold for the pinned classes.
+            // Skipping (not breaking) lets a smaller pinned row later in
+            // the batch still fit above the floor. The sweep may therefore
+            // end short of `target_freed`: that is the pin doing its job
+            // (B6 keeps REVOCATION unconditional on its separate path —
+            // `evict_fountain_content_hard_delete` never consults any of
+            // this state).
+            let candidate_pinned = is_pinned(&candidate);
+            if candidate_pinned
+                && pinned_bytes_held.saturating_sub(candidate.size_bytes) < pin_reserve_floor
+            {
+                continue;
             }
             // Try to emit a withdraws attestation for this SHA. If
             // the local signer never emitted a holds_bytes for it
@@ -901,6 +979,12 @@ impl Engine {
             if deleted {
                 rows_evicted += 1;
                 bytes_freed = bytes_freed.saturating_add(candidate.size_bytes);
+                if candidate_pinned {
+                    // §Q B5 (#370): keep the held-pinned accounting live so
+                    // the reserve-floor check above stays correct as pinned
+                    // rows are shed within this cycle.
+                    pinned_bytes_held = pinned_bytes_held.saturating_sub(candidate.size_bytes);
+                }
             }
             match withdraws_outcome {
                 Some(Ok(())) => withdraws_emitted += 1,
@@ -1261,6 +1345,147 @@ impl Engine {
                 .await
         } else {
             Ok(0)
+        }
+    }
+
+    // ─── v12.7.0 — §Q pin-INSTALL surface (CC 6.1.5.2 / CIRISPersist#370) ──
+
+    /// v12.7.0 (CC 6.1.5.2 §Q B2/B3 / CIRISPersist#370) — **install** a
+    /// signed `StorageBudgetV1` so it GOVERNS this node's capacity
+    /// eviction (#356 shipped build/verify as wire-negotiation only).
+    /// Three gates, in order:
+    ///
+    /// 1. **PQC-mandatory bound-hybrid verify at ingest, BEFORE
+    ///    persistence** (CC 5.3.2.4.3.1 store-path / CC 6.1.3): the wire's
+    ///    Ed25519 + ML-DSA-65 halves must verify against the owner pubkeys
+    ///    — reuses [`verify_storage_budget_wire`]. This also re-runs the
+    ///    structural validation (no `self`/`family` scope, `pin_reserve ≤
+    ///    budget`, sorted + deduped lists).
+    /// 2. **§Q B3 anti-rollback**: a candidate whose `revision` does not
+    ///    STRICTLY supersede the installed one for the same `node_id` is
+    ///    rejected with
+    ///    [`StorageContentionError::RevisionRollback`](crate::fountain::storage_contention::StorageContentionError)
+    ///    — enforced atomically inside the backend's conditional upsert
+    ///    ([`Backend::put_installed_storage_budget`](crate::store::Backend::put_installed_storage_budget)),
+    ///    so racing installs cannot roll back either.
+    /// 3. Persist (V093 `storage_budget_installed`, both backends): the
+    ///    signed wire VERBATIM + denormalized `revision`/`scopes`/
+    ///    `pinned_class`.
+    ///
+    /// The installed budget is what [`Self::sweep_evictions_once`] reads to
+    /// order candidates CACHE-BEFORE-PINNED (§Q B5) and to hold the
+    /// `pin_reserve_bytes` floor. It is **capacity-only** state: the
+    /// revocation path ([`Self::evict_fountain_content_hard_delete`])
+    /// never reads it — §Q B6, pinning never defeats revocation.
+    ///
+    /// Returns the accepted `revision`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn install_storage_budget_v1(
+        &self,
+        wire_json: &str,
+        ed25519_pubkey_base64: &str,
+        ml_dsa_65_pubkey_base64: &str,
+    ) -> Result<u64, crate::store::Error> {
+        use crate::fountain::storage_contention::{
+            verify_storage_budget_wire, InstalledStorageBudget, StorageContentionError,
+        };
+        use crate::store::Backend;
+        // Gate 1 — verify at the gate; nothing persists on failure.
+        verify_storage_budget_wire(wire_json, ed25519_pubkey_base64, ml_dsa_65_pubkey_base64)?;
+        let budget = InstalledStorageBudget::from_wire_json(wire_json, chrono::Utc::now())?;
+        // Gates 2+3 — the backend's conditional upsert IS the anti-rollback
+        // check (atomic at the row).
+        let written = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.put_installed_storage_budget(&budget).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.put_installed_storage_budget(&budget).await?,
+        };
+        if !written {
+            // Refused: read the incumbent revision back for the typed error
+            // (best-effort — the row existed a moment ago).
+            let installed = self
+                .get_installed_storage_budget(&budget.node_id)
+                .await?
+                .map(|b| b.revision)
+                .unwrap_or(budget.revision);
+            return Err(StorageContentionError::RevisionRollback {
+                node_id: budget.node_id,
+                installed,
+                candidate: budget.revision,
+            }
+            .into());
+        }
+        Ok(budget.revision)
+    }
+
+    /// #370 — read back the installed budget for `node_id` (typed).
+    /// `Ok(None)` when none installed. Dispatches to
+    /// [`Backend::get_installed_storage_budget`](crate::store::Backend::get_installed_storage_budget).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn get_installed_storage_budget(
+        &self,
+        node_id: &str,
+    ) -> Result<
+        Option<crate::fountain::storage_contention::InstalledStorageBudget>,
+        crate::store::Error,
+    > {
+        use crate::store::Backend;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.get_installed_storage_budget(node_id).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.get_installed_storage_budget(node_id).await,
+        }
+    }
+
+    /// #370 — the installed budget's signed wire JSON, VERBATIM as accepted
+    /// (re-verifiable end-to-end with
+    /// [`verify_storage_budget_wire`](crate::fountain::storage_contention::verify_storage_budget_wire)).
+    /// `Ok(None)` when none installed for `node_id`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn get_installed_storage_budget_json(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<String>, crate::store::Error> {
+        Ok(self
+            .get_installed_storage_budget(node_id)
+            .await?
+            .map(|b| b.wire_json))
+    }
+
+    /// #370 (§Q B5) — every installed budget. The capacity sweep folds
+    /// these into the effective `pinned_class` set + `pin_reserve_bytes`
+    /// floor once per cycle.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn list_installed_storage_budgets(
+        &self,
+    ) -> Result<Vec<crate::fountain::storage_contention::InstalledStorageBudget>, crate::store::Error>
+    {
+        use crate::store::Backend;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.list_installed_storage_budgets().await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.list_installed_storage_budgets().await,
+        }
+    }
+
+    /// #370 (§Q B5) — backend-dispatched pinned-consumption accounting:
+    /// total `federation_blobs` bytes whose `media_type` is in the
+    /// installed `pinned_class` set. Recomputed from held content (§Q:
+    /// consumption accounting is edge-internal, never trusted from the
+    /// wire).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn pinned_blob_bytes(
+        &self,
+        media_types: &[String],
+    ) -> Result<u64, crate::federation::BlobError> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.pinned_blob_bytes(media_types).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.pinned_blob_bytes(media_types).await,
         }
     }
 
@@ -7384,6 +7609,472 @@ mod tests {
             proxy_present > 0,
             "standard sweep should keep HOT proxy rows (no proxy-first ordering)"
         );
+    }
+
+    // ─── v12.7.0 (CC 6.1.5.2 §Q / CIRISPersist#370) — pin-install + B5 ───
+
+    /// §Q signer for the budget wires: a deterministic-enough hybrid pair
+    /// (fresh per test; the pubkeys ride along). Built + used SYNCHRONOUSLY
+    /// so no multi-KiB signer is ever held across an await (the ML-DSA-65
+    /// test-stack rule).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    struct QShapeId {
+        ed: ciris_crypto::Ed25519Signer,
+        pqc: ciris_crypto::MlDsa65Signer,
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn qshape_id() -> QShapeId {
+        QShapeId {
+            ed: ciris_crypto::Ed25519Signer::random().unwrap(),
+            pqc: ciris_crypto::MlDsa65Signer::new().unwrap(),
+        }
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn qshape_pubs(id: &QShapeId) -> (String, String) {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ciris_crypto::{ClassicalSigner, PqcSigner};
+        (
+            B64.encode(id.ed.public_key().unwrap()),
+            B64.encode(id.pqc.public_key().unwrap()),
+        )
+    }
+
+    /// Build + bound-hybrid sign a `StorageBudgetV1` wire: one `community`
+    /// scope with `budget_bytes = 100_000` and the given
+    /// `pin_reserve_bytes`, pinning `pinned_class` (MUST be pre-sorted).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn qshape_budget_wire(
+        id: &QShapeId,
+        node_id: &str,
+        revision: u64,
+        pinned_class: &[&str],
+        pin_reserve_bytes: u64,
+    ) -> String {
+        use crate::fountain::storage_contention::{
+            assemble_storage_budget_wire, storage_budget_preimage,
+        };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ciris_crypto::{ClassicalSigner, PqcSigner};
+        let payload = serde_json::json!({
+            "node_id": node_id,
+            "epoch_id": "e1",
+            "revision": revision,
+            "scopes": [{
+                "cohort_scope": "community",
+                "budget_bytes": 100_000u64,
+                "pin_reserve_bytes": pin_reserve_bytes,
+            }],
+            "pinned_class": pinned_class,
+        })
+        .to_string();
+        let preimage = storage_budget_preimage(&payload).expect("valid §Q payload");
+        let ed_sig = id.ed.sign(&preimage).unwrap();
+        let mut bound = preimage.clone();
+        bound.extend_from_slice(&ed_sig);
+        let pqc_sig = id.pqc.sign(&bound).unwrap();
+        assemble_storage_budget_wire(&payload, B64.encode(&ed_sig), B64.encode(&pqc_sig))
+            .expect("assemble signed budget wire")
+    }
+
+    /// #370 shared body — install happy path, getter read-back, and §Q B3
+    /// anti-rollback (equal + lower revision rejected; higher supersedes;
+    /// a tampered wire never reaches the store). `node_id` must be unique
+    /// per run on shared databases (the PG twin).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn run_install_budget_assertions(engine: &Engine, node_id: &str) {
+        use crate::fountain::storage_contention::verify_storage_budget_wire;
+        let id = qshape_id();
+        let (ed_pub, mldsa_pub) = qshape_pubs(&id);
+
+        // Happy path: revision 3 installs.
+        let wire3 = qshape_budget_wire(&id, node_id, 3, &["trace"], 2048);
+        let rev = engine
+            .install_storage_budget_v1(&wire3, &ed_pub, &mldsa_pub)
+            .await
+            .expect("install revision 3");
+        assert_eq!(rev, 3);
+
+        // Getter: the stored wire re-verifies end-to-end (PQC-mandatory)
+        // against the same owner pubkeys — the budget stays provable after
+        // install, not just at ingest.
+        let got = engine
+            .get_installed_storage_budget_json(node_id)
+            .await
+            .expect("getter")
+            .expect("a budget is installed");
+        verify_storage_budget_wire(&got, &ed_pub, &mldsa_pub)
+            .expect("stored wire re-verifies (bound-hybrid)");
+
+        // §Q B3 anti-rollback: EQUAL revision refused…
+        let err = engine
+            .install_storage_budget_v1(&wire3, &ed_pub, &mldsa_pub)
+            .await
+            .expect_err("equal revision must be refused");
+        assert_eq!(err.kind(), "storage_contention_revision_rollback");
+        // …and LOWER revision refused.
+        let wire2 = qshape_budget_wire(&id, node_id, 2, &["trace"], 2048);
+        let err = engine
+            .install_storage_budget_v1(&wire2, &ed_pub, &mldsa_pub)
+            .await
+            .expect_err("lower revision must be refused");
+        assert_eq!(err.kind(), "storage_contention_revision_rollback");
+
+        // Strictly-higher revision supersedes.
+        let wire5 = qshape_budget_wire(&id, node_id, 5, &["av_chunk", "trace"], 4096);
+        assert_eq!(
+            engine
+                .install_storage_budget_v1(&wire5, &ed_pub, &mldsa_pub)
+                .await
+                .expect("higher revision supersedes"),
+            5
+        );
+        let installed = engine
+            .get_installed_storage_budget(node_id)
+            .await
+            .expect("typed getter")
+            .expect("installed");
+        assert_eq!(installed.revision, 5);
+        assert_eq!(installed.pinned_class, vec!["av_chunk", "trace"]);
+        assert_eq!(installed.pin_reserve_total(), 4096);
+
+        // A tampered wire (revision bumped without re-signing) fails the
+        // PQC-mandatory verify AT THE GATE — nothing persists; the
+        // installed revision is unchanged.
+        let mut tampered: serde_json::Value = serde_json::from_str(&wire5).unwrap();
+        tampered["revision"] = serde_json::json!(9);
+        let err = engine
+            .install_storage_budget_v1(&tampered.to_string(), &ed_pub, &mldsa_pub)
+            .await
+            .expect_err("tampered wire must fail signature verify");
+        assert_eq!(err.kind(), "storage_contention_signature_failed");
+        assert_eq!(
+            engine
+                .get_installed_storage_budget(node_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            5,
+            "verify-before-mutation: the tampered wire wrote nothing"
+        );
+    }
+
+    /// #370 — install surface on SQLite.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn install_storage_budget_v1_happy_and_anti_rollback_sqlite() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        run_install_budget_assertions(&engine, "n-370-sqlite").await;
+    }
+
+    /// #370 — install surface on Postgres (shared twin; uuid node_id keeps
+    /// runs self-isolating). Skips when `CIRIS_PERSIST_TEST_PG_URL` unset.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn install_storage_budget_v1_happy_and_anti_rollback_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let engine = Engine::with_signer(test_signer(), &dsn)
+            .await
+            .expect("construct postgres engine");
+        let node_id = format!("n-370-pg-{}", uuid::Uuid::new_v4().simple());
+        run_install_budget_assertions(&engine, &node_id).await;
+    }
+
+    /// Seed `n` blobs of 1 KiB through `put_blob_signing` with the given
+    /// `media_type` (the §Q corpus-class token), attested by the local
+    /// signer's DERIVED key (which the caller must have registered).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn seed_typed_blobs(
+        engine: &Engine,
+        media_type: Option<&str>,
+        fill_base: u8,
+        n: usize,
+    ) -> Vec<[u8; 32]> {
+        use crate::federation::BlobBody;
+        let derived = test_signer().derived_key_id();
+        let mut shas = Vec::with_capacity(n);
+        for i in 0..n {
+            let bytes = vec![fill_base + i as u8; 1024];
+            let sha = {
+                use sha2::{Digest, Sha256};
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&Sha256::digest(&bytes));
+                out
+            };
+            engine
+                .put_blob_signing(
+                    &sha,
+                    BlobBody::Inline(bytes),
+                    media_type,
+                    &derived,
+                    chrono::Utc::now(),
+                    uuid::Uuid::new_v4(),
+                )
+                .await
+                .expect("put_blob_signing typed blob");
+            shas.push(sha);
+        }
+        shas
+    }
+
+    /// Backend-agnostic `has_blob`.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn blob_present(engine: &Engine, sha: &[u8; 32]) -> bool {
+        use crate::federation::BlobStorage;
+        #[cfg(feature = "sqlite")]
+        if let Some(sq) = engine.sqlite_backend() {
+            return sq.has_blob(sha).await.expect("has_blob");
+        }
+        #[cfg(feature = "postgres")]
+        if let Some(pg) = engine.postgres_backend() {
+            return pg.has_blob(sha).await.expect("has_blob");
+        }
+        panic!("no durable backend on this engine");
+    }
+
+    /// Backend-agnostic access-count heater (each `get_blob` bumps V053
+    /// access tracking, raising the decay score).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn heat_blob(engine: &Engine, sha: &[u8; 32], hits: usize) {
+        use crate::federation::BlobStorage;
+        for _ in 0..hits {
+            #[cfg(feature = "sqlite")]
+            if let Some(sq) = engine.sqlite_backend() {
+                let _ = sq.get_blob(sha).await.expect("get_blob");
+                continue;
+            }
+            #[cfg(feature = "postgres")]
+            if let Some(pg) = engine.postgres_backend() {
+                let _ = pg.get_blob(sha).await.expect("get_blob");
+                continue;
+            }
+            #[allow(unreachable_code)]
+            {
+                panic!("no durable backend on this engine");
+            }
+        }
+    }
+
+    /// #370 §Q B5 shared body — CACHE BEFORE PINNED. 3 COLD pinned
+    /// (`media_type = "trace"`) + 3 HOT unpinned blobs: under the standard
+    /// decay order the cold pinned rows would be the victims; with the
+    /// budget installed, the sweep must shed all 3 unpinned (hot!) rows
+    /// first and hold every pinned row above the `pin_reserve_bytes` floor.
+    ///
+    /// Budget math: 6 × 1 KiB stored, watermark = 4 KiB × 0.5 = 2 KiB ⇒
+    /// target_freed = 4 KiB. Unpinned frees 3 KiB, then the pinned floor
+    /// (3 KiB reserve == pinned bytes held) blocks every pinned eviction —
+    /// the sweep deliberately ends SHORT of target (the pin doing its job).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn run_b5_unpinned_before_pinned(engine: &Engine) {
+        let pinned = seed_typed_blobs(engine, Some("trace"), 0x10, 3).await;
+        let unpinned = seed_typed_blobs(engine, None, 0x40, 3).await;
+        for sha in &unpinned {
+            heat_blob(engine, sha, 20).await;
+        }
+        let id = qshape_id();
+        let (ed_pub, mldsa_pub) = qshape_pubs(&id);
+        let wire = qshape_budget_wire(&id, "n-b5-order", 1, &["trace"], 3 * 1024);
+        engine
+            .install_storage_budget_v1(&wire, &ed_pub, &mldsa_pub)
+            .await
+            .expect("install the pin");
+
+        let report = engine.sweep_evictions_once().await.expect("B5 sweep");
+        assert_eq!(
+            report.rows_evicted, 3,
+            "exactly the 3 unpinned rows evicted: {report:?}"
+        );
+        for sha in &unpinned {
+            assert!(
+                !blob_present(engine, sha).await,
+                "unpinned (cache) content evicts FIRST, even when hot (§Q B5)"
+            );
+        }
+        for sha in &pinned {
+            assert!(
+                blob_present(engine, sha).await,
+                "pinned content survives capacity pressure above the reserve floor (§Q B5)"
+            );
+        }
+    }
+
+    /// #370 §Q B5 shared body — once unpinned is exhausted, pinned content
+    /// DOES descend under continued capacity pressure, but only down to the
+    /// `pin_reserve_bytes` floor.
+    ///
+    /// Budget math: 3 pinned + 2 unpinned × 1 KiB = 5 KiB stored, watermark
+    /// = 1 KiB × 0.5 = 512 B ⇒ target_freed ≈ 4.5 KiB. Unpinned frees
+    /// 2 KiB; pinned then sheds until held-pinned would drop below the
+    /// 1 KiB reserve ⇒ exactly 2 of 3 pinned evicted, 1 held at the floor.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn run_b5_reserve_floor(engine: &Engine) {
+        let pinned = seed_typed_blobs(engine, Some("trace"), 0x10, 3).await;
+        let unpinned = seed_typed_blobs(engine, None, 0x40, 2).await;
+        let id = qshape_id();
+        let (ed_pub, mldsa_pub) = qshape_pubs(&id);
+        let wire = qshape_budget_wire(&id, "n-b5-floor", 1, &["trace"], 1024);
+        engine
+            .install_storage_budget_v1(&wire, &ed_pub, &mldsa_pub)
+            .await
+            .expect("install the pin");
+
+        let report = engine.sweep_evictions_once().await.expect("B5 sweep");
+        for sha in &unpinned {
+            assert!(
+                !blob_present(engine, sha).await,
+                "unpinned evicts before any pinned row (§Q B5)"
+            );
+        }
+        let mut pinned_surviving = 0usize;
+        for sha in &pinned {
+            if blob_present(engine, sha).await {
+                pinned_surviving += 1;
+            }
+        }
+        assert_eq!(
+            pinned_surviving, 1,
+            "pinned descends only to the pin_reserve_bytes floor (1 KiB): {report:?}"
+        );
+        assert_eq!(report.rows_evicted, 4, "2 unpinned + 2 pinned: {report:?}");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sweeper_b5_evicts_unpinned_before_pinned_sqlite() {
+        let cfg = crate::federation::ReplicationConfig {
+            storage_budget_bytes: 4 * 1024,
+            steady_state_utilization: 0.5,
+            eviction_decay_half_life_days: 365.0,
+            ..Default::default()
+        };
+        let (engine, _shas) = sweeper_seed_blobs(cfg, 0).await;
+        run_b5_unpinned_before_pinned(&engine).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sweeper_b5_holds_pin_reserve_floor_sqlite() {
+        let cfg = crate::federation::ReplicationConfig {
+            storage_budget_bytes: 1024,
+            steady_state_utilization: 0.5,
+            eviction_decay_half_life_days: 365.0,
+            ..Default::default()
+        };
+        let (engine, _shas) = sweeper_seed_blobs(cfg, 0).await;
+        run_b5_reserve_floor(&engine).await;
+    }
+
+    /// Create an ISOLATED database on the PG twin (the sweep ranks the
+    /// WHOLE `federation_blobs` table, so byte-exact ordering assertions
+    /// cannot self-isolate by uuid the way row-keyed tests do). Returns
+    /// `(dsn, db_name)`; `None` (skip) when the twin is unset.
+    #[cfg(feature = "postgres")]
+    async fn pg_isolated_db(tag: &str) -> Option<(String, String)> {
+        let Ok(base) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return None;
+        };
+        let db = format!("persist_370_{}_{}", tag, uuid::Uuid::new_v4().simple());
+        let (client, conn) = tokio_postgres::connect(&base, tokio_postgres::NoTls)
+            .await
+            .expect("admin connect to PG twin");
+        let conn_handle = tokio::spawn(conn);
+        client
+            .execute(format!("CREATE DATABASE {db}").as_str(), &[])
+            .await
+            .expect("create isolated database");
+        drop(client);
+        conn_handle.abort();
+        let (prefix, _) = base.rsplit_once('/').expect("dsn has a database path");
+        Some((format!("{prefix}/{db}"), db))
+    }
+
+    /// Best-effort drop of the isolated database (FORCE terminates any
+    /// pool connection the dropped Engine hasn't torn down yet).
+    #[cfg(feature = "postgres")]
+    async fn pg_drop_isolated_db(db: &str) {
+        let Ok(base) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            return;
+        };
+        if let Ok((client, conn)) = tokio_postgres::connect(&base, tokio_postgres::NoTls).await {
+            let conn_handle = tokio::spawn(conn);
+            let _ = client
+                .execute(format!("DROP DATABASE {db} WITH (FORCE)").as_str(), &[])
+                .await;
+            drop(client);
+            conn_handle.abort();
+        }
+    }
+
+    /// PG twin of `sweeper_seed_blobs`'s engine setup: replication config +
+    /// the local signer's DERIVED federation key registered.
+    #[cfg(feature = "postgres")]
+    async fn sweeper_engine_pg(cfg: crate::federation::ReplicationConfig, dsn: &str) -> Engine {
+        use crate::federation::FederationDirectory;
+        let signer = test_signer();
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_replication_config(signer, dsn, cfg)
+            .await
+            .expect("construct postgres engine");
+        let pg = engine.postgres_backend().expect("postgres present");
+        pg.put_public_key(sweeper_test_key_derived_for(
+            &derived,
+            "test-engine-steward",
+        ))
+        .await
+        .expect("seed signer key");
+        engine
+    }
+
+    /// #370 §Q B5 on Postgres — same shared body as the SQLite twin, on an
+    /// isolated database (whole-table sweep). Skips when the twin is unset.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn sweeper_b5_evicts_unpinned_before_pinned_postgres() {
+        let Some((dsn, db)) = pg_isolated_db("b5order").await else {
+            return;
+        };
+        {
+            let cfg = crate::federation::ReplicationConfig {
+                storage_budget_bytes: 4 * 1024,
+                steady_state_utilization: 0.5,
+                eviction_decay_half_life_days: 365.0,
+                ..Default::default()
+            };
+            let engine = sweeper_engine_pg(cfg, &dsn).await;
+            run_b5_unpinned_before_pinned(&engine).await;
+        }
+        pg_drop_isolated_db(&db).await;
+    }
+
+    /// #370 §Q B5 reserve floor on Postgres (isolated database).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn sweeper_b5_holds_pin_reserve_floor_postgres() {
+        let Some((dsn, db)) = pg_isolated_db("b5floor").await else {
+            return;
+        };
+        {
+            let cfg = crate::federation::ReplicationConfig {
+                storage_budget_bytes: 1024,
+                steady_state_utilization: 0.5,
+                eviction_decay_half_life_days: 365.0,
+                ..Default::default()
+            };
+            let engine = sweeper_engine_pg(cfg, &dsn).await;
+            run_b5_reserve_floor(&engine).await;
+        }
+        pg_drop_isolated_db(&db).await;
     }
 
     // ─── v6.8.0 (CIRISPersist#149) — proactive disk-pressure ENFORCEMENT ───

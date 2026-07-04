@@ -1686,6 +1686,85 @@ impl Backend for PostgresBackend {
         Ok(out)
     }
 
+    // ─── v12.7.0 — §Q pin-INSTALL surface (CIRISPersist#370) ─────────
+
+    async fn put_installed_storage_budget(
+        &self,
+        budget: &crate::fountain::storage_contention::InstalledStorageBudget,
+    ) -> Result<bool, Error> {
+        let revision = i64::try_from(budget.revision)
+            .map_err(|_| Error::Backend("storage budget revision exceeds i64".into()))?;
+        let scopes = serde_json::to_value(&budget.scopes)
+            .map_err(|e| Error::Backend(format!("serialize budget scopes: {e}")))?;
+        let pinned_class = serde_json::to_value(&budget.pinned_class)
+            .map_err(|e| Error::Backend(format!("serialize budget pinned_class: {e}")))?;
+        let wire: serde_json::Value = serde_json::from_str(&budget.wire_json)
+            .map_err(|e| Error::Backend(format!("parse budget wire json: {e}")))?;
+        let client = self.get_client().await?;
+        // §Q B3 anti-rollback, ATOMIC at the row: the DO UPDATE only fires
+        // when the incoming revision is STRICTLY higher; rows_affected == 0
+        // ⇒ refused (the Engine surfaces RevisionRollback).
+        let n = client
+            .execute(
+                "INSERT INTO cirislens.storage_budget_installed (\
+                     node_id, revision, epoch_id, scopes, pinned_class, wire, installed_at\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7) \
+                 ON CONFLICT (node_id) DO UPDATE SET \
+                     revision = EXCLUDED.revision, \
+                     epoch_id = EXCLUDED.epoch_id, \
+                     scopes = EXCLUDED.scopes, \
+                     pinned_class = EXCLUDED.pinned_class, \
+                     wire = EXCLUDED.wire, \
+                     installed_at = EXCLUDED.installed_at \
+                 WHERE storage_budget_installed.revision < EXCLUDED.revision",
+                &[
+                    &budget.node_id,
+                    &revision,
+                    &budget.epoch_id,
+                    &scopes,
+                    &pinned_class,
+                    &wire,
+                    &budget.installed_at,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("put_installed_storage_budget: {e}")))?;
+        Ok(n > 0)
+    }
+
+    async fn get_installed_storage_budget(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<crate::fountain::storage_contention::InstalledStorageBudget>, Error> {
+        let client = self.get_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT node_id, revision, epoch_id, scopes, pinned_class, wire, installed_at \
+                 FROM cirislens.storage_budget_installed WHERE node_id = $1",
+                &[&node_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("get_installed_storage_budget: {e}")))?;
+        row.map(pg_row_to_installed_storage_budget).transpose()
+    }
+
+    async fn list_installed_storage_budgets(
+        &self,
+    ) -> Result<Vec<crate::fountain::storage_contention::InstalledStorageBudget>, Error> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT node_id, revision, epoch_id, scopes, pinned_class, wire, installed_at \
+                 FROM cirislens.storage_budget_installed ORDER BY node_id ASC",
+                &[],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("list_installed_storage_budgets: {e}")))?;
+        rows.into_iter()
+            .map(pg_row_to_installed_storage_budget)
+            .collect()
+    }
+
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
 
     async fn put_aggregated_tier(
@@ -1850,6 +1929,33 @@ impl Backend for PostgresBackend {
             .map_err(|e| Error::Backend(format!("list content_aggregation: {e}")))?;
         rows.iter().map(Self::aggregation_record_from_row).collect()
     }
+}
+
+/// #370 — decode one `storage_budget_installed` row. The `wire` JSONB is
+/// re-serialized to the `wire_json` string (round-trips losslessly — JSONB
+/// key order is not signed material; the signatures verify over the CC
+/// 6.1.3 binary preimage rebuilt from the FIELDS, not over the JSON text).
+fn pg_row_to_installed_storage_budget(
+    row: tokio_postgres::Row,
+) -> Result<crate::fountain::storage_contention::InstalledStorageBudget, Error> {
+    let revision: i64 = row.safe_get_with("revision", Error::Backend)?;
+    let scopes: serde_json::Value = row.safe_get_with("scopes", Error::Backend)?;
+    let pinned_class: serde_json::Value = row.safe_get_with("pinned_class", Error::Backend)?;
+    let wire: serde_json::Value = row.safe_get_with("wire", Error::Backend)?;
+    Ok(
+        crate::fountain::storage_contention::InstalledStorageBudget {
+            node_id: row.safe_get_with("node_id", Error::Backend)?,
+            revision: u64::try_from(revision)
+                .map_err(|_| Error::Backend("installed budget revision negative".into()))?,
+            epoch_id: row.safe_get_with("epoch_id", Error::Backend)?,
+            scopes: serde_json::from_value(scopes)
+                .map_err(|e| Error::Backend(format!("decode budget scopes: {e}")))?,
+            pinned_class: serde_json::from_value(pinned_class)
+                .map_err(|e| Error::Backend(format!("decode budget pinned_class: {e}")))?,
+            wire_json: wire.to_string(),
+            installed_at: row.safe_get_with("installed_at", Error::Backend)?,
+        },
+    )
 }
 
 // ─── Pipeline read surface (v0.6.0-α5, CIRISPersist#19) ───────────
@@ -9054,7 +9160,7 @@ impl PostgresBackend {
             .map_err(|e| crate::federation::BlobError::Backend(format!("pool get: {e}")))?;
         let rows = client
             .query(
-                "SELECT sha256, size_bytes, access_count, last_accessed_at \
+                "SELECT sha256, size_bytes, access_count, last_accessed_at, media_type \
                  FROM cirislens.federation_blobs \
                  ORDER BY \
                    (access_count + 1)::float8 * \
@@ -9084,6 +9190,8 @@ impl PostgresBackend {
                 row.safe_get_with("access_count", crate::federation::BlobError::Backend)?;
             let last_accessed_at: chrono::DateTime<chrono::Utc> =
                 row.safe_get_with("last_accessed_at", crate::federation::BlobError::Backend)?;
+            let media_type: Option<String> =
+                row.safe_get_with("media_type", crate::federation::BlobError::Backend)?;
             out.push(crate::federation::EvictionCandidate {
                 sha256: sha,
                 size_bytes: size_bytes.max(0) as u64,
@@ -9093,9 +9201,43 @@ impl PostgresBackend {
                 // the signer's holds_bytes index (no attesting_key_id
                 // column on federation_blobs).
                 attesting_key_id: None,
+                // v12.7.0 (§Q B5, #370): the corpus-class token the
+                // Engine matches against the installed pinned_class set.
+                media_type,
             });
         }
         Ok(out)
+    }
+
+    /// v12.7.0 (§Q B5 / CIRISPersist#370) — total bytes currently held by
+    /// blobs whose `media_type` is one of `media_types` (the installed
+    /// `pinned_class` set). This is the §Q "consumption accounting is
+    /// edge-internal — recomputed from held content" number the sweep uses
+    /// to hold the `pin_reserve_bytes` floor; it is NEVER taken from the
+    /// wire. Empty set ⇒ 0.
+    pub async fn pinned_blob_bytes(
+        &self,
+        media_types: &[String],
+    ) -> Result<u64, crate::federation::BlobError> {
+        if media_types.is_empty() {
+            return Ok(0);
+        }
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("pool get: {e}")))?;
+        let row = client
+            .query_one(
+                "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT AS total \
+                 FROM cirislens.federation_blobs WHERE media_type = ANY($1)",
+                &[&media_types],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("pinned_blob_bytes query: {e}"))
+            })?;
+        let total: i64 = row.safe_get_with("total", crate::federation::BlobError::Backend)?;
+        Ok(total.max(0) as u64)
     }
 
     /// v3.4.0 (CIRISPersist#123) — delete one `federation_blobs` row
