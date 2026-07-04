@@ -360,6 +360,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence,
+            consent_role: None,
         };
         if drop_pqc {
             // A hybrid-pending row also drops the PQC pubkey.

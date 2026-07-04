@@ -358,6 +358,7 @@ pub(crate) mod test_support {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         dir.put_public_key(crate::federation::SignedKeyRecord { record: rec })
             .await
@@ -485,6 +486,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         dir.put_public_key(SignedKeyRecord { record: rec })
             .await

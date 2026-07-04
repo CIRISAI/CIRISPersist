@@ -1675,6 +1675,17 @@ impl FederationDirectory for OpsDirectory {
             method: "lookup_keys_for_identity",
         })
     }
+    async fn set_consent_role(
+        &self,
+        _key_id: &str,
+        _consent_role: Option<&str>,
+    ) -> Result<(), Error> {
+        // v12.7.0 (CIRISPersist#365) — no DirectoryOp in the capsule
+        // protocol carries consent_role mutation; not routable here.
+        Err(Error::Unsupported {
+            method: "set_consent_role",
+        })
+    }
     async fn attestation_upsert_local(
         &self,
         input: crate::federation::types::LocalAttestationInput,
@@ -2171,6 +2182,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         }
     }
 

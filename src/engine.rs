@@ -1754,6 +1754,7 @@ impl Engine {
             persist_row_hash: String::new(),
             roles,
             attestation_evidence: None,
+            consent_role: None,
         };
         let signed = crate::federation::SignedKeyRecord { record };
 
@@ -5803,6 +5804,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         sq.put_public_key(SignedKeyRecord {
             record: suspect_key,
@@ -6157,6 +6159,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         pg.put_public_key(SignedKeyRecord { record: suspect })
             .await
@@ -6819,6 +6822,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         pg.put_public_key(crate::federation::SignedKeyRecord { record: key_record })
             .await
@@ -6909,6 +6913,7 @@ mod tests {
                 persist_row_hash: String::new(),
                 roles: Vec::new(),
                 attestation_evidence: None,
+                consent_role: None,
             },
         }
     }
@@ -7590,6 +7595,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         sq.put_public_key(SignedKeyRecord { record }).await.unwrap();
     }
@@ -7758,6 +7764,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         pg.put_public_key(SignedKeyRecord { record }).await.unwrap();
 
@@ -8195,6 +8202,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         sq.put_public_key(SignedKeyRecord { record })
             .await
@@ -9851,6 +9859,7 @@ mod tests {
                 persist_row_hash: String::new(),
                 roles: Vec::new(),
                 attestation_evidence: None,
+                consent_role: None,
             },
         })
         .await

@@ -768,6 +768,7 @@ mod tests {
                 persist_row_hash: String::new(),
                 roles: Vec::new(),
                 attestation_evidence: None,
+                consent_role: None,
             },
         }
     }

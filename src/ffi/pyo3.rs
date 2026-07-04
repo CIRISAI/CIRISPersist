@@ -7531,6 +7531,107 @@ impl PyEngine {
         })
     }
 
+    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — resolve the
+    /// **Counter-RII `consent_role`** of `key_id`. Returns a JSON string: the
+    /// assigned role token (`"temporary"` / `"partnered"` / `"anonymous"` /
+    /// `"authorized_review"` / `"peer"` — the V020 vocabulary CC 3.4.7.2
+    /// ratifies), or `null` when the key has no assigned role (the stored
+    /// `'unregistered'` default, or the key is absent — all "no assigned
+    /// role": detection applies normally). Wraps
+    /// [`consent_role_of`](crate::federation::consent::consent_role_of). Persist
+    /// STORES + EXPOSES the role; the OQ-2 (`peer` blanket suppression) and
+    /// OQ-3 (`authorized_review` strict post-window) detection *signals* are
+    /// applied by the consumer (edge `ProbePatternObserver` / RATCHET) reading
+    /// this — persist houses no Counter-RII detector.
+    fn consent_role_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(move || {
+                let role: Option<String> = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::consent::consent_role_of(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::consent::consent_role_of(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&role)
+                    .map_err(|e| PyValueError::new_err(format!("consent_role serialize: {e}")))
+            })
+        })
+    }
+
+    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — assign or **overwrite** the
+    /// Counter-RII `consent_role` of `key_id`. `consent_role=None` revokes it
+    /// (resets the V020 column to its `'unregistered'` default). This is the
+    /// OQ-1 non-recursive overwrite: a subsequent call overwrites the single
+    /// flat column (no chain embedded in the field). Raises `ValueError` if
+    /// `key_id` has no `federation_keys` row, or if the token is not one of
+    /// the ratified vocabulary (`temporary` / `partnered` / `anonymous` /
+    /// `authorized_review` / `peer` — same rejection on BOTH backends).
+    #[pyo3(signature = (key_id, consent_role=None))]
+    fn set_consent_role(
+        &self,
+        py: Python<'_>,
+        key_id: &str,
+        consent_role: Option<&str>,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            let role: Option<String> = consent_role.map(str::to_owned);
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::set_consent_role(
+                            &*backend,
+                            &key_id,
+                            role.as_deref(),
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::set_consent_role(
+                            &*backend,
+                            &key_id,
+                            role.as_deref(),
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+            })
+        })
+    }
+
     /// v11.9.0 (CIRISPersist#309, CC 3.4.12) — the resolved **capacity state**
     /// of `key_id` for decision-`domain`, from its incoming witness
     /// `capacity_assurance:*:{domain}:*` attestations (most-recent live wins,
@@ -26302,6 +26403,7 @@ mod tests {
                     persist_row_hash: String::new(),
                     roles: Vec::new(),
                     attestation_evidence: None,
+                    consent_role: None,
                 },
             })
             .await

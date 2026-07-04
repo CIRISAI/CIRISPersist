@@ -2127,6 +2127,13 @@ impl PostgresBackend {
             } else {
                 Some(&row.roles)
             };
+            // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — wire None ⇔ the
+            // stored V020 'unregistered' default (column is NOT NULL).
+            crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
+            let consent_role_stored = crate::federation::types::consent_role::stored_from_wire(
+                row.consent_role.as_deref(),
+            )
+            .to_owned();
             client
                 .execute(
                     "INSERT INTO cirislens.federation_keys (\
@@ -2134,8 +2141,8 @@ impl PostgresBackend {
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                        attestation_evidence\
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+                        attestation_evidence, consent_role\
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
                      ON CONFLICT (key_id) DO NOTHING",
                     &[
                         &row.key_id,
@@ -2156,6 +2163,7 @@ impl PostgresBackend {
                         &row.persist_row_hash,
                         &roles_param,
                         &row.attestation_evidence,
+                        &consent_role_stored,
                     ],
                 )
                 .await
@@ -2233,6 +2241,12 @@ impl PostgresBackend {
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         // WHERE re-asserts the guards atomically: self-signed + same pubkey.
+        //
+        // v12.7.0 (CIRISPersist#365, CC 3.4.7.2): `consent_role` is
+        // deliberately NOT in the SET list — it is an operational role
+        // marker (its OQ-1 overwrite surface is `set_consent_role`), not
+        // registration content; an anchor-scrub upgrade must not clobber
+        // an assigned role.
         let n = client
             .execute(
                 "UPDATE cirislens.federation_keys SET \
@@ -2343,6 +2357,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         } else {
             Some(&row.roles)
         };
+        // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — admission-gate the
+        // token (Rust-level, so PG's V020 CHECK and CHECK-less SQLite
+        // behave identically), then map wire None ⇔ the stored V020
+        // 'unregistered' default (the column is NOT NULL).
+        crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
+        let consent_role_stored =
+            crate::federation::types::consent_role::stored_from_wire(row.consent_role.as_deref())
+                .to_owned();
         let result = client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
@@ -2350,8 +2372,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+                    attestation_evidence, consent_role\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
                  ON CONFLICT (key_id) DO NOTHING",
                 &[
                     &row.key_id,
@@ -2372,6 +2394,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.persist_row_hash,
                     &roles_param,
                     &row.attestation_evidence,
+                    &consent_role_stored,
                 ],
             )
             .await
@@ -2415,7 +2438,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence \
+                    attestation_evidence, consent_role \
                  FROM cirislens.federation_keys WHERE key_id = $1",
                 &[&key_id],
             )
@@ -2440,7 +2463,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence \
+                    attestation_evidence, consent_role \
                  FROM cirislens.federation_keys WHERE identity_ref = $1",
                 &[&identity_ref],
             )
@@ -2470,7 +2493,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence \
+                    attestation_evidence, consent_role \
                  FROM cirislens.federation_keys WHERE identity_type = $1 \
                  ORDER BY key_id",
                 &[&identity_type],
@@ -2480,6 +2503,40 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::Error::Backend(format!("list_keys_by_identity_type: {e}"))
             })?;
         rows.into_iter().map(pg_row_to_key_record).collect()
+    }
+
+    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — overwrite-on-revoke
+    /// consent_role. Flat UPDATE of the single V020 column; `None` resets
+    /// to the stored `'unregistered'` default (revoke). No chain — a
+    /// subsequent call overwrites. Excluded from `persist_row_hash`, so
+    /// this does not touch the signed row.
+    async fn set_consent_role(
+        &self,
+        key_id: &str,
+        consent_role: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::types::consent_role::check_admissible(consent_role)?;
+        let stored =
+            crate::federation::types::consent_role::stored_from_wire(consent_role).to_owned();
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_keys SET consent_role = $2 WHERE key_id = $1",
+                &[&key_id, &stored],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("set_consent_role {key_id}: {e}"))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "set_consent_role: no federation_keys row for {key_id}"
+            )));
+        }
+        Ok(())
     }
 
     async fn put_attestation(
@@ -6109,6 +6166,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         key.persist_row_hash = crate::federation::types::compute_persist_row_hash(&key)?;
 
@@ -6145,14 +6203,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ))
         })?;
         let roles_param: Option<&Vec<String>> = None;
+        // v12.7.0 (CIRISPersist#365) — wire None ⇔ stored 'unregistered'.
+        let consent_role_stored =
+            crate::federation::types::consent_role::stored_from_wire(key.consent_role.as_deref())
+                .to_owned();
         tx.execute(
             "INSERT INTO cirislens.federation_keys (\
                 key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                 identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                 original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                 scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                attestation_evidence\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+                attestation_evidence, consent_role\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
              ON CONFLICT (key_id) DO NOTHING",
             &[
                 &key.key_id,
@@ -6173,6 +6235,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 &key.persist_row_hash,
                 &roles_param,
                 &key.attestation_evidence,
+                &consent_role_stored,
             ],
         )
         .await
@@ -9933,6 +9996,18 @@ fn pg_row_to_key_record(
         .try_get::<_, Option<serde_json::Value>>("attestation_evidence")
         .ok()
         .flatten();
+    // v12.7.0 (CIRISPersist#365, CC 3.4.7.2): consent_role is the V020
+    // `TEXT NOT NULL DEFAULT 'unregistered'` column. Tolerant read
+    // (matching roles/attestation_evidence above) — a SELECT that didn't
+    // pull the column maps to None, and the stored 'unregistered'
+    // default maps to wire None (`consent_role::wire_from_stored`).
+    let consent_role: Option<String> = row
+        .try_get::<_, Option<String>>("consent_role")
+        .ok()
+        .flatten()
+        .as_deref()
+        .and_then(crate::federation::types::consent_role::wire_from_stored)
+        .map(str::to_owned);
     Ok(crate::federation::KeyRecord {
         key_id: row.safe_get_with("key_id", mk_err)?,
         pubkey_ed25519_base64: row.safe_get_with("pubkey_ed25519_base64", mk_err)?,
@@ -9952,6 +10027,7 @@ fn pg_row_to_key_record(
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
         roles,
         attestation_evidence,
+        consent_role,
     })
 }
 
@@ -12514,7 +12590,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    attestation_evidence \
+                    attestation_evidence, consent_role \
              FROM cirislens.federation_keys \
              {where_sql} \
              ORDER BY valid_from DESC, key_id DESC \
@@ -17669,7 +17745,73 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         }
+    }
+
+    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — consent_role round-trips
+    /// through put/lookup, OQ-1 overwrite-on-revoke via set_consent_role,
+    /// and the consent_role_of resolver — on the Postgres twin. Gated on a
+    /// live test PG (skips when `CIRIS_PERSIST_TEST_PG_URL` is unset).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn consent_role_round_trip_overwrite_and_resolver_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::consent::consent_role_of;
+        use crate::federation::types::consent_role;
+        use crate::federation::FederationDirectory;
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let kid = format!("k-cr-{}", uuid_like());
+
+        // Born with consent_role = peer → round-trips.
+        let mut key = fix_section_i_key(&kid, "primitive-cr", now, true);
+        key.consent_role = Some(consent_role::PEER.into());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord { record: key })
+            .await
+            .unwrap();
+        let got = FederationDirectory::lookup_public_key(&backend, &kid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.consent_role.as_deref(), Some(consent_role::PEER));
+        assert_eq!(
+            consent_role_of(&backend, &kid).await.unwrap().as_deref(),
+            Some(consent_role::PEER)
+        );
+
+        // OQ-1 overwrite → authorized_review.
+        FederationDirectory::set_consent_role(
+            &backend,
+            &kid,
+            Some(consent_role::AUTHORIZED_REVIEW),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            consent_role_of(&backend, &kid).await.unwrap().as_deref(),
+            Some(consent_role::AUTHORIZED_REVIEW)
+        );
+
+        // Revoke (overwrite to None).
+        FederationDirectory::set_consent_role(&backend, &kid, None)
+            .await
+            .unwrap();
+        assert_eq!(consent_role_of(&backend, &kid).await.unwrap(), None);
+
+        // Unknown key: setter errors, resolver stays total.
+        let missing = format!("k-cr-missing-{}", uuid_like());
+        assert!(
+            FederationDirectory::set_consent_role(&backend, &missing, Some("peer"))
+                .await
+                .is_err()
+        );
+        assert_eq!(consent_role_of(&backend, &missing).await.unwrap(), None);
     }
 
     /// V060 community substrate round-trip on Postgres — parity with
@@ -26264,6 +26406,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         backend
             .put_public_key(crate::federation::SignedKeyRecord { record })
@@ -27121,6 +27264,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         }
     }
 

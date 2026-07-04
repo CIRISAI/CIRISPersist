@@ -520,6 +520,7 @@ impl MemoryBackend {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         state.federation_keys.insert(key_id.to_owned(), rec);
         // Keep the legacy map populated too — some tests still
@@ -1214,6 +1215,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         record: crate::federation::SignedKeyRecord,
     ) -> Result<(), crate::federation::Error> {
         let mut row = record.record;
+        // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — same consent_role
+        // admission gate + 'unregistered'⇔None normalization as the SQL
+        // backends (a stored-form 'unregistered' submitted on the wire
+        // reads back as None everywhere).
+        crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
+        row.consent_role = row
+            .consent_role
+            .as_deref()
+            .and_then(crate::federation::types::consent_role::wire_from_stored)
+            .map(str::to_owned);
         // Server-computed hash (excludes the field itself).
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let mut state = self.state.lock().expect("memory backend lock");
@@ -1268,6 +1279,33 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .collect();
         rows.sort_by(|a, b| a.key_id.cmp(&b.key_id));
         Ok(rows)
+    }
+
+    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — overwrite-on-revoke
+    /// consent_role. `None` revokes (back to the unset/'unregistered'
+    /// default). No chain; a subsequent call overwrites. `consent_role`
+    /// is excluded from `persist_row_hash`, so mutating it does not
+    /// change the stored row's hash. Same admission gate +
+    /// 'unregistered'⇔None normalization as the SQL backends.
+    async fn set_consent_role(
+        &self,
+        key_id: &str,
+        consent_role: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::types::consent_role::check_admissible(consent_role)?;
+        let normalized: Option<String> = consent_role
+            .and_then(crate::federation::types::consent_role::wire_from_stored)
+            .map(str::to_owned);
+        let mut state = self.state.lock().expect("memory backend lock");
+        match state.federation_keys.get_mut(key_id) {
+            Some(row) => {
+                row.consent_role = normalized;
+                Ok(())
+            }
+            None => Err(crate::federation::Error::InvalidArgument(format!(
+                "set_consent_role: no federation_keys row for {key_id}"
+            ))),
+        }
     }
 
     async fn put_attestation(
@@ -3379,6 +3417,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 persist_row_hash: String::new(),
                 roles: Vec::new(),
                 attestation_evidence: None,
+                consent_role: None,
             };
             // persist_row_hash filled in inline (mirrors put_public_key)
             let mut to_insert = key;
@@ -4731,6 +4770,92 @@ mod tests {
         assert_eq!(got.to_bytes(), vkey.to_bytes());
     }
 
+    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — consent_role round-trip,
+    /// OQ-1 overwrite-on-revoke via set_consent_role, and the
+    /// consent_role_of resolver, on the memory backend.
+    #[tokio::test]
+    async fn consent_role_round_trip_overwrite_and_resolver_memory() {
+        use crate::federation::consent::consent_role_of;
+        use crate::federation::types::consent_role;
+        let backend = MemoryBackend::new();
+
+        // Born with consent_role = peer → round-trips through put/lookup.
+        let mut key = fix_key("k-cr", "primitive-cr", "k-cr");
+        key.consent_role = Some(consent_role::PEER.into());
+        crate::federation::FederationDirectory::put_public_key(
+            &backend,
+            crate::federation::SignedKeyRecord { record: key },
+        )
+        .await
+        .unwrap();
+        let got = crate::federation::FederationDirectory::lookup_public_key(&backend, "k-cr")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.consent_role.as_deref(), Some(consent_role::PEER));
+        assert_eq!(
+            consent_role_of(&backend, "k-cr").await.unwrap().as_deref(),
+            Some(consent_role::PEER)
+        );
+
+        // OQ-1 overwrite → authorized_review (flat, non-recursive).
+        crate::federation::FederationDirectory::set_consent_role(
+            &backend,
+            "k-cr",
+            Some(consent_role::AUTHORIZED_REVIEW),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            consent_role_of(&backend, "k-cr").await.unwrap().as_deref(),
+            Some(consent_role::AUTHORIZED_REVIEW)
+        );
+
+        // Revoke (overwrite to None).
+        crate::federation::FederationDirectory::set_consent_role(&backend, "k-cr", None)
+            .await
+            .unwrap();
+        assert_eq!(consent_role_of(&backend, "k-cr").await.unwrap(), None);
+
+        // Unknown key: setter errors, resolver stays total (Ok(None)).
+        assert!(crate::federation::FederationDirectory::set_consent_role(
+            &backend,
+            "k-missing",
+            Some("peer")
+        )
+        .await
+        .is_err());
+        assert_eq!(consent_role_of(&backend, "k-missing").await.unwrap(), None);
+
+        // Unrecognized token: rejected at admission (backend-symmetric).
+        assert!(crate::federation::FederationDirectory::set_consent_role(
+            &backend,
+            "k-cr",
+            Some("emperor")
+        )
+        .await
+        .is_err());
+
+        // The literal stored default 'unregistered' normalizes to wire
+        // None on set (stored/wire forms cohere).
+        crate::federation::FederationDirectory::set_consent_role(
+            &backend,
+            "k-cr",
+            Some(consent_role::UNREGISTERED),
+        )
+        .await
+        .unwrap();
+        assert_eq!(consent_role_of(&backend, "k-cr").await.unwrap(), None);
+
+        // consent_role does NOT enter persist_row_hash (OQ-1 exclusion).
+        let mut a = fix_key("k-hash", "primitive-cr", "k-hash");
+        a.consent_role = None;
+        let h0 = crate::federation::types::compute_persist_row_hash(&a).unwrap();
+        a.consent_role = Some(consent_role::PARTNERED.into());
+        let h1 = crate::federation::types::compute_persist_row_hash(&a).unwrap();
+        assert_eq!(h0, h1, "consent_role must not affect persist_row_hash");
+    }
+
     /// Mission category §4 "Backend parity" (placeholder for the
     /// Phase-1.4 conformance suite): a decomposed CompleteTrace lands
     /// on the in-memory backend with the right row counts, dedup
@@ -4864,6 +4989,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         }
     }
 

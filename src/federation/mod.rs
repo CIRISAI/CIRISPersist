@@ -43,6 +43,7 @@ pub mod blobs;
 pub mod capacity;
 pub mod cohort;
 pub mod community_dek;
+pub mod consent;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
 pub mod genesis;
@@ -140,6 +141,7 @@ pub use blobs::{
     HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
+pub use consent::consent_role_of;
 pub use goal::{
     canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
     MetaGoalAlignment,
@@ -194,7 +196,7 @@ pub use topology::{
     DelegationGraph, EdgeType, FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology,
     WithdrawalEntry, MAX_DELEGATION_DEPTH,
 };
-pub use types::{device_class, identity_type};
+pub use types::{consent_role, device_class, identity_type};
 pub use types::{
     Attestation, Community, CommunityMember, CommunityMembershipRevocation, EmitAttestationInput,
     EncryptionPubkeys, Family, FamilyMember, FamilyMembershipRevocation, HybridPendingRow,
@@ -376,6 +378,35 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         identity_type: &str,
     ) -> Result<Vec<KeyRecord>, Error>;
+
+    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — assign
+    /// or **overwrite** the Counter-RII [`consent_role`](types::consent_role)
+    /// of `key_id`.
+    ///
+    /// This is the OQ-1 **non-recursive, overwrite-on-revoke** mutation
+    /// on the V020 `federation_keys.consent_role` column (the
+    /// CIRISAgent#760 §RC lock CC 3.4.7.2 ratifies): `Some(role)` sets
+    /// one of the six ratified tokens ([`types::consent_role::RECOGNIZED`]
+    /// — an unrecognized token is [`Error::InvalidArgument`] on EVERY
+    /// backend, keeping PG's schema CHECK and CHECK-less SQLite
+    /// symmetric); `None` revokes it back to the stored `'unregistered'`
+    /// default. There is NO chain — a subsequent call simply overwrites
+    /// the single flat column (chain history, if a deployment wants it,
+    /// lives in a separate audit surface, never embedded in this field).
+    /// `consent_role` is excluded from `persist_row_hash`, so the
+    /// overwrite does not disturb the signed registration row (and
+    /// `adopt_scrub_upgrade` never touches it). Returns
+    /// [`Error::InvalidArgument`] if `key_id` has no `federation_keys`
+    /// row.
+    ///
+    /// Persist's responsibility ends at STORE + EXPOSE + this overwrite.
+    /// The OQ-2 (`peer` blanket suppression) and OQ-3
+    /// (`authorized_review` strict post-window) *detection signals* are
+    /// applied by the consumer (edge `ProbePatternObserver` / RATCHET)
+    /// reading the role via [`consent::consent_role_of`] — persist houses
+    /// no Counter-RII detector.
+    async fn set_consent_role(&self, key_id: &str, consent_role: Option<&str>)
+        -> Result<(), Error>;
 
     // ── Attestations ───────────────────────────────────────────────
 
