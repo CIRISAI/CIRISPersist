@@ -41,6 +41,7 @@ pub mod admit;
 pub mod aggregation;
 pub mod eviction;
 pub mod retention;
+pub mod storage_contention;
 pub mod types;
 
 pub use admit::{

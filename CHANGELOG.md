@@ -5,6 +5,51 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [12.4.0] — 2026-07-04
+
+### Added — #356: StorageBudgetV1 / CorpusWantV1 build+verify on the wheel (CC 6.1.5.2 §Q)
+
+Re-pin **ciris-verify-core/keyring/crypto v8.6.0 → v8.7.0** (CIRISVerify#170 lifted
+the two §Q signed shapes into `ciris_verify_core::holonomic::storage_contention` —
+their canonical home, on the shared `Preimage` + `verify_bound_hybrid` gate).
+persist wraps them on the Python wheel (`src/fountain/storage_contention.rs` +
+six PyO3 methods) — it does NOT redefine the crypto:
+
+- **`Engine.build_storage_budget_v1(payload_json)`** / **`build_corpus_want_v1(...)`** —
+  parse + structurally validate a payload, bound-hybrid sign its CC 6.1.3 preimage
+  (Ed25519 over preimage, ML-DSA-65 over `preimage ‖ ed25519_sig`) with the engine's
+  local signer, return the signed wire JSON.
+- **`verify_storage_budget_v1(wire, ed_pub_b64, mldsa_pub_b64)`** / **`verify_corpus_want_v1(...)`** —
+  PQC-mandatory bound-hybrid verify at ingest: `True` iff structurally valid AND both
+  halves verify; `False` on a structural/signature failure; raises only on
+  un-parseable JSON/base64.
+- **`storage_budget_supersedes(candidate, existing)`** (§Q B3 anti-rollback: same
+  `node_id`, strictly-higher `revision`) and **`corpus_want_admits(wire, cid, bytes)`**
+  (§Q B4 wanted-then-pulled).
+
+Serde **wire** structs convert to the verify-core payload for preimage/verify
+(same split as `AggregationMetaVerifyInputsV1` wrapping `AggregationMetaV1`). These
+shapes are verified-at-ingest, **not stored** — there is no persist admit/put table.
+Wheel `Requires-Dist: ciris-verify>=8.0.0,<9` unchanged (minor bump within major 8).
+
+Downstream: CIRISConformance `test_530` anti-rollback + want/have gates flip;
+CIRISEdge#269 (drop edge's local reimplementation, consume verify v8.7.0). The
+third gate — **pin-never-defeats-revocation** (§Q B6/N5, composing a pin surface
+with `evict_fountain_content_hard_delete`) — is tracked as a follow-up (needs a
+stored-pin design decision) and does not gate this wheel surface.
+
+### Fixed — #354: catch_unwind the executor-capsule C-ABI spawn boundary (no host abort)
+
+`persist_spawn` is an `extern "C"` frame; since Rust 1.81 a panic unwinding out of
+it aborts the process (`"cannot catch foreign exceptions"` → SIGABRT). Wrap the
+whole body (handle reconstruction + `runtime.spawn`) in `catch_unwind`: a panic in
+the synchronous FFI glue is contained + logged, never crossing back into the
+consumer's `.so`. (The spawned future's own panics are already contained by tokio's
+task harness.) The postgres `init_edge_runtime` SIGABRT itself was the OLD edge
+raw-`block_on` path — fixed edge-side in CIRISEdge#268; this is the persist-side
+defense-in-depth the issue asked for. Test: a panicking spawned task followed by a
+normal one proves the executor + process survive.
+
 ## [12.3.0] — 2026-07-03
 
 ### Fixed — #320: cross-cdylib capsule use-after-free (transport bring-up SIGSEGV)
