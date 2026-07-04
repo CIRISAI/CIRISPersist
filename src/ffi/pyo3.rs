@@ -26319,6 +26319,8 @@ mod tests {
                     }),
                     subject_key_ids: vec![],
                     cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                    scrub_signature_classical: None,
+                    scrub_signature_pqc: None,
                 })
                 .await
                 .unwrap();

@@ -392,8 +392,10 @@ impl MemoryBackend {
     }
 
     /// v4.4.0 (CIRISPersist#171) — local-tier write (upsert/insert)
-    /// parity with the sqlite/postgres backends. Synchronous (in-process).
-    fn memory_write_local_attestation(
+    /// parity with the sqlite/postgres backends. `async` since v12.6.0: a
+    /// subject-side revocation transiting the local tier is hybrid-verified
+    /// (resolving pubkeys via the directory) before it is written.
+    async fn memory_write_local_attestation(
         &self,
         input: crate::federation::types::LocalAttestationInput,
         replace: bool,
@@ -404,7 +406,7 @@ impl MemoryBackend {
                 "local attestation envelope must carry a \"dimension\" string".into(),
             )
         })?;
-        crate::federation::admission::check_local_tier_eligibility(
+        let disposition = crate::federation::admission::check_local_tier_eligibility(
             &input.attestation_type,
             Some(dimension.as_str()),
             &input.attesting_key_id,
@@ -412,6 +414,18 @@ impl MemoryBackend {
             &input.cohort_scope,
         )?;
         crate::federation::admission::check_cohort_scope(&input.cohort_scope)?;
+
+        // v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — a subject-side
+        // revocation MAY *transit* the local write path only if its bound-hybrid
+        // signature verifies (accept on VALID crypto only; the operator gate).
+        // Runs BEFORE the state lock (verify resolves pubkeys via the directory,
+        // which locks itself). `None` for a durable producer-authority row.
+        let transit = crate::federation::admission::verify_local_transit_revocation(
+            self,
+            disposition,
+            &input,
+        )
+        .await?;
 
         let mut state = self.state.lock().expect("memory backend lock");
         let identity_type = match state.federation_keys.get(&input.attesting_key_id) {
@@ -442,7 +456,17 @@ impl MemoryBackend {
 
         let attestation_id = uuid::Uuid::new_v4().to_string();
         let attesting_key_id = input.attesting_key_id.clone();
-        let mut row = input.into_local_row(attestation_id.clone(), chrono::Utc::now());
+        let now = chrono::Utc::now();
+        let mut row = match transit {
+            Some((hash, sig_classical, sig_pqc)) => input.into_transit_revocation_row(
+                attestation_id.clone(),
+                now,
+                hash,
+                sig_classical,
+                sig_pqc,
+            ),
+            None => input.into_local_row(attestation_id.clone(), now),
+        };
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         if replace {
@@ -1352,6 +1376,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // non-conformant per CC 5.3.2.4.3.1).
         crate::federation::verify_federation_tier_ingest(self, &row).await?;
 
+        // v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — a `revoked`
+        // consent_record at local tier MAY *transit* the local write path
+        // only if its bound-hybrid signature verifies (accept on VALID crypto
+        // only). Runs BEFORE the state lock (it resolves pubkeys via the
+        // directory, which locks itself) and BEFORE persist. No-op for
+        // non-consent_record rows and durable (granted / federation) ones.
+        // Backend-symmetric with SQLite + Postgres.
+        crate::federation::admission::verify_consent_record_transit_ingest(self, &row).await?;
+
         let mut state = self.state.lock().expect("memory backend lock");
         // FK enforcement parity with postgres: both attesting_key_id
         // and attested_key_id must exist in federation_keys.
@@ -1383,16 +1416,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             &attesting_identity_type,
         )?;
 
-        // v6.7.0 (CIRISPersist#146 Ask 5, CEG §5.6.8.7) — `consent_record`
-        // ceremony admission (required fields / closed stance set /
-        // substrate-only `expired` / §10.1.3 revoked-not-local). No-op for
-        // every non-`consent_record` row.
-        crate::federation::admission::check_consent_record_admission(
-            &row.attestation_type,
-            &row.attestation_envelope,
-            &row.tier,
-        )?;
-
         // v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer
         // dedup on `(references_attestation_id, attestation_type,
         // attesting_key_id)`. A duplicate composer is a typed
@@ -1416,14 +1439,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         input: crate::federation::types::LocalAttestationInput,
     ) -> Result<String, crate::federation::Error> {
-        self.memory_write_local_attestation(input, true)
+        self.memory_write_local_attestation(input, true).await
     }
 
     async fn attestation_insert_local(
         &self,
         input: crate::federation::types::LocalAttestationInput,
     ) -> Result<String, crate::federation::Error> {
-        self.memory_write_local_attestation(input, false)
+        self.memory_write_local_attestation(input, false).await
     }
 
     async fn list_attestations_for(
@@ -8206,9 +8229,15 @@ mod tests {
         );
     }
 
+    /// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — a `revoked`
+    /// consent_record at local tier is ACCEPTED as a **transit** write when
+    /// its bound-hybrid signature verifies (the operator decision), but a
+    /// crypto-INVALID one is rejected at admission (never rests unsigned).
+    /// Pre-v12.6.0 this was a hard rejection of both.
     #[tokio::test]
-    async fn consent_record_revoked_local_tier_rejected() {
+    async fn consent_record_revoked_local_tier_transits_iff_signed() {
         let backend = consent_backend().await;
+        // (1) Validly-signed revoked consent_record @ local → transit-accepted.
         let row = consent_record_row(
             "cr-4",
             "subject-key",
@@ -8216,13 +8245,74 @@ mod tests {
             crate::federation::types::attestation_tier::LOCAL,
             true,
         );
-        let err = backend
+        backend
             .put_attestation(SignedAttestation { attestation: row })
+            .await
+            .expect("crypto-valid revoked consent_record transits the local tier (§10.1.3)");
+
+        // (2) A crypto-INVALID one (signature corrupted) is rejected at
+        // admission — accept ONLY on a valid bound-hybrid signature.
+        let mut forged = consent_record_row(
+            "cr-4b",
+            "subject-key",
+            consent_record::stance::REVOKED,
+            crate::federation::types::attestation_tier::LOCAL,
+            true,
+        );
+        forged.scrub_signature_classical = "AAAA".into(); // not a valid sig
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: forged,
+            })
             .await
             .unwrap_err();
         assert!(
-            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("not local-tier-eligible") || m.contains("NOT local-tier-eligible")),
-            "revoked local-tier rejected (§10.1.3), got {err:?}"
+            matches!(
+                err,
+                crate::federation::Error::FederationTierUnverified { .. }
+            ),
+            "unsigned/forged revoked consent_record rejected at admission, got {err:?}"
+        );
+    }
+
+    /// v12.6.0 (CIRISPersist#171, §10.1.3) — the `put_attestation(tier=local)`
+    /// bypass is CLOSED for *bare* subject-side revocations too (not only the
+    /// consent_record ceremony): a `consent:state:revoked` row whose writer ∈
+    /// `subject_key_ids` at local tier is hybrid-verified at ingest — a valid
+    /// signature transits, a forged one is rejected.
+    #[tokio::test]
+    async fn bare_subject_side_revocation_via_put_attestation_gated() {
+        let backend = consent_backend().await;
+        let mut row = fix_attestation("bare-rev", "subject-key", "registry-steward", "subject-key");
+        row.attestation_envelope = serde_json::json!({
+            "id": "bare-rev", "dimension": "consent:state:revoked:v1",
+            "score": 1.0, "confidence": 0.9,
+        });
+        row.subject_key_ids = vec!["subject-key".into()];
+        row.tier = crate::federation::types::attestation_tier::LOCAL.into();
+        row.cohort_scope = crate::federation::types::cohort_scope::SELF.to_string();
+        resign_fix(&mut row); // envelope changed → re-sign
+        let mut forged = row.clone();
+        backend
+            .put_attestation(SignedAttestation { attestation: row })
+            .await
+            .expect("crypto-valid bare subject-side revocation transits at local tier");
+
+        // Forged signature → rejected (no put_attestation bypass of the gate).
+        forged.attestation_id = "bare-rev-forged".into();
+        forged.scrub_signature_classical = "AAAA".into();
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: forged,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::FederationTierUnverified { .. }
+            ),
+            "forged bare revocation rejected at put_attestation local tier, got {err:?}"
         );
     }
 
@@ -8928,14 +9018,19 @@ mod tests {
             .expect("unknown community ⇒ out of scope ⇒ no-op");
     }
 
-    /// #238 / #146 (CC 5.3.2.2 / §10.1.3, AV-61 transit-not-rest) — the
-    /// consent-revocation promotion-overdue `hard_case` fires at the 24 h
-    /// window boundary for a subject-side revocation that stays local-tier
-    /// (unpromoted), is idempotent on re-scan, and stops once the row promotes.
+    /// v12.6.0 (CIRISPersist#171 / #238 / #146, §10.1.3 transit-not-rest) —
+    /// the FULL consent-SLA loop through the REAL admission path (replacing the
+    /// #238 test that staged the transit row artificially): a crypto-valid
+    /// subject-side `consent:state:revoked` is ADMITTED as a transit local-tier
+    /// write via `attestation_upsert_local`, the revocation scan sees it, the
+    /// promotion-overdue `hard_case` fires at the 24 h boundary (not before), is
+    /// idempotent on re-scan, and stops once promoted. Also asserts a
+    /// crypto-INVALID revocation is REJECTED at admission (never transits).
     #[tokio::test]
-    async fn consent_revocation_promotion_overdue_fires_at_window_boundary() {
+    async fn consent_revocation_transit_admits_and_sla_fires_end_to_end() {
         use crate::federation::hard_case::{kind, HardCaseFilter};
-        use crate::federation::types::attestation_tier;
+        use crate::federation::tier_ingest::test_support::sign_envelope;
+        use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
         use crate::federation::FederationDirectory;
         use std::time::Duration;
         let backend = MemoryBackend::new();
@@ -8947,35 +9042,50 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let revoked_at: chrono::DateTime<chrono::Utc> = "2026-06-01T00:00:00Z".parse().unwrap();
-        // A subject-side `consent:state:revoked` TRANSITING local-tier
-        // (unpromoted). persist's admission gate refuses to *originate* such a
-        // local row (transit-not-rest); we stage it directly to exercise the
-        // watcher's promotion-overdue detection.
-        let mut rev = fix_attestation("rev-c", "subject-c", "target-c", "subject-c");
-        rev.attestation_envelope =
-            serde_json::json!({ "id": "rev-c", "dimension": "consent:state:revoked:v1" });
-        rev.asserted_at = revoked_at;
-        rev.subject_key_ids = vec!["subject-c".into()];
-        rev.tier = attestation_tier::LOCAL.into();
-        rev.promoted_at = None;
-        backend
-            .state
-            .lock()
-            .unwrap()
-            .federation_attestations
-            .push(rev);
+
+        // A subject-side `consent:state:revoked` envelope, hybrid-signed by the
+        // subject (Ed25519 + ML-DSA-65 bound) over the CEG canonical form.
+        let env = serde_json::json!({
+            "id": "rev-c", "dimension": "consent:state:revoked:v1",
+            "score": 1.0, "confidence": 0.9,
+        });
+        let (_hash, sig_classical, sig_pqc) = sign_envelope("subject-c", &env);
+
+        // Admit it through the REAL local-write admission path — accepted as a
+        // TRANSIT write because the bound-hybrid signature verifies (§10.1.3).
+        let att_id = backend
+            .attestation_upsert_local(LocalAttestationInput {
+                attesting_key_id: "subject-c".into(),
+                attested_key_id: Some("target-c".into()),
+                attestation_type: attestation_type::SCORES.into(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: env.clone(),
+                subject_key_ids: vec!["subject-c".into()],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                scrub_signature_classical: Some(sig_classical),
+                scrub_signature_pqc: sig_pqc,
+            })
+            .await
+            .expect("crypto-valid subject-side revocation transits the local tier (§10.1.3)");
+
+        // The transit row is stored at local tier, unpromoted, carrying its
+        // REAL signature (not the deferred empty sentinel) — never a durable
+        // unsigned local row.
+        let rows = backend.list_consent_revocations(None).await.unwrap();
+        assert_eq!(rows.len(), 1, "revocation scan sees the transit row");
+        let rev = &rows[0];
+        assert_eq!(rev.tier, attestation_tier::LOCAL);
+        assert!(rev.promoted_at.is_none());
+        assert!(
+            !rev.scrub_signature_classical.is_empty() && rev.scrub_signature_pqc.is_some(),
+            "transit row carries a real bound-hybrid signature"
+        );
+        let revoked_at = rev.asserted_at;
 
         let window = Duration::from_secs(86_400); // 24 h
 
-        // The local-tier transit row is visible to the revocation scan.
-        assert_eq!(
-            backend.list_consent_revocations(None).await.unwrap().len(),
-            1,
-            "list_consent_revocations includes the local-tier transit row"
-        );
-
-        // Just BEFORE the boundary (24 h − 1 s) → in flight, NOT overdue.
+        // Just BEFORE the boundary → in flight, NOT overdue.
         let before = revoked_at + chrono::Duration::seconds(86_400 - 1);
         let r = backend.run_consent_sla_watch(before, window).await.unwrap();
         assert_eq!(r.revocations_scanned, 1);
@@ -8986,7 +9096,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        // Just AFTER the boundary (24 h + 1 s) → overdue fires.
+        // Just AFTER the boundary → overdue fires.
         let after = revoked_at + chrono::Duration::seconds(86_400 + 1);
         let r = backend.run_consent_sla_watch(after, window).await.unwrap();
         assert_eq!(r.promotion_overdue, 1, "past the window: overdue fires");
@@ -9019,7 +9129,7 @@ mod tests {
         {
             let mut st = backend.state.lock().unwrap();
             for a in st.federation_attestations.iter_mut() {
-                if a.attestation_id == "rev-c" {
+                if a.attestation_id == att_id {
                     a.tier = attestation_tier::FEDERATION.into();
                     a.promoted_at = Some(after);
                 }
@@ -9032,6 +9142,57 @@ mod tests {
         assert_eq!(
             r.promotion_overdue, 0,
             "a promoted revocation is no longer overdue"
+        );
+
+        // A crypto-INVALID revocation is REJECTED at admission (never transits).
+        let bad = backend
+            .attestation_insert_local(LocalAttestationInput {
+                attesting_key_id: "subject-c".into(),
+                attested_key_id: Some("target-c".into()),
+                attestation_type: attestation_type::SCORES.into(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: serde_json::json!({
+                    "id": "rev-bad", "dimension": "consent:state:revoked:v1",
+                    "score": 1.0, "confidence": 0.9,
+                }),
+                subject_key_ids: vec!["subject-c".into()],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                scrub_signature_classical: Some("AAAA".into()), // not a valid sig
+                scrub_signature_pqc: Some("AAAA".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                bad,
+                crate::federation::Error::FederationTierUnverified { .. }
+            ),
+            "crypto-invalid revocation rejected at admission, got {bad:?}"
+        );
+
+        // An UNSIGNED revocation (no signature material) is likewise rejected.
+        let unsigned = backend
+            .attestation_insert_local(LocalAttestationInput {
+                attesting_key_id: "subject-c".into(),
+                attested_key_id: Some("target-c".into()),
+                attestation_type: attestation_type::SCORES.into(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: serde_json::json!({
+                    "id": "rev-unsigned", "dimension": "consent:state:revoked:v1",
+                    "score": 1.0, "confidence": 0.9,
+                }),
+                subject_key_ids: vec!["subject-c".into()],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(unsigned, crate::federation::Error::InvalidArgument(ref m) if m.contains("bound-hybrid signature")),
+            "unsigned revocation rejected at admission, got {unsigned:?}"
         );
     }
 

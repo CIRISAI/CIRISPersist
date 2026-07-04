@@ -2533,13 +2533,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
         // v6.7.0 (CIRISPersist#146 Ask 5, CEG §5.6.8.7) — `consent_record`
         // ceremony admission (required fields / closed stance set /
-        // substrate-only `expired` / §10.1.3 revoked-not-local). No-op for
-        // every non-`consent_record` row.
-        crate::federation::admission::check_consent_record_admission(
-            &row.attestation_type,
-            &row.attestation_envelope,
-            &row.tier,
-        )?;
+        // substrate-only `expired`). v12.6.0 (CIRISPersist#171, §10.1.3
+        // transit-not-rest): a `revoked` consent_record at local tier MAY
+        // *transit* the local write path only if its bound-hybrid signature
+        // verifies (accept on VALID crypto only). No-op for non-consent_record
+        // rows and durable ones. Backend-symmetric with Memory + SQLite.
+        crate::federation::admission::verify_consent_record_transit_ingest(self, &row).await?;
 
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate validation. Rejects out-of-closed-set values
@@ -9975,7 +9974,7 @@ impl PostgresBackend {
             )
         })?;
 
-        crate::federation::admission::check_local_tier_eligibility(
+        let disposition = crate::federation::admission::check_local_tier_eligibility(
             &input.attestation_type,
             Some(dimension.as_str()),
             &input.attesting_key_id,
@@ -9983,6 +9982,17 @@ impl PostgresBackend {
             &input.cohort_scope,
         )?;
         crate::federation::admission::check_cohort_scope(&input.cohort_scope)?;
+
+        // v12.6.0 (CIRISPersist#171, §10.1.3) — a subject-side revocation MAY
+        // *transit* the local write path only if its bound-hybrid signature
+        // verifies (accept on VALID crypto only). `None` for a durable
+        // producer-authority row. Runs before the client is checked out.
+        let transit = crate::federation::admission::verify_local_transit_revocation(
+            self,
+            disposition,
+            &input,
+        )
+        .await?;
 
         let mut client = self
             .get_client()
@@ -10015,11 +10025,25 @@ impl PostgresBackend {
         let attestation_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
         let attesting_key_id = input.attesting_key_id.clone();
-        let mut row = input.into_local_row(attestation_id.clone(), now);
+        // A durable row defers its signature (empty-sentinel scrub envelope);
+        // a TRANSIT revocation carries the caller's verified bound-hybrid
+        // signature + computed hash (§10.1.3 transit-not-rest).
+        let mut row = match transit {
+            Some((hash, sig_classical, sig_pqc)) => input.into_transit_revocation_row(
+                attestation_id.clone(),
+                now,
+                hash,
+                sig_classical,
+                sig_pqc,
+            ),
+            None => input.into_local_row(attestation_id.clone(), now),
+        };
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let subject_key_ids_json = serde_json::to_value(&row.subject_key_ids)
             .map_err(|e| Error::Backend(format!("subject_key_ids serialize: {e}")))?;
-        let original_content_hash: Vec<u8> = Vec::new(); // empty sentinel
+        // bytea: durable row hex "" → []; transit row = SHA-256 digest bytes.
+        let original_content_hash: Vec<u8> = hex::decode(&row.original_content_hash)
+            .map_err(|e| Error::Backend(format!("original_content_hash hex decode: {e}")))?;
         let attestation_uuid = uuid::Uuid::parse_str(&attestation_id)
             .map_err(|e| Error::Backend(format!("uuid parse: {e}")))?;
 
@@ -15155,6 +15179,147 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("{nanos:x}")
+    }
+
+    /// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — Postgres parity
+    /// for the FULL consent-SLA loop through the REAL admission path: a
+    /// crypto-valid subject-side `consent:state:revoked` is ADMITTED as a
+    /// transit local-tier write, and `run_consent_sla_watch` fires
+    /// `consent_revocation_promotion_overdue` for it past the 24 h window (not
+    /// before). A crypto-INVALID one is rejected at admission. Suffix-scoped so
+    /// the assertions bind only to this run's fixtures on the shared test DB.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_consent_revocation_transit_admits_and_sla_fires_end_to_end() {
+        use crate::federation::tier_ingest::test_support::sign_envelope;
+        use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
+        use crate::federation::FederationDirectory;
+        use std::time::Duration;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+
+        let now0 = chrono::Utc::now();
+        let suffix = uuid_like();
+        let subject = format!("subject-c-{suffix}");
+        let target = format!("target-c-{suffix}");
+        for kid in [&subject, &target] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: fix_section_i_key(kid, "registry", now0, true),
+                })
+                .await
+                .unwrap();
+        }
+
+        let env = serde_json::json!({
+            "id": format!("rev-{suffix}"), "dimension": "consent:state:revoked:v1",
+            "score": 1.0, "confidence": 0.9,
+        });
+        let (_hash, sig_classical, sig_pqc) = sign_envelope(&subject, &env);
+
+        backend
+            .attestation_upsert_local(LocalAttestationInput {
+                attesting_key_id: subject.clone(),
+                attested_key_id: Some(target.clone()),
+                attestation_type: attestation_type::SCORES.into(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: env.clone(),
+                subject_key_ids: vec![subject.clone()],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                scrub_signature_classical: Some(sig_classical),
+                scrub_signature_pqc: sig_pqc,
+            })
+            .await
+            .expect("crypto-valid subject-side revocation transits the local tier");
+
+        // Find THIS run's transit row (shared DB → filter by our subject).
+        let mine = backend
+            .list_consent_revocations(Some(now0))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.attesting_key_id == subject)
+            .expect("revocation scan sees our transit row");
+        assert_eq!(mine.tier, attestation_tier::LOCAL);
+        assert!(mine.promoted_at.is_none());
+        assert!(
+            !mine.scrub_signature_classical.is_empty() && mine.scrub_signature_pqc.is_some(),
+            "transit row round-trips its real bound-hybrid signature"
+        );
+        let revoked_at = mine.asserted_at;
+        let window = Duration::from_secs(86_400);
+
+        // Helper: does OUR overdue hard_case exist? (shared test DB → filter
+        // to this run's subject/target).
+        async fn ours_fired(
+            backend: &PostgresBackend,
+            since: chrono::DateTime<chrono::Utc>,
+            subject: &str,
+            target: &str,
+        ) -> bool {
+            use crate::federation::hard_case::{kind, HardCaseFilter};
+            use crate::federation::FederationDirectory as _;
+            backend
+                .list_hard_case_events(HardCaseFilter {
+                    kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                    since: Some(since),
+                })
+                .await
+                .unwrap()
+                .into_iter()
+                .any(|e| {
+                    e.subject_key_id.as_deref() == Some(subject)
+                        && e.target_key_id.as_deref() == Some(target)
+                })
+        }
+
+        // BEFORE the boundary → our revocation is in flight, not overdue.
+        let before = revoked_at + chrono::Duration::seconds(86_400 - 1);
+        backend.run_consent_sla_watch(before, window).await.unwrap();
+        assert!(
+            !ours_fired(&backend, now0, &subject, &target).await,
+            "within the window: our overdue hard_case must NOT have fired"
+        );
+
+        // AFTER the boundary → our overdue hard_case fires.
+        let after = revoked_at + chrono::Duration::seconds(86_400 + 1);
+        backend.run_consent_sla_watch(after, window).await.unwrap();
+        assert!(
+            ours_fired(&backend, now0, &subject, &target).await,
+            "past the window: our overdue hard_case fires"
+        );
+
+        // crypto-INVALID revocation → rejected at admission (never transits).
+        let bad = backend
+            .attestation_insert_local(LocalAttestationInput {
+                attesting_key_id: subject.clone(),
+                attested_key_id: Some(target.clone()),
+                attestation_type: attestation_type::SCORES.into(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: serde_json::json!({
+                    "id": format!("rev-bad-{suffix}"), "dimension": "consent:state:revoked:v1",
+                    "score": 1.0, "confidence": 0.9,
+                }),
+                subject_key_ids: vec![subject.clone()],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                scrub_signature_classical: Some("AAAA".into()),
+                scrub_signature_pqc: Some("AAAA".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                bad,
+                crate::federation::Error::FederationTierUnverified { .. }
+            ),
+            "crypto-invalid revocation rejected at admission, got {bad:?}"
+        );
     }
 
     // ─── Lens-derived schemas (v0.4.3, CIRISPersist#18) ────────────
@@ -22175,7 +22340,9 @@ mod tests {
         assert!(
             matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("substrate-emitted only"))
         );
-        let err = backend
+        // revoked / local (v12.6.0, §10.1.3 transit-not-rest): a crypto-VALID
+        // one TRANSITS the local tier (accepted); a forged one is rejected.
+        backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: mk(
                     crate::federation::types::consent_record::stance::REVOKED,
@@ -22183,9 +22350,24 @@ mod tests {
                 ),
             })
             .await
+            .expect("crypto-valid revoked consent_record transits the local tier on PG");
+        let mut forged = mk(
+            crate::federation::types::consent_record::stance::REVOKED,
+            crate::federation::types::attestation_tier::LOCAL,
+        );
+        forged.scrub_signature_classical = "AAAA".into(); // not a valid sig
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: forged,
+            })
+            .await
             .unwrap_err();
         assert!(
-            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("local-tier-eligible"))
+            matches!(
+                err,
+                crate::federation::Error::FederationTierUnverified { .. }
+            ),
+            "forged revoked/local consent_record rejected at admission, got {err:?}"
         );
     }
 
@@ -27593,6 +27775,8 @@ mod tests {
             }),
             subject_key_ids: subjects,
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
         }
     }
 

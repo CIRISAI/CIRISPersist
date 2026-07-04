@@ -186,7 +186,9 @@ pub use stream_sth::{
     log_id_for_stream, parse_stream_id, recompute_and_assert_root, StreamChunkLeaf,
     STREAM_LOG_ID_PREFIX,
 };
-pub use tier_ingest::verify_federation_tier_ingest;
+pub use tier_ingest::{
+    verify_envelope_hybrid_signature, verify_federation_tier_ingest, verify_row_hybrid_signature,
+};
 pub use topology::{
     build_delegation_graph, build_trust_topology, AuditChainEntry, AuditChainProof, DelegationEdge,
     DelegationGraph, EdgeType, FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology,

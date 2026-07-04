@@ -714,6 +714,22 @@ pub struct LocalAttestationInput {
     /// other value at local tier. Promotion (v4.5) widens the scope.
     #[serde(default = "default_self_cohort_scope")]
     pub cohort_scope: String,
+    /// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — the classical
+    /// Ed25519 signature over `JCS(attestation_envelope)`. Populated ONLY
+    /// for a **subject-side revocation transiting the local tier**: an
+    /// ordinary producer-authority local row defers its signature (this
+    /// stays `None` and the row is written with the empty-sentinel scrub
+    /// envelope). When the write-path gate classifies the row as a
+    /// [`crate::federation::admission::LocalTierDisposition::TransitRevocation`],
+    /// this (and [`Self::scrub_signature_pqc`]) MUST be present and verify
+    /// against the attester's registered pubkeys, or the write is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_classical: Option<String>,
+    /// v12.6.0 — the ML-DSA-65 signature over the bound payload
+    /// `JCS(attestation_envelope) ‖ ed25519_sig` (PQC-mandatory for a
+    /// transit revocation; see [`Self::scrub_signature_classical`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
 }
 
 /// Default cohort_scope for a local-tier write — `self` (private to the
@@ -757,6 +773,53 @@ impl LocalAttestationInput {
             scrub_key_id: self.attesting_key_id,
             scrub_timestamp: asserted_at,
             pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: self.subject_key_ids,
+            withdraws_admission_rule: None,
+            cohort_scope: self.cohort_scope,
+            tier: attestation_tier::LOCAL.to_string(),
+            promoted_at: None,
+        }
+    }
+
+    /// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — build the
+    /// `local`-tier row for a **subject-side revocation transiting** the
+    /// local write path. Unlike [`Self::into_local_row`] (deferred
+    /// empty-sentinel scrub envelope), this carries the caller's REAL
+    /// bound-hybrid signature + the persist-computed `original_content_hash`
+    /// (hex `SHA-256(JCS(envelope))`, returned by the verify step) so the
+    /// row is a fully-signed federation-classified revocation staged at
+    /// `tier = local`, `promoted_at = None`. It is NOT a durable local row:
+    /// the consent-SLA watcher drives it to promotion or overdue-flag.
+    /// `persist_row_hash` is filled by the caller after construction.
+    pub fn into_transit_revocation_row(
+        self,
+        attestation_id: String,
+        asserted_at: DateTime<Utc>,
+        original_content_hash: String,
+        scrub_signature_classical: String,
+        scrub_signature_pqc: Option<String>,
+    ) -> Attestation {
+        let attested_key_id = self
+            .attested_key_id
+            .unwrap_or_else(|| self.attesting_key_id.clone());
+        Attestation {
+            attestation_id,
+            attesting_key_id: self.attesting_key_id.clone(),
+            attested_key_id,
+            attestation_type: self.attestation_type,
+            weight: self.weight,
+            asserted_at,
+            expires_at: self.expires_at,
+            attestation_envelope: self.attestation_envelope,
+            original_content_hash,
+            scrub_signature_classical,
+            scrub_signature_pqc,
+            // Self-signed: the subject is the attester.
+            scrub_key_id: self.attesting_key_id,
+            scrub_timestamp: asserted_at,
+            // PQC half is present + verified for a transit revocation.
+            pqc_completed_at: Some(asserted_at),
             persist_row_hash: String::new(),
             subject_key_ids: self.subject_key_ids,
             withdraws_admission_rule: None,

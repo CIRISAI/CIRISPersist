@@ -851,10 +851,15 @@ pub fn envelope_subject_kind(envelope: &serde_json::Value) -> Option<&str> {
 ///      substrate's `valid_until`-passed emission, never a wire input).
 ///   3. **Tier eligibility** (rule 3, §10.1.3): a `stance: revoked`
 ///      `consent_record` carries subject revocation authority over
-///      another party's content → it is **NOT local-tier-eligible** and
-///      is rejected at `tier = "local"`. A `stance: granted` self-consent
-///      MAY be local (no tier restriction here; the §10.1.5.2 self-tier
-///      eligibility is enforced by [`check_local_tier_eligibility`]).
+///      another party's content. It is federation-tier by classification
+///      but MAY **transit** the local tier (v12.6.0, resolving AV-61): a
+///      `revoked` consent_record at `tier = "local"` returns
+///      [`LocalTierDisposition::TransitRevocation`] so the caller
+///      (`put_attestation`) hybrid-verifies its signature before storing
+///      (accept on VALID crypto only) and never lets it rest durable. A
+///      `stance: granted` self-consent MAY be local durable (the
+///      §10.1.5.2 self-tier eligibility is enforced by
+///      [`check_local_tier_eligibility`]).
 ///
 /// Rule 4 (composition with the §3.2.3 `withdraws` gate / no quorum) is
 /// not a *field* check — it is the single-subject authority already baked
@@ -866,19 +871,22 @@ pub fn envelope_subject_kind(envelope: &serde_json::Value) -> Option<&str> {
 ///
 /// `tier` is the row's [`crate::federation::types::Attestation::tier`]
 /// (`"local"` / `"federation"`). Returns [`Error::InvalidArgument`] on
-/// any rule violation; the row is not stored.
+/// any rule violation (the row is not stored); otherwise the
+/// [`LocalTierDisposition`] — [`LocalTierDisposition::TransitRevocation`]
+/// for a `revoked` consent_record at local tier (caller MUST hybrid-verify
+/// before storing), else [`LocalTierDisposition::Durable`].
 pub fn check_consent_record_admission(
     attestation_type: &str,
     envelope: &serde_json::Value,
     tier: &str,
-) -> Result<(), Error> {
+) -> Result<LocalTierDisposition, Error> {
     use crate::federation::types::consent_record;
     // No-op unless this is a `scores` carrying the consent_record
     // discriminator. (A `consent_record` MUST ride `scores` — §5.6.8.7
     // "Rides existing scores attestation_type"; a non-scores row bearing
     // the discriminator is malformed.)
     if envelope_subject_kind(envelope) != Some(consent_record::SUBJECT_KIND) {
-        return Ok(());
+        return Ok(LocalTierDisposition::Durable);
     }
     if attestation_type != attestation_type::SCORES {
         return Err(Error::InvalidArgument(format!(
@@ -917,49 +925,209 @@ pub fn check_consent_record_admission(
         ));
     }
     // Rule 3 — tier eligibility (§10.1.3): a `revoked` consent_record is
-    // subject revocation authority → never local-tier-eligible.
+    // subject revocation authority. It is federation-tier by classification
+    // but MAY *transit* the local tier — the caller (`put_attestation`)
+    // hybrid-verifies the signature before storing (accept on VALID crypto
+    // only; transit-not-rest). Pre-v12.6.0 this was a hard `Err`.
     if stance == consent_record::stance::REVOKED
         && tier == crate::federation::types::attestation_tier::LOCAL
     {
-        return Err(Error::InvalidArgument(
-            "a consent_record with stance 'revoked' is NOT local-tier-eligible \
-             (CEG §10.1.3 / §5.6.8.7 admission rule 3): it carries subject \
-             revocation authority — it must be federation-tier (hybrid-signed) \
-             or promoted within the §10.1.3 bounded window"
-                .to_string(),
-        ));
+        return Ok(LocalTierDisposition::TransitRevocation);
     }
-    Ok(())
+    Ok(LocalTierDisposition::Durable)
+}
+
+/// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — the
+/// `put_attestation` ingest gate for subject-side consent revocations at
+/// local tier. Two classifiers feed it:
+///
+/// 1. [`check_consent_record_admission`] (field / stance / substrate-only
+///    `expired` checks) — a `revoked` consent_record ceremony at
+///    `tier = local`;
+/// 2. [`is_subject_side_revocation`] — a *bare* subject-side revocation
+///    (`withdraws`, or a `consent:state:revoked` dimension with writer ∈
+///    `subject_key_ids`) at `tier = local`. Without this arm,
+///    `put_attestation(tier = local)` would be a trivial bypass of the
+///    crypto gate the local-write path
+///    ([`verify_local_transit_revocation`]) enforces.
+///
+/// Either way the row MAY transit the local tier only on VALID crypto: its
+/// bound-hybrid signature is verified via
+/// [`verify_row_hybrid_signature`](crate::federation::verify_row_hybrid_signature)
+/// against the attester's REGISTERED pubkeys **before** any store
+/// (Ed25519 + ML-DSA-65, Strict, PQC-mandatory). An unsigned /
+/// classical-only / forged one is rejected
+/// [`Error::FederationTierUnverified`], fail-secure. A no-op (`Ok(())`) for
+/// every other row (durable consent_records; federation-tier rows are gated
+/// by `verify_federation_tier_ingest`; non-revocations). Must run BEFORE the
+/// backend acquires its write lock (it resolves pubkeys via the directory,
+/// which locks itself).
+pub async fn verify_consent_record_transit_ingest<F>(
+    directory: &F,
+    row: &crate::federation::types::Attestation,
+) -> Result<(), Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let ceremony_disposition = check_consent_record_admission(
+        &row.attestation_type,
+        &row.attestation_envelope,
+        &row.tier,
+    )?;
+    let bare_transit = row.tier == crate::federation::types::attestation_tier::LOCAL
+        && is_subject_side_revocation(
+            &row.attestation_type,
+            envelope_dimension(&row.attestation_envelope),
+            &row.attesting_key_id,
+            &row.subject_key_ids,
+        );
+    if ceremony_disposition == LocalTierDisposition::TransitRevocation || bare_transit {
+        crate::federation::verify_row_hybrid_signature(directory, row).await
+    } else {
+        Ok(())
+    }
+}
+
+/// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — the local-write
+/// path's transit gate, shared by all three backends. Given the
+/// [`LocalTierDisposition`] from [`check_local_tier_eligibility`] and the
+/// caller's [`LocalAttestationInput`](crate::federation::types::LocalAttestationInput):
+///
+/// - [`LocalTierDisposition::Durable`] ⇒ `Ok(None)` (ordinary
+///   producer-authority row; signature deferred — written as the
+///   empty-sentinel scrub envelope).
+/// - [`LocalTierDisposition::TransitRevocation`] ⇒ the subject-side
+///   revocation MUST carry a bound-hybrid signature that verifies against
+///   the attester's REGISTERED pubkeys (Ed25519 + ML-DSA-65, Strict,
+///   PQC-mandatory). On success returns `Ok(Some((original_content_hash,
+///   scrub_signature_classical, scrub_signature_pqc)))` so the backend
+///   builds the signed transit row
+///   ([`LocalAttestationInput::into_transit_revocation_row`](crate::federation::types::LocalAttestationInput::into_transit_revocation_row)).
+///   A missing signature ⇒ [`Error::InvalidArgument`]; an invalid one ⇒
+///   [`Error::FederationTierUnverified`]. Either way the row is NOT stored —
+///   persist accepts the transit write ONLY on VALID crypto (never an
+///   unsigned/forged revocation), and never rests it as a durable local row.
+///
+/// MUST run BEFORE the backend acquires its write lock (it resolves pubkeys
+/// via the directory, which locks itself).
+#[allow(clippy::type_complexity)]
+pub async fn verify_local_transit_revocation<F>(
+    directory: &F,
+    disposition: LocalTierDisposition,
+    input: &crate::federation::types::LocalAttestationInput,
+) -> Result<Option<(String, String, Option<String>)>, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    match disposition {
+        LocalTierDisposition::Durable => Ok(None),
+        LocalTierDisposition::TransitRevocation => {
+            let sig_classical = input.scrub_signature_classical.as_deref().ok_or_else(|| {
+                Error::InvalidArgument(
+                    "a subject-side revocation transiting the local tier requires a bound-hybrid \
+                     signature (§10.1.3, AV-61): scrub_signature_classical + scrub_signature_pqc \
+                     must be present and verify against the attester's registered pubkeys"
+                        .to_string(),
+                )
+            })?;
+            let sig_pqc = input.scrub_signature_pqc.as_deref();
+            let hash = crate::federation::verify_envelope_hybrid_signature(
+                directory,
+                &input.attesting_key_id,
+                &input.attestation_envelope,
+                sig_classical,
+                sig_pqc,
+            )
+            .await?;
+            Ok(Some((
+                hash,
+                sig_classical.to_string(),
+                sig_pqc.map(str::to_string),
+            )))
+        }
+    }
+}
+
+/// v12.6.0 (CIRISPersist#171, CEG §10.1.3 transit-not-rest) — how a
+/// local-tier write is admitted. The subject-side revocation resolution of
+/// AV-61: a subject revocation is federation-tier *by classification* but
+/// MAY **transit** the local write path (never *rest* as a durable local
+/// row). [`check_local_tier_eligibility`] /
+/// [`check_consent_record_admission`] classify the row; the backend then
+/// acts on the disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalTierDisposition {
+    /// Ordinary producer-only-authority local row — signature deferred
+    /// (CC 5.3.2.2), written as an empty-sentinel scrub envelope.
+    Durable,
+    /// A subject-side consent revocation **transiting** the local tier
+    /// (§10.1.3). The backend MUST verify its bound-hybrid signature
+    /// (Ed25519 + ML-DSA-65, Strict, PQC-mandatory) against the attester's
+    /// REGISTERED pubkeys before storing; a signature that does not verify
+    /// (or is absent) is rejected. The accepted row carries the REAL
+    /// signature at `tier = local`, `promoted_at = None` — never a durable
+    /// unsigned local row: the consent-SLA watcher drives it to promotion
+    /// (federation-tier) or flags it overdue within the bounded window.
+    TransitRevocation,
+}
+
+/// True iff `(attestation_type, dimension, writer, subjects)` is a
+/// **subject-side** consent revocation (CEG §10.1.3, AV-61): a `withdraws`
+/// (structural) or a `consent:state:revoked` dimension whose writer
+/// (`attesting_key_id`) is a member of `subject_key_ids` — the subject
+/// exercising its own revocation right. The transit-not-rest classifier.
+#[must_use]
+pub fn is_subject_side_revocation(
+    attestation_type: &str,
+    dimension: Option<&str>,
+    attesting_key_id: &str,
+    subject_key_ids: &[String],
+) -> bool {
+    let is_revocation = attestation_type == crate::federation::types::attestation_type::WITHDRAWS
+        || dimension.is_some_and(|d| d.starts_with("consent:state:revoked"));
+    is_revocation && subject_key_ids.iter().any(|s| s == attesting_key_id)
 }
 
 /// v4.4.0 (CIRISPersist#171, CEG §10.1.3/§10.1.5/§7.5) — gate a row's
 /// eligibility for the **local tier** (signature-deferred,
 /// producer-only-authority). Local-tier eligibility is producer
 /// authority — NOT empty `subject_key_ids` (CEG §4.2.6: producer-
-/// authority rows legitimately name subjects). Exactly two classes are
-/// **refused** at local tier (they MUST be federation-tier, signed):
+/// authority rows legitimately name subjects).
+///
+/// One class is **hard-refused** at local tier:
 ///
 ///   1. **`capacity:*` (CEG §7.5 anti-Goodhart, AV-62).** A `capacity:*`
 ///      dimension rejects self-emission; the local tier's self-write →
 ///      self-read → deferred-sig shape is precisely the §7.5 forbidden
 ///      loop. Capacity is inherently third-party-attested.
+///
+/// A second class is **admitted as transit, not durable** (v12.6.0,
+/// resolving AV-61 per the §10.1.3 transit-not-rest ratification):
+///
 ///   2. **Subject-side revocation (CEG §10.1.3, AV-61).** A `withdraws`
 ///      (structural) or a `consent:state:revoked` dimension whose
 ///      **writer (`attesting_key_id`) is a member of `subject_key_ids`**
-///      — the subject exercising its own revocation right. Subject-side
-///      revocation is the federation-observability primitive peers
-///      depend on; it cannot ride the deferral path.
+///      — the subject exercising its own revocation right. It is
+///      federation-tier by classification but MAY *transit* the local
+///      write path: this returns [`LocalTierDisposition::TransitRevocation`]
+///      so the backend verifies the bound-hybrid signature before storing
+///      (accept on VALID crypto only) and marks the row transit (signed,
+///      `tier = local`, promotable/flaggable — never a durable local row).
+///      Pre-v12.6.0 this was a hard `Err`, which left the consent-SLA
+///      watcher firing on nothing (persist refused to originate any row for
+///      it to observe).
 ///
 /// `dimension` is the envelope dimension ([`envelope_dimension`]);
 /// `attestation_type` is the §3 structural primitive. Returns
-/// [`Error::InvalidArgument`] on an ineligible row; `Ok(())` otherwise.
+/// [`Error::InvalidArgument`] on an ineligible row (bad cohort_scope /
+/// capacity:*); otherwise the [`LocalTierDisposition`].
 pub fn check_local_tier_eligibility(
     attestation_type: &str,
     dimension: Option<&str>,
     attesting_key_id: &str,
     subject_key_ids: &[String],
     cohort_scope: &str,
-) -> Result<(), Error> {
+) -> Result<LocalTierDisposition, Error> {
     // (0) local rows are `self`-scoped (private to the producing
     // occurrence). The v4.0 `self`-cohort read-gate then IS the tier
     // read-gate (FSD §3 / CEG §10.1.5, AV-59); promotion widens scope.
@@ -979,18 +1147,18 @@ pub fn check_local_tier_eligibility(
                 .to_string(),
         ));
     }
-    // (2) subject-side revocation — never local (§10.1.3 / AV-61).
-    let is_revocation = attestation_type == crate::federation::types::attestation_type::WITHDRAWS
-        || dimension.is_some_and(|d| d.starts_with("consent:state:revoked"));
-    if is_revocation && subject_key_ids.iter().any(|s| s == attesting_key_id) {
-        return Err(Error::InvalidArgument(
-            "a subject-side revocation (the writer is a member of subject_key_ids) is NOT \
-             local-tier-eligible (CEG §10.1.3, AV-61): it must be federation-tier signed / \
-             promoted within the bounded window"
-                .to_string(),
-        ));
+    // (2) subject-side revocation — admitted as TRANSIT (§10.1.3, AV-61):
+    // the backend hybrid-verifies before storing, marks it transit, and the
+    // consent-SLA watcher drives it to promotion / overdue-flag.
+    if is_subject_side_revocation(
+        attestation_type,
+        dimension,
+        attesting_key_id,
+        subject_key_ids,
+    ) {
+        return Ok(LocalTierDisposition::TransitRevocation);
     }
-    Ok(())
+    Ok(LocalTierDisposition::Durable)
 }
 
 /// v4.4.0 (CIRISPersist#171, CEG §7.5 / AV-62) — the federation-path

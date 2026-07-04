@@ -2873,6 +2873,8 @@ impl Engine {
                 ),
                 subject_key_ids: Vec::new(),
                 cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
             })
             .await?;
         let accept_id = directory
@@ -2888,6 +2890,8 @@ impl Engine {
                 ),
                 subject_key_ids: Vec::new(),
                 cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
             })
             .await?;
 
@@ -2912,6 +2916,8 @@ impl Engine {
                 ),
                 subject_key_ids: Vec::new(),
                 cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
             })
             .await?;
 
@@ -7625,6 +7631,8 @@ mod tests {
             }),
             subject_key_ids: vec![],
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
         };
         let att_id = sq.attestation_upsert_local(input).await.unwrap();
 
@@ -7765,6 +7773,8 @@ mod tests {
             }),
             subject_key_ids: vec![],
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
         };
         let att_id = pg.attestation_upsert_local(input).await.unwrap();
 
