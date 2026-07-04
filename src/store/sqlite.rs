@@ -2409,6 +2409,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         crate::federation::admission::check_user_target_steward_binding_admission(self, &row)
             .await?;
 
+        // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
+        // gate: a node has AT MOST ONE responsible steward, so a second,
+        // distinct-owner owner-binding `delegates_to(U → node)` is rejected. Runs
+        // BEFORE persist_row_hash + INSERT so a rejected emission leaves no trace.
+        // Backend-symmetric with memory + Postgres.
+        crate::federation::admission::check_single_node_owner_admission(self, &row).await?;
+
         // v10.3.0 (CIRISPersist#288, CC 3.4.1/3.4.3/3.4.5) — reserved-prefix
         // admission on the attestation_TYPE namespace (accord:* → accord_holder;
         // system:*/audit_chain:*/… → substrate-self-report; hard_case:* →

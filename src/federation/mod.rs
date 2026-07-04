@@ -3573,6 +3573,49 @@ pub enum Error {
         offending_scopes: Vec<String>,
     },
 
+    /// v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — a **second,
+    /// distinct-owner** node owner-binding was REJECTED: the node already
+    /// carries a LIVE owner-binding from `incumbent_owner`, and a node has at
+    /// most ONE responsible steward (the `self` cohort boundary is undefined
+    /// otherwise). The incumbent must first `withdraws`/`recants` (or the
+    /// binding must lapse) before a different owner can bind. A refresh by the
+    /// SAME owner is idempotently admitted. The row is NOT stored (verify-
+    /// before-mutation, AV-9). Stable `kind()` token
+    /// `federation_node_already_owned`. See
+    /// [`admission::check_single_node_owner_admission`] / [`admission::owner_of`].
+    #[error(
+        "node {node_key_id:?} is already owner-bound by {incumbent_owner:?}; a node has \
+         at most one responsible steward (CC 1.13.3.3 / CC 3.2) — {attempted_owner:?} may \
+         not bind until the incumbent withdraws/recants or the binding lapses"
+    )]
+    NodeAlreadyOwned {
+        /// The node whose ownership is already claimed.
+        node_key_id: String,
+        /// The live incumbent owner (a different `user`-role granter).
+        incumbent_owner: String,
+        /// The rejected would-be owner (the incoming `attesting_key_id`).
+        attempted_owner: String,
+    },
+
+    /// v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — [`admission::owner_of`]
+    /// found **more than one** distinct live owner for a node (a pre-gate
+    /// anomaly; [`admission::check_single_node_owner_admission`] prevents new
+    /// occurrences). This is a READ-path fail-closed signal: an ambiguous owner
+    /// is NOT a resolvable `self` boundary, so consumers MUST refuse rather than
+    /// silently pick one. Stable `kind()` token `federation_ambiguous_node_owner`.
+    #[error(
+        "node {node_key_id:?} has {} distinct live owners {owners:?}; ownership is \
+         single-valued (CC 1.13.3.3 / CC 3.2) — cannot resolve a `self` boundary \
+         (fail closed)",
+        .owners.len()
+    )]
+    AmbiguousNodeOwner {
+        /// The node with an ambiguous (multi-owner) binding state.
+        node_key_id: String,
+        /// The distinct live owners (sorted).
+        owners: Vec<String>,
+    },
+
     /// v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — a **federation-tier**
     /// attestation was REJECTED at the bulk store/replicate ingest gate
     /// because its envelope hybrid signature could not be verified
@@ -3820,6 +3863,8 @@ impl Error {
             Error::WithdrawsNotAdmitted { .. } => "federation_withdraws_not_admitted",
             Error::DelegatedScopeUnauthorized { .. } => "federation_delegated_scope_unauthorized",
             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
+            Error::NodeAlreadyOwned { .. } => "federation_node_already_owned",
+            Error::AmbiguousNodeOwner { .. } => "federation_ambiguous_node_owner",
             Error::UnstewardedCommunityMember { .. } => "federation_unstewarded_community_member",
             Error::UserTargetStewardBindingForbidden { .. } => {
                 "federation_user_target_steward_binding_forbidden"

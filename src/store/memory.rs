@@ -1315,6 +1315,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         crate::federation::admission::check_user_target_steward_binding_admission(self, &row)
             .await?;
 
+        // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the single-owner
+        // gate: a node has AT MOST ONE responsible steward, so a second,
+        // distinct-owner owner-binding `delegates_to(U → node)` is rejected. This
+        // is what makes the `self` cohort boundary well-defined. Backend-symmetric
+        // with SQLite + Postgres; verify-before-mutation.
+        crate::federation::admission::check_single_node_owner_admission(self, &row).await?;
+
         // v10.3.0 (CIRISPersist#288, CC 3.4.1/3.4.3/3.4.5) — reserved-prefix
         // admission on the attestation_TYPE namespace, keyed on the attesting
         // key's identity_type. Backend-symmetric with SQLite + Postgres.
@@ -9112,6 +9119,210 @@ mod tests {
         assert_eq!(
             nodes_stewarded_by(&backend, "ob-owner").await.unwrap(),
             vec!["ob-node".to_string(), "ob-owner".to_string()]
+        );
+    }
+
+    // ── CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — single-owner gate ──
+
+    /// Build an OWNER-BINDING `delegates_to(owner → node)` carrying the CC
+    /// 1.13.3.3 / CC 3.2 ownership dimension (what the single-owner gate +
+    /// `owner_of` key on) with infra-only scope, re-signed for the
+    /// federation-tier ingest gate. Distinct from [`fix_node_delegates_to`],
+    /// which builds a plain (non-ownership) infra delegation.
+    fn fix_owner_binding(id: &str, owner: &str, node: &str) -> Attestation {
+        use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
+        let mut att = fix_attestation(id, owner, node, owner);
+        att.attestation_type = attestation_type::DELEGATES_TO.into();
+        att.attestation_envelope = serde_json::json!({
+            "id": id,
+            "kind": "delegates_to",
+            "dimension": owner_binding::DIMENSION,
+            "delegation_purpose": owner_binding::PURPOSE,
+            "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+        });
+        resign_fix(&mut att); // envelope changed → re-sign (CC 5.3.2.4.3.1)
+        att
+    }
+
+    /// Register a SECOND `user`-role key — a distinct would-be owner.
+    async fn seed_second_owner(backend: &MemoryBackend, key_id: &str) {
+        let mut u = fix_key(key_id, key_id, key_id);
+        u.identity_type = crate::federation::types::identity_type::USER.into();
+        backend
+            .put_public_key(SignedKeyRecord { record: u })
+            .await
+            .unwrap();
+    }
+
+    /// A node cannot accrue a SECOND, distinct owner: the first owner-binding
+    /// admits; a second from a DIFFERENT user is rejected `NodeAlreadyOwned`
+    /// and leaves no trace (verify-before-mutation). This is what keeps the
+    /// `self` cohort boundary single-valued.
+    #[tokio::test]
+    async fn single_owner_gate_rejects_second_distinct_owner() {
+        use crate::federation::admission::owner_of;
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await; // ob-owner (user), ob-node (node)
+        seed_second_owner(&backend, "ob-owner2").await;
+
+        // First owner-binding admits; owner_of resolves ob-owner.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_owner_binding("ob-b1", "ob-owner", "ob-node"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_of(&backend, "ob-node").await.unwrap(),
+            Some("ob-owner".to_string())
+        );
+
+        // A second, DIFFERENT owner is rejected.
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_owner_binding("ob-b2", "ob-owner2", "ob-node"),
+            })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::NodeAlreadyOwned {
+                ref node_key_id,
+                ref incumbent_owner,
+                ref attempted_owner,
+            } => {
+                assert_eq!(node_key_id, "ob-node");
+                assert_eq!(incumbent_owner, "ob-owner");
+                assert_eq!(attempted_owner, "ob-owner2");
+            }
+            other => panic!("expected NodeAlreadyOwned, got {other:?}"),
+        }
+        assert_eq!(err.kind(), "federation_node_already_owned");
+        // The rejected binding left no trace — owner unchanged.
+        assert_eq!(
+            owner_of(&backend, "ob-node").await.unwrap(),
+            Some("ob-owner".to_string())
+        );
+    }
+
+    /// A refresh by the SAME owner (new attestation id, same granter) is
+    /// idempotently admitted — re-binding your own node is not a second owner.
+    #[tokio::test]
+    async fn single_owner_gate_admits_same_owner_refresh() {
+        use crate::federation::admission::owner_of;
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_owner_binding("ob-b1", "ob-owner", "ob-node"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_owner_binding("ob-b2", "ob-owner", "ob-node"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_of(&backend, "ob-node").await.unwrap(),
+            Some("ob-owner".to_string())
+        );
+    }
+
+    /// Ownership is transferable, not permanent: after the incumbent binding
+    /// lapses (expiry → non-live), a DIFFERENT owner may bind. The gate honors
+    /// the same liveness predicate as `steward_bindings_of`.
+    #[tokio::test]
+    async fn single_owner_gate_admits_new_owner_after_incumbent_expires() {
+        use crate::federation::admission::owner_of;
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        seed_second_owner(&backend, "ob-owner2").await;
+
+        // An already-expired incumbent binding (expires_at is a row field, not
+        // in the signed envelope, so the ingest signature is unaffected).
+        let mut expired = fix_owner_binding("ob-b1", "ob-owner", "ob-node");
+        expired.expires_at = Some("2020-01-01T00:00:00Z".parse().unwrap());
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: expired,
+            })
+            .await
+            .unwrap();
+        // Expired → non-live → node reads as unowned.
+        assert_eq!(owner_of(&backend, "ob-node").await.unwrap(), None);
+
+        // A different owner may now bind.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_owner_binding("ob-b2", "ob-owner2", "ob-node"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_of(&backend, "ob-node").await.unwrap(),
+            Some("ob-owner2".to_string())
+        );
+    }
+
+    /// The gate + `owner_of` key on the OWNERSHIP dimension, NOT any
+    /// `delegates_to`. A plain infra delegation (act-on-behalf shape, no
+    /// ownership dimension) is not an owner-binding: it neither trips the gate
+    /// nor counts toward `owner_of` — even though `steward_bindings_of` (the
+    /// broader relation) does count it. This is the ownership-vs-delegation
+    /// distinction the single-owner invariant rests on.
+    #[tokio::test]
+    async fn owner_of_ignores_non_ownership_delegations() {
+        use crate::federation::admission::{owner_of, steward_bindings_of};
+        use crate::federation::types::delegation_scope as ds;
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        seed_second_owner(&backend, "ob-owner2").await;
+
+        // A non-ownership infra delegation (no ownership dimension).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_node_delegates_to(
+                    "ob-plain",
+                    "ob-owner",
+                    "ob-node",
+                    "ob-owner",
+                    &[ds::INFRA_SERVE],
+                ),
+            })
+            .await
+            .unwrap();
+        // Not an owner-binding → owner_of sees no owner…
+        assert_eq!(owner_of(&backend, "ob-node").await.unwrap(), None);
+        // …but steward_bindings_of (broader) DOES count the granter.
+        assert_eq!(
+            steward_bindings_of(&backend, "ob-node").await.unwrap(),
+            vec!["ob-owner".to_string()]
+        );
+        // A real owner-binding from a DIFFERENT user still admits — the plain
+        // delegation never claimed ownership, so it does not block.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_owner_binding("ob-b1", "ob-owner2", "ob-node"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_of(&backend, "ob-node").await.unwrap(),
+            Some("ob-owner2".to_string())
+        );
+    }
+
+    /// `owner_of` on an unowned node is `None` (not an error, not a guess).
+    #[tokio::test]
+    async fn owner_of_unowned_node_is_none() {
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        assert_eq!(
+            crate::federation::admission::owner_of(&backend, "ob-node")
+                .await
+                .unwrap(),
+            None
         );
     }
 
