@@ -70,6 +70,7 @@ async fn register_producer<D: FederationDirectory>(dir: &D, key_id: &str, ed_pk_
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         },
     })
     .await

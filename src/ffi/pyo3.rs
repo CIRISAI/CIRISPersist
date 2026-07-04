@@ -2021,6 +2021,37 @@ impl PyEngine {
         })
     }
 
+    /// #227 (residual) — drive one **consent-decay** sweep synchronously
+    /// (the time-driven twin of [`Self::sweep_evictions_once`]). Ages every
+    /// fountain content unit against its consent-decay schedule (TEMPORARY
+    /// 14-day, pattern 90-day) and evicts symbols down to the clock's
+    /// target tier via the SAME eviction mechanism disk-pressure uses.
+    /// Returns the number of symbol rows evicted this pass. Disk-independent
+    /// (no watermark) and idempotent (re-running evicts nothing further).
+    /// Sovereign callers (Pi-cron / k8s CronJob) drive this on their own
+    /// cadence.
+    fn sweep_consent_decay_once(&self, py: Python<'_>) -> PyResult<i64> {
+        self.ensure_usable()?;
+        let runtime = self.runtime.clone();
+        let slot = engine_slot();
+        let cell = slot
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
+        let engine = crate::Engine::from_shared_with_local(
+            cell.engine_backend_dispatch(),
+            cell.signer.clone(),
+            cell.local_signer.clone(),
+        );
+        drop(slot);
+        py.detach(move || {
+            let now = chrono::Utc::now();
+            runtime
+                .block_on(async move { engine.sweep_consent_decay_once(now).await })
+                .map(|report| report.symbols_evicted as i64)
+                .map_err(fountain_store_err_to_py)
+        })
+    }
+
     /// v6.8.0 (CIRISPersist#148) — current total local
     /// `federation_blobs` bytes (the cache usage). For ops monitoring.
     fn cache_usage_bytes(&self, py: Python<'_>) -> PyResult<u64> {
@@ -2839,9 +2870,12 @@ impl PyEngine {
             ) {
                 Ok(()) => Ok(true),
                 Err(E::Invalid(_)) | Err(E::SignatureFailed) => Ok(false),
-                Err(e @ (E::MalformedJson(_) | E::MalformedBase64(_))) => {
-                    Err(storage_contention_err_to_py(e))
-                }
+                // RevisionRollback is unreachable from a pure verify (it is
+                // the #370 install-path error) — grouped with the raising
+                // arm for exhaustiveness.
+                Err(
+                    e @ (E::MalformedJson(_) | E::MalformedBase64(_) | E::RevisionRollback { .. }),
+                ) => Err(storage_contention_err_to_py(e)),
             }
         })
     }
@@ -2864,9 +2898,12 @@ impl PyEngine {
             ) {
                 Ok(()) => Ok(true),
                 Err(E::Invalid(_)) | Err(E::SignatureFailed) => Ok(false),
-                Err(e @ (E::MalformedJson(_) | E::MalformedBase64(_))) => {
-                    Err(storage_contention_err_to_py(e))
-                }
+                // RevisionRollback is unreachable from a pure verify (it is
+                // the #370 install-path error) — grouped with the raising
+                // arm for exhaustiveness.
+                Err(
+                    e @ (E::MalformedJson(_) | E::MalformedBase64(_) | E::RevisionRollback { .. }),
+                ) => Err(storage_contention_err_to_py(e)),
             }
         })
     }
@@ -2908,6 +2945,83 @@ impl PyEngine {
                 object_bytes,
             )
             .map_err(storage_contention_err_to_py)
+        })
+    }
+
+    /// #370 (§Q B2/B3, CC 6.1.5.2) — INSTALL a signed `StorageBudgetV1` so
+    /// it governs this node's capacity eviction. Verifies the bound-hybrid
+    /// signature against the owner pubkeys (PQC-mandatory — verify at the
+    /// gate, BEFORE persistence), enforces §Q B3 anti-rollback (a
+    /// lower/equal `revision` from the same `node_id` than the installed
+    /// one is rejected), then persists the budget (V092, both backends).
+    /// The installed `pinned_class` / `pin_reserve_bytes` drive the B5
+    /// CACHE-BEFORE-PINNED ordering of the eviction sweep; revocation
+    /// (`evict_fountain_content_hard_delete`) stays pin-blind (§Q B6).
+    /// Returns the accepted `revision`. Raises `ValueError` on a
+    /// structural/signature failure or an anti-rollback rejection
+    /// (`storage_contention_revision_rollback`).
+    #[pyo3(name = "install_storage_budget_v1")]
+    fn install_storage_budget_v1_py(
+        &self,
+        py: Python<'_>,
+        wire_json: &str,
+        ed25519_pubkey_base64: &str,
+        ml_dsa_65_pubkey_base64: &str,
+    ) -> PyResult<u64> {
+        self.ensure_usable()?;
+        let wire_json = wire_json.to_owned();
+        let ed_pub = ed25519_pubkey_base64.to_owned();
+        let mldsa_pub = ml_dsa_65_pubkey_base64.to_owned();
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    engine
+                        .install_storage_budget_v1(&wire_json, &ed_pub, &mldsa_pub)
+                        .await
+                })
+            })
+            .map_err(fountain_store_err_to_py)
+        })
+    }
+
+    /// #370 — the installed `StorageBudgetV1` wire JSON for `node_id`,
+    /// VERBATIM as accepted (re-verifiable with `verify_storage_budget_v1`).
+    /// `None` when no budget is installed for that node.
+    #[pyo3(name = "get_installed_storage_budget_json")]
+    fn get_installed_storage_budget_json_py(
+        &self,
+        py: Python<'_>,
+        node_id: &str,
+    ) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        let node_id = node_id.to_owned();
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(
+                    async move { engine.get_installed_storage_budget_json(&node_id).await },
+                )
+            })
+            .map_err(fountain_store_err_to_py)
         })
     }
 
@@ -3767,6 +3881,126 @@ impl PyEngine {
         })
     }
 
+    /// v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
+    /// apply**. FFI mirror of
+    /// [`Engine::apply_replicated_key_record`](crate::engine::Engine::apply_replicated_key_record)
+    /// — the apply the replication bridge routes `apply_key` to instead of
+    /// raw `put_public_key` (which keeps its insert-only semantics for
+    /// direct registration).
+    ///
+    /// `signed_key_record_json` is the replicated `SignedKeyRecord`. Returns
+    /// the outcome token: `"inserted"` (new key_id, every `put_public_key`
+    /// admission gate intact), `"upgraded"` (existing self-signed row
+    /// adopted the anchor-scrubbed record — same hybrid pubkeys, scrub
+    /// Strict-verified against the directory-resolved scrubber, and the
+    /// v12.6.0 `owner_of(key_id)` gate resolved exactly one live owner),
+    /// `"unchanged"` (byte-identical re-apply), or `"refused"` (pubkey swap
+    /// / downgrade / re-scrub / conflicting version / unverifiable scrub /
+    /// unowned or ambiguous owner — fail-closed, row untouched). Refusals
+    /// are outcomes, not exceptions, so an apply loop stays total.
+    fn apply_replicated_key_record(
+        &self,
+        py: Python<'_>,
+        signed_key_record_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let record: crate::federation::SignedKeyRecord =
+                serde_json::from_str(signed_key_record_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
+                })?;
+            let outcome = py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        backend
+                            .apply_replicated_key_record(record)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        backend
+                            .apply_replicated_key_record(record)
+                            .await
+                            .map_err(federation_err_to_py)
+                    })
+                }
+            })?;
+            serde_json::to_value(outcome)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .ok_or_else(|| {
+                    PyValueError::new_err("apply_replicated_key_record outcome serialize")
+                })
+        })
+    }
+
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
+    /// founding bootstrap server**? Returns `True` iff its `federation_keys`
+    /// row's `identity_type` set contains `canonical`. Because the substrate
+    /// admission gate only ever admits `canonical` on an anchor-scrub-conferred
+    /// record (an accord holder scrub-signed the node with the role), a `True`
+    /// here means the role was accord-conferred — it cannot be self-claimed.
+    /// `False` for an unknown key or a non-canonical row.
+    fn is_canonical(&self, py: Python<'_>, key_id: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::is_canonical(backend.as_ref(), &key_id).await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::is_canonical(backend.as_ref(), &key_id).await
+                    })
+                }
+            })
+            .map_err(federation_err_to_py)
+        })
+    }
+
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
+    /// founding bootstrap servers** as a JSON array of `KeyRecord`s
+    /// (`federation_keys` rows whose `identity_type` set contains `canonical`,
+    /// stable-sorted by `key_id`). Every returned row is anchor-scrub-conferred
+    /// (the admission gate refuses a self-claimed `canonical`).
+    fn list_canonical_servers(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let rows = py
+                .detach(move || match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move { backend.list_canonical_servers().await })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move { backend.list_canonical_servers().await })
+                    }
+                })
+                .map_err(federation_err_to_py)?;
+            serde_json::to_string(&rows)
+                .map_err(|e| PyRuntimeError::new_err(format!("KeyRecord list JSON encode: {e}")))
+        })
+    }
+
     /// v1.5.3 — One-call helper that registers THIS engine's local
     /// pubkey as a `federation_keys` row of the specified
     /// `identity_type`. Composes the existing primitives
@@ -4295,6 +4529,17 @@ impl PyEngine {
     /// #247 floor: this can't FK-violate the way the hand-rolled emit sites
     /// did. Requires a PQC-configured local signer (the hybrid sign);
     /// raises if absent.
+    ///
+    /// v12.7.0 (CIRISPersist#368, CC 3.4.11/3.4.13) — `attested_key_id`
+    /// names the row's **SUBJECT** (the cross-subject edge shape
+    /// `delegates_to` uses). Omitted ⇒ self-attestation. This is the
+    /// **witness-targets-subject** age surface: a `witness`-role engine
+    /// emits `{"attestation_type": "age_assurance:{level}:{band}:v1",
+    /// "attested_key_id": "<subject>", ...}` and the SUBJECT's
+    /// `age_band_json` graduates (witness outranks self). A subject cannot
+    /// graduate itself: attester==attested on `age_assurance:*` raises
+    /// `ValueError("federation_age_assurance_self_emission_rejected")`, and
+    /// a non-witness emitter raises the reserved-prefix mismatch.
     fn emit_attestation(&self, py: Python<'_>, input_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -4351,6 +4596,14 @@ impl PyEngine {
     /// **DERIVED** federation key_id (`local_derived_key_id`, the #247
     /// floor), computed internally. Surfaces a clear error if the engine
     /// has no composed hybrid signer (no local signer / no PQC half).
+    ///
+    /// v12.7.0 (CIRISPersist#368) — despite the `_self` name (which refers
+    /// to signing with the engine's OWN composed signer), the input's
+    /// optional `attested_key_id` still names the row's SUBJECT, exactly as
+    /// on [`PyEngine::emit_attestation`] — so a witness-role hardware-hybrid
+    /// engine can graduate a DIFFERENT subject's age band through this path
+    /// too. Omitted ⇒ self-attestation (and `age_assurance:*` then rejects:
+    /// a subject must not emit its own age assurance, CC 3.4.11).
     fn emit_attestation_self(&self, py: Python<'_>, input_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -7388,6 +7641,64 @@ impl PyEngine {
         })
     }
 
+    /// v12.7.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
+    /// no-moderator-no-federate admission VERDICT for one community: exactly
+    /// the decision the federation-apply gate
+    /// ([`admission::check_no_moderator_federate_apply`](crate::federation::admission::check_no_moderator_federate_apply),
+    /// wired into every backend's `put_attestation`) takes for a federation
+    /// apply step keyed on `community_id`, returned as JSON instead of a
+    /// refusal so the gate can be staged without constructing a full
+    /// federation flow. Returns
+    /// `{"admitted": true, "community_known": false}` (not locally known —
+    /// out of scope, fail-open), `{"admitted": true, "community_known": true}`
+    /// (a live `moderate`-holder resolves, or the authorized-infrastructure
+    /// carve-out applies), or `{"admitted": false, "community_known": true,
+    /// "reason": "federation_community_no_moderator"}` (§11.11 rule-3
+    /// fail-secure). Read-only. Wraps the free function
+    /// [`admission::no_moderator_federate_verdict`](crate::federation::admission::no_moderator_federate_verdict).
+    fn check_no_moderator_federate_json(
+        &self,
+        py: Python<'_>,
+        community_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let community_id = community_id.to_owned();
+            py.detach(move || {
+                let verdict: serde_json::Value = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::no_moderator_federate_verdict(
+                                &*backend,
+                                &community_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::no_moderator_federate_verdict(
+                                &*backend,
+                                &community_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&verdict).map_err(|e| {
+                    PyValueError::new_err(format!("no_moderator_federate_verdict serialize: {e}"))
+                })
+            })
+        })
+    }
+
     /// #249 Cut A — is `key_id` **steward-bound** (resolves to a `user`-role
     /// human identity, directly / via occurrence / via a live `delegates_to`
     /// from a user-role granter)? Returns JSON `true` / `false`. Wraps the
@@ -7396,6 +7707,14 @@ impl PyEngine {
     /// fail-closed (a key whose chain to a `user` identity cannot be shown is
     /// not steward-bound). The most-reconstructed walk; exposing it stops
     /// consumers re-deriving the §5.6.8.10 graph.
+    ///
+    /// v12.7.0 (CIRISPersist#367, CC 3.2) — this is also THE
+    /// **steward-less-minor liveness predicate**: a PROVEN minor (witness
+    /// `age_assurance:*:minor` about it, emittable cross-subject per #368)
+    /// does NOT self-anchor, so it returns `true` only while a live
+    /// `delegates_to(adult-user → minor)` guardianship edge exists — and
+    /// flips to `false` (fail-secure) the moment the steward withdraws it.
+    /// An adult / age-unverified user self-anchors (`true` with no edge).
     fn is_steward_bound_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -7527,6 +7846,107 @@ impl PyEngine {
                 };
                 serde_json::to_string(band.as_str())
                     .map_err(|e| PyValueError::new_err(format!("age_band_fine serialize: {e}")))
+            })
+        })
+    }
+
+    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — resolve the
+    /// **Counter-RII `consent_role`** of `key_id`. Returns a JSON string: the
+    /// assigned role token (`"temporary"` / `"partnered"` / `"anonymous"` /
+    /// `"authorized_review"` / `"peer"` — the V020 vocabulary CC 3.4.7.2
+    /// ratifies), or `null` when the key has no assigned role (the stored
+    /// `'unregistered'` default, or the key is absent — all "no assigned
+    /// role": detection applies normally). Wraps
+    /// [`consent_role_of`](crate::federation::consent::consent_role_of). Persist
+    /// STORES + EXPOSES the role; the OQ-2 (`peer` blanket suppression) and
+    /// OQ-3 (`authorized_review` strict post-window) detection *signals* are
+    /// applied by the consumer (edge `ProbePatternObserver` / RATCHET) reading
+    /// this — persist houses no Counter-RII detector.
+    fn consent_role_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(move || {
+                let role: Option<String> = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::consent::consent_role_of(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::consent::consent_role_of(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&role)
+                    .map_err(|e| PyValueError::new_err(format!("consent_role serialize: {e}")))
+            })
+        })
+    }
+
+    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — assign or **overwrite** the
+    /// Counter-RII `consent_role` of `key_id`. `consent_role=None` revokes it
+    /// (resets the V020 column to its `'unregistered'` default). This is the
+    /// OQ-1 non-recursive overwrite: a subsequent call overwrites the single
+    /// flat column (no chain embedded in the field). Raises `ValueError` if
+    /// `key_id` has no `federation_keys` row, or if the token is not one of
+    /// the ratified vocabulary (`temporary` / `partnered` / `anonymous` /
+    /// `authorized_review` / `peer` — same rejection on BOTH backends).
+    #[pyo3(signature = (key_id, consent_role=None))]
+    fn set_consent_role(
+        &self,
+        py: Python<'_>,
+        key_id: &str,
+        consent_role: Option<&str>,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            let role: Option<String> = consent_role.map(str::to_owned);
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::set_consent_role(
+                            &*backend,
+                            &key_id,
+                            role.as_deref(),
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::FederationDirectory::set_consent_role(
+                            &*backend,
+                            &key_id,
+                            role.as_deref(),
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                    })
+                }
             })
         })
     }
@@ -23887,6 +24307,7 @@ fn fountain_store_err_to_py(e: crate::store::Error) -> PyErr {
         Error::FountainAdmit(_)
         | Error::FountainIntegrity(_)
         | Error::AggregationMetaRejected(_)
+        | Error::StorageContention(_)
         | Error::Schema(_) => PyValueError::new_err(e.kind()),
         Error::NotImplemented(_) | Error::Backend(_) | Error::Migration { .. } => {
             PyRuntimeError::new_err(format!("{e}"))
@@ -24376,8 +24797,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // shape as the other admission-gate rejections.
         // v10.3.0 (#288, CC 3.4.5) — capacity:* self-emission is the same
         // admission-gate-rejection shape (caller-fault, ValueError).
+        // v12.7.0 (#368, CC 3.4.11) — age_assurance:* self-emission is its
+        // exact sibling (subject-must-not-emit; caller-fault, ValueError).
         crate::federation::Error::ReservedPrefixEmitterMismatch { .. }
-        | crate::federation::Error::CapacitySelfEmissionRejected { .. } => {
+        | crate::federation::Error::CapacitySelfEmissionRejected { .. }
+        | crate::federation::Error::AgeAssuranceSelfEmissionRejected { .. } => {
             PyValueError::new_err(kind)
         }
         // v3.9.1 (CIRISPersist#150 Ask 3) — cohort_scope admission
@@ -24440,6 +24864,14 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // ValueError (4xx / 409-shaped, like `Conflict`).
         crate::federation::Error::NodeAlreadyOwned { .. }
         | crate::federation::Error::AmbiguousNodeOwner { .. } => PyValueError::new_err(kind),
+        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — a rejected `canonical`
+        // (founding-server) role that is not accord-conferred (self-claimed /
+        // non-anchor-scrubbed) is a caller-side authorization failure;
+        // ValueError (4xx). The `canonical` role is accord-CONFERRED, never
+        // self-claimed.
+        crate::federation::Error::CanonicalRoleNotAccordConferred { .. } => {
+            PyValueError::new_err(kind)
+        }
         // v9.0.0 (CC 3.2 / CC 3.4.7.1) — admitting an unstewarded node/agent to
         // a non-infrastructure community is a caller-side authorization
         // failure (non-infra membership is an authority act that must root
@@ -26302,6 +26734,7 @@ mod tests {
                     persist_row_hash: String::new(),
                     roles: Vec::new(),
                     attestation_evidence: None,
+                    consent_role: None,
                 },
             })
             .await
@@ -26319,6 +26752,8 @@ mod tests {
                     }),
                     subject_key_ids: vec![],
                     cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                    scrub_signature_classical: None,
+                    scrub_signature_pqc: None,
                 })
                 .await
                 .unwrap();

@@ -961,6 +961,7 @@ mod tests {
                 ROLE_SECRETS_ADMIN.to_owned(),
             ],
             attestation_evidence: None,
+            consent_role: None,
         };
         FederationDirectory::put_public_key(&*backend, SignedKeyRecord { record: key })
             .await

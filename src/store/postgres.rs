@@ -150,6 +150,8 @@ impl PostgresBackend {
     /// - `postgres://user:pass@host:5432/dbname`
     /// - `host=db user=lens password=… dbname=cirislens`
     pub async fn connect(dsn: &str) -> Result<Self, Error> {
+        #[cfg(feature = "tls")]
+        ensure_rustls_provider();
         let pg_config: tokio_postgres::Config = dsn
             .parse()
             .map_err(|e: tokio_postgres::Error| Error::Backend(format!("dsn parse: {e}")))?;
@@ -522,6 +524,7 @@ impl PostgresBackend {
     async fn dedicated_connect(&self) -> Result<tokio_postgres::Client, Error> {
         use rustls::ClientConfig;
         use tokio_postgres_rustls::MakeRustlsConnect;
+        ensure_rustls_provider();
         let mut roots = rustls::RootCertStore::empty();
         let cert_result = rustls_native_certs::load_native_certs();
         for cert in cert_result.certs {
@@ -553,6 +556,23 @@ impl PostgresBackend {
         });
         Ok(client)
     }
+}
+
+/// AV-18 `tls` feature — idempotently install the process-level rustls
+/// [`CryptoProvider`](rustls::crypto::CryptoProvider) before building a
+/// `ClientConfig`. The dependency graph compiles BOTH providers — `ring`
+/// (via the verify/reqwest stack) and `aws-lc-rs` (rustls' own default) —
+/// so rustls 0.23 cannot infer a process default and
+/// `ClientConfig::builder()` PANICS unless one was installed. We install
+/// `aws-lc-rs` (rustls' preferred provider; with `prefer-post-quantum` in
+/// the graph it negotiates the X25519MLKEM768 hybrid, matching the
+/// federation's PQC posture). `Err(_)` from `install_default` means a
+/// provider is already installed — ours from an earlier connect, or the
+/// host application's — and first-install-wins is exactly the rustls
+/// contract, so it is deliberately ignored.
+#[cfg(feature = "tls")]
+fn ensure_rustls_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 /// Walk the std::error::Error source chain; if a tokio-postgres
@@ -1666,6 +1686,110 @@ impl Backend for PostgresBackend {
         Ok(out)
     }
 
+    // ─── v12.7.0 — §Q pin-INSTALL surface (CIRISPersist#370) ─────────
+
+    async fn put_installed_storage_budget(
+        &self,
+        budget: &crate::fountain::storage_contention::InstalledStorageBudget,
+    ) -> Result<bool, Error> {
+        let revision = i64::try_from(budget.revision)
+            .map_err(|_| Error::Backend("storage budget revision exceeds i64".into()))?;
+        let scopes = serde_json::to_value(&budget.scopes)
+            .map_err(|e| Error::Backend(format!("serialize budget scopes: {e}")))?;
+        let pinned_class = serde_json::to_value(&budget.pinned_class)
+            .map_err(|e| Error::Backend(format!("serialize budget pinned_class: {e}")))?;
+        let wire: serde_json::Value = serde_json::from_str(&budget.wire_json)
+            .map_err(|e| Error::Backend(format!("parse budget wire json: {e}")))?;
+        let client = self.get_client().await?;
+        // §Q B3 anti-rollback, ATOMIC at the row: the DO UPDATE only fires
+        // when the incoming revision is STRICTLY higher; rows_affected == 0
+        // ⇒ refused (the Engine surfaces RevisionRollback).
+        let n = client
+            .execute(
+                "INSERT INTO cirislens.storage_budget_installed (\
+                     node_id, revision, epoch_id, scopes, pinned_class, wire, installed_at\
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7) \
+                 ON CONFLICT (node_id) DO UPDATE SET \
+                     revision = EXCLUDED.revision, \
+                     epoch_id = EXCLUDED.epoch_id, \
+                     scopes = EXCLUDED.scopes, \
+                     pinned_class = EXCLUDED.pinned_class, \
+                     wire = EXCLUDED.wire, \
+                     installed_at = EXCLUDED.installed_at \
+                 WHERE storage_budget_installed.revision < EXCLUDED.revision",
+                &[
+                    &budget.node_id,
+                    &revision,
+                    &budget.epoch_id,
+                    &scopes,
+                    &pinned_class,
+                    &wire,
+                    &budget.installed_at,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("put_installed_storage_budget: {e}")))?;
+        Ok(n > 0)
+    }
+
+    async fn get_installed_storage_budget(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<crate::fountain::storage_contention::InstalledStorageBudget>, Error> {
+        let client = self.get_client().await?;
+        let row = client
+            .query_opt(
+                "SELECT node_id, revision, epoch_id, scopes, pinned_class, wire, installed_at \
+                 FROM cirislens.storage_budget_installed WHERE node_id = $1",
+                &[&node_id],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("get_installed_storage_budget: {e}")))?;
+        row.map(pg_row_to_installed_storage_budget).transpose()
+    }
+
+    async fn list_installed_storage_budgets(
+        &self,
+    ) -> Result<Vec<crate::fountain::storage_contention::InstalledStorageBudget>, Error> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT node_id, revision, epoch_id, scopes, pinned_class, wire, installed_at \
+                 FROM cirislens.storage_budget_installed ORDER BY node_id ASC",
+                &[],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("list_installed_storage_budgets: {e}")))?;
+        rows.into_iter()
+            .map(pg_row_to_installed_storage_budget)
+            .collect()
+    }
+
+    // #227 (residual) — consent-decay clock enumerator (disk-independent).
+    async fn list_fountain_decay_candidates(
+        &self,
+    ) -> Result<Vec<crate::fountain::FountainDecayCandidate>, Error> {
+        let client = self.get_client().await?;
+        let rows = client
+            .query(
+                "SELECT content_id, corpus_kind, envelope, admitted_at \
+                 FROM cirislens.content_manifest",
+                &[],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("list_fountain_decay_candidates: {e}")))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(crate::fountain::FountainDecayCandidate {
+                content_id: r.safe_get_with("content_id", Error::Backend)?,
+                corpus_kind: r.safe_get_with("corpus_kind", Error::Backend)?,
+                envelope: r.safe_get_with("envelope", Error::Backend)?,
+                admitted_at: r.safe_get_with("admitted_at", Error::Backend)?,
+            });
+        }
+        Ok(out)
+    }
+
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
 
     async fn put_aggregated_tier(
@@ -1830,6 +1954,33 @@ impl Backend for PostgresBackend {
             .map_err(|e| Error::Backend(format!("list content_aggregation: {e}")))?;
         rows.iter().map(Self::aggregation_record_from_row).collect()
     }
+}
+
+/// #370 — decode one `storage_budget_installed` row. The `wire` JSONB is
+/// re-serialized to the `wire_json` string (round-trips losslessly — JSONB
+/// key order is not signed material; the signatures verify over the CC
+/// 6.1.3 binary preimage rebuilt from the FIELDS, not over the JSON text).
+fn pg_row_to_installed_storage_budget(
+    row: tokio_postgres::Row,
+) -> Result<crate::fountain::storage_contention::InstalledStorageBudget, Error> {
+    let revision: i64 = row.safe_get_with("revision", Error::Backend)?;
+    let scopes: serde_json::Value = row.safe_get_with("scopes", Error::Backend)?;
+    let pinned_class: serde_json::Value = row.safe_get_with("pinned_class", Error::Backend)?;
+    let wire: serde_json::Value = row.safe_get_with("wire", Error::Backend)?;
+    Ok(
+        crate::fountain::storage_contention::InstalledStorageBudget {
+            node_id: row.safe_get_with("node_id", Error::Backend)?,
+            revision: u64::try_from(revision)
+                .map_err(|_| Error::Backend("installed budget revision negative".into()))?,
+            epoch_id: row.safe_get_with("epoch_id", Error::Backend)?,
+            scopes: serde_json::from_value(scopes)
+                .map_err(|e| Error::Backend(format!("decode budget scopes: {e}")))?,
+            pinned_class: serde_json::from_value(pinned_class)
+                .map_err(|e| Error::Backend(format!("decode budget pinned_class: {e}")))?,
+            wire_json: wire.to_string(),
+            installed_at: row.safe_get_with("installed_at", Error::Backend)?,
+        },
+    )
 }
 
 // ─── Pipeline read surface (v0.6.0-α5, CIRISPersist#19) ───────────
@@ -2127,6 +2278,13 @@ impl PostgresBackend {
             } else {
                 Some(&row.roles)
             };
+            // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — wire None ⇔ the
+            // stored V020 'unregistered' default (column is NOT NULL).
+            crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
+            let consent_role_stored = crate::federation::types::consent_role::stored_from_wire(
+                row.consent_role.as_deref(),
+            )
+            .to_owned();
             client
                 .execute(
                     "INSERT INTO cirislens.federation_keys (\
@@ -2134,8 +2292,8 @@ impl PostgresBackend {
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                        attestation_evidence\
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+                        attestation_evidence, consent_role\
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
                      ON CONFLICT (key_id) DO NOTHING",
                     &[
                         &row.key_id,
@@ -2156,6 +2314,7 @@ impl PostgresBackend {
                         &row.persist_row_hash,
                         &roles_param,
                         &row.attestation_evidence,
+                        &consent_role_stored,
                     ],
                 )
                 .await
@@ -2193,6 +2352,13 @@ impl PostgresBackend {
                 row.algorithm
             )));
         }
+        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — adopt_scrub_upgrade is a
+        // self-signed → anchor-scrubbed UPDATE that CAN change identity_type,
+        // so it is a second path a `canonical` role could otherwise enter on.
+        // Re-run the accord-conferred gate: `canonical` is admitted here only
+        // if THIS incoming (anchor-scrubbed) record earned it via a real
+        // accord-holder scrubber. Backend-symmetric with SQLite.
+        crate::federation::admission::check_canonical_role_admission(self, &row).await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let existing = crate::federation::FederationDirectory::lookup_public_key(self, &row.key_id)
@@ -2233,6 +2399,12 @@ impl PostgresBackend {
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         // WHERE re-asserts the guards atomically: self-signed + same pubkey.
+        //
+        // v12.7.0 (CIRISPersist#365, CC 3.4.7.2): `consent_role` is
+        // deliberately NOT in the SET list — it is an operational role
+        // marker (its OQ-1 overwrite surface is `set_consent_role`), not
+        // registration content; an anchor-scrub upgrade must not clobber
+        // an assigned role.
         let n = client
             .execute(
                 "UPDATE cirislens.federation_keys SET \
@@ -2279,6 +2451,97 @@ impl PostgresBackend {
         }
         Ok(AdoptScrubOutcome::Upgraded)
     }
+
+    /// v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
+    /// apply** — Postgres twin of
+    /// [`SqliteBackend::apply_replicated_key_record`](crate::store::sqlite::SqliteBackend::apply_replicated_key_record).
+    /// All policy lives in the shared, backend-agnostic
+    /// [`plan_replicated_key_apply`](crate::federation::register::plan_replicated_key_apply)
+    /// (fresh insert via `put_public_key` with every direct-registration
+    /// gate intact; self-signed → anchor-scrubbed upgrade via
+    /// [`adopt_scrub_upgrade`](Self::adopt_scrub_upgrade) only after the
+    /// `verify_key_registration` Strict scrub gate + the v12.6.0 `owner_of`
+    /// single-owner gate pass; everything else `Unchanged` / `Refused`),
+    /// so the two backends cannot drift. A store-step `Conflict` (a row
+    /// that changed between plan and act) resolves to `Refused` —
+    /// fail-closed + re-offerable on the anti-entropy plane, never fatal.
+    pub async fn apply_replicated_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        use crate::federation::register::{
+            plan_replicated_key_apply, AdoptScrubOutcome, ReplicatedKeyOutcome, ReplicatedKeyPlan,
+        };
+        match plan_replicated_key_apply(self, &record.record).await? {
+            ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
+            ReplicatedKeyPlan::Refused => Ok(ReplicatedKeyOutcome::Refused),
+            ReplicatedKeyPlan::Insert => {
+                match crate::federation::FederationDirectory::put_public_key(self, record).await {
+                    Ok(()) => Ok(ReplicatedKeyOutcome::Inserted),
+                    // A row appeared between plan and act with different
+                    // content — first-seen wins on the replication plane.
+                    Err(crate::federation::Error::Conflict(_)) => Ok(ReplicatedKeyOutcome::Refused),
+                    Err(e) => Err(e),
+                }
+            }
+            ReplicatedKeyPlan::Upgrade => match self.adopt_scrub_upgrade(record).await {
+                Ok(AdoptScrubOutcome::Upgraded) => Ok(ReplicatedKeyOutcome::Upgraded),
+                Ok(AdoptScrubOutcome::AlreadyAdopted) => Ok(ReplicatedKeyOutcome::Unchanged),
+                // The atomic WHERE (or its Rust pre-checks) saw different
+                // state than the plan — a concurrent mutation. Fail-closed.
+                Err(crate::federation::Error::Conflict(_)) => Ok(ReplicatedKeyOutcome::Refused),
+                Err(e) => Err(e),
+            },
+        }
+    }
+
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
+    /// founding bootstrap servers**: `federation_keys` rows whose
+    /// `identity_type` **set** contains
+    /// [`crate::federation::types::identity_type::CANONICAL`], stable-sorted by
+    /// `key_id`. Every such row is (by the admission gate
+    /// [`crate::federation::admission::check_canonical_role_admission`])
+    /// necessarily anchor-scrub-conferred — the role cannot be self-claimed.
+    /// Inherent on the backend (dispatched by `Engine::list_canonical_servers`)
+    /// to avoid `FederationDirectory`/capsule bloat, mirroring
+    /// [`Self::adopt_scrub_upgrade`]. The SQL `LIKE` is a coarse prefilter; the
+    /// exact set-membership check is applied in Rust via `set_contains`.
+    pub async fn list_canonical_servers(
+        &self,
+    ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                    identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                    attestation_evidence \
+                 FROM cirislens.federation_keys WHERE identity_type LIKE '%canonical%' \
+                 ORDER BY key_id",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_canonical_servers: {e}"))
+            })?;
+        let recs: Vec<crate::federation::KeyRecord> = rows
+            .into_iter()
+            .map(pg_row_to_key_record)
+            .collect::<Result<_, _>>()?;
+        Ok(recs
+            .into_iter()
+            .filter(|r| {
+                crate::federation::types::identity_type::set_contains(
+                    &r.identity_type,
+                    crate::federation::types::identity_type::CANONICAL,
+                )
+            })
+            .collect())
+    }
 }
 
 #[async_trait::async_trait]
@@ -2309,6 +2572,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 chrono::Utc::now(),
             )?;
         }
+
+        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — the `canonical` (founding
+        // bootstrap server) role is accord-CONFERRED, never self-claimed: a row
+        // may carry `canonical` only when anchor-scrub-signed (scrub_key_id !=
+        // key_id AND the scrubber's ed25519 ∈ the pinned HUMANITY_ACCORD
+        // anchor). This is the substrate write chokepoint every registration
+        // path funnels through, so a self-signed / non-anchor-scrubbed
+        // `canonical` claim is refused here before any INSERT
+        // (verify-before-mutation). Backend-symmetric with SQLite + memory.
+        crate::federation::admission::check_canonical_role_admission(self, &row).await?;
 
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
@@ -2343,6 +2616,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         } else {
             Some(&row.roles)
         };
+        // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — admission-gate the
+        // token (Rust-level, so PG's V020 CHECK and CHECK-less SQLite
+        // behave identically), then map wire None ⇔ the stored V020
+        // 'unregistered' default (the column is NOT NULL).
+        crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
+        let consent_role_stored =
+            crate::federation::types::consent_role::stored_from_wire(row.consent_role.as_deref())
+                .to_owned();
         let result = client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
@@ -2350,8 +2631,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+                    attestation_evidence, consent_role\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
                  ON CONFLICT (key_id) DO NOTHING",
                 &[
                     &row.key_id,
@@ -2372,6 +2653,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.persist_row_hash,
                     &roles_param,
                     &row.attestation_evidence,
+                    &consent_role_stored,
                 ],
             )
             .await
@@ -2415,7 +2697,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence \
+                    attestation_evidence, consent_role \
                  FROM cirislens.federation_keys WHERE key_id = $1",
                 &[&key_id],
             )
@@ -2440,7 +2722,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence \
+                    attestation_evidence, consent_role \
                  FROM cirislens.federation_keys WHERE identity_ref = $1",
                 &[&identity_ref],
             )
@@ -2470,7 +2752,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence \
+                    attestation_evidence, consent_role \
                  FROM cirislens.federation_keys WHERE identity_type = $1 \
                  ORDER BY key_id",
                 &[&identity_type],
@@ -2480,6 +2762,40 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::Error::Backend(format!("list_keys_by_identity_type: {e}"))
             })?;
         rows.into_iter().map(pg_row_to_key_record).collect()
+    }
+
+    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1) — overwrite-on-revoke
+    /// consent_role. Flat UPDATE of the single V020 column; `None` resets
+    /// to the stored `'unregistered'` default (revoke). No chain — a
+    /// subsequent call overwrites. Excluded from `persist_row_hash`, so
+    /// this does not touch the signed row.
+    async fn set_consent_role(
+        &self,
+        key_id: &str,
+        consent_role: Option<&str>,
+    ) -> Result<(), crate::federation::Error> {
+        crate::federation::types::consent_role::check_admissible(consent_role)?;
+        let stored =
+            crate::federation::types::consent_role::stored_from_wire(consent_role).to_owned();
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_keys SET consent_role = $2 WHERE key_id = $1",
+                &[&key_id, &stored],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("set_consent_role {key_id}: {e}"))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "set_consent_role: no federation_keys row for {key_id}"
+            )));
+        }
+        Ok(())
     }
 
     async fn put_attestation(
@@ -2533,13 +2849,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
         // v6.7.0 (CIRISPersist#146 Ask 5, CEG §5.6.8.7) — `consent_record`
         // ceremony admission (required fields / closed stance set /
-        // substrate-only `expired` / §10.1.3 revoked-not-local). No-op for
-        // every non-`consent_record` row.
-        crate::federation::admission::check_consent_record_admission(
-            &row.attestation_type,
-            &row.attestation_envelope,
-            &row.tier,
-        )?;
+        // substrate-only `expired`). v12.6.0 (CIRISPersist#171, §10.1.3
+        // transit-not-rest): a `revoked` consent_record at local tier MAY
+        // *transit* the local write path only if its bound-hybrid signature
+        // verifies (accept on VALID crypto only). No-op for non-consent_record
+        // rows and durable ones. Backend-symmetric with Memory + SQLite.
+        crate::federation::admission::verify_consent_record_transit_ingest(self, &row).await?;
 
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate validation. Rejects out-of-closed-set values
@@ -2696,11 +3011,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // attesting key's identity_type. Backend-symmetric with SQLite + memory.
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
-        // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
-        // federate FEDERATION-APPLY re-check (point ii). A federation-tier row
-        // keyed on a community (`community_id`) is refused if C has lost its
-        // last live `moderate`-holder. No-op for local-tier rows, no
-        // community_id, or an unknown community. Backend-symmetric.
+        // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11; keying broadened by
+        // #369) — no-moderator-no-federate FEDERATION-APPLY re-check (point
+        // ii). A federation-tier row keyed on a community under ANY substrate
+        // shape (envelope `community_id`/`community_key_id`/`cohort_key_id`,
+        // a row endpoint or subject_key_ids entry resolving as a stored
+        // community) is refused if C has lost its last live
+        // `moderate`-holder. No-op for local-tier rows, rows referencing no
+        // known community. Backend-symmetric.
         crate::federation::admission::check_no_moderator_federate_apply(self, &row).await?;
 
         // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
@@ -6110,6 +6428,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         key.persist_row_hash = crate::federation::types::compute_persist_row_hash(&key)?;
 
@@ -6146,14 +6465,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ))
         })?;
         let roles_param: Option<&Vec<String>> = None;
+        // v12.7.0 (CIRISPersist#365) — wire None ⇔ stored 'unregistered'.
+        let consent_role_stored =
+            crate::federation::types::consent_role::stored_from_wire(key.consent_role.as_deref())
+                .to_owned();
         tx.execute(
             "INSERT INTO cirislens.federation_keys (\
                 key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
                 identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                 original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                 scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                attestation_evidence\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+                attestation_evidence, consent_role\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
              ON CONFLICT (key_id) DO NOTHING",
             &[
                 &key.key_id,
@@ -6174,6 +6497,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 &key.persist_row_hash,
                 &roles_param,
                 &key.attestation_evidence,
+                &consent_role_stored,
             ],
         )
         .await
@@ -8926,7 +9250,7 @@ impl PostgresBackend {
             .map_err(|e| crate::federation::BlobError::Backend(format!("pool get: {e}")))?;
         let rows = client
             .query(
-                "SELECT sha256, size_bytes, access_count, last_accessed_at \
+                "SELECT sha256, size_bytes, access_count, last_accessed_at, media_type \
                  FROM cirislens.federation_blobs \
                  ORDER BY \
                    (access_count + 1)::float8 * \
@@ -8956,6 +9280,8 @@ impl PostgresBackend {
                 row.safe_get_with("access_count", crate::federation::BlobError::Backend)?;
             let last_accessed_at: chrono::DateTime<chrono::Utc> =
                 row.safe_get_with("last_accessed_at", crate::federation::BlobError::Backend)?;
+            let media_type: Option<String> =
+                row.safe_get_with("media_type", crate::federation::BlobError::Backend)?;
             out.push(crate::federation::EvictionCandidate {
                 sha256: sha,
                 size_bytes: size_bytes.max(0) as u64,
@@ -8965,9 +9291,43 @@ impl PostgresBackend {
                 // the signer's holds_bytes index (no attesting_key_id
                 // column on federation_blobs).
                 attesting_key_id: None,
+                // v12.7.0 (§Q B5, #370): the corpus-class token the
+                // Engine matches against the installed pinned_class set.
+                media_type,
             });
         }
         Ok(out)
+    }
+
+    /// v12.7.0 (§Q B5 / CIRISPersist#370) — total bytes currently held by
+    /// blobs whose `media_type` is one of `media_types` (the installed
+    /// `pinned_class` set). This is the §Q "consumption accounting is
+    /// edge-internal — recomputed from held content" number the sweep uses
+    /// to hold the `pin_reserve_bytes` floor; it is NEVER taken from the
+    /// wire. Empty set ⇒ 0.
+    pub async fn pinned_blob_bytes(
+        &self,
+        media_types: &[String],
+    ) -> Result<u64, crate::federation::BlobError> {
+        if media_types.is_empty() {
+            return Ok(0);
+        }
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::BlobError::Backend(format!("pool get: {e}")))?;
+        let row = client
+            .query_one(
+                "SELECT COALESCE(SUM(size_bytes), 0)::BIGINT AS total \
+                 FROM cirislens.federation_blobs WHERE media_type = ANY($1)",
+                &[&media_types],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::BlobError::Backend(format!("pinned_blob_bytes query: {e}"))
+            })?;
+        let total: i64 = row.safe_get_with("total", crate::federation::BlobError::Backend)?;
+        Ok(total.max(0) as u64)
     }
 
     /// v3.4.0 (CIRISPersist#123) — delete one `federation_blobs` row
@@ -9934,6 +10294,18 @@ fn pg_row_to_key_record(
         .try_get::<_, Option<serde_json::Value>>("attestation_evidence")
         .ok()
         .flatten();
+    // v12.7.0 (CIRISPersist#365, CC 3.4.7.2): consent_role is the V020
+    // `TEXT NOT NULL DEFAULT 'unregistered'` column. Tolerant read
+    // (matching roles/attestation_evidence above) — a SELECT that didn't
+    // pull the column maps to None, and the stored 'unregistered'
+    // default maps to wire None (`consent_role::wire_from_stored`).
+    let consent_role: Option<String> = row
+        .try_get::<_, Option<String>>("consent_role")
+        .ok()
+        .flatten()
+        .as_deref()
+        .and_then(crate::federation::types::consent_role::wire_from_stored)
+        .map(str::to_owned);
     Ok(crate::federation::KeyRecord {
         key_id: row.safe_get_with("key_id", mk_err)?,
         pubkey_ed25519_base64: row.safe_get_with("pubkey_ed25519_base64", mk_err)?,
@@ -9953,6 +10325,7 @@ fn pg_row_to_key_record(
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
         roles,
         attestation_evidence,
+        consent_role,
     })
 }
 
@@ -9975,7 +10348,7 @@ impl PostgresBackend {
             )
         })?;
 
-        crate::federation::admission::check_local_tier_eligibility(
+        let disposition = crate::federation::admission::check_local_tier_eligibility(
             &input.attestation_type,
             Some(dimension.as_str()),
             &input.attesting_key_id,
@@ -9983,6 +10356,17 @@ impl PostgresBackend {
             &input.cohort_scope,
         )?;
         crate::federation::admission::check_cohort_scope(&input.cohort_scope)?;
+
+        // v12.6.0 (CIRISPersist#171, §10.1.3) — a subject-side revocation MAY
+        // *transit* the local write path only if its bound-hybrid signature
+        // verifies (accept on VALID crypto only). `None` for a durable
+        // producer-authority row. Runs before the client is checked out.
+        let transit = crate::federation::admission::verify_local_transit_revocation(
+            self,
+            disposition,
+            &input,
+        )
+        .await?;
 
         let mut client = self
             .get_client()
@@ -10015,11 +10399,25 @@ impl PostgresBackend {
         let attestation_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
         let attesting_key_id = input.attesting_key_id.clone();
-        let mut row = input.into_local_row(attestation_id.clone(), now);
+        // A durable row defers its signature (empty-sentinel scrub envelope);
+        // a TRANSIT revocation carries the caller's verified bound-hybrid
+        // signature + computed hash (§10.1.3 transit-not-rest).
+        let mut row = match transit {
+            Some((hash, sig_classical, sig_pqc)) => input.into_transit_revocation_row(
+                attestation_id.clone(),
+                now,
+                hash,
+                sig_classical,
+                sig_pqc,
+            ),
+            None => input.into_local_row(attestation_id.clone(), now),
+        };
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let subject_key_ids_json = serde_json::to_value(&row.subject_key_ids)
             .map_err(|e| Error::Backend(format!("subject_key_ids serialize: {e}")))?;
-        let original_content_hash: Vec<u8> = Vec::new(); // empty sentinel
+        // bytea: durable row hex "" → []; transit row = SHA-256 digest bytes.
+        let original_content_hash: Vec<u8> = hex::decode(&row.original_content_hash)
+            .map_err(|e| Error::Backend(format!("original_content_hash hex decode: {e}")))?;
         let attestation_uuid = uuid::Uuid::parse_str(&attestation_id)
             .map_err(|e| Error::Backend(format!("uuid parse: {e}")))?;
 
@@ -12490,7 +12888,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    attestation_evidence \
+                    attestation_evidence, consent_role \
              FROM cirislens.federation_keys \
              {where_sql} \
              ORDER BY valid_from DESC, key_id DESC \
@@ -15157,6 +15555,147 @@ mod tests {
         format!("{nanos:x}")
     }
 
+    /// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — Postgres parity
+    /// for the FULL consent-SLA loop through the REAL admission path: a
+    /// crypto-valid subject-side `consent:state:revoked` is ADMITTED as a
+    /// transit local-tier write, and `run_consent_sla_watch` fires
+    /// `consent_revocation_promotion_overdue` for it past the 24 h window (not
+    /// before). A crypto-INVALID one is rejected at admission. Suffix-scoped so
+    /// the assertions bind only to this run's fixtures on the shared test DB.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_consent_revocation_transit_admits_and_sla_fires_end_to_end() {
+        use crate::federation::tier_ingest::test_support::sign_envelope;
+        use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
+        use crate::federation::FederationDirectory;
+        use std::time::Duration;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+
+        let now0 = chrono::Utc::now();
+        let suffix = uuid_like();
+        let subject = format!("subject-c-{suffix}");
+        let target = format!("target-c-{suffix}");
+        for kid in [&subject, &target] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: fix_section_i_key(kid, "registry", now0, true),
+                })
+                .await
+                .unwrap();
+        }
+
+        let env = serde_json::json!({
+            "id": format!("rev-{suffix}"), "dimension": "consent:state:revoked:v1",
+            "score": 1.0, "confidence": 0.9,
+        });
+        let (_hash, sig_classical, sig_pqc) = sign_envelope(&subject, &env);
+
+        backend
+            .attestation_upsert_local(LocalAttestationInput {
+                attesting_key_id: subject.clone(),
+                attested_key_id: Some(target.clone()),
+                attestation_type: attestation_type::SCORES.into(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: env.clone(),
+                subject_key_ids: vec![subject.clone()],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                scrub_signature_classical: Some(sig_classical),
+                scrub_signature_pqc: sig_pqc,
+            })
+            .await
+            .expect("crypto-valid subject-side revocation transits the local tier");
+
+        // Find THIS run's transit row (shared DB → filter by our subject).
+        let mine = backend
+            .list_consent_revocations(Some(now0))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.attesting_key_id == subject)
+            .expect("revocation scan sees our transit row");
+        assert_eq!(mine.tier, attestation_tier::LOCAL);
+        assert!(mine.promoted_at.is_none());
+        assert!(
+            !mine.scrub_signature_classical.is_empty() && mine.scrub_signature_pqc.is_some(),
+            "transit row round-trips its real bound-hybrid signature"
+        );
+        let revoked_at = mine.asserted_at;
+        let window = Duration::from_secs(86_400);
+
+        // Helper: does OUR overdue hard_case exist? (shared test DB → filter
+        // to this run's subject/target).
+        async fn ours_fired(
+            backend: &PostgresBackend,
+            since: chrono::DateTime<chrono::Utc>,
+            subject: &str,
+            target: &str,
+        ) -> bool {
+            use crate::federation::hard_case::{kind, HardCaseFilter};
+            use crate::federation::FederationDirectory as _;
+            backend
+                .list_hard_case_events(HardCaseFilter {
+                    kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                    since: Some(since),
+                })
+                .await
+                .unwrap()
+                .into_iter()
+                .any(|e| {
+                    e.subject_key_id.as_deref() == Some(subject)
+                        && e.target_key_id.as_deref() == Some(target)
+                })
+        }
+
+        // BEFORE the boundary → our revocation is in flight, not overdue.
+        let before = revoked_at + chrono::Duration::seconds(86_400 - 1);
+        backend.run_consent_sla_watch(before, window).await.unwrap();
+        assert!(
+            !ours_fired(&backend, now0, &subject, &target).await,
+            "within the window: our overdue hard_case must NOT have fired"
+        );
+
+        // AFTER the boundary → our overdue hard_case fires.
+        let after = revoked_at + chrono::Duration::seconds(86_400 + 1);
+        backend.run_consent_sla_watch(after, window).await.unwrap();
+        assert!(
+            ours_fired(&backend, now0, &subject, &target).await,
+            "past the window: our overdue hard_case fires"
+        );
+
+        // crypto-INVALID revocation → rejected at admission (never transits).
+        let bad = backend
+            .attestation_insert_local(LocalAttestationInput {
+                attesting_key_id: subject.clone(),
+                attested_key_id: Some(target.clone()),
+                attestation_type: attestation_type::SCORES.into(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: serde_json::json!({
+                    "id": format!("rev-bad-{suffix}"), "dimension": "consent:state:revoked:v1",
+                    "score": 1.0, "confidence": 0.9,
+                }),
+                subject_key_ids: vec![subject.clone()],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                scrub_signature_classical: Some("AAAA".into()),
+                scrub_signature_pqc: Some("AAAA".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                bad,
+                crate::federation::Error::FederationTierUnverified { .. }
+            ),
+            "crypto-invalid revocation rejected at admission, got {bad:?}"
+        );
+    }
+
     // ─── Lens-derived schemas (v0.4.3, CIRISPersist#18) ────────────
 
     /// Smoke: detection event round-trip through put + get.
@@ -17504,7 +18043,73 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         }
+    }
+
+    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — consent_role round-trips
+    /// through put/lookup, OQ-1 overwrite-on-revoke via set_consent_role,
+    /// and the consent_role_of resolver — on the Postgres twin. Gated on a
+    /// live test PG (skips when `CIRIS_PERSIST_TEST_PG_URL` is unset).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn consent_role_round_trip_overwrite_and_resolver_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        use crate::federation::consent::consent_role_of;
+        use crate::federation::types::consent_role;
+        use crate::federation::FederationDirectory;
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let kid = format!("k-cr-{}", uuid_like());
+
+        // Born with consent_role = peer → round-trips.
+        let mut key = fix_section_i_key(&kid, "primitive-cr", now, true);
+        key.consent_role = Some(consent_role::PEER.into());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord { record: key })
+            .await
+            .unwrap();
+        let got = FederationDirectory::lookup_public_key(&backend, &kid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.consent_role.as_deref(), Some(consent_role::PEER));
+        assert_eq!(
+            consent_role_of(&backend, &kid).await.unwrap().as_deref(),
+            Some(consent_role::PEER)
+        );
+
+        // OQ-1 overwrite → authorized_review.
+        FederationDirectory::set_consent_role(
+            &backend,
+            &kid,
+            Some(consent_role::AUTHORIZED_REVIEW),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            consent_role_of(&backend, &kid).await.unwrap().as_deref(),
+            Some(consent_role::AUTHORIZED_REVIEW)
+        );
+
+        // Revoke (overwrite to None).
+        FederationDirectory::set_consent_role(&backend, &kid, None)
+            .await
+            .unwrap();
+        assert_eq!(consent_role_of(&backend, &kid).await.unwrap(), None);
+
+        // Unknown key: setter errors, resolver stays total.
+        let missing = format!("k-cr-missing-{}", uuid_like());
+        assert!(
+            FederationDirectory::set_consent_role(&backend, &missing, Some("peer"))
+                .await
+                .is_err()
+        );
+        assert_eq!(consent_role_of(&backend, &missing).await.unwrap(), None);
     }
 
     /// V060 community substrate round-trip on Postgres — parity with
@@ -21217,6 +21822,158 @@ mod tests {
         a
     }
 
+    /// #369 (CC 4.5.4 / §11.11) — no-moderator federation-APPLY gate,
+    /// broadened keying, END-TO-END through `put_attestation` (PG backend;
+    /// 3-backend parity with memory's decision table + the sqlite twin). A
+    /// federation-tier row attested TO a stored moderator-less community
+    /// (the membership shape — NO `community_id` envelope field) is refused
+    /// fail-secure; the same shape onto a moderatored community lands;
+    /// storage-only community ops stay untouched. Run-scoped uuid-suffixed
+    /// key ids (shared test DB).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_no_moderator_federate_apply_broadened_keying() {
+        use crate::federation::admission::MEMBER_ROLE_FOUNDER;
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let now = chrono::Utc::now();
+        let suffix = uuid_like();
+        let founder_user = format!("nm-user-{suffix}");
+        let founder_prim = format!("nm-prim-{suffix}");
+        let comm_ok = format!("nm-ok-{suffix}");
+        let comm_no = format!("nm-no-{suffix}");
+        for (kid, ity) in [
+            (&founder_user, crate::federation::types::identity_type::USER),
+            (
+                &founder_prim,
+                crate::federation::types::identity_type::PRIMITIVE,
+            ),
+            (&comm_ok, crate::federation::types::identity_type::PRIMITIVE),
+            (&comm_no, crate::federation::types::identity_type::PRIMITIVE),
+        ] {
+            let mut k = fix_section_i_key(kid, "nm", now, true);
+            k.identity_type = ity.into();
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord { record: k })
+                .await
+                .unwrap();
+        }
+        let put_comm = |cid: &str, founder: &str| crate::federation::SignedCommunity {
+            community: crate::federation::Community {
+                community_key_id: cid.to_owned(),
+                community_name: "nm-test".into(),
+                members: vec![crate::federation::CommunityMember {
+                    key_id: founder.to_owned(),
+                    joined_at: now,
+                    role: Some(MEMBER_ROLE_FOUNDER.into()),
+                }],
+                founded_at: now,
+                consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
+                    .into(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        };
+        // Storage-only put_community is NOT the federate gate — both records
+        // (moderatored AND moderator-less) store fine.
+        backend
+            .put_community(put_comm(&comm_ok, &founder_user))
+            .await
+            .unwrap();
+        backend
+            .put_community(put_comm(&comm_no, &founder_prim))
+            .await
+            .unwrap();
+
+        // (1) Membership shape onto the moderator-less community → REFUSED
+        //     fail-secure, nothing stored.
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_scores_attestation(
+                    &founder_prim,
+                    &comm_no,
+                    &founder_prim,
+                    "identity_binding:v1",
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::CommunityHasNoModerator { .. }
+            ),
+            "federation apply keyed on a moderator-less community must refuse, got {err:?}"
+        );
+        assert_eq!(err.kind(), "federation_community_no_moderator");
+        assert!(backend
+            .list_attestations_for(&comm_no)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // (2) Same shape onto the MODERATORED community → ADMITTED + stored.
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_scores_attestation(
+                    &founder_user,
+                    &comm_ok,
+                    &founder_user,
+                    "identity_binding:v1",
+                ),
+            })
+            .await
+            .expect("moderatored community continues to federate");
+        assert_eq!(
+            backend.list_attestations_for(&comm_ok).await.unwrap().len(),
+            1
+        );
+
+        // (3) Storage-only membership op on the moderator-less community →
+        //     untouched (loss-processing / recovery must not be blocked).
+        backend
+            .put_community_membership_revocation(
+                crate::federation::SignedCommunityMembershipRevocation {
+                    community_membership_revocation:
+                        crate::federation::CommunityMembershipRevocation {
+                            community_key_id: comm_no.clone(),
+                            removed_identity_key_id: founder_prim.clone(),
+                            removed_at: now,
+                            effective_at: now,
+                            reason: None,
+                            witness_set: Vec::new(),
+                            persist_row_hash: String::new(),
+                        },
+                },
+            )
+            .await
+            .expect("membership revocation is storage, not a federation apply step");
+
+        // (4) The drivable verdict mirrors the apply decision.
+        let v = crate::federation::admission::no_moderator_federate_verdict(&backend, &comm_no)
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "admitted": false, "community_known": true,
+                "reason": "federation_community_no_moderator"
+            })
+        );
+        let v = crate::federation::admission::no_moderator_federate_verdict(&backend, &comm_ok)
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "admitted": true, "community_known": true })
+        );
+    }
+
     /// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
     /// on-node-key gate, PG backend (3-backend parity with memory +
     /// sqlite). Covers (a) infra-only → ADMITTED, (b) agency:* → REJECTED
@@ -22175,7 +22932,9 @@ mod tests {
         assert!(
             matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("substrate-emitted only"))
         );
-        let err = backend
+        // revoked / local (v12.6.0, §10.1.3 transit-not-rest): a crypto-VALID
+        // one TRANSITS the local tier (accepted); a forged one is rejected.
+        backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: mk(
                     crate::federation::types::consent_record::stance::REVOKED,
@@ -22183,9 +22942,24 @@ mod tests {
                 ),
             })
             .await
+            .expect("crypto-valid revoked consent_record transits the local tier on PG");
+        let mut forged = mk(
+            crate::federation::types::consent_record::stance::REVOKED,
+            crate::federation::types::attestation_tier::LOCAL,
+        );
+        forged.scrub_signature_classical = "AAAA".into(); // not a valid sig
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: forged,
+            })
+            .await
             .unwrap_err();
         assert!(
-            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("local-tier-eligible"))
+            matches!(
+                err,
+                crate::federation::Error::FederationTierUnverified { .. }
+            ),
+            "forged revoked/local consent_record rejected at admission, got {err:?}"
         );
     }
 
@@ -22623,10 +23397,16 @@ mod tests {
         let agent_k = format!("pg-good-agt-§102-{}", uuid_like());
         backend
             .put_public_key(crate::federation::SignedKeyRecord {
+                // CC 3.4.8 (CIRISPersist#366) — `detection:correlated_action:*`
+                // is detector-only. Exercise the SET-membership gate with a
+                // folded `{agent, lenscore_detector}` LensCore-fold key.
                 record: pg_admission_key(
                     &steward,
                     "registry",
-                    crate::federation::types::identity_type::STEWARD,
+                    &crate::federation::types::identity_type::join_set([
+                        crate::federation::types::identity_type::AGENT,
+                        crate::federation::types::identity_type::LENSCORE_DETECTOR,
+                    ]),
                 ),
             })
             .await
@@ -22652,6 +23432,114 @@ mod tests {
             .await
             .unwrap();
         let rows = backend.list_attestations_for(&agent_k).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_rejects_detection_from_non_detector() {
+        // CC 3.4.8 (CIRISPersist#366) — a plain `agent` key (no
+        // `lenscore_detector` in its identity_type set) MUST be rejected on a
+        // `detection:correlated_action:*` primary emission.
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let agent = format!("pg-nondet-agt-§366-{}", uuid_like());
+        let subj = format!("pg-nondet-sub-§366-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent,
+                    "registry",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &subj,
+                    "primitive-nondet",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let att = pg_scores_attestation(
+            &agent,
+            &subj,
+            &agent,
+            "detection:correlated_action:rights_asymmetry:v1",
+        );
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::ReservedPrefixEmitterMismatch {
+                prefix, required, ..
+            } => {
+                assert_eq!(prefix, "detection:correlated_action:");
+                assert_eq!(
+                    required,
+                    vec![crate::federation::types::identity_type::LENSCORE_DETECTOR.to_owned()]
+                );
+            }
+            other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_attestation_admits_truth_grounding_cross_attestation() {
+        // CC 3.4.8 (CIRISPersist#366) — a non-detector peer cross-checking a
+        // detector verdict emits under the DISTINCT `truth_grounding:detection:*`
+        // prefix, which is UNGATED (does not start with `detection:`).
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+        let agent = format!("pg-cross-agt-§366-{}", uuid_like());
+        let subj = format!("pg-cross-sub-§366-{}", uuid_like());
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &agent,
+                    "registry",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &subj,
+                    "primitive-cross",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        let att = pg_scores_attestation(
+            &agent,
+            &subj,
+            &agent,
+            "truth_grounding:detection:correlated_action:rights_asymmetry:v1",
+        );
+        backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let rows = backend.list_attestations_for(&subj).await.unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -23246,10 +24134,12 @@ mod tests {
         let agent_k = format!("pg-sch-agt-§102-{}", uuid_like());
         backend
             .put_public_key(crate::federation::SignedKeyRecord {
+                // CC 3.4.8 (CIRISPersist#366) — detector-only prefix; the
+                // detection emitter must hold `lenscore_detector`.
                 record: pg_admission_key(
                     &steward,
                     "registry",
-                    crate::federation::types::identity_type::STEWARD,
+                    crate::federation::types::identity_type::LENSCORE_DETECTOR,
                 ),
             })
             .await
@@ -23336,10 +24226,14 @@ mod tests {
         let agent_k = format!("pg-bsch-agt-§102-{}", uuid_like());
         backend
             .put_public_key(crate::federation::SignedKeyRecord {
+                // CC 3.4.8 (CIRISPersist#366) — detector-only prefix; the
+                // detection emitter must hold `lenscore_detector` so the row
+                // reaches the schema validator (rejected there for the missing
+                // envelope field, not at the emitter gate).
                 record: pg_admission_key(
                     &steward,
                     "registry",
-                    crate::federation::types::identity_type::STEWARD,
+                    crate::federation::types::identity_type::LENSCORE_DETECTOR,
                 ),
             })
             .await
@@ -26082,6 +26976,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         backend
             .put_public_key(crate::federation::SignedKeyRecord { record })
@@ -26939,6 +27834,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         }
     }
 
@@ -27593,6 +28489,8 @@ mod tests {
             }),
             subject_key_ids: subjects,
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
         }
     }
 
@@ -29305,5 +30203,118 @@ mod tests {
             .map(|a| a.attesting_key_id.as_str())
             .collect();
         assert!(granters.contains(dt_g1.as_str()) && granters.contains(dt_g2.as_str()));
+    }
+
+    /// v12.7.0 (#371) — postgres twin of
+    /// `store::sqlite::tests::apply_replicated_key_record_ambiguous_owner_refused_sqlite`:
+    /// a node carrying TWO live owner-bindings (the second a PRE-GATE
+    /// anomaly, raw-SQL-inserted past the v12.6.0 single-owner admission
+    /// gate) resolves `AmbiguousNodeOwner`, so a replicated anchor-scrubbed
+    /// record for it is Refused (fail-closed) and the self-signed row is
+    /// untouched. The rest of the #371 decision table runs Engine-level on
+    /// both backends in `federation::register::tests`.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn apply_replicated_key_record_ambiguous_owner_refused_postgres() {
+        use crate::federation::register::ReplicatedKeyOutcome;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type;
+        use crate::federation::FederationDirectory as _;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+
+        // Run-scoped unique ids (shared test DB).
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let anchor = format!("apply-amb-anchor-{tag}");
+        let owner1 = format!("apply-amb-owner1-{tag}");
+        let owner2 = format!("apply-amb-owner2-{tag}");
+        let node = format!("apply-amb-node-{tag}");
+
+        ts::register_hybrid_key(&backend, &anchor).await;
+        ts::register_identity_key(&backend, &owner1, identity_type::USER).await;
+        ts::register_identity_key(&backend, &owner2, identity_type::USER).await;
+        // The node's self-signed boot row.
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: ts::replicated_key_record(&node, identity_type::NODE, &node, &node, "v1"),
+            })
+            .await
+            .unwrap();
+
+        // owner1 binds through the admission gate…
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: ts::owner_binding_attestation(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &owner1,
+                    &node,
+                ),
+            })
+            .await
+            .unwrap();
+        // …owner2's binding is the PRE-GATE anomaly, inserted via raw SQL
+        // (bypassing check_single_node_owner_admission, exactly the state a
+        // pre-v12.6.0 corpus can hold).
+        {
+            let anomaly =
+                ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &owner2, &node);
+            let anomaly_uuid = uuid::Uuid::parse_str(&anomaly.attestation_id).unwrap();
+            let ts_stamp: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+            let hash_bytes: Vec<u8> = vec![0u8];
+            let client = backend.get_client().await.expect("client");
+            client
+                .execute(
+                    "INSERT INTO cirislens.federation_attestations (\
+                        attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        asserted_at, attestation_envelope, original_content_hash, \
+                        scrub_signature_classical, scrub_key_id, scrub_timestamp, \
+                        persist_row_hash\
+                     ) VALUES ($1, $2, $3, 'delegates_to', $4, $5, $6, 'c2ln', $2, $4, '0')",
+                    &[
+                        &anomaly_uuid,
+                        &owner2,
+                        &node,
+                        &ts_stamp,
+                        &anomaly.attestation_envelope,
+                        &hash_bytes,
+                    ],
+                )
+                .await
+                .expect("raw anomaly insert");
+        }
+        // The anomaly is real: owner_of fails AmbiguousNodeOwner.
+        let err = crate::federation::admission::owner_of(&backend, &node)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::AmbiguousNodeOwner { .. }),
+            "expected AmbiguousNodeOwner, got {err:?}"
+        );
+
+        // A VERIFIABLE anchor-scrubbed record for the node ⇒ Refused
+        // (fail-closed), self-signed row untouched.
+        let scrubbed =
+            ts::replicated_key_record(&node, identity_type::NODE, &anchor, &anchor, "v1");
+        assert_eq!(
+            backend
+                .apply_replicated_key_record(crate::federation::SignedKeyRecord {
+                    record: scrubbed
+                })
+                .await
+                .unwrap(),
+            ReplicatedKeyOutcome::Refused
+        );
+        let row = crate::federation::FederationDirectory::lookup_public_key(&backend, &node)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.scrub_key_id, node,
+            "ambiguous-owner refusal must leave the self-signed row untouched"
+        );
     }
 }

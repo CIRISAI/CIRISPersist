@@ -333,6 +333,61 @@ class Engine:
         read (`revocations_for` + the key's `valid_until`).
         """
 
+    def adopt_scrub_upgrade(
+        self,
+        signed_key_record_json: str,
+    ) -> str:
+        """v12.2.0 (CIRISPersist#351) — adopt-scrub-**upgrade** this node's
+        own key row: replace its self-signed record with the
+        accord-anchor-scrubbed one (same `key_id` + pubkey) so it can root.
+        FFI mirror of the Rust `Engine.adopt_scrub_upgrade`.
+
+        `signed_key_record_json` is the granting-authority-scrubbed
+        `SignedKeyRecord` (`scrub_key_id` = an accord holder). Verifies the
+        scrub-signature (Strict, same gate as `register_federation_key`)
+        THEN the backend's monotonic gated UPDATE.
+
+        Returns:
+            ``"upgraded"`` or ``"already_adopted"``.
+
+        Raises:
+            ValueError: JSON decode failure, verification failure, pubkey
+                change, anchored-to-a-different-record, or missing row.
+            RuntimeError: backend / IO error.
+        """
+
+    def apply_replicated_key_record(
+        self,
+        signed_key_record_json: str,
+    ) -> str:
+        """v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated
+        Key-plane apply**. FFI mirror of the Rust
+        `Engine.apply_replicated_key_record` — the apply the replication
+        bridge routes `apply_key` to instead of raw `put_public_key`
+        (which keeps its insert-only semantics for direct registration).
+
+        `signed_key_record_json` is the replicated `SignedKeyRecord`.
+
+        Returns:
+            ``"inserted"`` — new key_id, stored with every put_public_key
+            admission gate intact; ``"upgraded"`` — the existing
+            self-signed row adopted the anchor-scrubbed record (same
+            hybrid pubkeys, scrub Strict-verified against the
+            directory-resolved scrubber, and the v12.6.0
+            ``owner_of(key_id)`` gate resolved exactly one live owner);
+            ``"unchanged"`` — byte-identical re-apply; ``"refused"`` —
+            pubkey swap / anchored-to-self downgrade / re-scrub /
+            conflicting version / unverifiable scrub / unowned or
+            ambiguous owner (fail-closed; the existing row is untouched).
+            Refusals are outcomes, not exceptions, so an apply loop stays
+            total over unsolicited records.
+
+        Raises:
+            ValueError: SignedKeyRecord JSON decode failure or a
+                malformed record no policy can classify.
+            RuntimeError: backend / IO error.
+        """
+
     def register_self_federation_key(
         self,
         identity_type: str,

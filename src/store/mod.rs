@@ -88,6 +88,17 @@ pub enum Error {
     #[error("aggregation meta rejected: {0}")]
     AggregationMetaRejected(#[from] crate::fountain::AggregationMetaError),
 
+    /// v12.7.0 (§Q / CIRISPersist#370) — a `StorageBudgetV1` pin-install was
+    /// refused: the bound-hybrid signature did not verify (PQC-mandatory —
+    /// verify at the gate, before persistence), the shape was structurally
+    /// invalid, or the candidate `revision` did not supersede the installed
+    /// one (§Q B3 anti-rollback). Carries the
+    /// [`crate::fountain::storage_contention::StorageContentionError`] (its
+    /// `kind()` is preserved via [`Error::kind`]). Verify-before-mutation:
+    /// NOTHING was written.
+    #[error("storage budget install rejected: {0}")]
+    StorageContention(#[from] crate::fountain::storage_contention::StorageContentionError),
+
     /// Migration phase error. v0.1.5: the `sqlstate` is extracted from
     /// the underlying tokio-postgres error chain when available so
     /// lens-side callers can distinguish 40P01 (deadlock detected),
@@ -127,6 +138,7 @@ impl Error {
             Error::FountainAdmit(e) => e.kind(),
             Error::FountainIntegrity(_) => "fountain_integrity",
             Error::AggregationMetaRejected(e) => e.kind(),
+            Error::StorageContention(e) => e.kind(),
         }
     }
 }

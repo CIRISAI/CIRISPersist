@@ -107,6 +107,151 @@ pub enum AdoptScrubOutcome {
     AlreadyAdopted,
 }
 
+/// v12.7.0 (CIRISPersist#371) — outcome of an
+/// [`apply_replicated_key_record`](crate::engine::Engine::apply_replicated_key_record),
+/// the **upgrade-aware replicated Key-plane apply**. Serde tokens are
+/// snake_case strings (`"inserted"` / `"upgraded"` / `"unchanged"` /
+/// `"refused"`), mirroring [`AdoptScrubOutcome`]'s wire shape.
+///
+/// A `Refused` is a *policy* outcome, not an error: the anti-entropy Key
+/// plane receives unsolicited records, so every gate failure that means
+/// "this record is not admitted against the current row" resolves to
+/// `Refused` (fail-closed, deterministic, safe to re-offer on the next
+/// anti-entropy round) rather than aborting the apply loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicatedKeyOutcome {
+    /// New `key_id` — stored via `put_public_key` (exactly the direct
+    /// registration path, including its admission gates).
+    Inserted,
+    /// Existing **self-signed** row replaced by the incoming
+    /// **anchor-scrubbed** record for the same identity (the #351
+    /// `adopt_scrub_upgrade`, now riding replication).
+    Upgraded,
+    /// The row already carries this exact record — idempotent no-op.
+    Unchanged,
+    /// The record was NOT applied: pubkey swap, anchored→self downgrade,
+    /// anchor-A→anchor-B re-scrub, conflicting second version (first-seen
+    /// wins), unverifiable scrub-signature, or an absent/ambiguous node
+    /// owner (`owner_of` fail-closed). The existing row is untouched.
+    Refused,
+}
+
+/// The classification half of the #371 replicated-key apply — which action
+/// [`apply_replicated_key_record`](crate::engine::Engine::apply_replicated_key_record)
+/// takes for an incoming record given the current directory state.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplicatedKeyPlan {
+    /// No row for `key_id` — insert via `put_public_key` (as today).
+    Insert,
+    /// Self-signed → anchor-scrubbed, all gates passed — run the backend's
+    /// monotonic `adopt_scrub_upgrade`.
+    Upgrade,
+    /// Byte-identical re-apply — no-op.
+    Unchanged,
+    /// Not admitted; leave the row untouched (fail-closed).
+    Refused,
+}
+
+/// v12.7.0 (CIRISPersist#371) — decide what an **upgrade-aware replicated
+/// Key-plane apply** does with `record`, WITHOUT mutating anything. The
+/// shared (backend-agnostic) policy core behind both backends'
+/// `apply_replicated_key_record`, so postgres and sqlite cannot drift.
+///
+/// Decision table (the #371 spec):
+///
+/// - **no existing row** ⇒ [`ReplicatedKeyPlan::Insert`] — the store step is
+///   `put_public_key` itself, so every direct-registration admission gate
+///   (32-byte Ed25519, `hybrid` algorithm, `accord_holder`
+///   hardware-attestation) still binds; nothing is bypassed for fresh rows.
+/// - **byte-identical re-apply** (same `persist_row_hash`, which is computed
+///   over the canonical row with the hash field dropped) ⇒
+///   [`ReplicatedKeyPlan::Unchanged`].
+/// - **any pubkey change** — Ed25519 OR ML-DSA-65 — ⇒
+///   [`ReplicatedKeyPlan::Refused`]. A replicated apply may never swap an
+///   identity's keys (stricter than #351's Ed25519-only Rust pre-check: on
+///   the unattended replication plane the PQC half is identity too).
+/// - **existing self-signed + incoming anchor-scrubbed** ⇒ upgrade, iff ALL
+///   of (fail-closed on each):
+///   1. the incoming scrub verifies through the SAME
+///      [`verify_key_registration`] `Strict` gate as
+///      `register_federation_key` / `adopt_scrub_upgrade` — the scrubber
+///      (`scrub_key_id`) is resolved from the directory, i.e. it chains to
+///      the seeded HUMANITY_ACCORD anchor rows on a real node; a
+///      verification failure ⇒ `Refused`, and
+///   2. [`owner_of`](crate::federation::admission::owner_of)`(key_id)`
+///      resolves to exactly ONE live owner — the row is inside a
+///      well-defined single-owner node set (the v12.6.0 invariant that makes
+///      auto-upgrade-on-replication safe: the Key-plane cohort spans exactly
+///      the owner's nodes, CIRISServer#162). An unowned node (`None`) or an
+///      [`Error::AmbiguousNodeOwner`] pre-gate anomaly ⇒ `Refused`.
+///      (The record itself carries no owner field — verify's
+///      `produce_scrubbed_key_record` envelope shape is pinned — so the
+///      owner scope is resolved from the local attestation graph, the same
+///      source the owner's replication cohort is built from.)
+/// - **monotonic**: anchored→self (downgrade), anchor-A→anchor-B (re-scrub
+///   hijack), and a conflicting second self-signed version are all
+///   first-seen/duplicity ⇒ [`ReplicatedKeyPlan::Refused`].
+///
+/// Malformed input that no policy can classify (e.g. an un-canonicalizable
+/// row) and backend failures still surface as `Err` — `Refused` is reserved
+/// for "well-formed but not admitted".
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn plan_replicated_key_apply(
+    directory: &dyn FederationDirectory,
+    record: &KeyRecord,
+) -> Result<ReplicatedKeyPlan, Error> {
+    let Some(existing) = directory.lookup_public_key(&record.key_id).await? else {
+        return Ok(ReplicatedKeyPlan::Insert);
+    };
+
+    // Idempotent re-apply: byte-identical row. `compute_persist_row_hash`
+    // drops the `persist_row_hash` field itself, so a record that arrives
+    // carrying the origin row's hash still compares stably.
+    let incoming_hash = super::types::compute_persist_row_hash(record)?;
+    if existing.persist_row_hash == incoming_hash {
+        return Ok(ReplicatedKeyPlan::Unchanged);
+    }
+
+    // Never a pubkey swap — BOTH hybrid halves must be identical. A
+    // different pubkey is a different identity, whatever the scrub says.
+    if existing.pubkey_ed25519_base64 != record.pubkey_ed25519_base64
+        || existing.pubkey_ml_dsa_65_base64 != record.pubkey_ml_dsa_65_base64
+    {
+        return Ok(ReplicatedKeyPlan::Refused);
+    }
+
+    let existing_self_signed = existing.scrub_key_id == existing.key_id;
+    let incoming_anchor_scrubbed = record.scrub_key_id != record.key_id;
+    if !(existing_self_signed && incoming_anchor_scrubbed) {
+        // anchored→self downgrade, anchor-A→anchor-B re-scrub, or a
+        // conflicting second self-signed version: first-seen/duplicity.
+        return Ok(ReplicatedKeyPlan::Refused);
+    }
+
+    // Gate 1 — the incoming scrub must verify (Strict hybrid, scrubber
+    // pubkeys resolved from the directory ⇒ chains to the seeded accord
+    // anchor). An unverifiable or malformed record is not admitted.
+    if let Err(e) = verify_key_registration(directory, record).await {
+        return match e {
+            Error::SignatureInvalid(_) | Error::InvalidArgument(_) => {
+                Ok(ReplicatedKeyPlan::Refused)
+            }
+            other => Err(other),
+        };
+    }
+
+    // Gate 2 — the row must sit inside a single owner's node set
+    // (v12.6.0 `owner_of`). Unowned or ambiguous ⇒ fail-closed.
+    match super::admission::owner_of(directory, &record.key_id).await {
+        Ok(Some(_)) => Ok(ReplicatedKeyPlan::Upgrade),
+        Ok(None) => Ok(ReplicatedKeyPlan::Refused),
+        Err(Error::AmbiguousNodeOwner { .. }) => Ok(ReplicatedKeyPlan::Refused),
+        Err(e) => Err(e),
+    }
+}
+
 /// v10.1.0 (CIRISPersist#275 hardening) — the **write-path admission
 /// invariant** for a `federation_keys` row's classical public key: it
 /// MUST base64-decode to exactly 32 bytes (a valid Ed25519 key).
@@ -360,6 +505,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence,
+            consent_role: None,
         };
         if drop_pqc {
             // A hybrid-pending row also drops the PQC pubkey.
@@ -677,5 +823,227 @@ mod tests {
         // the federation_keys PK (key_id is TEXT; uuid-suffix it).
         let tag = format!("pg-{}", uuid::Uuid::new_v4().simple());
         run_register_matrix(&engine, &tag).await;
+    }
+
+    // ─── v12.7.0 (CIRISPersist#371) — apply_replicated_key_record ───
+    //
+    // The upgrade-aware replicated Key-plane apply decision table, run
+    // identically against sqlite and (when CIRIS_PERSIST_TEST_PG_URL is
+    // set) postgres through the Engine wrapper, mirroring
+    // `run_register_matrix`. The ambiguous-owner (pre-gate anomaly) row
+    // needs raw SQL and lives with the backend siblings
+    // (`src/store/{sqlite,postgres}.rs`).
+
+    /// Apply one replicated record through the Engine wrapper.
+    async fn apply_one(engine: &Engine, record: KeyRecord) -> ReplicatedKeyOutcome {
+        engine
+            .apply_replicated_key_record(SignedKeyRecord { record })
+            .await
+            .expect("apply_replicated_key_record")
+    }
+
+    /// The `scrub_key_id` of `key_id`'s current directory row (the
+    /// self-signed vs anchor-scrubbed discriminator the matrix asserts on).
+    async fn row_scrub(engine: &Engine, key_id: &str) -> String {
+        engine
+            .federation_directory()
+            .lookup_public_key(key_id)
+            .await
+            .expect("lookup")
+            .expect("row exists")
+            .scrub_key_id
+    }
+
+    /// The #371 decision table: fresh insert (self-signed AND
+    /// anchor-scrubbed); idempotent re-apply; conflicting second version;
+    /// unverifiable scrub; pubkey swap (Ed25519 AND ML-DSA-65 halves);
+    /// absent owner; self→anchored upgrade happy path; anchored→self
+    /// downgrade; anchor-A→anchor-B re-scrub.
+    async fn run_apply_replicated_matrix(engine: &Engine, tag: &str) {
+        use crate::federation::register::ReplicatedKeyOutcome as O;
+        use crate::federation::tier_ingest::test_support as ts;
+        let directory = engine.federation_directory();
+        let dir = directory.as_ref();
+
+        let scrubber = format!("apply-anchor-a-{tag}");
+        let scrubber_b = format!("apply-anchor-b-{tag}");
+        let owner = format!("apply-owner-{tag}");
+        let node = format!("apply-node-{tag}");
+        // The scrubbers must exist as directory rows (the Strict gate
+        // resolves a granting-authority signer's pubkeys from the
+        // directory — the seeded accord-anchor shape) and the owner must
+        // be a live `user`-role granter for `owner_of`.
+        ts::register_hybrid_key(dir, &scrubber).await;
+        ts::register_hybrid_key(dir, &scrubber_b).await;
+        ts::register_identity_key(dir, &owner, identity_type::USER).await;
+
+        // (1) fresh insert — new key_id, self-signed (the boot state).
+        let self_rec = ts::replicated_key_record(&node, identity_type::NODE, &node, &node, "v1");
+        assert_eq!(
+            apply_one(engine, self_rec.clone()).await,
+            O::Inserted,
+            "(1) fresh insert"
+        );
+
+        // (2) byte-identical re-apply ⇒ Unchanged (idempotent).
+        assert_eq!(
+            apply_one(engine, self_rec.clone()).await,
+            O::Unchanged,
+            "(2) idempotent"
+        );
+
+        // (3) a conflicting second self-signed version ⇒ Refused
+        // (first-seen/duplicity; put_public_key's direct path stays
+        // untouched by this apply).
+        let self_v2 = ts::replicated_key_record(&node, identity_type::NODE, &node, &node, "v2");
+        assert_eq!(
+            apply_one(engine, self_v2).await,
+            O::Refused,
+            "(3) conflicting version"
+        );
+
+        // (4) verifiable anchor-scrubbed record but NO owner-binding ⇒
+        // Refused — the row is not inside any single-owner node set
+        // (owner_of = None, fail-closed), so replication may not upgrade it.
+        let scrubbed =
+            ts::replicated_key_record(&node, identity_type::NODE, &scrubber, &scrubber, "v1");
+        assert_eq!(
+            apply_one(engine, scrubbed.clone()).await,
+            O::Refused,
+            "(4) absent owner"
+        );
+        assert_eq!(
+            row_scrub(engine, &node).await,
+            node,
+            "(4) refused apply must leave the self-signed row untouched"
+        );
+
+        // Seed the owner-binding: delegates_to(owner → node) on the
+        // ownership dimension (the v12.6.0 single-owner relation).
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: ts::owner_binding_attestation(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &owner,
+                    &node,
+                ),
+            })
+            .await
+            .expect("owner-binding admitted");
+
+        // (5) unverifiable scrub — claims `scrubber`, signed by
+        // `scrubber_b` ⇒ Refused (Strict gate), row untouched.
+        let bad_sig =
+            ts::replicated_key_record(&node, identity_type::NODE, &scrubber, &scrubber_b, "v1");
+        assert_eq!(
+            apply_one(engine, bad_sig).await,
+            O::Refused,
+            "(5) unverifiable scrub"
+        );
+        assert_eq!(row_scrub(engine, &node).await, node, "(5) row untouched");
+
+        // (6) pubkey swap ⇒ Refused — EITHER hybrid half. Never an
+        // identity swap on the replication plane, whatever the scrub says.
+        let (other_ed, other_mldsa) = ts::hybrid_pubkeys(&format!("someone-else-{tag}"));
+        let mut ed_swap = scrubbed.clone();
+        ed_swap.pubkey_ed25519_base64 = other_ed;
+        assert_eq!(
+            apply_one(engine, ed_swap).await,
+            O::Refused,
+            "(6) Ed25519 swap"
+        );
+        let mut mldsa_swap = scrubbed.clone();
+        mldsa_swap.pubkey_ml_dsa_65_base64 = other_mldsa;
+        assert_eq!(
+            apply_one(engine, mldsa_swap).await,
+            O::Refused,
+            "(6) ML-DSA-65 swap"
+        );
+        assert_eq!(row_scrub(engine, &node).await, node, "(6) row untouched");
+
+        // (7) the happy path: same key_id + same hybrid pubkeys, scrub
+        // Strict-verifies against the directory-resolved scrubber, owner_of
+        // resolves exactly one live owner ⇒ Upgraded (the #351 adopt path
+        // riding replication).
+        assert_eq!(
+            apply_one(engine, scrubbed.clone()).await,
+            O::Upgraded,
+            "(7) upgrade"
+        );
+        assert_eq!(
+            row_scrub(engine, &node).await,
+            scrubber,
+            "(7) row is now anchor-scrubbed"
+        );
+
+        // (8) re-apply of the exact anchored record ⇒ Unchanged.
+        assert_eq!(
+            apply_one(engine, scrubbed.clone()).await,
+            O::Unchanged,
+            "(8) idempotent anchored"
+        );
+
+        // (9) anchored→self downgrade ⇒ Refused (monotonic).
+        assert_eq!(
+            apply_one(engine, self_rec).await,
+            O::Refused,
+            "(9) downgrade"
+        );
+        assert_eq!(
+            row_scrub(engine, &node).await,
+            scrubber,
+            "(9) still anchored"
+        );
+
+        // (10) anchor-A→anchor-B re-scrub ⇒ Refused (duplicity/first-seen),
+        // even though the record itself verifies.
+        let rescrub =
+            ts::replicated_key_record(&node, identity_type::NODE, &scrubber_b, &scrubber_b, "v1");
+        assert_eq!(
+            apply_one(engine, rescrub).await,
+            O::Refused,
+            "(10) re-scrub hijack"
+        );
+        assert_eq!(
+            row_scrub(engine, &node).await,
+            scrubber,
+            "(10) still anchor A"
+        );
+
+        // (11) fresh insert of an anchor-scrubbed record for an UNKNOWN
+        // key_id ⇒ Inserted — new-key inserts are exactly put_public_key
+        // "as today" (no owner gate on the insert path).
+        let node2 = format!("apply-node2-{tag}");
+        let fresh_scrubbed =
+            ts::replicated_key_record(&node2, identity_type::NODE, &scrubber, &scrubber, "v1");
+        assert_eq!(
+            apply_one(engine, fresh_scrubbed).await,
+            O::Inserted,
+            "(11) fresh scrubbed insert"
+        );
+        assert_eq!(row_scrub(engine, &node2).await, scrubber);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn apply_replicated_matrix_sqlite() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct sqlite engine");
+        run_apply_replicated_matrix(&engine, "sqlite").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn apply_replicated_matrix_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping apply_replicated_matrix_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let engine = Engine::with_signer(test_signer(), &dsn)
+            .await
+            .expect("construct postgres engine");
+        let tag = format!("pg-{}", uuid::Uuid::new_v4().simple());
+        run_apply_replicated_matrix(&engine, &tag).await;
     }
 }

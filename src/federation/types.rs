@@ -152,6 +152,47 @@ pub mod identity_type {
     /// this publishes the canonical token so producer + verifier agree
     /// byte-for-byte.
     pub const NODE: &str = "node";
+    /// v12.7.0 (CIRISPersist#366, CC 3.4.8) — the LensCore-detector role.
+    /// Only `federation_keys` rows whose `identity_type` **set** contains
+    /// this token may emit the detector-only reserved prefixes
+    /// `detection:correlated_action:*` and `detection:distributive:access:*`
+    /// (see [`super::admission::default_reserved_prefix_rules`]). Per
+    /// CC 3.4.7.1 the gate is evaluated by **set membership** — a folded
+    /// LensCore occurrence whose key holds `{agent, lenscore_detector}`
+    /// satisfies the detector gate via `lenscore_detector ∈ set` while its
+    /// cohabiting `agent` role neither grants nor blocks the detector right
+    /// (CC 3.4.8 LensCore-fold worked example). Cross-attestations by
+    /// non-detector peers MUST use the distinct `truth_grounding:detection:*`
+    /// prefix (ungated here), so anything on `detection:*` is a primary
+    /// detector emission and gate-able with no envelope field.
+    pub const LENSCORE_DETECTOR: &str = "lenscore_detector";
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1 set-membership) — a
+    /// **canonical / founding bootstrap server**. This role marks a node
+    /// as a member of the founding canonical set; it is **accord-CONFERRED,
+    /// never self-claimed**.
+    ///
+    /// The load-bearing invariant (the whole point of the role): a
+    /// `federation_keys` row may carry `canonical` in its `identity_type`
+    /// **set** ([`set_contains`]) **IFF** the record is
+    /// **anchor-scrub-signed** — `scrub_key_id != key_id` AND
+    /// `scrub_key_id`'s Ed25519 pubkey ∈ the pinned HUMANITY_ACCORD anchor
+    /// ([`ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor`],
+    /// the SAME terminus [`super::super::rooting::root_binding`] and
+    /// [`super::super::register::verify_key_registration`] /
+    /// `adopt_scrub_upgrade` verify). A **self-signed** record
+    /// (`scrub_key_id == key_id`) carrying `canonical`, or one scrubbed by a
+    /// **non-anchor** key, is REFUSED at admission
+    /// ([`super::super::Error::CanonicalRoleNotAccordConferred`], stable
+    /// `kind()` token `canonical_role_not_accord_conferred`) — fail-closed.
+    /// **Monotonic**: the role can only ever arrive on an anchor-scrubbed
+    /// record; it can never be added by a later self-registration or by
+    /// replication of a self-signed row (the gate composes with the
+    /// `put_public_key` DO-NOTHING / `adopt_scrub_upgrade` paths). The ONLY
+    /// way to become a canonical server is the Trust Root **add-canonical**
+    /// op: an accord holder scrub-signs the node with the `canonical` role.
+    /// The admission gate is
+    /// [`super::super::admission::check_canonical_role_admission`].
+    pub const CANONICAL: &str = "canonical";
 
     /// v6.5.0 (CEG §7.0.1) — join an `identity_type` **set** into the
     /// single TEXT column representation: sorted, de-duplicated,
@@ -191,6 +232,120 @@ pub mod identity_type {
     /// (`stored == member`) and the comma-joined-set case.
     pub fn set_contains(stored: &str, member: &str) -> bool {
         parse_set(stored).contains(&member)
+    }
+}
+
+/// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
+/// **Counter-RII `consent_role`** vocabulary: the role tokens carried on
+/// [`KeyRecord::consent_role`] that gate Counter-RII probe detection
+/// (RATCHET `FSD/COUNTER_RII_DETECTION.md`; Lean `ConsentGate.lean`, 8
+/// theorems verified). CC 3.4.7.2 ratified three primitive-level
+/// semantics that shape this field + edge's `ProbePatternObserver` gate.
+///
+/// Persist's role is **STORE + EXPOSE + OQ-1 overwrite**: it carries the
+/// role on the wire, resolves it ([`super::consent::consent_role_of`]),
+/// and gives it flat overwrite-on-revoke mutation semantics
+/// ([`super::FederationDirectory::set_consent_role`]). The **detection**
+/// itself (the OQ-2 / OQ-3 *signal* decisions) is applied by the
+/// consumer (edge / RATCHET) reading this field — persist does NOT house
+/// a Counter-RII detector.
+///
+/// **The column already shipped** — V020 (v1.3.0, the CIRISAgent#760 §RC
+/// "consent role lock") added `federation_keys.consent_role TEXT NOT NULL
+/// DEFAULT 'unregistered'` with exactly this six-token vocabulary (PG
+/// CHECK-enforced; SQLite by application contract — the Rust-level
+/// admission in `put_public_key`/`set_consent_role` keeps the backends
+/// symmetric). CC 3.4.7.2's "non-breaking against the shipped flat
+/// substrate" language is literal: OQ-1's flat overwrite-on-revoke IS the
+/// natural UPDATE semantics of that column. v12.7.0 puts the field **on
+/// the wire** ([`KeyRecord`]`::consent_role`, `None` ⇔ the stored
+/// `'unregistered'` default) and exposes the resolver + mutation surface.
+pub mod consent_role {
+    /// The stored default — no Counter-RII consent role assigned. This is
+    /// the V020 column default; on the wire it is represented as
+    /// `KeyRecord.consent_role = None` (interconverted at the storage
+    /// boundary, see [`wire_from_stored`] / [`stored_from_wire`]). An
+    /// `unregistered` key is subject to Counter-RII detection normally
+    /// (the `ConsentGate.lean` base default).
+    pub const UNREGISTERED: &str = "unregistered";
+    /// Base consent role mirroring [`super::TrustType::Temporary`] — the
+    /// CIRISAgent ConsentService taxonomy rung. Detection applies.
+    pub const TEMPORARY: &str = "temporary";
+    /// Base consent role mirroring [`super::TrustType::Partnered`]
+    /// (bilateral approval). Detection applies.
+    pub const PARTNERED: &str = "partnered";
+    /// Base consent role mirroring [`super::TrustType::Anonymous`].
+    /// Detection applies.
+    pub const ANONYMOUS: &str = "anonymous";
+    /// OQ-3 strict post-window role (`ConsentGate.lean` `AuthorizedReview`).
+    /// An `authorized_review` key is **signal-eligible immediately** at
+    /// `t > window_end` — no grace period. **Consumer-applied**: persist
+    /// carries the role; the consumer enforces the strict window.
+    pub const AUTHORIZED_REVIEW: &str = "authorized_review";
+    /// OQ-2 blanket-suppression role (`ConsentGate.lean` `Peer`). A node
+    /// holding `peer` **escapes Counter-RII detection at any `trust_mode`**
+    /// — a sovereign peer may probe other peers without raising the
+    /// (advisory-only) `ratchet:flag:counter_rii:*` signal (CC 3.1.6: the
+    /// flag can NEVER be sole evidence for `slashing:*`; the WA quorum is
+    /// the load-bearing adjudication gate). **Consumer-applied**: persist
+    /// carries the role; edge's `ProbePatternObserver` reads it and
+    /// suppresses.
+    pub const PEER: &str = "peer";
+
+    /// The six ratified tokens (identical to the V020 PG CHECK set), in
+    /// the V020 declaration order. Any other token is rejected at
+    /// admission on BOTH backends (Rust-level; the PG CHECK is defense in
+    /// depth).
+    pub const RECOGNIZED: [&str; 6] = [
+        UNREGISTERED,
+        TEMPORARY,
+        PARTNERED,
+        ANONYMOUS,
+        AUTHORIZED_REVIEW,
+        PEER,
+    ];
+
+    /// Is `role` one of the six ratified V020/CC 3.4.7.2 tokens?
+    pub fn is_recognized(role: &str) -> bool {
+        RECOGNIZED.contains(&role)
+    }
+
+    /// Storage → wire: the stored `'unregistered'` default (and empty
+    /// string, defensively) map to wire `None`; any other token is
+    /// carried verbatim.
+    pub fn wire_from_stored(stored: &str) -> Option<&str> {
+        if stored.is_empty() || stored == UNREGISTERED {
+            None
+        } else {
+            Some(stored)
+        }
+    }
+
+    /// Wire → storage: wire `None` maps to the stored `'unregistered'`
+    /// default (the V020 column is NOT NULL).
+    pub fn stored_from_wire(wire: Option<&str>) -> &str {
+        match wire {
+            Some(role) => role,
+            None => UNREGISTERED,
+        }
+    }
+
+    /// Admission gate for a wire-shape consent_role: `None` and the six
+    /// recognized tokens pass; anything else is
+    /// [`Error::InvalidArgument`](crate::federation::Error::InvalidArgument).
+    /// Applied in `put_public_key` + `set_consent_role` on EVERY backend
+    /// so PG (schema CHECK) and SQLite (no CHECK — SQLite's V020 ALTER
+    /// could not add one) behave identically.
+    pub fn check_admissible(wire: Option<&str>) -> Result<(), crate::federation::Error> {
+        match wire {
+            None => Ok(()),
+            Some(role) if is_recognized(role) => Ok(()),
+            Some(role) => Err(crate::federation::Error::InvalidArgument(format!(
+                "consent_role '{role}' is not a recognized CC 3.4.7.2 token \
+                 (expected one of: {})",
+                RECOGNIZED.join(", ")
+            ))),
+        }
     }
 }
 
@@ -531,6 +686,36 @@ pub struct KeyRecord {
     /// computations stay stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation_evidence: Option<serde_json::Value>,
+    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
+    /// **Counter-RII `consent_role`**. A single role token (see the
+    /// [`consent_role`] vocabulary module — `temporary` / `partnered` /
+    /// `anonymous` / `authorized_review` / `peer`) that gates the
+    /// Counter-RII probe detection a consumer (edge's
+    /// `ProbePatternObserver`, RATCHET `FSD/COUNTER_RII_DETECTION.md`)
+    /// applies. Per CC 3.4.7.2 this is a `federation_keys` **identity
+    /// field** — a sibling to [`identity_type`] — **not** an envelope
+    /// primitive. Backed by the V020 column (`TEXT NOT NULL DEFAULT
+    /// 'unregistered'`, the CIRISAgent#760 §RC lock CC 3.4.7.2 ratifies);
+    /// `None` here ⇔ the stored `'unregistered'` default (no assigned
+    /// role — detection applies normally).
+    ///
+    /// **Mutable + overwrite-on-revoke (OQ-1).** Unlike the signed
+    /// registration fields above, `consent_role` is an operational role
+    /// marker that a governance/consent surface assigns and later
+    /// overwrites (a subsequent revocation OVERWRITES the prior value —
+    /// flat, bounded, non-recursive; NO chain embedded in the field).
+    /// It is therefore **excluded from [`compute_persist_row_hash`]** (the
+    /// signed-registration content hash) so a later
+    /// [`FederationDirectory::set_consent_role`](super::FederationDirectory::set_consent_role)
+    /// overwrite does NOT disturb the registration hash / CIRISRegistry
+    /// vendored-shape parity, and `adopt_scrub_upgrade` deliberately does
+    /// NOT touch it (an anchor-scrub upgrade must not clobber an assigned
+    /// role). Backward-compatible default: pre-v12.7.0 rows + rows with no
+    /// assigned role serialize without the field
+    /// (`skip_serializing_if = "Option::is_none"`), so `persist_row_hash`
+    /// stays byte-stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_role: Option<String>,
 }
 
 impl KeyRecord {
@@ -714,6 +899,22 @@ pub struct LocalAttestationInput {
     /// other value at local tier. Promotion (v4.5) widens the scope.
     #[serde(default = "default_self_cohort_scope")]
     pub cohort_scope: String,
+    /// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — the classical
+    /// Ed25519 signature over `JCS(attestation_envelope)`. Populated ONLY
+    /// for a **subject-side revocation transiting the local tier**: an
+    /// ordinary producer-authority local row defers its signature (this
+    /// stays `None` and the row is written with the empty-sentinel scrub
+    /// envelope). When the write-path gate classifies the row as a
+    /// [`crate::federation::admission::LocalTierDisposition::TransitRevocation`],
+    /// this (and [`Self::scrub_signature_pqc`]) MUST be present and verify
+    /// against the attester's registered pubkeys, or the write is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_classical: Option<String>,
+    /// v12.6.0 — the ML-DSA-65 signature over the bound payload
+    /// `JCS(attestation_envelope) ‖ ed25519_sig` (PQC-mandatory for a
+    /// transit revocation; see [`Self::scrub_signature_classical`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
 }
 
 /// Default cohort_scope for a local-tier write — `self` (private to the
@@ -757,6 +958,53 @@ impl LocalAttestationInput {
             scrub_key_id: self.attesting_key_id,
             scrub_timestamp: asserted_at,
             pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: self.subject_key_ids,
+            withdraws_admission_rule: None,
+            cohort_scope: self.cohort_scope,
+            tier: attestation_tier::LOCAL.to_string(),
+            promoted_at: None,
+        }
+    }
+
+    /// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — build the
+    /// `local`-tier row for a **subject-side revocation transiting** the
+    /// local write path. Unlike [`Self::into_local_row`] (deferred
+    /// empty-sentinel scrub envelope), this carries the caller's REAL
+    /// bound-hybrid signature + the persist-computed `original_content_hash`
+    /// (hex `SHA-256(JCS(envelope))`, returned by the verify step) so the
+    /// row is a fully-signed federation-classified revocation staged at
+    /// `tier = local`, `promoted_at = None`. It is NOT a durable local row:
+    /// the consent-SLA watcher drives it to promotion or overdue-flag.
+    /// `persist_row_hash` is filled by the caller after construction.
+    pub fn into_transit_revocation_row(
+        self,
+        attestation_id: String,
+        asserted_at: DateTime<Utc>,
+        original_content_hash: String,
+        scrub_signature_classical: String,
+        scrub_signature_pqc: Option<String>,
+    ) -> Attestation {
+        let attested_key_id = self
+            .attested_key_id
+            .unwrap_or_else(|| self.attesting_key_id.clone());
+        Attestation {
+            attestation_id,
+            attesting_key_id: self.attesting_key_id.clone(),
+            attested_key_id,
+            attestation_type: self.attestation_type,
+            weight: self.weight,
+            asserted_at,
+            expires_at: self.expires_at,
+            attestation_envelope: self.attestation_envelope,
+            original_content_hash,
+            scrub_signature_classical,
+            scrub_signature_pqc,
+            // Self-signed: the subject is the attester.
+            scrub_key_id: self.attesting_key_id,
+            scrub_timestamp: asserted_at,
+            // PQC half is present + verified for a transit revocation.
+            pqc_completed_at: Some(asserted_at),
             persist_row_hash: String::new(),
             subject_key_ids: self.subject_key_ids,
             withdraws_admission_rule: None,
@@ -1873,10 +2121,19 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
     // canonicalize → hash. Dropping `persist_row_hash` keeps the hash
     // stable across populate/depopulate cycles (read response carries
     // the field; write submission may or may not).
+    //
+    // v12.7.0 (CIRISPersist#365, CC 3.4.7.2 OQ-1): also drop
+    // `consent_role`. It is a MUTABLE, overwrite-on-revoke operational
+    // role marker — NOT part of the signed registration content — so it
+    // MUST NOT enter the registration hash. Excluding it keeps
+    // `persist_row_hash` byte-identical to CIRISRegistry's vendored
+    // shape (which does not carry the field) and lets `set_consent_role`
+    // overwrite the role without invalidating the hash.
     let mut value = serde_json::to_value(row)
         .map_err(|e| super::Error::Backend(format!("serialize for hash: {e}")))?;
     if let Some(obj) = value.as_object_mut() {
         obj.remove("persist_row_hash");
+        obj.remove("consent_role");
     }
     let bytes = PythonJsonDumpsCanonicalizer
         .canonicalize_value(&value)
@@ -1888,6 +2145,46 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v12.7.0 (CIRISPersist#368) — the FFI wire contract for the
+    /// witness-targets-subject age surface: `EmitAttestationInput` JSON
+    /// (the exact `PyEngine::emit_attestation` / `emit_attestation_self`
+    /// input) carries the optional `attested_key_id` naming the SUBJECT,
+    /// and omitting it round-trips to `None` (the self-attestation
+    /// default).
+    #[test]
+    fn emit_attestation_input_json_carries_attested_key_id_subject() {
+        let with_subject: EmitAttestationInput = serde_json::from_str(
+            r#"{
+                "attestation_type": "age_assurance:government:adult:v1",
+                "attested_key_id": "subject-key-1",
+                "attestation_envelope": { "id": "wire-1" }
+            }"#,
+        )
+        .expect("decode");
+        assert_eq!(
+            with_subject.attested_key_id.as_deref(),
+            Some("subject-key-1")
+        );
+        assert_eq!(
+            with_subject.attestation_type,
+            "age_assurance:government:adult:v1"
+        );
+        // Round-trips (the field serializes back out when set).
+        let json = serde_json::to_value(&with_subject).unwrap();
+        assert_eq!(json["attested_key_id"], "subject-key-1");
+
+        // Omitted ⇒ None ⇒ the emit path self-binds to the emitter (and the
+        // `age_assurance:` admission gate then rejects the self-emission).
+        let without: EmitAttestationInput = serde_json::from_str(
+            r#"{
+                "attestation_type": "age_assurance:provider:adult:v1",
+                "attestation_envelope": { "id": "wire-2" }
+            }"#,
+        )
+        .expect("decode");
+        assert!(without.attested_key_id.is_none());
+    }
 
     /// #249 Cut C — the producer-side moderate-scope tokens MUST equal the
     /// admission duty-walk's scope constants, or an emitted edge would not
@@ -1943,6 +2240,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         }
     }
 

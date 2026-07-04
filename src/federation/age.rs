@@ -9,6 +9,14 @@
 //! - `age_assurance:*` — the **witness** rung (provider/government). The
 //!   `attestation_type` is reserved to a `witness`-role emitter at admission
 //!   (see [`super::admission::check_reserved_prefix_admission`]). Authoritative.
+//!   v12.7.0 (CIRISPersist#368, CC 3.4.11/3.4.13): the row names its SUBJECT
+//!   via `attested_key_id` — the same cross-subject edge shape `delegates_to`
+//!   uses — so a witness graduates a **different** subject's band by emitting
+//!   with [`EmitAttestationInput::attested_key_id`](super::EmitAttestationInput::attested_key_id)
+//!   `= Some(subject)` (e.g. over [`crate::Engine::emit_attestation`]).
+//!   A subject MUST NOT emit on `age_assurance:` — attester==attested is
+//!   rejected at admission AND ignored here at read time (defense-in-depth),
+//!   so nobody self-mints their own graduation.
 //! - `age_self_declared:*` — the **self** rung (subject-signed onboarding
 //!   "state your band"). A self-declared **adult is IGNORED** here — the
 //!   one-way ratchet: a subject may self-declare MINOR to LOWER its own
@@ -229,6 +237,15 @@ pub async fn age_band(directory: &dyn FederationDirectory, k: &str) -> Result<Ag
         }
         let at = r.attestation_type.as_str();
         if at.starts_with("age_assurance:") {
+            // v12.7.0 (CIRISPersist#368, CC 3.4.11) — read-side
+            // defense-in-depth: a SELF-emitted witness row (attester ==
+            // attested) confers nothing. The admission gate
+            // (`check_reserved_prefix_admission`) rejects the shape at
+            // `put_attestation`, but a pre-gate legacy/replicated row must
+            // not graduate its own emitter either.
+            if r.attesting_key_id == r.attested_key_id {
+                continue;
+            }
             // Witness rung — authoritative. The most recent one that parses
             // to a recognized band wins outright.
             if let Some(band) = parse_age_band_token(at) {
@@ -283,6 +300,11 @@ pub async fn age_band_fine(
         }
         let at = r.attestation_type.as_str();
         if at.starts_with("age_assurance:") {
+            // v12.7.0 (CIRISPersist#368, CC 3.4.11) — a self-emitted witness
+            // row confers nothing (see `age_band`; same defense-in-depth).
+            if r.attesting_key_id == r.attested_key_id {
+                continue;
+            }
             // Witness rung — authoritative; most-recent parse wins outright.
             if let Some(band) = parse_age_band_fine_token(at) {
                 return Ok(band);

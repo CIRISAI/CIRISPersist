@@ -2695,6 +2695,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         backend
             .put_public_key(crate::federation::SignedKeyRecord { record })
@@ -3288,6 +3289,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         use crate::federation::FederationDirectory;
         backend
@@ -3549,6 +3551,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         backend
             .put_public_key(crate::federation::types::SignedKeyRecord { record: rec })
@@ -3681,6 +3684,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         backend
             .put_public_key(crate::federation::types::SignedKeyRecord { record: rec })

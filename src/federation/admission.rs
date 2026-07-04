@@ -355,18 +355,23 @@ impl Default for DimensionAdmissionPolicy {
 /// - `licensure:*` (CEG §7.3) is co-owned — the admission gate
 ///   doesn't reject single-source emissions; per §7.3, consumers
 ///   mark them `confidence ≤ 0.5` until the second co-owner attests.
-/// - `detection:correlated_action:*` / `detection:distributive:*`
-///   (CEG §7.4) are LensCore-only emission but the substrate accepts
-///   cross-attestations under a different prefix per §7.4's last
-///   sentence; mapping this to a substrate-admission rule requires
-///   knowing whether the row is a primary detection-emission vs a
-///   cross-attestation, which lives in the envelope shape. Deferred
-///   to consumer-side check pending CEG-side rule clarification.
+/// - `detection:correlated_action:*` / `detection:distributive:access:*`
+///   (CC 3.4.8) ARE gated here (v12.7.0, CIRISPersist#366): they are
+///   LensCore-only emission — emitter rule `lenscore_detector ∈
+///   attesting_key.identity_type`. Per CC 3.4.8 a cross-attestation by a
+///   non-LensCore peer MUST use the DISTINCT `truth_grounding:detection:*`
+///   prefix (which does not start with `detection:` and so stays ungated),
+///   so anything landing on `detection:*` is a **primary detector
+///   emission** — gate-able with NO envelope field, resolving the earlier
+///   "which shape is this?" ambiguity. Only these two exact families are
+///   gated; a bare `detection:` prefix is NOT (CC 3.4.8 names exactly
+///   these two).
 pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
     use super::types::identity_type;
     let substrate_persist = identity_type::SUBSTRATE_PERSIST.to_owned();
     let witness = identity_type::WITNESS.to_owned();
     let trusted_publisher = identity_type::TRUSTED_PUBLISHER.to_owned();
+    let lenscore_detector = identity_type::LENSCORE_DETECTOR.to_owned();
     vec![
         ReservedPrefixRule {
             pattern_prefix: "system:".into(),
@@ -429,6 +434,24 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
         ReservedPrefixRule {
             pattern_prefix: crate::federation::capacity::CAPACITY_ASSURANCE_PREFIX.into(),
             required_identity_types: vec![witness],
+        },
+        // v12.7.0 (CIRISPersist#366, CC 3.4.8) — the detector-only
+        // prefixes. `detection:correlated_action:*` and
+        // `detection:distributive:access:*` are LensCore-only emission:
+        // emitter rule `lenscore_detector ∈ attesting_key.identity_type`.
+        // Set-membership (not scalar equality) is the load-bearing test
+        // (CC 3.4.7.1) so a folded `{agent, lenscore_detector}` key passes.
+        // A non-detector peer wishing to cross-check the detector's verdict
+        // emits under the DISTINCT `truth_grounding:detection:*` prefix
+        // (ungated — it does not start with `detection:`), so every row on
+        // these two families is a primary detector emission.
+        ReservedPrefixRule {
+            pattern_prefix: "detection:correlated_action:".into(),
+            required_identity_types: vec![lenscore_detector.clone()],
+        },
+        ReservedPrefixRule {
+            pattern_prefix: "detection:distributive:access:".into(),
+            required_identity_types: vec![lenscore_detector],
         },
     ]
 }
@@ -496,10 +519,17 @@ impl DimensionAdmissionPolicy {
         // operator owns.
         for rule in &self.reserved_prefix_rules {
             if dim.starts_with(rule.pattern_prefix.as_str()) {
+                // CC 3.4.7.1 — `identity_type` is a SET; the gate is
+                // satisfied iff a required role is a MEMBER of the
+                // attester's role-set (not scalar equality). For a
+                // single-role key `X ∈ {X}` ≡ `X == X`, so this is
+                // behavior-preserving for every legacy single-role key;
+                // it only newly-admits conformant folded keys (e.g. a
+                // `{agent, lenscore_detector}` LensCore fold — CC 3.4.8).
                 if !rule
                     .required_identity_types
                     .iter()
-                    .any(|t| t == attesting_identity_type)
+                    .any(|t| identity_type::set_contains(attesting_identity_type, t))
                 {
                     let mut required = rule.required_identity_types.clone();
                     required.sort();
@@ -851,10 +881,15 @@ pub fn envelope_subject_kind(envelope: &serde_json::Value) -> Option<&str> {
 ///      substrate's `valid_until`-passed emission, never a wire input).
 ///   3. **Tier eligibility** (rule 3, §10.1.3): a `stance: revoked`
 ///      `consent_record` carries subject revocation authority over
-///      another party's content → it is **NOT local-tier-eligible** and
-///      is rejected at `tier = "local"`. A `stance: granted` self-consent
-///      MAY be local (no tier restriction here; the §10.1.5.2 self-tier
-///      eligibility is enforced by [`check_local_tier_eligibility`]).
+///      another party's content. It is federation-tier by classification
+///      but MAY **transit** the local tier (v12.6.0, resolving AV-61): a
+///      `revoked` consent_record at `tier = "local"` returns
+///      [`LocalTierDisposition::TransitRevocation`] so the caller
+///      (`put_attestation`) hybrid-verifies its signature before storing
+///      (accept on VALID crypto only) and never lets it rest durable. A
+///      `stance: granted` self-consent MAY be local durable (the
+///      §10.1.5.2 self-tier eligibility is enforced by
+///      [`check_local_tier_eligibility`]).
 ///
 /// Rule 4 (composition with the §3.2.3 `withdraws` gate / no quorum) is
 /// not a *field* check — it is the single-subject authority already baked
@@ -866,19 +901,22 @@ pub fn envelope_subject_kind(envelope: &serde_json::Value) -> Option<&str> {
 ///
 /// `tier` is the row's [`crate::federation::types::Attestation::tier`]
 /// (`"local"` / `"federation"`). Returns [`Error::InvalidArgument`] on
-/// any rule violation; the row is not stored.
+/// any rule violation (the row is not stored); otherwise the
+/// [`LocalTierDisposition`] — [`LocalTierDisposition::TransitRevocation`]
+/// for a `revoked` consent_record at local tier (caller MUST hybrid-verify
+/// before storing), else [`LocalTierDisposition::Durable`].
 pub fn check_consent_record_admission(
     attestation_type: &str,
     envelope: &serde_json::Value,
     tier: &str,
-) -> Result<(), Error> {
+) -> Result<LocalTierDisposition, Error> {
     use crate::federation::types::consent_record;
     // No-op unless this is a `scores` carrying the consent_record
     // discriminator. (A `consent_record` MUST ride `scores` — §5.6.8.7
     // "Rides existing scores attestation_type"; a non-scores row bearing
     // the discriminator is malformed.)
     if envelope_subject_kind(envelope) != Some(consent_record::SUBJECT_KIND) {
-        return Ok(());
+        return Ok(LocalTierDisposition::Durable);
     }
     if attestation_type != attestation_type::SCORES {
         return Err(Error::InvalidArgument(format!(
@@ -917,49 +955,209 @@ pub fn check_consent_record_admission(
         ));
     }
     // Rule 3 — tier eligibility (§10.1.3): a `revoked` consent_record is
-    // subject revocation authority → never local-tier-eligible.
+    // subject revocation authority. It is federation-tier by classification
+    // but MAY *transit* the local tier — the caller (`put_attestation`)
+    // hybrid-verifies the signature before storing (accept on VALID crypto
+    // only; transit-not-rest). Pre-v12.6.0 this was a hard `Err`.
     if stance == consent_record::stance::REVOKED
         && tier == crate::federation::types::attestation_tier::LOCAL
     {
-        return Err(Error::InvalidArgument(
-            "a consent_record with stance 'revoked' is NOT local-tier-eligible \
-             (CEG §10.1.3 / §5.6.8.7 admission rule 3): it carries subject \
-             revocation authority — it must be federation-tier (hybrid-signed) \
-             or promoted within the §10.1.3 bounded window"
-                .to_string(),
-        ));
+        return Ok(LocalTierDisposition::TransitRevocation);
     }
-    Ok(())
+    Ok(LocalTierDisposition::Durable)
+}
+
+/// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — the
+/// `put_attestation` ingest gate for subject-side consent revocations at
+/// local tier. Two classifiers feed it:
+///
+/// 1. [`check_consent_record_admission`] (field / stance / substrate-only
+///    `expired` checks) — a `revoked` consent_record ceremony at
+///    `tier = local`;
+/// 2. [`is_subject_side_revocation`] — a *bare* subject-side revocation
+///    (`withdraws`, or a `consent:state:revoked` dimension with writer ∈
+///    `subject_key_ids`) at `tier = local`. Without this arm,
+///    `put_attestation(tier = local)` would be a trivial bypass of the
+///    crypto gate the local-write path
+///    ([`verify_local_transit_revocation`]) enforces.
+///
+/// Either way the row MAY transit the local tier only on VALID crypto: its
+/// bound-hybrid signature is verified via
+/// [`verify_row_hybrid_signature`](crate::federation::verify_row_hybrid_signature)
+/// against the attester's REGISTERED pubkeys **before** any store
+/// (Ed25519 + ML-DSA-65, Strict, PQC-mandatory). An unsigned /
+/// classical-only / forged one is rejected
+/// [`Error::FederationTierUnverified`], fail-secure. A no-op (`Ok(())`) for
+/// every other row (durable consent_records; federation-tier rows are gated
+/// by `verify_federation_tier_ingest`; non-revocations). Must run BEFORE the
+/// backend acquires its write lock (it resolves pubkeys via the directory,
+/// which locks itself).
+pub async fn verify_consent_record_transit_ingest<F>(
+    directory: &F,
+    row: &crate::federation::types::Attestation,
+) -> Result<(), Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    let ceremony_disposition = check_consent_record_admission(
+        &row.attestation_type,
+        &row.attestation_envelope,
+        &row.tier,
+    )?;
+    let bare_transit = row.tier == crate::federation::types::attestation_tier::LOCAL
+        && is_subject_side_revocation(
+            &row.attestation_type,
+            envelope_dimension(&row.attestation_envelope),
+            &row.attesting_key_id,
+            &row.subject_key_ids,
+        );
+    if ceremony_disposition == LocalTierDisposition::TransitRevocation || bare_transit {
+        crate::federation::verify_row_hybrid_signature(directory, row).await
+    } else {
+        Ok(())
+    }
+}
+
+/// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — the local-write
+/// path's transit gate, shared by all three backends. Given the
+/// [`LocalTierDisposition`] from [`check_local_tier_eligibility`] and the
+/// caller's [`LocalAttestationInput`](crate::federation::types::LocalAttestationInput):
+///
+/// - [`LocalTierDisposition::Durable`] ⇒ `Ok(None)` (ordinary
+///   producer-authority row; signature deferred — written as the
+///   empty-sentinel scrub envelope).
+/// - [`LocalTierDisposition::TransitRevocation`] ⇒ the subject-side
+///   revocation MUST carry a bound-hybrid signature that verifies against
+///   the attester's REGISTERED pubkeys (Ed25519 + ML-DSA-65, Strict,
+///   PQC-mandatory). On success returns `Ok(Some((original_content_hash,
+///   scrub_signature_classical, scrub_signature_pqc)))` so the backend
+///   builds the signed transit row
+///   ([`LocalAttestationInput::into_transit_revocation_row`](crate::federation::types::LocalAttestationInput::into_transit_revocation_row)).
+///   A missing signature ⇒ [`Error::InvalidArgument`]; an invalid one ⇒
+///   [`Error::FederationTierUnverified`]. Either way the row is NOT stored —
+///   persist accepts the transit write ONLY on VALID crypto (never an
+///   unsigned/forged revocation), and never rests it as a durable local row.
+///
+/// MUST run BEFORE the backend acquires its write lock (it resolves pubkeys
+/// via the directory, which locks itself).
+#[allow(clippy::type_complexity)]
+pub async fn verify_local_transit_revocation<F>(
+    directory: &F,
+    disposition: LocalTierDisposition,
+    input: &crate::federation::types::LocalAttestationInput,
+) -> Result<Option<(String, String, Option<String>)>, Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    match disposition {
+        LocalTierDisposition::Durable => Ok(None),
+        LocalTierDisposition::TransitRevocation => {
+            let sig_classical = input.scrub_signature_classical.as_deref().ok_or_else(|| {
+                Error::InvalidArgument(
+                    "a subject-side revocation transiting the local tier requires a bound-hybrid \
+                     signature (§10.1.3, AV-61): scrub_signature_classical + scrub_signature_pqc \
+                     must be present and verify against the attester's registered pubkeys"
+                        .to_string(),
+                )
+            })?;
+            let sig_pqc = input.scrub_signature_pqc.as_deref();
+            let hash = crate::federation::verify_envelope_hybrid_signature(
+                directory,
+                &input.attesting_key_id,
+                &input.attestation_envelope,
+                sig_classical,
+                sig_pqc,
+            )
+            .await?;
+            Ok(Some((
+                hash,
+                sig_classical.to_string(),
+                sig_pqc.map(str::to_string),
+            )))
+        }
+    }
+}
+
+/// v12.6.0 (CIRISPersist#171, CEG §10.1.3 transit-not-rest) — how a
+/// local-tier write is admitted. The subject-side revocation resolution of
+/// AV-61: a subject revocation is federation-tier *by classification* but
+/// MAY **transit** the local write path (never *rest* as a durable local
+/// row). [`check_local_tier_eligibility`] /
+/// [`check_consent_record_admission`] classify the row; the backend then
+/// acts on the disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalTierDisposition {
+    /// Ordinary producer-only-authority local row — signature deferred
+    /// (CC 5.3.2.2), written as an empty-sentinel scrub envelope.
+    Durable,
+    /// A subject-side consent revocation **transiting** the local tier
+    /// (§10.1.3). The backend MUST verify its bound-hybrid signature
+    /// (Ed25519 + ML-DSA-65, Strict, PQC-mandatory) against the attester's
+    /// REGISTERED pubkeys before storing; a signature that does not verify
+    /// (or is absent) is rejected. The accepted row carries the REAL
+    /// signature at `tier = local`, `promoted_at = None` — never a durable
+    /// unsigned local row: the consent-SLA watcher drives it to promotion
+    /// (federation-tier) or flags it overdue within the bounded window.
+    TransitRevocation,
+}
+
+/// True iff `(attestation_type, dimension, writer, subjects)` is a
+/// **subject-side** consent revocation (CEG §10.1.3, AV-61): a `withdraws`
+/// (structural) or a `consent:state:revoked` dimension whose writer
+/// (`attesting_key_id`) is a member of `subject_key_ids` — the subject
+/// exercising its own revocation right. The transit-not-rest classifier.
+#[must_use]
+pub fn is_subject_side_revocation(
+    attestation_type: &str,
+    dimension: Option<&str>,
+    attesting_key_id: &str,
+    subject_key_ids: &[String],
+) -> bool {
+    let is_revocation = attestation_type == crate::federation::types::attestation_type::WITHDRAWS
+        || dimension.is_some_and(|d| d.starts_with("consent:state:revoked"));
+    is_revocation && subject_key_ids.iter().any(|s| s == attesting_key_id)
 }
 
 /// v4.4.0 (CIRISPersist#171, CEG §10.1.3/§10.1.5/§7.5) — gate a row's
 /// eligibility for the **local tier** (signature-deferred,
 /// producer-only-authority). Local-tier eligibility is producer
 /// authority — NOT empty `subject_key_ids` (CEG §4.2.6: producer-
-/// authority rows legitimately name subjects). Exactly two classes are
-/// **refused** at local tier (they MUST be federation-tier, signed):
+/// authority rows legitimately name subjects).
+///
+/// One class is **hard-refused** at local tier:
 ///
 ///   1. **`capacity:*` (CEG §7.5 anti-Goodhart, AV-62).** A `capacity:*`
 ///      dimension rejects self-emission; the local tier's self-write →
 ///      self-read → deferred-sig shape is precisely the §7.5 forbidden
 ///      loop. Capacity is inherently third-party-attested.
+///
+/// A second class is **admitted as transit, not durable** (v12.6.0,
+/// resolving AV-61 per the §10.1.3 transit-not-rest ratification):
+///
 ///   2. **Subject-side revocation (CEG §10.1.3, AV-61).** A `withdraws`
 ///      (structural) or a `consent:state:revoked` dimension whose
 ///      **writer (`attesting_key_id`) is a member of `subject_key_ids`**
-///      — the subject exercising its own revocation right. Subject-side
-///      revocation is the federation-observability primitive peers
-///      depend on; it cannot ride the deferral path.
+///      — the subject exercising its own revocation right. It is
+///      federation-tier by classification but MAY *transit* the local
+///      write path: this returns [`LocalTierDisposition::TransitRevocation`]
+///      so the backend verifies the bound-hybrid signature before storing
+///      (accept on VALID crypto only) and marks the row transit (signed,
+///      `tier = local`, promotable/flaggable — never a durable local row).
+///      Pre-v12.6.0 this was a hard `Err`, which left the consent-SLA
+///      watcher firing on nothing (persist refused to originate any row for
+///      it to observe).
 ///
 /// `dimension` is the envelope dimension ([`envelope_dimension`]);
 /// `attestation_type` is the §3 structural primitive. Returns
-/// [`Error::InvalidArgument`] on an ineligible row; `Ok(())` otherwise.
+/// [`Error::InvalidArgument`] on an ineligible row (bad cohort_scope /
+/// capacity:*); otherwise the [`LocalTierDisposition`].
 pub fn check_local_tier_eligibility(
     attestation_type: &str,
     dimension: Option<&str>,
     attesting_key_id: &str,
     subject_key_ids: &[String],
     cohort_scope: &str,
-) -> Result<(), Error> {
+) -> Result<LocalTierDisposition, Error> {
     // (0) local rows are `self`-scoped (private to the producing
     // occurrence). The v4.0 `self`-cohort read-gate then IS the tier
     // read-gate (FSD §3 / CEG §10.1.5, AV-59); promotion widens scope.
@@ -979,18 +1177,18 @@ pub fn check_local_tier_eligibility(
                 .to_string(),
         ));
     }
-    // (2) subject-side revocation — never local (§10.1.3 / AV-61).
-    let is_revocation = attestation_type == crate::federation::types::attestation_type::WITHDRAWS
-        || dimension.is_some_and(|d| d.starts_with("consent:state:revoked"));
-    if is_revocation && subject_key_ids.iter().any(|s| s == attesting_key_id) {
-        return Err(Error::InvalidArgument(
-            "a subject-side revocation (the writer is a member of subject_key_ids) is NOT \
-             local-tier-eligible (CEG §10.1.3, AV-61): it must be federation-tier signed / \
-             promoted within the bounded window"
-                .to_string(),
-        ));
+    // (2) subject-side revocation — admitted as TRANSIT (§10.1.3, AV-61):
+    // the backend hybrid-verifies before storing, marks it transit, and the
+    // consent-SLA watcher drives it to promotion / overdue-flag.
+    if is_subject_side_revocation(
+        attestation_type,
+        dimension,
+        attesting_key_id,
+        subject_key_ids,
+    ) {
+        return Ok(LocalTierDisposition::TransitRevocation);
     }
-    Ok(())
+    Ok(LocalTierDisposition::Durable)
 }
 
 /// v4.4.0 (CIRISPersist#171, CEG §7.5 / AV-62) — the federation-path
@@ -2535,6 +2733,135 @@ pub async fn check_single_node_owner_admission(
     Ok(())
 }
 
+/// **CIRISPersist#372 (CC 3.4.7.1 set-membership) — the `canonical`-role
+/// admission gate.** A `federation_keys` row may carry the
+/// [`super::types::identity_type::CANONICAL`] role (founding / canonical
+/// bootstrap server) in its `identity_type` **set** IFF the record is
+/// **anchor-scrub-signed**: `scrub_key_id != key_id` AND `scrub_key_id`'s
+/// Ed25519 pubkey ∈ the pinned HUMANITY_ACCORD anchor. That role is
+/// accord-CONFERRED, never self-claimed — a node cannot bootstrap itself into
+/// the founding set.
+///
+/// This wrapper pins the trusted anchor to the HUMANITY_ACCORD holder keyset
+/// (A1/B1/C1) via
+/// [`ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor`] — the
+/// SAME terminus [`super::rooting::root_binding`] and
+/// [`super::register::verify_key_registration`] verify against. Use
+/// [`check_canonical_role_admission_anchored`] to inject a different anchor
+/// (tests).
+///
+/// Behaviour:
+/// - The row's `identity_type` set does NOT contain `canonical` → `Ok(())`
+///   (no-op; the vast majority of rows).
+/// - It contains `canonical` AND the record is anchor-scrub-signed → `Ok(())`.
+/// - It contains `canonical` but the record is **self-signed**
+///   (`scrub_key_id == key_id`), scrubbed by an **unknown** key, or scrubbed
+///   by a key whose ed25519 is **not** in the anchor → refused with
+///   [`Error::CanonicalRoleNotAccordConferred`] (fail-closed; the caller must
+///   NOT store the row).
+///
+/// **Monotonicity.** Because this runs at every `federation_keys` write
+/// chokepoint (`put_public_key` on both backends + memory, plus the
+/// `adopt_scrub_upgrade` self→anchored path), `canonical` can never be added
+/// by a later self-registration or by replication of a self-signed row: those
+/// records are all self-signed (or non-anchor-scrubbed) and are refused here
+/// before any INSERT/UPDATE. The only way `canonical` enters the directory is
+/// an accord holder scrub-signing the node with the role (the Trust Root
+/// add-canonical op). Verify-before-mutation (AV-9); backend-agnostic.
+pub async fn check_canonical_role_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+) -> Result<(), Error> {
+    let anchor = ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor();
+    check_canonical_role_admission_anchored(directory, row, &anchor).await
+}
+
+/// [`check_canonical_role_admission`] with an explicit trusted-anchor keyset —
+/// the core primitive. `trusted_anchor` is a slice of raw 32-byte Ed25519
+/// keys; the scrubber's (`scrub_key_id`'s) ed25519 must appear in it or the
+/// `canonical` role is refused. Production callers use the
+/// [`check_canonical_role_admission`] wrapper (accord-holder anchor); this form
+/// exists so tests (and any alternative pinning) can supply their own anchor,
+/// mirroring [`super::rooting::root_binding_anchored`].
+pub async fn check_canonical_role_admission_anchored(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+    trusted_anchor: &[[u8; 32]],
+) -> Result<(), Error> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    // Fast path: no `canonical` role in the set → nothing to gate.
+    if !identity_type::set_contains(&row.identity_type, identity_type::CANONICAL) {
+        return Ok(());
+    }
+
+    // Self-signed can NEVER confer `canonical` — this is the "a node cannot
+    // claim the founding role itself" invariant.
+    if row.scrub_key_id == row.key_id {
+        return Err(Error::CanonicalRoleNotAccordConferred {
+            key_id: row.key_id.clone(),
+            scrub_key_id: row.scrub_key_id.clone(),
+            reason: "self-signed record (scrub_key_id == key_id) cannot confer the `canonical` \
+                     role — it must be scrub-signed by a HUMANITY_ACCORD holder"
+                .to_owned(),
+        });
+    }
+
+    // Resolve the scrubber's row; an unknown scrubber cannot confer the role
+    // (fail-secure — the accord holder's key MUST already exist in the
+    // directory, the v12.2.0 gotcha).
+    let Some(scrubber) = directory.lookup_public_key(&row.scrub_key_id).await? else {
+        return Err(Error::CanonicalRoleNotAccordConferred {
+            key_id: row.key_id.clone(),
+            scrub_key_id: row.scrub_key_id.clone(),
+            reason: "scrub_key_id resolves to no federation_keys row — an unregistered scrubber \
+                     cannot confer the `canonical` role"
+                .to_owned(),
+        });
+    };
+
+    // The scrubber's ed25519 MUST be one of the pinned accord-holder anchor
+    // keys. This is the load-bearing gate: only the un-forgeable accord
+    // holders (A1/B1/C1) can confer `canonical`.
+    let raw = B64.decode(scrubber.pubkey_ed25519_base64.as_bytes()).ok();
+    let in_anchor = match raw {
+        Some(bytes) if bytes.len() == 32 => {
+            let mut ed = [0u8; 32];
+            ed.copy_from_slice(&bytes);
+            trusted_anchor.contains(&ed)
+        }
+        _ => false,
+    };
+    if !in_anchor {
+        return Err(Error::CanonicalRoleNotAccordConferred {
+            key_id: row.key_id.clone(),
+            scrub_key_id: row.scrub_key_id.clone(),
+            reason: "scrubber's ed25519 pubkey is not in the pinned HUMANITY_ACCORD anchor \
+                     (only accord holders may confer the `canonical` role)"
+                .to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+/// **CIRISPersist#372 — is `key_id` a canonical / founding bootstrap server?**
+/// True iff `key_id` resolves to a `federation_keys` row whose `identity_type`
+/// **set** contains [`super::types::identity_type::CANONICAL`]. Because
+/// [`check_canonical_role_admission`] gates every write path, a stored row can
+/// carry `canonical` only if it earned it via anchor-scrub — so this simple
+/// set-membership read is sufficient (the admission gate is the enforcement
+/// point). `false` for an unknown `key_id` or a non-canonical row.
+pub async fn is_canonical(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+) -> Result<bool, Error> {
+    Ok(directory
+        .lookup_public_key(key_id)
+        .await?
+        .is_some_and(|r| identity_type::set_contains(&r.identity_type, identity_type::CANONICAL)))
+}
+
 /// #249 Cut B — the steward-binding **PATH** for audit: the actual delegation
 /// chain `user → … → key_id` that steward-binds `key_id`, anchor-first (the
 /// human `user`-role key at index 0, `key_id` last). Where
@@ -2873,16 +3200,47 @@ pub async fn check_no_moderator_federate_admission_by_id(
 
 /// v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — the `put_attestation` entry
 /// point for the §11.11 federation-apply re-check (point ii). A
-/// **federation-tier** attestation carrying a `community_id` in its envelope is
-/// a "federation apply step keyed on C"; it is refused if `C` has no live
-/// `moderate`-holder ([`check_no_moderator_federate_admission_by_id`]).
+/// **federation-tier** attestation keyed on a community `C` is a "federation
+/// apply step keyed on C"; it is refused if `C` has no live `moderate`-holder
+/// ([`check_no_moderator_federate_admission_by_id`]).
+///
+/// # Keying — what "keyed on C" means for an attestation row (v12.7.0, #369)
+///
+/// §11.11 requires the re-check on **every** federation apply step keyed on
+/// `C`, not only rows that ride one envelope convention. A federation-tier
+/// row is keyed on `C` when it references `C` under ANY of the substrate's
+/// own community-reference shapes:
+///
+/// 1. **Envelope fields** — `community_id` (the CEG §11.10 moderation-gate
+///    shape, [`check_delegated_duty_scores_admission`]'s keying),
+///    `community_key_id` (the [`Community`](crate::federation::types::Community)
+///    record / CC 3.2 steward-binding-gate field name), and `cohort_key_id`
+///    (the #249 Cut G4 membership-change event field name). Each is honored
+///    when present as a string.
+/// 2. **Row endpoints** — `attesting_key_id` / `attested_key_id` resolving as
+///    a stored community (`lookup_community` hit). This is how
+///    community-MEMBERSHIP attestations reference their community with no
+///    literal envelope field: a community's own key IS a `federation_keys`
+///    row, and the scope read-gate already treats the attestation *subject*
+///    as the membership target ("`federation_attestations` carries
+///    `cohort_scope` but no separate `cohort_target_id`, so the subject
+///    doubles as the membership target" — `list_attestations_for`). A row
+///    attested TO `C` (membership / scores-on-community) or emitted BY `C`
+///    (community-signed roster claims) is a federation apply step keyed on
+///    `C`.
+/// 3. **`subject_key_ids` entries** resolving as stored communities — the
+///    CEG 0.6 §4.2 consent-subject shape (the same subject set the §11.10
+///    duty-holder composition folds community moderators into).
 ///
 /// A no-op (`Ok(())`) for:
 /// - **local-tier** rows — a local-tier write is private to the producing
 ///   occurrence and not a federation apply step (CC 5.3.2.2), and
-/// - rows carrying **no** `community_id` (not keyed on a community), and
-/// - a `community_id` **not locally known** (out of scope — fail-open, per
-///   [`check_no_moderator_federate_admission_by_id`]).
+/// - rows referencing **no** community under any shape above (not keyed on a
+///   community: every candidate either absent or **not locally known** —
+///   out of scope, fail-open, per
+///   [`check_no_moderator_federate_admission_by_id`]; an ordinary
+///   key-to-key attestation costs two `lookup_community` misses and passes
+///   untouched).
 ///
 /// A founder appointment (`delegates_to(moderate)` keyed on C) is NOT
 /// chicken-and-egg-blocked: a steward-bound founder is already a zero-hop named
@@ -2899,12 +3257,66 @@ pub async fn check_no_moderator_federate_apply(
     if row.tier != crate::federation::types::attestation_tier::FEDERATION {
         return Ok(());
     }
-    let community_id = row
-        .attestation_envelope
-        .get("community_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    check_no_moderator_federate_admission_by_id(directory, community_id).await
+    // Collect every community reference the row carries (deduplicated —
+    // a row naming C under several shapes re-checks it once).
+    let mut candidates: Vec<&str> = Vec::new();
+    for field in ["community_id", "community_key_id", "cohort_key_id"] {
+        if let Some(cid) = row.attestation_envelope.get(field).and_then(|v| v.as_str()) {
+            if !cid.is_empty() && !candidates.contains(&cid) {
+                candidates.push(cid);
+            }
+        }
+    }
+    for endpoint in [row.attesting_key_id.as_str(), row.attested_key_id.as_str()] {
+        if !endpoint.is_empty() && !candidates.contains(&endpoint) {
+            candidates.push(endpoint);
+        }
+    }
+    for sid in &row.subject_key_ids {
+        if !sid.is_empty() && !candidates.contains(&sid.as_str()) {
+            candidates.push(sid);
+        }
+    }
+    for cid in candidates {
+        check_no_moderator_federate_admission_by_id(directory, cid).await?;
+    }
+    Ok(())
+}
+
+/// v12.7.0 (CIRISPersist#369, CC 4.5.4 / §11.11) — the directly drivable
+/// federate-admission **verdict** over one community id: exactly the decision
+/// [`check_no_moderator_federate_apply`] takes for a federation apply step
+/// keyed on `community_id`, returned as data instead of an error so a
+/// conformance/consumer layer can stage the gate without constructing a full
+/// federation flow. Verdict JSON:
+///
+/// - `{"admitted": true, "community_known": false}` — not locally known ⇒
+///   out of scope, fail-open (the peer's own admission gate governs it);
+/// - `{"admitted": true, "community_known": true}` — a live `moderate`-holder
+///   resolves (or the authorized-infrastructure carve-out applies) ⇒ `C` may
+///   federate at moderated capability;
+/// - `{"admitted": false, "community_known": true, "reason":
+///   "federation_community_no_moderator"}` — §11.11 rule-3 fail-secure: no
+///   live steward-bound authority root ⇒ MUST NOT federate at moderated
+///   capability.
+///
+/// Read-only — never mutates; substrate read errors propagate as `Err`.
+pub async fn no_moderator_federate_verdict(
+    directory: &dyn super::FederationDirectory,
+    community_id: &str,
+) -> Result<serde_json::Value, Error> {
+    let Some(community) = directory.lookup_community(community_id).await? else {
+        return Ok(serde_json::json!({ "admitted": true, "community_known": false }));
+    };
+    match check_no_moderator_federate_admission(directory, &community).await {
+        Ok(()) => Ok(serde_json::json!({ "admitted": true, "community_known": true })),
+        Err(err @ Error::CommunityHasNoModerator { .. }) => Ok(serde_json::json!({
+            "admitted": false,
+            "community_known": true,
+            "reason": err.kind(),
+        })),
+        Err(other) => Err(other),
+    }
 }
 
 /// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §11.11) — is key `k` a **named
@@ -3716,6 +4128,15 @@ pub async fn check_adult_incapacity_binding(
 /// - `capacity:*` → MUST NOT be self-emitted (`attesting_key_id ==
 ///   attested_key_id`) — CC 3.4.5's "Critical enforcement" anti-Goodhart rule
 ///   (an `identity_type`-independent attester==attested check).
+/// - `age_assurance:*` → MUST NOT be self-emitted either (v12.7.0,
+///   CIRISPersist#368) — CC 3.4.11 "A subject MUST NOT emit on
+///   `age_assurance:`". The witness-RESERVED half rides the rule table; this
+///   attester==attested half stops a `witness`-typed key from graduating
+///   ITSELF. A witness graduates a DIFFERENT subject by naming it as
+///   `attested_key_id` (the cross-subject edge
+///   [`crate::Engine::emit_attestation`] carries via
+///   [`EmitAttestationInput::attested_key_id`](crate::federation::EmitAttestationInput::attested_key_id)),
+///   which [`super::age::age_band`] then resolves for that subject.
 ///
 /// Structural primitives (`scores` / `delegates_to` / `supersedes` /
 /// `withdraws` / `recants`) and any non-reserved type fast-exit with no
@@ -3746,6 +4167,25 @@ pub async fn check_reserved_prefix_admission(
         && row.attesting_key_id == row.attested_key_id
     {
         return Err(Error::CapacitySelfEmissionRejected {
+            key_id: row.attesting_key_id.clone(),
+            attestation_type: at.to_owned(),
+        });
+    }
+
+    // v12.7.0 (CIRISPersist#368) — CC 3.4.11: "A subject MUST NOT emit on
+    // `age_assurance:`". The witness rung is an attestation ABOUT a subject
+    // (`attested_key_id` = the subject, the same cross-subject edge shape
+    // `delegates_to` uses); the SUBJECT-must-not-emit half is an
+    // attester==attested check independent of identity_type — without it a
+    // key carrying the `witness` identity_type could self-mint its own
+    // `adult` graduation. The witness-RESERVED half (only `identity_type ⊇
+    // {witness}` may emit) rides the reserved-prefix rule table below,
+    // unchanged. Exact sibling of the CC 3.4.12 `capacity_assurance:` check
+    // above. NB: the self rung stays on the distinct NON-reserved
+    // `age_self_declared:` prefix (subject-signed by design), which this
+    // check never touches.
+    if at.starts_with("age_assurance:") && row.attesting_key_id == row.attested_key_id {
+        return Err(Error::AgeAssuranceSelfEmissionRejected {
             key_id: row.attesting_key_id.clone(),
             attestation_type: at.to_owned(),
         });
@@ -3801,7 +4241,17 @@ pub async fn check_reserved_prefix_admission(
         });
     }
     if let Some(rule) = matched_rule {
-        if !rule.required_identity_types.contains(&got) {
+        // CC 3.4.7.1 — set membership, not scalar equality: `got` is the
+        // stored (possibly comma-joined) `identity_type` set; the rule is
+        // satisfied iff a required role is one of its members. Single-role
+        // keys encode identically to scalar (`X ∈ {X}` ≡ `X == X`), so this
+        // is behavior-preserving for every existing reserved prefix and
+        // only newly-admits conformant folded keys (CC 3.4.8 detector fold).
+        if !rule
+            .required_identity_types
+            .iter()
+            .any(|t| identity_type::set_contains(&got, t))
+        {
             let mut required = rule.required_identity_types.clone();
             required.sort();
             return Err(Error::ReservedPrefixEmitterMismatch {
@@ -3922,14 +4372,84 @@ mod tests {
     #[test]
     fn admission_accepts_correlated_action_rights_asymmetry_v1() {
         // The v1.2 rename target itself — mechanism-descriptive
-        // + version-pinned. Should pass.
+        // + version-pinned. As of CC 3.4.8 (CIRISPersist#366) this is a
+        // detector-only prefix, so the emitter must hold `lenscore_detector`.
         let p = default_policy();
         p.check(
             attestation_type::SCORES,
             Some("detection:correlated_action:rights_asymmetry:v1"),
-            identity_type::STEWARD,
+            identity_type::LENSCORE_DETECTOR,
         )
         .unwrap();
+    }
+
+    // ── CC 3.4.8 (CIRISPersist#366) — detector-only prefix decision table
+    //    (dimension side; `DimensionAdmissionPolicy::check`) ────────────
+
+    #[test]
+    fn detector_prefix_decision_table_dimension_side() {
+        let p = default_policy();
+        let detector_dims = [
+            "detection:correlated_action:rights_asymmetry:v1",
+            "detection:distributive:access:disparity:v1",
+        ];
+
+        // 1. A plain `lenscore_detector` key is ADMITTED.
+        for dim in detector_dims {
+            p.check(
+                attestation_type::SCORES,
+                Some(dim),
+                identity_type::LENSCORE_DETECTOR,
+            )
+            .unwrap_or_else(|e| panic!("detector must admit {dim}: {e:?}"));
+        }
+
+        // 2. A folded `{agent, lenscore_detector}` key is ADMITTED by set
+        //    membership (CC 3.4.8 LensCore-fold worked example). Encode the
+        //    set as the canonical sorted comma-joined form.
+        let folded =
+            identity_type::join_set([identity_type::AGENT, identity_type::LENSCORE_DETECTOR]);
+        for dim in detector_dims {
+            p.check(attestation_type::SCORES, Some(dim), &folded)
+                .unwrap_or_else(|e| panic!("folded detector must admit {dim}: {e:?}"));
+        }
+
+        // 3. A plain `agent`/`steward` key is REJECTED — the cohabiting
+        //    non-detector role neither grants nor blocks; only the held
+        //    `lenscore_detector` role does.
+        for role in [identity_type::AGENT, identity_type::STEWARD] {
+            for dim in detector_dims {
+                let err = p
+                    .check(attestation_type::SCORES, Some(dim), role)
+                    .unwrap_err();
+                match err {
+                    Error::ReservedPrefixEmitterMismatch {
+                        required,
+                        got_identity_type,
+                        ..
+                    } => {
+                        assert_eq!(required, vec![identity_type::LENSCORE_DETECTOR.to_owned()]);
+                        assert_eq!(got_identity_type, role);
+                    }
+                    other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
+                }
+            }
+        }
+
+        // 4. A `truth_grounding:detection:*` cross-attestation from ANY key
+        //    is ADMITTED (ungated — a DIFFERENT prefix, shadowing-free).
+        for role in [
+            identity_type::AGENT,
+            identity_type::STEWARD,
+            identity_type::LENSCORE_DETECTOR,
+        ] {
+            p.check(
+                attestation_type::SCORES,
+                Some("truth_grounding:detection:correlated_action:rights_asymmetry:v1"),
+                role,
+            )
+            .unwrap_or_else(|e| panic!("cross-attestation must be ungated for {role}: {e:?}"));
+        }
     }
 
     // ── Ask 3 exemption: structural primitives bypass the gate ─────
@@ -4656,5 +5176,246 @@ mod tests {
         // agency kind — it just isn't an admissible node scope unprefixed.
         assert!(!scopes_are_infra_only(&scope_set(&["network_presence"])));
         assert!(!ds::is_legacy_agency_scope("network_presence"));
+    }
+}
+
+/// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — the accord-conferred `canonical`
+/// admission decision table, run identically against SQLite and (when
+/// `CIRIS_PERSIST_TEST_PG_URL` is set) Postgres. Exercises the PRODUCTION gate
+/// (`check_canonical_role_admission`, real HUMANITY_ACCORD anchor) end-to-end
+/// through `put_public_key` + `adopt_scrub_upgrade`, with the real A1 genesis
+/// holder seeded as the anchor scrubber (the v12.2.0 gotcha: the scrubber must
+/// exist as a `federation_keys` row). Proves `canonical` cannot be self-claimed
+/// via ANY path.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod canonical_gate_tests {
+    use super::super::genesis::accord_holder_genesis_records;
+    use super::super::types::{algorithm, identity_type};
+    use super::super::{is_canonical, FederationDirectory, KeyRecord, SignedKeyRecord};
+    use crate::verify::canonical::ceg_produce_canonicalize;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use ed25519_dalek::SigningKey;
+    use sha2::{Digest, Sha256};
+
+    /// Build a `federation_keys` `KeyRecord` for `key_id` carrying
+    /// `identity_type`, scrubbed by `scrub_key_id` (set `== key_id` for a
+    /// self-signed row). The scrub-signature is NOT verified at the
+    /// `put_public_key` chokepoint (that is `verify_key_registration`'s job on
+    /// `register_federation_key`), so a syntactically-valid record suffices to
+    /// exercise the canonical admission gate. Deterministic per-key pubkey.
+    fn record(key_id: &str, identity_type: &str, scrub_key_id: &str) -> KeyRecord {
+        let mut seed = [0x11u8; 32];
+        for (i, b) in key_id.bytes().take(32).enumerate() {
+            seed[i] = b;
+        }
+        let ed = SigningKey::from_bytes(&seed);
+        let envelope = serde_json::json!({ "key_id": key_id });
+        let canonical = ceg_produce_canonicalize(&envelope).expect("canonicalize");
+        let now = chrono::Utc::now();
+        KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: B64.encode(ed.verifying_key().to_bytes()),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: algorithm::HYBRID.to_owned(),
+            identity_type: identity_type.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: envelope,
+            original_content_hash: hex::encode(Sha256::digest(&canonical)),
+            scrub_signature_classical: "AA".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: scrub_key_id.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+        }
+    }
+
+    async fn put(dir: &dyn FederationDirectory, rec: KeyRecord) -> Result<(), super::Error> {
+        dir.put_public_key(SignedKeyRecord { record: rec }).await
+    }
+
+    /// The full decision table over an anchor-seeded directory. `dir` MUST
+    /// already carry the genesis A1/B1/C1 holders. `tag` scopes key_ids so
+    /// parallel/repeat runs don't collide.
+    async fn run_put_matrix(dir: &dyn FederationDirectory, tag: &str) {
+        let a1 = &accord_holder_genesis_records()[0].record;
+        assert_eq!(a1.key_id, "A1");
+
+        // Seed a NON-anchor key that exists in the directory (a plain
+        // self-signed steward) — used as a non-anchor scrubber below.
+        let notanchor = format!("notanchor-{tag}");
+        put(dir, record(&notanchor, identity_type::STEWARD, &notanchor))
+            .await
+            .expect("plain non-anchor key admits");
+
+        // (1) ADMITTED: anchor-scrubbed `node,canonical` (scrub_key_id = A1,
+        //     A1's ed25519 ∈ the pinned anchor).
+        let good = format!("canon-good-{tag}");
+        put(dir, record(&good, "canonical,node", &a1.key_id))
+            .await
+            .expect("(1) anchor-scrubbed canonical must be ADMITTED");
+        assert!(
+            is_canonical(dir, &good).await.expect("is_canonical"),
+            "(1) admitted canonical row must resolve is_canonical == true"
+        );
+
+        // (2) REFUSED: self-signed `canonical` (scrub_key_id == key_id).
+        let selfsigned = format!("canon-self-{tag}");
+        let err = put(dir, record(&selfsigned, "canonical", &selfsigned))
+            .await
+            .expect_err("(2) self-signed canonical must be REFUSED");
+        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
+        assert!(
+            dir.lookup_public_key(&selfsigned).await.unwrap().is_none(),
+            "(2) refused self-signed canonical must leave NO row"
+        );
+        assert!(!is_canonical(dir, &selfsigned).await.unwrap());
+
+        // (3) REFUSED: non-anchor-scrubbed `canonical` (scrubber exists but is
+        //     not in the anchor).
+        let nonanchor_canon = format!("canon-nonanchor-{tag}");
+        let err = put(dir, record(&nonanchor_canon, "canonical,node", &notanchor))
+            .await
+            .expect_err("(3) non-anchor-scrubbed canonical must be REFUSED");
+        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
+        assert!(
+            dir.lookup_public_key(&nonanchor_canon)
+                .await
+                .unwrap()
+                .is_none(),
+            "(3) refused non-anchor canonical must leave NO row"
+        );
+
+        // (3') REFUSED: canonical scrubbed by an UNKNOWN key (fail-secure).
+        let unknown_canon = format!("canon-unknown-{tag}");
+        let err = put(
+            dir,
+            record(&unknown_canon, "canonical", &format!("ghost-{tag}")),
+        )
+        .await
+        .expect_err("(3') unknown-scrubber canonical must be REFUSED");
+        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
+
+        // (4) A plain `node` row is admitted and is NOT canonical.
+        let plain = format!("plain-node-{tag}");
+        put(dir, record(&plain, identity_type::NODE, &plain))
+            .await
+            .expect("(4) plain node admits");
+        assert!(
+            !is_canonical(dir, &plain).await.unwrap(),
+            "(4) plain node must not be canonical"
+        );
+
+        // (5) MONOTONIC: a self-signed `node` row is admitted; a later
+        //     SELF-registration of the same key adding `canonical` is REFUSED
+        //     (the role cannot be added by a later self-registration /
+        //     replication of a self-signed row).
+        let mono = format!("mono-{tag}");
+        put(dir, record(&mono, identity_type::NODE, &mono))
+            .await
+            .expect("(5) initial self-signed node admits");
+        let err = put(dir, record(&mono, "canonical,node", &mono))
+            .await
+            .expect_err("(5) later self-signed canonical must be REFUSED");
+        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
+        assert!(
+            !is_canonical(dir, &mono).await.unwrap(),
+            "(5) monotonic: canonical must NOT have been added"
+        );
+
+        // (6) is_canonical on an unknown key is false (not an error).
+        assert!(!is_canonical(dir, &format!("nope-{tag}")).await.unwrap());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn canonical_matrix_sqlite() {
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(accord_holder_genesis_records())
+            .await
+            .expect("genesis seed");
+
+        run_put_matrix(&backend, "sq").await;
+
+        // The enumerator returns exactly the one admitted canonical row.
+        let canon = backend.list_canonical_servers().await.expect("list");
+        assert_eq!(canon.len(), 1, "exactly one canonical row admitted");
+        assert_eq!(canon[0].key_id, "canon-good-sq");
+        assert!(identity_type::set_contains(
+            &canon[0].identity_type,
+            identity_type::CANONICAL
+        ));
+
+        // adopt_scrub_upgrade path is ALSO gated: seed a self-signed node,
+        // then attempt a non-anchor-scrubbed upgrade that adds canonical.
+        let up = "mono-adopt-sq";
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: record(up, identity_type::NODE, up),
+            })
+            .await
+            .expect("seed self-signed node for adopt");
+        // Non-anchor scrubber adding canonical via adopt → REFUSED.
+        let mut adopted = record(up, "canonical,node", "notanchor-sq");
+        adopted.pubkey_ed25519_base64 = record(up, identity_type::NODE, up).pubkey_ed25519_base64;
+        let err = backend
+            .adopt_scrub_upgrade(SignedKeyRecord { record: adopted })
+            .await
+            .expect_err("adopt adding canonical via non-anchor scrubber must be REFUSED");
+        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
+        assert!(!is_canonical(&backend, up).await.unwrap());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn canonical_matrix_postgres() {
+        use crate::store::backend::Backend as _;
+        use crate::store::postgres::PostgresBackend;
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping canonical_matrix_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        // Fresh seed path: clear any prior A1/B1/C1 + our tagged rows.
+        let client = backend.pool().get().await.unwrap();
+        let _ = client
+            .execute(
+                "DELETE FROM cirislens.federation_keys WHERE key_id = ANY($1) \
+                 OR key_id LIKE 'canon-%pg' OR key_id LIKE '%-pg' OR identity_type LIKE '%canonical%'",
+                &[&vec!["A1".to_string(), "B1".to_string(), "C1".to_string()]],
+            )
+            .await;
+        backend
+            .seed_genesis_accord_holders(accord_holder_genesis_records())
+            .await
+            .expect("pg genesis seed");
+
+        run_put_matrix(&backend, "pg").await;
+
+        let canon = backend.list_canonical_servers().await.expect("list");
+        assert!(
+            canon.iter().any(|r| r.key_id == "canon-good-pg"),
+            "the admitted canonical row appears in list_canonical_servers"
+        );
+        assert!(
+            canon
+                .iter()
+                .all(|r| identity_type::set_contains(&r.identity_type, identity_type::CANONICAL)),
+            "every listed row carries canonical"
+        );
     }
 }

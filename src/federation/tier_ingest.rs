@@ -124,23 +124,52 @@ where
     if row.tier != attestation_tier::FEDERATION {
         return Ok(());
     }
+    verify_row_hybrid_signature(directory, row).await
+}
 
+/// v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — verify an
+/// [`Attestation`] row's envelope bound-hybrid signature **regardless of
+/// tier**. This is the tier-agnostic core [`verify_federation_tier_ingest`]
+/// runs for federation rows; the §10.1.3 subject-side revocation transit
+/// gate ([`super::admission::check_local_tier_eligibility`] /
+/// [`super::admission::check_consent_record_admission`]) runs it on a
+/// **local-tier** row so a subject revocation may *transit* the local write
+/// path only if its bound-hybrid signature verifies (the operator decision:
+/// accept on VALID crypto, never on an unsigned/forged revocation).
+///
+/// Same verify contract as the federation ingest gate: canonicalize the
+/// envelope, cross-check `SHA-256(canonical) == original_content_hash`,
+/// resolve the attester's REGISTERED pubkeys, [`verify_hybrid`] under
+/// [`HybridPolicy::Strict`] (both Ed25519 + ML-DSA-65 REQUIRED; PQC
+/// mandatory). ANY failure ⇒ [`Error::FederationTierUnverified`],
+/// fail-secure, row NOT stored.
+pub async fn verify_row_hybrid_signature<F>(directory: &F, row: &Attestation) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
     let reject = |reason: String| Error::FederationTierUnverified {
         attestation_id: row.attestation_id.clone(),
         attesting_key_id: row.attesting_key_id.clone(),
         reason,
     };
 
-    // (1) Canonicalize the attestation envelope through the CEG produce
-    // gate — the same canonical form the producer signed — and
-    // cross-check its SHA-256 against the row's declared
-    // original_content_hash. A canonicalizer disagreement (producer
-    // signed a different shape) is caught here, fail-secure, rather than
-    // masked as a downstream signature mismatch. Mirrors
-    // register.rs::verify_key_registration.
-    let canonical = ceg_produce_canonicalize(&row.attestation_envelope)
-        .map_err(|e| reject(format!("attestation_envelope canonicalize: {e}")))?;
-    let computed_hash = hex::encode(Sha256::digest(&canonical));
+    let computed_hash = verify_envelope_hybrid_signature(
+        directory,
+        &row.attesting_key_id,
+        &row.attestation_envelope,
+        &row.scrub_signature_classical,
+        row.scrub_signature_pqc.as_deref(),
+    )
+    .await
+    .map_err(|e| match e {
+        // Re-stamp the row's attestation_id onto the typed error (the
+        // envelope-level helper has no row id).
+        Error::FederationTierUnverified { reason, .. } => reject(reason),
+        other => other,
+    })?;
+
+    // Cross-check the declared original_content_hash matches the envelope's
+    // canonical SHA-256 (canonicalizer agreement, fail-secure).
     if computed_hash != row.original_content_hash {
         return Err(reject(format!(
             "original_content_hash mismatch: envelope canonicalizes to {computed_hash}, \
@@ -148,36 +177,62 @@ where
             row.original_content_hash
         )));
     }
+    Ok(())
+}
 
-    // (2) Resolve the attester's REGISTERED pubkeys. Verify against the
-    // registered key, never pubkeys carried on the row alone — an
-    // unknown/unregistered attester has no pubkeys to verify against and
-    // is rejected (fail-secure). The FK gate in put_attestation also
-    // requires attesting_key_id to exist, but resolving here keeps the
-    // gate self-contained and orders the reject as a typed
-    // federation-tier-unverified failure.
+/// v12.6.0 (CIRISPersist#171) — the envelope-level bound-hybrid verify
+/// primitive shared by [`verify_row_hybrid_signature`] (row form) and the
+/// §10.1.3 transit revocation local-write path (which has no assembled row
+/// yet — it verifies before building one). Canonicalizes `envelope` through
+/// the CEG produce gate, resolves `attesting_key_id`'s REGISTERED pubkeys via
+/// the directory (unknown attester ⇒ reject, fail-secure), and runs
+/// [`verify_hybrid`] under [`HybridPolicy::Strict`] (both halves REQUIRED,
+/// PQC-mandatory per CC 5.3.2.4.3.1). On success returns the hex-encoded
+/// `SHA-256(canonical)` (the row's `original_content_hash`); on ANY failure
+/// returns [`Error::FederationTierUnverified`] with an empty `attestation_id`
+/// (the caller re-stamps its own where one exists).
+pub async fn verify_envelope_hybrid_signature<F>(
+    directory: &F,
+    attesting_key_id: &str,
+    envelope: &serde_json::Value,
+    scrub_signature_classical: &str,
+    scrub_signature_pqc: Option<&str>,
+) -> Result<String, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let reject = |reason: String| Error::FederationTierUnverified {
+        attestation_id: String::new(),
+        attesting_key_id: attesting_key_id.to_string(),
+        reason,
+    };
+
+    // (1) Canonicalize through the CEG produce gate — the same canonical
+    // form the producer signed — and compute its SHA-256.
+    let canonical = ceg_produce_canonicalize(envelope)
+        .map_err(|e| reject(format!("attestation_envelope canonicalize: {e}")))?;
+    let computed_hash = hex::encode(Sha256::digest(&canonical));
+
+    // (2) Resolve the attester's REGISTERED pubkeys — never pubkeys carried
+    // on the row alone. Unknown/unregistered attester ⇒ reject (fail-secure).
     let attester = directory
-        .lookup_public_key(&row.attesting_key_id)
+        .lookup_public_key(attesting_key_id)
         .await
         .map_err(|e| reject(format!("attester lookup_public_key: {e} ({})", e.kind())))?
         .ok_or_else(|| {
             reject(format!(
-                "attesting_key_id {} is not registered — no pubkeys to verify the \
-                 federation-tier signature against",
-                row.attesting_key_id
+                "attesting_key_id {attesting_key_id} is not registered — no pubkeys to \
+                 verify the bound-hybrid signature against"
             ))
         })?;
 
-    // (3) Strict hybrid verify: both Ed25519 (over canonical) and
-    // ML-DSA-65 (over the bound canonical || classical_sig, applied
-    // inside the hybrid verifier) REQUIRED. A classical-only /
-    // hybrid-pending federation-tier row (PQC sig absent) is rejected —
-    // the load-bearing CC 5.3.2.4.3.1 guard. row_age is irrelevant under
-    // Strict.
+    // (3) Strict hybrid verify: Ed25519 (over canonical) AND ML-DSA-65 (over
+    // the bound canonical || classical_sig) both REQUIRED. A classical-only /
+    // hybrid-pending signature is rejected — the CC 5.3.2.4.3.1 guard.
     verify_hybrid(
         &canonical,
-        &row.scrub_signature_classical,
-        row.scrub_signature_pqc.as_deref(),
+        scrub_signature_classical,
+        scrub_signature_pqc,
         &attester.pubkey_ed25519_base64,
         attester.pubkey_ml_dsa_65_base64.as_deref(),
         HybridPolicy::Strict,
@@ -185,7 +240,7 @@ where
     )
     .map_err(|e| reject(format!("hybrid-verify: {e} ({})", e.kind())))?;
 
-    Ok(())
+    Ok(computed_hash)
 }
 
 /// v9.0.0 (CIRISPersist#237) — shared test-support for the
@@ -303,6 +358,7 @@ pub(crate) mod test_support {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         dir.put_public_key(crate::federation::SignedKeyRecord { record: rec })
             .await
@@ -367,6 +423,133 @@ pub(crate) mod test_support {
             Some(B64.encode(&pqc_sig)),
         )
     }
+
+    /// #371 — register `key_id` with its REAL deterministic hybrid pubkeys
+    /// and an explicit `identity_type` (the [`register_hybrid_key`] shape,
+    /// but e.g. `user`-role for `owner_of` granters or `node`-role for
+    /// owned-node rows). Self-signed, deterministic timestamps so a rebuilt
+    /// record is byte-identical.
+    pub async fn register_identity_key<D: crate::federation::FederationDirectory + ?Sized>(
+        dir: &D,
+        key_id: &str,
+        identity_type: &str,
+    ) {
+        let record = replicated_key_record(
+            key_id,
+            identity_type,
+            key_id, // self-signed
+            key_id,
+            "register",
+        );
+        dir.put_public_key(crate::federation::SignedKeyRecord { record })
+            .await
+            .expect("register identity key");
+    }
+
+    /// #371 — build a fully-formed [`KeyRecord`](crate::federation::KeyRecord)
+    /// for `key_id` carrying `key_id`'s REAL deterministic hybrid pubkeys,
+    /// whose registration envelope is hybrid-signed by `signer_key_id`'s
+    /// deterministic keys (through [`sign_envelope`], the exact shape
+    /// `verify_key_registration` Strict-verifies). Deterministic timestamps,
+    /// so building the same record twice is byte-identical (drives the
+    /// idempotent-`Unchanged` arm of the #371 decision table).
+    ///
+    /// - `scrub_key_id == key_id` + `signer_key_id == key_id` ⇒ a verifiable
+    ///   **self-signed** record (the in-place boot state).
+    /// - `scrub_key_id != key_id` + `signer_key_id == scrub_key_id` ⇒ a
+    ///   verifiable **granting-authority (anchor-scrubbed)** record —
+    ///   register the scrubber first ([`register_hybrid_key`] /
+    ///   [`register_identity_key`]) so the Strict gate resolves its pubkeys.
+    /// - `signer_key_id != scrub_key_id` ⇒ a record whose scrub does NOT
+    ///   verify (the bad-signer decision-table row).
+    ///
+    /// `nonce` is folded into the signed envelope, so two records for the
+    /// same `key_id` with different nonces are distinct-but-valid versions
+    /// (drives the conflicting-second-version / duplicity rows).
+    pub fn replicated_key_record(
+        key_id: &str,
+        identity_type: &str,
+        scrub_key_id: &str,
+        signer_key_id: &str,
+        nonce: &str,
+    ) -> crate::federation::KeyRecord {
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
+        let envelope = serde_json::json!({
+            "key_id": key_id,
+            "purpose": "federation-peering",
+            "nonce": nonce,
+        });
+        let (och, classical, pqc) = sign_envelope(signer_key_id, &envelope);
+        let ts: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+        crate::federation::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: identity_type.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: ts,
+            valid_until: None,
+            registration_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            scrub_key_id: scrub_key_id.to_owned(),
+            scrub_timestamp: ts,
+            pqc_completed_at: Some(ts),
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+        }
+    }
+
+    /// #371 — build a LIVE **owner-binding** `delegates_to(owner → node)`
+    /// (the CC 1.13.3.3 / CC 3.2 ownership dimension the v12.6.0
+    /// single-owner gate + `owner_of` key on), federation-tier
+    /// hybrid-signed by `owner`'s deterministic keys so
+    /// `verify_federation_tier_ingest` admits it. Register `owner` as a
+    /// `user`-role key ([`register_identity_key`]) first.
+    pub fn owner_binding_attestation(
+        id: &str,
+        owner: &str,
+        node: &str,
+    ) -> crate::federation::Attestation {
+        use crate::federation::types::{
+            attestation_tier, attestation_type, delegation_scope as ds, owner_binding,
+        };
+        let envelope = serde_json::json!({
+            "id": id,
+            "kind": "delegates_to",
+            "dimension": owner_binding::DIMENSION,
+            "delegation_purpose": owner_binding::PURPOSE,
+            "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+        });
+        let (och, classical, pqc) = sign_envelope(owner, &envelope);
+        let ts: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+        crate::federation::Attestation {
+            attestation_id: id.to_owned(),
+            attesting_key_id: owner.to_owned(),
+            attested_key_id: node.to_owned(),
+            attestation_type: attestation_type::DELEGATES_TO.to_owned(),
+            weight: Some(1.0),
+            asserted_at: ts,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            scrub_key_id: owner.to_owned(),
+            scrub_timestamp: ts,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".to_owned(),
+            tier: attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+        }
+    }
 }
 
 #[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
@@ -430,6 +613,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         dir.put_public_key(SignedKeyRecord { record: rec })
             .await

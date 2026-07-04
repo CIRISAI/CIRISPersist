@@ -43,6 +43,7 @@ pub mod blobs;
 pub mod capacity;
 pub mod cohort;
 pub mod community_dek;
+pub mod consent;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
 pub mod genesis;
@@ -127,8 +128,9 @@ pub(crate) mod serde_bytes_b64 {
 }
 
 pub use admission::{
-    check_cohort_scope, check_consensus_protocol_form, check_device_class,
-    check_encryption_pubkeys, check_observed_region, AttestationLadderTransitionPolicy,
+    check_canonical_role_admission, check_canonical_role_admission_anchored, check_cohort_scope,
+    check_consensus_protocol_form, check_device_class, check_encryption_pubkeys,
+    check_observed_region, is_canonical, AttestationLadderTransitionPolicy,
     DimensionAdmissionPolicy, DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule,
     ATTESTATION_LADDER_MECHANISMS,
 };
@@ -140,6 +142,7 @@ pub use blobs::{
     HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
+pub use consent::consent_role_of;
 pub use goal::{
     canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
     MetaGoalAlignment,
@@ -186,13 +189,15 @@ pub use stream_sth::{
     log_id_for_stream, parse_stream_id, recompute_and_assert_root, StreamChunkLeaf,
     STREAM_LOG_ID_PREFIX,
 };
-pub use tier_ingest::verify_federation_tier_ingest;
+pub use tier_ingest::{
+    verify_envelope_hybrid_signature, verify_federation_tier_ingest, verify_row_hybrid_signature,
+};
 pub use topology::{
     build_delegation_graph, build_trust_topology, AuditChainEntry, AuditChainProof, DelegationEdge,
     DelegationGraph, EdgeType, FederationDirectoryFilter, TrustEdge, TrustNode, TrustTopology,
     WithdrawalEntry, MAX_DELEGATION_DEPTH,
 };
-pub use types::{device_class, identity_type};
+pub use types::{consent_role, device_class, identity_type};
 pub use types::{
     Attestation, Community, CommunityMember, CommunityMembershipRevocation, EmitAttestationInput,
     EncryptionPubkeys, Family, FamilyMember, FamilyMembershipRevocation, HybridPendingRow,
@@ -374,6 +379,35 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         identity_type: &str,
     ) -> Result<Vec<KeyRecord>, Error>;
+
+    /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — assign
+    /// or **overwrite** the Counter-RII [`consent_role`](types::consent_role)
+    /// of `key_id`.
+    ///
+    /// This is the OQ-1 **non-recursive, overwrite-on-revoke** mutation
+    /// on the V020 `federation_keys.consent_role` column (the
+    /// CIRISAgent#760 §RC lock CC 3.4.7.2 ratifies): `Some(role)` sets
+    /// one of the six ratified tokens ([`types::consent_role::RECOGNIZED`]
+    /// — an unrecognized token is [`Error::InvalidArgument`] on EVERY
+    /// backend, keeping PG's schema CHECK and CHECK-less SQLite
+    /// symmetric); `None` revokes it back to the stored `'unregistered'`
+    /// default. There is NO chain — a subsequent call simply overwrites
+    /// the single flat column (chain history, if a deployment wants it,
+    /// lives in a separate audit surface, never embedded in this field).
+    /// `consent_role` is excluded from `persist_row_hash`, so the
+    /// overwrite does not disturb the signed registration row (and
+    /// `adopt_scrub_upgrade` never touches it). Returns
+    /// [`Error::InvalidArgument`] if `key_id` has no `federation_keys`
+    /// row.
+    ///
+    /// Persist's responsibility ends at STORE + EXPOSE + this overwrite.
+    /// The OQ-2 (`peer` blanket suppression) and OQ-3
+    /// (`authorized_review` strict post-window) *detection signals* are
+    /// applied by the consumer (edge `ProbePatternObserver` / RATCHET)
+    /// reading the role via [`consent::consent_role_of`] — persist houses
+    /// no Counter-RII detector.
+    async fn set_consent_role(&self, key_id: &str, consent_role: Option<&str>)
+        -> Result<(), Error>;
 
     // ── Attestations ───────────────────────────────────────────────
 
@@ -3144,6 +3178,30 @@ pub enum Error {
         attestation_type: String,
     },
 
+    /// v12.7.0 (CIRISPersist#368, CC 3.4.11). An `age_assurance:*`
+    /// attestation was self-emitted (`attesting_key_id ==
+    /// attested_key_id`). The witness rung is an attestation ABOUT a
+    /// subject: CC 3.4.11 — "A subject MUST NOT emit on `age_assurance:`;
+    /// … a CCS MUST reject … at admission". Without this check a key that
+    /// happens to carry the `witness` identity_type could graduate ITSELF
+    /// to `adult` — the self-minted adulthood the witness reservation
+    /// exists to prevent. Rejected at admission; the row is not stored.
+    /// The exact sibling of [`Error::CapacitySelfEmissionRejected`]
+    /// (CC 3.4.12's identical subject-must-not-emit rule for
+    /// `capacity_assurance:*`); like it, an attester==attested check
+    /// independent of `identity_type`.
+    #[error(
+        "age_assurance:* self-emission rejected: attesting_key_id == attested_key_id \
+         ({key_id:?}) — a subject must not emit its own age assurance (CC 3.4.11; \
+         attestation_type={attestation_type:?})"
+    )]
+    AgeAssuranceSelfEmissionRejected {
+        /// The key that attempted to self-emit an `age_assurance:*` row.
+        key_id: String,
+        /// The `attestation_type` that triggered the rejection.
+        attestation_type: String,
+    },
+
     /// v2.5.0 (CIRISPersist#102 Ask 4). The submitted `scores`
     /// attestation's `attestation_envelope` failed JSON Schema
     /// validation against the per-axis schema registered for the
@@ -3616,6 +3674,38 @@ pub enum Error {
         owners: Vec<String>,
     },
 
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1 set-membership) — a
+    /// `federation_keys` row carrying the [`types::identity_type::CANONICAL`]
+    /// role was REJECTED at admission because it is **not accord-conferred**.
+    /// The `canonical` (founding bootstrap server) role is accord-CONFERRED,
+    /// never self-claimed: a row may carry it **iff** the record is
+    /// anchor-scrub-signed (`scrub_key_id != key_id` AND `scrub_key_id`'s
+    /// Ed25519 pubkey ∈ the pinned HUMANITY_ACCORD anchor —
+    /// [`ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor`]).
+    /// A **self-signed** record carrying `canonical`, or one scrubbed by a
+    /// **non-anchor** key, is refused here (fail-closed) — the row is NOT
+    /// stored (verify-before-mutation, AV-9). This closes the "a node
+    /// bootstraps itself into the founding set" gap on EVERY admission path
+    /// (direct registration, self-registration, replication of a self-signed
+    /// row, and the `adopt_scrub_upgrade` self→anchored path). Stable
+    /// `kind()` token `canonical_role_not_accord_conferred`. See
+    /// [`admission::check_canonical_role_admission`].
+    #[error(
+        "federation_keys row {key_id:?} carries the `canonical` role but is not accord-conferred \
+         (scrub_key_id={scrub_key_id:?}, reason: {reason}); the `canonical` founding-server role \
+         is accord-CONFERRED, never self-claimed — a row may carry it only when anchor-scrub-signed \
+         (scrub_key_id != key_id AND the scrubber's ed25519 ∈ the pinned HUMANITY_ACCORD anchor)"
+    )]
+    CanonicalRoleNotAccordConferred {
+        /// The `key_id` of the row that attempted to carry `canonical`.
+        key_id: String,
+        /// The row's `scrub_key_id` (the claimed scrubber).
+        scrub_key_id: String,
+        /// Why the record failed the accord-conferred test (self-signed /
+        /// unknown scrubber / non-anchor scrubber / undecodable scrubber key).
+        reason: String,
+    },
+
     /// v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — a **federation-tier**
     /// attestation was REJECTED at the bulk store/replicate ingest gate
     /// because its envelope hybrid signature could not be verified
@@ -3832,6 +3922,9 @@ impl Error {
             Error::CapacitySelfEmissionRejected { .. } => {
                 "federation_capacity_self_emission_rejected"
             }
+            Error::AgeAssuranceSelfEmissionRejected { .. } => {
+                "federation_age_assurance_self_emission_rejected"
+            }
             Error::ReservedPrefixEmitterMismatch { .. } => {
                 "federation_reserved_prefix_emitter_mismatch"
             }
@@ -3865,6 +3958,7 @@ impl Error {
             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
             Error::NodeAlreadyOwned { .. } => "federation_node_already_owned",
             Error::AmbiguousNodeOwner { .. } => "federation_ambiguous_node_owner",
+            Error::CanonicalRoleNotAccordConferred { .. } => "canonical_role_not_accord_conferred",
             Error::UnstewardedCommunityMember { .. } => "federation_unstewarded_community_member",
             Error::UserTargetStewardBindingForbidden { .. } => {
                 "federation_user_target_steward_binding_forbidden"

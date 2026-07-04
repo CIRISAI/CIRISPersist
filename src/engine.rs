@@ -841,14 +841,77 @@ impl Engine {
             }
         };
 
+        // v12.7.0 (§Q B5 / CIRISPersist#370) — fold the INSTALLED
+        // StorageBudgetV1 state (V092; written only after the PQC-mandatory
+        // verify + B3 anti-rollback in `install_storage_budget_v1`) into
+        // this cycle's pin classification:
+        //   * `pinned_classes` — the union of every installed budget's
+        //     `pinned_class` set (a node typically installs exactly one —
+        //     its own; folding the union + summed reserve is the
+        //     most-protective composition when several owners' budgets are
+        //     present: ambiguity fails toward retention, mirroring how
+        //     B4 dedup retains while ANY scope pins).
+        //   * `pin_reserve_floor` — the summed `pin_reserve_bytes` over all
+        //     scopes: the byte floor the pinned classes hold under CAPACITY
+        //     pressure.
+        // A candidate is PINNED iff its `media_type` (the substrate's
+        // per-blob corpus-class token) is in `pinned_classes`. With no
+        // installed budget both are empty ⇒ this entire block is inert and
+        // the pre-#370 ordering is byte-identical.
+        let installed_budgets = self.list_installed_storage_budgets().await.map_err(|e| {
+            crate::federation::BlobError::Backend(format!(
+                "sweeper: list_installed_storage_budgets failed: {e}"
+            ))
+        })?;
+        let mut pinned_classes: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut pin_reserve_floor: u64 = 0;
+        for budget in &installed_budgets {
+            pinned_classes.extend(budget.pinned_class.iter().cloned());
+            pin_reserve_floor = pin_reserve_floor.saturating_add(budget.pin_reserve_total());
+        }
+        let is_pinned = |candidate: &crate::federation::EvictionCandidate| -> bool {
+            candidate
+                .media_type
+                .as_deref()
+                .is_some_and(|m| pinned_classes.contains(m))
+        };
+        // §Q B5 consumption accounting: recomputed from HELD content (the
+        // full table, not just this batch), never trusted from the wire.
+        // Decremented as pinned rows are shed so the reserve floor holds
+        // within the cycle.
+        let mut pinned_bytes_held: u64 = if pinned_classes.is_empty() {
+            0
+        } else {
+            let media_types: Vec<String> = pinned_classes.iter().cloned().collect();
+            self.pinned_blob_bytes(&media_types).await?
+        };
+
         // Rust-side re-rank applies on both backends. PG already ranks
         // in SQL by full decay score; SQLite ranks by the monotone
         // bound. Re-ranking is idempotent on PG (no-op reorder) and
         // load-bearing on SQLite. Sorting ascending so lowest-score
-        // evicts first. When `force_evict_proxy_first` is set (crit/stop
-        // disk-pressure tiers), proxy candidates sort entirely ahead of
-        // local/family ones regardless of decay score.
+        // evicts first.
+        //
+        // Key order (outermost first):
+        //   1. §Q B5 CACHE BEFORE PINNED (#370) — unpinned candidates sort
+        //      entirely ahead of pinned ones; pinned content is reached
+        //      only once unpinned is exhausted. This is the NORMATIVE
+        //      descent order (CC 6.1.2.3), so it outranks…
+        //   2. …the #149 force-evict-proxy-first hint (crit/stop
+        //      disk-pressure tiers): a local operational reordering that
+        //      applies WITHIN a pin class only.
+        //   3. Decay score (popularity × freshness), ascending — the
+        //      standing rarity stand-in within each (pin, proxy) band
+        //      (blob-level rarity scoring is PIN-AS-RECOMMENDATION /
+        //      edge-internal per CC 6.1.3; the decay order is persist's
+        //      deterministic local proxy for "lowest rarity first").
         candidates.sort_by(|a, b| {
+            // unpinned/cache (false) sorts before pinned (true).
+            match is_pinned(a).cmp(&is_pinned(b)) {
+                std::cmp::Ordering::Equal => {}
+                non_eq => return non_eq,
+            }
             if force_evict_proxy_first {
                 let pa = is_proxy(a);
                 let pb = is_proxy(b);
@@ -871,6 +934,21 @@ impl Engine {
         for candidate in candidates {
             if bytes_freed >= target_freed {
                 break;
+            }
+            // §Q B5 (#370): a PINNED candidate is evictable under CAPACITY
+            // pressure only down to the `pin_reserve_bytes` floor — the
+            // reserve the owner elected to hold for the pinned classes.
+            // Skipping (not breaking) lets a smaller pinned row later in
+            // the batch still fit above the floor. The sweep may therefore
+            // end short of `target_freed`: that is the pin doing its job
+            // (B6 keeps REVOCATION unconditional on its separate path —
+            // `evict_fountain_content_hard_delete` never consults any of
+            // this state).
+            let candidate_pinned = is_pinned(&candidate);
+            if candidate_pinned
+                && pinned_bytes_held.saturating_sub(candidate.size_bytes) < pin_reserve_floor
+            {
+                continue;
             }
             // Try to emit a withdraws attestation for this SHA. If
             // the local signer never emitted a holds_bytes for it
@@ -901,6 +979,12 @@ impl Engine {
             if deleted {
                 rows_evicted += 1;
                 bytes_freed = bytes_freed.saturating_add(candidate.size_bytes);
+                if candidate_pinned {
+                    // §Q B5 (#370): keep the held-pinned accounting live so
+                    // the reserve-floor check above stays correct as pinned
+                    // rows are shed within this cycle.
+                    pinned_bytes_held = pinned_bytes_held.saturating_sub(candidate.size_bytes);
+                }
             }
             match withdraws_outcome {
                 Some(Ok(())) => withdraws_emitted += 1,
@@ -1262,6 +1346,207 @@ impl Engine {
         } else {
             Ok(0)
         }
+    }
+
+    // ─── v12.7.0 — §Q pin-INSTALL surface (CC 6.1.5.2 / CIRISPersist#370) ──
+
+    /// v12.7.0 (CC 6.1.5.2 §Q B2/B3 / CIRISPersist#370) — **install** a
+    /// signed `StorageBudgetV1` so it GOVERNS this node's capacity
+    /// eviction (#356 shipped build/verify as wire-negotiation only).
+    /// Three gates, in order:
+    ///
+    /// 1. **PQC-mandatory bound-hybrid verify at ingest, BEFORE
+    ///    persistence** (CC 5.3.2.4.3.1 store-path / CC 6.1.3): the wire's
+    ///    Ed25519 + ML-DSA-65 halves must verify against the owner pubkeys
+    ///    — reuses [`verify_storage_budget_wire`]. This also re-runs the
+    ///    structural validation (no `self`/`family` scope, `pin_reserve ≤
+    ///    budget`, sorted + deduped lists).
+    /// 2. **§Q B3 anti-rollback**: a candidate whose `revision` does not
+    ///    STRICTLY supersede the installed one for the same `node_id` is
+    ///    rejected with
+    ///    [`StorageContentionError::RevisionRollback`](crate::fountain::storage_contention::StorageContentionError)
+    ///    — enforced atomically inside the backend's conditional upsert
+    ///    ([`Backend::put_installed_storage_budget`](crate::store::Backend::put_installed_storage_budget)),
+    ///    so racing installs cannot roll back either.
+    /// 3. Persist (V093 `storage_budget_installed`, both backends): the
+    ///    signed wire VERBATIM + denormalized `revision`/`scopes`/
+    ///    `pinned_class`.
+    ///
+    /// The installed budget is what [`Self::sweep_evictions_once`] reads to
+    /// order candidates CACHE-BEFORE-PINNED (§Q B5) and to hold the
+    /// `pin_reserve_bytes` floor. It is **capacity-only** state: the
+    /// revocation path ([`Self::evict_fountain_content_hard_delete`])
+    /// never reads it — §Q B6, pinning never defeats revocation.
+    ///
+    /// Returns the accepted `revision`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn install_storage_budget_v1(
+        &self,
+        wire_json: &str,
+        ed25519_pubkey_base64: &str,
+        ml_dsa_65_pubkey_base64: &str,
+    ) -> Result<u64, crate::store::Error> {
+        use crate::fountain::storage_contention::{
+            verify_storage_budget_wire, InstalledStorageBudget, StorageContentionError,
+        };
+        use crate::store::Backend;
+        // Gate 1 — verify at the gate; nothing persists on failure.
+        verify_storage_budget_wire(wire_json, ed25519_pubkey_base64, ml_dsa_65_pubkey_base64)?;
+        let budget = InstalledStorageBudget::from_wire_json(wire_json, chrono::Utc::now())?;
+        // Gates 2+3 — the backend's conditional upsert IS the anti-rollback
+        // check (atomic at the row).
+        let written = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.put_installed_storage_budget(&budget).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.put_installed_storage_budget(&budget).await?,
+        };
+        if !written {
+            // Refused: read the incumbent revision back for the typed error
+            // (best-effort — the row existed a moment ago).
+            let installed = self
+                .get_installed_storage_budget(&budget.node_id)
+                .await?
+                .map(|b| b.revision)
+                .unwrap_or(budget.revision);
+            return Err(StorageContentionError::RevisionRollback {
+                node_id: budget.node_id,
+                installed,
+                candidate: budget.revision,
+            }
+            .into());
+        }
+        Ok(budget.revision)
+    }
+
+    /// #370 — read back the installed budget for `node_id` (typed).
+    /// `Ok(None)` when none installed. Dispatches to
+    /// [`Backend::get_installed_storage_budget`](crate::store::Backend::get_installed_storage_budget).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn get_installed_storage_budget(
+        &self,
+        node_id: &str,
+    ) -> Result<
+        Option<crate::fountain::storage_contention::InstalledStorageBudget>,
+        crate::store::Error,
+    > {
+        use crate::store::Backend;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.get_installed_storage_budget(node_id).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.get_installed_storage_budget(node_id).await,
+        }
+    }
+
+    /// #370 — the installed budget's signed wire JSON, VERBATIM as accepted
+    /// (re-verifiable end-to-end with
+    /// [`verify_storage_budget_wire`](crate::fountain::storage_contention::verify_storage_budget_wire)).
+    /// `Ok(None)` when none installed for `node_id`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn get_installed_storage_budget_json(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<String>, crate::store::Error> {
+        Ok(self
+            .get_installed_storage_budget(node_id)
+            .await?
+            .map(|b| b.wire_json))
+    }
+
+    /// #370 (§Q B5) — every installed budget. The capacity sweep folds
+    /// these into the effective `pinned_class` set + `pin_reserve_bytes`
+    /// floor once per cycle.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn list_installed_storage_budgets(
+        &self,
+    ) -> Result<Vec<crate::fountain::storage_contention::InstalledStorageBudget>, crate::store::Error>
+    {
+        use crate::store::Backend;
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.list_installed_storage_budgets().await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.list_installed_storage_budgets().await,
+        }
+    }
+
+    /// #370 (§Q B5) — backend-dispatched pinned-consumption accounting:
+    /// total `federation_blobs` bytes whose `media_type` is in the
+    /// installed `pinned_class` set. Recomputed from held content (§Q:
+    /// consumption accounting is edge-internal, never trusted from the
+    /// wire).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn pinned_blob_bytes(
+        &self,
+        media_types: &[String],
+    ) -> Result<u64, crate::federation::BlobError> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.pinned_blob_bytes(media_types).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.pinned_blob_bytes(media_types).await,
+        }
+    }
+
+    /// #227 (residual) — the **consent-decay sweep**: the time-driven twin
+    /// of the disk-pressure sweeper
+    /// ([`sweep_evictions_once`](Self::sweep_evictions_once)). Enumerate
+    /// EVERY fountain content unit
+    /// ([`list_fountain_decay_candidates`](crate::store::Backend::list_fountain_decay_candidates)),
+    /// read each unit's consent-decay class from its signed envelope, map
+    /// `now - admitted_at` through the per-class decay schedule
+    /// ([`consent_decay_target_tier`](crate::fountain::consent_decay_target_tier)
+    /// — TEMPORARY 14-day, pattern 90-day), and drive any unit whose clock
+    /// says it should be below its current tier down via the SAME eviction
+    /// mechanism the disk-pressure trigger uses
+    /// ([`evict_fountain_content_to_tier`](Self::evict_fountain_content_to_tier)).
+    ///
+    /// **Disk-INDEPENDENT** — fires regardless of free bytes (no watermark,
+    /// no `ReplicationConfig` gate). **Idempotent** — the eviction
+    /// mechanism only removes symbols down to a keep-count and is a no-op
+    /// once a unit is already at/below its decay tier, so re-running the
+    /// sweep at the same `now` evicts nothing further. Units that declare
+    /// no decay class in their envelope are left untouched (fail-safe).
+    ///
+    /// `now` is threaded for deterministic testing; the FFI wrapper passes
+    /// wall-clock `Utc::now()`. Manifests are NEVER touched (the
+    /// always-retained provenance).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn sweep_consent_decay_once(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::fountain::ConsentDecaySweepReport, crate::store::Error> {
+        use crate::store::Backend;
+        let candidates = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.list_fountain_decay_candidates().await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.list_fountain_decay_candidates().await?,
+        };
+        let mut report = crate::fountain::ConsentDecaySweepReport::default();
+        for c in candidates {
+            report.content_scanned += 1;
+            let Some(tier) =
+                crate::fountain::consent_decay_target_tier(&c.envelope, c.admitted_at, now)
+            else {
+                // No declared decay class ⇒ the time-clock opts out.
+                continue;
+            };
+            report.content_with_decay_class += 1;
+            if tier == crate::fountain::FountainTier::Full {
+                // Clock hasn't reached the first breakpoint yet.
+                continue;
+            }
+            let evicted = self
+                .evict_fountain_content_to_tier(&c.content_id, &c.corpus_kind, tier)
+                .await?;
+            report.symbols_evicted += evicted;
+            if evicted > 0 {
+                report.content_decayed += 1;
+            }
+        }
+        Ok(report)
     }
 
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
@@ -1754,6 +2039,7 @@ impl Engine {
             persist_row_hash: String::new(),
             roles,
             attestation_evidence: None,
+            consent_role: None,
         };
         let signed = crate::federation::SignedKeyRecord { record };
 
@@ -1882,6 +2168,22 @@ impl Engine {
     /// #247 FK-violation class (the same bug `attestation_promote` had).
     /// `attested_key_id` defaults to the derived key_id (self-attestation)
     /// when [`EmitAttestationInput::attested_key_id`] is `None`.
+    ///
+    /// v12.7.0 (CIRISPersist#368, CC 3.4.11/3.4.13) —
+    /// [`EmitAttestationInput::attested_key_id`] names the row's **SUBJECT**
+    /// (the natural CEG cross-subject edge target, exactly how
+    /// [`Self::grant_delegation`] keys a `delegates_to` by its recipient).
+    /// This is the **witness-targets-subject** age-assurance surface: a
+    /// `witness`-role signer emits `attestation_type =
+    /// "age_assurance:{level}:{band}:v1"` with `attested_key_id =
+    /// Some(subject)` and the SUBJECT's
+    /// [`age_band`](crate::federation::age::age_band) graduates (the witness
+    /// rung outranks the subject's `age_self_declared:*`). The identity gate
+    /// is unchanged (only `identity_type ⊇ {witness}` may emit the prefix),
+    /// and a subject cannot graduate ITSELF: attester==attested on
+    /// `age_assurance:*` is rejected at admission
+    /// ([`Error::AgeAssuranceSelfEmissionRejected`](crate::federation::Error::AgeAssuranceSelfEmissionRejected),
+    /// CC 3.4.11 "a subject MUST NOT emit on `age_assurance:`").
     ///
     /// This is the single correct implementation consumers (Node / Lens /
     /// Registry / Server, and persist's own withdraws producer) compose
@@ -2079,6 +2381,20 @@ impl Engine {
     /// emitted row: a node-ONLY recipient may carry only `infra:*` scopes —
     /// use [`Self::steward_bind`] for that case. `#247`-derived
     /// `attesting_key_id` is internal.
+    ///
+    /// v12.7.0 (CIRISPersist#367, CC 3.2) — a **`user`-role recipient** is
+    /// governed by the user-target steward-binding gate
+    /// ([`check_user_target_steward_binding_admission`](crate::federation::admission::check_user_target_steward_binding_admission)):
+    /// the ONLY admissible user-target shapes are **minor-guardianship**
+    /// (recipient is a PROVEN minor — a witness `age_assurance:*:minor`
+    /// about it, emittable cross-subject per #368 — and the signer is a
+    /// PROVEN adult `user`) and the narrow CC 3.4.12 adult-incapacity
+    /// aperture. Everything else rejects
+    /// (`federation_user_target_steward_binding_forbidden`). Withdrawing the
+    /// guardianship edge ([`Self::revoke_delegation`]) leaves the minor
+    /// steward-less and
+    /// [`is_steward_bound`](crate::federation::admission::is_steward_bound)
+    /// fails secure (`false`).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn grant_delegation(
         &self,
@@ -2873,6 +3189,8 @@ impl Engine {
                 ),
                 subject_key_ids: Vec::new(),
                 cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
             })
             .await?;
         let accept_id = directory
@@ -2888,6 +3206,8 @@ impl Engine {
                 ),
                 subject_key_ids: Vec::new(),
                 cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
             })
             .await?;
 
@@ -2912,6 +3232,8 @@ impl Engine {
                 ),
                 subject_key_ids: Vec::new(),
                 cohort_scope: cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
             })
             .await?;
 
@@ -3627,6 +3949,82 @@ impl Engine {
             BackendDispatch::Postgres(b) => b.adopt_scrub_upgrade(record).await,
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => b.adopt_scrub_upgrade(record).await,
+        }
+    }
+
+    /// v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
+    /// apply**: the anti-entropy apply the edge replication bridge routes
+    /// `apply_key` to instead of raw
+    /// [`put_public_key`](crate::federation::FederationDirectory::put_public_key)
+    /// (which keeps its insert-only semantics for direct
+    /// claim/peering/registration — no behavior change there). With this,
+    /// an accord-holder-scrubbed record for a node the receiver already
+    /// holds a **self-signed** row for auto-upgrades that row in place, so
+    /// the genesis-mesh seed becomes pure owned-node replication and stale
+    /// self-signed copies on sibling nodes heal — no per-node
+    /// `adopt-scrubbed` endpoint call ([`adopt_scrub_upgrade`](Self::adopt_scrub_upgrade)
+    /// itself is unchanged and remains available; consumers retire the
+    /// endpoint separately).
+    ///
+    /// Decision table + gate composition live in the shared
+    /// [`plan_replicated_key_apply`](crate::federation::register::plan_replicated_key_apply):
+    /// fresh `key_id` ⇒ insert with every `put_public_key` admission gate
+    /// intact; existing self-signed row + incoming anchor-scrubbed record ⇒
+    /// upgrade iff same hybrid pubkeys AND the scrub verifies through the
+    /// [`verify_key_registration`](crate::federation::verify_key_registration)
+    /// `Strict` gate (scrubber resolved from the directory — the seeded
+    /// HUMANITY_ACCORD anchor) AND
+    /// [`owner_of`](crate::federation::admission::owner_of) resolves exactly
+    /// one live owner (v12.6.0; unowned/ambiguous ⇒ fail-closed);
+    /// byte-identical ⇒ `Unchanged`; anything else (downgrade, re-scrub,
+    /// pubkey swap, conflicting version) ⇒ `Refused`, row untouched.
+    ///
+    /// Unlike [`adopt_scrub_upgrade`](Self::adopt_scrub_upgrade)'s
+    /// Engine-layer verify split, the verification is INSIDE the backend
+    /// method (it only binds on the upgrade transition — a fresh insert
+    /// keeps `put_public_key`'s as-today semantics), so no caller can reach
+    /// the upgrade unverified. This wrapper is pure dispatch.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn apply_replicated_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.apply_replicated_key_record(record).await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.apply_replicated_key_record(record).await,
+        }
+    }
+
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
+    /// founding bootstrap server**? True iff its `federation_keys` row's
+    /// `identity_type` set contains `canonical`. Because the admission gate
+    /// [`check_canonical_role_admission`](crate::federation::check_canonical_role_admission)
+    /// only ever admits `canonical` on an anchor-scrub-conferred record, a
+    /// `true` here means the node was conferred the role by a HUMANITY_ACCORD
+    /// holder — it cannot be self-claimed. `false` for an unknown key or a
+    /// non-canonical row.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn is_canonical(&self, key_id: &str) -> Result<bool, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::is_canonical(directory.as_ref(), key_id).await
+    }
+
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
+    /// founding bootstrap servers**: all `federation_keys` rows whose
+    /// `identity_type` set contains `canonical`, stable-sorted by `key_id`.
+    /// Every returned row is (by the admission gate) anchor-scrub-conferred —
+    /// none is self-claimed. Dispatches to the backend's inherent enumerator.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn list_canonical_servers(
+        &self,
+    ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.list_canonical_servers().await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.list_canonical_servers().await,
         }
     }
 
@@ -5797,6 +6195,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         sq.put_public_key(SignedKeyRecord {
             record: suspect_key,
@@ -6151,6 +6550,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         pg.put_public_key(SignedKeyRecord { record: suspect })
             .await
@@ -6813,6 +7213,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         pg.put_public_key(crate::federation::SignedKeyRecord { record: key_record })
             .await
@@ -6903,6 +7304,7 @@ mod tests {
                 persist_row_hash: String::new(),
                 roles: Vec::new(),
                 attestation_evidence: None,
+                consent_role: None,
             },
         }
     }
@@ -7300,6 +7702,472 @@ mod tests {
         );
     }
 
+    // ─── v12.7.0 (CC 6.1.5.2 §Q / CIRISPersist#370) — pin-install + B5 ───
+
+    /// §Q signer for the budget wires: a deterministic-enough hybrid pair
+    /// (fresh per test; the pubkeys ride along). Built + used SYNCHRONOUSLY
+    /// so no multi-KiB signer is ever held across an await (the ML-DSA-65
+    /// test-stack rule).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    struct QShapeId {
+        ed: ciris_crypto::Ed25519Signer,
+        pqc: ciris_crypto::MlDsa65Signer,
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn qshape_id() -> QShapeId {
+        QShapeId {
+            ed: ciris_crypto::Ed25519Signer::random().unwrap(),
+            pqc: ciris_crypto::MlDsa65Signer::new().unwrap(),
+        }
+    }
+
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn qshape_pubs(id: &QShapeId) -> (String, String) {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ciris_crypto::{ClassicalSigner, PqcSigner};
+        (
+            B64.encode(id.ed.public_key().unwrap()),
+            B64.encode(id.pqc.public_key().unwrap()),
+        )
+    }
+
+    /// Build + bound-hybrid sign a `StorageBudgetV1` wire: one `community`
+    /// scope with `budget_bytes = 100_000` and the given
+    /// `pin_reserve_bytes`, pinning `pinned_class` (MUST be pre-sorted).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn qshape_budget_wire(
+        id: &QShapeId,
+        node_id: &str,
+        revision: u64,
+        pinned_class: &[&str],
+        pin_reserve_bytes: u64,
+    ) -> String {
+        use crate::fountain::storage_contention::{
+            assemble_storage_budget_wire, storage_budget_preimage,
+        };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ciris_crypto::{ClassicalSigner, PqcSigner};
+        let payload = serde_json::json!({
+            "node_id": node_id,
+            "epoch_id": "e1",
+            "revision": revision,
+            "scopes": [{
+                "cohort_scope": "community",
+                "budget_bytes": 100_000u64,
+                "pin_reserve_bytes": pin_reserve_bytes,
+            }],
+            "pinned_class": pinned_class,
+        })
+        .to_string();
+        let preimage = storage_budget_preimage(&payload).expect("valid §Q payload");
+        let ed_sig = id.ed.sign(&preimage).unwrap();
+        let mut bound = preimage.clone();
+        bound.extend_from_slice(&ed_sig);
+        let pqc_sig = id.pqc.sign(&bound).unwrap();
+        assemble_storage_budget_wire(&payload, B64.encode(&ed_sig), B64.encode(&pqc_sig))
+            .expect("assemble signed budget wire")
+    }
+
+    /// #370 shared body — install happy path, getter read-back, and §Q B3
+    /// anti-rollback (equal + lower revision rejected; higher supersedes;
+    /// a tampered wire never reaches the store). `node_id` must be unique
+    /// per run on shared databases (the PG twin).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn run_install_budget_assertions(engine: &Engine, node_id: &str) {
+        use crate::fountain::storage_contention::verify_storage_budget_wire;
+        let id = qshape_id();
+        let (ed_pub, mldsa_pub) = qshape_pubs(&id);
+
+        // Happy path: revision 3 installs.
+        let wire3 = qshape_budget_wire(&id, node_id, 3, &["trace"], 2048);
+        let rev = engine
+            .install_storage_budget_v1(&wire3, &ed_pub, &mldsa_pub)
+            .await
+            .expect("install revision 3");
+        assert_eq!(rev, 3);
+
+        // Getter: the stored wire re-verifies end-to-end (PQC-mandatory)
+        // against the same owner pubkeys — the budget stays provable after
+        // install, not just at ingest.
+        let got = engine
+            .get_installed_storage_budget_json(node_id)
+            .await
+            .expect("getter")
+            .expect("a budget is installed");
+        verify_storage_budget_wire(&got, &ed_pub, &mldsa_pub)
+            .expect("stored wire re-verifies (bound-hybrid)");
+
+        // §Q B3 anti-rollback: EQUAL revision refused…
+        let err = engine
+            .install_storage_budget_v1(&wire3, &ed_pub, &mldsa_pub)
+            .await
+            .expect_err("equal revision must be refused");
+        assert_eq!(err.kind(), "storage_contention_revision_rollback");
+        // …and LOWER revision refused.
+        let wire2 = qshape_budget_wire(&id, node_id, 2, &["trace"], 2048);
+        let err = engine
+            .install_storage_budget_v1(&wire2, &ed_pub, &mldsa_pub)
+            .await
+            .expect_err("lower revision must be refused");
+        assert_eq!(err.kind(), "storage_contention_revision_rollback");
+
+        // Strictly-higher revision supersedes.
+        let wire5 = qshape_budget_wire(&id, node_id, 5, &["av_chunk", "trace"], 4096);
+        assert_eq!(
+            engine
+                .install_storage_budget_v1(&wire5, &ed_pub, &mldsa_pub)
+                .await
+                .expect("higher revision supersedes"),
+            5
+        );
+        let installed = engine
+            .get_installed_storage_budget(node_id)
+            .await
+            .expect("typed getter")
+            .expect("installed");
+        assert_eq!(installed.revision, 5);
+        assert_eq!(installed.pinned_class, vec!["av_chunk", "trace"]);
+        assert_eq!(installed.pin_reserve_total(), 4096);
+
+        // A tampered wire (revision bumped without re-signing) fails the
+        // PQC-mandatory verify AT THE GATE — nothing persists; the
+        // installed revision is unchanged.
+        let mut tampered: serde_json::Value = serde_json::from_str(&wire5).unwrap();
+        tampered["revision"] = serde_json::json!(9);
+        let err = engine
+            .install_storage_budget_v1(&tampered.to_string(), &ed_pub, &mldsa_pub)
+            .await
+            .expect_err("tampered wire must fail signature verify");
+        assert_eq!(err.kind(), "storage_contention_signature_failed");
+        assert_eq!(
+            engine
+                .get_installed_storage_budget(node_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            5,
+            "verify-before-mutation: the tampered wire wrote nothing"
+        );
+    }
+
+    /// #370 — install surface on SQLite.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn install_storage_budget_v1_happy_and_anti_rollback_sqlite() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        run_install_budget_assertions(&engine, "n-370-sqlite").await;
+    }
+
+    /// #370 — install surface on Postgres (shared twin; uuid node_id keeps
+    /// runs self-isolating). Skips when `CIRIS_PERSIST_TEST_PG_URL` unset.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn install_storage_budget_v1_happy_and_anti_rollback_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let engine = Engine::with_signer(test_signer(), &dsn)
+            .await
+            .expect("construct postgres engine");
+        let node_id = format!("n-370-pg-{}", uuid::Uuid::new_v4().simple());
+        run_install_budget_assertions(&engine, &node_id).await;
+    }
+
+    /// Seed `n` blobs of 1 KiB through `put_blob_signing` with the given
+    /// `media_type` (the §Q corpus-class token), attested by the local
+    /// signer's DERIVED key (which the caller must have registered).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn seed_typed_blobs(
+        engine: &Engine,
+        media_type: Option<&str>,
+        fill_base: u8,
+        n: usize,
+    ) -> Vec<[u8; 32]> {
+        use crate::federation::BlobBody;
+        let derived = test_signer().derived_key_id();
+        let mut shas = Vec::with_capacity(n);
+        for i in 0..n {
+            let bytes = vec![fill_base + i as u8; 1024];
+            let sha = {
+                use sha2::{Digest, Sha256};
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&Sha256::digest(&bytes));
+                out
+            };
+            engine
+                .put_blob_signing(
+                    &sha,
+                    BlobBody::Inline(bytes),
+                    media_type,
+                    &derived,
+                    chrono::Utc::now(),
+                    uuid::Uuid::new_v4(),
+                )
+                .await
+                .expect("put_blob_signing typed blob");
+            shas.push(sha);
+        }
+        shas
+    }
+
+    /// Backend-agnostic `has_blob`.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn blob_present(engine: &Engine, sha: &[u8; 32]) -> bool {
+        use crate::federation::BlobStorage;
+        #[cfg(feature = "sqlite")]
+        if let Some(sq) = engine.sqlite_backend() {
+            return sq.has_blob(sha).await.expect("has_blob");
+        }
+        #[cfg(feature = "postgres")]
+        if let Some(pg) = engine.postgres_backend() {
+            return pg.has_blob(sha).await.expect("has_blob");
+        }
+        panic!("no durable backend on this engine");
+    }
+
+    /// Backend-agnostic access-count heater (each `get_blob` bumps V053
+    /// access tracking, raising the decay score).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn heat_blob(engine: &Engine, sha: &[u8; 32], hits: usize) {
+        use crate::federation::BlobStorage;
+        for _ in 0..hits {
+            #[cfg(feature = "sqlite")]
+            if let Some(sq) = engine.sqlite_backend() {
+                let _ = sq.get_blob(sha).await.expect("get_blob");
+                continue;
+            }
+            #[cfg(feature = "postgres")]
+            if let Some(pg) = engine.postgres_backend() {
+                let _ = pg.get_blob(sha).await.expect("get_blob");
+                continue;
+            }
+            #[allow(unreachable_code)]
+            {
+                panic!("no durable backend on this engine");
+            }
+        }
+    }
+
+    /// #370 §Q B5 shared body — CACHE BEFORE PINNED. 3 COLD pinned
+    /// (`media_type = "trace"`) + 3 HOT unpinned blobs: under the standard
+    /// decay order the cold pinned rows would be the victims; with the
+    /// budget installed, the sweep must shed all 3 unpinned (hot!) rows
+    /// first and hold every pinned row above the `pin_reserve_bytes` floor.
+    ///
+    /// Budget math: 6 × 1 KiB stored, watermark = 4 KiB × 0.5 = 2 KiB ⇒
+    /// target_freed = 4 KiB. Unpinned frees 3 KiB, then the pinned floor
+    /// (3 KiB reserve == pinned bytes held) blocks every pinned eviction —
+    /// the sweep deliberately ends SHORT of target (the pin doing its job).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn run_b5_unpinned_before_pinned(engine: &Engine) {
+        let pinned = seed_typed_blobs(engine, Some("trace"), 0x10, 3).await;
+        let unpinned = seed_typed_blobs(engine, None, 0x40, 3).await;
+        for sha in &unpinned {
+            heat_blob(engine, sha, 20).await;
+        }
+        let id = qshape_id();
+        let (ed_pub, mldsa_pub) = qshape_pubs(&id);
+        let wire = qshape_budget_wire(&id, "n-b5-order", 1, &["trace"], 3 * 1024);
+        engine
+            .install_storage_budget_v1(&wire, &ed_pub, &mldsa_pub)
+            .await
+            .expect("install the pin");
+
+        let report = engine.sweep_evictions_once().await.expect("B5 sweep");
+        assert_eq!(
+            report.rows_evicted, 3,
+            "exactly the 3 unpinned rows evicted: {report:?}"
+        );
+        for sha in &unpinned {
+            assert!(
+                !blob_present(engine, sha).await,
+                "unpinned (cache) content evicts FIRST, even when hot (§Q B5)"
+            );
+        }
+        for sha in &pinned {
+            assert!(
+                blob_present(engine, sha).await,
+                "pinned content survives capacity pressure above the reserve floor (§Q B5)"
+            );
+        }
+    }
+
+    /// #370 §Q B5 shared body — once unpinned is exhausted, pinned content
+    /// DOES descend under continued capacity pressure, but only down to the
+    /// `pin_reserve_bytes` floor.
+    ///
+    /// Budget math: 3 pinned + 2 unpinned × 1 KiB = 5 KiB stored, watermark
+    /// = 1 KiB × 0.5 = 512 B ⇒ target_freed ≈ 4.5 KiB. Unpinned frees
+    /// 2 KiB; pinned then sheds until held-pinned would drop below the
+    /// 1 KiB reserve ⇒ exactly 2 of 3 pinned evicted, 1 held at the floor.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn run_b5_reserve_floor(engine: &Engine) {
+        let pinned = seed_typed_blobs(engine, Some("trace"), 0x10, 3).await;
+        let unpinned = seed_typed_blobs(engine, None, 0x40, 2).await;
+        let id = qshape_id();
+        let (ed_pub, mldsa_pub) = qshape_pubs(&id);
+        let wire = qshape_budget_wire(&id, "n-b5-floor", 1, &["trace"], 1024);
+        engine
+            .install_storage_budget_v1(&wire, &ed_pub, &mldsa_pub)
+            .await
+            .expect("install the pin");
+
+        let report = engine.sweep_evictions_once().await.expect("B5 sweep");
+        for sha in &unpinned {
+            assert!(
+                !blob_present(engine, sha).await,
+                "unpinned evicts before any pinned row (§Q B5)"
+            );
+        }
+        let mut pinned_surviving = 0usize;
+        for sha in &pinned {
+            if blob_present(engine, sha).await {
+                pinned_surviving += 1;
+            }
+        }
+        assert_eq!(
+            pinned_surviving, 1,
+            "pinned descends only to the pin_reserve_bytes floor (1 KiB): {report:?}"
+        );
+        assert_eq!(report.rows_evicted, 4, "2 unpinned + 2 pinned: {report:?}");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sweeper_b5_evicts_unpinned_before_pinned_sqlite() {
+        let cfg = crate::federation::ReplicationConfig {
+            storage_budget_bytes: 4 * 1024,
+            steady_state_utilization: 0.5,
+            eviction_decay_half_life_days: 365.0,
+            ..Default::default()
+        };
+        let (engine, _shas) = sweeper_seed_blobs(cfg, 0).await;
+        run_b5_unpinned_before_pinned(&engine).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sweeper_b5_holds_pin_reserve_floor_sqlite() {
+        let cfg = crate::federation::ReplicationConfig {
+            storage_budget_bytes: 1024,
+            steady_state_utilization: 0.5,
+            eviction_decay_half_life_days: 365.0,
+            ..Default::default()
+        };
+        let (engine, _shas) = sweeper_seed_blobs(cfg, 0).await;
+        run_b5_reserve_floor(&engine).await;
+    }
+
+    /// Create an ISOLATED database on the PG twin (the sweep ranks the
+    /// WHOLE `federation_blobs` table, so byte-exact ordering assertions
+    /// cannot self-isolate by uuid the way row-keyed tests do). Returns
+    /// `(dsn, db_name)`; `None` (skip) when the twin is unset.
+    #[cfg(feature = "postgres")]
+    async fn pg_isolated_db(tag: &str) -> Option<(String, String)> {
+        let Ok(base) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return None;
+        };
+        let db = format!("persist_370_{}_{}", tag, uuid::Uuid::new_v4().simple());
+        let (client, conn) = tokio_postgres::connect(&base, tokio_postgres::NoTls)
+            .await
+            .expect("admin connect to PG twin");
+        let conn_handle = tokio::spawn(conn);
+        client
+            .execute(format!("CREATE DATABASE {db}").as_str(), &[])
+            .await
+            .expect("create isolated database");
+        drop(client);
+        conn_handle.abort();
+        let (prefix, _) = base.rsplit_once('/').expect("dsn has a database path");
+        Some((format!("{prefix}/{db}"), db))
+    }
+
+    /// Best-effort drop of the isolated database (FORCE terminates any
+    /// pool connection the dropped Engine hasn't torn down yet).
+    #[cfg(feature = "postgres")]
+    async fn pg_drop_isolated_db(db: &str) {
+        let Ok(base) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            return;
+        };
+        if let Ok((client, conn)) = tokio_postgres::connect(&base, tokio_postgres::NoTls).await {
+            let conn_handle = tokio::spawn(conn);
+            let _ = client
+                .execute(format!("DROP DATABASE {db} WITH (FORCE)").as_str(), &[])
+                .await;
+            drop(client);
+            conn_handle.abort();
+        }
+    }
+
+    /// PG twin of `sweeper_seed_blobs`'s engine setup: replication config +
+    /// the local signer's DERIVED federation key registered.
+    #[cfg(feature = "postgres")]
+    async fn sweeper_engine_pg(cfg: crate::federation::ReplicationConfig, dsn: &str) -> Engine {
+        use crate::federation::FederationDirectory;
+        let signer = test_signer();
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_replication_config(signer, dsn, cfg)
+            .await
+            .expect("construct postgres engine");
+        let pg = engine.postgres_backend().expect("postgres present");
+        pg.put_public_key(sweeper_test_key_derived_for(
+            &derived,
+            "test-engine-steward",
+        ))
+        .await
+        .expect("seed signer key");
+        engine
+    }
+
+    /// #370 §Q B5 on Postgres — same shared body as the SQLite twin, on an
+    /// isolated database (whole-table sweep). Skips when the twin is unset.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn sweeper_b5_evicts_unpinned_before_pinned_postgres() {
+        let Some((dsn, db)) = pg_isolated_db("b5order").await else {
+            return;
+        };
+        {
+            let cfg = crate::federation::ReplicationConfig {
+                storage_budget_bytes: 4 * 1024,
+                steady_state_utilization: 0.5,
+                eviction_decay_half_life_days: 365.0,
+                ..Default::default()
+            };
+            let engine = sweeper_engine_pg(cfg, &dsn).await;
+            run_b5_unpinned_before_pinned(&engine).await;
+        }
+        pg_drop_isolated_db(&db).await;
+    }
+
+    /// #370 §Q B5 reserve floor on Postgres (isolated database).
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn sweeper_b5_holds_pin_reserve_floor_postgres() {
+        let Some((dsn, db)) = pg_isolated_db("b5floor").await else {
+            return;
+        };
+        {
+            let cfg = crate::federation::ReplicationConfig {
+                storage_budget_bytes: 1024,
+                steady_state_utilization: 0.5,
+                eviction_decay_half_life_days: 365.0,
+                ..Default::default()
+            };
+            let engine = sweeper_engine_pg(cfg, &dsn).await;
+            run_b5_reserve_floor(&engine).await;
+        }
+        pg_drop_isolated_db(&db).await;
+    }
+
     // ─── v6.8.0 (CIRISPersist#149) — proactive disk-pressure ENFORCEMENT ───
 
     /// Build a disk-pressure config whose family predicate matches
@@ -7584,6 +8452,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         sq.put_public_key(SignedKeyRecord { record }).await.unwrap();
     }
@@ -7625,6 +8494,8 @@ mod tests {
             }),
             subject_key_ids: vec![],
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
         };
         let att_id = sq.attestation_upsert_local(input).await.unwrap();
 
@@ -7750,6 +8621,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         pg.put_public_key(SignedKeyRecord { record }).await.unwrap();
 
@@ -7765,6 +8637,8 @@ mod tests {
             }),
             subject_key_ids: vec![],
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
         };
         let att_id = pg.attestation_upsert_local(input).await.unwrap();
 
@@ -8185,6 +9059,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         sq.put_public_key(SignedKeyRecord { record })
             .await
@@ -8447,6 +9322,433 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_node_agency_forbidden");
+    }
+
+    // ── v12.7.0 (CIRISPersist#368 + #367, CC 3.4.11/3.4.13 + CC 3.2) ──
+    // Witness-targets-subject age graduation over the REAL emit path, and
+    // the minor-guardianship admit + steward-less-minor fail-secure driven
+    // end-to-end over `emit_attestation` / `grant_delegation` /
+    // `revoke_delegation`.
+
+    /// A `witness`-role `federation_keys` row keyed by `derived_key_id` with
+    /// `pubkey_label`'s REAL deterministic hybrid pubkeys — the registered
+    /// age-assurance verifier shape the `age_assurance:` reserved-prefix
+    /// rule requires of the emitter.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn witness_test_key_derived_for(
+        derived_key_id: &str,
+        pubkey_label: &str,
+    ) -> crate::federation::SignedKeyRecord {
+        let mut signed = sweeper_test_key_derived_for(derived_key_id, pubkey_label);
+        signed.record.identity_type = crate::federation::types::identity_type::WITNESS.into();
+        signed
+    }
+
+    /// #368 — the witness-targets-subject age flow over the REAL
+    /// `Engine::emit_attestation` path (sqlite): a witness names a DIFFERENT
+    /// subject via `EmitAttestationInput::attested_key_id` and THAT subject's
+    /// `age_band` graduates (witness outranks the subject's own
+    /// self-declared rung); the witness CANNOT graduate itself
+    /// (attester==attested rejected); a non-witness emitter is still
+    /// refused by the unchanged identity gate.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn witness_targets_subject_age_graduation_over_emit_sqlite() {
+        use crate::federation::age::{age_band, age_band_fine, AgeBand, AgeBandFine};
+        use crate::federation::FederationDirectory;
+
+        let w_signer = crate::federation::tier_ingest::test_support::local_signer("age-witness");
+        let t_signer = crate::federation::tier_ingest::test_support::local_signer("age-subject");
+        let w = w_signer.derived_key_id();
+        let t = t_signer.derived_key_id();
+        let engine = Engine::with_signer(w_signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(witness_test_key_derived_for(&w, "age-witness"))
+            .await
+            .expect("seed witness");
+        sq.put_public_key(user_test_key_derived_for(&t, "age-subject"))
+            .await
+            .expect("seed subject");
+
+        // The subject self-declares MINOR (self rung; attested defaults to
+        // the emitter — subject-signed by design).
+        let self_minor = crate::federation::EmitAttestationInput::with_envelope(
+            "age_self_declared:minor:v1",
+            serde_json::json!({ "id": "wtse-self-minor" }),
+        );
+        engine
+            .emit_attestation(&t_signer, self_minor)
+            .await
+            .expect("self-declared minor admits");
+        assert_eq!(engine.age_band(&t).await.unwrap(), AgeBand::Minor);
+
+        // WITNESS-TARGETS-SUBJECT: the witness emits `age_assurance:*` ABOUT
+        // the subject by carrying it in `attested_key_id` — the #368 surface.
+        let mut cross = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:government:adult:v1",
+            serde_json::json!({ "id": "wtse-w-adult" }),
+        );
+        cross.attested_key_id = Some(t.clone());
+        let att_id = engine
+            .emit_attestation(&w_signer, cross)
+            .await
+            .expect("witness-targets-subject age_assurance admitted");
+        let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(row.attesting_key_id, w, "attester = the witness");
+        assert_eq!(row.attested_key_id, t, "subject rides attested_key_id");
+        // The SUBJECT's band graduates (witness outranks its self-minor).
+        assert_eq!(
+            engine.age_band(&t).await.unwrap(),
+            AgeBand::Adult,
+            "a witness row ABOUT the subject graduates the SUBJECT's band",
+        );
+        assert_eq!(
+            age_band_fine(&*sq, &t).await.unwrap(),
+            AgeBandFine::Adult,
+            "the finer resolution graduates too",
+        );
+
+        // SELF-graduation via the witness prefix is refused: the same
+        // witness emitting with the default (self) attested_key_id.
+        let selfie = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:provider:adult:v1",
+            serde_json::json!({ "id": "wtse-w-self" }),
+        );
+        let e = engine
+            .emit_attestation(&w_signer, selfie)
+            .await
+            .expect_err("a subject must not emit its own age assurance");
+        assert_eq!(e.kind(), "federation_age_assurance_self_emission_rejected");
+        assert_eq!(
+            age_band(&*sq, &w).await.unwrap(),
+            AgeBand::Unknown,
+            "the witness's own band is untouched",
+        );
+
+        // Identity gate unchanged: the (non-witness) SUBJECT cross-attesting
+        // the witness's age is refused (reserved prefix needs a witness).
+        let mut bad = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:provider:adult:v1",
+            serde_json::json!({ "id": "wtse-t-cross" }),
+        );
+        bad.attested_key_id = Some(w.clone());
+        let e = engine
+            .emit_attestation(&t_signer, bad)
+            .await
+            .expect_err("a non-witness emitter is refused");
+        assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
+    }
+
+    /// #368 PG twin of
+    /// [`witness_targets_subject_age_graduation_over_emit_sqlite`] — the
+    /// cross-subject graduation + self-graduation rejection over the live
+    /// Postgres `put_attestation` gates (pg/sqlite symmetry). Skips when
+    /// `CIRIS_PERSIST_TEST_PG_URL` is unset.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn witness_targets_subject_age_graduation_over_emit_postgres() {
+        use crate::federation::age::{age_band, AgeBand};
+        use crate::federation::FederationDirectory;
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let w_label = format!("age-w-{run}");
+        let t_label = format!("age-t-{run}");
+        let w_signer = crate::federation::tier_ingest::test_support::local_signer(&w_label);
+        let t_signer = crate::federation::tier_ingest::test_support::local_signer(&t_label);
+        let w = w_signer.derived_key_id();
+        let t = t_signer.derived_key_id();
+        let engine = Engine::with_signer(w_signer.clone(), &dsn)
+            .await
+            .expect("pg engine");
+        let pg = engine.postgres_backend().expect("pg backend");
+        pg.put_public_key(witness_test_key_derived_for(&w, &w_label))
+            .await
+            .expect("seed witness");
+        pg.put_public_key(user_test_key_derived_for(&t, &t_label))
+            .await
+            .expect("seed subject");
+
+        // Subject self-declares minor.
+        engine
+            .emit_attestation(
+                &t_signer,
+                crate::federation::EmitAttestationInput::with_envelope(
+                    "age_self_declared:minor:v1",
+                    serde_json::json!({ "id": format!("pgw-self-{run}") }),
+                ),
+            )
+            .await
+            .expect("self-declared minor admits");
+        assert_eq!(engine.age_band(&t).await.unwrap(), AgeBand::Minor);
+
+        // Witness graduates the SUBJECT cross-subject.
+        let mut cross = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:government:adult:v1",
+            serde_json::json!({ "id": format!("pgw-adult-{run}") }),
+        );
+        cross.attested_key_id = Some(t.clone());
+        engine
+            .emit_attestation(&w_signer, cross)
+            .await
+            .expect("witness-targets-subject admitted on postgres");
+        assert_eq!(engine.age_band(&t).await.unwrap(), AgeBand::Adult);
+
+        // Self-graduation via the witness prefix rejected on PG too.
+        let e = engine
+            .emit_attestation(
+                &w_signer,
+                crate::federation::EmitAttestationInput::with_envelope(
+                    "age_assurance:provider:adult:v1",
+                    serde_json::json!({ "id": format!("pgw-self-adult-{run}") }),
+                ),
+            )
+            .await
+            .expect_err("self-emission rejected on postgres");
+        assert_eq!(e.kind(), "federation_age_assurance_self_emission_rejected");
+        assert_eq!(age_band(&**pg, &w).await.unwrap(), AgeBand::Unknown);
+    }
+
+    /// #367 — the FULL CC 3.2 minor-guardianship flow over the REAL paths
+    /// (sqlite): a witness attests T minor (cross-subject, #368) → the
+    /// steward-less minor fails secure → S's binding is refused until S is a
+    /// PROVEN adult → witness attests S adult → `grant_delegation(S → T)` is
+    /// ADMITTED → `revoke_delegation` leaves the minor steward-less again
+    /// (fail-secure). An age-unverified user target stays rejected.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn minor_guardianship_grant_and_withdraw_end_to_end_sqlite() {
+        use crate::federation::admission::{is_steward_bound, steward_bindings_of};
+        use crate::federation::age::AgeBand;
+        use crate::federation::types::delegation_scope;
+        use crate::federation::FederationDirectory;
+
+        let w_signer = crate::federation::tier_ingest::test_support::local_signer("mg-witness");
+        let s_signer = crate::federation::tier_ingest::test_support::local_signer("mg-steward");
+        let w = w_signer.derived_key_id();
+        let s = s_signer.derived_key_id();
+        let engine = Engine::with_signer(w_signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(witness_test_key_derived_for(&w, "mg-witness"))
+            .await
+            .expect("seed witness");
+        sq.put_public_key(user_test_key_derived_for(&s, "mg-steward"))
+            .await
+            .expect("seed steward");
+        // The ward T and an age-unverified control U (emit nothing; plain
+        // registered user-role keys).
+        let mut t_key = sweeper_test_key("mg-ward");
+        t_key.record.identity_type = crate::federation::types::identity_type::USER.into();
+        sq.put_public_key(t_key).await.expect("seed ward");
+        let mut u_key = sweeper_test_key("mg-unverified");
+        u_key.record.identity_type = crate::federation::types::identity_type::USER.into();
+        sq.put_public_key(u_key).await.expect("seed unverified");
+
+        // Age-unverified user self-anchors (presumption of sovereignty).
+        assert!(is_steward_bound(&*sq, "mg-ward").await.unwrap());
+
+        // Witness attests T MINOR (the #368 cross-subject emit).
+        let mut minor = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:provider:minor:v1",
+            serde_json::json!({ "id": "mg-w-minor" }),
+        );
+        minor.attested_key_id = Some("mg-ward".to_owned());
+        engine
+            .emit_attestation(&w_signer, minor)
+            .await
+            .expect("witness attests the ward minor");
+        assert_eq!(engine.age_band("mg-ward").await.unwrap(), AgeBand::Minor);
+        // A PROVEN minor with no steward fails secure.
+        assert!(
+            !is_steward_bound(&*sq, "mg-ward").await.unwrap(),
+            "a steward-less proven minor must not self-anchor",
+        );
+        assert!(steward_bindings_of(&*sq, "mg-ward")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // S is not yet a PROVEN adult → the binding is refused.
+        let e = engine
+            .grant_delegation(
+                &s_signer,
+                "mg-ward",
+                vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
+                false,
+            )
+            .await
+            .expect_err("an unproven granter cannot steward a minor");
+        match e {
+            crate::federation::Error::UserTargetStewardBindingForbidden { reason, .. } => {
+                assert_eq!(reason, "granter_not_adult_user");
+            }
+            other => panic!("expected UserTargetStewardBindingForbidden, got {other:?}"),
+        }
+
+        // Witness attests S ADULT (cross-subject again).
+        let mut adult = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:government:adult:v1",
+            serde_json::json!({ "id": "mg-w-adult" }),
+        );
+        adult.attested_key_id = Some(s.clone());
+        engine
+            .emit_attestation(&w_signer, adult)
+            .await
+            .expect("witness attests the steward adult");
+        assert_eq!(engine.age_band(&s).await.unwrap(), AgeBand::Adult);
+
+        // The CC 3.2 positive case: adult user S → proven-minor T ADMITTED
+        // over the REAL `grant_delegation` path.
+        let grant_id = engine
+            .grant_delegation(
+                &s_signer,
+                "mg-ward",
+                vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
+                false,
+            )
+            .await
+            .expect("adult-user → proven-minor guardianship is ADMITTED (CC 3.2)");
+        assert!(is_steward_bound(&*sq, "mg-ward").await.unwrap());
+        assert_eq!(
+            steward_bindings_of(&*sq, "mg-ward").await.unwrap(),
+            vec![s.clone()],
+            "the minor is steward-bound to exactly S",
+        );
+
+        // Withdraw the guardianship → the minor is steward-less again and
+        // the liveness predicates fail secure.
+        engine
+            .revoke_delegation(&s_signer, &grant_id, "mg-ward")
+            .await
+            .expect("revoke_delegation");
+        assert!(
+            !is_steward_bound(&*sq, "mg-ward").await.unwrap(),
+            "a minor whose only guardianship edge was withdrawn fails secure",
+        );
+        assert!(
+            steward_bindings_of(&*sq, "mg-ward")
+                .await
+                .unwrap()
+                .is_empty(),
+            "no anchors remain after the withdraw",
+        );
+
+        // An age-UNVERIFIED user target is still rejected (presumption of
+        // sovereignty — nothing in this cut widened the wall).
+        let e = engine
+            .grant_delegation(
+                &s_signer,
+                "mg-unverified",
+                vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
+                false,
+            )
+            .await
+            .expect_err("an unverified user target stays rejected");
+        match e {
+            crate::federation::Error::UserTargetStewardBindingForbidden { reason, .. } => {
+                assert_eq!(reason, "target_age_unverified");
+            }
+            other => panic!("expected UserTargetStewardBindingForbidden, got {other:?}"),
+        }
+    }
+
+    /// #367 PG twin of
+    /// [`minor_guardianship_grant_and_withdraw_end_to_end_sqlite`] — the
+    /// witness→minor attest → adult-steward grant → withdraw → fail-secure
+    /// arc over the live Postgres gates. Skips when
+    /// `CIRIS_PERSIST_TEST_PG_URL` is unset.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn minor_guardianship_grant_and_withdraw_end_to_end_postgres() {
+        use crate::federation::admission::{is_steward_bound, steward_bindings_of};
+        use crate::federation::age::AgeBand;
+        use crate::federation::types::delegation_scope;
+        use crate::federation::FederationDirectory;
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let w_label = format!("mg-w-{run}");
+        let s_label = format!("mg-s-{run}");
+        let ward = format!("mg-ward-{run}");
+        let w_signer = crate::federation::tier_ingest::test_support::local_signer(&w_label);
+        let s_signer = crate::federation::tier_ingest::test_support::local_signer(&s_label);
+        let w = w_signer.derived_key_id();
+        let s = s_signer.derived_key_id();
+        let engine = Engine::with_signer(w_signer.clone(), &dsn)
+            .await
+            .expect("pg engine");
+        let pg = engine.postgres_backend().expect("pg backend");
+        pg.put_public_key(witness_test_key_derived_for(&w, &w_label))
+            .await
+            .expect("seed witness");
+        pg.put_public_key(user_test_key_derived_for(&s, &s_label))
+            .await
+            .expect("seed steward");
+        let mut t_key = sweeper_test_key(&ward);
+        t_key.record.identity_type = crate::federation::types::identity_type::USER.into();
+        pg.put_public_key(t_key).await.expect("seed ward");
+
+        // Witness attests T minor + S adult (cross-subject, #368).
+        let mut minor = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:provider:minor:v1",
+            serde_json::json!({ "id": format!("mgp-minor-{run}") }),
+        );
+        minor.attested_key_id = Some(ward.clone());
+        engine
+            .emit_attestation(&w_signer, minor)
+            .await
+            .expect("witness attests ward minor");
+        let mut adult = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:government:adult:v1",
+            serde_json::json!({ "id": format!("mgp-adult-{run}") }),
+        );
+        adult.attested_key_id = Some(s.clone());
+        engine
+            .emit_attestation(&w_signer, adult)
+            .await
+            .expect("witness attests steward adult");
+        assert_eq!(engine.age_band(&ward).await.unwrap(), AgeBand::Minor);
+        assert_eq!(engine.age_band(&s).await.unwrap(), AgeBand::Adult);
+        assert!(
+            !is_steward_bound(&**pg, &ward).await.unwrap(),
+            "steward-less proven minor fails secure on postgres",
+        );
+
+        // Adult user → proven minor: ADMITTED; withdraw → fail-secure.
+        let grant_id = engine
+            .grant_delegation(
+                &s_signer,
+                &ward,
+                vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
+                false,
+            )
+            .await
+            .expect("guardianship admitted on postgres");
+        assert_eq!(
+            steward_bindings_of(&**pg, &ward).await.unwrap(),
+            vec![s.clone()],
+        );
+        engine
+            .revoke_delegation(&s_signer, &grant_id, &ward)
+            .await
+            .expect("revoke_delegation");
+        assert!(
+            !is_steward_bound(&**pg, &ward).await.unwrap(),
+            "withdrawn guardianship leaves the minor steward-less (fail-secure)",
+        );
+        assert!(steward_bindings_of(&**pg, &ward).await.unwrap().is_empty());
     }
 
     /// #249 — the add_moderator ↔ is_named_moderator round-trip: an
@@ -9841,6 +11143,7 @@ mod tests {
                 persist_row_hash: String::new(),
                 roles: Vec::new(),
                 attestation_evidence: None,
+                consent_role: None,
             },
         })
         .await

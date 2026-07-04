@@ -2325,6 +2325,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         backend
             .put_public_key(crate::federation::SignedKeyRecord { record })
@@ -2531,6 +2532,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         // Tolerate an exact-content idempotent re-seed on a reused PG (the
         // lead's local docker DB persists across runs); a genuine
@@ -3508,6 +3510,7 @@ mod tests {
             persist_row_hash: String::new(),
             roles: Vec::new(),
             attestation_evidence: None,
+            consent_role: None,
         };
         use crate::federation::FederationDirectory;
         backend

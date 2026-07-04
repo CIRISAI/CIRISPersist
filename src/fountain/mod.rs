@@ -20,11 +20,14 @@
 //! # Two orthogonal eviction triggers
 //! 1. **DiskPressure** (#149) — [`FountainTier::from_pressure`] maps the
 //!    free-bytes tier to a keep-count.
-//! 2. **Consent decay** — the eviction MECHANISM is exposed as a
-//!    callable ([`crate::store::Backend::evict_fountain_content_to_tier`]);
-//!    the FULL Consensual-Evolution stream scheduling integration is an
-//!    explicit **documented follow-on** (see CHANGELOG [8.0.0]) and is
-//!    intentionally NOT built in this cut.
+//! 2. **Consent decay** — the per-`content_id` consent clock in [`decay`]
+//!    drives the tier down as content ages past its consent stream's
+//!    window (TEMPORARY 14-day, pattern 90-day), **independent of disk**.
+//!    It reuses the SAME eviction MECHANISM
+//!    ([`crate::store::Backend::evict_fountain_content_to_tier`]); the
+//!    scheduling is driven by
+//!    [`crate::Engine::sweep_consent_decay_once`]. See [`decay`] for the
+//!    spec-pinned-vs-default schedule breakdown.
 //!
 //! # Modules
 //! - [`types`] — the LOCKED `FountainContentV1` structs + the typed
@@ -39,6 +42,7 @@
 
 pub mod admit;
 pub mod aggregation;
+pub mod decay;
 pub mod eviction;
 pub mod retention;
 pub mod storage_contention;
@@ -54,6 +58,11 @@ pub use aggregation::{
     verify_member_commitment, AggregationMetaError, AggregationMetaV1, AggregationMetaVerification,
     AggregationMetaVerifyInputsV1, AggregationRecordV1, EjectionAction, EjectionVerdict,
     AGGREGATE_CORPUS_PREFIX,
+};
+pub use decay::{
+    consent_decay_class_from_envelope, consent_decay_target_tier, ConsentDecayClass,
+    ConsentDecaySweepReport, FountainDecayCandidate, DECAY_FRACTION_T2, DECAY_FRACTION_T3,
+    DECAY_FRACTION_T4, DECAY_FRACTION_T5, PATTERN_DECAY_DAYS, TEMPORARY_DECAY_DAYS,
 };
 pub use eviction::FountainTier;
 pub use retention::{

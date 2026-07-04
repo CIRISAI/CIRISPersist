@@ -428,6 +428,63 @@ pub trait Backend: Send + Sync {
         publisher_key_id: &str,
     ) -> impl Future<Output = Result<Vec<crate::fountain::FountainHeldMeta>, Error>> + Send;
 
+    // ─── v12.7.0 — §Q pin-INSTALL surface (CC 6.1.5.2 / CIRISPersist#370) ──
+    //
+    // The durable half of the storage-contention shapes (#356 shipped
+    // build/verify as wire-negotiation only). One row per owner node_id in
+    // `storage_budget_installed` (V093). The B5 capacity sweep
+    // (`Engine::sweep_evictions_once`) reads this state back; the
+    // revocation path (`evict_fountain_content_hard_delete`, above) NEVER
+    // does — §Q B6: pinning never defeats revocation.
+
+    /// #370 (§Q B3) — conditionally upsert an installed `StorageBudgetV1`.
+    ///
+    /// The caller (`Engine::install_storage_budget_v1`) MUST have
+    /// bound-hybrid-verified the wire first (PQC-mandatory, CC 5.3.2.4.3.1
+    /// store-path); this method enforces the **anti-rollback** half
+    /// ATOMICALLY at the row: insert if the `node_id` is new, replace iff
+    /// `budget.revision` is STRICTLY higher than the installed revision.
+    /// Returns `Ok(true)` when the row was written, `Ok(false)` when refused
+    /// (lower/equal revision — the caller surfaces
+    /// `StorageContentionError::RevisionRollback`). Doing the check in the
+    /// upsert itself (`... WHERE installed.revision < excluded.revision`)
+    /// means two racing installs cannot roll the revision back.
+    fn put_installed_storage_budget(
+        &self,
+        budget: &crate::fountain::storage_contention::InstalledStorageBudget,
+    ) -> impl Future<Output = Result<bool, Error>> + Send;
+
+    /// #370 — read back the installed budget for `node_id` (the signed wire
+    /// verbatim + denormalized fields). `Ok(None)` when none installed.
+    fn get_installed_storage_budget(
+        &self,
+        node_id: &str,
+    ) -> impl Future<
+        Output = Result<Option<crate::fountain::storage_contention::InstalledStorageBudget>, Error>,
+    > + Send;
+
+    /// #370 (§Q B5) — every installed budget (typically exactly one: this
+    /// node's own). The capacity sweep folds these into the effective
+    /// `pinned_class` set + `pin_reserve_bytes` floor once per cycle.
+    fn list_installed_storage_budgets(
+        &self,
+    ) -> impl Future<
+        Output = Result<Vec<crate::fountain::storage_contention::InstalledStorageBudget>, Error>,
+    > + Send;
+    /// #227 (residual) — enumerate EVERY fountain content unit's decay
+    /// coordinates for the consent-decay clock: `(content_id, corpus_kind,
+    /// envelope, admitted_at)`. The signed `envelope` carries the decay
+    /// class ([`crate::fountain::consent_decay_class_from_envelope`]) and
+    /// `admitted_at` is the decay reference instant. No symbol bytes are
+    /// read; the sweep asks
+    /// [`consent_decay_target_tier`](crate::fountain::consent_decay_target_tier)
+    /// for a target tier and reuses the shared eviction mechanism
+    /// ([`Self::evict_fountain_content_to_tier`]). Unordered; empty when
+    /// nothing is stored. Disk-INDEPENDENT (never consults free bytes).
+    fn list_fountain_decay_candidates(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::fountain::FountainDecayCandidate>, Error>> + Send;
+
     // ─── v8.3.0 — §19.7 inter-object aggregation (CIRISPersist#230) ──
     //
     // The forever-memory storage half of operator 2. persist is

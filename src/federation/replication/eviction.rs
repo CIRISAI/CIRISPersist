@@ -100,6 +100,14 @@ pub struct EvictionCandidate {
     /// (fail-toward-eviction is safe: an unattributed blob we can
     /// re-fetch is the right thing to shed first).
     pub attesting_key_id: Option<String>,
+    /// v12.7.0 (§Q B5 / CIRISPersist#370) — the row's
+    /// `federation_blobs.media_type`, the substrate's per-blob corpus-class
+    /// token. The sweep matches it against the installed
+    /// `StorageBudgetV1.pinned_class` set to classify the candidate as
+    /// PINNED (evict last, cache-before-pinned) vs cache. `None` ⇒ no
+    /// class ⇒ never pinned (fail-toward-eviction, same posture as
+    /// `attesting_key_id`).
+    pub media_type: Option<String>,
 }
 
 /// v3.4.0 (CIRISPersist#123) — outcome of one sweep cycle.
