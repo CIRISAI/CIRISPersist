@@ -5,6 +5,32 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.0.1] — 2026-07-04 — dyn-reachable replicated Key-plane apply (#375)
+
+Patch: no wire change, no schema change, verify pin unchanged (v8.7.0).
+
+### Fixed
+- **#375** — `apply_replicated_key_record` (the #371 upgrade-aware, `owner_of`-gated
+  replicated Key-plane apply) is now a method on the **`FederationDirectory` trait**,
+  not only an inherent method on `SqliteBackend`/`PostgresBackend`/`Engine`. CIRISEdge's
+  anti-entropy bridge holds an `Arc<dyn FederationDirectory>` with no concrete backend
+  type, so it could previously only reach `put_public_key` (`ON CONFLICT DO NOTHING`) —
+  silently dropping an anchor-scrubbed record for a `key_id` already held self-signed,
+  the exact DO-NOTHING #371 exists to replace. The sqlite/postgres impls delegate to the
+  existing inherent method (single source of truth); the trait default preserves the
+  memory/mock backends with first-seen insert semantics (collision ⇒ `Refused`,
+  fail-closed, re-offerable). Unblocks CIRISEdge#277.
+  Purely additive to the trait — a `Result<ReplicatedKeyOutcome, Error>` method with a
+  default body, so existing `impl FederationDirectory` blocks keep compiling unchanged.
+  - **Capsule path routed too** (#320 ABI-stable `OpsDirectory`): edge consumes persist
+    through the C-ABI directory capsule, whose `OpsDirectory` overrides ~40 trait methods
+    but would otherwise inherit the new insert-only default — so the fix adds an
+    append-only `DirectoryOp::ApplyReplicatedKeyRecord` + `DirectoryOpResult::ReplicatedKeyOutcome`
+    and an `OpsDirectory` override, so the *capsule* consumer (the real edge shape) reaches
+    the upgrade-aware backend apply, not `put_public_key` DO-NOTHING. `DIRECTORY_ABI_VERSION`
+    unchanged (append-only serde op contract; the vtable C struct is untouched). Proven by a
+    sqlite-backed capsule round-trip that drives a real `Upgraded` through `build_op`.
+
 ## [13.0.0] — 2026-07-04 — CC 1.0 RC1 compliance cut
 
 Nine conformance issues, read against the standalone **CIRISConstitution v0.9.3**,
