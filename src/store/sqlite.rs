@@ -25646,6 +25646,155 @@ mod tests {
         );
     }
 
+    /// CC 3.4.12 (CIRISPersist#309) — adult-incapacity binding + fail-to-liberty
+    /// on the SQLITE backend (pg/sqlite symmetry): the shared admission gate
+    /// admits a scoped, reversible-excluded, bounded binding; a lapsed
+    /// `valid_until` is non-live and the adult auto-re-sovereigns.
+    #[tokio::test]
+    async fn adult_incapacity_binding_and_fail_to_liberty_sqlite() {
+        use crate::federation::admission::steward_bindings_of;
+        use crate::federation::types::{attestation_type, identity_type};
+        use chrono::{Duration, Utc};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        for (k, ity) in [
+            ("si-assessor", identity_type::WITNESS),
+            ("si-S", identity_type::USER),
+            ("si-A", identity_type::USER),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key_with_identity_type(k, k, k, ity),
+                })
+                .await
+                .unwrap();
+        }
+
+        // A capacity/age attestation ABOUT `subj` from `emitter` carrying a
+        // bare `attestation_type` token (like the age fixtures).
+        let att = |emitter: &str, subj: &str, token: &str| {
+            let mut a = topo_attestation(emitter, subj, token, None, None, &[], None, Utc::now());
+            a.attestation_envelope = serde_json::json!({ "id": token });
+            resign_fed(&mut a);
+            a
+        };
+        for (subj, token) in [
+            ("si-S", "age_assurance:provider:adult:v1"),
+            ("si-A", "age_assurance:provider:adult:v1"),
+        ] {
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: att("si-assessor", subj, token),
+                })
+                .await
+                .unwrap();
+        }
+        for token in [
+            "capacity_assurance:panel:financial:incapacitated:v1",
+            "capacity_assurance:reversible_excluded:financial",
+        ] {
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: att("si-assessor", "si-A", token),
+                })
+                .await
+                .expect("witness capacity attestation admitted on sqlite");
+        }
+
+        // An adult-incapacity binding with the CC 3.4.12 envelope fields.
+        let binding = |id: &str, valid_until: &str| {
+            let mut a = topo_attestation(
+                "si-S",
+                "si-A",
+                attestation_type::DELEGATES_TO,
+                None,
+                None,
+                &[],
+                None,
+                Utc::now(),
+            );
+            a.attestation_envelope = serde_json::json!({
+                "id": id,
+                "scope": ["financial"],
+                "binding_legitimacy_source": "prior_will_proxy",
+                "valid_until": valid_until,
+            });
+            resign_fed(&mut a);
+            a
+        };
+
+        // LIVE binding (future valid_until) → S is a live anchor of A.
+        let future = (Utc::now() + Duration::days(30)).to_rfc3339();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: binding("si-live", &future),
+            })
+            .await
+            .expect("valid adult-incapacity binding admitted on sqlite");
+        assert!(steward_bindings_of(&backend, "si-A")
+            .await
+            .unwrap()
+            .contains(&"si-S".to_string()));
+
+        // Fail-to-liberty: a fresh ward whose ONLY binding has lapsed.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type("si-B", "si-B", "si-B", identity_type::USER),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: att("si-assessor", "si-B", "age_assurance:provider:adult:v1"),
+            })
+            .await
+            .unwrap();
+        for token in [
+            "capacity_assurance:panel:financial:incapacitated:v1",
+            "capacity_assurance:reversible_excluded:financial",
+        ] {
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: att("si-assessor", "si-B", token),
+                })
+                .await
+                .unwrap();
+        }
+        let lapsed = (Utc::now() - Duration::days(1)).to_rfc3339();
+        let mut b = topo_attestation(
+            "si-S",
+            "si-B",
+            attestation_type::DELEGATES_TO,
+            None,
+            None,
+            &[],
+            None,
+            Utc::now(),
+        );
+        b.attestation_envelope = serde_json::json!({
+            "id": "si-lapsed",
+            "scope": ["financial"],
+            "binding_legitimacy_source": "prior_will_proxy",
+            "valid_until": lapsed,
+        });
+        resign_fed(&mut b);
+        backend
+            .put_attestation(SignedAttestation { attestation: b })
+            .await
+            .expect("lapsed-valid_until binding structurally admitted");
+        let anchors = steward_bindings_of(&backend, "si-B").await.unwrap();
+        assert!(
+            !anchors.contains(&"si-S".to_string()),
+            "a lapsed binding confers no standing (fail-to-liberty)"
+        );
+        assert_eq!(
+            anchors,
+            vec!["si-B".to_string()],
+            "adult auto-re-sovereigns"
+        );
+    }
+
     /// SecReview F3: a WITHDRAWN `delegates_to(user → node)` no longer
     /// confers steward-binding (sqlite parity) — admitted while live, REJECTED
     /// after the granter withdraws the edge.

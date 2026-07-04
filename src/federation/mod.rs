@@ -40,6 +40,7 @@ pub mod at_rest_cascade;
 pub mod backfill;
 pub mod blackhole;
 pub mod blobs;
+pub mod capacity;
 pub mod cohort;
 pub mod community_dek;
 #[cfg(feature = "cirisaudit")]
@@ -3654,6 +3655,26 @@ pub enum Error {
     /// - `granter_not_adult_user` — the granter is not a `user`, or not a
     ///   proven adult (a minor cannot be a guardian; a non-user cannot be a
     ///   guardian).
+    ///
+    /// v11.9.0 (CIRISPersist#309, CC 3.4.12) — an ADULT target is admissible
+    /// ONLY through the narrow adult-incapacity aperture
+    /// ([`admission::check_adult_incapacity_binding`]). Its rejection reasons:
+    ///
+    /// - `scope_missing` — the binding declares no scope.
+    /// - `scope_exceeds_attested_domains` — a scoped domain has no live
+    ///   `capacity_assurance:*:{d}:incapacitated`.
+    /// - `capacity_reversible_not_excluded` — a scoped domain lacks the
+    ///   mandatory `reversible_excluded` companion (and the T1
+    ///   `reversible_pending` acute path does not apply).
+    /// - `scope_touches_protected_domain` — scope intersects the apophatic
+    ///   [`crate::federation::capacity::PROTECTED_NON_TRANSFERABLE`] floor.
+    /// - `attester_conflicted` — a capacity assessor is the steward or
+    ///   petitioner (assessor-independence).
+    /// - `missing_legitimacy_source` — absent/invalid
+    ///   `binding_legitimacy_source` (never the steward's signature alone).
+    /// - `missing_valid_until` / `valid_until_unparseable` /
+    ///   `valid_until_exceeds_review_cadence` — the fail-to-liberty mandatory
+    ///   bounded expiry is missing, malformed, or outruns the T2 cadence.
     ///
     /// `node`/`agent`-target bindings are governed by
     /// [`admission::check_node_agency_admission`] and are NOT affected by this
