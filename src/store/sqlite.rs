@@ -2417,6 +2417,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // so a rejected emission leaves no trace.
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
+        // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
+        // federate FEDERATION-APPLY re-check (point ii). A federation-tier row
+        // keyed on a community (`community_id`) is refused if C has lost its
+        // last live `moderate`-holder. No-op for local-tier rows, no
+        // community_id, or an unknown community. Backend-symmetric.
+        crate::federation::admission::check_no_moderator_federate_apply(self, &row).await?;
+
         // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
         // hybrid-verify at the federation-tier bulk store/replicate
         // ingest gate (parity with the postgres + memory backends). A
@@ -16200,6 +16207,118 @@ mod tests {
         );
     }
 
+    /// #238 / #146 (CC 5.3.2.2 / §10.1.3, AV-61 transit-not-rest) — the
+    /// consent-revocation promotion-overdue `hard_case` fires at the 24 h
+    /// window boundary for a subject-side revocation staged local-tier
+    /// (unpromoted), on the SQLite backend's real `list_consent_revocations`.
+    #[tokio::test]
+    async fn consent_promotion_overdue_fires_at_window_boundary_sqlite() {
+        use crate::federation::{
+            hard_case::kind, hard_case::HardCaseFilter, FederationDirectory, SignedAttestation,
+        };
+        use std::time::Duration;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["subject-p", "target-p"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, &format!("prim-{k}"), k),
+                })
+                .await
+                .unwrap();
+        }
+        let revoked_at: chrono::DateTime<chrono::Utc> = "2026-06-01T00:00:00Z".parse().unwrap();
+        // A subject-side consent:state:revoked. It is federation-tier by
+        // classification, so it admits federation-tier (signed); we then flip
+        // it to the local-tier TRANSIT state (unpromoted) directly — persist's
+        // admission gate refuses to *originate* a local subject revocation
+        // (transit-not-rest), so this simulates the #171 promote-surface
+        // staging the watcher must drive out.
+        let mut rev = fed_attestation("rev-p", "subject-p", "target-p", "subject-p");
+        rev.attestation_envelope =
+            serde_json::json!({ "id": "rev-p", "dimension": "consent:state:revoked:v1" });
+        rev.asserted_at = revoked_at;
+        rev.subject_key_ids = vec!["subject-p".into()];
+        resign_fed(&mut rev);
+        backend
+            .put_attestation(SignedAttestation { attestation: rev })
+            .await
+            .unwrap();
+        // Flip to local-tier, unpromoted (the transit staging state).
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "UPDATE federation_attestations SET tier = 'local', promoted_at = NULL \
+                 WHERE attestation_id = 'rev-p'",
+                [],
+            )
+            .unwrap();
+        }
+        let window = Duration::from_secs(86_400); // 24 h
+
+        // The SQLite scan surfaces the local-tier transit row.
+        let revs = backend.list_consent_revocations(None).await.unwrap();
+        assert_eq!(revs.len(), 1, "local-tier subject revocation is scanned");
+        assert_ne!(
+            revs[0].tier,
+            crate::federation::types::attestation_tier::FEDERATION,
+            "row is local-tier (transit)"
+        );
+
+        // Just BEFORE the boundary → in flight, not overdue.
+        let before = revoked_at + chrono::Duration::seconds(86_400 - 1);
+        let r = backend.run_consent_sla_watch(before, window).await.unwrap();
+        assert_eq!(r.promotion_overdue, 0, "within the window: not yet overdue");
+
+        // Just AFTER the boundary → overdue fires; recorded + idempotent.
+        let after = revoked_at + chrono::Duration::seconds(86_400 + 1);
+        let r = backend.run_consent_sla_watch(after, window).await.unwrap();
+        assert_eq!(r.promotion_overdue, 1, "past the window: overdue fires");
+        let evs = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].target_key_id.as_deref(), Some("target-p"));
+        assert_eq!(evs[0].subject_key_id.as_deref(), Some("subject-p"));
+        let r = backend.run_consent_sla_watch(after, window).await.unwrap();
+        assert_eq!(r.promotion_overdue, 1, "still detected");
+        assert_eq!(
+            backend
+                .list_hard_case_events(HardCaseFilter {
+                    kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                    since: None,
+                })
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "idempotent: no duplicate overdue row"
+        );
+
+        // Promote it (tier=federation) → drops out of the fire condition.
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "UPDATE federation_attestations SET tier = 'federation', promoted_at = ?1 \
+                 WHERE attestation_id = 'rev-p'",
+                [after.to_rfc3339()],
+            )
+            .unwrap();
+        }
+        let r = backend
+            .run_consent_sla_watch(after + chrono::Duration::seconds(1), window)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.promotion_overdue, 0,
+            "a promoted revocation is no longer overdue"
+        );
+    }
+
     fn fed_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
         Revocation {
             revocation_id: id.into(),
@@ -25643,6 +25762,155 @@ mod tests {
         assert!(
             !is_steward_bound(&backend, "sl-M").await.unwrap(),
             "a minor whose only adult steward was withdrawn must fail secure",
+        );
+    }
+
+    /// CC 3.4.12 (CIRISPersist#309) — adult-incapacity binding + fail-to-liberty
+    /// on the SQLITE backend (pg/sqlite symmetry): the shared admission gate
+    /// admits a scoped, reversible-excluded, bounded binding; a lapsed
+    /// `valid_until` is non-live and the adult auto-re-sovereigns.
+    #[tokio::test]
+    async fn adult_incapacity_binding_and_fail_to_liberty_sqlite() {
+        use crate::federation::admission::steward_bindings_of;
+        use crate::federation::types::{attestation_type, identity_type};
+        use chrono::{Duration, Utc};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        for (k, ity) in [
+            ("si-assessor", identity_type::WITNESS),
+            ("si-S", identity_type::USER),
+            ("si-A", identity_type::USER),
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key_with_identity_type(k, k, k, ity),
+                })
+                .await
+                .unwrap();
+        }
+
+        // A capacity/age attestation ABOUT `subj` from `emitter` carrying a
+        // bare `attestation_type` token (like the age fixtures).
+        let att = |emitter: &str, subj: &str, token: &str| {
+            let mut a = topo_attestation(emitter, subj, token, None, None, &[], None, Utc::now());
+            a.attestation_envelope = serde_json::json!({ "id": token });
+            resign_fed(&mut a);
+            a
+        };
+        for (subj, token) in [
+            ("si-S", "age_assurance:provider:adult:v1"),
+            ("si-A", "age_assurance:provider:adult:v1"),
+        ] {
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: att("si-assessor", subj, token),
+                })
+                .await
+                .unwrap();
+        }
+        for token in [
+            "capacity_assurance:panel:financial:incapacitated:v1",
+            "capacity_assurance:reversible_excluded:financial",
+        ] {
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: att("si-assessor", "si-A", token),
+                })
+                .await
+                .expect("witness capacity attestation admitted on sqlite");
+        }
+
+        // An adult-incapacity binding with the CC 3.4.12 envelope fields.
+        let binding = |id: &str, valid_until: &str| {
+            let mut a = topo_attestation(
+                "si-S",
+                "si-A",
+                attestation_type::DELEGATES_TO,
+                None,
+                None,
+                &[],
+                None,
+                Utc::now(),
+            );
+            a.attestation_envelope = serde_json::json!({
+                "id": id,
+                "scope": ["financial"],
+                "binding_legitimacy_source": "prior_will_proxy",
+                "valid_until": valid_until,
+            });
+            resign_fed(&mut a);
+            a
+        };
+
+        // LIVE binding (future valid_until) → S is a live anchor of A.
+        let future = (Utc::now() + Duration::days(30)).to_rfc3339();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: binding("si-live", &future),
+            })
+            .await
+            .expect("valid adult-incapacity binding admitted on sqlite");
+        assert!(steward_bindings_of(&backend, "si-A")
+            .await
+            .unwrap()
+            .contains(&"si-S".to_string()));
+
+        // Fail-to-liberty: a fresh ward whose ONLY binding has lapsed.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type("si-B", "si-B", "si-B", identity_type::USER),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: att("si-assessor", "si-B", "age_assurance:provider:adult:v1"),
+            })
+            .await
+            .unwrap();
+        for token in [
+            "capacity_assurance:panel:financial:incapacitated:v1",
+            "capacity_assurance:reversible_excluded:financial",
+        ] {
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: att("si-assessor", "si-B", token),
+                })
+                .await
+                .unwrap();
+        }
+        let lapsed = (Utc::now() - Duration::days(1)).to_rfc3339();
+        let mut b = topo_attestation(
+            "si-S",
+            "si-B",
+            attestation_type::DELEGATES_TO,
+            None,
+            None,
+            &[],
+            None,
+            Utc::now(),
+        );
+        b.attestation_envelope = serde_json::json!({
+            "id": "si-lapsed",
+            "scope": ["financial"],
+            "binding_legitimacy_source": "prior_will_proxy",
+            "valid_until": lapsed,
+        });
+        resign_fed(&mut b);
+        backend
+            .put_attestation(SignedAttestation { attestation: b })
+            .await
+            .expect("lapsed-valid_until binding structurally admitted");
+        let anchors = steward_bindings_of(&backend, "si-B").await.unwrap();
+        assert!(
+            !anchors.contains(&"si-S".to_string()),
+            "a lapsed binding confers no standing (fail-to-liberty)"
+        );
+        assert_eq!(
+            anchors,
+            vec!["si-B".to_string()],
+            "adult auto-re-sovereigns"
         );
     }
 

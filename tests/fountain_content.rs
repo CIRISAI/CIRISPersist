@@ -26,6 +26,9 @@ use base64::Engine as _;
 use ciris_keyring::{MlDsa65SoftwareSigner, PqcSigner};
 use ed25519_dalek::{Signer as _, SigningKey};
 
+use ciris_persist::fountain::storage_contention::{
+    assemble_storage_budget_wire, storage_budget_preimage, verify_storage_budget_wire,
+};
 use ciris_persist::fountain::{
     symbol_sha256_hex, FountainContent, FountainManifestV1, FountainSymbolV1, FountainTier,
     MANIFEST_VERSION_V1,
@@ -134,6 +137,40 @@ async fn build_manifest_and_symbols(
     // classical-only: leave signature_ml_dsa_65 empty (the hard cut).
 
     (manifest, symbols)
+}
+
+/// §Q B6/N5 (CIRISPersist#359): build + VERIFY a signed `StorageBudgetV1`
+/// whose `pinned_class` covers `corpus_kind` with a non-zero
+/// `pin_reserve_bytes`. Returns the verified wire JSON. This proves a *valid,
+/// aggregator-signed* pin advertisement covering the subject_kind exists — the
+/// exact state B6 says must NOT shield content from revocation.
+async fn build_and_verify_trace_pin(corpus_kind: &str) -> String {
+    let (ed_sk, ed_pk_b64, mldsa) = producer_pubkeys();
+    let mldsa_pk_b64 = BASE64.encode(mldsa.public_key().await.unwrap());
+
+    // A budget that PINS `corpus_kind` (in pinned_class) with a real byte
+    // reserve — i.e. the strongest pin the §Q surface can express.
+    let payload = format!(
+        r#"{{"node_id":"n-pin","epoch_id":"e1","revision":1,
+            "scopes":[{{"cohort_scope":"community","budget_bytes":100000,"pin_reserve_bytes":50000}}],
+            "pinned_class":["{corpus_kind}"]}}"#
+    );
+
+    // Bound-hybrid sign: Ed25519 over the preimage, ML-DSA-65 over
+    // (preimage || ed_sig) — the same shape the engine's signer emits.
+    let preimage = storage_budget_preimage(&payload).expect("valid pin payload");
+    let ed_sig = ed_sk.sign(&preimage).to_bytes();
+    let mut bound = preimage.clone();
+    bound.extend_from_slice(&ed_sig);
+    let pqc_sig = mldsa.sign(&bound).await.unwrap();
+    let wire =
+        assemble_storage_budget_wire(&payload, BASE64.encode(ed_sig), BASE64.encode(&pqc_sig))
+            .expect("assemble signed budget");
+
+    // The pin is genuinely valid (PQC-mandatory bound-hybrid verifies).
+    verify_storage_budget_wire(&wire, &ed_pk_b64, &mldsa_pk_b64)
+        .expect("(j) the pin advertisement is a valid, verified StorageBudgetV1");
+    wire
 }
 
 /// The shared body: assertions (a)–(g) against a migrated backend.
@@ -337,6 +374,60 @@ async fn run_fountain_assertions<B: Backend>(backend: &B, suffix: &str) {
         revoked.present(),
         0,
         "(i) zero symbols survive revocation HardDelete"
+    );
+
+    // (j) §Q B6/N5 (CIRISPersist#359): PINNING NEVER DEFEATS REVOCATION.
+    //     A *verified*, aggregator-signed StorageBudgetV1 whose pinned_class
+    //     covers `corpus` ("trace") with pin_reserve_bytes > 0 does NOT shield
+    //     that content from hard-delete. The pin is a verified-at-ingest
+    //     advertisement, not stored pin STATE — there is no pin table and
+    //     evict_fountain_content_hard_delete has no §Q pin parameter, so the
+    //     pin structurally cannot reach the deletion path. B6: a pin holds
+    //     content above the floor against CAPACITY pressure only, never
+    //     against revocation.
+    let pin_wire = build_and_verify_trace_pin(corpus).await;
+    assert!(
+        pin_wire.contains(corpus),
+        "(j) the verified pin advertisement covers the subject_kind being revoked"
+    );
+    let pcid = format!("c-pinned-revoke-{suffix}");
+    let (pman, psyms) =
+        build_manifest_and_symbols(&pcid, n_source, k_repair, symbol_size, true).await;
+    backend
+        .put_fountain_content(&pman, &psyms)
+        .await
+        .expect("(j) admit pinned-class content");
+    assert!(
+        matches!(
+            backend.get_fountain_content(&pcid, corpus).await.unwrap(),
+            Some(FountainContent::Full { .. })
+        ),
+        "(j) full before revoke, despite the pin"
+    );
+    // Revocation runs unconditionally — the pin over `corpus` is never
+    // consulted (the delete takes only content_id + corpus_kind).
+    let pdropped = backend
+        .evict_fountain_content_hard_delete(&pcid, corpus)
+        .await
+        .expect("(j) hard delete over pinned class");
+    assert_eq!(
+        pdropped,
+        u64::from(total),
+        "(j) HardDelete drops ALL symbols even when a valid pin covers the class"
+    );
+    let pin_revoked = backend
+        .get_fountain_content(&pcid, corpus)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pin_revoked.present(),
+        0,
+        "(j) pinning never defeats revocation — zero symbols survive (§Q B6)"
+    );
+    assert!(
+        matches!(pin_revoked, FountainContent::EnvelopeOnly { .. }),
+        "(j) pinned content → EnvelopeOnly after revocation, got {pin_revoked:?}"
     );
 
     // (#227 publisher view) list_held_fountain_content — the publisher sees

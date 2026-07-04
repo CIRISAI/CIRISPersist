@@ -40,6 +40,7 @@ pub mod at_rest_cascade;
 pub mod backfill;
 pub mod blackhole;
 pub mod blobs;
+pub mod capacity;
 pub mod cohort;
 pub mod community_dek;
 #[cfg(feature = "cirisaudit")]
@@ -2842,14 +2843,22 @@ pub trait FederationDirectory: Send + Sync {
             }
 
             // (b) §10.1.3 local-tier revocation unpromoted past the window.
-            // CAVEAT: persist's admission gate (AV-61) rejects subject-side
-            // revocations at the local tier — a subject revoke is always
-            // federation-tier — so under the *current* write model this
-            // condition has nothing to fire on. The check is kept
-            // forward-compatible: it fires correctly IF the #171
-            // agent-facing local-tier write/promote surface ever produces a
-            // local-tier subject revocation that then fails to promote. The
-            // §10.1.3-vs-AV-61 tension is flagged for CEG/§171 to resolve.
+            // AV-61 RESOLVED (CIRISPersist#238; §10.1.3 "transit-not-rest"
+            // ratification): a subject-side revocation is federation-tier by
+            // *classification*. It MAY *transit* the local-tier write path
+            // while in flight (the producing occurrence's substrate accepts the
+            // unsigned envelope before promotion) but MUST NOT *rest* there —
+            // its only conformant terminal states are *promoted* (tier becomes
+            // `federation`, so it drops out of this fire condition) or
+            // *overdue-flagged* (this emission). This overdue emission IS the
+            // SLA enforcement: the consent-promotion gate and the CC 5.3.2.4.3
+            // `local ⟹ caller is the producing occurrence` read-gate read this
+            // SAME overdue state, which is exactly what keeps the two gates
+            // from de-syncing (the AV-61 threat). persist itself never *rests*
+            // a subject revocation as a durable local row — its own admission
+            // gate (`check_local_tier_eligibility` rule 2) refuses to originate
+            // one; a transit-staged row here arrives via the #171 promote
+            // surface and this watcher drives it out (promote or flag).
             let local = rev.tier != crate::federation::types::attestation_tier::FEDERATION;
             if local && rev.promoted_at.is_none() && now - revoked_at > promotion {
                 self.record_hard_case(hard_case::HardCaseEvent {
@@ -3655,6 +3664,26 @@ pub enum Error {
     ///   proven adult (a minor cannot be a guardian; a non-user cannot be a
     ///   guardian).
     ///
+    /// v11.9.0 (CIRISPersist#309, CC 3.4.12) — an ADULT target is admissible
+    /// ONLY through the narrow adult-incapacity aperture
+    /// ([`admission::check_adult_incapacity_binding`]). Its rejection reasons:
+    ///
+    /// - `scope_missing` — the binding declares no scope.
+    /// - `scope_exceeds_attested_domains` — a scoped domain has no live
+    ///   `capacity_assurance:*:{d}:incapacitated`.
+    /// - `capacity_reversible_not_excluded` — a scoped domain lacks the
+    ///   mandatory `reversible_excluded` companion (and the T1
+    ///   `reversible_pending` acute path does not apply).
+    /// - `scope_touches_protected_domain` — scope intersects the apophatic
+    ///   [`crate::federation::capacity::PROTECTED_NON_TRANSFERABLE`] floor.
+    /// - `attester_conflicted` — a capacity assessor is the steward or
+    ///   petitioner (assessor-independence).
+    /// - `missing_legitimacy_source` — absent/invalid
+    ///   `binding_legitimacy_source` (never the steward's signature alone).
+    /// - `missing_valid_until` / `valid_until_unparseable` /
+    ///   `valid_until_exceeds_review_cadence` — the fail-to-liberty mandatory
+    ///   bounded expiry is missing, malformed, or outruns the T2 cadence.
+    ///
     /// `node`/`agent`-target bindings are governed by
     /// [`admission::check_node_agency_admission`] and are NOT affected by this
     /// rule. The row is NOT stored (verify-before-mutation, AV-9). Stable
@@ -3674,6 +3703,40 @@ pub enum Error {
         /// `target_age_unverified` / `granter_unresolved` /
         /// `granter_not_adult_user`).
         reason: &'static str,
+    },
+
+    /// v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11 — the no-moderator-no-
+    /// federate existence invariant). A federation-tier apply step keyed on a
+    /// `community` was REFUSED because that community has **no live holder of
+    /// its `moderate` duty** — no
+    /// [`is_named_moderator`](admission::is_named_moderator) resolvable member.
+    /// A `community` federates only while ≥1 steward-bound authority root
+    /// exists (a founder / `consensus_protocol` signer who
+    /// [`is_steward_bound`](admission::is_steward_bound)); such a root is a
+    /// zero-hop named moderator, and every delegated moderator chains back to
+    /// one. Fail-secure per §11.11 rule 3 — "better no group than an
+    /// unmoderated one": a moderator-less community MUST NOT federate at
+    /// moderated capability. `cohort_subkind: infrastructure` communities are
+    /// EXEMPT (trust + serve needs no moderator, mirroring the CC 3.2 steward-
+    /// binding carve-out). The row/record is NOT stored (verify-before-
+    /// mutation, AV-9). Stable `kind()` token
+    /// `federation_community_no_moderator`. See
+    /// [`admission::check_no_moderator_federate_admission`].
+    ///
+    /// Merit auto-promotion (§11.11 rule 2) + the CC 4.5.13 48-hour recovery
+    /// are appointment *ceremonies* that emit a `delegates_to(moderate)` signed
+    /// by the community authority — persist cannot forge that signature, so
+    /// those live one layer up; this substrate gate is the fail-secure floor
+    /// they recover the community *out of*.
+    #[error(
+        "community {community_key_id:?} has no live `moderate`-duty holder — a community \
+         federates only while ≥1 steward-bound authority root (a named moderator) exists \
+         (CC 4.5.4 / §11.11 — no unmoderated federated space; better no group than an \
+         unmoderated one). Fail-secure: it MUST NOT federate at moderated capability"
+    )]
+    CommunityHasNoModerator {
+        /// The community whose federation was refused for lack of a moderator.
+        community_key_id: String,
     },
 
     /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228 item 1 / #229 item 1)
@@ -3761,6 +3824,7 @@ impl Error {
             Error::UserTargetStewardBindingForbidden { .. } => {
                 "federation_user_target_steward_binding_forbidden"
             }
+            Error::CommunityHasNoModerator { .. } => "federation_community_no_moderator",
             Error::FederationTierUnverified { .. } => "federation_federation_tier_unverified",
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",

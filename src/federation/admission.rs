@@ -416,6 +416,18 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
         },
         ReservedPrefixRule {
             pattern_prefix: "age_assurance:".into(),
+            required_identity_types: vec![witness.clone()],
+        },
+        // v11.9.0 (CIRISPersist#309, CC 3.4.12) — the capacity-assurance
+        // ladder, the witness-reserved sibling of `age_assurance:`. A
+        // registered qualified assessor (identity_type ⊇ {witness}) attests;
+        // this covers both the `capacity_assurance:{level}:{domain}:{band}`
+        // verdicts AND the `reversible_excluded` / `reversible_pending`
+        // companions (same prefix). The SUBJECT-must-not-emit rule (attester
+        // == attested) is enforced separately in
+        // `check_reserved_prefix_admission` (an identity-independent check).
+        ReservedPrefixRule {
+            pattern_prefix: crate::federation::capacity::CAPACITY_ASSURANCE_PREFIX.into(),
             required_identity_types: vec![witness],
         },
     ]
@@ -1218,6 +1230,27 @@ fn delegation_scope_grants(envelope: &serde_json::Value, scope_token: &str) -> b
 /// `⊆`-parent attenuation check (`child.scope ⊆ parent.scope`) compares
 /// these sets along the chain. A `scope` that is neither string nor array
 /// (or absent) yields the empty set.
+/// v11.9.0 (CIRISPersist#309, CC 3.4.12 fail-to-liberty) — has a
+/// `delegates_to` row's envelope `valid_until` lapsed as of `now`? An
+/// adult-incapacity binding carries a mandatory `valid_until`; on lapse it
+/// goes non-live and the adult auto-re-sovereigns with NO steward assent. A
+/// minor-guardianship row carries no `valid_until`, so this returns `false`
+/// for it (unaffected). An unparseable `valid_until` is treated as
+/// NOT-lapsed (fail-open at read is wrong here — but a malformed binding is
+/// rejected at admission, so this branch is unreachable for admitted rows;
+/// we do not silently un-live a row on a parse quirk).
+fn delegation_valid_until_lapsed(
+    envelope: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    envelope
+        .get(crate::federation::capacity::binding_field::VALID_UNTIL)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+        .map(|vu| vu <= now)
+        .unwrap_or(false)
+}
+
 fn delegation_scope_set(envelope: &serde_json::Value) -> std::collections::HashSet<String> {
     match envelope.get("scope") {
         Some(serde_json::Value::String(s)) => std::iter::once(s.clone()).collect(),
@@ -2184,6 +2217,11 @@ pub async fn is_steward_bound(
                 continue;
             }
         }
+        // (b') fail-to-liberty — a lapsed adult-incapacity `valid_until` is
+        //      not live (CC 3.4.12; no-op for minor rows).
+        if delegation_valid_until_lapsed(&r.attestation_envelope, now) {
+            continue;
+        }
         let Some(granter) = directory.lookup_public_key(&r.attesting_key_id).await? else {
             continue;
         };
@@ -2262,6 +2300,11 @@ pub async fn steward_bindings_of(
             if exp <= now {
                 continue;
             }
+        }
+        // Fail-to-liberty (CC 3.4.12): a lapsed adult-incapacity `valid_until`
+        // is non-live; the adult auto-re-sovereigns. No-op for minor rows.
+        if delegation_valid_until_lapsed(&r.attestation_envelope, now) {
+            continue;
         }
         let Some(granter) = directory.lookup_public_key(&r.attesting_key_id).await? else {
             continue;
@@ -2418,6 +2461,11 @@ pub async fn steward_binding_chain(
                 continue;
             }
         }
+        // Fail-to-liberty (CC 3.4.12): a lapsed adult-incapacity `valid_until`
+        // is non-live; the adult auto-re-sovereigns. No-op for minor rows.
+        if delegation_valid_until_lapsed(&r.attestation_envelope, now) {
+            continue;
+        }
         let Some(granter) = directory.lookup_public_key(&r.attesting_key_id).await? else {
             continue;
         };
@@ -2566,6 +2614,164 @@ pub async fn check_community_membership_steward_binding(
         }
     }
     Ok(())
+}
+
+/// v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11 — the no-moderator-no-federate
+/// existence invariant) — the **substrate** federate-gate: a `community`
+/// federates (is admitted to, and continues at, moderated capability) ONLY
+/// while ≥1 live holder of its `moderate` duty exists. This is the moderation
+/// analogue of the CC 3.2 steward-binding gate, and — like it — lives in the
+/// substrate where the write lands, NOT in a governance / consumer-policy
+/// layer (§11.11 "the gate lives where the write lands"; resolving the
+/// CIRISPersist#238 / CIRISRegistry#110(a) ownership ambiguity to SUBSTRATE).
+///
+/// Takes the [`Community`](crate::federation::types::Community) record
+/// **directly** (not via `lookup_community`) — the reusable admission-decision
+/// primitive over a record in hand (in-flight or stored). For the
+/// federation-apply re-check keyed on a stored community's id, see
+/// [`check_no_moderator_federate_admission_by_id`]; both are the load-bearing
+/// enforcement point [`check_no_moderator_federate_apply`] consumes.
+///
+/// # Enforcement point (design note — CIRISPersist#238)
+///
+/// The §11.11 gate is enforced at the **federation-apply chokepoint**: every
+/// federation-tier attestation apply step keyed on `C`
+/// ([`check_no_moderator_federate_apply`], wired into every backend's
+/// `put_attestation`). This point subsumes BOTH spec evaluation points — a
+/// community's **first** federation-tier apply keyed on `C` IS its
+/// admission-to-federate (i), and every subsequent one is the continue-to-
+/// federate re-check (ii). It is deliberately NOT wired into `put_community`:
+/// storing a community *record* is not itself "federating" (a local-only
+/// community that never emits federation-tier content keyed on `C` causes no
+/// unmoderated-federation harm), and hard-failing record storage would also
+/// fail-secure communities that §11.11 rule-2 merit auto-promotion / the CC
+/// 4.5.13 recovery could still rescue — ceremonies persist cannot itself
+/// perform (it cannot forge the authority's appointment signature). The gate
+/// thus "lives where the [federation] write lands." This function remains the
+/// admission-decision primitive a consumer/governance layer MAY call to decide
+/// admission ahead of federation.
+///
+/// # The existence check
+///
+/// A named moderator exists IFF the community has ≥1 **steward-bound authority
+/// root**. This is exact, not an approximation: [`is_named_moderator`] admits
+/// `k` only via a chain rooted at some `root ∈ authority_set(C)` with
+/// [`is_steward_bound(root)`](is_steward_bound) — and that steward-bound root
+/// is itself a **zero-hop** named moderator. So `moderators_of(C, moderate)`
+/// is non-empty IFF such a root exists; we test that directly (the authority
+/// set computed from the in-flight record's roster, per
+/// [`community_authority_set`]'s `founder_only`-vs-open rule), avoiding the
+/// per-delegate walk.
+///
+/// # Carve-out + fail-secure
+///
+/// `cohort_subkind: infrastructure` communities
+/// ([`is_authorized_infrastructure_community`]) are EXEMPT — a node MAY trust +
+/// serve an infrastructure community (`ciris-canonical` / governance roots)
+/// with no moderator, mirroring the CC 3.2 steward-binding carve-out. Every
+/// other community with no steward-bound authority root is REFUSED with
+/// [`Error::CommunityHasNoModerator`] BEFORE any row is stored
+/// (verify-before-mutation, AV-9) — §11.11 rule 3 fail-secure, "better no
+/// group than an unmoderated one".
+///
+/// Merit auto-promotion (§11.11 rule 2) + the CC 4.5.13 48-hour recovery are
+/// signed appointment *ceremonies* (a `delegates_to(moderate)` emitted by the
+/// community authority); persist cannot forge that authority signature, so
+/// they live one layer up. This gate is the fail-secure floor the ceremony
+/// recovers the community out of — the substrate never *fabricates* a
+/// moderator, it only refuses to federate one that does not exist.
+pub async fn check_no_moderator_federate_admission(
+    directory: &dyn super::FederationDirectory,
+    community: &super::Community,
+) -> Result<(), Error> {
+    // Infrastructure carve-out (authorized only — SecReview F2 fail-secure):
+    // trust + serve needs no moderator.
+    if is_authorized_infrastructure_community(directory, community).await? {
+        return Ok(());
+    }
+    // Authority set from the in-flight roster (mirrors community_authority_set:
+    // founders always; every member too under a non-`founder_only` protocol).
+    let founder_only =
+        community.consensus_protocol == crate::federation::types::consensus_protocol::FOUNDER_ONLY;
+    for m in &community.members {
+        let is_authority = m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER) || !founder_only;
+        if is_authority && is_steward_bound(directory, &m.key_id).await? {
+            // ≥1 steward-bound authority root ⇒ a live (zero-hop) named
+            // moderator exists ⇒ the community may federate.
+            return Ok(());
+        }
+    }
+    Err(Error::CommunityHasNoModerator {
+        community_key_id: community.community_key_id.clone(),
+    })
+}
+
+/// v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — the **federation-apply**
+/// re-check of [`check_no_moderator_federate_admission`], keyed on a stored
+/// community's `community_id`. §11.11 requires the moderator-existence gate at
+/// **two** points: (i) at admission (`put_community` — the record-in-flight
+/// form above) AND (ii) **on the federation path** — "every cross-region
+/// propagation / federation apply step keyed on C MUST re-check live
+/// `moderate`-holder existence at apply time, so a community that *loses* its
+/// moderator (lapse / `withdraws`-revocation / freshness expiry) cannot
+/// continue at moderated capability." Mid-life moderator loss happens via
+/// `delegates_to` retraction / steward-binding lapse — NOT via a community
+/// re-write — so the community-record admission gate alone cannot catch it;
+/// this apply-time re-check does.
+///
+/// Resolves the community via [`FederationDirectory::lookup_community`]. A
+/// community **not locally known** is out of scope — `Ok(())` (fail-open): the
+/// substrate cannot resolve an absent record's moderators, and a
+/// federation-tier row keyed on it is governed by that peer's own admission
+/// gate; the known-community record admission gate is the authoritative point.
+/// A known community runs the full existence + infrastructure-carve-out check.
+pub async fn check_no_moderator_federate_admission_by_id(
+    directory: &dyn super::FederationDirectory,
+    community_id: &str,
+) -> Result<(), Error> {
+    if community_id.is_empty() {
+        return Ok(());
+    }
+    let Some(community) = directory.lookup_community(community_id).await? else {
+        return Ok(());
+    };
+    check_no_moderator_federate_admission(directory, &community).await
+}
+
+/// v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — the `put_attestation` entry
+/// point for the §11.11 federation-apply re-check (point ii). A
+/// **federation-tier** attestation carrying a `community_id` in its envelope is
+/// a "federation apply step keyed on C"; it is refused if `C` has no live
+/// `moderate`-holder ([`check_no_moderator_federate_admission_by_id`]).
+///
+/// A no-op (`Ok(())`) for:
+/// - **local-tier** rows — a local-tier write is private to the producing
+///   occurrence and not a federation apply step (CC 5.3.2.2), and
+/// - rows carrying **no** `community_id` (not keyed on a community), and
+/// - a `community_id` **not locally known** (out of scope — fail-open, per
+///   [`check_no_moderator_federate_admission_by_id`]).
+///
+/// A founder appointment (`delegates_to(moderate)` keyed on C) is NOT
+/// chicken-and-egg-blocked: a steward-bound founder is already a zero-hop named
+/// moderator, so `C` is not moderator-less at that point; and a non-steward-
+/// bound founder could not root a moderator via the appointment anyway (the
+/// walk requires a steward-bound root). Verify-before-mutation (AV-9) — wired
+/// alongside the other shared admission gates on every backend's
+/// `put_attestation`, before the row is hashed + INSERTed.
+pub async fn check_no_moderator_federate_apply(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    // Only federation-tier rows are a federation apply step.
+    if row.tier != crate::federation::types::attestation_tier::FEDERATION {
+        return Ok(());
+    }
+    let community_id = row
+        .attestation_envelope
+        .get("community_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    check_no_moderator_federate_admission_by_id(directory, community_id).await
 }
 
 /// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §11.11) — is key `k` a **named
@@ -3105,6 +3311,13 @@ pub async fn check_node_agency_admission(
 ///   attesting_key_id` is structural on the emit path, so no separate signer
 ///   check is needed.
 ///
+/// v11.9.0 (CIRISPersist#309, CC 3.4.12): an ADULT user target is no longer
+/// rejected unconditionally — it is dispatched to
+/// [`check_adult_incapacity_binding`], the single narrow aperture that admits
+/// an attested-incapacitated adult under a scoped, bounded, independently-
+/// attested fiduciary binding (and re-asserts `target_is_self_sovereign` when
+/// no live incapacity is attested — the presumption of capacity).
+///
 /// Verify-before-mutation (AV-9): wired into every backend's
 /// `put_attestation` immediately AFTER [`check_node_agency_admission`], so a
 /// rejected emission leaves no trace. Backend-agnostic — resolution uses the
@@ -3131,18 +3344,29 @@ pub async fn check_user_target_steward_binding_admission(
     if !target_set.contains(identity_type::USER) {
         return Ok(());
     }
-    // The target is a user. It must be a PROVEN minor to be stewardable.
+    // The target is a user. The default CC 3.2 rule admits ONLY a proven
+    // minor (guardianship). An ADULT target is un-stewardable by default —
+    // EXCEPT the single narrow CC 3.4.12 adult-incapacity aperture, which
+    // this dispatches to. An unverified age is neither (presumption of
+    // sovereignty).
     let target_band = age_band(directory, &row.attested_key_id).await?;
-    if target_band != AgeBand::Minor {
-        let reason = match target_band {
-            AgeBand::Adult => "target_is_self_sovereign",
-            // Unknown (presumption of sovereignty).
-            _ => "target_age_unverified",
-        };
-        return Err(Error::UserTargetStewardBindingForbidden {
-            target_key_id: row.attested_key_id.clone(),
-            reason,
-        });
+    match target_band {
+        AgeBand::Minor => { /* fall through to minor-guardianship checks */ }
+        AgeBand::Adult => {
+            // The adult-incapacity path is the ONLY way to steward-bind an
+            // adult. It reasserts `target_is_self_sovereign` when no live
+            // incapacity is attested (presumption of capacity).
+            return check_adult_incapacity_binding(directory, row).await;
+        }
+        AgeBand::Unknown => {
+            return Err(Error::UserTargetStewardBindingForbidden {
+                target_key_id: row.attested_key_id.clone(),
+                // Presumption of sovereignty (age axis): not PROVEN a minor,
+                // and not PROVEN an adult (so not eligible for the incapacity
+                // aperture either — that predicate requires age_band == adult).
+                reason: "target_age_unverified",
+            });
+        }
     }
     // Target is a proven minor — require the granter is a proven adult user.
     let Some(granter) = directory.lookup_public_key(&row.attesting_key_id).await? else {
@@ -3161,6 +3385,179 @@ pub async fn check_user_target_steward_binding_admission(
         });
     }
     // Admit the minor-guardianship binding (S == attesting_key_id structural).
+    Ok(())
+}
+
+/// v11.9.0 (CIRISPersist#309, CC 3.4.12) — the **adult-incapacity
+/// steward-binding** admission predicate: the third — and final — admissible
+/// user-target case, and the single narrow aperture in the CC 3.2
+/// un-stewardable-adult wall. Called by
+/// [`check_user_target_steward_binding_admission`] only when the target `T`
+/// resolves to a `user`-role identity with `age_band(T) == Adult`.
+///
+/// Admits `delegates_to(S -> T)` **only** when ALL hold (CC 3.4.12 admission
+/// predicate); otherwise REJECTS with a stable reason token on
+/// [`Error::UserTargetStewardBindingForbidden`]:
+///
+/// - **`target_is_self_sovereign`** — no LIVE `capacity_assurance:*:{d}:
+///   incapacitated` for any domain (the **presumption of capacity**: absence
+///   ⇒ full capacity ⇒ the un-stewardable default reasserts).
+/// - **`scope_missing`** — the binding declares no scope (a scope-less adult
+///   binding grants nothing checkable and cannot be `⊆` the attested loss).
+/// - **`scope_exceeds_attested_domains`** — a scoped domain has no live
+///   `:incapacitated` verdict (scope MUST be `⊆` the attested loss).
+/// - **`capacity_reversible_not_excluded`** — a scoped incapacitated domain
+///   lacks its mandatory `reversible_excluded` companion, and the acute T1
+///   `reversible_pending` path does not apply (wrong tier / missing pending /
+///   wrong legitimacy source).
+/// - **`scope_touches_protected_domain`** — scope intersects
+///   [`crate::federation::capacity::PROTECTED_NON_TRANSFERABLE`] (the
+///   apophatic floor: contact / relational / voting / marriage / reproduction
+///   are never delegable).
+/// - **`attester_conflicted`** — a capacity assessor for a covered domain is
+///   the steward `S` or the `petitioner` (assessor-independence; no one mints
+///   the incapacity of a person they propose to steward).
+/// - **`missing_legitimacy_source`** — `binding_legitimacy_source` is absent
+///   or not one of {`prior_will_proxy`, `wa_due_process_quorum`,
+///   `emergency_necessity_expedited`} (NEVER the steward's signature alone).
+/// - **`missing_valid_until`** — no `valid_until` (mandatory expiry ⇒
+///   fail-to-liberty).
+/// - **`valid_until_unparseable`** — `valid_until` is not an ISO-8601 instant.
+/// - **`valid_until_exceeds_review_cadence`** — the window exceeds
+///   [`crate::federation::capacity::T2_REVIEW_CADENCE_DAYS`] (no window may
+///   outrun periodic review).
+///
+/// **Fail-to-liberty** is enforced at READ time, not here: a binding whose
+/// `valid_until` has lapsed is treated as non-live by
+/// [`steward_bindings_of`], so the adult auto-re-sovereigns with no steward
+/// assent (see that function). This gate only guarantees a mandatory,
+/// bounded `valid_until` is present so the lapse mechanism can fire.
+///
+/// **Deliberately scoped down (CIRISPersist#309), tracked for follow-up:**
+/// the `panel`-rung M-of-N independent-quorum requirement for continuing /
+/// asset-bearing domains, the T1 retrospective-WA-audit HARD_DEADLINE + the
+/// irreversible-acts prohibition, the ward's-champion / inalienable-channel
+/// roles, and the supported-vs-substituted distinct-wire-shape check are
+/// governance/temporal concerns above this admission chokepoint. This gate
+/// enforces the structural core (per-domain incapacity + reversible exclusion,
+/// scope containment, protected-domain exclusion, assessor independence vs
+/// steward/petitioner, a mandatory bounded legitimacy source, and the
+/// fail-to-liberty `valid_until`).
+pub async fn check_adult_incapacity_binding(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    use super::age::{age_band, AgeBand};
+    use crate::federation::capacity::{
+        binding_field, is_protected_domain, legitimacy_source, tier, T2_REVIEW_CADENCE_DAYS,
+    };
+    let reject = |reason: &'static str| {
+        Err(Error::UserTargetStewardBindingForbidden {
+            target_key_id: row.attested_key_id.clone(),
+            reason,
+        })
+    };
+    let env = &row.attestation_envelope;
+
+    // Gather the ward's live incapacity facts in a single pass.
+    let facts =
+        crate::federation::capacity::incapacity_facts(directory, &row.attested_key_id).await?;
+
+    // (1) presumption of capacity: NO live incapacity attested anywhere ⇒ the
+    // adult is sovereign, the CC 3.2 default reasserts. (Checked FIRST so a
+    // capacitated adult target always reports `target_is_self_sovereign`.)
+    if facts.incapacitated_domains.is_empty() {
+        return reject("target_is_self_sovereign");
+    }
+
+    // The steward S must itself be an adult `user` (CC 3.4.12 "steward is a
+    // user identity (adult)"). A minor / non-user cannot be a fiduciary.
+    let steward_is_adult_user = match directory.lookup_public_key(&row.attesting_key_id).await? {
+        Some(rec) => {
+            identity_type::set_contains(&rec.identity_type, identity_type::USER)
+                && age_band(directory, &row.attesting_key_id).await? == AgeBand::Adult
+        }
+        None => false,
+    };
+    if !steward_is_adult_user {
+        return reject("granter_not_adult_user");
+    }
+
+    // (2) the delegated scope — the domains the steward may act in. Reuse the
+    // shared `scope` reader (bare-string OR array-set). For an adult-incapacity
+    // binding the scope tokens are decision-domains.
+    let scope = delegation_scope_set(env);
+    if scope.is_empty() {
+        return reject("scope_missing");
+    }
+
+    // Whether the T1 acute path (reversible_pending in lieu of _excluded) is
+    // available for this binding: tier == T1 AND legitimacy == emergency.
+    let legit = env
+        .get(binding_field::LEGITIMACY_SOURCE)
+        .and_then(serde_json::Value::as_str);
+    let binding_tier = env
+        .get(binding_field::TIER)
+        .and_then(serde_json::Value::as_str);
+    let t1_path = binding_tier == Some(tier::T1_EMERGENCY_NECESSITY)
+        && legit == Some(legitimacy_source::EMERGENCY_NECESSITY_EXPEDITED);
+
+    // (3) scope ⊆ attested-incapacitated domains, each with reversible
+    // exclusion (or the T1 pending path), and none protected.
+    for d in &scope {
+        if is_protected_domain(d) {
+            return reject("scope_touches_protected_domain");
+        }
+        if !facts.incapacitated_domains.contains(d) {
+            return reject("scope_exceeds_attested_domains");
+        }
+        let excluded = facts.reversible_excluded_domains.contains(d);
+        let pending_ok = t1_path && facts.reversible_pending_domains.contains(d);
+        if !excluded && !pending_ok {
+            return reject("capacity_reversible_not_excluded");
+        }
+    }
+
+    // (4) assessor independence: no capacity attester for the covered domains
+    // may be the steward S or the petitioner (anti-capture). `S` is the
+    // granter = attesting_key_id of the delegates_to.
+    let steward = row.attesting_key_id.as_str();
+    let petitioner = env
+        .get(binding_field::PETITIONER_KEY_ID)
+        .and_then(serde_json::Value::as_str);
+    if facts.incapacity_attesters.contains(steward)
+        || petitioner
+            .map(|p| facts.incapacity_attesters.contains(p))
+            .unwrap_or(false)
+    {
+        return reject("attester_conflicted");
+    }
+
+    // (5) mandatory legitimacy source ∈ the closed set — NEVER the steward's
+    // signature alone (naked self-appointment).
+    match legit {
+        Some(s) if legitimacy_source::is_valid(s) => {}
+        _ => return reject("missing_legitimacy_source"),
+    }
+
+    // (6) mandatory bounded valid_until (fail-to-liberty).
+    let Some(vu_raw) = env
+        .get(binding_field::VALID_UNTIL)
+        .and_then(serde_json::Value::as_str)
+    else {
+        return reject("missing_valid_until");
+    };
+    let Ok(valid_until) = vu_raw.parse::<chrono::DateTime<chrono::Utc>>() else {
+        return reject("valid_until_unparseable");
+    };
+    // No window may outrun the T2 periodic-review cadence.
+    let ceiling = chrono::Utc::now() + chrono::Duration::days(T2_REVIEW_CADENCE_DAYS);
+    if valid_until > ceiling {
+        return reject("valid_until_exceeds_review_cadence");
+    }
+
+    // ADMIT the scoped, bounded, independently-attested adult-incapacity
+    // fiduciary binding (CC 3.4.12).
     Ok(())
 }
 
@@ -3200,6 +3597,21 @@ pub async fn check_reserved_prefix_admission(
     // CC 3.4.5 — capacity:* self-emission. Cheapest check (no lookup); an
     // attester==attested rule independent of identity_type.
     if at.starts_with("capacity:") && row.attesting_key_id == row.attested_key_id {
+        return Err(Error::CapacitySelfEmissionRejected {
+            key_id: row.attesting_key_id.clone(),
+            attestation_type: at.to_owned(),
+        });
+    }
+
+    // CC 3.4.12 — capacity_assurance:* the SUBJECT must not self-mint their
+    // own (in)capacity ("the subject MUST NOT emit it"). An attester==attested
+    // check independent of identity_type; the witness-RESERVED half (only a
+    // registered `witness` assessor may emit) rides the reserved-prefix rule
+    // table below. (`capacity_assurance:` does not start with `capacity:`, so
+    // the CC 3.4.5 check above never fires for it.)
+    if at.starts_with(crate::federation::capacity::CAPACITY_ASSURANCE_PREFIX)
+        && row.attesting_key_id == row.attested_key_id
+    {
         return Err(Error::CapacitySelfEmissionRejected {
             key_id: row.attesting_key_id.clone(),
             attestation_type: at.to_owned(),

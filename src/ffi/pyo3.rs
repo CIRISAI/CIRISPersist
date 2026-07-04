@@ -7484,6 +7484,102 @@ impl PyEngine {
         })
     }
 
+    /// v11.9.0 (CIRISPersist#309, CC 3.4.13 Q1) — the **finer four-band** age
+    /// resolution of `key_id`, the policy vocabulary ABOVE the binary
+    /// [`age_band_json`]. Returns one of `"under_13"` / `"13_15"` / `"16_17"`
+    /// / `"adult"` / `"unknown"`. The three sub-18 bands are all `minor` on
+    /// the binary wire predicate. Same witness-outranks-self one-way ratchet.
+    /// Wraps [`age_band_fine`](crate::federation::age::age_band_fine). The
+    /// `"unknown"` value is exposed verbatim: a CONTENT-axis consumer floors
+    /// it to the most-protective `"under_13"` (CC 3.4.13 Q1 fail-secure), the
+    /// steward-binding axis treats it as self-sovereign.
+    fn age_band_fine_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(move || {
+                let band = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::age::age_band_fine(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::age::age_band_fine(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key_id,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(band.as_str())
+                    .map_err(|e| PyValueError::new_err(format!("age_band_fine serialize: {e}")))
+            })
+        })
+    }
+
+    /// v11.9.0 (CIRISPersist#309, CC 3.4.12) — the resolved **capacity state**
+    /// of `key_id` for decision-`domain`, from its incoming witness
+    /// `capacity_assurance:*:{domain}:*` attestations (most-recent live wins,
+    /// `valid_until`/`expires_at` freshness). Returns one of `"capacitated"` /
+    /// `"incapacitated"` / `"unknown"`. Per the **presumption of capacity**
+    /// (CC 3.4.12), `"unknown"` (absence of any live proof) MUST be treated by
+    /// a consumer as full capacity / sovereign — never as incapacity. Wraps
+    /// [`capacity_state`](crate::federation::capacity::capacity_state).
+    fn capacity_state_json(&self, py: Python<'_>, key_id: &str, domain: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            let domain = domain.to_owned();
+            py.detach(move || {
+                let state = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::capacity::capacity_state(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key_id,
+                                &domain,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::capacity::capacity_state(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key_id,
+                                &domain,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(state.as_str())
+                    .map_err(|e| PyValueError::new_err(format!("capacity_state serialize: {e}")))
+            })
+        })
+    }
+
     /// #249 Cut A — the **duty-holders** of a bare community-scoped action
     /// (a `moderation:*` / `reconsideration:*` over `community_id` with no
     /// content subject) for `duty` (`moderate` / `takedown` / `review`): the
@@ -24370,6 +24466,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // caller-side malformed-content / authorization failure;
         // ValueError (4xx).
         crate::federation::Error::WitnessAdmit(_) => PyValueError::new_err(kind),
+        // #238 (CC 4.5.4 / §11.11) — a community with no live `moderate`-holder
+        // cannot be admitted-to / continue federating. A caller/state admission
+        // refusal (fail-secure), like the other admission gates → ValueError (4xx).
+        crate::federation::Error::CommunityHasNoModerator { .. } => PyValueError::new_err(kind),
         // Server-fault → RuntimeError (5xx).
         crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
         // v11.8.1 (CIRISPersist#329) — the directory-ops proxy was asked

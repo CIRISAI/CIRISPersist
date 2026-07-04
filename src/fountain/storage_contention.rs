@@ -12,10 +12,39 @@
 //!
 //! These shapes are **verified-at-ingest, not stored** (CC 6.1.3 store-path):
 //! there is no persist admit/put table for them — a consumer builds one to
-//! advertise / verifies one it received. The pin-vs-revocation composition (the
-//! §Q B6/N5 gate that couples a pinned budget with hard-delete eviction) is
-//! tracked separately (CIRISPersist#356 follow-up) and does not gate this wheel
-//! surface.
+//! advertise / verifies one it received.
+//!
+//! # §Q B6/N5 — pinning never defeats revocation (CIRISPersist#359)
+//!
+//! CC 6.1.5.2 §Q B6: *"Pinning never defeats consent: an active `withdraws` /
+//! `consent:state:revoked` still forces immediate descent below the noise floor
+//! **regardless of pin state**. A pin holds content above the floor against
+//! **capacity** pressure only — never against revocation."* (N5, under CC
+//! 6.1.5: revocation is a content-level dominating signal that never competes
+//! inside the priority/rarity ordering.)
+//!
+//! persist satisfies this invariant **structurally**, and the THIN form the
+//! spec confirms is sufficient:
+//!
+//! - A `StorageBudgetV1.pinned_class` / `pin_reserve_bytes` is a **verified-at-
+//!   ingest advertisement**, not persisted pin STATE. There is no pin table, no
+//!   `pinned_class` column, and no migration — nothing a deletion path could
+//!   query.
+//! - The revocation path
+//!   [`crate::store::Backend::evict_fountain_content_hard_delete`] takes only
+//!   `(content_id, corpus_kind)`. It has **no §Q pin parameter and reads no pin
+//!   state**; it unconditionally drops every symbol (it does not even consult
+//!   `retention_priority`). A pin covering that `subject_kind` therefore cannot
+//!   reach the delete, so it cannot shield the content.
+//!
+//! Because the pin advertisement and the delete never share a code path, B6
+//! holds by construction. The proof is locked by
+//! `tests/fountain_content.rs` section (j): a *verified* `StorageBudgetV1` whose
+//! `pinned_class` covers `trace` with `pin_reserve_bytes > 0` does not prevent a
+//! subsequent `evict_fountain_content_hard_delete` from removing `trace`
+//! content. Making the gate "real" (a stored pin the delete overrides) would
+//! require adding the very pin STATE whose absence is what makes revocation
+//! unconditional today — so the thin form is the conformant one.
 
 use serde::{Deserialize, Serialize};
 

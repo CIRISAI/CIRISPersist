@@ -1320,6 +1320,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // key's identity_type. Backend-symmetric with SQLite + Postgres.
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
+        // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
+        // federate FEDERATION-APPLY re-check (point ii). A federation-tier row
+        // keyed on a community (`community_id` in its envelope) is a federation
+        // apply step keyed on C; it is refused if C has lost its last live
+        // `moderate`-holder (so a moderator-less community cannot continue at
+        // moderated capability). No-op for local-tier rows, rows with no
+        // community_id, and communities not locally known. Resolves the
+        // community + steward-binding via the directory (locks state itself),
+        // so it runs before the state lock. Backend-symmetric.
+        crate::federation::admission::check_no_moderator_federate_apply(self, &row).await?;
+
         // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
         // hybrid-verify at the federation-tier bulk store/replicate
         // ingest gate (parity with the postgres + sqlite backends). A
@@ -2431,6 +2442,44 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .cmp(&a.emitted_at)
                 .then_with(|| b.event_id.cmp(&a.event_id))
         });
+        Ok(rows)
+    }
+
+    // ─── v12.5.0 (CIRISPersist#238 / #146, CEG §8.1.11.3 / §10.1.3) —
+    //     subject-side consent revocations for the consent-SLA watcher. Memory
+    //     parity with the sqlite/postgres backends (the default trait impl
+    //     errors); the promotion-overdue check
+    //     ([`run_consent_sla_watch`]) needs local-tier rows too, so this is
+    //     NOT tier-filtered (unlike list_attestations_for, which is
+    //     federation-only).
+
+    async fn list_consent_revocations(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        use crate::federation::types::attestation_type;
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                // Subject-side revocations only: a `withdraws` admitted under
+                // rule 2/3/4 (rule 1 is the producer's own self-revoke, not a
+                // consent event), OR a `consent:state:revoked` stance.
+                let is_subject_withdraws = a.attestation_type == attestation_type::WITHDRAWS
+                    && matches!(a.withdraws_admission_rule, Some(2..=4));
+                let is_consent_revoked = a
+                    .attestation_envelope
+                    .get("dimension")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|d| d.starts_with("consent:state:revoked"));
+                is_subject_withdraws || is_consent_revoked
+            })
+            .filter(|a| since.is_none_or(|s| a.asserted_at >= s))
+            .cloned()
+            .collect();
+        // Match the SQL backends: ORDER BY asserted_at DESC.
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
         Ok(rows)
     }
 
@@ -8731,6 +8780,254 @@ mod tests {
         .unwrap());
     }
 
+    /// #238 (CC 4.5.4 / §11.11) — the no-moderator-no-federate substrate gate,
+    /// decision-table style. A `community` federates ONLY while ≥1 steward-bound
+    /// authority root (a live named `moderate`-holder) exists; infrastructure
+    /// communities are EXEMPT. Enforcement lives at the federation-apply
+    /// chokepoint ([`check_no_moderator_federate_apply`]); the admission
+    /// predicate ([`check_no_moderator_federate_admission`]) is its primitive.
+    #[tokio::test]
+    async fn no_moderator_federate_gate_decision_table() {
+        use crate::federation::admission::{
+            check_no_moderator_federate_admission, check_no_moderator_federate_admission_by_id,
+            check_no_moderator_federate_apply, MEMBER_ROLE_FOUNDER,
+        };
+        use crate::federation::types::{consensus_protocol, identity_type};
+
+        // Build a community `cid` founded (founder_only) by `founder` of
+        // identity_type `founder_it`, optionally infra-labeled. Registers the
+        // community + founder keys and STORES the record (put_community itself
+        // does not gate on moderator existence — the apply path does).
+        async fn seed(
+            backend: &MemoryBackend,
+            cid: &str,
+            founder: &str,
+            founder_it: &str,
+            infra: bool,
+        ) -> crate::federation::types::Community {
+            let mut ck = fix_key(cid, "primitive", cid);
+            if infra {
+                // SecReview F2: the infra carve-out is honored only when the
+                // community's own key is the substrate_persist authority.
+                ck.identity_type = identity_type::SUBSTRATE_PERSIST.into();
+            }
+            backend
+                .put_public_key(SignedKeyRecord { record: ck })
+                .await
+                .unwrap();
+            let mut fk = fix_key(founder, "primitive", founder);
+            fk.identity_type = founder_it.into();
+            backend
+                .put_public_key(SignedKeyRecord { record: fk })
+                .await
+                .unwrap();
+            let policy_blob =
+                infra.then(|| serde_json::json!({ "cohort_subkind": "infrastructure" }));
+            let community = crate::federation::types::Community {
+                community_key_id: cid.into(),
+                community_name: "dt".into(),
+                members: vec![crate::federation::types::CommunityMember {
+                    key_id: founder.into(),
+                    joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    role: Some(MEMBER_ROLE_FOUNDER.into()),
+                }],
+                founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                consensus_protocol: consensus_protocol::FOUNDER_ONLY.into(),
+                policy_blob,
+                persist_row_hash: String::new(),
+            };
+            backend
+                .put_community(crate::federation::SignedCommunity {
+                    community: community.clone(),
+                })
+                .await
+                .expect("record stored (put_community is not the moderator gate)");
+            community
+        }
+
+        let b = MemoryBackend::new();
+
+        // ── admission predicate (the reusable primitive) ────────────────────
+        // (1) user founder = steward-bound authority root = zero-hop named
+        //     moderator → ADMIT.
+        let c_ok = seed(&b, "dt-ok", "dt-user", identity_type::USER, false).await;
+        check_no_moderator_federate_admission(&b, &c_ok)
+            .await
+            .expect("steward-bound (user) founder ⇒ has a moderator ⇒ may federate");
+
+        // (2) primitive founder = passes the steward-binding gate (not
+        //     node/agent, out of its scope) but is NOT steward-bound ⇒ NO named
+        //     moderator ⇒ REJECT, fail-secure.
+        let c_no = seed(&b, "dt-no", "dt-prim", identity_type::PRIMITIVE, false).await;
+        let err = check_no_moderator_federate_admission(&b, &c_no)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::CommunityHasNoModerator { .. }
+            ),
+            "moderator-less community refused, got {err:?}"
+        );
+        assert_eq!(err.kind(), "federation_community_no_moderator");
+
+        // (3) infrastructure community with a non-steward-bound founder →
+        //     EXEMPT (trust + serve needs no moderator) → ADMIT.
+        let c_infra = seed(&b, "dt-infra", "dt-iprim", identity_type::PRIMITIVE, true).await;
+        check_no_moderator_federate_admission(&b, &c_infra)
+            .await
+            .expect("authorized infrastructure community is exempt from the moderator gate");
+
+        // ── federation-apply chokepoint (points i + ii unified) ─────────────
+        // A federation-tier row keyed on the moderator-less community → REJECT.
+        let mut row = fix_attestation("dt-apply", "dt-prim", "dt-prim", "dt-prim");
+        row.attestation_envelope = serde_json::json!({
+            "id": "dt-apply", "dimension": "identity_binding:v1", "community_id": "dt-no"
+        });
+        let err = check_no_moderator_federate_apply(&b, &row)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::CommunityHasNoModerator { .. }
+            ),
+            "federation-apply step keyed on a moderator-less community is refused"
+        );
+        // A LOCAL-tier row keyed on it → no-op (local writes are not a
+        // federation apply step).
+        let mut local_row = row.clone();
+        local_row.tier = crate::federation::types::attestation_tier::LOCAL.into();
+        check_no_moderator_federate_apply(&b, &local_row)
+            .await
+            .expect("local-tier row is not a federation apply step");
+        // A row keyed on the MODERATORED community → ADMIT.
+        let mut live_row = row.clone();
+        live_row.attestation_envelope = serde_json::json!({
+            "id": "dt-apply2", "dimension": "identity_binding:v1", "community_id": "dt-ok"
+        });
+        check_no_moderator_federate_apply(&b, &live_row)
+            .await
+            .expect("moderatored community may continue to federate");
+        // No community_id + unknown community_id → out of scope (Ok).
+        let mut bare = row.clone();
+        bare.attestation_envelope =
+            serde_json::json!({ "id": "x", "dimension": "identity_binding:v1" });
+        check_no_moderator_federate_apply(&b, &bare)
+            .await
+            .expect("no community_id ⇒ not keyed on a community ⇒ no-op");
+        check_no_moderator_federate_admission_by_id(&b, "no-such")
+            .await
+            .expect("unknown community ⇒ out of scope ⇒ no-op");
+    }
+
+    /// #238 / #146 (CC 5.3.2.2 / §10.1.3, AV-61 transit-not-rest) — the
+    /// consent-revocation promotion-overdue `hard_case` fires at the 24 h
+    /// window boundary for a subject-side revocation that stays local-tier
+    /// (unpromoted), is idempotent on re-scan, and stops once the row promotes.
+    #[tokio::test]
+    async fn consent_revocation_promotion_overdue_fires_at_window_boundary() {
+        use crate::federation::hard_case::{kind, HardCaseFilter};
+        use crate::federation::types::attestation_tier;
+        use crate::federation::FederationDirectory;
+        use std::time::Duration;
+        let backend = MemoryBackend::new();
+        for k in ["subject-c", "target-c"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        let revoked_at: chrono::DateTime<chrono::Utc> = "2026-06-01T00:00:00Z".parse().unwrap();
+        // A subject-side `consent:state:revoked` TRANSITING local-tier
+        // (unpromoted). persist's admission gate refuses to *originate* such a
+        // local row (transit-not-rest); we stage it directly to exercise the
+        // watcher's promotion-overdue detection.
+        let mut rev = fix_attestation("rev-c", "subject-c", "target-c", "subject-c");
+        rev.attestation_envelope =
+            serde_json::json!({ "id": "rev-c", "dimension": "consent:state:revoked:v1" });
+        rev.asserted_at = revoked_at;
+        rev.subject_key_ids = vec!["subject-c".into()];
+        rev.tier = attestation_tier::LOCAL.into();
+        rev.promoted_at = None;
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .federation_attestations
+            .push(rev);
+
+        let window = Duration::from_secs(86_400); // 24 h
+
+        // The local-tier transit row is visible to the revocation scan.
+        assert_eq!(
+            backend.list_consent_revocations(None).await.unwrap().len(),
+            1,
+            "list_consent_revocations includes the local-tier transit row"
+        );
+
+        // Just BEFORE the boundary (24 h − 1 s) → in flight, NOT overdue.
+        let before = revoked_at + chrono::Duration::seconds(86_400 - 1);
+        let r = backend.run_consent_sla_watch(before, window).await.unwrap();
+        assert_eq!(r.revocations_scanned, 1);
+        assert_eq!(r.promotion_overdue, 0, "within the window: not yet overdue");
+        assert!(backend
+            .list_hard_case_events(HardCaseFilter::default())
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Just AFTER the boundary (24 h + 1 s) → overdue fires.
+        let after = revoked_at + chrono::Duration::seconds(86_400 + 1);
+        let r = backend.run_consent_sla_watch(after, window).await.unwrap();
+        assert_eq!(r.promotion_overdue, 1, "past the window: overdue fires");
+        let evs = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].target_key_id.as_deref(), Some("target-c"));
+        assert_eq!(evs[0].subject_key_id.as_deref(), Some("subject-c"));
+
+        // Re-scan is idempotent on the deterministic event_id.
+        let r = backend.run_consent_sla_watch(after, window).await.unwrap();
+        assert_eq!(r.promotion_overdue, 1, "condition still active");
+        assert_eq!(
+            backend
+                .list_hard_case_events(HardCaseFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "no duplicate overdue row on re-scan"
+        );
+
+        // Once PROMOTED (tier=federation) it drops out of the fire condition —
+        // its only other conformant terminal state (transit-not-rest).
+        {
+            let mut st = backend.state.lock().unwrap();
+            for a in st.federation_attestations.iter_mut() {
+                if a.attestation_id == "rev-c" {
+                    a.tier = attestation_tier::FEDERATION.into();
+                    a.promoted_at = Some(after);
+                }
+            }
+        }
+        let r = backend
+            .run_consent_sla_watch(after + chrono::Duration::seconds(1), window)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.promotion_overdue, 0,
+            "a promoted revocation is no longer overdue"
+        );
+    }
+
     /// steward_bindings_of: an steward-bound node (live `delegates_to(user →
     /// node, infra:*)`) → returns the binding user; an unbound node → empty.
     #[tokio::test]
@@ -9533,6 +9830,530 @@ mod tests {
             })
             .await
             .expect("a node target is governed by the node-agency gate, not the user-target gate");
+    }
+
+    // ── CIRISPersist#309 (CC 3.4.12) — adult-incapacity steward-binding ──
+
+    /// Build an adult-incapacity `delegates_to(steward -> ward)` carrying the
+    /// CC 3.4.12 envelope fields. `scope` = decision-domains; the optionals
+    /// mirror `capacity::binding_field::*`.
+    #[allow(clippy::too_many_arguments)]
+    fn fix_incapacity_binding(
+        id: &str,
+        steward: &str,
+        ward: &str,
+        scope: &[&str],
+        legit: Option<&str>,
+        valid_until: Option<&str>,
+        binding_tier: Option<&str>,
+        petitioner: Option<&str>,
+    ) -> Attestation {
+        let mut att = fix_attestation(id, steward, ward, steward);
+        att.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        let mut env = serde_json::json!({
+            "id": id,
+            "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+        });
+        let obj = env.as_object_mut().unwrap();
+        if let Some(l) = legit {
+            obj.insert("binding_legitimacy_source".into(), serde_json::json!(l));
+        }
+        if let Some(v) = valid_until {
+            obj.insert("valid_until".into(), serde_json::json!(v));
+        }
+        if let Some(t) = binding_tier {
+            obj.insert("binding_tier".into(), serde_json::json!(t));
+        }
+        if let Some(p) = petitioner {
+            obj.insert("petitioner_key_id".into(), serde_json::json!(p));
+        }
+        att.attestation_envelope = env;
+        resign_fix(&mut att);
+        att
+    }
+
+    fn assert_forbidden(e: &crate::federation::Error, want: &str) {
+        assert_eq!(e.kind(), "federation_user_target_steward_binding_forbidden");
+        match e {
+            crate::federation::Error::UserTargetStewardBindingForbidden { reason, .. } => {
+                assert_eq!(*reason, want, "wrong rejection reason");
+            }
+            other => panic!("expected UserTargetStewardBindingForbidden({want}), got {other:?}"),
+        }
+    }
+
+    /// Register `assessor`(witness), `S`(adult user), `A`(adult user); attest
+    /// S and A adults. Returns nothing; keys are `<p>-assessor/-S/-A`.
+    async fn bootstrap_incapacity(backend: &MemoryBackend, p: &str) {
+        put_typed_key(backend, &format!("{p}-assessor"), "witness").await;
+        put_typed_key(backend, &format!("{p}-S"), "user").await;
+        put_typed_key(backend, &format!("{p}-A"), "user").await;
+        for who in ["S", "A"] {
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: fix_age_attestation(
+                        &format!("{p}w-{who}"),
+                        &format!("{p}-assessor"),
+                        &format!("{p}-{who}"),
+                        "age_assurance:provider:adult:v1",
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Put a capacity attestation ABOUT `ward` from `attester`.
+    async fn put_capacity(
+        backend: &MemoryBackend,
+        id: &str,
+        attester: &str,
+        ward: &str,
+        token: &str,
+    ) {
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_age_attestation(id, attester, ward, token),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("capacity attestation {token} rejected: {e:?}"));
+    }
+
+    /// CC 3.4.12 capacity-assurance emitter discipline: witness-RESERVED (a
+    /// non-witness emitter is rejected) AND the subject MUST NOT self-emit
+    /// (attester == attested rejected even for a witness).
+    #[tokio::test]
+    async fn capacity_assurance_witness_reserved_and_no_self_emit() {
+        let backend = MemoryBackend::new();
+        put_typed_key(&backend, "cap-assessor", "witness").await;
+        put_typed_key(&backend, "cap-user", "user").await;
+        put_typed_key(&backend, "cap-subj", "user").await;
+
+        // A witness assessor CAN attest another's capacity.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_age_attestation(
+                    "cap-ok",
+                    "cap-assessor",
+                    "cap-subj",
+                    "capacity_assurance:panel:financial:incapacitated:v1",
+                ),
+            })
+            .await
+            .expect("witness assessor may attest another's capacity");
+
+        // A non-witness (plain user) may NOT emit capacity_assurance.
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_age_attestation(
+                    "cap-nonwit",
+                    "cap-user",
+                    "cap-subj",
+                    "capacity_assurance:provider:medical:incapacitated:v1",
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
+
+        // The SUBJECT must not self-mint their own (in)capacity, even as a
+        // witness (attester == attested).
+        put_typed_key(&backend, "cap-selfwit", "witness").await;
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_age_attestation(
+                    "cap-self",
+                    "cap-selfwit",
+                    "cap-selfwit",
+                    "capacity_assurance:provider:financial:incapacitated:v1",
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), "federation_capacity_self_emission_rejected");
+    }
+
+    /// CC 3.4.12 adult-incapacity admission decision table (through the REAL
+    /// `put_attestation` path): presumption-of-capacity, missing legitimacy /
+    /// valid_until, cadence ceiling, scope containment, reversible exclusion,
+    /// then a valid ADMIT that makes the steward a live anchor.
+    #[tokio::test]
+    async fn adult_incapacity_binding_gate_decision_table() {
+        use crate::federation::admission::steward_bindings_of;
+        use chrono::{Duration, Utc};
+        let backend = MemoryBackend::new();
+        bootstrap_incapacity(&backend, "ai").await;
+        let future = (Utc::now() + Duration::days(30)).to_rfc3339();
+
+        // (0) presumption of capacity — an adult with NO incapacity attested is
+        // self-sovereign (the CC 3.2 un-stewardable default reasserts).
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_incapacity_binding(
+                    "ai-0",
+                    "ai-S",
+                    "ai-A",
+                    &["financial"],
+                    Some("prior_will_proxy"),
+                    Some(&future),
+                    None,
+                    None,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_forbidden(&e, "target_is_self_sovereign");
+
+        // Attest A incapacitated for `financial` + rule out reversible mimics.
+        put_capacity(
+            &backend,
+            "aic-fin",
+            "ai-assessor",
+            "ai-A",
+            "capacity_assurance:panel:financial:incapacitated:v1",
+        )
+        .await;
+        put_capacity(
+            &backend,
+            "aic-fin-rex",
+            "ai-assessor",
+            "ai-A",
+            "capacity_assurance:reversible_excluded:financial",
+        )
+        .await;
+
+        // (1) missing legitimacy source → naked self-appointment refused.
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_incapacity_binding(
+                    "ai-1",
+                    "ai-S",
+                    "ai-A",
+                    &["financial"],
+                    None,
+                    Some(&future),
+                    None,
+                    None,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_forbidden(&e, "missing_legitimacy_source");
+
+        // (2) missing valid_until → no fail-to-liberty expiry.
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_incapacity_binding(
+                    "ai-2",
+                    "ai-S",
+                    "ai-A",
+                    &["financial"],
+                    Some("prior_will_proxy"),
+                    None,
+                    None,
+                    None,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_forbidden(&e, "missing_valid_until");
+
+        // (3) valid_until beyond the T2 review cadence (90d) → rejected.
+        let far = (Utc::now() + Duration::days(200)).to_rfc3339();
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_incapacity_binding(
+                    "ai-3",
+                    "ai-S",
+                    "ai-A",
+                    &["financial"],
+                    Some("prior_will_proxy"),
+                    Some(&far),
+                    None,
+                    None,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_forbidden(&e, "valid_until_exceeds_review_cadence");
+
+        // (4) scope exceeds the attested-incapacitated domains.
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_incapacity_binding(
+                    "ai-4",
+                    "ai-S",
+                    "ai-A",
+                    &["medical"],
+                    Some("prior_will_proxy"),
+                    Some(&future),
+                    None,
+                    None,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_forbidden(&e, "scope_exceeds_attested_domains");
+
+        // (5) attested incapacitated but reversible mimics NOT excluded.
+        put_capacity(
+            &backend,
+            "aic-res",
+            "ai-assessor",
+            "ai-A",
+            "capacity_assurance:provider:residence:incapacitated:v1",
+        )
+        .await;
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_incapacity_binding(
+                    "ai-5",
+                    "ai-S",
+                    "ai-A",
+                    &["residence"],
+                    Some("prior_will_proxy"),
+                    Some(&future),
+                    None,
+                    None,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_forbidden(&e, "capacity_reversible_not_excluded");
+
+        // (6) ADMIT — scope ⊆ attested loss, reversible excluded, prior-will
+        // legitimacy, bounded valid_until, independent assessor.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_incapacity_binding(
+                    "ai-6",
+                    "ai-S",
+                    "ai-A",
+                    &["financial"],
+                    Some("prior_will_proxy"),
+                    Some(&future),
+                    None,
+                    None,
+                ),
+            })
+            .await
+            .expect("valid adult-incapacity binding is admitted");
+
+        // A live binding makes S an anchor of A; A (an adult) also self-anchors
+        // (it is never demoted to a perpetual minor).
+        let anchors = steward_bindings_of(&backend, "ai-A").await.unwrap();
+        assert!(anchors.contains(&"ai-S".to_string()), "S is a live anchor");
+        assert!(
+            anchors.contains(&"ai-A".to_string()),
+            "the adult retains its own self-anchor (never a perpetual minor)"
+        );
+    }
+
+    /// CC 3.4.12 T1 acute path: `reversible_pending` (in lieu of `_excluded`)
+    /// is admissible ONLY for `binding_tier == T1_emergency_necessity` with the
+    /// `emergency_necessity_expedited` legitimacy source.
+    #[tokio::test]
+    async fn adult_incapacity_t1_reversible_pending_path() {
+        use crate::federation::capacity::{legitimacy_source, tier};
+        use chrono::{Duration, Utc};
+        let backend = MemoryBackend::new();
+        bootstrap_incapacity(&backend, "t1").await;
+        let soon = (Utc::now() + Duration::days(2)).to_rfc3339();
+        put_capacity(
+            &backend,
+            "t1c",
+            "t1-assessor",
+            "t1-A",
+            "capacity_assurance:provider:medical:incapacitated:v1",
+        )
+        .await;
+        put_capacity(
+            &backend,
+            "t1c-pend",
+            "t1-assessor",
+            "t1-A",
+            "capacity_assurance:reversible_pending:medical",
+        )
+        .await;
+
+        // Standard path (no T1 tier) with only `pending` → rejected.
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_incapacity_binding(
+                    "t1-std",
+                    "t1-S",
+                    "t1-A",
+                    &["medical"],
+                    Some(legitimacy_source::PRIOR_WILL_PROXY),
+                    Some(&soon),
+                    None,
+                    None,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_forbidden(&e, "capacity_reversible_not_excluded");
+
+        // T1 acute path → admitted.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_incapacity_binding(
+                    "t1-ok",
+                    "t1-S",
+                    "t1-A",
+                    &["medical"],
+                    Some(legitimacy_source::EMERGENCY_NECESSITY_EXPEDITED),
+                    Some(&soon),
+                    Some(tier::T1_EMERGENCY_NECESSITY),
+                    None,
+                ),
+            })
+            .await
+            .expect("T1 emergency-necessity + reversible_pending is admitted");
+    }
+
+    /// CC 3.4.12 apophatic floor: a protected non-transferable domain (voting)
+    /// is rejected even when incapacity + reversible exclusion are attested.
+    #[tokio::test]
+    async fn adult_incapacity_protected_domain_rejected() {
+        use chrono::{Duration, Utc};
+        let backend = MemoryBackend::new();
+        bootstrap_incapacity(&backend, "pd").await;
+        let future = (Utc::now() + Duration::days(10)).to_rfc3339();
+        put_capacity(
+            &backend,
+            "pdc",
+            "pd-assessor",
+            "pd-A",
+            "capacity_assurance:panel:voting:incapacitated:v1",
+        )
+        .await;
+        put_capacity(
+            &backend,
+            "pdc-rex",
+            "pd-assessor",
+            "pd-A",
+            "capacity_assurance:reversible_excluded:voting",
+        )
+        .await;
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_incapacity_binding(
+                    "pd-b",
+                    "pd-S",
+                    "pd-A",
+                    &["voting"],
+                    Some("wa_due_process_quorum"),
+                    Some(&future),
+                    None,
+                    None,
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_forbidden(&e, "scope_touches_protected_domain");
+    }
+
+    /// CC 3.4.12 assessor-independence: the capacity attester may not be the
+    /// petitioner (anti-capture). The steward-is-attester case rides the same
+    /// `incapacity_attesters.contains(steward)` branch.
+    #[tokio::test]
+    async fn adult_incapacity_conflicted_attester_rejected() {
+        use chrono::{Duration, Utc};
+        let backend = MemoryBackend::new();
+        bootstrap_incapacity(&backend, "cf").await;
+        let future = (Utc::now() + Duration::days(10)).to_rfc3339();
+        put_capacity(
+            &backend,
+            "cfc",
+            "cf-assessor",
+            "cf-A",
+            "capacity_assurance:panel:financial:incapacitated:v1",
+        )
+        .await;
+        put_capacity(
+            &backend,
+            "cfc-rex",
+            "cf-assessor",
+            "cf-A",
+            "capacity_assurance:reversible_excluded:financial",
+        )
+        .await;
+        // petitioner == the assessor → conflicted.
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_incapacity_binding(
+                    "cf-b",
+                    "cf-S",
+                    "cf-A",
+                    &["financial"],
+                    Some("wa_due_process_quorum"),
+                    Some(&future),
+                    None,
+                    Some("cf-assessor"),
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_forbidden(&e, "attester_conflicted");
+    }
+
+    /// CC 3.4.12 fail-to-liberty: a binding whose `valid_until` has lapsed is
+    /// non-live — the steward drops out of the ward's anchors and the adult
+    /// auto-re-sovereigns (self-anchor only), with NO steward assent.
+    #[tokio::test]
+    async fn adult_incapacity_fail_to_liberty_auto_re_sovereign() {
+        use crate::federation::admission::steward_bindings_of;
+        use chrono::{Duration, Utc};
+        let backend = MemoryBackend::new();
+        bootstrap_incapacity(&backend, "fl").await;
+        put_capacity(
+            &backend,
+            "flc",
+            "fl-assessor",
+            "fl-A",
+            "capacity_assurance:panel:financial:incapacitated:v1",
+        )
+        .await;
+        put_capacity(
+            &backend,
+            "flc-rex",
+            "fl-assessor",
+            "fl-A",
+            "capacity_assurance:reversible_excluded:financial",
+        )
+        .await;
+        // Admit a binding whose valid_until is ALREADY in the past (structurally
+        // admissible: present, parseable, within the cadence ceiling).
+        let lapsed = (Utc::now() - Duration::days(1)).to_rfc3339();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_incapacity_binding(
+                    "fl-b",
+                    "fl-S",
+                    "fl-A",
+                    &["financial"],
+                    Some("prior_will_proxy"),
+                    Some(&lapsed),
+                    None,
+                    None,
+                ),
+            })
+            .await
+            .expect("a lapsed-valid_until binding is structurally admitted");
+
+        // Fail-to-liberty at READ: the lapsed edge confers no standing. S is
+        // NOT an anchor; the adult self-anchors (auto-re-sovereign).
+        let anchors = steward_bindings_of(&backend, "fl-A").await.unwrap();
+        assert!(
+            !anchors.contains(&"fl-S".to_string()),
+            "a lapsed adult-incapacity binding must NOT confer steward standing"
+        );
+        assert_eq!(
+            anchors,
+            vec!["fl-A".to_string()],
+            "the adult auto-re-sovereigns to its own self-anchor with no steward assent"
+        );
     }
 
     /// Minor-stewardship liveness fail-secure (CC 3.2): a minor user bound by
