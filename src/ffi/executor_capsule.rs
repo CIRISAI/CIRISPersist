@@ -226,34 +226,69 @@ pub static PERSIST_EXECUTOR_VTABLE: AsyncExecutorVTable = AsyncExecutorVTable {
 /// MUST be invoked exclusively through the vtable's function pointer,
 /// never called directly from outside `ciris_persist.abi3.so`.
 unsafe extern "C" fn persist_spawn(data: *mut c_void, task: *mut TaskOpaque) {
-    // SAFETY: per the vtable contract, `data` was produced by
-    // `Arc::into_raw(Arc<Runtime>)` on the persist side. We
-    // reconstruct without dropping by cloning and re-leaking.
-    let runtime: Arc<tokio::runtime::Runtime> = unsafe {
-        let raw = data as *const tokio::runtime::Runtime;
-        let arc = Arc::from_raw(raw);
-        let clone = arc.clone();
-        // Don't drop ours — we don't own the data pointer; the
-        // capsule does. Re-leak to keep refcount stable.
-        let _ = Arc::into_raw(arc);
-        clone
-    };
+    // #354 (CIRISPersist#354): guard the C-ABI boundary. This is an
+    // `extern "C"` frame — a panic that unwinds out of it hits
+    // `"cannot catch foreign exceptions"` and **aborts the host
+    // process** (rc=-6 / SIGABRT). Since Rust 1.81 an `extern "C"` fn
+    // aborts on unwind by default. So wrap the whole body in
+    // `catch_unwind`: if reconstructing the handles or `runtime.spawn`
+    // (e.g. onto a shutting-down runtime) panics, we contain it here
+    // and log — never let it cross back into the consumer's `.so`.
+    //
+    // (The spawned *future's* own panics are already contained by
+    // tokio's task harness — a panicking task fails its JoinHandle, it
+    // does not abort the runtime. This guard covers the synchronous
+    // glue, which the harness does not.)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: per the vtable contract, `data` was produced by
+        // `Arc::into_raw(Arc<Runtime>)` on the persist side. We
+        // reconstruct without dropping by cloning and re-leaking.
+        let runtime: Arc<tokio::runtime::Runtime> = unsafe {
+            let raw = data as *const tokio::runtime::Runtime;
+            let arc = Arc::from_raw(raw);
+            let clone = arc.clone();
+            // Don't drop ours — we don't own the data pointer; the
+            // capsule does. Re-leak to keep refcount stable.
+            let _ = Arc::into_raw(arc);
+            clone
+        };
 
-    // SAFETY: per the vtable contract, `task` was produced by
-    // `Box::into_raw(Box::new(Box::pin(async { ... }) as Pin<Box<dyn
-    // Future + Send + 'static>>))` on the consumer side. We
-    // reconstruct and take ownership.
-    type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-    let wrapped: Box<BoxedFut> = unsafe { Box::from_raw(task as *mut BoxedFut) };
-    let future: BoxedFut = *wrapped;
+        // SAFETY: per the vtable contract, `task` was produced by
+        // `Box::into_raw(Box::new(Box::pin(async { ... }) as Pin<Box<dyn
+        // Future + Send + 'static>>))` on the consumer side. We
+        // reconstruct and take ownership.
+        type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+        let wrapped: Box<BoxedFut> = unsafe { Box::from_raw(task as *mut BoxedFut) };
+        let future: BoxedFut = *wrapped;
 
-    // Spawn onto persist's tokio runtime. The future's polling will
-    // happen on a worker thread owned by this runtime, so tokio's
-    // thread-local current-runtime context will resolve to persist's
-    // tokio throughout the future's lifetime. Calls to persist's
-    // public API from inside the future use persist's tokio
-    // primitives naturally.
-    runtime.spawn(future);
+        // Spawn onto persist's tokio runtime. The future's polling will
+        // happen on a worker thread owned by this runtime, so tokio's
+        // thread-local current-runtime context will resolve to persist's
+        // tokio throughout the future's lifetime. Calls to persist's
+        // public API from inside the future use persist's tokio
+        // primitives naturally.
+        runtime.spawn(future);
+    }));
+    if let Err(payload) = result {
+        let msg = panic_payload_msg(&payload);
+        tracing::error!(
+            panic = %msg,
+            "ciris_persist executor_capsule::spawn panicked — contained at the C-ABI \
+             boundary; host process NOT aborted (the spawn was dropped)"
+        );
+    }
+}
+
+/// #354 — extract a human-readable message from a `catch_unwind` payload
+/// (`Box<dyn Any + Send>`): `String`, then `&'static str`, then a fallback.
+fn panic_payload_msg(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        "(opaque panic payload)".to_string()
+    }
 }
 
 /// Implementation of `AsyncExecutorVTable::drop` for persist's tokio.
@@ -450,6 +485,50 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("multi-thread runtime drives spawned tasks; receive must succeed");
         assert_eq!(received, "hello from persist's tokio");
+
+        unsafe { (executor.vtable.drop)(executor.data) };
+        drop(runtime);
+    }
+
+    #[test]
+    fn panicking_spawned_task_does_not_abort_host_and_executor_survives() {
+        // #354: a consumer future that panics MUST NOT abort the host. tokio's
+        // task harness contains the future's panic; `persist_spawn`'s
+        // `catch_unwind` covers the synchronous C-ABI glue. This test proves
+        // the end-to-end guarantee: after a panicking task, the executor still
+        // runs a normal task to completion (runtime + process intact).
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let executor = build_persist_executor(runtime.clone());
+
+        type BoxedFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+        // 1. Spawn a task that panics. If this aborted the host, the test
+        //    binary would die with SIGABRT (a hard test failure), not proceed.
+        let boom: BoxedFut = Box::pin(async move {
+            panic!("boom in a spawned consumer task (#354 containment probe)");
+        });
+        let boom_ptr: *mut TaskOpaque = Box::into_raw(Box::new(boom)).cast();
+        unsafe { (executor.vtable.spawn)(executor.data, boom_ptr) };
+
+        // 2. Spawn a normal task; if it completes, the runtime survived the panic.
+        let (tx, rx) = mpsc::channel::<&'static str>();
+        let ok: BoxedFut = Box::pin(async move {
+            let _ = tx.send("executor still alive");
+        });
+        let ok_ptr: *mut TaskOpaque = Box::into_raw(Box::new(ok)).cast();
+        unsafe { (executor.vtable.spawn)(executor.data, ok_ptr) };
+
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok("executor still alive"),
+            "the executor must keep running after a spawned task panicked"
+        );
 
         unsafe { (executor.vtable.drop)(executor.data) };
         drop(runtime);
