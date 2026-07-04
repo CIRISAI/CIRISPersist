@@ -61,9 +61,22 @@ use serde::{Deserialize, Serialize};
 
 pub use ciris_verify_core::holonomic::aggregation::descend_order;
 pub use ciris_verify_core::holonomic::{
-    ejection_verdict, member_commitment, verify_aggregation_meta, verify_member_commitment,
-    AggregationMetaVerification, EjectionVerdict,
+    ejection_verdict, member_commitment, passes_dominance_gate, verify_aggregation_meta,
+    verify_member_commitment, AggregationMetaVerification, EjectionVerdict,
 };
+
+/// §19.7.1.2 (CIRISVerify#167 / CIRISPersist#357) — the CC 6.1.2 noise-floor
+/// dominance floor persist enforces at admission: a composite's **effective**
+/// source count (`n_eff`) must be at least this fraction of its raw
+/// `source_count`, else one source supplies too much of the mass and the
+/// "aggregate" leaks a recoverable dominant source (the 900/1000 case →
+/// `n_eff ≈ 1`). `0.5` = effective N must be ≥ half of raw N.
+///
+/// **Fail-closed:** [`passes_dominance_gate`] is `false` for a version-1 tier
+/// (no *signed* `n_eff`), so a v1 tier is rejected — this is the intended
+/// §19.7.1.2 posture (a dominated aggregator cannot bypass the floor by
+/// declaring the pre-#167 schema). Pinned here; twins with CIRISConstitution#6.
+pub const MIN_DOMINANCE_RATIO: f64 = 0.5;
 
 /// `corpus_kind` prefix for an aggregate composite: a composite folding
 /// `"trace"` sources has `corpus_kind = "aggregate:trace"`.
@@ -104,6 +117,17 @@ pub struct AggregationMetaVerifyInputsV1 {
     pub aggregation_algorithm_id: String,
     /// N members aggregated into this tier (the descent fan-in).
     pub source_count: u32,
+    /// §19.7.1.2 (CIRISVerify#167) — signed effective-source-count
+    /// (inverse-Simpson `n_eff = (Σmᵢ)²/Σmᵢ²`). **Signed only when
+    /// `version >= 2`**; a v1 tier's preimage does NOT include it, so its
+    /// value is verification-neutral (persist re-emits it into the
+    /// verify-core meta so a version-2 tier's canonical preimage — which
+    /// appends `u32(n_eff)` — reproduces byte-for-byte). `#[serde(default)]`
+    /// so pre-#167 stored/wire inputs (no `n_eff`) still parse; a v1 tier
+    /// defaults to `0`, which is fine (not in its preimage, and it fails
+    /// [`ciris_verify_core::holonomic::passes_dominance_gate`] closed).
+    #[serde(default)]
+    pub n_eff: u32,
     /// §19.7.1.1 Merkle root over the source member ids — base16 (hex) of the
     /// raw 32 bytes. Mirrors the stored
     /// [`AggregationMetaV1::member_commitment`] (which is the SAME hex value).
@@ -132,6 +156,7 @@ impl AggregationMetaVerifyInputsV1 {
             tier: self.tier,
             aggregation_algorithm_id: self.aggregation_algorithm_id.clone(),
             source_count: self.source_count,
+            n_eff: self.n_eff,
             member_commitment: mc,
             noise_floor_descriptor: self.noise_floor_descriptor.clone(),
         })
@@ -162,6 +187,16 @@ pub enum AggregationMetaError {
     /// would store a commitment the signature does not cover).
     #[error("aggregation_meta verify: stored member_commitment != signed §19.7.1 commitment")]
     MemberCommitmentMismatch,
+    /// §19.7.1.2 (CIRISVerify#167 / CIRISPersist#357) — the tier's authenticated
+    /// effective-source-count `n_eff` is below the [`MIN_DOMINANCE_RATIO`] floor
+    /// (a dominated fold: one source supplies too much of the mass, so the
+    /// aggregate is not a genuine noise-floor composite). Fail-closed: a
+    /// version-1 tier carries no signed `n_eff` and is rejected here.
+    #[error(
+        "aggregation_meta §19.7.1.2 dominance gate: effective source count below \
+         the noise-floor ratio (n_eff too low, or a version-1 tier with no signed n_eff)"
+    )]
+    Dominated,
 }
 
 impl AggregationMetaError {
@@ -172,6 +207,7 @@ impl AggregationMetaError {
             Self::MissingAggregatorPubkey(_) => "aggregation_meta_missing_pubkey",
             Self::MalformedInput(_) => "aggregation_meta_invalid",
             Self::MemberCommitmentMismatch => "aggregation_meta_member_commitment",
+            Self::Dominated => "aggregation_meta_dominated",
         }
     }
 }
@@ -320,7 +356,17 @@ impl AggregationMetaV1 {
 
         let verify_meta = self.verification.to_verify_meta()?;
         match verify_aggregation_meta(&verify_meta, &sig_ed, &sig_mldsa, &ed_pub, &mldsa_pub) {
-            AggregationMetaVerification::HybridVerified => Ok(()),
+            AggregationMetaVerification::HybridVerified => {
+                // §19.7.1.2 (CIRISVerify#167 / CIRISPersist#357) — dominance
+                // gate. Only now that the bound-hybrid signature authenticated
+                // `n_eff` is the effective-source-count trustworthy; reject a
+                // dominated fold (and, fail-closed, any version-1 tier that
+                // carries no signed n_eff). §10.1.5.1.1: BEFORE persistence.
+                if !passes_dominance_gate(&verify_meta, MIN_DOMINANCE_RATIO) {
+                    return Err(AggregationMetaError::Dominated);
+                }
+                Ok(())
+            }
             AggregationMetaVerification::Failed => Err(AggregationMetaError::HybridRequired),
         }
     }
@@ -485,6 +531,10 @@ pub async fn descend_aggregated_sources_on_backend<B: crate::store::Backend>(
         tier: 0,
         aggregation_algorithm_id: String::new(),
         source_count: member_ids.len() as u32,
+        // §19.7.1.2 (#167): v1 neutral placeholder (n_eff == source_count).
+        // This meta drives only `verify_member_commitment` (membership), and a
+        // v1 preimage excludes n_eff, so the value is verification-neutral.
+        n_eff: member_ids.len() as u32,
         member_commitment: aggregation_member_commitment_from_hex(&record.member_commitment)
             .map_err(crate::store::Error::AggregationMetaRejected)?,
         noise_floor_descriptor: String::new(),

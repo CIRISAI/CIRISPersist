@@ -5,6 +5,80 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [12.3.0] — 2026-07-03
+
+### Fixed — #320: cross-cdylib capsule use-after-free (transport bring-up SIGSEGV)
+
+`init_edge_runtime(enable_transport=True)` against persist ≥12.0 crashed with a
+SIGSEGV inside `Arc<dyn FederationDirectory>::clone` at `directory_capsule.rs`.
+Root cause: the `*_ops_capsule` / `executor_capsule` accessors each minted a
+**fresh** `PyCapsule` per call, whose GC destructor frees the boxed handle its
+raw `data` pointer targets. A consumer (edge) extracts the raw pointer once and
+relies on the engine owning the capsule — but the fresh temporary is GC'd
+immediately, so a later async op cloned a **freed** `Arc` → use-after-free.
+
+Fix: **cache the four capsules on `PyEngine`** (`std::sync::OnceLock<Py<PyCapsule>>`
+for `directory_ops` / `outbound_queue_ops` / `signer_ops` / `executor`) via a
+shared `cached_capsule` helper — build-once, return a bound clone of the same
+capsule on every access, so the boxed data outlives any consumer that extracted
+the pointer. Added env-gated (`CIRIS_PERSIST_TRACE`) `dtrace` on the directory-
+ops-proxy boundary (`SEND`/`BUILD_OP`/`EXECUTE`/`COMPLETE`/`CALLBACK`/`RECV`) —
+zero-cost when off — so a cohab hang localizes to an exact stage/op.
+
+Note: this fixes the **crash**. The separate transport **deadlock** in the same
+call is an edge-side bug (edge drives its own async via `runtime.block_on()` on
+persist's cross-cdylib raw `tokio::Handle`, which wedges in release builds inside
+`Handle::block_on`; the fix is to route through the executor vtable / `run_async`)
+— tracked as a CIRISEdge change, proven in a release build against this cut.
+
+### Added — #357: §19.7.1.2 dominance gate + AggregationMetaV1 v2 preimage (CIRISVerify#167)
+
+Re-pin **ciris-verify-core/keyring/crypto v8.5.0 → v8.6.0** (carries CIRISVerify#167).
+A composite where one source supplies ~90% of the mass (the 900/1000 case) was
+indistinguishable from a balanced fold (`source_count` is raw N). v8.6.0 adds a
+**signed** effective-source-count `n_eff` (inverse-Simpson participation ratio)
+so the fold's *effective* N is checkable at admission.
+
+- **`n_eff` threaded** through persist's `AggregationMetaVerifyInputsV1` →
+  `to_verify_meta` (`#[serde(default)]` so pre-#167 stored/wire inputs still
+  parse). Persist now reproduces the **v2 canonical preimage** (v1 layout `‖
+  u32(n_eff)` for version ≥ 2; a v1 tier's preimage is byte-identical to pre-#167,
+  so existing signatures/vectors verify unchanged).
+- **Dominance gate at admission** — after `verify_aggregation_meta` authenticates
+  `n_eff`, `AggregationMetaV1::verify_for_admission` calls
+  `passes_dominance_gate(meta, MIN_DOMINANCE_RATIO)` and rejects a dominated tier
+  with `AggregationMetaError::Dominated` (`kind = "aggregation_meta_dominated"`),
+  BEFORE persistence (§10.1.5.1.1). `MIN_DOMINANCE_RATIO = 0.5` (effective N must
+  be ≥ half of raw N; twins with CIRISConstitution#6). **Fail-closed**: a
+  version-1 tier carries no *signed* `n_eff` and is rejected — a dominated
+  aggregator cannot bypass the floor by declaring the pre-#167 schema.
+- `aggregation_tier` vectors upgraded to signed v2 folds; new `(b2)` assertion
+  proves a dominated fold (`n_eff=1, source_count=3 → 0.33 < 0.5`) is rejected
+  with zero rows written, on **both** sqlite + postgres.
+
+Wheel `Requires-Dist: ciris-verify>=8.0.0,<9` unchanged (minor bump within
+major 8). Full suite green: 1049 sqlite / 882 postgres · aggregation_tier pg+sqlite.
+
+### Removed — #355: drop the dead vendored `openssl` + unused `bytes`
+
+`openssl = { "0.10", vendored }` was gated behind `postgres` (+ the android/ios
+target tables) but had **zero code references** — `cargo tree -i openssl`
+confirmed a leaf (only `ciris-persist`); the pool uses `NoTls` and TLS is the
+separate rustls path. Removed all three entries + `dep:openssl` from the
+`postgres` feature. This drops `openssl`/`-macros`/`-sys` + `foreign-types{,-shared}`
+**and the `openssl-src` build-dep that compiles OpenSSL 3.6.3 from C on every
+wheel platform** — the slowest, flakiest step in the build matrix (the mobile
+`#246` pain, plausibly behind the recurring Windows-installer failures). Also
+dropped the unused direct `bytes` dep (only a doc-comment reference; still
+transitive via tokio-postgres/reqwest). Inert leaf, no link consumer — both
+backends + the wheel feature set build green with `openssl` absent from the tree.
+
+### Deps
+- `deny.toml`: ignore RUSTSEC-2026-0118 (hickory-proto NSEC3 DNSSEC-validation
+  loop) — transitive via verify → hickory-resolver (reqwest's plain resolver);
+  persist does not enable DNSSEC/NSEC3 validation so the path is unreachable, and
+  no patched version exists. Sibling of the already-ignored RUSTSEC-2026-0119.
+
 ## [12.2.0] — 2026-07-03
 
 ### Added — #351: adopt-scrub-upgrade primitive (self-signed → anchor-scrubbed own-key row)

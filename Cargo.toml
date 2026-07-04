@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "12.2.0"
+version = "12.3.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -18,7 +18,7 @@ publish = false
 default = []
 
 # Phase 1 features.
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:bytes", "dep:postgres-types", "dep:refinery", "refinery/tokio-postgres", "dep:openssl"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types", "dep:refinery", "refinery/tokio-postgres"]
 server   = ["dep:axum", "dep:tower", "dep:http-body-util"]
 # pyo3 implies postgres — the lens FastAPI integration shape (FSD §3.5)
 # needs the Postgres backend to be available. This is the published-wheel
@@ -503,14 +503,14 @@ tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 # ciris-crypto invariant (FSD §7.5a) means persist takes ZERO direct
 # deps on AES-GCM/PBKDF2/HKDF/HMAC primitive crates ever — the
 # `src/secrets/crypto.rs` facade lands as a single import-site change.
-ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.5.0", version = "8", features = ["pqc-ml-dsa"] }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.5.0", version = "8" }
+ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.6.0", version = "8", features = ["pqc-ml-dsa"] }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.6.0", version = "8" }
 # v0.3.6 (CIRISPersist#14) — direct ciris-crypto dep for HybridVerifier
 # in `Engine.verify_hybrid`. Same git source / tag as ciris-keyring +
 # ciris-verify-core so versions are workspace-coherent. Features
 # `ed25519` + `pqc-ml-dsa` light up the concrete Ed25519Verifier +
 # MlDsa65Verifier impls used by HybridVerifier::verify.
-ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.5.0", version = "8", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant"] }
+ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.6.0", version = "8", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant"] }
 async-trait   = "0.1"
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,
@@ -593,7 +593,6 @@ jsonschema    = { version = "0.46", default-features = false }
 # decoder paths.
 tokio-postgres    = { version = "0.7.18", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"], optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
-bytes             = { version = "1", optional = true }
 postgres-types    = { version = "0.2.14", optional = true }
 # CIRISPersist#339 — `default-features = false` drops refinery's default
 # `toml` feature (config-file loading, which we never use — migrations are
@@ -608,16 +607,12 @@ refinery          = { version = "0.9", default-features = false, optional = true
 tokio-postgres-rustls = { version = "0.13", optional = true }
 rustls                = { version = "0.23", optional = true }
 rustls-native-certs   = { version = "0.8", optional = true }
-# `openssl` is pulled ONLY by the `postgres` feature (`dep:openssl`,
-# below) — the Postgres connection pool builds against it. It is NOT a
-# transitive requirement of refinery (verified via `cargo tree -i
-# native-tls` → absent on every target; CIRISPersist#339): refinery's
-# `tokio-postgres` backend uses `NoTls` and does not pull
-# postgres-native-tls/native-tls/openssl-sys. `vendored` builds openssl
-# from source for the target arch (no system libssl-dev:<arch> needed),
-# which matters for the postgres-enabled cross-compiles. A sqlite-only
-# build pulls no openssl at all.
-openssl           = { version = "0.10", features = ["vendored"], optional = true }
+# v12.3.0 (CIRISPersist#355) — the vendored `openssl` dep was removed. It
+# was a DEAD LEAF: gated behind `postgres` but with ZERO code references
+# (`cargo tree -i openssl` → only ciris-persist; the pool uses `NoTls`,
+# TLS is the separate rustls path). Dropping it (base + the android/ios
+# target entries below) kills the OpenSSL-from-C build-dep — the slowest,
+# flakiest step in the wheel matrix.
 
 # Phase 1 — server feature
 axum  = { version = "0.8", optional = true }
@@ -777,38 +772,21 @@ tokio-stream = "0.1"
 # key). Placed AFTER every platform-independent dep — see the v0.9.0
 # bug note on the rusqlite target table above.
 [target.'cfg(target_os = "linux")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.5.0", version = "8", features = ["pqc-ml-dsa"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.6.0", version = "8", features = ["pqc-ml-dsa"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.5.0", version = "8", features = ["pqc-ml-dsa", "ios"] }
-# v2.0.4 / CIRISPersist#339 — vendored openssl for iOS PyO3
-# cross-compilation, but ONLY when the `postgres` feature is active.
-# `optional = true` (was unconditional) unions with the base `dep:openssl`
-# (which only the `postgres` feature enables) + adds the `vendored`
-# feature on iOS, where there is no system libssl. A `pyo3-sqlite`
-# (sqlite-only) iOS wheel now pulls NO openssl at all — retiring the
-# vendored build-from-source (CIRISEdge#246). ARM64 has no SM4-NI issue
-# unlike Android x86_64. Same pattern as the Android entry.
-openssl = { version = "0.10", features = ["vendored"], optional = true }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.6.0", version = "8", features = ["pqc-ml-dsa", "ios"] }
+# v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
+# see the base-deps note). No iOS openssl in any configuration now.
 
 [target.'cfg(target_os = "android")'.dependencies]
 # v3.5.2 (#132) — rusqlite `bundled` for Android. See comment block
 # before the iOS entry (~line 628) for the rationale.
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"], optional = true }
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.5.0", version = "8", features = ["pqc-ml-dsa", "android"] }
-# v2.0.3 / CIRISPersist#339 — vendored openssl for Android
-# cross-compilation, gated behind the `postgres` feature. NOTE: an earlier
-# comment here blamed refinery-core for transitively pulling
-# postgres-native-tls → native-tls → openssl-sys "regardless of feature".
-# That was wrong — verified via `cargo tree -i native-tls` (absent on every
-# target, sqlite-only and postgres alike): refinery's tokio-postgres backend
-# uses NoTls and pulls no openssl. openssl comes ONLY from the `postgres`
-# connection pool's `dep:openssl`. So `optional = true` (was unconditional)
-# unions with the base `dep:openssl` + adds `vendored` on Android (no system
-# openssl). A `pyo3-sqlite` Android wheel now pulls NO openssl — retiring the
-# vendored build-from-source, the flakiest part of the mobile matrix
-# (CIRISEdge#246).
-openssl = { version = "0.10", features = ["vendored"], optional = true }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v8.6.0", version = "8", features = ["pqc-ml-dsa", "android"] }
+# v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
+# see the base-deps note). No Android openssl in any configuration now,
+# retiring the flakiest part of the mobile wheel matrix.
 
 [dev-dependencies]
 # Mission category §4: canonicalization parity. Used to validate our

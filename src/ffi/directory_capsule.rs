@@ -131,6 +131,42 @@ use crate::fountain::{FountainHeldMeta, FountainTier};
 // two must agree on the exact boxed-future type.
 use crate::ffi::executor_capsule::TaskOpaque;
 
+/// CIRISPersist#320 diagnostic — env-gated (`CIRIS_PERSIST_TRACE`) trace of the
+/// directory-ops-proxy boundary, so a transport-bring-up hang localizes to an
+/// exact stage/op. **Silent** unless the env var is set (checked once, cached),
+/// so it is zero-cost in production. The consumer (edge) side logs
+/// `SEND`/`RECV`; the persist-`.so` side logs `BUILD_OP`/`EXECUTE`/`COMPLETE`/
+/// `CALLBACK`. A stall shows as the last stage printed with no follow-up:
+///   * `SEND` with no `BUILD_OP`  → the op never crossed the FFI / spawned.
+///   * `EXECUTE` with no `COMPLETE` → the directory method itself hung.
+///   * `COMPLETE` with no `RECV`  → the result callback / consumer recv broke.
+#[inline]
+pub(crate) fn dtrace_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
+    match ON.load(Ordering::Relaxed) {
+        0 => {
+            let v = if std::env::var_os("CIRIS_PERSIST_TRACE").is_some() {
+                2
+            } else {
+                1
+            };
+            ON.store(v, Ordering::Relaxed);
+            v == 2
+        }
+        v => v == 2,
+    }
+}
+
+#[inline]
+pub(crate) fn dtrace(stage: &str, op: &str) {
+    if dtrace_enabled() {
+        // Truncate the op preview so a large payload doesn't flood the log.
+        let op = if op.len() > 90 { &op[..90] } else { op };
+        eprintln!("[ciris_persist directory_op] {stage} {op}");
+    }
+}
+
 /// The boxed-future shape [`crate::ffi::executor_capsule`] spawns. The
 /// pointer returned by [`DirectoryVTable::build_op`] is a
 /// `Box<BoxedFut>` cast to `*mut TaskOpaque`, byte-identical to what the
@@ -865,6 +901,16 @@ unsafe extern "C" fn persist_directory_build_op(
     let parsed: Result<DirectoryOp, String> =
         serde_json::from_slice::<DirectoryOp>(op_bytes).map_err(|e| e.to_string());
 
+    // #320 trace: owned preview of the op JSON (op_bytes is only valid for
+    // this synchronous call; the future runs later on a worker thread).
+    // Allocated only when tracing is on — zero-cost in production.
+    let op_preview: String = if dtrace_enabled() {
+        String::from_utf8_lossy(op_bytes).into_owned()
+    } else {
+        String::new()
+    };
+    dtrace("BUILD_OP", &op_preview);
+
     // Capture the consumer callback + context in a Send bundle so the
     // future (spawned onto persist's worker pool) may hold it.
     let completion = SendCompletion {
@@ -876,10 +922,12 @@ unsafe extern "C" fn persist_directory_build_op(
         // Keep the cloned Arc + completion bundle alive across the await.
         let dir = dir;
         let completion = completion;
+        dtrace("EXECUTE", &op_preview);
         let result: DirectoryOpResult = match parsed {
             Ok(op) => dispatch_directory_op(dir.as_ref(), op).await,
             Err(msg) => DirectoryOpResult::Err(format!("directory op parse failure: {msg}")),
         };
+        dtrace("COMPLETE", &op_preview);
         // Serialization of `DirectoryOpResult` cannot realistically fail
         // (owned data, no non-string map keys). If it somehow did, fall
         // back to a serialized Err so the consumer's completion path
@@ -895,6 +943,7 @@ unsafe extern "C" fn persist_directory_build_op(
         // Send, called exactly once from this worker thread. `bytes`
         // outlives the synchronous call (dropped only after the callback
         // returns); the consumer copies before returning.
+        dtrace("CALLBACK", &op_preview);
         unsafe {
             (completion.cb)(completion.ctx, bytes.as_ptr(), bytes.len());
         }
@@ -1058,6 +1107,14 @@ impl OpsDirectory {
         let op_bytes = serde_json::to_vec(op).map_err(|e| {
             Error::Backend(format!("directory ops proxy: op serialize failure: {e}"))
         })?;
+        // #320 trace (consumer side): op preview for SEND/RECV bracketing.
+        // Allocated only when tracing is on — zero-cost in production.
+        let op_preview: String = if dtrace_enabled() {
+            String::from_utf8_lossy(&op_bytes).into_owned()
+        } else {
+            String::new()
+        };
+        dtrace("SEND", &op_preview);
 
         let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
         // Hand the Sender to persist as an opaque `*mut c_void`; the
@@ -1100,6 +1157,7 @@ impl OpsDirectory {
                 "directory ops proxy: directory op producer dropped without responding".into(),
             )
         })?;
+        dtrace("RECV", &op_preview);
 
         serde_json::from_slice::<DirectoryOpResult>(&result_bytes).map_err(|e| {
             Error::Backend(format!(

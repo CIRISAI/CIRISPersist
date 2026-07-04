@@ -623,6 +623,42 @@ pub struct PyEngine {
     /// state — `set_multimedia_config_json` mutates the shared slot.
     #[cfg(feature = "cirisnode")]
     multimedia_config: Arc<std::sync::RwLock<Option<Arc<crate::cirisnode::MultimediaConfig>>>>,
+    /// v12.2.1 (CIRISPersist#320) — the directory-ops-proxy capsule, built
+    /// once and **cached on the engine**. Consumers (CIRISEdge#245) extract the
+    /// raw `Directory { data, vtable }` pointer and rely on the capsule (and
+    /// thus the boxed `Arc<dyn FederationDirectory>` it owns + frees on GC)
+    /// outliving the consumer — "rooted in the Python engine object" per edge's
+    /// own contract. Minting a FRESH temporary per access GC'd it immediately,
+    /// so an async op (transport bring-up) called `build_op` on a dangling
+    /// `data` → `Arc::clone` UAF → SIGSEGV. Caching keeps it alive for the
+    /// engine's lifetime, making the consumer contract sound.
+    directory_ops_capsule_cache: std::sync::OnceLock<pyo3::Py<pyo3::types::PyCapsule>>,
+    /// v12.2.1 (CIRISPersist#320) — same UAF fix for the other capsules that
+    /// hand out a raw pointer with a GC-freeing destructor. The executor one is
+    /// the load-bearing case for the transport deadlock: `spawn` on a GC'd
+    /// executor lands the task on a torn-down runtime (task never runs → the
+    /// bring-up's `run_async` recv blocks forever). Outbound + signer are the
+    /// same latent class. Cached ⇒ alive for the engine's lifetime.
+    outbound_queue_ops_capsule_cache: std::sync::OnceLock<pyo3::Py<pyo3::types::PyCapsule>>,
+    signer_ops_capsule_cache: std::sync::OnceLock<pyo3::Py<pyo3::types::PyCapsule>>,
+    executor_capsule_cache: std::sync::OnceLock<pyo3::Py<pyo3::types::PyCapsule>>,
+}
+
+/// #320 — build-once/cache a capsule on the engine so the boxed value its raw
+/// `data` points at outlives any consumer that extracted the pointer (the
+/// PyCapsule's GC destructor would otherwise free it while still in use). The
+/// GIL (`py`) serializes init; `OnceLock::set` is race-safe regardless.
+fn cached_capsule<'py>(
+    cell: &std::sync::OnceLock<pyo3::Py<pyo3::types::PyCapsule>>,
+    py: Python<'py>,
+    build: impl FnOnce() -> PyResult<Bound<'py, pyo3::types::PyCapsule>>,
+) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+    if let Some(cached) = cell.get() {
+        return Ok(cached.bind(py).clone());
+    }
+    let capsule = build()?;
+    let _ = cell.set(capsule.unbind());
+    Ok(cell.get().expect("just set").bind(py).clone())
 }
 
 impl PyEngine {
@@ -645,6 +681,10 @@ impl PyEngine {
             subscriptions: cell.subscriptions.clone(),
             #[cfg(feature = "cirisnode")]
             multimedia_config: cell.multimedia_config.clone(),
+            directory_ops_capsule_cache: std::sync::OnceLock::new(),
+            outbound_queue_ops_capsule_cache: std::sync::OnceLock::new(),
+            signer_ops_capsule_cache: std::sync::OnceLock::new(),
+            executor_capsule_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -2091,6 +2131,10 @@ impl PyEngine {
             subscriptions: self.subscriptions.clone(),
             #[cfg(feature = "cirisnode")]
             multimedia_config: self.multimedia_config.clone(),
+            directory_ops_capsule_cache: std::sync::OnceLock::new(),
+            outbound_queue_ops_capsule_cache: std::sync::OnceLock::new(),
+            signer_ops_capsule_cache: std::sync::OnceLock::new(),
+            executor_capsule_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -22581,14 +22625,19 @@ impl PyEngine {
         &self,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
-        let arc: Arc<dyn crate::federation::FederationDirectory> = match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => b.clone(),
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => b.clone(),
-        };
-        crate::ffi::directory_capsule::build_capsule_with_destructor(py, arc)
-            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("directory_ops_capsule: {e}")))
+        // #320: build ONCE and cache on the engine so the capsule (and the
+        // boxed Arc its `data` points at) outlives any consumer that extracts
+        // the raw pointer — the transport-bring-up UAF fix.
+        cached_capsule(&self.directory_ops_capsule_cache, py, || {
+            let arc: Arc<dyn crate::federation::FederationDirectory> = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => b.clone(),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => b.clone(),
+            };
+            crate::ffi::directory_capsule::build_capsule_with_destructor(py, arc)
+                .map_err(|e| PyErr::new::<LensQueryError, _>(format!("directory_ops_capsule: {e}")))
+        })
     }
 
     /// v2.7.0 (CIRISPersist#109) — cross-module accessor for the
@@ -22660,15 +22709,18 @@ impl PyEngine {
         &self,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
-        let dispatch = match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
-        };
-        crate::ffi::outbound_queue_capsule::build_capsule_with_destructor(py, dispatch).map_err(
-            |e| PyErr::new::<LensQueryError, _>(format!("outbound_queue_ops_capsule: {e}")),
-        )
+        // #320: cache — same UAF fix as directory_ops_capsule.
+        cached_capsule(&self.outbound_queue_ops_capsule_cache, py, || {
+            let dispatch = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => crate::engine::BackendDispatch::Postgres(b.clone()),
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+            };
+            crate::ffi::outbound_queue_capsule::build_capsule_with_destructor(py, dispatch).map_err(
+                |e| PyErr::new::<LensQueryError, _>(format!("outbound_queue_ops_capsule: {e}")),
+            )
+        })
     }
 
     /// v2.7.0 (CIRISPersist#109) — cross-module accessor for the
@@ -22742,13 +22794,16 @@ impl PyEngine {
         &self,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
-        let handle = crate::signing::KeyringSignerHandle {
-            signer: self.signer.clone(),
-            pqc_signer: self.local_signer.as_ref().and_then(|ls| ls.pqc_signer()),
-            key_id: self.signer_key_id.clone(),
-        };
-        crate::ffi::signer_capsule::build_capsule_with_destructor(py, handle)
-            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("signer_ops_capsule: {e}")))
+        // #320: cache — same UAF fix as directory_ops_capsule.
+        cached_capsule(&self.signer_ops_capsule_cache, py, || {
+            let handle = crate::signing::KeyringSignerHandle {
+                signer: self.signer.clone(),
+                pqc_signer: self.local_signer.as_ref().and_then(|ls| ls.pqc_signer()),
+                key_id: self.signer_key_id.clone(),
+            };
+            crate::ffi::signer_capsule::build_capsule_with_destructor(py, handle)
+                .map_err(|e| PyErr::new::<LensQueryError, _>(format!("signer_ops_capsule: {e}")))
+        })
     }
 
     /// v2.8.0 (CIRISPersist#111) — cross-cdylib accessor for the tokio
@@ -22908,8 +22963,15 @@ impl PyEngine {
         // Delegate to the executor_capsule module — the unsafe
         // PyCapsule::new_with_destructor lives there, scoped under
         // that module's `#![allow(unsafe_code)]` for FFI surfaces.
-        crate::ffi::executor_capsule::build_capsule_with_destructor(py, self.runtime.clone())
-            .map_err(|e| PyErr::new::<LensQueryError, _>(format!("executor_capsule: {e}")))
+        //
+        // #320: cache. This is the load-bearing one for the transport
+        // deadlock — a GC'd executor capsule frees the boxed runtime handle,
+        // so edge's `spawn` lands the task on a torn-down runtime and it never
+        // runs (the bring-up's `run_async` recv then blocks forever).
+        cached_capsule(&self.executor_capsule_cache, py, || {
+            crate::ffi::executor_capsule::build_capsule_with_destructor(py, self.runtime.clone())
+                .map_err(|e| PyErr::new::<LensQueryError, _>(format!("executor_capsule: {e}")))
+        })
     }
 
     /// v2.11.0 (CIRISPersist#115) — cross-module accessor for the blob
