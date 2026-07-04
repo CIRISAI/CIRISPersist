@@ -354,6 +354,41 @@ pub trait FederationDirectory: Send + Sync {
     /// differing content.
     async fn put_public_key(&self, record: SignedKeyRecord) -> Result<(), Error>;
 
+    /// v13.0.1 (CIRISPersist#375) — the **upgrade-aware, `owner_of`-gated
+    /// Key-plane apply** for anti-entropy replication, dyn-dispatchable.
+    ///
+    /// This is the trait surface for the #371 apply. Edge's replication
+    /// bridge holds an `Arc<dyn FederationDirectory>` and has no concrete
+    /// backend type, so the inherent
+    /// `apply_replicated_key_record` on `SqliteBackend`/`PostgresBackend`
+    /// (dispatched by [`Engine::apply_replicated_key_record`](crate::Engine::apply_replicated_key_record))
+    /// was unreachable — a receiver could only call [`Self::put_public_key`]
+    /// (`ON CONFLICT DO NOTHING`), silently dropping an anchor-scrubbed
+    /// record for a `key_id` it already holds self-signed. That DO-NOTHING
+    /// is exactly what #371 replaces over replication.
+    ///
+    /// The real sqlite/postgres backends **override** this to run the
+    /// monotonic, verify-before-mutation upgrade path (the
+    /// [`plan_replicated_key_apply`](register::plan_replicated_key_apply)
+    /// classification + `adopt_scrub_upgrade` on the Upgrade arm). The
+    /// default body here preserves the memory/mock backends: they have no
+    /// scrub-upgrade plane, so an incoming record is a **first-seen
+    /// insert** — `put_public_key` already leaves an existing differing row
+    /// untouched, so a collision resolves to `Refused` (fail-closed,
+    /// re-offerable) rather than aborting the anti-entropy loop.
+    async fn apply_replicated_key_record(
+        &self,
+        record: SignedKeyRecord,
+    ) -> Result<register::ReplicatedKeyOutcome, Error> {
+        match self.put_public_key(record).await {
+            Ok(()) => Ok(register::ReplicatedKeyOutcome::Inserted),
+            // First-seen wins on the replication plane: a differing row
+            // already present ⇒ not applied, but safe to re-offer.
+            Err(Error::Conflict(_)) => Ok(register::ReplicatedKeyOutcome::Refused),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Fetch a single pubkey row by `key_id`. Returns `None` if absent.
     async fn lookup_public_key(&self, key_id: &str) -> Result<Option<KeyRecord>, Error>;
 

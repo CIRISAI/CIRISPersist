@@ -10038,6 +10038,41 @@ mod tests {
         .unwrap());
     }
 
+    /// v13.0.1 (#375) — the DEFAULT `FederationDirectory::apply_replicated_key_record`
+    /// trait body (memory/mock backends, no scrub-upgrade plane): a new
+    /// key_id is a first-seen Inserted; a differing record for an existing
+    /// key_id is Refused (fail-closed, first-seen wins) and leaves the row
+    /// untouched — no panic, no error propagated up the anti-entropy loop.
+    #[tokio::test]
+    async fn apply_replicated_key_record_default_first_seen_wins_memory() {
+        use crate::federation::register::ReplicatedKeyOutcome;
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        let dir: &dyn FederationDirectory = &backend;
+
+        // First-seen insert.
+        assert_eq!(
+            dir.apply_replicated_key_record(SignedKeyRecord {
+                record: fix_key("node-x", "primitive", "node-x"),
+            })
+            .await
+            .unwrap(),
+            ReplicatedKeyOutcome::Inserted
+        );
+
+        // A differing record for the same key_id — Refused, original kept.
+        let mut differing = fix_key("node-x", "primitive", "A1");
+        differing.pubkey_ed25519_base64 = "AAAA-different-pubkey".into();
+        assert_eq!(
+            dir.apply_replicated_key_record(SignedKeyRecord { record: differing })
+                .await
+                .unwrap(),
+            ReplicatedKeyOutcome::Refused
+        );
+        let row = dir.lookup_public_key("node-x").await.unwrap().unwrap();
+        assert_eq!(row.scrub_key_id, "node-x", "original self-signed row kept");
+    }
+
     /// reachable_under_scope_with_reasons (#272): the refusal-reason
     /// companion classifies each "no" — Reachable / MissingScope /
     /// RetractedAtRoot / SignerUnreached / NoTrustRoots — and stays

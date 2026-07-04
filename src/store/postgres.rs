@@ -2546,6 +2546,18 @@ impl PostgresBackend {
 
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for PostgresBackend {
+    // v13.0.1 (CIRISPersist#375) — expose the #371 upgrade-aware apply on
+    // the trait so `Arc<dyn FederationDirectory>` holders (CIRISEdge's
+    // anti-entropy bridge) reach the real path, not `put_public_key`'s
+    // DO-NOTHING. Delegates to the inherent method (the single source of
+    // truth for the plan + adopt_scrub_upgrade logic).
+    async fn apply_replicated_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        PostgresBackend::apply_replicated_key_record(self, record).await
+    }
+
     async fn put_public_key(
         &self,
         record: crate::federation::SignedKeyRecord,

@@ -2276,6 +2276,18 @@ impl SqliteBackend {
 
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for SqliteBackend {
+    // v13.0.1 (CIRISPersist#375) — expose the #371 upgrade-aware apply on
+    // the trait so `Arc<dyn FederationDirectory>` holders (CIRISEdge's
+    // anti-entropy bridge) reach the real path, not `put_public_key`'s
+    // DO-NOTHING. Delegates to the inherent method (the single source of
+    // truth for the plan + adopt_scrub_upgrade logic).
+    async fn apply_replicated_key_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        SqliteBackend::apply_replicated_key_record(self, record).await
+    }
+
     async fn put_public_key(
         &self,
         record: crate::federation::SignedKeyRecord,
@@ -15568,6 +15580,83 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, crate::federation::Error::InvalidArgument(_)));
+    }
+
+    /// v13.0.1 (#375) — the #371 upgrade-aware apply is reachable through
+    /// `&dyn FederationDirectory` (the shape CIRISEdge's anti-entropy bridge
+    /// holds) and runs the REAL path, not `put_public_key`'s DO-NOTHING:
+    /// a self-signed row is upgraded in place by a dyn-dispatched
+    /// anchor-scrubbed record, and a re-apply is Unchanged.
+    #[tokio::test]
+    async fn apply_replicated_key_record_dyn_dispatch_upgrades_sqlite() {
+        use crate::federation::register::ReplicatedKeyOutcome as O;
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type;
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // Reach the apply ONLY through the trait object — no concrete
+        // backend type, exactly like FederationDirectoryReplicationBridge
+        // (which holds `Arc<dyn FederationDirectory>`).
+        let dir: &dyn FederationDirectory = &backend;
+
+        // The anchor scrubber (granting authority) and the node's single
+        // `user`-role owner must exist for the Strict scrub gate + owner_of.
+        ts::register_hybrid_key(dir, "anchor-a").await;
+        ts::register_identity_key(dir, "owner-a", identity_type::USER).await;
+
+        // (1) fresh insert of the self-signed boot row — dyn-dispatched.
+        let self_rec =
+            ts::replicated_key_record("node-x", identity_type::NODE, "node-x", "node-x", "v1");
+        assert_eq!(
+            dir.apply_replicated_key_record(SignedKeyRecord { record: self_rec })
+                .await
+                .unwrap(),
+            O::Inserted,
+            "(1) dyn fresh insert"
+        );
+
+        // Seed the single-owner binding (v12.6.0) so owner_of resolves.
+        dir.put_attestation(crate::federation::SignedAttestation {
+            attestation: ts::owner_binding_attestation(
+                &uuid::Uuid::new_v4().to_string(),
+                "owner-a",
+                "node-x",
+            ),
+        })
+        .await
+        .expect("owner-binding admitted");
+
+        // (2) anchor-scrubbed record ⇒ UPGRADE — an outcome the default
+        // trait body can NEVER produce, so reaching it proves dyn dispatch
+        // hit the real upgrade-aware method, not put_public_key DO-NOTHING.
+        let scrubbed =
+            ts::replicated_key_record("node-x", identity_type::NODE, "anchor-a", "anchor-a", "v1");
+        assert_eq!(
+            dir.apply_replicated_key_record(SignedKeyRecord {
+                record: scrubbed.clone(),
+            })
+            .await
+            .unwrap(),
+            O::Upgraded,
+            "(2) dyn-dispatched apply must UPGRADE, not silently DO-NOTHING"
+        );
+        let row = dir.lookup_public_key("node-x").await.unwrap().unwrap();
+        assert_eq!(
+            row.scrub_key_id, "anchor-a",
+            "row is anchor-scrubbed via dyn"
+        );
+        assert_ne!(row.scrub_key_id, row.key_id, "no longer self-signed");
+
+        // (3) idempotent re-apply over the same trait object.
+        assert_eq!(
+            dir.apply_replicated_key_record(SignedKeyRecord { record: scrubbed })
+                .await
+                .unwrap(),
+            O::Unchanged,
+            "(3) dyn idempotent"
+        );
     }
 
     /// #351 — a pubkey change (different identity) is refused even with a
