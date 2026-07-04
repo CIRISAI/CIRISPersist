@@ -5,6 +5,47 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [12.6.0] — 2026-07-04 — single-owner node invariant (CIRISConstitution#23)
+
+The `self` cohort boundary (CC 1.13.3.3 / CC 3.2) is defined by a node's owner,
+so it is only well-defined if a node has **exactly one** owner. That invariant
+was assumed at read time (`is_steward_bound(..).next()` on a *sorted* set —
+grindable) but never enforced at bind time, and `steward_bindings_of` conflates
+ownership with *any* `delegates_to` (act-on-behalf, hierarchy). This cut makes
+single-ownership a substrate invariant, enforced where the objects live.
+
+### Added — #363 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2): single-owner admission gate + `owner_of`
+
+- **`owner_binding` dimension** (`src/federation/types.rs`): the
+  substrate-normative discriminator for a node owner-binding —
+  `delegates_to(user → node)` carrying `dimension:
+  "ownership:responsible_party:node:v1"` + `delegation_purpose: "responsible_for"`,
+  infra:*-only. Byte-identical to CIRISServer's `DIMENSION_OWNER_BINDING` /
+  `OWNER_BINDING_PURPOSE` (the wire is the contract). This is what separates the
+  **single-valued ownership** relation from the general (multi-parent)
+  `delegates_to` grammar (CC 4.5.13 hierarchy / act-on-behalf).
+- **`check_single_node_owner_admission`** (`src/federation/admission.rs`): the
+  node-target companion to `check_node_agency_admission`. Rejects a second,
+  distinct-owner owner-binding on an already-owned node
+  (`Error::NodeAlreadyOwned`); a same-owner refresh is idempotent; ownership is
+  transferable once the incumbent `withdraws`/`recants` or the binding lapses.
+  Wired into every backend's `put_attestation` (memory/sqlite/postgres),
+  verify-before-mutation (AV-9), keyed on the ownership dimension so
+  act-on-behalf / hierarchy delegations are untouched.
+- **`owner_of(node) -> Option<String>`** (`src/federation/admission.rs`): the
+  dimension-precise single-owner projection (a subset of `steward_bindings_of`
+  restricted to owner-bindings) — the reader consumers MUST use to resolve "the
+  owner of a node" for the `self` boundary. Returns `Error::AmbiguousNodeOwner`
+  on a multi-owner node (a pre-gate anomaly) so consumers **fail closed** instead
+  of silently picking a sorted `.next()`.
+- **Errors**: `NodeAlreadyOwned` (`federation_node_already_owned`) +
+  `AmbiguousNodeOwner` (`federation_ambiguous_node_owner`).
+
+Downstream: CIRISEdge widens its `SelfOnly` cohort-scope enforcement from
+"recipient == my key" to "recipient ∈ my owner's nodes" on top of this
+(cross-device self-replication); CIRISServer's `is_steward_bound` should adopt
+`owner_of` + fail-closed. See CIRISConstitution#23 for the normative text.
+
 ## [12.5.0] — 2026-07-04 — CC 0.9.3 conformance batch
 
 Read against the now-standalone **CIRISConstitution v0.9.3**. Three conformance

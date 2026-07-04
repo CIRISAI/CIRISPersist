@@ -2402,6 +2402,139 @@ pub async fn nodes_stewarded_by(
     Ok(out)
 }
 
+/// The distinct set of **live owner-binding granters** of `node` — the users
+/// `U` with a live `delegates_to(U → node)` carrying the CC 1.13.3.3 / CC 3.2
+/// owner-binding dimension ([`super::types::owner_binding::DIMENSION`]). The raw
+/// set behind [`owner_of`] + [`check_single_node_owner_admission`]; it applies
+/// the SAME liveness/retraction predicate as [`steward_bindings_of`]'s clause
+/// (3) — not-expired, not adult-incapacity-lapsed, live `user`-role granter, not
+/// `withdraws`/`recants`-retracted — restricted to the ownership dimension, so
+/// `owner_of(node)` is always a subset of `steward_bindings_of(node)`.
+async fn live_owner_binding_granters(
+    directory: &dyn super::FederationDirectory,
+    node: &str,
+) -> Result<std::collections::BTreeSet<String>, Error> {
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let now = chrono::Utc::now();
+    for r in directory.list_attestations_for(node).await? {
+        if r.attestation_type != attestation_type::DELEGATES_TO {
+            continue;
+        }
+        // Only OWNER-BINDING edges — the versioned ownership dimension. This is
+        // what keeps ownership single-valued WITHOUT constraining act-on-behalf
+        // / hierarchy delegations (multi-parent per CC 4.5.13).
+        if envelope_dimension(&r.attestation_envelope)
+            != Some(super::types::owner_binding::DIMENSION)
+        {
+            continue;
+        }
+        if let Some(exp) = r.expires_at {
+            if exp <= now {
+                continue;
+            }
+        }
+        // Fail-to-liberty (CC 3.4.12): a lapsed adult-incapacity `valid_until`
+        // is non-live.
+        if delegation_valid_until_lapsed(&r.attestation_envelope, now) {
+            continue;
+        }
+        // A non-`user` granter cannot steward — mirror steward_bindings_of.
+        let Some(granter) = directory.lookup_public_key(&r.attesting_key_id).await? else {
+            continue;
+        };
+        if !identity_type::set_contains(&granter.identity_type, identity_type::USER) {
+            continue;
+        }
+        let granter_retracted = directory
+            .list_attestations_by(&r.attesting_key_id)
+            .await?
+            .into_iter()
+            .any(|g| {
+                (g.attestation_type == attestation_type::WITHDRAWS
+                    || g.attestation_type == attestation_type::RECANTS)
+                    && g.attested_key_id == node
+            });
+        if granter_retracted {
+            continue;
+        }
+        out.insert(r.attesting_key_id);
+    }
+    Ok(out)
+}
+
+/// **CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — the single responsible owner
+/// of `node`, or `None` when the node is unowned.** The dimension-precise
+/// ownership projection (a subset of [`steward_bindings_of`] restricted to
+/// owner-binding edges), and the reader consumers MUST use to resolve "the owner
+/// of a node" for the `self` cohort boundary.
+///
+/// Returns [`Error::AmbiguousNodeOwner`] when the node carries **more than one**
+/// distinct live owner — a pre-gate anomaly the single-owner admission gate
+/// [`check_single_node_owner_admission`] prevents going forward. Consumers
+/// (CIRISEdge's `SelfOnly` widening, CIRISServer's node switcher) MUST treat the
+/// error as **fail-closed**: an ambiguous owner is not a resolvable `self`
+/// boundary. NEVER silently pick one (unlike the historical
+/// `is_steward_bound(..).next()` on a sorted set).
+pub async fn owner_of(
+    directory: &dyn super::FederationDirectory,
+    node: &str,
+) -> Result<Option<String>, Error> {
+    let owners = live_owner_binding_granters(directory, node).await?;
+    match owners.len() {
+        0 => Ok(None),
+        1 => Ok(owners.into_iter().next()),
+        _ => Err(Error::AmbiguousNodeOwner {
+            node_key_id: node.to_owned(),
+            owners: owners.into_iter().collect(),
+        }),
+    }
+}
+
+/// **CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — the single-owner admission
+/// gate.** The node-target companion to [`check_node_agency_admission`]: a node
+/// has **at most one** responsible steward (the `self` cohort boundary is
+/// undefined otherwise). Rejects a `delegates_to(U → node)` owner-binding when
+/// the node already carries a LIVE owner-binding from a DIFFERENT granter `U'`
+/// ([`Error::NodeAlreadyOwned`]) — the incumbent must first `withdraws` /
+/// `recants` it (or it must lapse). A refresh by the SAME owner is idempotently
+/// admitted; a first owner is admitted.
+///
+/// Keyed on the versioned owner-binding dimension
+/// ([`super::types::owner_binding::DIMENSION`]) so it constrains ONLY the
+/// ownership relation; act-on-behalf / hierarchy `delegates_to` (multi-parent
+/// per CC 4.5.13) are untouched. A no-op for any non-`delegates_to` row or any
+/// `delegates_to` lacking the ownership dimension.
+///
+/// Verify-before-mutation (AV-9): wired into every backend's `put_attestation`
+/// immediately AFTER [`check_user_target_steward_binding_admission`], so a
+/// rejected second-owner emission leaves no trace. Backend-agnostic.
+pub async fn check_single_node_owner_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::DELEGATES_TO {
+        return Ok(());
+    }
+    if envelope_dimension(&row.attestation_envelope) != Some(super::types::owner_binding::DIMENSION)
+    {
+        return Ok(());
+    }
+    // The incoming row is NOT yet stored (this runs pre-insert), so every
+    // granter here is a pre-existing incumbent. Any incumbent that is NOT the
+    // attesting owner blocks admission — a node cannot accrue a second steward.
+    let incumbents = live_owner_binding_granters(directory, &row.attested_key_id).await?;
+    for incumbent in incumbents {
+        if incumbent != row.attesting_key_id {
+            return Err(Error::NodeAlreadyOwned {
+                node_key_id: row.attested_key_id.clone(),
+                incumbent_owner: incumbent,
+                attempted_owner: row.attesting_key_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// #249 Cut B — the steward-binding **PATH** for audit: the actual delegation
 /// chain `user → … → key_id` that steward-binds `key_id`, anchor-first (the
 /// human `user`-role key at index 0, `key_id` last). Where

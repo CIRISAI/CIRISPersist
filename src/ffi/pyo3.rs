@@ -24434,6 +24434,12 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // node-only key is caller-side authorization failure; ValueError
         // (4xx). "Infrastructure must not have agency."
         crate::federation::Error::NodeAgencyForbidden { .. } => PyValueError::new_err(kind),
+        // v12.6.0 (CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — a rejected
+        // second-owner binding (single-owner gate) is a caller-side conflict,
+        // and an ambiguous-owner read is a fail-closed state rejection; both are
+        // ValueError (4xx / 409-shaped, like `Conflict`).
+        crate::federation::Error::NodeAlreadyOwned { .. }
+        | crate::federation::Error::AmbiguousNodeOwner { .. } => PyValueError::new_err(kind),
         // v9.0.0 (CC 3.2 / CC 3.4.7.1) — admitting an unstewarded node/agent to
         // a non-infrastructure community is a caller-side authorization
         // failure (non-infra membership is an authority act that must root

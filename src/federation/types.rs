@@ -262,6 +262,30 @@ pub mod attestation_type {
     pub const RECANTS: &str = "recants";
 }
 
+/// v12.6.0 (CIRISPersist#363 / CIRISConstitution#23, CC 1.13.3.3 / CC 3.2) — the
+/// substrate-normative discriminator for the **node owner-binding**: the
+/// `delegates_to(user → node)` edge that names a node's single responsible
+/// steward and thereby *defines* the node's `self` cohort boundary.
+///
+/// An owner-binding is a [`attestation_type::DELEGATES_TO`] carrying
+/// [`DIMENSION`] as its envelope `dimension` (and, on the producer side,
+/// [`PURPOSE`] as `delegation_purpose`, with `infra:*`-only `scope`). This is
+/// what separates the **ownership** relation — which is **single-valued** (a
+/// node has at most one owner, [`super::super::admission::owner_of`]) — from
+/// the general (multi-parent) `delegates_to` grammar (act-on-behalf, hierarchy
+/// per CC 4.5.13). CIRISServer's `auth::ownership` builds these; the two
+/// constants MUST stay byte-identical to server's `DIMENSION_OWNER_BINDING` /
+/// `OWNER_BINDING_PURPOSE` (the wire is the contract).
+pub mod owner_binding {
+    /// The versioned owner-binding `dimension` — the substrate keys the
+    /// single-owner admission gate + [`super::super::admission::owner_of`] on
+    /// this exact string. Versioned (`:v1`) per the dimension gate.
+    pub const DIMENSION: &str = "ownership:responsible_party:node:v1";
+    /// The owner-binding `delegation_purpose` (producer-side marker; the
+    /// substrate gate keys on [`DIMENSION`], this documents the pair).
+    pub const PURPOSE: &str = "responsible_for";
+}
+
 /// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the reserved
 /// **two-prefix delegation scope split** that makes "infrastructure
 /// must not have agency" wire-checkable.
