@@ -2690,6 +2690,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // attesting key's identity_type. Backend-symmetric with SQLite + memory.
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
+        // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
+        // federate FEDERATION-APPLY re-check (point ii). A federation-tier row
+        // keyed on a community (`community_id`) is refused if C has lost its
+        // last live `moderate`-holder. No-op for local-tier rows, no
+        // community_id, or an unknown community. Backend-symmetric.
+        crate::federation::admission::check_no_moderator_federate_apply(self, &row).await?;
+
         // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
         // hybrid-verify at the federation-tier bulk store/replicate
         // ingest gate. A no-op for local-tier rows (CC 5.3.2.2 deferred

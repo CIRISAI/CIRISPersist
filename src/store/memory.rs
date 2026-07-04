@@ -1320,6 +1320,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // key's identity_type. Backend-symmetric with SQLite + Postgres.
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
+        // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
+        // federate FEDERATION-APPLY re-check (point ii). A federation-tier row
+        // keyed on a community (`community_id` in its envelope) is a federation
+        // apply step keyed on C; it is refused if C has lost its last live
+        // `moderate`-holder (so a moderator-less community cannot continue at
+        // moderated capability). No-op for local-tier rows, rows with no
+        // community_id, and communities not locally known. Resolves the
+        // community + steward-binding via the directory (locks state itself),
+        // so it runs before the state lock. Backend-symmetric.
+        crate::federation::admission::check_no_moderator_federate_apply(self, &row).await?;
+
         // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
         // hybrid-verify at the federation-tier bulk store/replicate
         // ingest gate (parity with the postgres + sqlite backends). A
@@ -2431,6 +2442,44 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 .cmp(&a.emitted_at)
                 .then_with(|| b.event_id.cmp(&a.event_id))
         });
+        Ok(rows)
+    }
+
+    // ─── v12.5.0 (CIRISPersist#238 / #146, CEG §8.1.11.3 / §10.1.3) —
+    //     subject-side consent revocations for the consent-SLA watcher. Memory
+    //     parity with the sqlite/postgres backends (the default trait impl
+    //     errors); the promotion-overdue check
+    //     ([`run_consent_sla_watch`]) needs local-tier rows too, so this is
+    //     NOT tier-filtered (unlike list_attestations_for, which is
+    //     federation-only).
+
+    async fn list_consent_revocations(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        use crate::federation::types::attestation_type;
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                // Subject-side revocations only: a `withdraws` admitted under
+                // rule 2/3/4 (rule 1 is the producer's own self-revoke, not a
+                // consent event), OR a `consent:state:revoked` stance.
+                let is_subject_withdraws = a.attestation_type == attestation_type::WITHDRAWS
+                    && matches!(a.withdraws_admission_rule, Some(2..=4));
+                let is_consent_revoked = a
+                    .attestation_envelope
+                    .get("dimension")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|d| d.starts_with("consent:state:revoked"));
+                is_subject_withdraws || is_consent_revoked
+            })
+            .filter(|a| since.is_none_or(|s| a.asserted_at >= s))
+            .cloned()
+            .collect();
+        // Match the SQL backends: ORDER BY asserted_at DESC.
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
         Ok(rows)
     }
 
@@ -8729,6 +8778,254 @@ mod tests {
         )
         .await
         .unwrap());
+    }
+
+    /// #238 (CC 4.5.4 / §11.11) — the no-moderator-no-federate substrate gate,
+    /// decision-table style. A `community` federates ONLY while ≥1 steward-bound
+    /// authority root (a live named `moderate`-holder) exists; infrastructure
+    /// communities are EXEMPT. Enforcement lives at the federation-apply
+    /// chokepoint ([`check_no_moderator_federate_apply`]); the admission
+    /// predicate ([`check_no_moderator_federate_admission`]) is its primitive.
+    #[tokio::test]
+    async fn no_moderator_federate_gate_decision_table() {
+        use crate::federation::admission::{
+            check_no_moderator_federate_admission, check_no_moderator_federate_admission_by_id,
+            check_no_moderator_federate_apply, MEMBER_ROLE_FOUNDER,
+        };
+        use crate::federation::types::{consensus_protocol, identity_type};
+
+        // Build a community `cid` founded (founder_only) by `founder` of
+        // identity_type `founder_it`, optionally infra-labeled. Registers the
+        // community + founder keys and STORES the record (put_community itself
+        // does not gate on moderator existence — the apply path does).
+        async fn seed(
+            backend: &MemoryBackend,
+            cid: &str,
+            founder: &str,
+            founder_it: &str,
+            infra: bool,
+        ) -> crate::federation::types::Community {
+            let mut ck = fix_key(cid, "primitive", cid);
+            if infra {
+                // SecReview F2: the infra carve-out is honored only when the
+                // community's own key is the substrate_persist authority.
+                ck.identity_type = identity_type::SUBSTRATE_PERSIST.into();
+            }
+            backend
+                .put_public_key(SignedKeyRecord { record: ck })
+                .await
+                .unwrap();
+            let mut fk = fix_key(founder, "primitive", founder);
+            fk.identity_type = founder_it.into();
+            backend
+                .put_public_key(SignedKeyRecord { record: fk })
+                .await
+                .unwrap();
+            let policy_blob =
+                infra.then(|| serde_json::json!({ "cohort_subkind": "infrastructure" }));
+            let community = crate::federation::types::Community {
+                community_key_id: cid.into(),
+                community_name: "dt".into(),
+                members: vec![crate::federation::types::CommunityMember {
+                    key_id: founder.into(),
+                    joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    role: Some(MEMBER_ROLE_FOUNDER.into()),
+                }],
+                founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                consensus_protocol: consensus_protocol::FOUNDER_ONLY.into(),
+                policy_blob,
+                persist_row_hash: String::new(),
+            };
+            backend
+                .put_community(crate::federation::SignedCommunity {
+                    community: community.clone(),
+                })
+                .await
+                .expect("record stored (put_community is not the moderator gate)");
+            community
+        }
+
+        let b = MemoryBackend::new();
+
+        // ── admission predicate (the reusable primitive) ────────────────────
+        // (1) user founder = steward-bound authority root = zero-hop named
+        //     moderator → ADMIT.
+        let c_ok = seed(&b, "dt-ok", "dt-user", identity_type::USER, false).await;
+        check_no_moderator_federate_admission(&b, &c_ok)
+            .await
+            .expect("steward-bound (user) founder ⇒ has a moderator ⇒ may federate");
+
+        // (2) primitive founder = passes the steward-binding gate (not
+        //     node/agent, out of its scope) but is NOT steward-bound ⇒ NO named
+        //     moderator ⇒ REJECT, fail-secure.
+        let c_no = seed(&b, "dt-no", "dt-prim", identity_type::PRIMITIVE, false).await;
+        let err = check_no_moderator_federate_admission(&b, &c_no)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::CommunityHasNoModerator { .. }
+            ),
+            "moderator-less community refused, got {err:?}"
+        );
+        assert_eq!(err.kind(), "federation_community_no_moderator");
+
+        // (3) infrastructure community with a non-steward-bound founder →
+        //     EXEMPT (trust + serve needs no moderator) → ADMIT.
+        let c_infra = seed(&b, "dt-infra", "dt-iprim", identity_type::PRIMITIVE, true).await;
+        check_no_moderator_federate_admission(&b, &c_infra)
+            .await
+            .expect("authorized infrastructure community is exempt from the moderator gate");
+
+        // ── federation-apply chokepoint (points i + ii unified) ─────────────
+        // A federation-tier row keyed on the moderator-less community → REJECT.
+        let mut row = fix_attestation("dt-apply", "dt-prim", "dt-prim", "dt-prim");
+        row.attestation_envelope = serde_json::json!({
+            "id": "dt-apply", "dimension": "identity_binding:v1", "community_id": "dt-no"
+        });
+        let err = check_no_moderator_federate_apply(&b, &row)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::federation::Error::CommunityHasNoModerator { .. }
+            ),
+            "federation-apply step keyed on a moderator-less community is refused"
+        );
+        // A LOCAL-tier row keyed on it → no-op (local writes are not a
+        // federation apply step).
+        let mut local_row = row.clone();
+        local_row.tier = crate::federation::types::attestation_tier::LOCAL.into();
+        check_no_moderator_federate_apply(&b, &local_row)
+            .await
+            .expect("local-tier row is not a federation apply step");
+        // A row keyed on the MODERATORED community → ADMIT.
+        let mut live_row = row.clone();
+        live_row.attestation_envelope = serde_json::json!({
+            "id": "dt-apply2", "dimension": "identity_binding:v1", "community_id": "dt-ok"
+        });
+        check_no_moderator_federate_apply(&b, &live_row)
+            .await
+            .expect("moderatored community may continue to federate");
+        // No community_id + unknown community_id → out of scope (Ok).
+        let mut bare = row.clone();
+        bare.attestation_envelope =
+            serde_json::json!({ "id": "x", "dimension": "identity_binding:v1" });
+        check_no_moderator_federate_apply(&b, &bare)
+            .await
+            .expect("no community_id ⇒ not keyed on a community ⇒ no-op");
+        check_no_moderator_federate_admission_by_id(&b, "no-such")
+            .await
+            .expect("unknown community ⇒ out of scope ⇒ no-op");
+    }
+
+    /// #238 / #146 (CC 5.3.2.2 / §10.1.3, AV-61 transit-not-rest) — the
+    /// consent-revocation promotion-overdue `hard_case` fires at the 24 h
+    /// window boundary for a subject-side revocation that stays local-tier
+    /// (unpromoted), is idempotent on re-scan, and stops once the row promotes.
+    #[tokio::test]
+    async fn consent_revocation_promotion_overdue_fires_at_window_boundary() {
+        use crate::federation::hard_case::{kind, HardCaseFilter};
+        use crate::federation::types::attestation_tier;
+        use crate::federation::FederationDirectory;
+        use std::time::Duration;
+        let backend = MemoryBackend::new();
+        for k in ["subject-c", "target-c"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        let revoked_at: chrono::DateTime<chrono::Utc> = "2026-06-01T00:00:00Z".parse().unwrap();
+        // A subject-side `consent:state:revoked` TRANSITING local-tier
+        // (unpromoted). persist's admission gate refuses to *originate* such a
+        // local row (transit-not-rest); we stage it directly to exercise the
+        // watcher's promotion-overdue detection.
+        let mut rev = fix_attestation("rev-c", "subject-c", "target-c", "subject-c");
+        rev.attestation_envelope =
+            serde_json::json!({ "id": "rev-c", "dimension": "consent:state:revoked:v1" });
+        rev.asserted_at = revoked_at;
+        rev.subject_key_ids = vec!["subject-c".into()];
+        rev.tier = attestation_tier::LOCAL.into();
+        rev.promoted_at = None;
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .federation_attestations
+            .push(rev);
+
+        let window = Duration::from_secs(86_400); // 24 h
+
+        // The local-tier transit row is visible to the revocation scan.
+        assert_eq!(
+            backend.list_consent_revocations(None).await.unwrap().len(),
+            1,
+            "list_consent_revocations includes the local-tier transit row"
+        );
+
+        // Just BEFORE the boundary (24 h − 1 s) → in flight, NOT overdue.
+        let before = revoked_at + chrono::Duration::seconds(86_400 - 1);
+        let r = backend.run_consent_sla_watch(before, window).await.unwrap();
+        assert_eq!(r.revocations_scanned, 1);
+        assert_eq!(r.promotion_overdue, 0, "within the window: not yet overdue");
+        assert!(backend
+            .list_hard_case_events(HardCaseFilter::default())
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Just AFTER the boundary (24 h + 1 s) → overdue fires.
+        let after = revoked_at + chrono::Duration::seconds(86_400 + 1);
+        let r = backend.run_consent_sla_watch(after, window).await.unwrap();
+        assert_eq!(r.promotion_overdue, 1, "past the window: overdue fires");
+        let evs = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].target_key_id.as_deref(), Some("target-c"));
+        assert_eq!(evs[0].subject_key_id.as_deref(), Some("subject-c"));
+
+        // Re-scan is idempotent on the deterministic event_id.
+        let r = backend.run_consent_sla_watch(after, window).await.unwrap();
+        assert_eq!(r.promotion_overdue, 1, "condition still active");
+        assert_eq!(
+            backend
+                .list_hard_case_events(HardCaseFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "no duplicate overdue row on re-scan"
+        );
+
+        // Once PROMOTED (tier=federation) it drops out of the fire condition —
+        // its only other conformant terminal state (transit-not-rest).
+        {
+            let mut st = backend.state.lock().unwrap();
+            for a in st.federation_attestations.iter_mut() {
+                if a.attestation_id == "rev-c" {
+                    a.tier = attestation_tier::FEDERATION.into();
+                    a.promoted_at = Some(after);
+                }
+            }
+        }
+        let r = backend
+            .run_consent_sla_watch(after + chrono::Duration::seconds(1), window)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.promotion_overdue, 0,
+            "a promoted revocation is no longer overdue"
+        );
     }
 
     /// steward_bindings_of: an steward-bound node (live `delegates_to(user →

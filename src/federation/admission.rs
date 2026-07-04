@@ -2616,6 +2616,164 @@ pub async fn check_community_membership_steward_binding(
     Ok(())
 }
 
+/// v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11 — the no-moderator-no-federate
+/// existence invariant) — the **substrate** federate-gate: a `community`
+/// federates (is admitted to, and continues at, moderated capability) ONLY
+/// while ≥1 live holder of its `moderate` duty exists. This is the moderation
+/// analogue of the CC 3.2 steward-binding gate, and — like it — lives in the
+/// substrate where the write lands, NOT in a governance / consumer-policy
+/// layer (§11.11 "the gate lives where the write lands"; resolving the
+/// CIRISPersist#238 / CIRISRegistry#110(a) ownership ambiguity to SUBSTRATE).
+///
+/// Takes the [`Community`](crate::federation::types::Community) record
+/// **directly** (not via `lookup_community`) — the reusable admission-decision
+/// primitive over a record in hand (in-flight or stored). For the
+/// federation-apply re-check keyed on a stored community's id, see
+/// [`check_no_moderator_federate_admission_by_id`]; both are the load-bearing
+/// enforcement point [`check_no_moderator_federate_apply`] consumes.
+///
+/// # Enforcement point (design note — CIRISPersist#238)
+///
+/// The §11.11 gate is enforced at the **federation-apply chokepoint**: every
+/// federation-tier attestation apply step keyed on `C`
+/// ([`check_no_moderator_federate_apply`], wired into every backend's
+/// `put_attestation`). This point subsumes BOTH spec evaluation points — a
+/// community's **first** federation-tier apply keyed on `C` IS its
+/// admission-to-federate (i), and every subsequent one is the continue-to-
+/// federate re-check (ii). It is deliberately NOT wired into `put_community`:
+/// storing a community *record* is not itself "federating" (a local-only
+/// community that never emits federation-tier content keyed on `C` causes no
+/// unmoderated-federation harm), and hard-failing record storage would also
+/// fail-secure communities that §11.11 rule-2 merit auto-promotion / the CC
+/// 4.5.13 recovery could still rescue — ceremonies persist cannot itself
+/// perform (it cannot forge the authority's appointment signature). The gate
+/// thus "lives where the [federation] write lands." This function remains the
+/// admission-decision primitive a consumer/governance layer MAY call to decide
+/// admission ahead of federation.
+///
+/// # The existence check
+///
+/// A named moderator exists IFF the community has ≥1 **steward-bound authority
+/// root**. This is exact, not an approximation: [`is_named_moderator`] admits
+/// `k` only via a chain rooted at some `root ∈ authority_set(C)` with
+/// [`is_steward_bound(root)`](is_steward_bound) — and that steward-bound root
+/// is itself a **zero-hop** named moderator. So `moderators_of(C, moderate)`
+/// is non-empty IFF such a root exists; we test that directly (the authority
+/// set computed from the in-flight record's roster, per
+/// [`community_authority_set`]'s `founder_only`-vs-open rule), avoiding the
+/// per-delegate walk.
+///
+/// # Carve-out + fail-secure
+///
+/// `cohort_subkind: infrastructure` communities
+/// ([`is_authorized_infrastructure_community`]) are EXEMPT — a node MAY trust +
+/// serve an infrastructure community (`ciris-canonical` / governance roots)
+/// with no moderator, mirroring the CC 3.2 steward-binding carve-out. Every
+/// other community with no steward-bound authority root is REFUSED with
+/// [`Error::CommunityHasNoModerator`] BEFORE any row is stored
+/// (verify-before-mutation, AV-9) — §11.11 rule 3 fail-secure, "better no
+/// group than an unmoderated one".
+///
+/// Merit auto-promotion (§11.11 rule 2) + the CC 4.5.13 48-hour recovery are
+/// signed appointment *ceremonies* (a `delegates_to(moderate)` emitted by the
+/// community authority); persist cannot forge that authority signature, so
+/// they live one layer up. This gate is the fail-secure floor the ceremony
+/// recovers the community out of — the substrate never *fabricates* a
+/// moderator, it only refuses to federate one that does not exist.
+pub async fn check_no_moderator_federate_admission(
+    directory: &dyn super::FederationDirectory,
+    community: &super::Community,
+) -> Result<(), Error> {
+    // Infrastructure carve-out (authorized only — SecReview F2 fail-secure):
+    // trust + serve needs no moderator.
+    if is_authorized_infrastructure_community(directory, community).await? {
+        return Ok(());
+    }
+    // Authority set from the in-flight roster (mirrors community_authority_set:
+    // founders always; every member too under a non-`founder_only` protocol).
+    let founder_only =
+        community.consensus_protocol == crate::federation::types::consensus_protocol::FOUNDER_ONLY;
+    for m in &community.members {
+        let is_authority = m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER) || !founder_only;
+        if is_authority && is_steward_bound(directory, &m.key_id).await? {
+            // ≥1 steward-bound authority root ⇒ a live (zero-hop) named
+            // moderator exists ⇒ the community may federate.
+            return Ok(());
+        }
+    }
+    Err(Error::CommunityHasNoModerator {
+        community_key_id: community.community_key_id.clone(),
+    })
+}
+
+/// v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — the **federation-apply**
+/// re-check of [`check_no_moderator_federate_admission`], keyed on a stored
+/// community's `community_id`. §11.11 requires the moderator-existence gate at
+/// **two** points: (i) at admission (`put_community` — the record-in-flight
+/// form above) AND (ii) **on the federation path** — "every cross-region
+/// propagation / federation apply step keyed on C MUST re-check live
+/// `moderate`-holder existence at apply time, so a community that *loses* its
+/// moderator (lapse / `withdraws`-revocation / freshness expiry) cannot
+/// continue at moderated capability." Mid-life moderator loss happens via
+/// `delegates_to` retraction / steward-binding lapse — NOT via a community
+/// re-write — so the community-record admission gate alone cannot catch it;
+/// this apply-time re-check does.
+///
+/// Resolves the community via [`FederationDirectory::lookup_community`]. A
+/// community **not locally known** is out of scope — `Ok(())` (fail-open): the
+/// substrate cannot resolve an absent record's moderators, and a
+/// federation-tier row keyed on it is governed by that peer's own admission
+/// gate; the known-community record admission gate is the authoritative point.
+/// A known community runs the full existence + infrastructure-carve-out check.
+pub async fn check_no_moderator_federate_admission_by_id(
+    directory: &dyn super::FederationDirectory,
+    community_id: &str,
+) -> Result<(), Error> {
+    if community_id.is_empty() {
+        return Ok(());
+    }
+    let Some(community) = directory.lookup_community(community_id).await? else {
+        return Ok(());
+    };
+    check_no_moderator_federate_admission(directory, &community).await
+}
+
+/// v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — the `put_attestation` entry
+/// point for the §11.11 federation-apply re-check (point ii). A
+/// **federation-tier** attestation carrying a `community_id` in its envelope is
+/// a "federation apply step keyed on C"; it is refused if `C` has no live
+/// `moderate`-holder ([`check_no_moderator_federate_admission_by_id`]).
+///
+/// A no-op (`Ok(())`) for:
+/// - **local-tier** rows — a local-tier write is private to the producing
+///   occurrence and not a federation apply step (CC 5.3.2.2), and
+/// - rows carrying **no** `community_id` (not keyed on a community), and
+/// - a `community_id` **not locally known** (out of scope — fail-open, per
+///   [`check_no_moderator_federate_admission_by_id`]).
+///
+/// A founder appointment (`delegates_to(moderate)` keyed on C) is NOT
+/// chicken-and-egg-blocked: a steward-bound founder is already a zero-hop named
+/// moderator, so `C` is not moderator-less at that point; and a non-steward-
+/// bound founder could not root a moderator via the appointment anyway (the
+/// walk requires a steward-bound root). Verify-before-mutation (AV-9) — wired
+/// alongside the other shared admission gates on every backend's
+/// `put_attestation`, before the row is hashed + INSERTed.
+pub async fn check_no_moderator_federate_apply(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    // Only federation-tier rows are a federation apply step.
+    if row.tier != crate::federation::types::attestation_tier::FEDERATION {
+        return Ok(());
+    }
+    let community_id = row
+        .attestation_envelope
+        .get("community_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    check_no_moderator_federate_admission_by_id(directory, community_id).await
+}
+
 /// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §11.11) — is key `k` a **named
 /// moderator** of community `community_id` for `duty` (`moderate` /
 /// `takedown` / `review`)? True iff a live scope-bearing `delegates_to`

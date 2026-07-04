@@ -24466,6 +24466,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // caller-side malformed-content / authorization failure;
         // ValueError (4xx).
         crate::federation::Error::WitnessAdmit(_) => PyValueError::new_err(kind),
+        // #238 (CC 4.5.4 / §11.11) — a community with no live `moderate`-holder
+        // cannot be admitted-to / continue federating. A caller/state admission
+        // refusal (fail-secure), like the other admission gates → ValueError (4xx).
+        crate::federation::Error::CommunityHasNoModerator { .. } => PyValueError::new_err(kind),
         // Server-fault → RuntimeError (5xx).
         crate::federation::Error::Backend(_) => PyRuntimeError::new_err(kind),
         // v11.8.1 (CIRISPersist#329) — the directory-ops proxy was asked

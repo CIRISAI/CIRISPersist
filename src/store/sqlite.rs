@@ -2417,6 +2417,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // so a rejected emission leaves no trace.
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
+        // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
+        // federate FEDERATION-APPLY re-check (point ii). A federation-tier row
+        // keyed on a community (`community_id`) is refused if C has lost its
+        // last live `moderate`-holder. No-op for local-tier rows, no
+        // community_id, or an unknown community. Backend-symmetric.
+        crate::federation::admission::check_no_moderator_federate_apply(self, &row).await?;
+
         // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
         // hybrid-verify at the federation-tier bulk store/replicate
         // ingest gate (parity with the postgres + memory backends). A
@@ -16197,6 +16204,118 @@ mod tests {
         assert_eq!(
             r3.sla_breaches, 0,
             "consent:deletion_complete suppresses the breach"
+        );
+    }
+
+    /// #238 / #146 (CC 5.3.2.2 / §10.1.3, AV-61 transit-not-rest) — the
+    /// consent-revocation promotion-overdue `hard_case` fires at the 24 h
+    /// window boundary for a subject-side revocation staged local-tier
+    /// (unpromoted), on the SQLite backend's real `list_consent_revocations`.
+    #[tokio::test]
+    async fn consent_promotion_overdue_fires_at_window_boundary_sqlite() {
+        use crate::federation::{
+            hard_case::kind, hard_case::HardCaseFilter, FederationDirectory, SignedAttestation,
+        };
+        use std::time::Duration;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["subject-p", "target-p"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, &format!("prim-{k}"), k),
+                })
+                .await
+                .unwrap();
+        }
+        let revoked_at: chrono::DateTime<chrono::Utc> = "2026-06-01T00:00:00Z".parse().unwrap();
+        // A subject-side consent:state:revoked. It is federation-tier by
+        // classification, so it admits federation-tier (signed); we then flip
+        // it to the local-tier TRANSIT state (unpromoted) directly — persist's
+        // admission gate refuses to *originate* a local subject revocation
+        // (transit-not-rest), so this simulates the #171 promote-surface
+        // staging the watcher must drive out.
+        let mut rev = fed_attestation("rev-p", "subject-p", "target-p", "subject-p");
+        rev.attestation_envelope =
+            serde_json::json!({ "id": "rev-p", "dimension": "consent:state:revoked:v1" });
+        rev.asserted_at = revoked_at;
+        rev.subject_key_ids = vec!["subject-p".into()];
+        resign_fed(&mut rev);
+        backend
+            .put_attestation(SignedAttestation { attestation: rev })
+            .await
+            .unwrap();
+        // Flip to local-tier, unpromoted (the transit staging state).
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "UPDATE federation_attestations SET tier = 'local', promoted_at = NULL \
+                 WHERE attestation_id = 'rev-p'",
+                [],
+            )
+            .unwrap();
+        }
+        let window = Duration::from_secs(86_400); // 24 h
+
+        // The SQLite scan surfaces the local-tier transit row.
+        let revs = backend.list_consent_revocations(None).await.unwrap();
+        assert_eq!(revs.len(), 1, "local-tier subject revocation is scanned");
+        assert_ne!(
+            revs[0].tier,
+            crate::federation::types::attestation_tier::FEDERATION,
+            "row is local-tier (transit)"
+        );
+
+        // Just BEFORE the boundary → in flight, not overdue.
+        let before = revoked_at + chrono::Duration::seconds(86_400 - 1);
+        let r = backend.run_consent_sla_watch(before, window).await.unwrap();
+        assert_eq!(r.promotion_overdue, 0, "within the window: not yet overdue");
+
+        // Just AFTER the boundary → overdue fires; recorded + idempotent.
+        let after = revoked_at + chrono::Duration::seconds(86_400 + 1);
+        let r = backend.run_consent_sla_watch(after, window).await.unwrap();
+        assert_eq!(r.promotion_overdue, 1, "past the window: overdue fires");
+        let evs = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].target_key_id.as_deref(), Some("target-p"));
+        assert_eq!(evs[0].subject_key_id.as_deref(), Some("subject-p"));
+        let r = backend.run_consent_sla_watch(after, window).await.unwrap();
+        assert_eq!(r.promotion_overdue, 1, "still detected");
+        assert_eq!(
+            backend
+                .list_hard_case_events(HardCaseFilter {
+                    kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                    since: None,
+                })
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "idempotent: no duplicate overdue row"
+        );
+
+        // Promote it (tier=federation) → drops out of the fire condition.
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "UPDATE federation_attestations SET tier = 'federation', promoted_at = ?1 \
+                 WHERE attestation_id = 'rev-p'",
+                [after.to_rfc3339()],
+            )
+            .unwrap();
+        }
+        let r = backend
+            .run_consent_sla_watch(after + chrono::Duration::seconds(1), window)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.promotion_overdue, 0,
+            "a promoted revocation is no longer overdue"
         );
     }
 
