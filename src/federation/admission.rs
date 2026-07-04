@@ -3884,6 +3884,15 @@ pub async fn check_adult_incapacity_binding(
 /// - `capacity:*` → MUST NOT be self-emitted (`attesting_key_id ==
 ///   attested_key_id`) — CC 3.4.5's "Critical enforcement" anti-Goodhart rule
 ///   (an `identity_type`-independent attester==attested check).
+/// - `age_assurance:*` → MUST NOT be self-emitted either (v12.7.0,
+///   CIRISPersist#368) — CC 3.4.11 "A subject MUST NOT emit on
+///   `age_assurance:`". The witness-RESERVED half rides the rule table; this
+///   attester==attested half stops a `witness`-typed key from graduating
+///   ITSELF. A witness graduates a DIFFERENT subject by naming it as
+///   `attested_key_id` (the cross-subject edge
+///   [`crate::Engine::emit_attestation`] carries via
+///   [`EmitAttestationInput::attested_key_id`](crate::federation::EmitAttestationInput::attested_key_id)),
+///   which [`super::age::age_band`] then resolves for that subject.
 ///
 /// Structural primitives (`scores` / `delegates_to` / `supersedes` /
 /// `withdraws` / `recants`) and any non-reserved type fast-exit with no
@@ -3914,6 +3923,25 @@ pub async fn check_reserved_prefix_admission(
         && row.attesting_key_id == row.attested_key_id
     {
         return Err(Error::CapacitySelfEmissionRejected {
+            key_id: row.attesting_key_id.clone(),
+            attestation_type: at.to_owned(),
+        });
+    }
+
+    // v12.7.0 (CIRISPersist#368) — CC 3.4.11: "A subject MUST NOT emit on
+    // `age_assurance:`". The witness rung is an attestation ABOUT a subject
+    // (`attested_key_id` = the subject, the same cross-subject edge shape
+    // `delegates_to` uses); the SUBJECT-must-not-emit half is an
+    // attester==attested check independent of identity_type — without it a
+    // key carrying the `witness` identity_type could self-mint its own
+    // `adult` graduation. The witness-RESERVED half (only `identity_type ⊇
+    // {witness}` may emit) rides the reserved-prefix rule table below,
+    // unchanged. Exact sibling of the CC 3.4.12 `capacity_assurance:` check
+    // above. NB: the self rung stays on the distinct NON-reserved
+    // `age_self_declared:` prefix (subject-signed by design), which this
+    // check never touches.
+    if at.starts_with("age_assurance:") && row.attesting_key_id == row.attested_key_id {
+        return Err(Error::AgeAssuranceSelfEmissionRejected {
             key_id: row.attesting_key_id.clone(),
             attestation_type: at.to_owned(),
         });

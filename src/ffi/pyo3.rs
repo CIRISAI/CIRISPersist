@@ -4355,6 +4355,17 @@ impl PyEngine {
     /// #247 floor: this can't FK-violate the way the hand-rolled emit sites
     /// did. Requires a PQC-configured local signer (the hybrid sign);
     /// raises if absent.
+    ///
+    /// v12.7.0 (CIRISPersist#368, CC 3.4.11/3.4.13) — `attested_key_id`
+    /// names the row's **SUBJECT** (the cross-subject edge shape
+    /// `delegates_to` uses). Omitted ⇒ self-attestation. This is the
+    /// **witness-targets-subject** age surface: a `witness`-role engine
+    /// emits `{"attestation_type": "age_assurance:{level}:{band}:v1",
+    /// "attested_key_id": "<subject>", ...}` and the SUBJECT's
+    /// `age_band_json` graduates (witness outranks self). A subject cannot
+    /// graduate itself: attester==attested on `age_assurance:*` raises
+    /// `ValueError("federation_age_assurance_self_emission_rejected")`, and
+    /// a non-witness emitter raises the reserved-prefix mismatch.
     fn emit_attestation(&self, py: Python<'_>, input_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -4411,6 +4422,14 @@ impl PyEngine {
     /// **DERIVED** federation key_id (`local_derived_key_id`, the #247
     /// floor), computed internally. Surfaces a clear error if the engine
     /// has no composed hybrid signer (no local signer / no PQC half).
+    ///
+    /// v12.7.0 (CIRISPersist#368) — despite the `_self` name (which refers
+    /// to signing with the engine's OWN composed signer), the input's
+    /// optional `attested_key_id` still names the row's SUBJECT, exactly as
+    /// on [`PyEngine::emit_attestation`] — so a witness-role hardware-hybrid
+    /// engine can graduate a DIFFERENT subject's age band through this path
+    /// too. Omitted ⇒ self-attestation (and `age_assurance:*` then rejects:
+    /// a subject must not emit its own age assurance, CC 3.4.11).
     fn emit_attestation_self(&self, py: Python<'_>, input_json: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -7456,6 +7475,14 @@ impl PyEngine {
     /// fail-closed (a key whose chain to a `user` identity cannot be shown is
     /// not steward-bound). The most-reconstructed walk; exposing it stops
     /// consumers re-deriving the §5.6.8.10 graph.
+    ///
+    /// v12.7.0 (CIRISPersist#367, CC 3.2) — this is also THE
+    /// **steward-less-minor liveness predicate**: a PROVEN minor (witness
+    /// `age_assurance:*:minor` about it, emittable cross-subject per #368)
+    /// does NOT self-anchor, so it returns `true` only while a live
+    /// `delegates_to(adult-user → minor)` guardianship edge exists — and
+    /// flips to `false` (fail-secure) the moment the steward withdraws it.
+    /// An adult / age-unverified user self-anchors (`true` with no edge).
     fn is_steward_bound_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
@@ -24537,8 +24564,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // shape as the other admission-gate rejections.
         // v10.3.0 (#288, CC 3.4.5) — capacity:* self-emission is the same
         // admission-gate-rejection shape (caller-fault, ValueError).
+        // v12.7.0 (#368, CC 3.4.11) — age_assurance:* self-emission is its
+        // exact sibling (subject-must-not-emit; caller-fault, ValueError).
         crate::federation::Error::ReservedPrefixEmitterMismatch { .. }
-        | crate::federation::Error::CapacitySelfEmissionRejected { .. } => {
+        | crate::federation::Error::CapacitySelfEmissionRejected { .. }
+        | crate::federation::Error::AgeAssuranceSelfEmissionRejected { .. } => {
             PyValueError::new_err(kind)
         }
         // v3.9.1 (CIRISPersist#150 Ask 3) — cohort_scope admission

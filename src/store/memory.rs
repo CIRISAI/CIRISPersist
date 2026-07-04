@@ -10330,6 +10330,156 @@ mod tests {
             .expect("a node target is governed by the node-agency gate, not the user-target gate");
     }
 
+    // ── v12.7.0 (CIRISPersist#368, CC 3.4.11 / CC 3.4.13) ────────────────
+    //    Witness-targets-subject age_assurance admission decision table.
+
+    /// CC 3.4.11 witness-targets-subject decision table, through the REAL
+    /// `put_attestation` admission path:
+    ///
+    /// - a witness emitting `age_assurance:*` ABOUT a DIFFERENT subject is
+    ///   ADMITTED and graduates THAT subject's band (witness outranks the
+    ///   subject's own self-declared rung);
+    /// - a witness emitting `age_assurance:*` about ITSELF (attester ==
+    ///   attested) is REJECTED — "a subject MUST NOT emit on
+    ///   `age_assurance:`" — so nobody self-mints their own graduation;
+    /// - a non-witness cross-subject emitter is still REJECTED by the
+    ///   unchanged identity gate (reserved-prefix emitter mismatch).
+    #[tokio::test]
+    async fn age_assurance_witness_targets_subject_decision_table() {
+        use crate::federation::age::{age_band, age_band_fine, AgeBand, AgeBandFine};
+        let backend = MemoryBackend::new();
+        put_typed_key(&backend, "wts-witness", "witness").await;
+        put_typed_key(&backend, "wts-T", "user").await; // the subject
+        put_typed_key(&backend, "wts-P", "user").await; // plain (non-witness) user
+
+        // Baseline: T self-declares MINOR (the non-reserved self rung still
+        // admits attester==attested — it is subject-signed by design).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_age_attestation(
+                    "wts-self-minor",
+                    "wts-T",
+                    "wts-T",
+                    "age_self_declared:minor:v1",
+                ),
+            })
+            .await
+            .expect("subject-signed self rung admits");
+        assert_eq!(age_band(&backend, "wts-T").await.unwrap(), AgeBand::Minor);
+
+        // CROSS-SUBJECT witness graduation: W attests T adult — ADMITTED, and
+        // T's band graduates (witness outranks T's own self-declared minor).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_age_attestation(
+                    "wts-w-adult",
+                    "wts-witness",
+                    "wts-T",
+                    "age_assurance:government:adult:v1",
+                ),
+            })
+            .await
+            .expect("witness-targets-subject age_assurance is admitted (CC 3.4.13)");
+        assert_eq!(
+            age_band(&backend, "wts-T").await.unwrap(),
+            AgeBand::Adult,
+            "a witness row ABOUT T graduates T's band",
+        );
+        assert_eq!(
+            age_band_fine(&backend, "wts-T").await.unwrap(),
+            AgeBandFine::Adult,
+            "the finer resolution graduates too",
+        );
+
+        // SELF-graduation via the witness prefix: W attests W — REJECTED
+        // (attester == attested; CC 3.4.11 "a subject MUST NOT emit on
+        // `age_assurance:`"). The witness identity_type does NOT bypass.
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_age_attestation(
+                    "wts-w-self",
+                    "wts-witness",
+                    "wts-witness",
+                    "age_assurance:provider:adult:v1",
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), "federation_age_assurance_self_emission_rejected");
+        assert_eq!(
+            age_band(&backend, "wts-witness").await.unwrap(),
+            AgeBand::Unknown,
+            "the rejected self-emission confers nothing",
+        );
+
+        // Identity gate UNCHANGED: a plain user cross-attesting T's age is
+        // still refused (reserved prefix requires a witness emitter).
+        let e = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_age_attestation(
+                    "wts-p-cross",
+                    "wts-P",
+                    "wts-T",
+                    "age_assurance:provider:minor:v1",
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
+    }
+
+    /// #368 read-side defense-in-depth: a self-emitted `age_assurance:*` row
+    /// that PRE-DATES the admission gate (or arrived via replication before
+    /// v12.7.0) must not graduate its own emitter either. Injected directly
+    /// into backend state (bypassing `put_attestation`) to simulate the
+    /// legacy row; `age_band` / `age_band_fine` skip it.
+    #[tokio::test]
+    async fn age_band_ignores_pre_gate_self_emitted_witness_row() {
+        use crate::federation::age::{age_band, age_band_fine, AgeBand, AgeBandFine};
+        let backend = MemoryBackend::new();
+        put_typed_key(&backend, "pg-witness", "witness").await;
+        put_typed_key(&backend, "pg-T", "user").await;
+
+        // Bypass the gate: push a self-emitted witness-adult row directly.
+        let legacy = fix_age_attestation(
+            "pg-self-adult",
+            "pg-witness",
+            "pg-witness",
+            "age_assurance:government:adult:v1",
+        );
+        backend
+            .state
+            .lock()
+            .expect("memory backend lock")
+            .federation_attestations
+            .push(legacy);
+
+        assert_eq!(
+            age_band(&backend, "pg-witness").await.unwrap(),
+            AgeBand::Unknown,
+            "a pre-gate self-emitted witness row is skipped at read time",
+        );
+        assert_eq!(
+            age_band_fine(&backend, "pg-witness").await.unwrap(),
+            AgeBandFine::Unknown,
+        );
+
+        // Control: the SAME token about a DIFFERENT subject resolves.
+        let cross = fix_age_attestation(
+            "pg-cross-adult",
+            "pg-witness",
+            "pg-T",
+            "age_assurance:government:adult:v1",
+        );
+        backend
+            .state
+            .lock()
+            .expect("memory backend lock")
+            .federation_attestations
+            .push(cross);
+        assert_eq!(age_band(&backend, "pg-T").await.unwrap(), AgeBand::Adult);
+    }
+
     // ── CIRISPersist#309 (CC 3.4.12) — adult-incapacity steward-binding ──
 
     /// Build an adult-incapacity `delegates_to(steward -> ward)` carrying the

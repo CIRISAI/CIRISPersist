@@ -2105,6 +2105,46 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
 mod tests {
     use super::*;
 
+    /// v12.7.0 (CIRISPersist#368) — the FFI wire contract for the
+    /// witness-targets-subject age surface: `EmitAttestationInput` JSON
+    /// (the exact `PyEngine::emit_attestation` / `emit_attestation_self`
+    /// input) carries the optional `attested_key_id` naming the SUBJECT,
+    /// and omitting it round-trips to `None` (the self-attestation
+    /// default).
+    #[test]
+    fn emit_attestation_input_json_carries_attested_key_id_subject() {
+        let with_subject: EmitAttestationInput = serde_json::from_str(
+            r#"{
+                "attestation_type": "age_assurance:government:adult:v1",
+                "attested_key_id": "subject-key-1",
+                "attestation_envelope": { "id": "wire-1" }
+            }"#,
+        )
+        .expect("decode");
+        assert_eq!(
+            with_subject.attested_key_id.as_deref(),
+            Some("subject-key-1")
+        );
+        assert_eq!(
+            with_subject.attestation_type,
+            "age_assurance:government:adult:v1"
+        );
+        // Round-trips (the field serializes back out when set).
+        let json = serde_json::to_value(&with_subject).unwrap();
+        assert_eq!(json["attested_key_id"], "subject-key-1");
+
+        // Omitted ⇒ None ⇒ the emit path self-binds to the emitter (and the
+        // `age_assurance:` admission gate then rejects the self-emission).
+        let without: EmitAttestationInput = serde_json::from_str(
+            r#"{
+                "attestation_type": "age_assurance:provider:adult:v1",
+                "attestation_envelope": { "id": "wire-2" }
+            }"#,
+        )
+        .expect("decode");
+        assert!(without.attested_key_id.is_none());
+    }
+
     /// #249 Cut C — the producer-side moderate-scope tokens MUST equal the
     /// admission duty-walk's scope constants, or an emitted edge would not
     /// be admissible by `is_named_moderator` / `check_moderation_admission`.

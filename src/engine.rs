@@ -1884,6 +1884,22 @@ impl Engine {
     /// `attested_key_id` defaults to the derived key_id (self-attestation)
     /// when [`EmitAttestationInput::attested_key_id`] is `None`.
     ///
+    /// v12.7.0 (CIRISPersist#368, CC 3.4.11/3.4.13) —
+    /// [`EmitAttestationInput::attested_key_id`] names the row's **SUBJECT**
+    /// (the natural CEG cross-subject edge target, exactly how
+    /// [`Self::grant_delegation`] keys a `delegates_to` by its recipient).
+    /// This is the **witness-targets-subject** age-assurance surface: a
+    /// `witness`-role signer emits `attestation_type =
+    /// "age_assurance:{level}:{band}:v1"` with `attested_key_id =
+    /// Some(subject)` and the SUBJECT's
+    /// [`age_band`](crate::federation::age::age_band) graduates (the witness
+    /// rung outranks the subject's `age_self_declared:*`). The identity gate
+    /// is unchanged (only `identity_type ⊇ {witness}` may emit the prefix),
+    /// and a subject cannot graduate ITSELF: attester==attested on
+    /// `age_assurance:*` is rejected at admission
+    /// ([`Error::AgeAssuranceSelfEmissionRejected`](crate::federation::Error::AgeAssuranceSelfEmissionRejected),
+    /// CC 3.4.11 "a subject MUST NOT emit on `age_assurance:`").
+    ///
     /// This is the single correct implementation consumers (Node / Lens /
     /// Registry / Server, and persist's own withdraws producer) compose
     /// against instead of hand-rolling the ~50-line recipe. For the
@@ -2080,6 +2096,20 @@ impl Engine {
     /// emitted row: a node-ONLY recipient may carry only `infra:*` scopes —
     /// use [`Self::steward_bind`] for that case. `#247`-derived
     /// `attesting_key_id` is internal.
+    ///
+    /// v12.7.0 (CIRISPersist#367, CC 3.2) — a **`user`-role recipient** is
+    /// governed by the user-target steward-binding gate
+    /// ([`check_user_target_steward_binding_admission`](crate::federation::admission::check_user_target_steward_binding_admission)):
+    /// the ONLY admissible user-target shapes are **minor-guardianship**
+    /// (recipient is a PROVEN minor — a witness `age_assurance:*:minor`
+    /// about it, emittable cross-subject per #368 — and the signer is a
+    /// PROVEN adult `user`) and the narrow CC 3.4.12 adult-incapacity
+    /// aperture. Everything else rejects
+    /// (`federation_user_target_steward_binding_forbidden`). Withdrawing the
+    /// guardianship edge ([`Self::revoke_delegation`]) leaves the minor
+    /// steward-less and
+    /// [`is_steward_bound`](crate::federation::admission::is_steward_bound)
+    /// fails secure (`false`).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn grant_delegation(
         &self,
@@ -8510,6 +8540,433 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_node_agency_forbidden");
+    }
+
+    // ── v12.7.0 (CIRISPersist#368 + #367, CC 3.4.11/3.4.13 + CC 3.2) ──
+    // Witness-targets-subject age graduation over the REAL emit path, and
+    // the minor-guardianship admit + steward-less-minor fail-secure driven
+    // end-to-end over `emit_attestation` / `grant_delegation` /
+    // `revoke_delegation`.
+
+    /// A `witness`-role `federation_keys` row keyed by `derived_key_id` with
+    /// `pubkey_label`'s REAL deterministic hybrid pubkeys — the registered
+    /// age-assurance verifier shape the `age_assurance:` reserved-prefix
+    /// rule requires of the emitter.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn witness_test_key_derived_for(
+        derived_key_id: &str,
+        pubkey_label: &str,
+    ) -> crate::federation::SignedKeyRecord {
+        let mut signed = sweeper_test_key_derived_for(derived_key_id, pubkey_label);
+        signed.record.identity_type = crate::federation::types::identity_type::WITNESS.into();
+        signed
+    }
+
+    /// #368 — the witness-targets-subject age flow over the REAL
+    /// `Engine::emit_attestation` path (sqlite): a witness names a DIFFERENT
+    /// subject via `EmitAttestationInput::attested_key_id` and THAT subject's
+    /// `age_band` graduates (witness outranks the subject's own
+    /// self-declared rung); the witness CANNOT graduate itself
+    /// (attester==attested rejected); a non-witness emitter is still
+    /// refused by the unchanged identity gate.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn witness_targets_subject_age_graduation_over_emit_sqlite() {
+        use crate::federation::age::{age_band, age_band_fine, AgeBand, AgeBandFine};
+        use crate::federation::FederationDirectory;
+
+        let w_signer = crate::federation::tier_ingest::test_support::local_signer("age-witness");
+        let t_signer = crate::federation::tier_ingest::test_support::local_signer("age-subject");
+        let w = w_signer.derived_key_id();
+        let t = t_signer.derived_key_id();
+        let engine = Engine::with_signer(w_signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(witness_test_key_derived_for(&w, "age-witness"))
+            .await
+            .expect("seed witness");
+        sq.put_public_key(user_test_key_derived_for(&t, "age-subject"))
+            .await
+            .expect("seed subject");
+
+        // The subject self-declares MINOR (self rung; attested defaults to
+        // the emitter — subject-signed by design).
+        let self_minor = crate::federation::EmitAttestationInput::with_envelope(
+            "age_self_declared:minor:v1",
+            serde_json::json!({ "id": "wtse-self-minor" }),
+        );
+        engine
+            .emit_attestation(&t_signer, self_minor)
+            .await
+            .expect("self-declared minor admits");
+        assert_eq!(engine.age_band(&t).await.unwrap(), AgeBand::Minor);
+
+        // WITNESS-TARGETS-SUBJECT: the witness emits `age_assurance:*` ABOUT
+        // the subject by carrying it in `attested_key_id` — the #368 surface.
+        let mut cross = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:government:adult:v1",
+            serde_json::json!({ "id": "wtse-w-adult" }),
+        );
+        cross.attested_key_id = Some(t.clone());
+        let att_id = engine
+            .emit_attestation(&w_signer, cross)
+            .await
+            .expect("witness-targets-subject age_assurance admitted");
+        let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(row.attesting_key_id, w, "attester = the witness");
+        assert_eq!(row.attested_key_id, t, "subject rides attested_key_id");
+        // The SUBJECT's band graduates (witness outranks its self-minor).
+        assert_eq!(
+            engine.age_band(&t).await.unwrap(),
+            AgeBand::Adult,
+            "a witness row ABOUT the subject graduates the SUBJECT's band",
+        );
+        assert_eq!(
+            age_band_fine(&*sq, &t).await.unwrap(),
+            AgeBandFine::Adult,
+            "the finer resolution graduates too",
+        );
+
+        // SELF-graduation via the witness prefix is refused: the same
+        // witness emitting with the default (self) attested_key_id.
+        let selfie = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:provider:adult:v1",
+            serde_json::json!({ "id": "wtse-w-self" }),
+        );
+        let e = engine
+            .emit_attestation(&w_signer, selfie)
+            .await
+            .expect_err("a subject must not emit its own age assurance");
+        assert_eq!(e.kind(), "federation_age_assurance_self_emission_rejected");
+        assert_eq!(
+            age_band(&*sq, &w).await.unwrap(),
+            AgeBand::Unknown,
+            "the witness's own band is untouched",
+        );
+
+        // Identity gate unchanged: the (non-witness) SUBJECT cross-attesting
+        // the witness's age is refused (reserved prefix needs a witness).
+        let mut bad = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:provider:adult:v1",
+            serde_json::json!({ "id": "wtse-t-cross" }),
+        );
+        bad.attested_key_id = Some(w.clone());
+        let e = engine
+            .emit_attestation(&t_signer, bad)
+            .await
+            .expect_err("a non-witness emitter is refused");
+        assert_eq!(e.kind(), "federation_reserved_prefix_emitter_mismatch");
+    }
+
+    /// #368 PG twin of
+    /// [`witness_targets_subject_age_graduation_over_emit_sqlite`] — the
+    /// cross-subject graduation + self-graduation rejection over the live
+    /// Postgres `put_attestation` gates (pg/sqlite symmetry). Skips when
+    /// `CIRIS_PERSIST_TEST_PG_URL` is unset.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn witness_targets_subject_age_graduation_over_emit_postgres() {
+        use crate::federation::age::{age_band, AgeBand};
+        use crate::federation::FederationDirectory;
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let w_label = format!("age-w-{run}");
+        let t_label = format!("age-t-{run}");
+        let w_signer = crate::federation::tier_ingest::test_support::local_signer(&w_label);
+        let t_signer = crate::federation::tier_ingest::test_support::local_signer(&t_label);
+        let w = w_signer.derived_key_id();
+        let t = t_signer.derived_key_id();
+        let engine = Engine::with_signer(w_signer.clone(), &dsn)
+            .await
+            .expect("pg engine");
+        let pg = engine.postgres_backend().expect("pg backend");
+        pg.put_public_key(witness_test_key_derived_for(&w, &w_label))
+            .await
+            .expect("seed witness");
+        pg.put_public_key(user_test_key_derived_for(&t, &t_label))
+            .await
+            .expect("seed subject");
+
+        // Subject self-declares minor.
+        engine
+            .emit_attestation(
+                &t_signer,
+                crate::federation::EmitAttestationInput::with_envelope(
+                    "age_self_declared:minor:v1",
+                    serde_json::json!({ "id": format!("pgw-self-{run}") }),
+                ),
+            )
+            .await
+            .expect("self-declared minor admits");
+        assert_eq!(engine.age_band(&t).await.unwrap(), AgeBand::Minor);
+
+        // Witness graduates the SUBJECT cross-subject.
+        let mut cross = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:government:adult:v1",
+            serde_json::json!({ "id": format!("pgw-adult-{run}") }),
+        );
+        cross.attested_key_id = Some(t.clone());
+        engine
+            .emit_attestation(&w_signer, cross)
+            .await
+            .expect("witness-targets-subject admitted on postgres");
+        assert_eq!(engine.age_band(&t).await.unwrap(), AgeBand::Adult);
+
+        // Self-graduation via the witness prefix rejected on PG too.
+        let e = engine
+            .emit_attestation(
+                &w_signer,
+                crate::federation::EmitAttestationInput::with_envelope(
+                    "age_assurance:provider:adult:v1",
+                    serde_json::json!({ "id": format!("pgw-self-adult-{run}") }),
+                ),
+            )
+            .await
+            .expect_err("self-emission rejected on postgres");
+        assert_eq!(e.kind(), "federation_age_assurance_self_emission_rejected");
+        assert_eq!(age_band(&**pg, &w).await.unwrap(), AgeBand::Unknown);
+    }
+
+    /// #367 — the FULL CC 3.2 minor-guardianship flow over the REAL paths
+    /// (sqlite): a witness attests T minor (cross-subject, #368) → the
+    /// steward-less minor fails secure → S's binding is refused until S is a
+    /// PROVEN adult → witness attests S adult → `grant_delegation(S → T)` is
+    /// ADMITTED → `revoke_delegation` leaves the minor steward-less again
+    /// (fail-secure). An age-unverified user target stays rejected.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn minor_guardianship_grant_and_withdraw_end_to_end_sqlite() {
+        use crate::federation::admission::{is_steward_bound, steward_bindings_of};
+        use crate::federation::age::AgeBand;
+        use crate::federation::types::delegation_scope;
+        use crate::federation::FederationDirectory;
+
+        let w_signer = crate::federation::tier_ingest::test_support::local_signer("mg-witness");
+        let s_signer = crate::federation::tier_ingest::test_support::local_signer("mg-steward");
+        let w = w_signer.derived_key_id();
+        let s = s_signer.derived_key_id();
+        let engine = Engine::with_signer(w_signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(witness_test_key_derived_for(&w, "mg-witness"))
+            .await
+            .expect("seed witness");
+        sq.put_public_key(user_test_key_derived_for(&s, "mg-steward"))
+            .await
+            .expect("seed steward");
+        // The ward T and an age-unverified control U (emit nothing; plain
+        // registered user-role keys).
+        let mut t_key = sweeper_test_key("mg-ward");
+        t_key.record.identity_type = crate::federation::types::identity_type::USER.into();
+        sq.put_public_key(t_key).await.expect("seed ward");
+        let mut u_key = sweeper_test_key("mg-unverified");
+        u_key.record.identity_type = crate::federation::types::identity_type::USER.into();
+        sq.put_public_key(u_key).await.expect("seed unverified");
+
+        // Age-unverified user self-anchors (presumption of sovereignty).
+        assert!(is_steward_bound(&*sq, "mg-ward").await.unwrap());
+
+        // Witness attests T MINOR (the #368 cross-subject emit).
+        let mut minor = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:provider:minor:v1",
+            serde_json::json!({ "id": "mg-w-minor" }),
+        );
+        minor.attested_key_id = Some("mg-ward".to_owned());
+        engine
+            .emit_attestation(&w_signer, minor)
+            .await
+            .expect("witness attests the ward minor");
+        assert_eq!(engine.age_band("mg-ward").await.unwrap(), AgeBand::Minor);
+        // A PROVEN minor with no steward fails secure.
+        assert!(
+            !is_steward_bound(&*sq, "mg-ward").await.unwrap(),
+            "a steward-less proven minor must not self-anchor",
+        );
+        assert!(steward_bindings_of(&*sq, "mg-ward")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // S is not yet a PROVEN adult → the binding is refused.
+        let e = engine
+            .grant_delegation(
+                &s_signer,
+                "mg-ward",
+                vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
+                false,
+            )
+            .await
+            .expect_err("an unproven granter cannot steward a minor");
+        match e {
+            crate::federation::Error::UserTargetStewardBindingForbidden { reason, .. } => {
+                assert_eq!(reason, "granter_not_adult_user");
+            }
+            other => panic!("expected UserTargetStewardBindingForbidden, got {other:?}"),
+        }
+
+        // Witness attests S ADULT (cross-subject again).
+        let mut adult = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:government:adult:v1",
+            serde_json::json!({ "id": "mg-w-adult" }),
+        );
+        adult.attested_key_id = Some(s.clone());
+        engine
+            .emit_attestation(&w_signer, adult)
+            .await
+            .expect("witness attests the steward adult");
+        assert_eq!(engine.age_band(&s).await.unwrap(), AgeBand::Adult);
+
+        // The CC 3.2 positive case: adult user S → proven-minor T ADMITTED
+        // over the REAL `grant_delegation` path.
+        let grant_id = engine
+            .grant_delegation(
+                &s_signer,
+                "mg-ward",
+                vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
+                false,
+            )
+            .await
+            .expect("adult-user → proven-minor guardianship is ADMITTED (CC 3.2)");
+        assert!(is_steward_bound(&*sq, "mg-ward").await.unwrap());
+        assert_eq!(
+            steward_bindings_of(&*sq, "mg-ward").await.unwrap(),
+            vec![s.clone()],
+            "the minor is steward-bound to exactly S",
+        );
+
+        // Withdraw the guardianship → the minor is steward-less again and
+        // the liveness predicates fail secure.
+        engine
+            .revoke_delegation(&s_signer, &grant_id, "mg-ward")
+            .await
+            .expect("revoke_delegation");
+        assert!(
+            !is_steward_bound(&*sq, "mg-ward").await.unwrap(),
+            "a minor whose only guardianship edge was withdrawn fails secure",
+        );
+        assert!(
+            steward_bindings_of(&*sq, "mg-ward")
+                .await
+                .unwrap()
+                .is_empty(),
+            "no anchors remain after the withdraw",
+        );
+
+        // An age-UNVERIFIED user target is still rejected (presumption of
+        // sovereignty — nothing in this cut widened the wall).
+        let e = engine
+            .grant_delegation(
+                &s_signer,
+                "mg-unverified",
+                vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
+                false,
+            )
+            .await
+            .expect_err("an unverified user target stays rejected");
+        match e {
+            crate::federation::Error::UserTargetStewardBindingForbidden { reason, .. } => {
+                assert_eq!(reason, "target_age_unverified");
+            }
+            other => panic!("expected UserTargetStewardBindingForbidden, got {other:?}"),
+        }
+    }
+
+    /// #367 PG twin of
+    /// [`minor_guardianship_grant_and_withdraw_end_to_end_sqlite`] — the
+    /// witness→minor attest → adult-steward grant → withdraw → fail-secure
+    /// arc over the live Postgres gates. Skips when
+    /// `CIRIS_PERSIST_TEST_PG_URL` is unset.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn minor_guardianship_grant_and_withdraw_end_to_end_postgres() {
+        use crate::federation::admission::{is_steward_bound, steward_bindings_of};
+        use crate::federation::age::AgeBand;
+        use crate::federation::types::delegation_scope;
+        use crate::federation::FederationDirectory;
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let w_label = format!("mg-w-{run}");
+        let s_label = format!("mg-s-{run}");
+        let ward = format!("mg-ward-{run}");
+        let w_signer = crate::federation::tier_ingest::test_support::local_signer(&w_label);
+        let s_signer = crate::federation::tier_ingest::test_support::local_signer(&s_label);
+        let w = w_signer.derived_key_id();
+        let s = s_signer.derived_key_id();
+        let engine = Engine::with_signer(w_signer.clone(), &dsn)
+            .await
+            .expect("pg engine");
+        let pg = engine.postgres_backend().expect("pg backend");
+        pg.put_public_key(witness_test_key_derived_for(&w, &w_label))
+            .await
+            .expect("seed witness");
+        pg.put_public_key(user_test_key_derived_for(&s, &s_label))
+            .await
+            .expect("seed steward");
+        let mut t_key = sweeper_test_key(&ward);
+        t_key.record.identity_type = crate::federation::types::identity_type::USER.into();
+        pg.put_public_key(t_key).await.expect("seed ward");
+
+        // Witness attests T minor + S adult (cross-subject, #368).
+        let mut minor = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:provider:minor:v1",
+            serde_json::json!({ "id": format!("mgp-minor-{run}") }),
+        );
+        minor.attested_key_id = Some(ward.clone());
+        engine
+            .emit_attestation(&w_signer, minor)
+            .await
+            .expect("witness attests ward minor");
+        let mut adult = crate::federation::EmitAttestationInput::with_envelope(
+            "age_assurance:government:adult:v1",
+            serde_json::json!({ "id": format!("mgp-adult-{run}") }),
+        );
+        adult.attested_key_id = Some(s.clone());
+        engine
+            .emit_attestation(&w_signer, adult)
+            .await
+            .expect("witness attests steward adult");
+        assert_eq!(engine.age_band(&ward).await.unwrap(), AgeBand::Minor);
+        assert_eq!(engine.age_band(&s).await.unwrap(), AgeBand::Adult);
+        assert!(
+            !is_steward_bound(&**pg, &ward).await.unwrap(),
+            "steward-less proven minor fails secure on postgres",
+        );
+
+        // Adult user → proven minor: ADMITTED; withdraw → fail-secure.
+        let grant_id = engine
+            .grant_delegation(
+                &s_signer,
+                &ward,
+                vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
+                false,
+            )
+            .await
+            .expect("guardianship admitted on postgres");
+        assert_eq!(
+            steward_bindings_of(&**pg, &ward).await.unwrap(),
+            vec![s.clone()],
+        );
+        engine
+            .revoke_delegation(&s_signer, &grant_id, &ward)
+            .await
+            .expect("revoke_delegation");
+        assert!(
+            !is_steward_bound(&**pg, &ward).await.unwrap(),
+            "withdrawn guardianship leaves the minor steward-less (fail-secure)",
+        );
+        assert!(steward_bindings_of(&**pg, &ward).await.unwrap().is_empty());
     }
 
     /// #249 — the add_moderator ↔ is_named_moderator round-trip: an

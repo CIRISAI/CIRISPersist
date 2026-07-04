@@ -3177,6 +3177,30 @@ pub enum Error {
         attestation_type: String,
     },
 
+    /// v12.7.0 (CIRISPersist#368, CC 3.4.11). An `age_assurance:*`
+    /// attestation was self-emitted (`attesting_key_id ==
+    /// attested_key_id`). The witness rung is an attestation ABOUT a
+    /// subject: CC 3.4.11 — "A subject MUST NOT emit on `age_assurance:`;
+    /// … a CCS MUST reject … at admission". Without this check a key that
+    /// happens to carry the `witness` identity_type could graduate ITSELF
+    /// to `adult` — the self-minted adulthood the witness reservation
+    /// exists to prevent. Rejected at admission; the row is not stored.
+    /// The exact sibling of [`Error::CapacitySelfEmissionRejected`]
+    /// (CC 3.4.12's identical subject-must-not-emit rule for
+    /// `capacity_assurance:*`); like it, an attester==attested check
+    /// independent of `identity_type`.
+    #[error(
+        "age_assurance:* self-emission rejected: attesting_key_id == attested_key_id \
+         ({key_id:?}) — a subject must not emit its own age assurance (CC 3.4.11; \
+         attestation_type={attestation_type:?})"
+    )]
+    AgeAssuranceSelfEmissionRejected {
+        /// The key that attempted to self-emit an `age_assurance:*` row.
+        key_id: String,
+        /// The `attestation_type` that triggered the rejection.
+        attestation_type: String,
+    },
+
     /// v2.5.0 (CIRISPersist#102 Ask 4). The submitted `scores`
     /// attestation's `attestation_envelope` failed JSON Schema
     /// validation against the per-axis schema registered for the
@@ -3864,6 +3888,9 @@ impl Error {
             Error::DimensionRejected { .. } => "federation_dimension_rejected",
             Error::CapacitySelfEmissionRejected { .. } => {
                 "federation_capacity_self_emission_rejected"
+            }
+            Error::AgeAssuranceSelfEmissionRejected { .. } => {
+                "federation_age_assurance_self_emission_rejected"
             }
             Error::ReservedPrefixEmitterMismatch { .. } => {
                 "federation_reserved_prefix_emitter_mismatch"
