@@ -818,7 +818,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # #321 — run cargo-deny RUNNER-NATIVE instead of the containerized
+      # EmbarkStudios/cargo-deny-action@v2. That Docker action ships its own
+      # musl rustup which reads our rust-toolchain.toml and prints
+      #   error: override toolchain 'stable-x86_64-unknown-linux-musl' is not installed
+      # on every run (cosmetic, but permanent log noise). Being containerized it
+      # also didn't inherit the workflow-level CARGO_NET_* crates.io-flake
+      # hardening (lines 25-27) for the advisory-DB fetch. Installing the binary
+      # onto the host toolchain (same taiki-e/install-action already used for
+      # nextest) fixes both: zero override noise + inherited flake env. Config
+      # is unchanged — `cargo deny check` runs advisories + bans + licenses +
+      # sources per deny.toml, exactly as the action did.
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check
 
   # Build the abi3-py311 wheel via maturin. Per
   # PLATFORM_ARCHITECTURE.md §3.5: one wheel per (os, arch) pair.
