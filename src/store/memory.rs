@@ -1311,6 +1311,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .as_deref()
             .and_then(crate::federation::types::consent_role::wire_from_stored)
             .map(str::to_owned);
+        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — accord-conferred `canonical`
+        // gate. Runs BEFORE the state lock (it calls lookup_public_key on self,
+        // which acquires the lock itself) and BEFORE persist — a self-signed /
+        // non-anchor-scrubbed `canonical` claim leaves no trace. Backend-
+        // symmetric with SQLite + Postgres.
+        crate::federation::admission::check_canonical_role_admission(self, &row).await?;
         // Server-computed hash (excludes the field itself).
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let mut state = self.state.lock().expect("memory backend lock");

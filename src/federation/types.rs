@@ -166,6 +166,33 @@ pub mod identity_type {
     /// prefix (ungated here), so anything on `detection:*` is a primary
     /// detector emission and gate-able with no envelope field.
     pub const LENSCORE_DETECTOR: &str = "lenscore_detector";
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1 set-membership) — a
+    /// **canonical / founding bootstrap server**. This role marks a node
+    /// as a member of the founding canonical set; it is **accord-CONFERRED,
+    /// never self-claimed**.
+    ///
+    /// The load-bearing invariant (the whole point of the role): a
+    /// `federation_keys` row may carry `canonical` in its `identity_type`
+    /// **set** ([`set_contains`]) **IFF** the record is
+    /// **anchor-scrub-signed** — `scrub_key_id != key_id` AND
+    /// `scrub_key_id`'s Ed25519 pubkey ∈ the pinned HUMANITY_ACCORD anchor
+    /// ([`ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor`],
+    /// the SAME terminus [`super::super::rooting::root_binding`] and
+    /// [`super::super::register::verify_key_registration`] /
+    /// `adopt_scrub_upgrade` verify). A **self-signed** record
+    /// (`scrub_key_id == key_id`) carrying `canonical`, or one scrubbed by a
+    /// **non-anchor** key, is REFUSED at admission
+    /// ([`super::super::Error::CanonicalRoleNotAccordConferred`], stable
+    /// `kind()` token `canonical_role_not_accord_conferred`) — fail-closed.
+    /// **Monotonic**: the role can only ever arrive on an anchor-scrubbed
+    /// record; it can never be added by a later self-registration or by
+    /// replication of a self-signed row (the gate composes with the
+    /// `put_public_key` DO-NOTHING / `adopt_scrub_upgrade` paths). The ONLY
+    /// way to become a canonical server is the Trust Root **add-canonical**
+    /// op: an accord holder scrub-signs the node with the `canonical` role.
+    /// The admission gate is
+    /// [`super::super::admission::check_canonical_role_admission`].
+    pub const CANONICAL: &str = "canonical";
 
     /// v6.5.0 (CEG §7.0.1) — join an `identity_type` **set** into the
     /// single TEXT column representation: sorted, de-duplicated,

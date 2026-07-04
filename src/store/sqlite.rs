@@ -2068,6 +2068,14 @@ impl SqliteBackend {
                 row.algorithm
             )));
         }
+        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — adopt_scrub_upgrade is a
+        // self-signed → anchor-scrubbed UPDATE that CAN change identity_type,
+        // so it is a second path a `canonical` role could otherwise enter on.
+        // Re-run the accord-conferred gate: `canonical` is admitted here only
+        // if THIS incoming (anchor-scrubbed) record earned it via a real
+        // accord-holder scrubber. (The scrub_key_id != key_id guard above is
+        // necessary but not sufficient — the scrubber must be in the anchor.)
+        crate::federation::admission::check_canonical_role_admission(self, &row).await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         // Resolve the existing row + classify the transition.
@@ -2221,6 +2229,49 @@ impl SqliteBackend {
             },
         }
     }
+
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
+    /// founding bootstrap servers**: `federation_keys` rows whose
+    /// `identity_type` **set** contains
+    /// [`crate::federation::types::identity_type::CANONICAL`], stable-sorted by
+    /// `key_id`. Every such row is (by the admission gate
+    /// [`crate::federation::admission::check_canonical_role_admission`])
+    /// necessarily anchor-scrub-conferred — the role cannot be self-claimed.
+    /// Inherent on the backend (dispatched by `Engine::list_canonical_servers`)
+    /// to avoid `FederationDirectory`/capsule bloat, mirroring
+    /// [`Self::adopt_scrub_upgrade`]. The SQL `LIKE` is a coarse prefilter; the
+    /// exact set-membership check is applied in Rust via `set_contains`.
+    pub async fn list_canonical_servers(
+        &self,
+    ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        (
+            move || -> Result<Vec<crate::federation::KeyRecord>, rusqlite::Error> {
+                let conn = conn.lock();
+                let mut stmt = conn.prepare(
+                    "SELECT key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, algorithm, \
+                        identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
+                        attestation_evidence \
+                     FROM federation_keys WHERE identity_type LIKE '%canonical%' \
+                     ORDER BY key_id",
+                )?;
+                let rows = stmt.query_map([], sqlite_row_to_key_record)?;
+                rows.collect()
+            })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_canonical_servers: {e}")))
+        .map(|rows: Vec<crate::federation::KeyRecord>| {
+            rows.into_iter()
+                .filter(|r| {
+                    crate::federation::types::identity_type::set_contains(
+                        &r.identity_type,
+                        crate::federation::types::identity_type::CANONICAL,
+                    )
+                })
+                .collect()
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -2248,6 +2299,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 chrono::Utc::now(),
             )?;
         }
+
+        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — the `canonical` (founding
+        // bootstrap server) role is accord-CONFERRED, never self-claimed: a row
+        // may carry `canonical` only when anchor-scrub-signed (scrub_key_id !=
+        // key_id AND the scrubber's ed25519 ∈ the pinned HUMANITY_ACCORD
+        // anchor). This is the substrate write chokepoint every registration
+        // path (register_federation_key, register_self_federation_key, direct
+        // FFI, replication of a peer row) funnels through, so a self-signed /
+        // non-anchor-scrubbed `canonical` claim is refused here before any
+        // INSERT (verify-before-mutation). Backend-symmetric with Postgres +
+        // memory.
+        crate::federation::admission::check_canonical_role_admission(self, &row).await?;
 
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 

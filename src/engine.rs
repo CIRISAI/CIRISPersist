@@ -3997,6 +3997,37 @@ impl Engine {
         }
     }
 
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
+    /// founding bootstrap server**? True iff its `federation_keys` row's
+    /// `identity_type` set contains `canonical`. Because the admission gate
+    /// [`check_canonical_role_admission`](crate::federation::check_canonical_role_admission)
+    /// only ever admits `canonical` on an anchor-scrub-conferred record, a
+    /// `true` here means the node was conferred the role by a HUMANITY_ACCORD
+    /// holder — it cannot be self-claimed. `false` for an unknown key or a
+    /// non-canonical row.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn is_canonical(&self, key_id: &str) -> Result<bool, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::is_canonical(directory.as_ref(), key_id).await
+    }
+
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
+    /// founding bootstrap servers**: all `federation_keys` rows whose
+    /// `identity_type` set contains `canonical`, stable-sorted by `key_id`.
+    /// Every returned row is (by the admission gate) anchor-scrub-conferred —
+    /// none is self-claimed. Dispatches to the backend's inherent enumerator.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn list_canonical_servers(
+        &self,
+    ) -> Result<Vec<crate::federation::KeyRecord>, crate::federation::Error> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.list_canonical_servers().await,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.list_canonical_servers().await,
+        }
+    }
+
     /// v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the
     /// symmetric **deregister** path: the revocation teeth a withdrawn
     /// `consent:replication` relies on.

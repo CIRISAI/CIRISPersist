@@ -3941,6 +3941,68 @@ impl PyEngine {
         })
     }
 
+
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — is `key_id` a **canonical /
+    /// founding bootstrap server**? Returns `True` iff its `federation_keys`
+    /// row's `identity_type` set contains `canonical`. Because the substrate
+    /// admission gate only ever admits `canonical` on an anchor-scrub-conferred
+    /// record (an accord holder scrub-signed the node with the role), a `True`
+    /// here means the role was accord-conferred — it cannot be self-claimed.
+    /// `False` for an unknown key or a non-canonical row.
+    fn is_canonical(&self, py: Python<'_>, key_id: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::is_canonical(backend.as_ref(), &key_id).await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::is_canonical(backend.as_ref(), &key_id).await
+                    })
+                }
+            })
+            .map_err(federation_err_to_py)
+        })
+    }
+
+
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
+    /// founding bootstrap servers** as a JSON array of `KeyRecord`s
+    /// (`federation_keys` rows whose `identity_type` set contains `canonical`,
+    /// stable-sorted by `key_id`). Every returned row is anchor-scrub-conferred
+    /// (the admission gate refuses a self-claimed `canonical`).
+    fn list_canonical_servers(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let rows = py
+                .detach(move || match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move { backend.list_canonical_servers().await })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move { backend.list_canonical_servers().await })
+                    }
+                })
+                .map_err(federation_err_to_py)?;
+            serde_json::to_string(&rows)
+                .map_err(|e| PyRuntimeError::new_err(format!("KeyRecord list JSON encode: {e}")))
+        })
+    }
+
     /// v1.5.3 — One-call helper that registers THIS engine's local
     /// pubkey as a `federation_keys` row of the specified
     /// `identity_type`. Composes the existing primitives
@@ -24804,6 +24866,14 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // ValueError (4xx / 409-shaped, like `Conflict`).
         crate::federation::Error::NodeAlreadyOwned { .. }
         | crate::federation::Error::AmbiguousNodeOwner { .. } => PyValueError::new_err(kind),
+        // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — a rejected `canonical`
+        // (founding-server) role that is not accord-conferred (self-claimed /
+        // non-anchor-scrubbed) is a caller-side authorization failure;
+        // ValueError (4xx). The `canonical` role is accord-CONFERRED, never
+        // self-claimed.
+        crate::federation::Error::CanonicalRoleNotAccordConferred { .. } => {
+            PyValueError::new_err(kind)
+        }
         // v9.0.0 (CC 3.2 / CC 3.4.7.1) — admitting an unstewarded node/agent to
         // a non-infrastructure community is a caller-side authorization
         // failure (non-infra membership is an authority act that must root

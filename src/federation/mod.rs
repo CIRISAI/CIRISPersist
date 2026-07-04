@@ -128,8 +128,9 @@ pub(crate) mod serde_bytes_b64 {
 }
 
 pub use admission::{
-    check_cohort_scope, check_consensus_protocol_form, check_device_class,
-    check_encryption_pubkeys, check_observed_region, AttestationLadderTransitionPolicy,
+    check_canonical_role_admission, check_canonical_role_admission_anchored, check_cohort_scope,
+    check_consensus_protocol_form, check_device_class, check_encryption_pubkeys,
+    check_observed_region, is_canonical, AttestationLadderTransitionPolicy,
     DimensionAdmissionPolicy, DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule,
     ATTESTATION_LADDER_MECHANISMS,
 };
@@ -3673,6 +3674,38 @@ pub enum Error {
         owners: Vec<String>,
     },
 
+    /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1 set-membership) — a
+    /// `federation_keys` row carrying the [`types::identity_type::CANONICAL`]
+    /// role was REJECTED at admission because it is **not accord-conferred**.
+    /// The `canonical` (founding bootstrap server) role is accord-CONFERRED,
+    /// never self-claimed: a row may carry it **iff** the record is
+    /// anchor-scrub-signed (`scrub_key_id != key_id` AND `scrub_key_id`'s
+    /// Ed25519 pubkey ∈ the pinned HUMANITY_ACCORD anchor —
+    /// [`ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor`]).
+    /// A **self-signed** record carrying `canonical`, or one scrubbed by a
+    /// **non-anchor** key, is refused here (fail-closed) — the row is NOT
+    /// stored (verify-before-mutation, AV-9). This closes the "a node
+    /// bootstraps itself into the founding set" gap on EVERY admission path
+    /// (direct registration, self-registration, replication of a self-signed
+    /// row, and the `adopt_scrub_upgrade` self→anchored path). Stable
+    /// `kind()` token `canonical_role_not_accord_conferred`. See
+    /// [`admission::check_canonical_role_admission`].
+    #[error(
+        "federation_keys row {key_id:?} carries the `canonical` role but is not accord-conferred \
+         (scrub_key_id={scrub_key_id:?}, reason: {reason}); the `canonical` founding-server role \
+         is accord-CONFERRED, never self-claimed — a row may carry it only when anchor-scrub-signed \
+         (scrub_key_id != key_id AND the scrubber's ed25519 ∈ the pinned HUMANITY_ACCORD anchor)"
+    )]
+    CanonicalRoleNotAccordConferred {
+        /// The `key_id` of the row that attempted to carry `canonical`.
+        key_id: String,
+        /// The row's `scrub_key_id` (the claimed scrubber).
+        scrub_key_id: String,
+        /// Why the record failed the accord-conferred test (self-signed /
+        /// unknown scrubber / non-anchor scrubber / undecodable scrubber key).
+        reason: String,
+    },
+
     /// v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — a **federation-tier**
     /// attestation was REJECTED at the bulk store/replicate ingest gate
     /// because its envelope hybrid signature could not be verified
@@ -3925,6 +3958,7 @@ impl Error {
             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
             Error::NodeAlreadyOwned { .. } => "federation_node_already_owned",
             Error::AmbiguousNodeOwner { .. } => "federation_ambiguous_node_owner",
+            Error::CanonicalRoleNotAccordConferred { .. } => "canonical_role_not_accord_conferred",
             Error::UnstewardedCommunityMember { .. } => "federation_unstewarded_community_member",
             Error::UserTargetStewardBindingForbidden { .. } => {
                 "federation_user_target_steward_binding_forbidden"
