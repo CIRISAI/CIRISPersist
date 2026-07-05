@@ -506,6 +506,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         if drop_pqc {
             // A hybrid-pending row also drops the PQC pubkey.

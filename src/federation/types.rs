@@ -2280,6 +2280,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         let hints = r.transport_hints();
         assert_eq!(hints.len(), 2);
@@ -2294,6 +2295,95 @@ mod tests {
         // Malformed → empty (not an error on the read path).
         r.registration_envelope = serde_json::json!({ "transport_hints": "not-a-list" });
         assert!(r.transport_hints().is_empty());
+    }
+
+    /// v13.2.0 (CIRISPersist#383) — the additive `additional_scrubs` field is
+    /// **byte-invisible when empty**: it `skip_serializing_if = "Vec::is_empty"`
+    /// so an ordinary / single-scrub record serializes WITHOUT the key and its
+    /// `persist_row_hash` is byte-identical to the pre-#383 shape. A real 2-scrub
+    /// set is included → its own distinct hash. Also exercises the
+    /// `scrubs()` / `distinct_scrub_count()` helpers + ScrubSig serde round-trip.
+    #[test]
+    fn additional_scrubs_empty_is_hash_stable_nonempty_changes_hash() {
+        let base = KeyRecord {
+            key_id: "canon-1".into(),
+            pubkey_ed25519_base64: "AAAA".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: algorithm::HYBRID.into(),
+            identity_type: "canonical,node".into(),
+            identity_ref: "canon-1".into(),
+            valid_from: "2026-07-05T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "key_id": "canon-1" }),
+            original_content_hash: "h".into(),
+            scrub_signature_classical: "sig1".into(),
+            scrub_signature_pqc: Some("pqc1".into()),
+            scrub_key_id: "A1".into(),
+            scrub_timestamp: "2026-07-05T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+
+        // Empty set → the field serializes away entirely (byte-invisible).
+        let json = serde_json::to_value(&base).unwrap();
+        assert!(
+            json.get("additional_scrubs").is_none(),
+            "empty additional_scrubs must NOT appear on the wire"
+        );
+
+        // scrubs()/distinct_scrub_count() over the base (single-scrub) record.
+        assert_eq!(base.scrubs().len(), 1);
+        assert_eq!(base.distinct_scrub_count(), 1);
+
+        // The hash of an empty-additional_scrubs record equals the hash of a
+        // genuinely pre-#383 value — one whose JSON never carried the key.
+        // `compute_persist_row_hash` is generic over Serialize, so we feed it a
+        // `serde_json::Value` with the key removed; because skip_serializing_if
+        // dropped it from the real record too, the two hashes match.
+        let h_empty = compute_persist_row_hash(&base).unwrap();
+        let mut pre383 = serde_json::to_value(&base).unwrap();
+        assert!(
+            pre383
+                .as_object_mut()
+                .unwrap()
+                .remove("additional_scrubs")
+                .is_none(),
+            "the empty field was already absent from the serialized form"
+        );
+        assert_eq!(
+            h_empty,
+            compute_persist_row_hash(&pre383).unwrap(),
+            "empty additional_scrubs → persist_row_hash byte-identical to pre-#383"
+        );
+
+        // A real 2-scrub record: scrub #2 rides additional_scrubs. The set is
+        // now non-empty → included in the hash → a DISTINCT value.
+        let mut two = base.clone();
+        two.additional_scrubs = vec![ScrubSig {
+            scrub_key_id: "B1".into(),
+            scrub_signature_classical: "sig2".into(),
+            scrub_signature_pqc: Some("pqc2".into()),
+        }];
+        let json2 = serde_json::to_value(&two).unwrap();
+        assert!(
+            json2.get("additional_scrubs").is_some(),
+            "a non-empty scrub set MUST appear on the wire"
+        );
+        assert_eq!(two.scrubs().len(), 2, "scrub #1 + one additional");
+        assert_eq!(two.distinct_scrub_count(), 2, "A1 + B1 distinct");
+        assert_ne!(
+            compute_persist_row_hash(&two).unwrap(),
+            h_empty,
+            "a real 2-scrub set must change the persist_row_hash"
+        );
+
+        // ScrubSig + additional_scrubs serde round-trip.
+        let round: KeyRecord = serde_json::from_str(&serde_json::to_string(&two).unwrap()).unwrap();
+        assert_eq!(round.additional_scrubs, two.additional_scrubs);
     }
 
     /// v12.7.0 (CIRISPersist#368) — the FFI wire contract for the
@@ -2391,6 +2481,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         }
     }
 

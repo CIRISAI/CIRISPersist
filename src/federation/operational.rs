@@ -892,6 +892,65 @@ pub(crate) mod test_support {
             threshold,
         }
     }
+
+    /// v13.2.0 (CIRISPersist#383) — build a **multi-scrub canonical**
+    /// `KeyRecord` for `key_id` carrying `identity_type`, scrubbed by each of
+    /// `scrubbers` over the SAME canonical `registration_envelope` (JCS via
+    /// `ceg_produce_canonicalize` — the IDENTICAL bytes
+    /// [`check_canonical_role_admission`](crate::federation::admission::check_canonical_role_admission)
+    /// verifies). Scrub #1 fills the base `scrub_key_id`/`scrub_signature_*`
+    /// fields; scrubs #2..N ride `additional_scrubs`. Each scrub is a REAL
+    /// hybrid signature by the scrubber's keypair, so the 2-of-3 add gate
+    /// (`verify_quorum_policy`) counts it. Pass the accord-holder `Identity`s as
+    /// `scrubbers` (2 distinct for a 2-of-3 admit). `envelope` lets a test embed
+    /// e.g. a `transport_hints` array (the bootstrap-dial-set surface).
+    pub fn signed_canonical_record(
+        key_id: &str,
+        identity_type: &str,
+        envelope: serde_json::Value,
+        scrubbers: &[&Identity],
+    ) -> crate::federation::types::KeyRecord {
+        use crate::federation::types::ScrubSig;
+        use sha2::{Digest, Sha256};
+        let bytes = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
+            .expect("canonicalize envelope");
+        let now = chrono::Utc::now();
+        let scrub_sigs: Vec<ScrubSig> = scrubbers
+            .iter()
+            .map(|s| {
+                let (ed, pqc) = s.sign_bytes(&bytes);
+                ScrubSig {
+                    scrub_key_id: s.key_id.clone(),
+                    scrub_signature_classical: ed,
+                    scrub_signature_pqc: Some(pqc),
+                }
+            })
+            .collect();
+        assert!(!scrub_sigs.is_empty(), "at least one scrubber required");
+        let first = scrub_sigs[0].clone();
+        crate::federation::types::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: b64().encode([7u8; 32]),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: identity_type.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: envelope,
+            original_content_hash: hex::encode(Sha256::digest(&bytes)),
+            scrub_signature_classical: first.scrub_signature_classical,
+            scrub_signature_pqc: first.scrub_signature_pqc,
+            scrub_key_id: first.scrub_key_id,
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: scrub_sigs[1..].to_vec(),
+        }
+    }
 }
 
 #[cfg(test)]

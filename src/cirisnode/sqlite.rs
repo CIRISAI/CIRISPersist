@@ -2696,6 +2696,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         backend
             .put_public_key(crate::federation::SignedKeyRecord { record })
@@ -3290,6 +3291,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         use crate::federation::FederationDirectory;
         backend
@@ -3552,6 +3554,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         backend
             .put_public_key(crate::federation::types::SignedKeyRecord { record: rec })
@@ -3685,6 +3688,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         backend
             .put_public_key(crate::federation::types::SignedKeyRecord { record: rec })

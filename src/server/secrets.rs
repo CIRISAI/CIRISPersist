@@ -962,6 +962,7 @@ mod tests {
             ],
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         FederationDirectory::put_public_key(&*backend, SignedKeyRecord { record: key })
             .await

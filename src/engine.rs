@@ -2040,6 +2040,7 @@ impl Engine {
             roles,
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         let signed = crate::federation::SignedKeyRecord { record };
 
@@ -4073,9 +4074,10 @@ impl Engine {
     /// accord-holder roster (A1/B1/C1) at the **2-of-3 destructive threshold** —
     /// never a caller-supplied `AccordDecision.authorized` bool (which is
     /// unauthenticated and forgeable) — before recording the tombstone
-    /// (verify-before-mutation, AV-9). Asymmetric by design: a single accord
-    /// holder may ADD a canonical (1-of-N anchor-scrub conferral) but NOT
-    /// withdraw one (needs the 2-of-3 family quorum). Idempotent. After this,
+    /// (verify-before-mutation, AV-9). Symmetric m-of-n by design (v13.2.0 /
+    /// CIRISPersist#383): ADD now also requires ≥2-of-3 accord co-scrubs (the
+    /// 1-of-N add path was retired as a first-strike weakness), and WITHDRAW
+    /// keeps the 2-of-3 family quorum. Idempotent. After this,
     /// [`is_canonical`](Self::is_canonical) reads `false`.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn withdraw_canonical_role(
@@ -4895,15 +4897,14 @@ async fn build_backend(dsn: &str) -> Result<BackendDispatch, EngineError> {
             crate::federation::genesis::verify_anchor_seeded(&pg)
                 .await
                 .map_err(EngineError::GenesisSeed)?;
-            // v13.1.0 (CIRISPersist#380) — bake the A1-conferred canonical
-            // genesis server. Runs AFTER the accord seed so the canonical
-            // admission gate resolves A1 live. Idempotent + fail-secure.
-            crate::federation::genesis::seed_canonical_servers(&pg)
-                .await
-                .map_err(EngineError::GenesisSeed)?;
-            crate::federation::genesis::verify_canonical_seeded(&pg)
-                .await
-                .map_err(EngineError::GenesisSeed)?;
+            // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
+            // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
+            // REMOVED: a single-anchor founding record is a first-strike
+            // weakness (one captured accord key mints a rogue canonical). Now
+            // that canonical ADD requires ≥2 distinct anchor scrubs (2-of-3),
+            // a fresh node ships with an EMPTY canonical set until the operator
+            // bakes the 2-of-3 replacement. The accord-holder rooting anchor
+            // (A1/B1/C1) above is untouched.
             Ok(BackendDispatch::Postgres(Arc::new(pg)))
         }
         #[cfg(not(feature = "postgres"))]
@@ -4943,15 +4944,14 @@ async fn build_backend(dsn: &str) -> Result<BackendDispatch, EngineError> {
             crate::federation::genesis::verify_anchor_seeded(&sq)
                 .await
                 .map_err(EngineError::GenesisSeed)?;
-            // v13.1.0 (CIRISPersist#380) — bake the A1-conferred canonical
-            // genesis server. Runs AFTER the accord seed so the canonical
-            // admission gate resolves A1 live. Idempotent + fail-secure.
-            crate::federation::genesis::seed_canonical_servers(&sq)
-                .await
-                .map_err(EngineError::GenesisSeed)?;
-            crate::federation::genesis::verify_canonical_seeded(&sq)
-                .await
-                .map_err(EngineError::GenesisSeed)?;
+            // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
+            // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
+            // REMOVED: a single-anchor founding record is a first-strike
+            // weakness (one captured accord key mints a rogue canonical). Now
+            // that canonical ADD requires ≥2 distinct anchor scrubs (2-of-3),
+            // a fresh node ships with an EMPTY canonical set until the operator
+            // bakes the 2-of-3 replacement. The accord-holder rooting anchor
+            // (A1/B1/C1) above is untouched.
             Ok(BackendDispatch::Sqlite(Arc::new(sq)))
         }
         #[cfg(not(feature = "sqlite"))]
@@ -5138,74 +5138,6 @@ mod tests {
             .await
             .expect("sign");
         assert_eq!(sig.len(), 64);
-    }
-
-    /// v13.1.0 (CIRISPersist#380) — a FRESH engine auto-loads the baked
-    /// canonical genesis server, exactly as it auto-seeds the accord family:
-    /// no manual seed call, `is_canonical` is true and `list_canonical_servers`
-    /// returns `ciris-canonical-1-…` straight out of `Engine::with_signer`.
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn fresh_engine_auto_loads_canonical_genesis_seed() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("construct engine");
-        let node = &crate::federation::genesis::canonical_genesis_records()[0].record;
-        assert!(
-            engine
-                .is_canonical(&node.key_id)
-                .await
-                .expect("is_canonical"),
-            "fresh engine must recognize the baked canonical server {}",
-            node.key_id
-        );
-        let listed = engine.list_canonical_servers().await.expect("list");
-        assert!(
-            listed.iter().any(|r| r.key_id == node.key_id),
-            "list_canonical_servers must include the baked {}",
-            node.key_id
-        );
-    }
-
-    /// v13.1.0 (CIRISPersist#381) — `canonical_bootstrap_hints` surfaces the
-    /// accord-attested `transport_hints` embedded in a canonical server's
-    /// signed envelope, paired with its key_id — the zero-config bootstrap
-    /// dial set. A canonical record carrying an `ip` hint in its envelope is
-    /// admitted (A1-conferred) and its hint appears; the baked hintless
-    /// genesis record contributes nothing.
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn canonical_bootstrap_hints_surface_envelope_transport() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("construct engine");
-
-        // Clone the baked canonical record, give it a distinct key_id and an
-        // `ip` transport hint in its (still A1-scrubbed) envelope, and admit
-        // it through the canonical gate (scrub_key_id = A1 ∈ anchor).
-        let mut hinted = crate::federation::genesis::canonical_genesis_records()[0]
-            .record
-            .clone();
-        hinted.key_id = "ciris-canonical-2-hinted".into();
-        hinted.identity_ref = hinted.key_id.clone();
-        if let Some(env) = hinted.registration_envelope.as_object_mut() {
-            env.insert(
-                "transport_hints".into(),
-                serde_json::json!([{ "kind": "ip", "destination": "108.61.242.236:4242" }]),
-            );
-        }
-        engine
-            .federation_directory()
-            .put_public_key(crate::federation::SignedKeyRecord { record: hinted })
-            .await
-            .expect("admit hinted canonical");
-
-        let hints = engine.canonical_bootstrap_hints().await.expect("hints");
-        let ip = hints
-            .iter()
-            .find(|(kid, h)| kid == "ciris-canonical-2-hinted" && h.kind == "ip")
-            .expect("ip bootstrap hint present");
-        assert_eq!(ip.1.destination, "108.61.242.236:4242");
     }
 
     #[cfg(feature = "sqlite")]
@@ -6380,6 +6312,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         sq.put_public_key(SignedKeyRecord {
             record: suspect_key,
@@ -6735,6 +6668,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         pg.put_public_key(SignedKeyRecord { record: suspect })
             .await
@@ -7398,6 +7332,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         pg.put_public_key(crate::federation::SignedKeyRecord { record: key_record })
             .await
@@ -7489,6 +7424,7 @@ mod tests {
                 roles: Vec::new(),
                 attestation_evidence: None,
                 consent_role: None,
+                additional_scrubs: Vec::new(),
             },
         }
     }
@@ -8637,6 +8573,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         sq.put_public_key(SignedKeyRecord { record }).await.unwrap();
     }
@@ -8806,6 +8743,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         pg.put_public_key(SignedKeyRecord { record }).await.unwrap();
 
@@ -9244,6 +9182,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         sq.put_public_key(SignedKeyRecord { record })
             .await
@@ -11328,6 +11267,7 @@ mod tests {
                 roles: Vec::new(),
                 attestation_evidence: None,
                 consent_role: None,
+                additional_scrubs: Vec::new(),
             },
         })
         .await

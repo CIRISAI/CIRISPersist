@@ -538,6 +538,7 @@ impl MemoryBackend {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         state.federation_keys.insert(key_id.to_owned(), rec);
         // Keep the legacy map populated too — some tests still
@@ -3575,6 +3576,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 roles: Vec::new(),
                 attestation_evidence: None,
                 consent_role: None,
+                additional_scrubs: Vec::new(),
             };
             // persist_row_hash filled in inline (mirrors put_public_key)
             let mut to_insert = key;
@@ -5147,6 +5149,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         }
     }
 

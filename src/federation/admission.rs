@@ -2747,8 +2747,8 @@ pub async fn check_single_node_owner_admission(
 /// [`ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor`] — the
 /// SAME terminus [`super::rooting::root_binding`] and
 /// [`super::register::verify_key_registration`] verify against. Use
-/// [`check_canonical_role_admission_anchored`] to inject a different anchor
-/// (tests).
+/// [`check_canonical_role_admission_over_roster`] to inject a different accord
+/// roster (tests).
 ///
 /// Behaviour:
 /// - The row's `identity_type` set does NOT contain `canonical` → `Ok(())`
@@ -2772,43 +2772,87 @@ pub async fn check_canonical_role_admission(
     directory: &dyn super::FederationDirectory,
     row: &super::KeyRecord,
 ) -> Result<(), Error> {
-    let anchor = ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor();
-    check_canonical_role_admission_anchored(directory, row, &anchor).await
+    check_canonical_role_admission_over_roster(directory, row, &accord_holder_roster_key_ids())
+        .await
 }
 
-/// [`check_canonical_role_admission`] with an explicit trusted-anchor keyset —
-/// the core primitive. `trusted_anchor` is a slice of raw 32-byte Ed25519
-/// keys; the scrubber's (`scrub_key_id`'s) ed25519 must appear in it or the
-/// `canonical` role is refused. Production callers use the
-/// [`check_canonical_role_admission`] wrapper (accord-holder anchor); this form
-/// exists so tests (and any alternative pinning) can supply their own anchor,
-/// mirroring [`super::rooting::root_binding_anchored`].
-pub async fn check_canonical_role_admission_anchored(
+/// [`check_canonical_role_admission`] with an explicit accord-holder roster
+/// keyset — the core primitive. Production callers use the
+/// [`check_canonical_role_admission`] wrapper (genesis A1/B1/C1 roster); this
+/// form exists so tests can supply their own signable holders, mirroring
+/// [`super::withdraw_canonical_role_over_roster`].
+///
+/// # v13.2.0 (CIRISPersist#383) — 2-of-3 multi-scrub add (the security crux)
+///
+/// The `canonical` role is conferred ONLY if the record carries **≥ a strict
+/// majority of the live accord family, each a cryptographically VERIFIED
+/// hybrid scrub signature** over the record's canonical `registration_envelope`
+/// — the m-of-n add gate (2-of-3 today; 3-of-4 if the family grows). This
+/// retires the v13.0.0 (#372) **1-of-N** add path, where a single anchor-scrub
+/// (`scrub_key_id ∈ anchor`, membership only, no sig verified) conferred the
+/// role — the ASI first-strike hole (one captured accord key mints a rogue
+/// founding anchor). CC 3.4.7.1 / CIRISVerify#174.
+///
+/// The gate routes through verify-core's **`verify_quorum_policy`** — the SAME
+/// m-of-n primitive `ciris-canonical` registry-consensus, the HUMANITY_ACCORD,
+/// and every entrenched `quorum:M/N` community use — so the count is DYNAMIC
+/// (strict-majority of the roster, never a frozen `2`), non-forgeable (each
+/// hybrid sig is cryptographically verified; only DISTINCT founders count; a
+/// forged / garbage scrub silently does not count), and deadlock-safe
+/// (`2·M > N`, no `M==1` escape, declared `N` must equal the live founder
+/// roster size).
+///
+/// Steps:
+/// 1. Fast path — the row's `identity_type` set lacks `canonical` → `Ok(())`.
+/// 2. **Withdrawal consult (revocation-wins, #377).** A `key_id` the accord
+///    quorum WITHDREW (V095 tombstone) cannot be re-conferred `canonical`, EVEN
+///    with a valid 2-of-3 scrub set — the add-gate is monotonic and the
+///    anti-entropy path ([`apply_replicated_key_record`](super::register),
+///    #375) re-runs it, so without this a peer still holding the old scrubbed
+///    record would silently RE-ADD the role on the next round. A SUPERSEDE
+///    successor (`superseded_by == this key_id`) is exempt.
+/// 3. **Roster** — resolve `roster_key_ids` to their PINNED directory pubkeys
+///    as `Founder`-role [`ThresholdMember`](ciris_verify_core::threshold::ThresholdMember)s
+///    (skip any that don't resolve). `n = roster.len()`; never caller keys.
+/// 4. **Policy** — strict majority over the LIVE roster,
+///    [`QuorumPolicy::new`](ciris_verify_core::threshold::QuorumPolicy::new)`(n/2 + 1, n)`.
+/// 5. **Signatures** — the record's full scrub set ([`KeyRecord::scrubs`], scrub
+///    #1 + `additional_scrubs`) mapped to
+///    [`ThresholdSignature`](ciris_verify_core::threshold::ThresholdSignature)s.
+/// 6. **bytes** — `ceg_produce_canonicalize(registration_envelope)` (JCS RFC
+///    8785), the IDENTICAL canonical form the single-scrub verify
+///    ([`super::register::verify_key_registration`] / [`super::rooting`]) uses,
+///    so the multi-scrub bytes line up with the base-field scrub.
+/// 7. [`verify_quorum_policy`](ciris_verify_core::threshold::verify_quorum_policy)`(bytes,
+///    &roster, &sigs, policy)` — `Ok` ⇒ confer; any
+///    [`ThresholdError`](ciris_verify_core::threshold::ThresholdError) ⇒
+///    [`Error::CanonicalRoleNotAccordConferred`] (fail-closed).
+///
+/// **Monotonicity.** This runs at every `federation_keys` write chokepoint
+/// (`put_public_key` on all three backends + the `adopt_scrub_upgrade`
+/// self→anchored path), so `canonical` can never be added by a later
+/// self-registration or by replication of an under-quorum record. The only way
+/// `canonical` enters the directory is a fully-assembled ≥2-of-3 accord co-scrub
+/// (the Trust Root add-canonical op). `root_binding` is unchanged (still roots
+/// via ANY one scrub — rooting is recognition, not conferral). Verify-before-
+/// mutation (AV-9); backend-agnostic.
+pub async fn check_canonical_role_admission_over_roster(
     directory: &dyn super::FederationDirectory,
     row: &super::KeyRecord,
-    trusted_anchor: &[[u8; 32]],
+    roster_key_ids: &[String],
 ) -> Result<(), Error> {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use ciris_verify_core::threshold::{
+        verify_quorum_policy, QuorumPolicy, Role, ThresholdMember, ThresholdSignature,
+    };
 
-    // Fast path: no `canonical` role in the set → nothing to gate.
+    // (1) Fast path: no `canonical` role in the set → nothing to gate.
     if !identity_type::set_contains(&row.identity_type, identity_type::CANONICAL) {
         return Ok(());
     }
 
-    // v13.1.0 (CIRISPersist#377) — revocation-wins: a `key_id` the accord
-    // quorum WITHDREW (V095 tombstone) cannot be re-conferred `canonical`, EVEN
-    // by a valid anchor-scrub. The add-gate is monotonic and the anti-entropy
-    // path ([`apply_replicated_key_record`](super::register), #375) re-runs it,
-    // so without this consult a peer still holding the old anchor-scrubbed
-    // `canonical` record would silently RE-ADD the role on the next replication
-    // round — the withdrawal would evaporate. Consulting the durable,
-    // quorum-verified tombstone makes the gate
-    // "anchor-scrubbed AND not withdrawn-by-quorum" (same revocation-wins
-    // ordering as #370 B6 / #161). A SUPERSEDE successor is EXEMPT: a tombstone
-    // whose `superseded_by` names THIS same `key_id` is the rotate-in target of
-    // a key-id-preserving supersede, not a block. Runs before the anchor-scrub
-    // checks so a withdrawn key is refused even when the incoming record carries
-    // a genuine anchor scrub.
+    // (2) Revocation-wins (#377): a quorum-withdrawn key stays refused, even
+    // with a valid 2-of-3 scrub set. Runs BEFORE the quorum verify. A SUPERSEDE
+    // successor whose tombstone names THIS key_id is exempt (rotate-in).
     if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
         if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
             return Err(Error::CanonicalRoleWithdrawn {
@@ -2818,52 +2862,64 @@ pub async fn check_canonical_role_admission_anchored(
         }
     }
 
-    // Self-signed can NEVER confer `canonical` — this is the "a node cannot
-    // claim the founding role itself" invariant.
-    if row.scrub_key_id == row.key_id {
-        return Err(Error::CanonicalRoleNotAccordConferred {
-            key_id: row.key_id.clone(),
-            scrub_key_id: row.scrub_key_id.clone(),
-            reason: "self-signed record (scrub_key_id == key_id) cannot confer the `canonical` \
-                     role — it must be scrub-signed by a HUMANITY_ACCORD holder"
-                .to_owned(),
-        });
-    }
-
-    // Resolve the scrubber's row; an unknown scrubber cannot confer the role
-    // (fail-secure — the accord holder's key MUST already exist in the
-    // directory, the v12.2.0 gotcha).
-    let Some(scrubber) = directory.lookup_public_key(&row.scrub_key_id).await? else {
-        return Err(Error::CanonicalRoleNotAccordConferred {
-            key_id: row.key_id.clone(),
-            scrub_key_id: row.scrub_key_id.clone(),
-            reason: "scrub_key_id resolves to no federation_keys row — an unregistered scrubber \
-                     cannot confer the `canonical` role"
-                .to_owned(),
-        });
-    };
-
-    // The scrubber's ed25519 MUST be one of the pinned accord-holder anchor
-    // keys. This is the load-bearing gate: only the un-forgeable accord
-    // holders (A1/B1/C1) can confer `canonical`.
-    let raw = B64.decode(scrubber.pubkey_ed25519_base64.as_bytes()).ok();
-    let in_anchor = match raw {
-        Some(bytes) if bytes.len() == 32 => {
-            let mut ed = [0u8; 32];
-            ed.copy_from_slice(&bytes);
-            trusted_anchor.contains(&ed)
+    // (3) Standing founder roster = the accord family resolved to their PINNED
+    // directory pubkeys (never caller-supplied keys). Skip any that don't
+    // resolve; `n` tracks the LIVE roster so the policy is dynamic.
+    let mut roster: Vec<ThresholdMember> = Vec::with_capacity(roster_key_ids.len());
+    for kid in roster_key_ids {
+        if let Some(rec) = directory.lookup_public_key(kid).await? {
+            roster.push(ThresholdMember {
+                member_id: rec.key_id,
+                ed25519_public_key_base64: rec.pubkey_ed25519_base64,
+                mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
+                role: Some(Role::Founder),
+            });
         }
-        _ => false,
-    };
-    if !in_anchor {
-        return Err(Error::CanonicalRoleNotAccordConferred {
+    }
+    let n = roster.len();
+
+    // (4) Strict-majority policy over the live roster (2-of-3 today; 3-of-4 if
+    // the family grows). `verify_quorum_policy` re-validates `2·M > N` and
+    // `N == founder_count`, so this is NOT a frozen constant.
+    let policy = QuorumPolicy::new(n / 2 + 1, n);
+
+    // (6) The exact canonical bytes the scrubs signed = JCS(registration_envelope)
+    // — the IDENTICAL function the single-scrub verify uses, so a base-field
+    // scrub and an `additional_scrubs` entry are over byte-identical content.
+    let bytes = crate::verify::canonical::ceg_produce_canonicalize(&row.registration_envelope)
+        .map_err(|e| Error::CanonicalRoleNotAccordConferred {
             key_id: row.key_id.clone(),
             scrub_key_id: row.scrub_key_id.clone(),
-            reason: "scrubber's ed25519 pubkey is not in the pinned HUMANITY_ACCORD anchor \
-                     (only accord holders may confer the `canonical` role)"
-                .to_owned(),
-        });
-    }
+            reason: format!("registration_envelope canonicalize failed: {e}"),
+        })?;
+
+    // (5) The record's full scrub set → threshold signatures (member_id =
+    // scrub_key_id; a self-scrub's member_id is not in the founder roster, so it
+    // is silently not counted — self can never confer).
+    let sigs: Vec<ThresholdSignature> = row
+        .scrubs()
+        .into_iter()
+        .map(|s| ThresholdSignature {
+            member_id: s.scrub_key_id,
+            ed25519_signature_base64: s.scrub_signature_classical,
+            mldsa65_signature_base64: s.scrub_signature_pqc,
+        })
+        .collect();
+
+    // (7) m-of-n over the accord family. Non-forgeable: verify_quorum_policy
+    // cryptographically verifies each hybrid sig and counts ONLY distinct
+    // founders — a claimed-but-unsigned / garbage scrub does not count.
+    verify_quorum_policy(&bytes, &roster, &sigs, policy).map_err(|e| {
+        Error::CanonicalRoleNotAccordConferred {
+            key_id: row.key_id.clone(),
+            scrub_key_id: row.scrub_key_id.clone(),
+            reason: format!(
+                "accord family m-of-n not met for canonical add ({m}-of-{n}): {e}",
+                m = policy.m,
+                n = policy.n
+            ),
+        }
+    })?;
 
     Ok(())
 }
@@ -2892,8 +2948,9 @@ pub async fn is_canonical(
 // Withdrawal is a durable, quorum-verified TOMBSTONE (V095) — NOT a hard
 // un-set — because the add-gate above is monotonic and anti-entropy re-runs
 // it, so a hard drop would be silently re-added on the next replication round.
-// The gate ([`check_canonical_role_admission_anchored`]) consults the tombstone
-// so the effective rule is "anchor-scrubbed AND not withdrawn-by-quorum".
+// The gate ([`check_canonical_role_admission_over_roster`]) consults the
+// tombstone so the effective rule is "2-of-3-scrubbed AND not
+// withdrawn-by-quorum".
 // ─────────────────────────────────────────────────────────────────────
 
 /// The canonical `op` token committed by a plain-WITHDRAW authority payload
@@ -2959,8 +3016,9 @@ pub fn canonical_withdrawal_payload_sha256(
 
 /// v13.1.0 (CIRISPersist#377) — the **destructive quorum threshold** `M` for a
 /// canonical withdraw/supersede: **2 of 3** accord holders (A1/B1/C1) must vote
-/// YES. This is the genesis trust model's destructive floor (1-of-N bootstrap
-/// ADD — the anchor-scrub conferral — vs 2/3 for a DESTRUCTIVE op). Absolute,
+/// YES. Symmetric with the v13.2.0 (#383) 2-of-3 ADD gate — every
+/// capability-granting canonical op is m-of-n (no 1-of-N first-strike hole).
+/// Absolute,
 /// not a fraction of `|L|` — an adversary must present ≥2 distinct real accord
 /// holders' cryptographically-verified YES participations; inflating `|L|` with
 /// captured keys cannot lower the bar.
@@ -3162,7 +3220,7 @@ pub async fn withdraw_canonical_role(
 /// [`withdraw_canonical_role`] with an explicit accord-holder roster keyset — the
 /// core primitive. Production callers use the [`withdraw_canonical_role`] wrapper
 /// (genesis A1/B1/C1 roster); this form exists so tests can supply their own
-/// signable holders, mirroring [`check_canonical_role_admission_anchored`].
+/// signable holders, mirroring [`check_canonical_role_admission_over_roster`].
 pub async fn withdraw_canonical_role_over_roster(
     directory: &dyn super::FederationDirectory,
     key_id: &str,
@@ -5575,19 +5633,87 @@ mod tests {
     }
 }
 
+/// v13.2.0 (CIRISPersist#383) — run `body` against an **isolated, freshly-created
+/// postgres database** derived from `base_dsn`, then drop it. The v13.2.0
+/// canonical tests seed the accord family (A1/B1/C1) under their real key_ids
+/// with TEST hybrid keys to satisfy the 2-of-3 ADD gate; on the SHARED test db
+/// that squats the real anchor and breaks concurrent Engine-constructing pg
+/// tests. A throwaway db (`ciris_isol_<uuid>`) gives full pg coverage with zero
+/// shared-anchor pollution. `CREATE`/`DROP DATABASE` run over a bare admin
+/// connection (they cannot execute inside the pool's transactioned session);
+/// `DROP … WITH (FORCE)` terminates any lingering pool session.
+#[cfg(all(test, feature = "postgres"))]
+async fn run_in_isolated_pg_db<F, Fut>(base_dsn: &str, body: F)
+where
+    F: FnOnce(crate::store::postgres::PostgresBackend) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use crate::store::backend::Backend as _;
+    use crate::store::postgres::PostgresBackend;
+    use tokio_postgres::NoTls;
+
+    let (base, _cur_db) = base_dsn.rsplit_once('/').expect("dsn has a db path");
+    let db = format!("ciris_isol_{}", uuid::Uuid::new_v4().simple());
+    let admin_dsn = format!("{base}/postgres");
+    let temp_dsn = format!("{base}/{db}");
+
+    let (admin, conn) = tokio_postgres::connect(&admin_dsn, NoTls)
+        .await
+        .expect("admin connect");
+    let admin_task = tokio::spawn(conn);
+    admin
+        .execute(&format!("CREATE DATABASE {db}"), &[])
+        .await
+        .expect("create throwaway db");
+    drop(admin);
+    let _ = admin_task.await;
+
+    {
+        let backend = PostgresBackend::connect(&temp_dsn)
+            .await
+            .expect("connect throwaway db");
+        backend
+            .run_migrations()
+            .await
+            .expect("migrate throwaway db");
+        body(backend).await;
+    } // backend (pool) dropped → connections released
+
+    let (admin, conn) = tokio_postgres::connect(&admin_dsn, NoTls)
+        .await
+        .expect("admin reconnect");
+    let admin_task = tokio::spawn(conn);
+    let _ = admin
+        .execute(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"), &[])
+        .await;
+    drop(admin);
+    let _ = admin_task.await;
+}
+
 /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — the accord-conferred `canonical`
 /// admission decision table, run identically against SQLite and (when
 /// `CIRIS_PERSIST_TEST_PG_URL` is set) Postgres. Exercises the PRODUCTION gate
-/// (`check_canonical_role_admission`, real HUMANITY_ACCORD anchor) end-to-end
-/// through `put_public_key` + `adopt_scrub_upgrade`, with the real A1 genesis
-/// holder seeded as the anchor scrubber (the v12.2.0 gotcha: the scrubber must
-/// exist as a `federation_keys` row). Proves `canonical` cannot be self-claimed
-/// via ANY path.
+/// (`check_canonical_role_admission`) end-to-end through `put_public_key` +
+/// `adopt_scrub_upgrade`.
+///
+/// v13.2.0 (CIRISPersist#383) — the gate is now the **2-of-3 multi-scrub** add:
+/// `canonical` is conferred only on a record with ≥ a strict majority of the
+/// accord family, each a cryptographically VERIFIED hybrid scrub over the SAME
+/// canonical `registration_envelope` (`verify_quorum_policy`). Because the real
+/// A1/B1/C1 ceremony private keys are not in the test tree, these tests seed the
+/// three accord holders under their REAL key_ids (`accord_holder_roster_key_ids`
+/// = A1/B1/C1) with **test hybrid keypairs** (as `node` rows, skipping the HW
+/// attestation gate), so the production gate resolves the roster to signable
+/// keys and a genuine 2-of-3 co-scrub can be produced + verified end-to-end.
+/// Proves: 2 distinct valid anchor scrubs ADMIT; 1 scrub, a FORGED 2nd scrub,
+/// two scrubs by the SAME holder, and a self-scrub + 1 anchor are all REFUSED;
+/// `canonical` cannot be self-claimed via ANY path.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod canonical_gate_tests {
-    use super::super::genesis::accord_holder_genesis_records;
-    use super::super::types::{algorithm, identity_type};
+    use super::super::operational::test_support::{signed_canonical_record, Identity};
+    use super::super::types::{algorithm, identity_type, ScrubSig};
     use super::super::{is_canonical, FederationDirectory, KeyRecord, SignedKeyRecord};
+    use super::accord_holder_roster_key_ids;
     use crate::verify::canonical::ceg_produce_canonicalize;
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
@@ -5629,6 +5755,7 @@ mod canonical_gate_tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
@@ -5636,125 +5763,309 @@ mod canonical_gate_tests {
         dir.put_public_key(SignedKeyRecord { record: rec }).await
     }
 
-    /// The full decision table over an anchor-seeded directory. `dir` MUST
-    /// already carry the genesis A1/B1/C1 holders. `tag` scopes key_ids so
-    /// parallel/repeat runs don't collide.
-    async fn run_put_matrix(dir: &dyn FederationDirectory, tag: &str) {
-        let a1 = &accord_holder_genesis_records()[0].record;
-        assert_eq!(a1.key_id, "A1");
+    /// Register `id` as a `node` `federation_keys` row under its key_id with the
+    /// Identity's PINNED hybrid pubkeys (so a founder roster resolves to keys
+    /// the test can sign with). `node` (not `accord_holder`) skips the HW gate.
+    async fn register_founder(dir: &dyn FederationDirectory, id: &Identity) {
+        let m = id.member();
+        let mut rec = record(&id.key_id, identity_type::NODE, &id.key_id);
+        rec.pubkey_ed25519_base64 = m.ed25519_public_key_base64;
+        rec.pubkey_ml_dsa_65_base64 = m.mldsa65_public_key_base64;
+        put(dir, rec).await.expect("register founder");
+    }
 
-        // Seed a NON-anchor key that exists in the directory (a plain
-        // self-signed steward) — used as a non-anchor scrubber below.
-        let notanchor = format!("notanchor-{tag}");
-        put(dir, record(&notanchor, identity_type::STEWARD, &notanchor))
-            .await
-            .expect("plain non-anchor key admits");
+    /// The full 2-of-3 multi-scrub admission decision table, exercised on the
+    /// CORE gate [`super::check_canonical_role_admission_over_roster`] with a
+    /// DISTINCT test roster (`cah{0,1,2}-{tag}`) — so it runs on every backend
+    /// (incl. the SHARED postgres) WITHOUT touching the real A1/B1/C1 anchor.
+    /// The real accord ceremony private keys are not in-tree, so a genuine
+    /// co-scrub can only be produced against a test roster; the production
+    /// `check_canonical_role_admission` wrapper is identical modulo the roster
+    /// key_ids and is exercised end-to-end on the isolated backends
+    /// ([`run_endtoend`]).
+    async fn run_gate_matrix(dir: &dyn FederationDirectory, tag: &str) {
+        let founders = [
+            Identity::new(&format!("cah0-{tag}")),
+            Identity::new(&format!("cah1-{tag}")),
+            Identity::new(&format!("cah2-{tag}")),
+        ];
+        for f in &founders {
+            register_founder(dir, f).await;
+        }
+        let roster: Vec<String> = founders.iter().map(|f| f.key_id.clone()).collect();
+        let env = |kid: &str| serde_json::json!({ "key_id": kid });
+        let gate = |rec: KeyRecord, roster: Vec<String>| async move {
+            super::check_canonical_role_admission_over_roster(dir, &rec, &roster).await
+        };
 
-        // (1) ADMITTED: anchor-scrubbed `node,canonical` (scrub_key_id = A1,
-        //     A1's ed25519 ∈ the pinned anchor).
-        let good = format!("canon-good-{tag}");
-        put(dir, record(&good, "canonical,node", &a1.key_id))
-            .await
-            .expect("(1) anchor-scrubbed canonical must be ADMITTED");
-        assert!(
-            is_canonical(dir, &good).await.expect("is_canonical"),
-            "(1) admitted canonical row must resolve is_canonical == true"
-        );
-
-        // (2) REFUSED: self-signed `canonical` (scrub_key_id == key_id).
-        let selfsigned = format!("canon-self-{tag}");
-        let err = put(dir, record(&selfsigned, "canonical", &selfsigned))
-            .await
-            .expect_err("(2) self-signed canonical must be REFUSED");
-        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
-        assert!(
-            dir.lookup_public_key(&selfsigned).await.unwrap().is_none(),
-            "(2) refused self-signed canonical must leave NO row"
-        );
-        assert!(!is_canonical(dir, &selfsigned).await.unwrap());
-
-        // (3) REFUSED: non-anchor-scrubbed `canonical` (scrubber exists but is
-        //     not in the anchor).
-        let nonanchor_canon = format!("canon-nonanchor-{tag}");
-        let err = put(dir, record(&nonanchor_canon, "canonical,node", &notanchor))
-            .await
-            .expect_err("(3) non-anchor-scrubbed canonical must be REFUSED");
-        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
-        assert!(
-            dir.lookup_public_key(&nonanchor_canon)
-                .await
-                .unwrap()
-                .is_none(),
-            "(3) refused non-anchor canonical must leave NO row"
-        );
-
-        // (3') REFUSED: canonical scrubbed by an UNKNOWN key (fail-secure).
-        let unknown_canon = format!("canon-unknown-{tag}");
-        let err = put(
-            dir,
-            record(&unknown_canon, "canonical", &format!("ghost-{tag}")),
+        // (1) ADMITTED: 2 DISTINCT valid founder scrubs (strict majority of 3).
+        gate(
+            signed_canonical_record(
+                "g1",
+                "canonical,node",
+                env("g1"),
+                &[&founders[0], &founders[1]],
+            ),
+            roster.clone(),
         )
         .await
-        .expect_err("(3') unknown-scrubber canonical must be REFUSED");
-        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
+        .expect("(1) 2-of-3 distinct valid scrubs must confer canonical");
 
-        // (4) A plain `node` row is admitted and is NOT canonical.
-        let plain = format!("plain-node-{tag}");
-        put(dir, record(&plain, identity_type::NODE, &plain))
-            .await
-            .expect("(4) plain node admits");
-        assert!(
-            !is_canonical(dir, &plain).await.unwrap(),
-            "(4) plain node must not be canonical"
-        );
-
-        // (5) MONOTONIC: a self-signed `node` row is admitted; a later
-        //     SELF-registration of the same key adding `canonical` is REFUSED
-        //     (the role cannot be added by a later self-registration /
-        //     replication of a self-signed row).
-        let mono = format!("mono-{tag}");
-        put(dir, record(&mono, identity_type::NODE, &mono))
-            .await
-            .expect("(5) initial self-signed node admits");
-        let err = put(dir, record(&mono, "canonical,node", &mono))
-            .await
-            .expect_err("(5) later self-signed canonical must be REFUSED");
+        // (2) REFUSED: exactly ONE scrub (1-of-N is retired). Error cites m-of-n.
+        let err = gate(
+            signed_canonical_record("g2", "canonical,node", env("g2"), &[&founders[0]]),
+            roster.clone(),
+        )
+        .await
+        .expect_err("(2) a single scrub must be REFUSED");
         assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
         assert!(
-            !is_canonical(dir, &mono).await.unwrap(),
-            "(5) monotonic: canonical must NOT have been added"
+            format!("{err}").contains("2-of-3") || format!("{err}").contains("m-of-n"),
+            "(2) error must cite the m-of-n shortfall, got: {err}"
         );
 
-        // (6) is_canonical on an unknown key is false (not an error).
-        assert!(!is_canonical(dir, &format!("nope-{tag}")).await.unwrap());
+        // (3) FORGERY (load-bearing): scrub #1 is a REAL cah0 scrub; the 2nd
+        //     claims member_id = cah1 with a GARBAGE signature. The quorum
+        //     primitive cryptographically verifies each sig, so the forged one
+        //     does NOT count → 1 < 2 → REFUSED. Counting claimed scrub_key_ids
+        //     without verifying would WRONGLY admit this.
+        let mut forged =
+            signed_canonical_record("g3", "canonical,node", env("g3"), &[&founders[0]]);
+        forged.additional_scrubs = vec![ScrubSig {
+            scrub_key_id: founders[1].key_id.clone(),
+            scrub_signature_classical: B64.encode([0u8; 64]),
+            scrub_signature_pqc: Some(B64.encode([0u8; 64])),
+        }];
+        let err = gate(forged, roster.clone())
+            .await
+            .expect_err("(3) a forged 2nd scrub must be REFUSED");
+        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
+
+        // (4) NOT DISTINCT: two scrubs by the SAME founder (cah0 twice) → the
+        //     primitive dedups by member → 1 distinct < 2 → REFUSED.
+        let err = gate(
+            signed_canonical_record(
+                "g4",
+                "canonical,node",
+                env("g4"),
+                &[&founders[0], &founders[0]],
+            ),
+            roster.clone(),
+        )
+        .await
+        .expect_err("(4) two scrubs by the same holder must be REFUSED");
+        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
+
+        // (5) SELF-SCRUB + 1 founder: scrub #1 is a self-scrub (member_id =
+        //     key_id, NOT a founder → not counted); only the 1 founder scrub
+        //     counts → REFUSED. A node cannot bootstrap itself into the set.
+        let me_self = Identity::new("g5");
+        let err = gate(
+            signed_canonical_record("g5", "canonical,node", env("g5"), &[&me_self, &founders[0]]),
+            roster.clone(),
+        )
+        .await
+        .expect_err("(5) self-scrub + 1 founder must be REFUSED");
+        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
+
+        // (6) A non-canonical record fast-paths to Ok regardless of scrubs.
+        gate(
+            record("g6", identity_type::NODE, &founders[0].key_id),
+            roster.clone(),
+        )
+        .await
+        .expect("(6) a non-canonical record is not gated");
+
+        // (7) WITHDRAWN-still-refused (#377 composition): record a withdrawal
+        //     tombstone for a key, then EVEN a valid 2-of-3 scrub set is refused
+        //     — the revocation-wins consult runs before the quorum verify.
+        dir.record_canonical_withdrawal("g7", None, "digest-g7")
+            .await
+            .expect("record withdrawal");
+        let err = gate(
+            signed_canonical_record(
+                "g7",
+                "canonical,node",
+                env("g7"),
+                &[&founders[0], &founders[1]],
+            ),
+            roster.clone(),
+        )
+        .await
+        .expect_err("(7) a withdrawn key stays refused even with a valid 2-of-3");
+        assert_eq!(err.kind(), "canonical_role_withdrawn");
+
+        // (8) ROSTER-DERIVED POLICY (the threshold tracks the LIVE roster, is
+        //     NOT a frozen `2`): over a 4-FOUNDER roster the strict majority is
+        //     3, so the SAME 2 valid scrubs that pass at n=3 are REFUSED at n=4.
+        let f3 = Identity::new(&format!("cah3-{tag}"));
+        register_founder(dir, &f3).await;
+        let roster4: Vec<String> = founders
+            .iter()
+            .map(|f| f.key_id.clone())
+            .chain(std::iter::once(f3.key_id.clone()))
+            .collect();
+        let err = gate(
+            signed_canonical_record(
+                "g8",
+                "canonical,node",
+                env("g8"),
+                &[&founders[0], &founders[1]],
+            ),
+            roster4.clone(),
+        )
+        .await
+        .expect_err("(8) 2 scrubs over a 4-founder roster (needs 3) must be REFUSED");
+        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
+        // 3 distinct valid scrubs over the 4-founder roster DO confer.
+        gate(
+            signed_canonical_record(
+                "g8b",
+                "canonical,node",
+                env("g8b"),
+                &[&founders[0], &founders[1], &f3],
+            ),
+            roster4,
+        )
+        .await
+        .expect("(8) 3-of-4 over the live roster confers canonical");
+
+        // (9) STORAGE round-trip of `additional_scrubs` on the write path
+        //     (writer + decoder) — a NON-canonical node record carrying a 2nd
+        //     scrub fast-paths the gate, stores, and reads back with the scrub
+        //     set intact. Covers the V096 column + serde on every backend.
+        let store = format!("gstore-{tag}");
+        dir.put_public_key(SignedKeyRecord {
+            record: signed_canonical_record(
+                &store,
+                identity_type::NODE,
+                env(&store),
+                &[&founders[0], &founders[1]],
+            ),
+        })
+        .await
+        .expect("(9) non-canonical 2-scrub node stores");
+        let read = dir.lookup_public_key(&store).await.unwrap().unwrap();
+        assert_eq!(read.additional_scrubs.len(), 1, "(9) 2nd scrub round-trips");
+        assert_eq!(read.distinct_scrub_count(), 2);
+        assert_eq!(
+            read.additional_scrubs[0].scrub_key_id, founders[1].key_id,
+            "(9) the additional scrub's key_id survives store→read"
+        );
+    }
+
+    /// End-to-end through the PRODUCTION gate + storage on an ISOLATED backend:
+    /// seed the accord family (A1/B1/C1) under their real key_ids with TEST
+    /// hybrid keys (safe only on a per-test-isolated backend — NEVER the shared
+    /// pg), admit a 2-of-3 canonical via `put_public_key`, and confirm
+    /// `is_canonical` / `list_canonical_servers` / round-trip
+    /// `additional_scrubs` / accord-attested bootstrap-hint surfacing.
+    async fn run_endtoend(dir: &dyn FederationDirectory, tag: &str) {
+        let accord: Vec<Identity> = accord_holder_roster_key_ids()
+            .iter()
+            .map(|k| Identity::new(k))
+            .collect();
+        for a in &accord {
+            register_founder(dir, a).await;
+        }
+        let good = format!("canon-good-{tag}");
+        let good_env = serde_json::json!({
+            "key_id": good,
+            "transport_hints": [{ "kind": "ip", "destination": "108.61.242.236:4242" }],
+        });
+        dir.put_public_key(SignedKeyRecord {
+            record: signed_canonical_record(
+                &good,
+                "canonical,node",
+                good_env,
+                &[&accord[0], &accord[1]],
+            ),
+        })
+        .await
+        .expect("2-of-3 canonical admits through the production gate");
+        assert!(is_canonical(dir, &good).await.expect("is_canonical"));
+
+        // Round-trip: the 2nd scrub survives store→read.
+        let read = dir.lookup_public_key(&good).await.unwrap().unwrap();
+        assert_eq!(
+            read.additional_scrubs.len(),
+            1,
+            "2nd scrub preserved on read-back"
+        );
+        assert_eq!(read.distinct_scrub_count(), 2);
+
+        // #381 bootstrap-hint surfacing from the signed envelope.
+        let hints = read.transport_hints();
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.kind == "ip" && h.destination == "108.61.242.236:4242"),
+            "the accord-attested transport hint must surface"
+        );
+
+        // A single-scrub re-offer of a DIFFERENT key is refused end-to-end.
+        let one = format!("canon-one-{tag}");
+        let err = dir
+            .put_public_key(SignedKeyRecord {
+                record: signed_canonical_record(
+                    &one,
+                    "canonical,node",
+                    serde_json::json!({"key_id": one}),
+                    &[&accord[0]],
+                ),
+            })
+            .await
+            .expect_err("a single-scrub canonical must be REFUSED end-to-end");
+        assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
+        assert!(dir.lookup_public_key(&one).await.unwrap().is_none());
     }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn canonical_matrix_sqlite() {
+    async fn canonical_gate_sqlite() {
         use crate::store::backend::Backend as _;
         use crate::store::sqlite::SqliteBackend;
-
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        backend
-            .seed_genesis_accord_holders(accord_holder_genesis_records())
-            .await
-            .expect("genesis seed");
+        run_gate_matrix(&backend, "sq").await;
+    }
 
-        run_put_matrix(&backend, "sq").await;
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn canonical_gate_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping canonical_gate_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        // Isolated throwaway db → zero shared-anchor pollution (the matrix seeds
+        // no A1/B1/C1 here, but the isolated db also keeps its stray gate rows
+        // out of the shared suite entirely).
+        super::run_in_isolated_pg_db(&dsn, |backend| async move {
+            run_gate_matrix(&backend, "pg").await;
+        })
+        .await;
+    }
 
-        // The enumerator returns exactly the one admitted canonical row.
-        let canon = backend.list_canonical_servers().await.expect("list");
-        assert_eq!(canon.len(), 1, "exactly one canonical row admitted");
-        assert_eq!(canon[0].key_id, "canon-good-sq");
-        assert!(identity_type::set_contains(
-            &canon[0].identity_type,
-            identity_type::CANONICAL
-        ));
+    #[tokio::test]
+    async fn canonical_gate_memory() {
+        use crate::store::memory::MemoryBackend;
+        let backend = MemoryBackend::new();
+        run_gate_matrix(&backend, "mem").await;
+    }
 
-        // adopt_scrub_upgrade path is ALSO gated: seed a self-signed node,
-        // then attempt a non-anchor-scrubbed upgrade that adds canonical.
+    /// End-to-end via the PRODUCTION `check_canonical_role_admission` on the
+    /// ISOLATED sqlite-in-memory backend (safe to seed test A1/B1/C1).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn canonical_endtoend_sqlite() {
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        run_endtoend(&backend, "e2e-sq").await;
+
+        // adopt_scrub_upgrade path is ALSO gated: a self-signed node cannot be
+        // upgraded to canonical by an under-quorum (single/non-roster) scrub.
         let up = "mono-adopt-sq";
         backend
             .put_public_key(SignedKeyRecord {
@@ -5762,57 +6073,29 @@ mod canonical_gate_tests {
             })
             .await
             .expect("seed self-signed node for adopt");
-        // Non-anchor scrubber adding canonical via adopt → REFUSED.
         let mut adopted = record(up, "canonical,node", "notanchor-sq");
         adopted.pubkey_ed25519_base64 = record(up, identity_type::NODE, up).pubkey_ed25519_base64;
         let err = backend
             .adopt_scrub_upgrade(SignedKeyRecord { record: adopted })
             .await
-            .expect_err("adopt adding canonical via non-anchor scrubber must be REFUSED");
+            .expect_err("adopt adding canonical without quorum must be REFUSED");
         assert_eq!(err.kind(), "canonical_role_not_accord_conferred");
         assert!(!is_canonical(&backend, up).await.unwrap());
-    }
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    #[serial_test::serial(postgres)]
-    async fn canonical_matrix_postgres() {
-        use crate::store::backend::Backend as _;
-        use crate::store::postgres::PostgresBackend;
-
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
-            eprintln!("skipping canonical_matrix_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
-            return;
-        };
-        let backend = PostgresBackend::connect(&dsn).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        // Fresh seed path: clear any prior A1/B1/C1 + our tagged rows.
-        let client = backend.pool().get().await.unwrap();
-        let _ = client
-            .execute(
-                "DELETE FROM cirislens.federation_keys WHERE key_id = ANY($1) \
-                 OR key_id LIKE 'canon-%pg' OR key_id LIKE '%-pg' OR identity_type LIKE '%canonical%'",
-                &[&vec!["A1".to_string(), "B1".to_string(), "C1".to_string()]],
-            )
-            .await;
-        backend
-            .seed_genesis_accord_holders(accord_holder_genesis_records())
-            .await
-            .expect("pg genesis seed");
-
-        run_put_matrix(&backend, "pg").await;
 
         let canon = backend.list_canonical_servers().await.expect("list");
-        assert!(
-            canon.iter().any(|r| r.key_id == "canon-good-pg"),
-            "the admitted canonical row appears in list_canonical_servers"
-        );
-        assert!(
-            canon
-                .iter()
-                .all(|r| identity_type::set_contains(&r.identity_type, identity_type::CANONICAL)),
-            "every listed row carries canonical"
-        );
+        assert_eq!(canon.len(), 1, "exactly the one admitted canonical row");
+        assert!(identity_type::set_contains(
+            &canon[0].identity_type,
+            identity_type::CANONICAL
+        ));
+    }
+
+    /// End-to-end via the PRODUCTION gate on the ISOLATED memory backend.
+    #[tokio::test]
+    async fn canonical_endtoend_memory() {
+        use crate::store::memory::MemoryBackend;
+        let backend = MemoryBackend::new();
+        run_endtoend(&backend, "e2e-mem").await;
     }
 }
 
@@ -5831,12 +6114,11 @@ mod canonical_gate_tests {
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod canonical_withdrawal_tests {
     use super::super::accord_quorum::test_fixtures::signed_participation;
-    use super::super::genesis::accord_holder_genesis_records;
-    use super::super::operational::test_support::Identity;
+    use super::super::operational::test_support::{signed_canonical_record, Identity};
     use super::super::types::{algorithm, identity_type};
     use super::super::{FederationDirectory, KeyRecord, SignedKeyRecord};
     use super::{
-        canonical_withdrawal_payload_sha256, is_canonical_effective,
+        accord_holder_roster_key_ids, canonical_withdrawal_payload_sha256, is_canonical_effective,
         supersede_canonical_over_roster, withdraw_canonical_role_over_roster,
         OP_SUPERSEDE_CANONICAL, OP_WITHDRAW_CANONICAL,
     };
@@ -5881,6 +6163,7 @@ mod canonical_withdrawal_tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
@@ -5945,10 +6228,23 @@ mod canonical_withdrawal_tests {
     /// (genesis A1/B1/C1 present for the anchor-scrub ADD gate) with a signable
     /// 3-holder quorum roster (H0/H1/H2) for the destructive-op authority.
     async fn run_withdrawal_matrix(dir: &dyn FederationDirectory, tag: &str) {
-        let a1 = &accord_holder_genesis_records()[0].record;
-        assert_eq!(a1.key_id, "A1");
+        // Seed the accord family (A1/B1/C1) under their REAL key_ids with TEST
+        // hybrid keypairs so the v13.2.0 2-of-3 ADD gate can be satisfied
+        // end-to-end (the real ceremony keys are not in-tree). `env` builds the
+        // per-key envelope; a canonical `good`/`old`/`new` is admitted with a
+        // valid A1+B1 co-scrub over it.
+        let accord: Vec<Identity> = accord_holder_roster_key_ids()
+            .iter()
+            .map(|k| Identity::new(k))
+            .collect();
+        assert_eq!(accord[0].key_id, "A1");
+        for a in &accord {
+            register_holder(dir, a).await;
+        }
+        let env = |kid: &str| serde_json::json!({ "key_id": kid });
 
-        // Signable quorum roster (3 holders) resolved from directory pinned keys.
+        // Signable DESTRUCTIVE-quorum roster (3 holders) — distinct from the
+        // ADD roster; resolved from directory pinned keys.
         let holders = [
             Identity::new(&format!("H0-{tag}")),
             Identity::new(&format!("H1-{tag}")),
@@ -5960,11 +6256,19 @@ mod canonical_withdrawal_tests {
         let roster: Vec<ThresholdMember> = holders.iter().map(|h| h.member()).collect();
         let roster_key_ids: Vec<String> = holders.iter().map(|h| h.key_id.clone()).collect();
 
-        // ── Admit an anchor-scrubbed canonical, then withdraw it. ──────────
+        // ── Admit a 2-of-3 anchor-scrubbed canonical, then withdraw it. ─────
         let good = format!("cw-good-{tag}");
-        put(dir, record(&good, "canonical,node", &a1.key_id))
-            .await
-            .expect("anchor-scrubbed canonical must be ADMITTED");
+        put(
+            dir,
+            signed_canonical_record(
+                &good,
+                "canonical,node",
+                env(&good),
+                &[&accord[0], &accord[1]],
+            ),
+        )
+        .await
+        .expect("2-of-3 anchor-scrubbed canonical must be ADMITTED");
         assert!(is_canonical_effective(dir, &good).await.unwrap());
 
         // (A) FORGED-AUTHORITY REJECTION: a stored proposal committing to
@@ -6090,7 +6394,10 @@ mod canonical_withdrawal_tests {
 
         // (F) Revocation-wins gate consult: re-offering the anchor-scrubbed
         //     canonical record for `good` via put_public_key is REFUSED.
-        let err = put(dir, record(&good, "canonical,node", &a1.key_id))
+        // The withdrawal consult runs BEFORE the quorum verify, so a re-offer of
+        // the WITHDRAWN key is refused regardless of scrub validity — a plain
+        // (even under-quorum) canonical record suffices to prove the consult wins.
+        let err = put(dir, record(&good, "canonical,node", &accord[0].key_id))
             .await
             .expect_err("re-confer of a withdrawn canonical must be REFUSED");
         assert_eq!(err.kind(), "canonical_role_withdrawn");
@@ -6115,7 +6422,7 @@ mod canonical_withdrawal_tests {
             .expect("withdraw the (future) key");
         let outcome = dir
             .apply_replicated_key_record(SignedKeyRecord {
-                record: record(&repl, "canonical,node", &a1.key_id),
+                record: record(&repl, "canonical,node", &accord[0].key_id),
             })
             .await;
         match outcome {
@@ -6132,9 +6439,12 @@ mod canonical_withdrawal_tests {
         // ── (H) SUPERSEDE: admit successor + withdraw predecessor atomically. ─
         let old = format!("cw-old-{tag}");
         let new = format!("cw-new-{tag}");
-        put(dir, record(&old, "canonical,node", &a1.key_id))
-            .await
-            .expect("admit predecessor canonical");
+        put(
+            dir,
+            signed_canonical_record(&old, "canonical,node", env(&old), &[&accord[0], &accord[1]]),
+        )
+        .await
+        .expect("admit predecessor canonical (2-of-3)");
         assert!(is_canonical_effective(dir, &old).await.unwrap());
 
         // Fail-closed: a proposal committing to old→WRONG cannot supersede
@@ -6154,7 +6464,14 @@ mod canonical_withdrawal_tests {
             dir,
             &old,
             SignedKeyRecord {
-                record: record(&new, "canonical,node", &a1.key_id),
+                // Authority is verified BEFORE the successor is admitted, so a
+                // payload mismatch refuses before this record is even inspected.
+                record: signed_canonical_record(
+                    &new,
+                    "canonical,node",
+                    env(&new),
+                    &[&accord[0], &accord[1]],
+                ),
             },
             &d_wrong,
             &roster_key_ids,
@@ -6185,7 +6502,12 @@ mod canonical_withdrawal_tests {
             dir,
             &old,
             SignedKeyRecord {
-                record: record(&new, "canonical,node", &a1.key_id),
+                record: signed_canonical_record(
+                    &new,
+                    "canonical,node",
+                    env(&new),
+                    &[&accord[0], &accord[1]],
+                ),
             },
             &d_sup,
             &roster_key_ids,
@@ -6215,65 +6537,39 @@ mod canonical_withdrawal_tests {
 
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
-        backend
-            .seed_genesis_accord_holders(accord_holder_genesis_records())
-            .await
-            .expect("genesis seed");
-
+        // The matrix seeds the accord family (A1/B1/C1) with test hybrid keys
+        // itself (2-of-3 ADD gate); no real-genesis seed here.
         run_withdrawal_matrix(&backend, "sq").await;
     }
 
+    /// v13.2.0 (CIRISPersist#383) — run the withdraw/supersede matrix against an
+    /// **ISOLATED, freshly-created postgres database**. The matrix seeds the
+    /// accord family (A1/B1/C1) with TEST hybrid keys to satisfy the 2-of-3 ADD
+    /// gate for its `good`/`old`/`new` setup rows; on the SHARED test db that
+    /// would squat the real anchor and break concurrent Engine-constructing pg
+    /// tests, so we spin up a throwaway db (`cw_isol_<uuid>`), migrate it, run,
+    /// and drop it — full pg coverage with zero shared-anchor pollution.
     #[cfg(feature = "postgres")]
     #[tokio::test]
-    #[serial_test::serial(postgres)]
     async fn canonical_withdrawal_postgres() {
-        use crate::store::backend::Backend as _;
-        use crate::store::postgres::PostgresBackend;
-
         let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
             eprintln!("skipping canonical_withdrawal_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
         };
-        let backend = PostgresBackend::connect(&dsn).await.unwrap();
-        backend.run_migrations().await.unwrap();
-        let client = backend.pool().get().await.unwrap();
-        // Fresh state: clear our tagged withdrawals + accord rows, then delete
-        // the referencing canonical/tagged rows AND the A1/B1/C1 anchors + roster
-        // holders in ONE statement (a canonical row's scrub_key_id FKs to its
-        // anchor, so both must drop together — the delete is statement-atomic).
-        let _ = client
-            .execute("DELETE FROM cirislens.canonical_role_withdrawal", &[])
-            .await;
-        let _ = client
-            .execute("DELETE FROM cirislens.accord_participation", &[])
-            .await;
-        let _ = client
-            .execute("DELETE FROM cirislens.accord_proposal", &[])
-            .await;
-        let _ = client
-            .execute("DELETE FROM cirislens.accord_issued_nonce", &[])
-            .await;
-        let _ = client
-            .execute(
-                "DELETE FROM cirislens.federation_keys WHERE key_id = ANY($1) \
-                 OR key_id LIKE 'cw-%-pg' OR key_id LIKE 'H_-pg' \
-                 OR identity_type LIKE '%canonical%'",
-                &[&vec!["A1".to_string(), "B1".to_string(), "C1".to_string()]],
-            )
-            .await;
-        backend
-            .seed_genesis_accord_holders(accord_holder_genesis_records())
-            .await
-            .expect("pg genesis seed");
-
-        run_withdrawal_matrix(&backend, "pg").await;
+        super::run_in_isolated_pg_db(&dsn, |backend| async move {
+            run_withdrawal_matrix(&backend, "pg").await;
+        })
+        .await;
     }
 
     /// Memory-backend symmetry: the withdrawal store (record/lookup/list,
     /// idempotency) + the revocation-wins gate consult
-    /// ([`check_canonical_role_admission_anchored`](super::check_canonical_role_admission_anchored))
-    /// behave identically to the SQL backends. Uses a TEST anchor so no genesis
-    /// seed is required (the withdrawal consult runs BEFORE the anchor checks).
+    /// ([`check_canonical_role_admission_over_roster`](super::check_canonical_role_admission_over_roster))
+    /// behave identically to the SQL backends. Seeds the accord family (A1/B1/C1)
+    /// with test hybrid keys so the 2-of-3 ADD gate can be satisfied, then proves
+    /// the withdrawal consult runs BEFORE the quorum verify (a withdrawn key is
+    /// refused EVEN with a valid 2-of-3 scrub set), while a superseded-to-self
+    /// key is exempt.
     #[tokio::test]
     async fn canonical_withdrawal_memory() {
         use crate::store::memory::MemoryBackend;
@@ -6304,39 +6600,45 @@ mod canonical_withdrawal_tests {
             .unwrap()
             .is_none());
 
-        // The gate consult rejects re-conferring canonical on the withdrawn
-        // key K — regardless of anchor (the consult runs first). Use a test
-        // anchor containing K's scrubber so ONLY the withdrawal can be the
+        // Seed the signable accord family (A1/B1/C1 with test hybrid keys) so a
+        // GENUINE 2-of-3 co-scrub can be produced + verified by the gate.
+        let accord: Vec<Identity> = accord_holder_roster_key_ids()
+            .iter()
+            .map(|k| Identity::new(k))
+            .collect();
+        for a in &accord {
+            register_holder(dir, a).await;
+        }
+        let roster = accord_holder_roster_key_ids();
+        let env = |kid: &str| serde_json::json!({ "key_id": kid });
+
+        // The gate consult rejects re-conferring canonical on the withdrawn key
+        // K EVEN with a valid 2-of-3 scrub set — the consult runs FIRST
+        // (revocation-wins), so the withdrawal (not a quorum shortfall) is the
         // rejection cause.
-        let scrubber_seed = [0x33u8; 32];
-        let scrubber = SigningKey::from_bytes(&scrubber_seed);
-        let anchor = vec![scrubber.verifying_key().to_bytes()];
-        put(dir, {
-            let mut r = record("scrubber", identity_type::STEWARD, "scrubber");
-            r.pubkey_ed25519_base64 = B64.encode(scrubber.verifying_key().to_bytes());
-            r
-        })
-        .await
-        .expect("register scrubber");
-        let rec = record("K", "canonical,node", "scrubber");
-        let err = super::check_canonical_role_admission_anchored(dir, &rec, &anchor)
+        let rec =
+            signed_canonical_record("K", "canonical,node", env("K"), &[&accord[0], &accord[1]]);
+        let err = super::check_canonical_role_admission_over_roster(dir, &rec, &roster)
             .await
             .expect_err("withdrawn key cannot be re-conferred canonical");
         assert_eq!(err.kind(), "canonical_role_withdrawn");
 
-        // A NON-withdrawn key with the same anchor scrub is admitted by the gate.
-        let ok = record("J", "canonical,node", "scrubber");
-        super::check_canonical_role_admission_anchored(dir, &ok, &anchor)
+        // A NON-withdrawn key with a valid 2-of-3 scrub set passes the gate.
+        let ok =
+            signed_canonical_record("J", "canonical,node", env("J"), &[&accord[0], &accord[1]]);
+        super::check_canonical_role_admission_over_roster(dir, &ok, &roster)
             .await
-            .expect("non-withdrawn anchor-scrubbed canonical passes the gate");
+            .expect("non-withdrawn 2-of-3 canonical passes the gate");
 
         // Supersede exemption: a tombstone whose superseded_by names THIS key
-        // does NOT block re-confer (key-id-preserving rotation).
+        // does NOT block re-confer (key-id-preserving rotation) — the valid
+        // 2-of-3 then confers.
         dir.record_canonical_withdrawal("S", Some("S"), "digest-2")
             .await
             .expect("self-superseded tombstone");
-        let rec_s = record("S", "canonical,node", "scrubber");
-        super::check_canonical_role_admission_anchored(dir, &rec_s, &anchor)
+        let rec_s =
+            signed_canonical_record("S", "canonical,node", env("S"), &[&accord[0], &accord[1]]);
+        super::check_canonical_role_admission_over_roster(dir, &rec_s, &roster)
             .await
             .expect("a superseded-to-self key is exempt from the withdrawal block");
     }
