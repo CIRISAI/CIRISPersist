@@ -316,6 +316,99 @@ pub fn dedup_key(row: &TraceEventRow) -> (String, String, String, ReasoningEvent
     )
 }
 
+/// #226 — number of app-level dedup shards for the trace-ingest path.
+///
+/// The `trace_events` dedup UNIQUE index is a single hot B-tree; under
+/// concurrent aggregate ingest (N writers / connections), every
+/// `ON CONFLICT DO NOTHING` insert contends on that one index (right-edge
+/// leaf pages as `ts` climbs, plus the uniqueness probe). CIRISPersist#226
+/// relieves that centrally — in persist, plain PG + SQLite, NO extensions —
+/// by PREFIXING the dedup index with a `shard_key` in
+/// `[0, TRACE_DEDUP_SHARD_COUNT)` derived deterministically from the dedup
+/// key (see [`trace_dedup_shard_key`]). Concurrent inserts spread across
+/// `TRACE_DEDUP_SHARD_COUNT` disjoint index subtrees, so aggregate
+/// throughput scales closer to core count instead of colliding on one page.
+///
+/// Chosen at 64: enough fan-out to absorb a many-core / many-connection
+/// writer fleet, small enough that the extra leading column costs nothing
+/// on reads (every dedup lookup already binds the full key, and the shard
+/// is a pure function of it — see [`trace_dedup_shard_key`]).
+pub const TRACE_DEDUP_SHARD_COUNT: i16 = 64;
+
+/// #226 — the deterministic dedup shard for a trace row.
+///
+/// The shard is a pure function of a SUBSET of the dedup key
+/// (`agent_id_hash`, `trace_id`, `thought_id`, `event_type`,
+/// `attempt_index` — deliberately NOT `ts`, see below), so:
+///
+/// * **Dedup is preserved EXACTLY.** A true duplicate carries the identical
+///   full dedup tuple, hence the identical shard, hence it still collides on
+///   the `(shard_key, agent_id_hash, trace_id, thought_id, event_type,
+///   attempt_index, ts)` UNIQUE index. Uniqueness over that 7-tuple forbids
+///   precisely the same rows the old 6-tuple index did (`shard_key` adds no
+///   distinguishing power because it is a function of the other columns).
+/// * **`ts` is excluded on purpose.** Two rows that differ only in `ts` are
+///   distinct traces (not duplicates); sharing a shard is fine — the `ts`
+///   column in the unique index keeps them apart. Excluding `ts` also keeps
+///   the shard reproducible from columns stored VERBATIM on both backends,
+///   so the V094 legacy backfill computes the identical value without any
+///   timestamp-formatting ambiguity.
+///
+/// The hash is FNV-1a/64 over a NUL-separated concatenation — stable across
+/// processes, machines, and backends (NOT `std`'s randomized `DefaultHasher`),
+/// which is what makes a duplicate arriving on a different node/connection
+/// land in the same shard.
+#[must_use]
+pub fn trace_dedup_shard_key(row: &TraceEventRow) -> i16 {
+    trace_dedup_shard_key_parts(
+        &row.agent_id_hash,
+        &row.trace_id,
+        &row.thought_id,
+        row.event_type.as_str(),
+        row.attempt_index,
+    )
+}
+
+/// #226 — [`trace_dedup_shard_key`] over raw field values.
+///
+/// Split out so the V094 legacy backfill (which reads the columns straight
+/// from the DB, not a [`TraceEventRow`]) computes the byte-identical shard.
+/// A DB-`NULL` `agent_id_hash` maps to the empty string here, matching the
+/// `TraceEventRow` (whose `agent_id_hash` is a non-optional `String`).
+#[must_use]
+pub fn trace_dedup_shard_key_parts(
+    agent_id_hash: &str,
+    trace_id: &str,
+    thought_id: &str,
+    event_type: &str,
+    attempt_index: u32,
+) -> i16 {
+    // FNV-1a/64 constants (FNV_offset_basis / FNV_prime).
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn mix(mut h: u64, bytes: &[u8]) -> u64 {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        // NUL field separator so `("a","b")` and `("ab","")` differ.
+        h ^= u64::from(0u8);
+        h.wrapping_mul(FNV_PRIME)
+    }
+
+    let mut h = FNV_OFFSET;
+    h = mix(h, agent_id_hash.as_bytes());
+    h = mix(h, trace_id.as_bytes());
+    h = mix(h, thought_id.as_bytes());
+    h = mix(h, event_type.as_bytes());
+    h = mix(h, &attempt_index.to_le_bytes());
+
+    // `TRACE_DEDUP_SHARD_COUNT` is a small positive i16, so the modulus
+    // fits an i16 and is always in `[0, TRACE_DEDUP_SHARD_COUNT)`.
+    (h % TRACE_DEDUP_SHARD_COUNT as u64) as i16
+}
+
 /// Best-effort `_:_:_:_` synthetic timestamp helper for tests.
 #[allow(dead_code)]
 fn parse_iso(s: &str) -> DateTime<Utc> {
@@ -782,5 +875,67 @@ mod tests {
         // Historical substitution — same as v0.3.0–v0.3.2 behavior at 2.7.0.
         assert_eq!(call.parent_event_type, ReasoningEventType::LlmCall);
         assert_eq!(call.parent_attempt_index, 0);
+    }
+
+    // ─── #226 — app-level dedup shard (V094) ───────────────────────────
+
+    /// #226 — the shard is deterministic and always in-range. This is
+    /// what makes a duplicate arriving on a different process/connection
+    /// land in the SAME shard and still collide.
+    #[test]
+    fn shard_key_deterministic_and_in_range() {
+        for attempt in 0u32..8 {
+            let a = trace_dedup_shard_key_parts("ah", "tid", "thid", "ACTION_RESULT", attempt);
+            let b = trace_dedup_shard_key_parts("ah", "tid", "thid", "ACTION_RESULT", attempt);
+            assert_eq!(a, b, "same inputs → same shard");
+            assert!(
+                (0..TRACE_DEDUP_SHARD_COUNT).contains(&a),
+                "shard {a} out of [0,{TRACE_DEDUP_SHARD_COUNT})"
+            );
+        }
+    }
+
+    /// #226 — the row wrapper agrees with the parts function byte-for-byte
+    /// (the backfill uses `_parts`, the insert path uses the wrapper; they
+    /// MUST produce the same value or a legacy re-ingest would not dedup).
+    #[test]
+    fn shard_key_wrapper_matches_parts() {
+        let trace = fixture_trace();
+        let d = decompose(&trace).unwrap();
+        for ev in &d.events {
+            let via_row = trace_dedup_shard_key(ev);
+            let via_parts = trace_dedup_shard_key_parts(
+                &ev.agent_id_hash,
+                &ev.trace_id,
+                &ev.thought_id,
+                ev.event_type.as_str(),
+                ev.attempt_index,
+            );
+            assert_eq!(via_row, via_parts, "wrapper vs parts must agree");
+        }
+    }
+
+    /// #226 — the shard spreads inserts across buckets (the whole point:
+    /// concurrent writers fan out across disjoint index subtrees instead of
+    /// one hot page). Over many distinct trace_ids the shard is far from
+    /// constant and covers most of the `TRACE_DEDUP_SHARD_COUNT` range.
+    #[test]
+    fn shard_key_spreads_across_buckets() {
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..2000u32 {
+            seen.insert(trace_dedup_shard_key_parts(
+                "ah",
+                &format!("trace-{i}"),
+                "thid",
+                "ACTION_RESULT",
+                0,
+            ));
+        }
+        assert!(
+            seen.len() > (TRACE_DEDUP_SHARD_COUNT as usize) / 2,
+            "shard must spread across the range, only hit {} of {}",
+            seen.len(),
+            TRACE_DEDUP_SHARD_COUNT
+        );
     }
 }

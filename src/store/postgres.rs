@@ -26,10 +26,14 @@
 //!   natively. Pattern (2) — copy-to-temp-then-insert — is the
 //!   optimization we'll switch to when batches routinely exceed ~100
 //!   rows.
-//! - **Idempotency**: the `trace_events_dedup` UNIQUE index in
-//!   `V001__trace_events.sql` is the conflict target for
-//!   `ON CONFLICT (trace_id, thought_id, event_type, attempt_index, ts)
-//!   DO NOTHING` (mission category §4 "Idempotency").
+//! - **Idempotency**: the sharded `trace_events_dedup_sharded` UNIQUE index
+//!   in `V094__trace_events_dedup_shard.sql` (CIRISPersist#226 — it retired
+//!   the single hot `trace_events_dedup` of V001) is the conflict target for
+//!   `ON CONFLICT (shard_key, agent_id_hash, trace_id, thought_id,
+//!   event_type, attempt_index, ts) DO NOTHING` (mission category §4
+//!   "Idempotency"). `shard_key` is a pure function of the other key
+//!   columns, so it dedups exactly the same rows the V001 index did while
+//!   spreading concurrent inserts across shards.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -143,6 +147,74 @@ pub struct PostgresBackend {
 }
 
 impl PostgresBackend {
+    /// #226 (V094) — assign `shard_key` to legacy `trace_events` rows that
+    /// predate the sharded dedup index (their `shard_key` is `NULL`).
+    ///
+    /// Computes the byte-identical FNV shard the insert path binds
+    /// ([`super::decompose::trace_dedup_shard_key_parts`]) so a
+    /// post-migration re-ingest of the same trace still collides on the
+    /// V094 `trace_events_dedup_sharded` UNIQUE index — dedup semantics are
+    /// preserved across the migration, not just for new rows.
+    ///
+    /// Idempotent + batched. The V094 `trace_events_shard_backfill` partial
+    /// index makes the `WHERE shard_key IS NULL` probe O(1) and empties as
+    /// this runs; every new insert writes a non-`NULL` shard, so after the
+    /// one-time backfill this is a near-free empty-index probe on each boot.
+    /// Runs inside `run_migrations`, BEFORE the engine serves any write.
+    async fn backfill_trace_dedup_shard_keys(&self) -> Result<(), Error> {
+        const BATCH: i64 = 5_000;
+        loop {
+            let mut client = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+            let rows = client
+                .query(
+                    "SELECT event_id, ts, agent_id_hash, trace_id, thought_id, \
+                     event_type, attempt_index \
+                     FROM cirislens.trace_events WHERE shard_key IS NULL LIMIT $1",
+                    &[&BATCH],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("backfill select: {e}")))?;
+            if rows.is_empty() {
+                break;
+            }
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| Error::Backend(format!("begin tx: {e}")))?;
+            for row in &rows {
+                let event_id: i64 = row.safe_get_with(0, Error::Backend)?;
+                let ts: chrono::DateTime<chrono::Utc> = row.safe_get_with(1, Error::Backend)?;
+                let agent_id_hash: Option<String> = row.safe_get_with(2, Error::Backend)?;
+                let trace_id: String = row.safe_get_with(3, Error::Backend)?;
+                let thought_id: String = row.safe_get_with(4, Error::Backend)?;
+                let event_type: String = row.safe_get_with(5, Error::Backend)?;
+                let attempt_index: i32 = row.safe_get_with(6, Error::Backend)?;
+                let shard: i16 = super::decompose::trace_dedup_shard_key_parts(
+                    agent_id_hash.as_deref().unwrap_or(""),
+                    &trace_id,
+                    &thought_id,
+                    &event_type,
+                    u32::try_from(attempt_index).unwrap_or(0),
+                );
+                tx.execute(
+                    "UPDATE cirislens.trace_events SET shard_key = $1 \
+                     WHERE event_id = $2 AND ts = $3",
+                    &[&shard, &event_id, &ts],
+                )
+                .await
+                .map_err(|e| Error::Backend(format!("backfill update: {e}")))?;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| Error::Backend(format!("commit: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// Connect via libpq-style connection string and return a backend
     /// with a configured connection pool.
     ///
@@ -683,8 +755,9 @@ impl Backend for PostgresBackend {
                             agent_role, agent_template, deployment_domain, \
                             deployment_type, deployment_region, deployment_trust_mode, \
                             verification_source, cohort_scope, cohort_target_id, \
-                            signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id";
-        const N_COLS: usize = 39;
+                            signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id, \
+                            shard_key";
+        const N_COLS: usize = 40;
 
         let mut sql = String::with_capacity(2048);
         sql.push_str("INSERT INTO cirislens.trace_events (");
@@ -788,13 +861,21 @@ impl Backend for PostgresBackend {
             params.push(Box::new(row.signature_ml_dsa_65.clone()));
             params.push(Box::new(row.pubkey_ml_dsa_65.clone()));
             params.push(Box::new(row.pqc_key_id.clone()));
+            // #226 — app-level dedup shard (V094). Deterministic FNV over
+            // a subset of the dedup key; a true duplicate computes the same
+            // shard and still collides on the sharded UNIQUE index below.
+            params.push(Box::new(super::decompose::trace_dedup_shard_key(row)));
         }
-        // THREAT_MODEL.md AV-9: dedup-key target now includes
+        // THREAT_MODEL.md AV-9: dedup-key target still includes
         // agent_id_hash so a malicious agent reusing another agent's
         // trace_id/thought_id shape cannot DOS the victim's traces.
-        // Matches the V001 trace_events_dedup UNIQUE index.
+        // #226 (V094): PREFIXED with shard_key so concurrent inserts
+        // spread across 64 disjoint B-tree subtrees instead of one hot
+        // page. shard_key is a pure function of the other key columns, so
+        // this forbids exactly the rows the old 6-column index did.
+        // Matches the V094 trace_events_dedup_sharded UNIQUE index.
         sql.push_str(
-            " ON CONFLICT (agent_id_hash, trace_id, thought_id, \
+            " ON CONFLICT (shard_key, agent_id_hash, trace_id, thought_id, \
              event_type, attempt_index, ts) DO NOTHING",
         );
 
@@ -1131,6 +1212,14 @@ impl Backend for PostgresBackend {
         drop(lock_client);
 
         migration_result?;
+
+        // #226 (V094) — backfill shard_key for legacy rows, before the
+        // engine serves any write. See `backfill_trace_dedup_shard_keys`.
+        // Run on a pooled connection (the lock connection is already
+        // dropped); the UPDATE is idempotent + safe under a concurrent
+        // second worker (a row it sets no longer matches `IS NULL`).
+        self.backfill_trace_dedup_shard_keys().await?;
+
         tracing::info!("ciris-persist: migration phase complete");
         Ok(())
     }

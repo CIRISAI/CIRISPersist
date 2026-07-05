@@ -35,10 +35,11 @@
 //!   `INSERT INTO … VALUES (…), (…), … ON CONFLICT DO NOTHING`. SQLite
 //!   3.24+ supports `ON CONFLICT` clauses; the bundled rusqlite ships a
 //!   recent-enough libsqlite3.
-//! - **Idempotency**: the `trace_events_dedup` UNIQUE index in
-//!   `V001__trace_events.sql` is the conflict target — same shape as
-//!   the postgres index (THREAT_MODEL.md AV-9, includes
-//!   `agent_id_hash`).
+//! - **Idempotency**: the sharded `trace_events_dedup_sharded` UNIQUE index
+//!   in `V094__trace_events_dedup_shard.sql` (CIRISPersist#226) is the
+//!   conflict target — same shape as the postgres index (THREAT_MODEL.md
+//!   AV-9, includes `agent_id_hash`; #226 prefixes `shard_key`, a pure
+//!   function of the key, to spread concurrent inserts across shards).
 #![allow(clippy::redundant_closure_call)]
 // v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
 // tokio::task::spawn_blocking sites uses (closure)() to invoke
@@ -447,13 +448,14 @@ impl Backend for SqliteBackend {
                 agent_role, agent_template, deployment_domain, \
                 deployment_type, deployment_region, deployment_trust_mode, \
                 verification_source, cohort_scope, cohort_target_id, \
-                signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id\
+                signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id, \
+                shard_key\
                 ) VALUES (\
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
-                ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39\
-                ) ON CONFLICT (agent_id_hash, trace_id, thought_id, event_type, \
-                attempt_index, ts) DO NOTHING";
+                ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40\
+                ) ON CONFLICT (shard_key, agent_id_hash, trace_id, thought_id, \
+                event_type, attempt_index, ts) DO NOTHING";
 
             {
                 let mut stmt = tx.prepare(SQL)?;
@@ -491,8 +493,12 @@ impl Backend for SqliteBackend {
                             })?;
 
                     let attempt_index_i64 = i64::from(row.attempt_index);
+                    // #226 — app-level dedup shard (V094). Same FNV the
+                    // postgres path binds; a true duplicate maps to the same
+                    // shard and still collides on the sharded UNIQUE index.
+                    let shard_key = i64::from(super::decompose::trace_dedup_shard_key(row));
 
-                    let params: [SqlValue; 39] = [
+                    let params: [SqlValue; 40] = [
                         SqlValue::Text(row.trace_id.clone()),
                         SqlValue::Text(row.thought_id.clone()),
                         opt_text(row.task_id.as_deref()),
@@ -546,6 +552,8 @@ impl Backend for SqliteBackend {
                         opt_text(row.signature_ml_dsa_65.as_deref()),
                         opt_text(row.pubkey_ml_dsa_65.as_deref()),
                         opt_text(row.pqc_key_id.as_deref()),
+                        // #226 — shard_key (V094).
+                        SqlValue::Integer(shard_key),
                     ];
 
                     let n = stmt.execute(params_from_iter(params.iter()))?;
@@ -730,6 +738,10 @@ impl Backend for SqliteBackend {
             sqlstate: None,
             detail: format!("sqlite migrations: {e}"),
         })?;
+
+        // #226 (V094) — backfill shard_key for legacy rows, before the
+        // engine serves any write. See `backfill_trace_dedup_shard_keys`.
+        self.backfill_trace_dedup_shard_keys().await?;
         Ok(())
     }
 
@@ -1547,6 +1559,79 @@ struct RawAggregationRow {
 // JSONB→serde_json::Value decode. Wire shape matches PG byte-for-byte.
 
 impl SqliteBackend {
+    /// #226 (V094) — assign `shard_key` to legacy `trace_events` rows that
+    /// predate the sharded dedup index (their `shard_key` is `NULL`).
+    ///
+    /// Computes the byte-identical FNV shard the insert path binds
+    /// ([`super::decompose::trace_dedup_shard_key_parts`]) so a
+    /// post-migration re-ingest of the same trace still collides on the
+    /// V094 `trace_events_dedup_sharded` UNIQUE index — dedup semantics are
+    /// preserved across the migration, not just for new rows.
+    ///
+    /// Idempotent + batched. The V094 `trace_events_shard_backfill` partial
+    /// index makes the `WHERE shard_key IS NULL` probe O(1) and empties as
+    /// this runs; every new insert writes a non-`NULL` shard, so after the
+    /// one-time backfill this is a near-free empty-index probe on each boot.
+    /// Runs inside `run_migrations`, BEFORE the engine serves any write.
+    async fn backfill_trace_dedup_shard_keys(&self) -> Result<(), Error> {
+        const BATCH: i64 = 5_000;
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let mut conn = conn.lock();
+            loop {
+                // Collect a batch of rows still needing a shard.
+                let batch: Vec<(i64, Option<String>, String, String, String, i64)> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, agent_id_hash, trace_id, thought_id, \
+                         event_type, attempt_index \
+                         FROM trace_events WHERE shard_key IS NULL LIMIT ?1",
+                    )?;
+                    let rows = stmt.query_map([BATCH], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, i64>(5)?,
+                        ))
+                    })?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                if batch.is_empty() {
+                    break;
+                }
+                let tx = conn.transaction()?;
+                {
+                    let mut up =
+                        tx.prepare("UPDATE trace_events SET shard_key = ?1 WHERE event_id = ?2")?;
+                    for (
+                        event_id,
+                        agent_id_hash,
+                        trace_id,
+                        thought_id,
+                        event_type,
+                        attempt_index,
+                    ) in &batch
+                    {
+                        let shard = i64::from(super::decompose::trace_dedup_shard_key_parts(
+                            agent_id_hash.as_deref().unwrap_or(""),
+                            trace_id,
+                            thought_id,
+                            event_type,
+                            u32::try_from(*attempt_index).unwrap_or(0),
+                        ));
+                        up.execute(rusqlite::params![shard, event_id])?;
+                    }
+                }
+                tx.commit()?;
+            }
+            Ok(())
+        })()
+        .map_err(|e| Error::Backend(format!("backfill trace shard_key: {e}")))?;
+        Ok(())
+    }
+
     /// v8.0.0 (CIRISPersist#227) — read the `content_manifest` row for
     /// `(content_id, corpus_kind)` back into a
     /// [`FountainManifestV1`](crate::fountain::FountainManifestV1).
