@@ -716,6 +716,38 @@ pub struct KeyRecord {
     /// stays byte-stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consent_role: Option<String>,
+    /// v13.2.0 (CIRISPersist#383 / CIRISVerify#174) — the **2nd..Nth anchor
+    /// scrub signatures** over the SAME canonical `registration_envelope`
+    /// (scrub #1 is the base `scrub_key_id`/`scrub_signature_*` fields above).
+    /// Empty for an ordinary / single-scrub record → serializes away entirely
+    /// (`skip_serializing_if`), so the record stays **byte-identical** to the
+    /// pre-#383 shape and cannot perturb `compute_persist_row_hash` (which
+    /// excludes it — see there). The `canonical` role is conferred only on a
+    /// record whose scrub set has **≥2 distinct anchor holders with valid
+    /// signatures** (`check_canonical_role_admission`), the 2-of-3 add gate.
+    /// `root_binding` still roots via **any one** scrub. Wire-identical to
+    /// `ciris_verify_core::federation_self_record::KeyRecord::additional_scrubs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_scrubs: Vec<ScrubSig>,
+}
+
+/// v13.2.0 (CIRISPersist#383 / CIRISVerify#174) — a single anchor-holder
+/// scrub signature over a canonical `registration_envelope`, the shape of an
+/// entry in [`KeyRecord::additional_scrubs`]. Every scrub on a record is over
+/// the **same** canonical bytes; the scrub *set* lives OUTSIDE the signed
+/// envelope, so a 1-scrub and a 2-scrub record of the same target canonicalize
+/// identically. Wire-identical to `ciris_verify_core`'s `ScrubSig`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrubSig {
+    /// The anchor holder (A1/B1/C1) whose key produced this scrub. Must resolve
+    /// to a registered `federation_keys` row; the scrub verifies against its
+    /// pinned pubkeys over `JCS(registration_envelope)`.
+    pub scrub_key_id: String,
+    /// Base64 `Ed25519.sign(JCS(registration_envelope))`.
+    pub scrub_signature_classical: String,
+    /// Base64 `ML-DSA-65.sign(JCS(registration_envelope) ‖ ed25519_sig)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
 }
 
 /// A single **transport reachability hint** carried INSIDE a
@@ -756,6 +788,38 @@ impl KeyRecord {
             .get("transport_hints")
             .and_then(|v| serde_json::from_value::<Vec<TransportHint>>(v.clone()).ok())
             .unwrap_or_default()
+    }
+
+    /// v13.2.0 (CIRISPersist#383) — the **full ordered scrub set**: scrub #1
+    /// reconstructed from the base `scrub_key_id`/`scrub_signature_*` fields,
+    /// followed by every [`Self::additional_scrubs`] entry. Each is a signature
+    /// over the SAME canonical `registration_envelope` bytes. This is the set
+    /// `root_binding` roots (via any one) / `check_canonical_role_admission`
+    /// confers `canonical` on (≥2 distinct anchor holders, sigs verified).
+    /// Wire-identical to `ciris_verify_core`'s `KeyRecord::scrubs`.
+    pub fn scrubs(&self) -> Vec<ScrubSig> {
+        let mut out = Vec::with_capacity(1 + self.additional_scrubs.len());
+        out.push(ScrubSig {
+            scrub_key_id: self.scrub_key_id.clone(),
+            scrub_signature_classical: self.scrub_signature_classical.clone(),
+            scrub_signature_pqc: self.scrub_signature_pqc.clone(),
+        });
+        out.extend(self.additional_scrubs.iter().cloned());
+        out
+    }
+
+    /// v13.2.0 (CIRISPersist#383) — count of **distinct** `scrub_key_id`s across
+    /// the whole scrub set (a coarse pre-check; the admission gate additionally
+    /// requires each counted scrub to be a pinned anchor holder with a VALID
+    /// signature). Excludes nothing — a self-scrub (`scrub_key_id == key_id`)
+    /// counts here but is rejected by the gate (self cannot confer `canonical`).
+    pub fn distinct_scrub_count(&self) -> usize {
+        let mut ids = std::collections::BTreeSet::new();
+        ids.insert(self.scrub_key_id.as_str());
+        for s in &self.additional_scrubs {
+            ids.insert(s.scrub_key_id.as_str());
+        }
+        ids.len()
     }
 
     /// True iff both PQC components have been attached. Consumers
