@@ -5,6 +5,52 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.2.0] — 2026-07-05 — 2-of-3 canonical add + accord m-of-n hardening
+
+Closes the first-strike hole in the founding trust anchor: **canonical add is now
+m-of-n on the accord family**, not 1-of-N. verify re-pinned **v8.8.0 → v8.9.0**
+(CIRISVerify#174 multi-scrub producer). `Requires-Dist ciris-verify>=8.0.0,<9`
+unchanged. Migration V096.
+
+### ⚠ BREAKING (behavioral — canonical trust plane)
+- **The 1-of-N canonical genesis seed (`ciris-canonical-1-…`, v13.1.0 #380) is
+  REMOVED.** A single A1 scrub conferring the founding anchor is a first-strike
+  weakness; a fresh node now ships with an **empty canonical set** until the
+  operator bakes a 2-of-3 (multi-scrub) genesis record in a later release. The
+  accord-holder (A1/B1/C1) rooting seed is unchanged.
+- **`check_canonical_role_admission` now requires ≥ a strict majority of the
+  accord family** (`verify_quorum_policy`, 2-of-3 today), each scrub
+  cryptographically verified — was single-`scrub_key_id ∈ anchor` membership.
+  A single-scrub `canonical` record is refused.
+
+### Added / Changed
+- **#383** — **2-of-3 multi-scrub canonical add.** `KeyRecord` gains additive
+  `additional_scrubs: Vec<ScrubSig>` (scrub #1 in the base fields; empty
+  serializes away → byte-identical to pre-#383; V096 column, wire-identical to
+  `ciris_verify_core` v8.9.0). The gate resolves the **live** accord roster as
+  `Role::Founder` `ThresholdMember`s, derives `QuorumPolicy::new(n/2+1, n)`
+  (strict majority — 2-of-3 now, 3-of-4 if the family grows), and calls
+  `verify_quorum_policy` over `JCS(registration_envelope)` — non-forgeable (a
+  claimed-but-unsigned scrub does not count), dynamic, no hardcoded threshold.
+  Composes with #377 (a withdrawn key stays refused; revocation-wins) and #375.
+  `root_binding` unchanged (roots via any one scrub — recognition ≠ conferral).
+- **#377** (follow-up) — **withdraw/supersede threshold derived from the live
+  accord roster** (strict majority via `QuorumPolicy`), replacing the hardcoded
+  `2/3` consts. Every capability-granting canonical op is now m-of-n on the
+  family, using verify's primitive (operator directive: never hardcode a quorum).
+- **#378** (CC 3.2 rc2) — **single-owner surface over the Engine FFI**:
+  `delegation_purpose:owner_binding` arg on `grant_delegation`/`steward_bind`,
+  `owner_of`/`owner_of_json` (purpose-filtered ≤1), reject-2nd-distinct-owner
+  (idempotent same-owner). The v12.6.0 admission gate was correct but
+  FFI-undrivable; this exposes it.
+- **#379** (CC 3.4.8) — **`detection:*` prefix-wildcard** reserved in
+  `default_reserved_prefix_rules()`: any novel `detection:{newkind}:*` from a
+  non-`lenscore_detector` key is refused by construction; `truth_grounding:detection:*`
+  cross-attestations stay ungated.
+
+Full suite green: **1427 pg+sqlite+memory lib + integration, 0 failed** (fresh DB).
+Consumer: CIRISServer (canonical add flips 1-of-N → 2-of-3; propose/cosign path).
+
 ## [13.1.0] — 2026-07-05 — canonical-mesh genesis bundle
 
 The canonical-server mesh seed (trust + reachability) plus the destructive

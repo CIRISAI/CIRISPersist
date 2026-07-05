@@ -2040,6 +2040,7 @@ impl Engine {
             roles,
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         let signed = crate::federation::SignedKeyRecord { record };
 
@@ -2395,6 +2396,17 @@ impl Engine {
     /// steward-less and
     /// [`is_steward_bound`](crate::federation::admission::is_steward_bound)
     /// fails secure (`false`).
+    ///
+    /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2 single-owner) — `delegation_purpose`
+    /// marks the edge's ownership sub-relation. `Some(`[`owner_binding::PURPOSE`](crate::federation::types::owner_binding::PURPOSE)`)`
+    /// (`"responsible_for"`) builds an **owner-binding** via
+    /// [`owner_binding_delegates_to_envelope`](crate::federation::owner_binding_delegates_to_envelope)
+    /// — the single-valued `delegates_to(user → node)` that names the node's one
+    /// responsible steward and is admitted through the single-owner gate
+    /// ([`check_single_node_owner_admission`](crate::federation::admission::check_single_node_owner_admission)):
+    /// a second DISTINCT owner is rejected. `None` (the default) builds the
+    /// general multi-parent `delegates_to` and is untouched by the gate. Any
+    /// other purpose value is treated as a general delegation.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn grant_delegation(
         &self,
@@ -2402,9 +2414,17 @@ impl Engine {
         delegate_key_id: &str,
         scopes: Vec<String>,
         sub_delegation: bool,
+        delegation_purpose: Option<&str>,
     ) -> Result<String, crate::federation::Error> {
-        let envelope =
-            crate::federation::delegates_to_envelope(delegate_key_id, &scopes, sub_delegation);
+        let envelope = match delegation_purpose {
+            // The owner-binding sub-relation (CC 3.2): single-valued ownership,
+            // gated by check_single_node_owner_admission. `sub_delegation` is
+            // ignored (an owner-binding is a leaf, never a deputization).
+            Some(p) if p == crate::federation::types::owner_binding::PURPOSE => {
+                crate::federation::owner_binding_delegates_to_envelope(delegate_key_id, &scopes)
+            }
+            _ => crate::federation::delegates_to_envelope(delegate_key_id, &scopes, sub_delegation),
+        };
         let mut input = crate::federation::EmitAttestationInput::with_envelope(
             crate::federation::types::attestation_type::DELEGATES_TO,
             envelope,
@@ -2433,6 +2453,14 @@ impl Engine {
     /// recipient is a node key. The steward-binding this writes is exactly the
     /// `delegates_to(U → k)` edge [`is_steward_bound`] reads.
     ///
+    /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2) — pass
+    /// `delegation_purpose = Some(`[`owner_binding::PURPOSE`](crate::federation::types::owner_binding::PURPOSE)`)`
+    /// to make this steward-binding the node's single-valued **owner-binding**
+    /// (`infra:*`-only scope IS the owner-binding shape). It is then subject to
+    /// the single-owner admission gate (a second distinct owner rejects) and
+    /// resolvable via [`owner_of`](Self::owner_of). `None` (default) is a plain
+    /// steward-binding.
+    ///
     /// [`is_steward_bound`]: crate::federation::admission::is_steward_bound
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn steward_bind(
@@ -2440,9 +2468,16 @@ impl Engine {
         signer: &crate::signing::LocalSigner,
         node_or_agent_key_id: &str,
         infra_scopes: Vec<String>,
+        delegation_purpose: Option<&str>,
     ) -> Result<String, crate::federation::Error> {
-        self.grant_delegation(signer, node_or_agent_key_id, infra_scopes, false)
-            .await
+        self.grant_delegation(
+            signer,
+            node_or_agent_key_id,
+            infra_scopes,
+            false,
+            delegation_purpose,
+        )
+        .await
     }
 
     /// v9.3.0 (CIRISPersist#249, CEG §11.10/§11.11 appointment) — appoint
@@ -2479,7 +2514,7 @@ impl Engine {
         // the community's authority roots, not by a field match. Bind it in
         // the debug log so the appointment is traceable.
         let _ = community_id;
-        self.grant_delegation(signer, moderator_key_id, vec![duty.to_owned()], true)
+        self.grant_delegation(signer, moderator_key_id, vec![duty.to_owned()], true, None)
             .await
     }
 
@@ -3801,6 +3836,27 @@ impl Engine {
         .await
     }
 
+    /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2 single-owner) — the **single
+    /// responsible owner** of `node_key_id`, purpose-filtered to the
+    /// owner-binding sub-relation → **at most one** (`Some(owner)`), or `None`
+    /// when the node is unowned. This is the resolver consumers MUST use for
+    /// "who owns this node" — NEVER the purpose-conflating
+    /// [`steward_bindings_of`](Self::steward_bindings_of) /
+    /// [`delegations_to`](Self::delegations_to) readers, which return every
+    /// `delegates_to` granter (cardinality > 1, the anti-pattern CC 3.2
+    /// forbids). A pre-gate ambiguous state (two live owners from before the
+    /// single-owner gate) resolves **fail-closed** with
+    /// [`Error::AmbiguousNodeOwner`](crate::federation::Error::AmbiguousNodeOwner).
+    /// See [`admission::owner_of`](crate::federation::admission::owner_of).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn owner_of(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Option<String>, crate::federation::Error> {
+        crate::federation::admission::owner_of(self.federation_directory().as_ref(), node_key_id)
+            .await
+    }
+
     /// #249 Cut B — inbound `delegates_to` edges naming `key_id` as
     /// recipient. See
     /// [`FederationDirectory::delegations_to`](crate::federation::FederationDirectory::delegations_to).
@@ -4073,9 +4129,10 @@ impl Engine {
     /// accord-holder roster (A1/B1/C1) at the **2-of-3 destructive threshold** —
     /// never a caller-supplied `AccordDecision.authorized` bool (which is
     /// unauthenticated and forgeable) — before recording the tombstone
-    /// (verify-before-mutation, AV-9). Asymmetric by design: a single accord
-    /// holder may ADD a canonical (1-of-N anchor-scrub conferral) but NOT
-    /// withdraw one (needs the 2-of-3 family quorum). Idempotent. After this,
+    /// (verify-before-mutation, AV-9). Symmetric m-of-n by design (v13.2.0 /
+    /// CIRISPersist#383): ADD now also requires ≥2-of-3 accord co-scrubs (the
+    /// 1-of-N add path was retired as a first-strike weakness), and WITHDRAW
+    /// keeps the 2-of-3 family quorum. Idempotent. After this,
     /// [`is_canonical`](Self::is_canonical) reads `false`.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn withdraw_canonical_role(
@@ -4895,15 +4952,14 @@ async fn build_backend(dsn: &str) -> Result<BackendDispatch, EngineError> {
             crate::federation::genesis::verify_anchor_seeded(&pg)
                 .await
                 .map_err(EngineError::GenesisSeed)?;
-            // v13.1.0 (CIRISPersist#380) — bake the A1-conferred canonical
-            // genesis server. Runs AFTER the accord seed so the canonical
-            // admission gate resolves A1 live. Idempotent + fail-secure.
-            crate::federation::genesis::seed_canonical_servers(&pg)
-                .await
-                .map_err(EngineError::GenesisSeed)?;
-            crate::federation::genesis::verify_canonical_seeded(&pg)
-                .await
-                .map_err(EngineError::GenesisSeed)?;
+            // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
+            // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
+            // REMOVED: a single-anchor founding record is a first-strike
+            // weakness (one captured accord key mints a rogue canonical). Now
+            // that canonical ADD requires ≥2 distinct anchor scrubs (2-of-3),
+            // a fresh node ships with an EMPTY canonical set until the operator
+            // bakes the 2-of-3 replacement. The accord-holder rooting anchor
+            // (A1/B1/C1) above is untouched.
             Ok(BackendDispatch::Postgres(Arc::new(pg)))
         }
         #[cfg(not(feature = "postgres"))]
@@ -4943,15 +4999,14 @@ async fn build_backend(dsn: &str) -> Result<BackendDispatch, EngineError> {
             crate::federation::genesis::verify_anchor_seeded(&sq)
                 .await
                 .map_err(EngineError::GenesisSeed)?;
-            // v13.1.0 (CIRISPersist#380) — bake the A1-conferred canonical
-            // genesis server. Runs AFTER the accord seed so the canonical
-            // admission gate resolves A1 live. Idempotent + fail-secure.
-            crate::federation::genesis::seed_canonical_servers(&sq)
-                .await
-                .map_err(EngineError::GenesisSeed)?;
-            crate::federation::genesis::verify_canonical_seeded(&sq)
-                .await
-                .map_err(EngineError::GenesisSeed)?;
+            // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
+            // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
+            // REMOVED: a single-anchor founding record is a first-strike
+            // weakness (one captured accord key mints a rogue canonical). Now
+            // that canonical ADD requires ≥2 distinct anchor scrubs (2-of-3),
+            // a fresh node ships with an EMPTY canonical set until the operator
+            // bakes the 2-of-3 replacement. The accord-holder rooting anchor
+            // (A1/B1/C1) above is untouched.
             Ok(BackendDispatch::Sqlite(Arc::new(sq)))
         }
         #[cfg(not(feature = "sqlite"))]
@@ -5138,74 +5193,6 @@ mod tests {
             .await
             .expect("sign");
         assert_eq!(sig.len(), 64);
-    }
-
-    /// v13.1.0 (CIRISPersist#380) — a FRESH engine auto-loads the baked
-    /// canonical genesis server, exactly as it auto-seeds the accord family:
-    /// no manual seed call, `is_canonical` is true and `list_canonical_servers`
-    /// returns `ciris-canonical-1-…` straight out of `Engine::with_signer`.
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn fresh_engine_auto_loads_canonical_genesis_seed() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("construct engine");
-        let node = &crate::federation::genesis::canonical_genesis_records()[0].record;
-        assert!(
-            engine
-                .is_canonical(&node.key_id)
-                .await
-                .expect("is_canonical"),
-            "fresh engine must recognize the baked canonical server {}",
-            node.key_id
-        );
-        let listed = engine.list_canonical_servers().await.expect("list");
-        assert!(
-            listed.iter().any(|r| r.key_id == node.key_id),
-            "list_canonical_servers must include the baked {}",
-            node.key_id
-        );
-    }
-
-    /// v13.1.0 (CIRISPersist#381) — `canonical_bootstrap_hints` surfaces the
-    /// accord-attested `transport_hints` embedded in a canonical server's
-    /// signed envelope, paired with its key_id — the zero-config bootstrap
-    /// dial set. A canonical record carrying an `ip` hint in its envelope is
-    /// admitted (A1-conferred) and its hint appears; the baked hintless
-    /// genesis record contributes nothing.
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn canonical_bootstrap_hints_surface_envelope_transport() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("construct engine");
-
-        // Clone the baked canonical record, give it a distinct key_id and an
-        // `ip` transport hint in its (still A1-scrubbed) envelope, and admit
-        // it through the canonical gate (scrub_key_id = A1 ∈ anchor).
-        let mut hinted = crate::federation::genesis::canonical_genesis_records()[0]
-            .record
-            .clone();
-        hinted.key_id = "ciris-canonical-2-hinted".into();
-        hinted.identity_ref = hinted.key_id.clone();
-        if let Some(env) = hinted.registration_envelope.as_object_mut() {
-            env.insert(
-                "transport_hints".into(),
-                serde_json::json!([{ "kind": "ip", "destination": "108.61.242.236:4242" }]),
-            );
-        }
-        engine
-            .federation_directory()
-            .put_public_key(crate::federation::SignedKeyRecord { record: hinted })
-            .await
-            .expect("admit hinted canonical");
-
-        let hints = engine.canonical_bootstrap_hints().await.expect("hints");
-        let ip = hints
-            .iter()
-            .find(|(kid, h)| kid == "ciris-canonical-2-hinted" && h.kind == "ip")
-            .expect("ip bootstrap hint present");
-        assert_eq!(ip.1.destination, "108.61.242.236:4242");
     }
 
     #[cfg(feature = "sqlite")]
@@ -6380,6 +6367,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         sq.put_public_key(SignedKeyRecord {
             record: suspect_key,
@@ -6735,6 +6723,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         pg.put_public_key(SignedKeyRecord { record: suspect })
             .await
@@ -7398,6 +7387,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         pg.put_public_key(crate::federation::SignedKeyRecord { record: key_record })
             .await
@@ -7489,6 +7479,7 @@ mod tests {
                 roles: Vec::new(),
                 attestation_evidence: None,
                 consent_role: None,
+                additional_scrubs: Vec::new(),
             },
         }
     }
@@ -8637,6 +8628,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         sq.put_public_key(SignedKeyRecord { record }).await.unwrap();
     }
@@ -8806,6 +8798,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         pg.put_public_key(SignedKeyRecord { record }).await.unwrap();
 
@@ -9244,6 +9237,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         sq.put_public_key(SignedKeyRecord { record })
             .await
@@ -9424,6 +9418,7 @@ mod tests {
                 "delegate",
                 vec!["message_io".into(), "review".into()],
                 true,
+                None,
             )
             .await
             .expect("grant_delegation");
@@ -9475,6 +9470,7 @@ mod tests {
                     delegation_scope::INFRA_NETWORK_PRESENCE.into(),
                     delegation_scope::INFRA_SERVE.into(),
                 ],
+                None,
             )
             .await
             .expect("steward_bind infra:* admitted on node key");
@@ -9502,6 +9498,7 @@ mod tests {
                 "node-1",
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
+                None,
             )
             .await
             .unwrap_err();
@@ -9767,6 +9764,7 @@ mod tests {
                 "mg-ward",
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
+                None,
             )
             .await
             .expect_err("an unproven granter cannot steward a minor");
@@ -9797,6 +9795,7 @@ mod tests {
                 "mg-ward",
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
+                None,
             )
             .await
             .expect("adult-user → proven-minor guardianship is ADMITTED (CC 3.2)");
@@ -9833,6 +9832,7 @@ mod tests {
                 "mg-unverified",
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
+                None,
             )
             .await
             .expect_err("an unverified user target stays rejected");
@@ -9917,6 +9917,7 @@ mod tests {
                 &ward,
                 vec![delegation_scope::AGENCY_ACT_ON_BEHALF.into()],
                 false,
+                None,
             )
             .await
             .expect("guardianship admitted on postgres");
@@ -9933,6 +9934,250 @@ mod tests {
             "withdrawn guardianship leaves the minor steward-less (fail-secure)",
         );
         assert!(steward_bindings_of(&**pg, &ward).await.unwrap().is_empty());
+    }
+
+    // ── v13.2.0 (CIRISPersist#378, CC 3.2 rc2 single-owner) ──────────────
+    // The owner-binding sub-relation over the REAL emit path
+    // (`steward_bind(.., Some(owner_binding::PURPOSE))`) + `owner_of`: the
+    // purpose arg round-trips onto the wire, a second DISTINCT owner is
+    // rejected at bind time (idempotent same-owner), and `owner_of` is
+    // purpose-filtered → ≤1 (an unrelated general delegation does not count).
+
+    /// #378 (sqlite) — `steward_bind(node, infra, Some("responsible_for"))`
+    /// stamps the owner-binding wire shape, `owner_of` resolves the single
+    /// owner, a second distinct owner rejects (`NodeAlreadyOwned`), a
+    /// same-owner refresh is idempotent, a general (non-ownership) delegation
+    /// does NOT count toward `owner_of`, and an unbound node is `None`.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn owner_binding_single_owner_end_to_end_sqlite() {
+        use crate::federation::types::{delegation_scope, owner_binding};
+        use crate::federation::FederationDirectory;
+
+        let o1_signer = crate::federation::tier_ingest::test_support::local_signer("ob-owner1");
+        let o2_signer = crate::federation::tier_ingest::test_support::local_signer("ob-owner2");
+        let o1 = o1_signer.derived_key_id();
+        let o2 = o2_signer.derived_key_id();
+        let engine = Engine::with_signer(o1_signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        // Two user-role would-be owners + a node-only key (owner-binding is
+        // infra:*-only, so it passes the node-agency gate on a node key).
+        sq.put_public_key(user_test_key_derived_for(&o1, "ob-owner1"))
+            .await
+            .expect("seed owner1");
+        sq.put_public_key(user_test_key_derived_for(&o2, "ob-owner2"))
+            .await
+            .expect("seed owner2");
+        let mut node = sweeper_test_key("ob-node");
+        node.record.identity_type = crate::federation::types::identity_type::NODE.into();
+        sq.put_public_key(node).await.expect("seed node");
+        let infra = vec![
+            delegation_scope::INFRA_SERVE.into(),
+            delegation_scope::INFRA_NETWORK_PRESENCE.into(),
+        ];
+
+        // First owner-binding admits; the purpose arg rides the wire.
+        let att_id = engine
+            .steward_bind(
+                &o1_signer,
+                "ob-node",
+                infra.clone(),
+                Some(owner_binding::PURPOSE),
+            )
+            .await
+            .expect("first owner-binding admits");
+        let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            row.attestation_envelope["dimension"],
+            owner_binding::DIMENSION,
+            "owner-binding carries the ownership dimension",
+        );
+        assert_eq!(
+            row.attestation_envelope["delegation_purpose"],
+            owner_binding::PURPOSE,
+            "owner-binding carries the producer-side purpose marker",
+        );
+        assert_eq!(
+            engine.owner_of("ob-node").await.unwrap(),
+            Some(o1.clone()),
+            "owner_of resolves the single owner",
+        );
+
+        // A second, DISTINCT owner is rejected at bind time (no trace).
+        let err = engine
+            .steward_bind(
+                &o2_signer,
+                "ob-node",
+                infra.clone(),
+                Some(owner_binding::PURPOSE),
+            )
+            .await
+            .expect_err("a second distinct owner is rejected");
+        assert_eq!(err.kind(), "federation_node_already_owned");
+        match err {
+            crate::federation::Error::NodeAlreadyOwned {
+                ref node_key_id,
+                ref incumbent_owner,
+                ref attempted_owner,
+            } => {
+                assert_eq!(node_key_id, "ob-node");
+                assert_eq!(incumbent_owner, &o1);
+                assert_eq!(attempted_owner, &o2);
+            }
+            other => panic!("expected NodeAlreadyOwned, got {other:?}"),
+        }
+        assert_eq!(
+            engine.owner_of("ob-node").await.unwrap(),
+            Some(o1.clone()),
+            "the rejected second owner left the owner unchanged",
+        );
+
+        // A refresh by the SAME owner is idempotently admitted.
+        engine
+            .steward_bind(
+                &o1_signer,
+                "ob-node",
+                infra.clone(),
+                Some(owner_binding::PURPOSE),
+            )
+            .await
+            .expect("same-owner refresh is idempotent");
+        assert_eq!(engine.owner_of("ob-node").await.unwrap(), Some(o1.clone()));
+
+        // A general (non-ownership) delegation from a DIFFERENT user is
+        // admitted (it never claims ownership) but does NOT count toward
+        // owner_of — the purpose filter keeps ownership single-valued.
+        engine
+            .steward_bind(&o2_signer, "ob-node", infra.clone(), None)
+            .await
+            .expect("a plain steward-binding is not an owner-binding");
+        assert_eq!(
+            engine.owner_of("ob-node").await.unwrap(),
+            Some(o1.clone()),
+            "owner_of ignores the general delegation (purpose-filtered ≤1)",
+        );
+
+        // An unbound node reads as unowned.
+        let mut node2 = sweeper_test_key("ob-node2");
+        node2.record.identity_type = crate::federation::types::identity_type::NODE.into();
+        sq.put_public_key(node2).await.expect("seed node2");
+        assert_eq!(engine.owner_of("ob-node2").await.unwrap(), None);
+    }
+
+    /// #378 PG twin of [`owner_binding_single_owner_end_to_end_sqlite`] — the
+    /// same owner-binding / single-owner-gate / purpose-filtered `owner_of`
+    /// arc over the live Postgres gates. Skips when `CIRIS_PERSIST_TEST_PG_URL`
+    /// is unset.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn owner_binding_single_owner_end_to_end_postgres() {
+        use crate::federation::types::{delegation_scope, owner_binding};
+        use crate::federation::FederationDirectory;
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let o1_label = format!("ob-o1-{run}");
+        let o2_label = format!("ob-o2-{run}");
+        let node_label = format!("ob-node-{run}");
+        let node2_label = format!("ob-node2-{run}");
+        let o1_signer = crate::federation::tier_ingest::test_support::local_signer(&o1_label);
+        let o2_signer = crate::federation::tier_ingest::test_support::local_signer(&o2_label);
+        let o1 = o1_signer.derived_key_id();
+        let o2 = o2_signer.derived_key_id();
+        let engine = Engine::with_signer(o1_signer.clone(), &dsn)
+            .await
+            .expect("pg engine");
+        let pg = engine.postgres_backend().expect("pg backend");
+        pg.put_public_key(user_test_key_derived_for(&o1, &o1_label))
+            .await
+            .expect("seed owner1");
+        pg.put_public_key(user_test_key_derived_for(&o2, &o2_label))
+            .await
+            .expect("seed owner2");
+        let mut node = sweeper_test_key(&node_label);
+        node.record.identity_type = crate::federation::types::identity_type::NODE.into();
+        pg.put_public_key(node).await.expect("seed node");
+        let infra = vec![
+            delegation_scope::INFRA_SERVE.into(),
+            delegation_scope::INFRA_NETWORK_PRESENCE.into(),
+        ];
+
+        // First owner-binding admits; purpose rides the wire; owner_of == o1.
+        let att_id = engine
+            .steward_bind(
+                &o1_signer,
+                &node_label,
+                infra.clone(),
+                Some(owner_binding::PURPOSE),
+            )
+            .await
+            .expect("first owner-binding admits");
+        let row = pg.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            row.attestation_envelope["dimension"],
+            owner_binding::DIMENSION
+        );
+        assert_eq!(
+            row.attestation_envelope["delegation_purpose"],
+            owner_binding::PURPOSE
+        );
+        assert_eq!(
+            engine.owner_of(&node_label).await.unwrap(),
+            Some(o1.clone())
+        );
+
+        // Second distinct owner rejected; owner unchanged.
+        let err = engine
+            .steward_bind(
+                &o2_signer,
+                &node_label,
+                infra.clone(),
+                Some(owner_binding::PURPOSE),
+            )
+            .await
+            .expect_err("a second distinct owner is rejected");
+        assert_eq!(err.kind(), "federation_node_already_owned");
+        assert_eq!(
+            engine.owner_of(&node_label).await.unwrap(),
+            Some(o1.clone())
+        );
+
+        // Same-owner refresh idempotent.
+        engine
+            .steward_bind(
+                &o1_signer,
+                &node_label,
+                infra.clone(),
+                Some(owner_binding::PURPOSE),
+            )
+            .await
+            .expect("same-owner refresh is idempotent");
+        assert_eq!(
+            engine.owner_of(&node_label).await.unwrap(),
+            Some(o1.clone())
+        );
+
+        // A general delegation from a different user does not count.
+        engine
+            .steward_bind(&o2_signer, &node_label, infra.clone(), None)
+            .await
+            .expect("a plain steward-binding is not an owner-binding");
+        assert_eq!(
+            engine.owner_of(&node_label).await.unwrap(),
+            Some(o1.clone())
+        );
+
+        // Unbound node → None.
+        let mut node2 = sweeper_test_key(&node2_label);
+        node2.record.identity_type = crate::federation::types::identity_type::NODE.into();
+        pg.put_public_key(node2).await.expect("seed node2");
+        assert_eq!(engine.owner_of(&node2_label).await.unwrap(), None);
     }
 
     /// #249 — the add_moderator ↔ is_named_moderator round-trip: an
@@ -11328,6 +11573,7 @@ mod tests {
                 roles: Vec::new(),
                 attestation_evidence: None,
                 consent_role: None,
+                additional_scrubs: Vec::new(),
             },
         })
         .await

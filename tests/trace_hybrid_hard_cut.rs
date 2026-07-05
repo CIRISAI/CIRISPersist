@@ -71,6 +71,7 @@ async fn register_producer<D: FederationDirectory>(dir: &D, key_id: &str, ed_pk_
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         },
     })
     .await

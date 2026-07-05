@@ -2501,6 +2501,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let consent_role_stored =
             crate::federation::types::consent_role::stored_from_wire(row.consent_role.as_deref())
                 .to_owned();
+        // v13.2.0 (CIRISPersist#383) — the 2nd..Nth anchor scrubs serialize to
+        // the V096 `additional_scrubs` JSON-array TEXT column. Empty → "[]"
+        // (the column DEFAULT), so a single-scrub row is byte-stable.
+        let additional_scrubs_text =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -2510,8 +2517,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence, consent_role\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                    attestation_evidence, consent_role, additional_scrubs\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                 rusqlite::params![
                     row.key_id,
                     row.pubkey_ed25519_base64,
@@ -2532,6 +2539,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     roles_text,
                     attestation_evidence_text,
                     consent_role_stored,
+                    additional_scrubs_text,
                 ],
             )?;
             Ok(())
@@ -2554,7 +2562,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                        attestation_evidence, consent_role \
+                        attestation_evidence, consent_role, additional_scrubs \
                      FROM federation_keys WHERE key_id = ?1",
                     [&key_id],
                     sqlite_row_to_key_record,
@@ -2578,7 +2586,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                        attestation_evidence, consent_role \
+                        attestation_evidence, consent_role, additional_scrubs \
                      FROM federation_keys WHERE identity_ref = ?1",
                 )?;
                 let rows = stmt.query_map([&identity_ref], sqlite_row_to_key_record)?;
@@ -2605,7 +2613,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                        attestation_evidence, consent_role \
+                        attestation_evidence, consent_role, additional_scrubs \
                      FROM federation_keys WHERE identity_type = ?1 \
                      ORDER BY key_id",
                 )?;
@@ -6352,6 +6360,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         key.persist_row_hash = crate::federation::types::compute_persist_row_hash(&key)?;
 
@@ -10443,6 +10452,17 @@ fn sqlite_row_to_key_record(
         .as_deref()
         .and_then(crate::federation::types::consent_role::wire_from_stored)
         .map(str::to_owned);
+    // v13.2.0 (CIRISPersist#383): additional_scrubs is the V096
+    // `TEXT NOT NULL DEFAULT '[]'` column holding the 2nd..Nth anchor scrub
+    // signatures as a JSON array. MUST decode the column (never Vec::new()) —
+    // else a stored 2-of-3 canonical record reads back as 0 additional scrubs
+    // and loses its quorum. NULL / absent column / empty string → empty set.
+    let additional_scrubs_text: Option<String> = row.get("additional_scrubs").ok();
+    let additional_scrubs: Vec<crate::federation::types::ScrubSig> = additional_scrubs_text
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
     Ok(crate::federation::KeyRecord {
         key_id: row.get("key_id")?,
         pubkey_ed25519_base64: row.get("pubkey_ed25519_base64")?,
@@ -10463,6 +10483,7 @@ fn sqlite_row_to_key_record(
         roles,
         attestation_evidence,
         consent_role,
+        additional_scrubs,
     })
 }
 
@@ -13010,7 +13031,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                     registration_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
                     scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence, consent_role \
+                    attestation_evidence, consent_role, additional_scrubs \
              FROM federation_keys {where_sql} \
              ORDER BY valid_from DESC, key_id DESC LIMIT ?{p_limit}"
         );
@@ -15717,6 +15738,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
@@ -21518,6 +21540,97 @@ mod tests {
             "k-a",
             "plain-agent",
             "truth_grounding:detection:correlated_action:rights_asymmetry:v1",
+        );
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_rejects_novel_detection_subkind_from_non_detector() {
+        // CIRISPersist#379 (CC 3.4.8) — the `detection:*` prefix-WILDCARD.
+        // A NOVEL subkind with no dedicated leaf rule (nothing named
+        // `emergent_pattern` is enumerated) must STILL be refused for a
+        // plain `agent` key at the real `put_attestation` chokepoint.
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    "plain-agent",
+                    "registry",
+                    "plain-agent",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "plain-agent"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-novel-subkind-1",
+            "plain-agent",
+            "k-a",
+            "plain-agent",
+            "detection:emergent_pattern:novel_signal:v1",
+        );
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::ReservedPrefixEmitterMismatch {
+                prefix, required, ..
+            } => {
+                assert_eq!(prefix, "detection:");
+                assert_eq!(
+                    required,
+                    vec![crate::federation::types::identity_type::LENSCORE_DETECTOR.to_owned()]
+                );
+            }
+            other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_admits_novel_detection_subkind_from_lenscore_detector() {
+        // The wildcard grants the SAME novel subkind to a
+        // `lenscore_detector` key — the gate isn't a deny-only net, it
+        // actually admits the emission construction covers.
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    "detector-key",
+                    "registry",
+                    "detector-key",
+                    crate::federation::types::identity_type::LENSCORE_DETECTOR,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "detector-key"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-novel-subkind-2",
+            "detector-key",
+            "k-a",
+            "detector-key",
+            "detection:emergent_pattern:novel_signal:v1",
         );
         backend
             .put_attestation(SignedAttestation { attestation: att })
@@ -29335,6 +29448,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         backend
             .put_public_key(SignedKeyRecord { record })

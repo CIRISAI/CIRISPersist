@@ -1,0 +1,36 @@
+-- V096 — #383 multi-scrub canonical record: the 2nd..Nth anchor scrub
+-- signatures (CC 3.4.7.1 / FSD Trust Root / CIRISVerify#174) (SQLite dialect).
+--
+-- Postgres parity (postgres/lens/V096): same column + same intent, with the
+-- following dialect translations:
+--
+--   PostgreSQL                          → SQLite
+--   ─────────────────────────────────────────────────────────────────
+--   ADD COLUMN IF NOT EXISTS            → ADD COLUMN (SQLite ALTER cannot
+--                                          IF NOT EXISTS a column; the
+--                                          migration runs once)
+--   COMMENT ON COLUMN ...               → (no equivalent — docs live in
+--                                          source + the PG twin)
+--
+-- # Why this column
+--
+-- #383 flips canonical ADD from 1-of-N to 2-of-3: `canonical` is conferred only
+-- on a record with ≥2 DISTINCT anchor holders each carrying a cryptographically
+-- VALID scrub signature over the SAME canonical `registration_envelope`. The
+-- scrub *set* lives OUTSIDE the byte-identical signed envelope, so persist
+-- carries it additively — scrub #1 stays in `scrub_key_id`/`scrub_signature_*`;
+-- scrubs #2..N ride this column as a JSON array of
+-- `{scrub_key_id, scrub_signature_classical, scrub_signature_pqc?}`
+-- (`KeyRecord.additional_scrubs`, wire-identical to `ciris_verify_core` v8.9.0).
+--
+-- # Shape
+--
+-- TEXT holding a JSON array; DEFAULT '[]' and NULL-tolerant (a legacy /
+-- single-scrub row reads back as an empty set). An empty array serializes away
+-- (`skip_serializing_if`) so a single-scrub record's `persist_row_hash` stays
+-- byte-identical to the pre-#383 shape.
+--
+-- No explicit BEGIN/COMMIT — refinery wraps each migration in a transaction.
+
+ALTER TABLE federation_keys
+    ADD COLUMN additional_scrubs TEXT NOT NULL DEFAULT '[]';

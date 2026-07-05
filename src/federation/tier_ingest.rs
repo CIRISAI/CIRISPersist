@@ -359,6 +359,7 @@ pub(crate) mod test_support {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         dir.put_public_key(crate::federation::SignedKeyRecord { record: rec })
             .await
@@ -501,6 +502,7 @@ pub(crate) mod test_support {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
@@ -614,6 +616,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         dir.put_public_key(SignedKeyRecord { record: rec })
             .await

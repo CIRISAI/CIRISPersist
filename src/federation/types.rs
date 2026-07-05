@@ -716,6 +716,38 @@ pub struct KeyRecord {
     /// stays byte-stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consent_role: Option<String>,
+    /// v13.2.0 (CIRISPersist#383 / CIRISVerify#174) — the **2nd..Nth anchor
+    /// scrub signatures** over the SAME canonical `registration_envelope`
+    /// (scrub #1 is the base `scrub_key_id`/`scrub_signature_*` fields above).
+    /// Empty for an ordinary / single-scrub record → serializes away entirely
+    /// (`skip_serializing_if`), so the record stays **byte-identical** to the
+    /// pre-#383 shape and cannot perturb `compute_persist_row_hash` (which
+    /// excludes it — see there). The `canonical` role is conferred only on a
+    /// record whose scrub set has **≥2 distinct anchor holders with valid
+    /// signatures** (`check_canonical_role_admission`), the 2-of-3 add gate.
+    /// `root_binding` still roots via **any one** scrub. Wire-identical to
+    /// `ciris_verify_core::federation_self_record::KeyRecord::additional_scrubs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_scrubs: Vec<ScrubSig>,
+}
+
+/// v13.2.0 (CIRISPersist#383 / CIRISVerify#174) — a single anchor-holder
+/// scrub signature over a canonical `registration_envelope`, the shape of an
+/// entry in [`KeyRecord::additional_scrubs`]. Every scrub on a record is over
+/// the **same** canonical bytes; the scrub *set* lives OUTSIDE the signed
+/// envelope, so a 1-scrub and a 2-scrub record of the same target canonicalize
+/// identically. Wire-identical to `ciris_verify_core`'s `ScrubSig`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrubSig {
+    /// The anchor holder (A1/B1/C1) whose key produced this scrub. Must resolve
+    /// to a registered `federation_keys` row; the scrub verifies against its
+    /// pinned pubkeys over `JCS(registration_envelope)`.
+    pub scrub_key_id: String,
+    /// Base64 `Ed25519.sign(JCS(registration_envelope))`.
+    pub scrub_signature_classical: String,
+    /// Base64 `ML-DSA-65.sign(JCS(registration_envelope) ‖ ed25519_sig)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
 }
 
 /// A single **transport reachability hint** carried INSIDE a
@@ -756,6 +788,38 @@ impl KeyRecord {
             .get("transport_hints")
             .and_then(|v| serde_json::from_value::<Vec<TransportHint>>(v.clone()).ok())
             .unwrap_or_default()
+    }
+
+    /// v13.2.0 (CIRISPersist#383) — the **full ordered scrub set**: scrub #1
+    /// reconstructed from the base `scrub_key_id`/`scrub_signature_*` fields,
+    /// followed by every [`Self::additional_scrubs`] entry. Each is a signature
+    /// over the SAME canonical `registration_envelope` bytes. This is the set
+    /// `root_binding` roots (via any one) / `check_canonical_role_admission`
+    /// confers `canonical` on (≥2 distinct anchor holders, sigs verified).
+    /// Wire-identical to `ciris_verify_core`'s `KeyRecord::scrubs`.
+    pub fn scrubs(&self) -> Vec<ScrubSig> {
+        let mut out = Vec::with_capacity(1 + self.additional_scrubs.len());
+        out.push(ScrubSig {
+            scrub_key_id: self.scrub_key_id.clone(),
+            scrub_signature_classical: self.scrub_signature_classical.clone(),
+            scrub_signature_pqc: self.scrub_signature_pqc.clone(),
+        });
+        out.extend(self.additional_scrubs.iter().cloned());
+        out
+    }
+
+    /// v13.2.0 (CIRISPersist#383) — count of **distinct** `scrub_key_id`s across
+    /// the whole scrub set (a coarse pre-check; the admission gate additionally
+    /// requires each counted scrub to be a pinned anchor holder with a VALID
+    /// signature). Excludes nothing — a self-scrub (`scrub_key_id == key_id`)
+    /// counts here but is rejected by the gate (self cannot confer `canonical`).
+    pub fn distinct_scrub_count(&self) -> usize {
+        let mut ids = std::collections::BTreeSet::new();
+        ids.insert(self.scrub_key_id.as_str());
+        for s in &self.additional_scrubs {
+            ids.insert(s.scrub_key_id.as_str());
+        }
+        ids.len()
     }
 
     /// True iff both PQC components have been attached. Consumers
@@ -2216,6 +2280,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         let hints = r.transport_hints();
         assert_eq!(hints.len(), 2);
@@ -2230,6 +2295,95 @@ mod tests {
         // Malformed → empty (not an error on the read path).
         r.registration_envelope = serde_json::json!({ "transport_hints": "not-a-list" });
         assert!(r.transport_hints().is_empty());
+    }
+
+    /// v13.2.0 (CIRISPersist#383) — the additive `additional_scrubs` field is
+    /// **byte-invisible when empty**: it `skip_serializing_if = "Vec::is_empty"`
+    /// so an ordinary / single-scrub record serializes WITHOUT the key and its
+    /// `persist_row_hash` is byte-identical to the pre-#383 shape. A real 2-scrub
+    /// set is included → its own distinct hash. Also exercises the
+    /// `scrubs()` / `distinct_scrub_count()` helpers + ScrubSig serde round-trip.
+    #[test]
+    fn additional_scrubs_empty_is_hash_stable_nonempty_changes_hash() {
+        let base = KeyRecord {
+            key_id: "canon-1".into(),
+            pubkey_ed25519_base64: "AAAA".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: algorithm::HYBRID.into(),
+            identity_type: "canonical,node".into(),
+            identity_ref: "canon-1".into(),
+            valid_from: "2026-07-05T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "key_id": "canon-1" }),
+            original_content_hash: "h".into(),
+            scrub_signature_classical: "sig1".into(),
+            scrub_signature_pqc: Some("pqc1".into()),
+            scrub_key_id: "A1".into(),
+            scrub_timestamp: "2026-07-05T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+
+        // Empty set → the field serializes away entirely (byte-invisible).
+        let json = serde_json::to_value(&base).unwrap();
+        assert!(
+            json.get("additional_scrubs").is_none(),
+            "empty additional_scrubs must NOT appear on the wire"
+        );
+
+        // scrubs()/distinct_scrub_count() over the base (single-scrub) record.
+        assert_eq!(base.scrubs().len(), 1);
+        assert_eq!(base.distinct_scrub_count(), 1);
+
+        // The hash of an empty-additional_scrubs record equals the hash of a
+        // genuinely pre-#383 value — one whose JSON never carried the key.
+        // `compute_persist_row_hash` is generic over Serialize, so we feed it a
+        // `serde_json::Value` with the key removed; because skip_serializing_if
+        // dropped it from the real record too, the two hashes match.
+        let h_empty = compute_persist_row_hash(&base).unwrap();
+        let mut pre383 = serde_json::to_value(&base).unwrap();
+        assert!(
+            pre383
+                .as_object_mut()
+                .unwrap()
+                .remove("additional_scrubs")
+                .is_none(),
+            "the empty field was already absent from the serialized form"
+        );
+        assert_eq!(
+            h_empty,
+            compute_persist_row_hash(&pre383).unwrap(),
+            "empty additional_scrubs → persist_row_hash byte-identical to pre-#383"
+        );
+
+        // A real 2-scrub record: scrub #2 rides additional_scrubs. The set is
+        // now non-empty → included in the hash → a DISTINCT value.
+        let mut two = base.clone();
+        two.additional_scrubs = vec![ScrubSig {
+            scrub_key_id: "B1".into(),
+            scrub_signature_classical: "sig2".into(),
+            scrub_signature_pqc: Some("pqc2".into()),
+        }];
+        let json2 = serde_json::to_value(&two).unwrap();
+        assert!(
+            json2.get("additional_scrubs").is_some(),
+            "a non-empty scrub set MUST appear on the wire"
+        );
+        assert_eq!(two.scrubs().len(), 2, "scrub #1 + one additional");
+        assert_eq!(two.distinct_scrub_count(), 2, "A1 + B1 distinct");
+        assert_ne!(
+            compute_persist_row_hash(&two).unwrap(),
+            h_empty,
+            "a real 2-scrub set must change the persist_row_hash"
+        );
+
+        // ScrubSig + additional_scrubs serde round-trip.
+        let round: KeyRecord = serde_json::from_str(&serde_json::to_string(&two).unwrap()).unwrap();
+        assert_eq!(round.additional_scrubs, two.additional_scrubs);
     }
 
     /// v12.7.0 (CIRISPersist#368) — the FFI wire contract for the
@@ -2327,6 +2481,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         }
     }
 

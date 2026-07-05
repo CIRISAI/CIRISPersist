@@ -2742,6 +2742,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let consent_role_stored =
             crate::federation::types::consent_role::stored_from_wire(row.consent_role.as_deref())
                 .to_owned();
+        // v13.2.0 (CIRISPersist#383) — the 2nd..Nth anchor scrubs serialize to
+        // the V096 `additional_scrubs` JSON-array TEXT column. Empty → "[]"
+        // (the column DEFAULT), so a single-scrub row is byte-stable.
+        let additional_scrubs_param =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
         let result = client
             .execute(
                 "INSERT INTO cirislens.federation_keys (\
@@ -2749,8 +2756,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence, consent_role\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
+                    attestation_evidence, consent_role, additional_scrubs\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
                  ON CONFLICT (key_id) DO NOTHING",
                 &[
                     &row.key_id,
@@ -2772,6 +2779,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &roles_param,
                     &row.attestation_evidence,
                     &consent_role_stored,
+                    &additional_scrubs_param,
                 ],
             )
             .await
@@ -2815,7 +2823,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence, consent_role \
+                    attestation_evidence, consent_role, additional_scrubs \
                  FROM cirislens.federation_keys WHERE key_id = $1",
                 &[&key_id],
             )
@@ -2840,7 +2848,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence, consent_role \
+                    attestation_evidence, consent_role, additional_scrubs \
                  FROM cirislens.federation_keys WHERE identity_ref = $1",
                 &[&identity_ref],
             )
@@ -2870,7 +2878,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, roles, \
-                    attestation_evidence, consent_role \
+                    attestation_evidence, consent_role, additional_scrubs \
                  FROM cirislens.federation_keys WHERE identity_type = $1 \
                  ORDER BY key_id",
                 &[&identity_type],
@@ -6669,6 +6677,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         key.persist_row_hash = crate::federation::types::compute_persist_row_hash(&key)?;
 
@@ -10546,6 +10555,20 @@ fn pg_row_to_key_record(
         .as_deref()
         .and_then(crate::federation::types::consent_role::wire_from_stored)
         .map(str::to_owned);
+    // v13.2.0 (CIRISPersist#383): additional_scrubs is the V096
+    // `TEXT NOT NULL DEFAULT '[]'` column holding the 2nd..Nth anchor scrub
+    // signatures as a JSON array. MUST decode the column (never Vec::new()) —
+    // else a stored 2-of-3 canonical record reads back as 0 additional scrubs
+    // and loses its quorum. Tolerant read (matching roles/consent_role above):
+    // a SELECT that didn't pull the column, a NULL, or an empty/malformed
+    // string all map to an empty set. SELECTs that need it MUST include it.
+    let additional_scrubs: Vec<crate::federation::types::ScrubSig> = row
+        .try_get::<_, Option<String>>("additional_scrubs")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
     Ok(crate::federation::KeyRecord {
         key_id: row.safe_get_with("key_id", mk_err)?,
         pubkey_ed25519_base64: row.safe_get_with("pubkey_ed25519_base64", mk_err)?,
@@ -10566,6 +10589,7 @@ fn pg_row_to_key_record(
         roles,
         attestation_evidence,
         consent_role,
+        additional_scrubs,
     })
 }
 
@@ -13128,7 +13152,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    attestation_evidence, consent_role \
+                    attestation_evidence, consent_role, additional_scrubs \
              FROM cirislens.federation_keys \
              {where_sql} \
              ORDER BY valid_from DESC, key_id DESC \
@@ -18284,6 +18308,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
@@ -27217,6 +27242,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         };
         backend
             .put_public_key(crate::federation::SignedKeyRecord { record })
@@ -28075,6 +28101,7 @@ mod tests {
             roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
+            additional_scrubs: Vec::new(),
         }
     }
 

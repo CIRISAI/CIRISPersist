@@ -159,6 +159,35 @@ pub fn delegates_to_envelope(
     })
 }
 
+/// v13.2.0 (CIRISPersist#378, CC 3.2 rc2 single-owner) — the **owner-binding**
+/// `delegates_to(user → node)` envelope: "I (user) am the single responsible
+/// steward of `node`". The ownership specialization of
+/// [`delegates_to_envelope`]: it stamps the CC 1.13.3.3 / CC 3.2 ownership
+/// [`DIMENSION`](super::types::owner_binding::DIMENSION) (what the single-owner
+/// admission gate + [`owner_of`](super::admission::owner_of) key on) plus the
+/// producer-side [`PURPOSE`](super::types::owner_binding::PURPOSE) marker
+/// (`delegation_purpose`). This is the ONE `delegates_to` shape that is
+/// single-valued (a node has at most one owner) — distinct from the general
+/// (multi-parent) act-on-behalf / hierarchy grammar `delegates_to_envelope`
+/// builds. `scope` SHOULD be `infra:*`-only (the owner-binding carries only
+/// server-class authority); `sub_delegation` is `false` (a leaf ownership
+/// binding, not a deputization). The two constants stay byte-identical to
+/// CIRISServer's `auth::ownership` shape (the wire is the contract).
+pub fn owner_binding_delegates_to_envelope(
+    node_key_id: &str,
+    infra_scopes: &[String],
+) -> serde_json::Value {
+    use super::types::owner_binding;
+    serde_json::json!({
+        "kind": "delegates_to",
+        "dimension": owner_binding::DIMENSION,
+        "delegation_purpose": owner_binding::PURPOSE,
+        "delegate_key_id": node_key_id,
+        "scope": infra_scopes,
+        "sub_delegation": false,
+    })
+}
+
 /// v6.5.0 (CEG §8.1.12.7) — the user-side `consent:partnership_grant`
 /// envelope: "I (user) offer a bilateral partnership to this agent
 /// occurrence", keyed by a shared `bilateral_pair_id`.
@@ -252,6 +281,30 @@ mod tests {
         let scope = env["scope"].as_array().unwrap();
         assert!(scope.iter().any(|v| v == "moderate"));
         assert!(scope.iter().any(|v| v == "review"));
+    }
+
+    #[test]
+    fn owner_binding_envelope_carries_ownership_dimension_and_purpose() {
+        // #378 (CC 3.2 rc2) — the owner-binding specialization stamps the
+        // ownership dimension + producer-side purpose marker (what the
+        // single-owner gate + owner_of key on), sub_delegation always false.
+        use super::super::types::owner_binding;
+        let env = owner_binding_delegates_to_envelope(
+            "node-key",
+            &[
+                "infra:serve".to_string(),
+                "infra:network_presence".to_string(),
+            ],
+        );
+        assert_eq!(env["kind"], "delegates_to");
+        assert_eq!(env["dimension"], owner_binding::DIMENSION);
+        assert_eq!(env["delegation_purpose"], owner_binding::PURPOSE);
+        assert_eq!(env["delegate_key_id"], "node-key");
+        assert_eq!(env["sub_delegation"], false);
+        let scope = env["scope"].as_array().unwrap();
+        assert!(scope
+            .iter()
+            .all(|v| v.as_str().unwrap().starts_with("infra:")));
     }
 
     #[test]

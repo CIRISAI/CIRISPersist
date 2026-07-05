@@ -769,6 +769,7 @@ mod tests {
                 roles: Vec::new(),
                 attestation_evidence: None,
                 consent_role: None,
+                additional_scrubs: Vec::new(),
             },
         }
     }

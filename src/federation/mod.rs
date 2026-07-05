@@ -129,7 +129,7 @@ pub(crate) mod serde_bytes_b64 {
 
 pub use admission::{
     canonical_withdrawal_payload_sha256, check_canonical_role_admission,
-    check_canonical_role_admission_anchored, check_cohort_scope, check_consensus_protocol_form,
+    check_canonical_role_admission_over_roster, check_cohort_scope, check_consensus_protocol_form,
     check_device_class, check_encryption_pubkeys, check_observed_region, is_canonical,
     is_canonical_effective, supersede_canonical, verify_canonical_supersede_authority,
     verify_canonical_withdraw_authority, withdraw_canonical_role,
@@ -182,8 +182,9 @@ pub use schema_resolver::{
     axis_from_dimension, AxisSchema, NoOpSchemaResolver, SchemaResolver, SchemaResolverError,
 };
 pub use self_at_login::{
-    delegates_to_agent_envelope, delegates_to_envelope, partnership_accept_envelope,
-    partnership_grant_envelope, TransportDestination, SELF_AT_LOGIN_DELEGATION_SCOPE,
+    delegates_to_agent_envelope, delegates_to_envelope, owner_binding_delegates_to_envelope,
+    partnership_accept_envelope, partnership_grant_envelope, TransportDestination,
+    SELF_AT_LOGIN_DELEGATION_SCOPE,
 };
 pub use shared_instance::{SharedInstanceLease, DEFAULT_STALE_AFTER};
 #[cfg(feature = "sqlite")]
@@ -3834,8 +3835,8 @@ pub enum Error {
     /// persist-computed canonical payload for THIS operation + target (a replay
     /// of a decision authorizing some other payload). Fail-closed
     /// (verify-before-mutation, AV-9 — no tombstone / successor is written).
-    /// Asymmetric by design: a single accord holder may ADD a canonical (1-of-N
-    /// anchor-scrub conferral) but NOT withdraw one. Stable `kind()` token
+    /// Symmetric m-of-n by design (v13.2.0 / CIRISPersist#383): ADD requires a
+    /// 2-of-3 accord co-scrub and WITHDRAW/SUPERSEDE the 2-of-3 quorum. Stable `kind()` token
     /// `canonical_withdrawal_authority_invalid`. See
     /// [`admission::verify_canonical_withdraw_authority`].
     #[error(
