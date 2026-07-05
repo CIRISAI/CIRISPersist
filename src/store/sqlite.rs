@@ -21552,6 +21552,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_put_attestation_rejects_novel_detection_subkind_from_non_detector() {
+        // CIRISPersist#379 (CC 3.4.8) — the `detection:*` prefix-WILDCARD.
+        // A NOVEL subkind with no dedicated leaf rule (nothing named
+        // `emergent_pattern` is enumerated) must STILL be refused for a
+        // plain `agent` key at the real `put_attestation` chokepoint.
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    "plain-agent",
+                    "registry",
+                    "plain-agent",
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "plain-agent"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-novel-subkind-1",
+            "plain-agent",
+            "k-a",
+            "plain-agent",
+            "detection:emergent_pattern:novel_signal:v1",
+        );
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        match err {
+            crate::federation::Error::ReservedPrefixEmitterMismatch {
+                prefix, required, ..
+            } => {
+                assert_eq!(prefix, "detection:");
+                assert_eq!(
+                    required,
+                    vec![crate::federation::types::identity_type::LENSCORE_DETECTOR.to_owned()]
+                );
+            }
+            other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_put_attestation_admits_novel_detection_subkind_from_lenscore_detector() {
+        // The wildcard grants the SAME novel subkind to a
+        // `lenscore_detector` key — the gate isn't a deny-only net, it
+        // actually admits the emission construction covers.
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    "detector-key",
+                    "registry",
+                    "detector-key",
+                    crate::federation::types::identity_type::LENSCORE_DETECTOR,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("k-a", "primitive-a", "detector-key"),
+            })
+            .await
+            .unwrap();
+        let att = scores_attestation_with_dimension(
+            "att-novel-subkind-2",
+            "detector-key",
+            "k-a",
+            "detector-key",
+            "detection:emergent_pattern:novel_signal:v1",
+        );
+        backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap();
+        let rows = crate::federation::FederationDirectory::list_attestations_for(&backend, "k-a")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
     async fn sqlite_put_attestation_exempts_structural_rename_chain() {
         // FSD-002 v1.2 Ask 5 delta — the rename chain
         // `delegates_to:correlated_action_v2:from:emergent_deception_v1`

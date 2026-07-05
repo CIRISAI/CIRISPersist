@@ -363,9 +363,21 @@ impl Default for DimensionAdmissionPolicy {
 ///   prefix (which does not start with `detection:` and so stays ungated),
 ///   so anything landing on `detection:*` is a **primary detector
 ///   emission** — gate-able with NO envelope field, resolving the earlier
-///   "which shape is this?" ambiguity. Only these two exact families are
-///   gated; a bare `detection:` prefix is NOT (CC 3.4.8 names exactly
-///   these two).
+///   "which shape is this?" ambiguity. As of CIRISPersist#379 the bare
+///   `detection:` prefix is ALSO gated (see below) — the two leaves are
+///   kept as the more-specific, first-matched entries so their mismatch
+///   errors keep reporting the narrower prefix.
+/// - `detection:*` (CC 3.4.8, the prefix-WILDCARD) is gated here
+///   (CIRISPersist#379): every `detection:{anything}` — including subkinds
+///   not yet enumerated as their own leaf — requires `lenscore_detector`
+///   by construction. This closes the gap where a NOVEL
+///   `detection:{newkind}:*` subkind from an ordinary agent key was
+///   wrongly admitted until someone added its leaf rule. It is declared
+///   AFTER the two leaves above so first-match-wins precedence keeps
+///   their narrower `prefix` value in the emitted error; this wildcard is
+///   a pure fallback net over anything else under `detection:`. It does
+///   NOT catch `truth_grounding:detection:*`, which is a distinct prefix
+///   (doesn't start with `detection:`) and stays ungated per CC 3.4.8.
 pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
     use super::types::identity_type;
     let substrate_persist = identity_type::SUBSTRATE_PERSIST.to_owned();
@@ -451,6 +463,35 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
         },
         ReservedPrefixRule {
             pattern_prefix: "detection:distributive:access:".into(),
+            required_identity_types: vec![lenscore_detector.clone()],
+        },
+        // CIRISPersist#379 (CC 3.4.8) — the `detection:*` prefix-WILDCARD.
+        // The two leaves above enumerate the known detector families;
+        // this blanket rule closes the conformance gap (CIRISConformance
+        // `test_550_detection_discriminator`) where a NOVEL
+        // `detection:{newkind}:*` subkind from an ordinary agent key was
+        // wrongly admitted until someone hand-added its own leaf. Every
+        // `detection:{anything}` now requires `lenscore_detector` by
+        // construction — no envelope parsing, a pure prefix rule.
+        //
+        // Declared AFTER the two leaves: `default_reserved_prefix_rules()`
+        // consumers scan in declaration order and stop at the first match
+        // (`DimensionAdmissionPolicy::check`'s `for … { break }` loop and
+        // `check_reserved_prefix_admission`'s `.find()`), so the two
+        // leaves still win their own lookup and keep reporting the
+        // narrower `detection:correlated_action:` /
+        // `detection:distributive:access:` prefix in
+        // `Error::ReservedPrefixEmitterMismatch`. This rule only ever
+        // fires as the fallback net for everything else under
+        // `detection:` — same required role either way, so it is
+        // behavior-preserving for the two enumerated leaves.
+        //
+        // `truth_grounding:detection:*` cross-attestations (CC 3.4.8)
+        // remain ungated: that string does NOT start with `detection:`
+        // (it starts with `truth_grounding:`), so `str::starts_with`
+        // never matches this rule for it.
+        ReservedPrefixRule {
+            pattern_prefix: "detection:".into(),
             required_identity_types: vec![lenscore_detector],
         },
     ]
@@ -4903,6 +4944,122 @@ mod tests {
                 role,
             )
             .unwrap_or_else(|e| panic!("cross-attestation must be ungated for {role}: {e:?}"));
+        }
+    }
+
+    // ── CIRISPersist#379 (CC 3.4.8) — the `detection:*` prefix-WILDCARD ──
+
+    #[test]
+    fn detection_wildcard_refuses_novel_subkind_from_agent_key() {
+        // A NOVEL `detection:{newkind}:*` subkind that has no dedicated
+        // leaf rule (nothing named `emergent_pattern` exists among the
+        // enumerated leaves) must STILL be refused for a plain `agent`
+        // key — the blanket `detection:` wildcard rule closes this gap
+        // (the conformance sweep's `test_550_detection_discriminator`
+        // strict-xfail).
+        let p = default_policy();
+        let err = p
+            .check(
+                attestation_type::SCORES,
+                Some("detection:emergent_pattern:novel_signal:v1"),
+                identity_type::AGENT,
+            )
+            .unwrap_err();
+        match err {
+            Error::ReservedPrefixEmitterMismatch {
+                dimension,
+                prefix,
+                required,
+                got_identity_type,
+            } => {
+                assert_eq!(dimension, "detection:emergent_pattern:novel_signal:v1");
+                assert_eq!(prefix, "detection:");
+                assert_eq!(required, vec![identity_type::LENSCORE_DETECTOR.to_owned()]);
+                assert_eq!(got_identity_type, identity_type::AGENT);
+            }
+            other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detection_wildcard_admits_novel_subkind_from_lenscore_detector_key() {
+        // The same novel subkind IS admitted for a `lenscore_detector`
+        // key — the wildcard grants exactly the role the two enumerated
+        // leaves already require, just without needing its own leaf.
+        let p = default_policy();
+        p.check(
+            attestation_type::SCORES,
+            Some("detection:emergent_pattern:novel_signal:v1"),
+            identity_type::LENSCORE_DETECTOR,
+        )
+        .unwrap_or_else(|e| panic!("lenscore_detector must admit novel detection subkind: {e:?}"));
+
+        // And a folded `{agent, lenscore_detector}` key, by set membership
+        // (CC 3.4.7.1), same as the two enumerated leaves.
+        let folded =
+            identity_type::join_set([identity_type::AGENT, identity_type::LENSCORE_DETECTOR]);
+        p.check(
+            attestation_type::SCORES,
+            Some("detection:emergent_pattern:novel_signal:v1"),
+            &folded,
+        )
+        .unwrap_or_else(|e| panic!("folded detector key must admit novel subkind: {e:?}"));
+    }
+
+    #[test]
+    fn detection_wildcard_does_not_shadow_the_two_enumerated_leaves() {
+        // The wildcard is declared AFTER the two leaves, so the leaves'
+        // own (narrower) `prefix` still surfaces in the mismatch error —
+        // precedence must not regress to the blanket `detection:` prefix
+        // for these two already-enumerated families.
+        let p = default_policy();
+        let cases = [
+            (
+                "detection:correlated_action:rights_asymmetry:v1",
+                "detection:correlated_action:",
+            ),
+            (
+                "detection:distributive:access:disparity:v1",
+                "detection:distributive:access:",
+            ),
+        ];
+        for (dim, expected_prefix) in cases {
+            let err = p
+                .check(attestation_type::SCORES, Some(dim), identity_type::AGENT)
+                .unwrap_err();
+            match err {
+                Error::ReservedPrefixEmitterMismatch { prefix, .. } => {
+                    assert_eq!(
+                        prefix, expected_prefix,
+                        "{dim} should report its own leaf prefix, not the blanket wildcard"
+                    );
+                }
+                other => panic!("expected ReservedPrefixEmitterMismatch, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn detection_wildcard_does_not_catch_truth_grounding_cross_attestation() {
+        // CRITICAL: `truth_grounding:detection:*` is a DISTINCT prefix
+        // (it does not start with `detection:`) and MUST remain ungated
+        // for cross-attestations by any key, including a plain `agent`
+        // key with no detector role at all — the wildcard must not
+        // accidentally widen its net to catch it.
+        let p = default_policy();
+        for role in [
+            identity_type::AGENT,
+            identity_type::STEWARD,
+            identity_type::LENSCORE_DETECTOR,
+        ] {
+            p.check(
+                attestation_type::SCORES,
+                Some("truth_grounding:detection:novel_kind:foo:v1"),
+                role,
+            )
+            .unwrap_or_else(|e| {
+                panic!("truth_grounding:detection:* cross-attestation must stay free for {role}: {e:?}")
+            });
         }
     }
 
