@@ -2072,6 +2072,23 @@ fn pg_row_to_installed_storage_budget(
     )
 }
 
+/// #377 — decode one `canonical_role_withdrawal` row (V095) into a
+/// [`CanonicalWithdrawal`](crate::federation::CanonicalWithdrawal). Uses the
+/// typed `safe_get_with` helpers (no bare `row.get`).
+fn pg_row_to_canonical_withdrawal(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::CanonicalWithdrawal, crate::federation::Error> {
+    use crate::federation::Error as FedError;
+    Ok(crate::federation::CanonicalWithdrawal {
+        key_id: row.safe_get_with("key_id", FedError::Backend)?,
+        withdrawn_at: row.safe_get_with("withdrawn_at", FedError::Backend)?,
+        authority_decision_digest: row
+            .safe_get_with("authority_decision_digest", FedError::Backend)?,
+        superseded_by: row.safe_get_with("superseded_by", FedError::Backend)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", FedError::Backend)?,
+    })
+}
+
 // ─── Pipeline read surface (v0.6.0-α5, CIRISPersist#19) ───────────
 //
 // Inherent methods on `PostgresBackend` for reading the V009
@@ -2897,6 +2914,128 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )));
         }
         Ok(())
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — record a canonical-role WITHDRAW/SUPERSEDE
+    /// tombstone (V095). Idempotent on `key_id`: an existing row with the same
+    /// `superseded_by` + `authority_decision_digest` is a no-op; a differing one
+    /// is a [`Conflict`](crate::federation::Error::Conflict). Backend-symmetric
+    /// with SQLite + memory.
+    async fn record_canonical_withdrawal(
+        &self,
+        key_id: &str,
+        superseded_by: Option<&str>,
+        authority_decision_digest: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut record = crate::federation::CanonicalWithdrawal {
+            key_id: key_id.to_owned(),
+            withdrawn_at: chrono::Utc::now(),
+            authority_decision_digest: authority_decision_digest.to_owned(),
+            superseded_by: superseded_by.map(str::to_owned),
+            persist_row_hash: String::new(),
+        };
+        record.persist_row_hash = crate::federation::types::compute_persist_row_hash(&record)?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Idempotency: an existing tombstone with matching superseded_by +
+        // authority digest is a no-op; a differing one Conflicts (mirrors the
+        // SQLite SELECT-then-INSERT).
+        let existing = client
+            .query_opt(
+                "SELECT superseded_by, authority_decision_digest \
+                 FROM cirislens.canonical_role_withdrawal WHERE key_id = $1",
+                &[&record.key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("record_canonical_withdrawal read: {e}"))
+            })?;
+        if let Some(row) = existing {
+            let existing_superseded: Option<String> =
+                row.safe_get_with("superseded_by", crate::federation::Error::Backend)?;
+            let existing_auth: String = row.safe_get_with(
+                "authority_decision_digest",
+                crate::federation::Error::Backend,
+            )?;
+            if existing_superseded == record.superseded_by
+                && existing_auth == record.authority_decision_digest
+            {
+                return Ok(()); // idempotent no-op
+            }
+            return Err(crate::federation::Error::Conflict(format!(
+                "canonical_role_withdrawal for {} already exists with different content",
+                record.key_id
+            )));
+        }
+        client
+            .execute(
+                "INSERT INTO cirislens.canonical_role_withdrawal (\
+                    key_id, withdrawn_at, authority_decision_digest, superseded_by, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &record.key_id,
+                    &record.withdrawn_at,
+                    &record.authority_decision_digest,
+                    &record.superseded_by,
+                    &record.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("record_canonical_withdrawal: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — consult the V095 withdrawal tombstone for
+    /// `key_id` (the load-bearing gate consult). Backend-symmetric.
+    async fn lookup_canonical_withdrawal(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::CanonicalWithdrawal>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row = client
+            .query_opt(
+                "SELECT key_id, withdrawn_at, authority_decision_digest, superseded_by, \
+                    persist_row_hash \
+                 FROM cirislens.canonical_role_withdrawal WHERE key_id = $1",
+                &[&key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("lookup_canonical_withdrawal: {e}"))
+            })?;
+        row.map(pg_row_to_canonical_withdrawal).transpose()
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — all V095 withdrawal tombstones, stable-sorted
+    /// by `key_id`. Backend-symmetric.
+    async fn list_canonical_withdrawals(
+        &self,
+    ) -> Result<Vec<crate::federation::CanonicalWithdrawal>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT key_id, withdrawn_at, authority_decision_digest, superseded_by, \
+                    persist_row_hash \
+                 FROM cirislens.canonical_role_withdrawal ORDER BY key_id",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_canonical_withdrawals: {e}"))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_canonical_withdrawal)
+            .collect()
     }
 
     async fn put_attestation(

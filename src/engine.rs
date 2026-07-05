@@ -4008,7 +4008,11 @@ impl Engine {
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn is_canonical(&self, key_id: &str) -> Result<bool, crate::federation::Error> {
         let directory = self.federation_directory();
-        crate::federation::is_canonical(directory.as_ref(), key_id).await
+        // v13.1.0 (CIRISPersist#377) — tombstone-aware: a WITHDRAWN canonical
+        // reads `false` (the raw set-membership still carries the role token,
+        // but the quorum revoked it). See
+        // [`crate::federation::is_canonical_effective`].
+        crate::federation::is_canonical_effective(directory.as_ref(), key_id).await
     }
 
     /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
@@ -4052,6 +4056,74 @@ impl Engine {
                     .map(move |h| (r.key_id.clone(), h))
             })
             .collect())
+    }
+
+    /// v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — **withdraw**
+    /// the `canonical` founding-server role from `key_id`. The DESTRUCTIVE
+    /// counterpart of the monotonic add-canonical (#372): a durable,
+    /// quorum-verified TOMBSTONE (V095) that
+    /// [`check_canonical_role_admission`](crate::federation::check_canonical_role_admission)
+    /// consults — so withdrawal defeats a re-add over anti-entropy
+    /// ([`apply_replicated_key_record`](Self::apply_replicated_key_record))
+    /// rather than being silently re-conferred.
+    ///
+    /// `proposal_digest` names a STORED accord live-quorum proposal (#302 /
+    /// V091) whose payload commits to `(withdraw, key_id)`. Persist re-tallies
+    /// ITS OWN cryptographically-verified `accord_participation` rows against the
+    /// accord-holder roster (A1/B1/C1) at the **2-of-3 destructive threshold** —
+    /// never a caller-supplied `AccordDecision.authorized` bool (which is
+    /// unauthenticated and forgeable) — before recording the tombstone
+    /// (verify-before-mutation, AV-9). Asymmetric by design: a single accord
+    /// holder may ADD a canonical (1-of-N anchor-scrub conferral) but NOT
+    /// withdraw one (needs the 2-of-3 family quorum). Idempotent. After this,
+    /// [`is_canonical`](Self::is_canonical) reads `false`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn withdraw_canonical_role(
+        &self,
+        key_id: &str,
+        proposal_digest: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::withdraw_canonical_role(directory.as_ref(), key_id, proposal_digest)
+            .await
+    }
+
+    /// v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — **supersede**
+    /// (rotate) a canonical server: admit `new_record`'s successor key (the
+    /// normal anchor-scrub add-gate runs) AND record `old_key_id`'s withdrawal
+    /// with `superseded_by = new_key_id` (the old→new audit link).
+    /// `proposal_digest` names a STORED accord proposal whose payload commits to
+    /// the supersede `old_key_id → new_record.key_id`; persist re-tallies its own
+    /// verified participations at the 2-of-3 destructive threshold
+    /// (verify-before-mutation). The authority is verified first; the successor
+    /// is admitted before the predecessor is tombstoned so the canonical set is
+    /// never momentarily empty.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn supersede_canonical(
+        &self,
+        old_key_id: &str,
+        new_record: crate::federation::SignedKeyRecord,
+        proposal_digest: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::supersede_canonical(
+            directory.as_ref(),
+            old_key_id,
+            new_record,
+            proposal_digest,
+        )
+        .await
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — enumerate the canonical-role withdrawal
+    /// tombstones (V095), stable-sorted by `key_id` — the withdrawn-history view
+    /// alongside [`list_canonical_servers`](Self::list_canonical_servers).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn list_canonical_withdrawals(
+        &self,
+    ) -> Result<Vec<crate::federation::CanonicalWithdrawal>, crate::federation::Error> {
+        let directory = self.federation_directory();
+        directory.list_canonical_withdrawals().await
     }
 
     /// v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the

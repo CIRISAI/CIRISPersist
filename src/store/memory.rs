@@ -197,6 +197,9 @@ struct State {
     accord_decisions: HashMap<String, crate::federation::accord_quorum::StoredDecision>,
     accord_active_halts: HashMap<String, crate::federation::accord_quorum::ActiveHalt>,
     accord_issued_nonces: std::collections::HashSet<(String, String)>,
+    /// #377 — canonical-role WITHDRAW/SUPERSEDE tombstones (V095), keyed by the
+    /// withdrawn `key_id`. The in-memory mirror of `canonical_role_withdrawal`.
+    canonical_withdrawals: HashMap<String, crate::federation::CanonicalWithdrawal>,
 }
 
 /// v9.1.0 (CIRISPersist#243) — one in-memory scope-blob symbol + its LRU
@@ -256,6 +259,7 @@ impl Default for MemoryBackend {
                 accord_decisions: HashMap::new(),
                 accord_active_halts: HashMap::new(),
                 accord_issued_nonces: std::collections::HashSet::new(),
+                canonical_withdrawals: HashMap::new(),
             }),
         }
     }
@@ -1398,6 +1402,64 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 "set_consent_role: no federation_keys row for {key_id}"
             ))),
         }
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — record a canonical-role WITHDRAW/SUPERSEDE
+    /// tombstone (V095 mirror). Idempotent on `key_id`: matching
+    /// `superseded_by` + `authority_decision_digest` is a no-op; a differing one
+    /// is a [`Conflict`](crate::federation::Error::Conflict). Backend-symmetric
+    /// with SQLite + Postgres.
+    async fn record_canonical_withdrawal(
+        &self,
+        key_id: &str,
+        superseded_by: Option<&str>,
+        authority_decision_digest: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut record = crate::federation::CanonicalWithdrawal {
+            key_id: key_id.to_owned(),
+            withdrawn_at: chrono::Utc::now(),
+            authority_decision_digest: authority_decision_digest.to_owned(),
+            superseded_by: superseded_by.map(str::to_owned),
+            persist_row_hash: String::new(),
+        };
+        record.persist_row_hash = crate::federation::types::compute_persist_row_hash(&record)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        if let Some(existing) = state.canonical_withdrawals.get(key_id) {
+            if existing.superseded_by == record.superseded_by
+                && existing.authority_decision_digest == record.authority_decision_digest
+            {
+                return Ok(()); // idempotent no-op
+            }
+            return Err(crate::federation::Error::Conflict(format!(
+                "canonical_role_withdrawal for {key_id} already exists with different content"
+            )));
+        }
+        state
+            .canonical_withdrawals
+            .insert(key_id.to_owned(), record);
+        Ok(())
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — consult the V095 withdrawal tombstone for
+    /// `key_id` (the load-bearing gate consult). Backend-symmetric.
+    async fn lookup_canonical_withdrawal(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::CanonicalWithdrawal>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state.canonical_withdrawals.get(key_id).cloned())
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — all V095 withdrawal tombstones, stable-sorted
+    /// by `key_id`. Backend-symmetric.
+    async fn list_canonical_withdrawals(
+        &self,
+    ) -> Result<Vec<crate::federation::CanonicalWithdrawal>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut out: Vec<crate::federation::CanonicalWithdrawal> =
+            state.canonical_withdrawals.values().cloned().collect();
+        out.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        Ok(out)
     }
 
     async fn put_attestation(

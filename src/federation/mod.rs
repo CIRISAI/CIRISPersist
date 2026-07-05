@@ -128,10 +128,13 @@ pub(crate) mod serde_bytes_b64 {
 }
 
 pub use admission::{
-    check_canonical_role_admission, check_canonical_role_admission_anchored, check_cohort_scope,
-    check_consensus_protocol_form, check_device_class, check_encryption_pubkeys,
-    check_observed_region, is_canonical, AttestationLadderTransitionPolicy,
-    DimensionAdmissionPolicy, DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule,
+    canonical_withdrawal_payload_sha256, check_canonical_role_admission,
+    check_canonical_role_admission_anchored, check_cohort_scope, check_consensus_protocol_form,
+    check_device_class, check_encryption_pubkeys, check_observed_region, is_canonical,
+    is_canonical_effective, supersede_canonical, verify_canonical_supersede_authority,
+    verify_canonical_withdraw_authority, withdraw_canonical_role,
+    AttestationLadderTransitionPolicy, CanonicalWithdrawal, DimensionAdmissionPolicy,
+    DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule,
     ATTESTATION_LADDER_MECHANISMS,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
@@ -443,6 +446,61 @@ pub trait FederationDirectory: Send + Sync {
     /// no Counter-RII detector.
     async fn set_consent_role(&self, key_id: &str, consent_role: Option<&str>)
         -> Result<(), Error>;
+
+    /// v13.1.0 (CIRISPersist#377) — record a canonical-role WITHDRAW/SUPERSEDE
+    /// **tombstone** (V095 `canonical_role_withdrawal`). `key_id` is the
+    /// withdrawn canonical node; `superseded_by` is the successor key_id for a
+    /// supersede (the old→new link) or `None` for a plain withdraw;
+    /// `authority_decision_digest` is the authorizing accord `AccordDecision`
+    /// proposal digest (#302, the audit anchor). **Idempotent** — a re-record of
+    /// the same withdrawal is a no-op (the tombstone is monotone; a conflicting
+    /// re-record with a DIFFERENT `superseded_by` is a [`Error::Conflict`]).
+    ///
+    /// Recorded on the revocation-wins plane: because
+    /// [`check_canonical_role_admission`](admission::check_canonical_role_admission)
+    /// consults the tombstone, a re-add of the withdrawn canonical over
+    /// anti-entropy ([`apply_replicated_key_record`](Self::apply_replicated_key_record))
+    /// is Refused. Callers use the verify-before-mutation orchestration
+    /// ([`admission::withdraw_canonical_role`] / [`admission::supersede_canonical`])
+    /// which verifies the accord authority BEFORE this write. The default body
+    /// errors (mock/test backends without the V095 table); the real
+    /// sqlite/postgres/memory backends override it.
+    async fn record_canonical_withdrawal(
+        &self,
+        key_id: &str,
+        superseded_by: Option<&str>,
+        authority_decision_digest: &str,
+    ) -> Result<(), Error> {
+        let _ = (key_id, superseded_by, authority_decision_digest);
+        Err(Error::Backend(
+            "record_canonical_withdrawal is not supported by this backend".to_owned(),
+        ))
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — consult the canonical-role withdrawal
+    /// tombstone for `key_id` (V095). `Some(_)` iff the accord quorum withdrew
+    /// (or superseded) it; `None` otherwise. This is the load-bearing gate
+    /// consult: [`check_canonical_role_admission`](admission::check_canonical_role_admission)
+    /// calls it so a withdrawn canonical cannot be re-conferred the role. The
+    /// default returns `None` (backends without the V095 table — mock/test);
+    /// the real sqlite/postgres/memory backends override it.
+    async fn lookup_canonical_withdrawal(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<admission::CanonicalWithdrawal>, Error> {
+        let _ = key_id;
+        Ok(None)
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — list all canonical-role withdrawal
+    /// tombstones (V095), stable-sorted by `key_id`. Gives
+    /// `list_canonical_servers` consumers a withdrawn-history view. The default
+    /// returns empty; the real backends override it.
+    async fn list_canonical_withdrawals(
+        &self,
+    ) -> Result<Vec<admission::CanonicalWithdrawal>, Error> {
+        Ok(Vec::new())
+    }
 
     // ── Attestations ───────────────────────────────────────────────
 
@@ -3741,6 +3799,55 @@ pub enum Error {
         reason: String,
     },
 
+    /// v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — a
+    /// `federation_keys` write was REFUSED because it would confer the
+    /// `canonical` role on a `key_id` the accord quorum has WITHDRAWN (a durable
+    /// V095 `canonical_role_withdrawal` tombstone exists whose `superseded_by`
+    /// does NOT name this same key). This is the **revocation-wins** gate
+    /// consult that makes withdrawal defeat a re-add over anti-entropy: even a
+    /// genuinely anchor-scrubbed re-offer of the old `canonical` record is
+    /// refused here (verify-before-mutation, AV-9 — the row is NOT stored /
+    /// upgraded), so a peer still holding the old record cannot silently
+    /// re-confer the role on the next replication round. Stable `kind()` token
+    /// `canonical_role_withdrawn`. See
+    /// [`admission::check_canonical_role_admission`] and
+    /// [`admission::withdraw_canonical_role`].
+    #[error(
+        "federation_keys row {key_id:?} was refused the `canonical` role: the accord quorum \
+         withdrew it (V095 tombstone; superseded_by={superseded_by:?}) — a withdrawn canonical \
+         key cannot be re-conferred the role, even by a valid anchor-scrub (revocation-wins, \
+         #377); the withdrawal MUST be superseded to a new key to re-enter the canonical set"
+    )]
+    CanonicalRoleWithdrawn {
+        /// The `key_id` that carries a withdrawal tombstone.
+        key_id: String,
+        /// The successor `key_id` the withdrawal points to (a supersede), or
+        /// `None` for a plain withdraw.
+        superseded_by: Option<String>,
+    },
+
+    /// v13.1.0 (CIRISPersist#377, FSD Trust Root m-of-n) — a canonical
+    /// withdraw/supersede was REFUSED because its accord live-quorum authority
+    /// [`AccordDecision`](ciris_verify_core::accord_live_quorum::AccordDecision)
+    /// did not verify: either `authorized == false` (no m-of-n family quorum
+    /// verdict) or its `proposal.payload_sha256` does not commit to the
+    /// persist-computed canonical payload for THIS operation + target (a replay
+    /// of a decision authorizing some other payload). Fail-closed
+    /// (verify-before-mutation, AV-9 — no tombstone / successor is written).
+    /// Asymmetric by design: a single accord holder may ADD a canonical (1-of-N
+    /// anchor-scrub conferral) but NOT withdraw one. Stable `kind()` token
+    /// `canonical_withdrawal_authority_invalid`. See
+    /// [`admission::verify_canonical_withdraw_authority`].
+    #[error(
+        "canonical withdraw/supersede of {key_id:?} refused — invalid accord authority: {reason}"
+    )]
+    CanonicalWithdrawalAuthorityInvalid {
+        /// The target `key_id` the (rejected) withdraw/supersede named.
+        key_id: String,
+        /// Why the authority failed (unauthorized decision / payload mismatch).
+        reason: String,
+    },
+
     /// v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — a **federation-tier**
     /// attestation was REJECTED at the bulk store/replicate ingest gate
     /// because its envelope hybrid signature could not be verified
@@ -3994,6 +4101,10 @@ impl Error {
             Error::NodeAlreadyOwned { .. } => "federation_node_already_owned",
             Error::AmbiguousNodeOwner { .. } => "federation_ambiguous_node_owner",
             Error::CanonicalRoleNotAccordConferred { .. } => "canonical_role_not_accord_conferred",
+            Error::CanonicalRoleWithdrawn { .. } => "canonical_role_withdrawn",
+            Error::CanonicalWithdrawalAuthorityInvalid { .. } => {
+                "canonical_withdrawal_authority_invalid"
+            }
             Error::UnstewardedCommunityMember { .. } => "federation_unstewarded_community_member",
             Error::UserTargetStewardBindingForbidden { .. } => {
                 "federation_user_target_steward_binding_forbidden"

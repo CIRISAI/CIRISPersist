@@ -1960,6 +1960,28 @@ fn decode_installed_storage_budget(
     )
 }
 
+/// #377 — decode one `canonical_role_withdrawal` row (V095) into a
+/// [`CanonicalWithdrawal`](crate::federation::CanonicalWithdrawal). Column order:
+/// `key_id, withdrawn_at, authority_decision_digest, superseded_by,
+/// persist_row_hash`.
+fn sqlite_row_to_canonical_withdrawal(
+    row: &rusqlite::Row<'_>,
+) -> Result<crate::federation::CanonicalWithdrawal, rusqlite::Error> {
+    let withdrawn_at_text: String = row.get(1)?;
+    let withdrawn_at = chrono::DateTime::parse_from_rfc3339(&withdrawn_at_text)
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+        })?
+        .with_timezone(&chrono::Utc);
+    Ok(crate::federation::CanonicalWithdrawal {
+        key_id: row.get(0)?,
+        withdrawn_at,
+        authority_decision_digest: row.get(2)?,
+        superseded_by: row.get(3)?,
+        persist_row_hash: row.get(4)?,
+    })
+}
+
 fn opt_text(v: Option<&str>) -> SqlValue {
     match v {
         Some(s) => SqlValue::Text(s.to_owned()),
@@ -2625,6 +2647,108 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             )));
         }
         Ok(())
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — record a canonical-role WITHDRAW/SUPERSEDE
+    /// tombstone (V095). Idempotent on `key_id`: an existing row with the same
+    /// `superseded_by` + `authority_decision_digest` is a no-op; a differing one
+    /// is a [`Conflict`](crate::federation::Error::Conflict). Backend-symmetric
+    /// with Postgres + memory.
+    async fn record_canonical_withdrawal(
+        &self,
+        key_id: &str,
+        superseded_by: Option<&str>,
+        authority_decision_digest: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut record = crate::federation::CanonicalWithdrawal {
+            key_id: key_id.to_owned(),
+            withdrawn_at: chrono::Utc::now(),
+            authority_decision_digest: authority_decision_digest.to_owned(),
+            superseded_by: superseded_by.map(str::to_owned),
+            persist_row_hash: String::new(),
+        };
+        record.persist_row_hash = crate::federation::types::compute_persist_row_hash(&record)?;
+        let conn = self.conn.clone();
+        let outcome = (move || -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
+            let conn = conn.lock();
+            let existing: Option<(Option<String>, String)> = conn
+                .query_row(
+                    "SELECT superseded_by, authority_decision_digest \
+                     FROM canonical_role_withdrawal WHERE key_id = ?1",
+                    [&record.key_id],
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            if let Some((existing_superseded, existing_auth)) = existing {
+                if existing_superseded == record.superseded_by
+                    && existing_auth == record.authority_decision_digest
+                {
+                    return Ok(Ok(())); // idempotent no-op
+                }
+                return Ok(Err(crate::federation::Error::Conflict(format!(
+                    "canonical_role_withdrawal for {} already exists with different content",
+                    record.key_id
+                ))));
+            }
+            conn.execute(
+                "INSERT INTO canonical_role_withdrawal (\
+                    key_id, withdrawn_at, authority_decision_digest, superseded_by, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    record.key_id,
+                    record.withdrawn_at.to_rfc3339(),
+                    record.authority_decision_digest,
+                    record.superseded_by,
+                    record.persist_row_hash,
+                ],
+            )?;
+            Ok(Ok(()))
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("record_canonical_withdrawal: {e}"))
+        })?;
+        outcome
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — consult the V095 withdrawal tombstone for
+    /// `key_id` (the load-bearing gate consult). Backend-symmetric.
+    async fn lookup_canonical_withdrawal(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::CanonicalWithdrawal>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key_id = key_id.to_owned();
+        (move || -> Result<Option<crate::federation::CanonicalWithdrawal>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT key_id, withdrawn_at, authority_decision_digest, superseded_by, \
+                        persist_row_hash \
+                     FROM canonical_role_withdrawal WHERE key_id = ?1",
+                [&key_id],
+                sqlite_row_to_canonical_withdrawal,
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("lookup_canonical_withdrawal: {e}")))
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — all V095 withdrawal tombstones, stable-sorted
+    /// by `key_id`. Backend-symmetric.
+    async fn list_canonical_withdrawals(
+        &self,
+    ) -> Result<Vec<crate::federation::CanonicalWithdrawal>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        (move || -> Result<Vec<crate::federation::CanonicalWithdrawal>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT key_id, withdrawn_at, authority_decision_digest, superseded_by, \
+                        persist_row_hash \
+                     FROM canonical_role_withdrawal ORDER BY key_id",
+            )?;
+            let rows = stmt.query_map([], sqlite_row_to_canonical_withdrawal)?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_canonical_withdrawals: {e}")))
     }
 
     async fn put_attestation(
