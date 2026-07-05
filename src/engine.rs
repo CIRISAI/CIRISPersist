@@ -4028,6 +4028,32 @@ impl Engine {
         }
     }
 
+    /// v13.1.0 (CIRISPersist#381) — the **accord-attested bootstrap dial set**:
+    /// every [`TransportHint`](crate::federation::types::TransportHint) carried
+    /// inside the signed `registration_envelope` of each `canonical` server,
+    /// paired with the server `key_id` it reaches. This is the reachability
+    /// plane a cold node uses to JOIN the mesh with zero config — sourced from
+    /// the baked/replicated canonical records, not a hardcoded bootstrap-peers
+    /// const (which ciris-server 0.5.81 retires). Hints are the genesis/default
+    /// address; the mutable `TransportDestination` overlay wins at runtime.
+    /// A canonical server with no envelope hint contributes nothing (the field
+    /// is optional); consumers filter by `kind` (e.g. `ip` for the TCP entry).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn canonical_bootstrap_hints(
+        &self,
+    ) -> Result<Vec<(String, crate::federation::types::TransportHint)>, crate::federation::Error>
+    {
+        let servers = self.list_canonical_servers().await?;
+        Ok(servers
+            .into_iter()
+            .flat_map(|r| {
+                r.transport_hints()
+                    .into_iter()
+                    .map(move |h| (r.key_id.clone(), h))
+            })
+            .collect())
+    }
+
     /// v8.8.0 (CIRISPersist#234, CEG 1.0-RC28/RC29 §5.6.8.15) — the
     /// symmetric **deregister** path: the revocation teeth a withdrawn
     /// `consent:replication` relies on.
@@ -5067,6 +5093,47 @@ mod tests {
             "list_canonical_servers must include the baked {}",
             node.key_id
         );
+    }
+
+    /// v13.1.0 (CIRISPersist#381) — `canonical_bootstrap_hints` surfaces the
+    /// accord-attested `transport_hints` embedded in a canonical server's
+    /// signed envelope, paired with its key_id — the zero-config bootstrap
+    /// dial set. A canonical record carrying an `ip` hint in its envelope is
+    /// admitted (A1-conferred) and its hint appears; the baked hintless
+    /// genesis record contributes nothing.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn canonical_bootstrap_hints_surface_envelope_transport() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+
+        // Clone the baked canonical record, give it a distinct key_id and an
+        // `ip` transport hint in its (still A1-scrubbed) envelope, and admit
+        // it through the canonical gate (scrub_key_id = A1 ∈ anchor).
+        let mut hinted = crate::federation::genesis::canonical_genesis_records()[0]
+            .record
+            .clone();
+        hinted.key_id = "ciris-canonical-2-hinted".into();
+        hinted.identity_ref = hinted.key_id.clone();
+        if let Some(env) = hinted.registration_envelope.as_object_mut() {
+            env.insert(
+                "transport_hints".into(),
+                serde_json::json!([{ "kind": "ip", "destination": "108.61.242.236:4242" }]),
+            );
+        }
+        engine
+            .federation_directory()
+            .put_public_key(crate::federation::SignedKeyRecord { record: hinted })
+            .await
+            .expect("admit hinted canonical");
+
+        let hints = engine.canonical_bootstrap_hints().await.expect("hints");
+        let ip = hints
+            .iter()
+            .find(|(kid, h)| kid == "ciris-canonical-2-hinted" && h.kind == "ip")
+            .expect("ip bootstrap hint present");
+        assert_eq!(ip.1.destination, "108.61.242.236:4242");
     }
 
     #[cfg(feature = "sqlite")]
