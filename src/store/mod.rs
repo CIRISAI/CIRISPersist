@@ -26,7 +26,10 @@ pub mod sqlite;
 pub mod types;
 
 pub use backend::{Backend, InsertReport, PublicKeySample};
-pub use decompose::{decompose, dedup_key, Decomposed};
+pub use decompose::{
+    decompose, dedup_key, trace_dedup_shard_key, trace_dedup_shard_key_parts, Decomposed,
+    TRACE_DEDUP_SHARD_COUNT,
+};
 pub use memory::MemoryBackend;
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresBackend;

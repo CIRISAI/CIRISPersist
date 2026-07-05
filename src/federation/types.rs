@@ -718,7 +718,46 @@ pub struct KeyRecord {
     pub consent_role: Option<String>,
 }
 
+/// A single **transport reachability hint** carried INSIDE a
+/// [`KeyRecord`]'s signed `registration_envelope` (CIRISPersist#381).
+///
+/// Because the hint lives inside the envelope the accord holder scrubs, it
+/// is **accord-attested by construction** — it is covered by the same
+/// `original_content_hash` + scrub signature as the key, and cannot be
+/// spoofed post-hoc. This is the *genesis / default* address; runtime
+/// address churn is still handled by the mutable `TransportDestination`
+/// overlay + the 1-of-N update-address op, which wins when present.
+///
+/// `kind` is an open vocabulary (`ip` | `reticulum` | `https` | …); the
+/// `ip` hint is the internet-dialable TCP entry a cold node bootstraps
+/// against, whereas a `reticulum` destination is a pubkey-derivable overlay
+/// address (not itself a bootstrap target).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportHint {
+    /// Open-vocabulary transport kind (`ip` | `reticulum` | `https` | …).
+    pub kind: String,
+    /// The address for that kind (e.g. `108.61.242.236:4242`).
+    pub destination: String,
+}
+
 impl KeyRecord {
+    /// The **transport reachability hints** embedded in this record's signed
+    /// `registration_envelope` (CIRISPersist#381) — the accord-attested
+    /// genesis/default dial addresses. Returns `[]` when the envelope carries
+    /// no `transport_hints` (the field is OPTIONAL: ordinary node records and
+    /// pre-#381 baked records simply omit it). A malformed `transport_hints`
+    /// value is treated as absent (`[]`) rather than an error — this is a
+    /// read-side convenience over opaque signed JSON, not an admission gate.
+    ///
+    /// This is a pure READ over the already-signed envelope; it does not
+    /// mutate anything and cannot change the record's hash or signature.
+    pub fn transport_hints(&self) -> Vec<TransportHint> {
+        self.registration_envelope
+            .get("transport_hints")
+            .and_then(|v| serde_json::from_value::<Vec<TransportHint>>(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
     /// True iff both PQC components have been attached. Consumers
     /// composing strict-hybrid trust policy refuse rows where this
     /// returns false.
@@ -2145,6 +2184,53 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v13.1.0 (CIRISPersist#381) — `KeyRecord::transport_hints` reads the
+    /// accord-attested hints from the signed envelope: present → typed list,
+    /// absent → `[]`, malformed → `[]` (read-side convenience, not a gate).
+    #[test]
+    fn key_record_transport_hints_read_from_envelope() {
+        let mut r = KeyRecord {
+            key_id: "n1".into(),
+            pubkey_ed25519_base64: "AAAA".into(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: algorithm::HYBRID.into(),
+            identity_type: identity_type::NODE.into(),
+            identity_ref: "n1".into(),
+            valid_from: "2026-07-05T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            registration_envelope: serde_json::json!({
+                "key_id": "n1",
+                "transport_hints": [
+                    { "kind": "ip", "destination": "108.61.242.236:4242" },
+                    { "kind": "reticulum", "destination": "deadbeef" }
+                ]
+            }),
+            original_content_hash: "h".into(),
+            scrub_signature_classical: "s".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "A1".into(),
+            scrub_timestamp: "2026-07-05T00:00:00Z".parse().unwrap(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+        };
+        let hints = r.transport_hints();
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0].kind, "ip");
+        assert_eq!(hints[0].destination, "108.61.242.236:4242");
+        assert_eq!(hints[1].kind, "reticulum");
+
+        // Absent → empty (optional field; ordinary/pre-#381 records).
+        r.registration_envelope = serde_json::json!({ "key_id": "n1" });
+        assert!(r.transport_hints().is_empty());
+
+        // Malformed → empty (not an error on the read path).
+        r.registration_envelope = serde_json::json!({ "transport_hints": "not-a-list" });
+        assert!(r.transport_hints().is_empty());
+    }
 
     /// v12.7.0 (CIRISPersist#368) — the FFI wire contract for the
     /// witness-targets-subject age surface: `EmitAttestationInput` JSON

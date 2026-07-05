@@ -2795,6 +2795,29 @@ pub async fn check_canonical_role_admission_anchored(
         return Ok(());
     }
 
+    // v13.1.0 (CIRISPersist#377) — revocation-wins: a `key_id` the accord
+    // quorum WITHDREW (V095 tombstone) cannot be re-conferred `canonical`, EVEN
+    // by a valid anchor-scrub. The add-gate is monotonic and the anti-entropy
+    // path ([`apply_replicated_key_record`](super::register), #375) re-runs it,
+    // so without this consult a peer still holding the old anchor-scrubbed
+    // `canonical` record would silently RE-ADD the role on the next replication
+    // round — the withdrawal would evaporate. Consulting the durable,
+    // quorum-verified tombstone makes the gate
+    // "anchor-scrubbed AND not withdrawn-by-quorum" (same revocation-wins
+    // ordering as #370 B6 / #161). A SUPERSEDE successor is EXEMPT: a tombstone
+    // whose `superseded_by` names THIS same `key_id` is the rotate-in target of
+    // a key-id-preserving supersede, not a block. Runs before the anchor-scrub
+    // checks so a withdrawn key is refused even when the incoming record carries
+    // a genuine anchor scrub.
+    if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
+        if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
+            return Err(Error::CanonicalRoleWithdrawn {
+                key_id: row.key_id.clone(),
+                superseded_by: w.superseded_by.clone(),
+            });
+        }
+    }
+
     // Self-signed can NEVER confer `canonical` — this is the "a node cannot
     // claim the founding role itself" invariant.
     if row.scrub_key_id == row.key_id {
@@ -2860,6 +2883,379 @@ pub async fn is_canonical(
         .lookup_public_key(key_id)
         .await?
         .is_some_and(|r| identity_type::set_contains(&r.identity_type, identity_type::CANONICAL)))
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// v13.1.0 (CIRISPersist#377) — canonical-role WITHDRAW / SUPERSEDE.
+//
+// The two DESTRUCTIVE Trust Root ops on top of #372's monotonic add-canonical.
+// Withdrawal is a durable, quorum-verified TOMBSTONE (V095) — NOT a hard
+// un-set — because the add-gate above is monotonic and anti-entropy re-runs
+// it, so a hard drop would be silently re-added on the next replication round.
+// The gate ([`check_canonical_role_admission_anchored`]) consults the tombstone
+// so the effective rule is "anchor-scrubbed AND not withdrawn-by-quorum".
+// ─────────────────────────────────────────────────────────────────────
+
+/// The canonical `op` token committed by a plain-WITHDRAW authority payload
+/// (bound into `AccordProposal::payload_sha256`).
+pub const OP_WITHDRAW_CANONICAL: &str = "withdraw_canonical";
+/// The canonical `op` token committed by a SUPERSEDE authority payload.
+pub const OP_SUPERSEDE_CANONICAL: &str = "supersede_canonical";
+
+/// v13.1.0 (CIRISPersist#377) — a stored canonical-role WITHDRAW/SUPERSEDE
+/// tombstone (V095 `canonical_role_withdrawal`). One row per withdrawn
+/// canonical `key_id`. The gate consults it (revocation-wins); a
+/// [`superseded_by`](Self::superseded_by)`= Some(new)` row is the old→new audit
+/// link of a supersede (a plain withdraw leaves it `None`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalWithdrawal {
+    /// The withdrawn canonical node (the `federation_keys.key_id` whose
+    /// `canonical` role is tombstoned).
+    pub key_id: String,
+    /// When the withdrawal was recorded.
+    pub withdrawn_at: chrono::DateTime<chrono::Utc>,
+    /// The authorizing accord **proposal digest** (V091 / #302) — the audit
+    /// anchor for the m-of-n quorum whose stored, verified participations
+    /// persist re-tallied to authorize this withdrawal.
+    pub authority_decision_digest: String,
+    /// The successor key_id for a SUPERSEDE (old→new link); `None` for a plain
+    /// WITHDRAW.
+    pub superseded_by: Option<String>,
+    /// Substrate row hash (canonical SHA-256 of the stored row).
+    pub persist_row_hash: String,
+}
+
+/// v13.1.0 (CIRISPersist#377) — the canonical persist-computed authority
+/// payload digest a withdraw/supersede accord **proposal** MUST commit to (its
+/// `payload_sha256`). Lowercase-hex SHA-256 of the JCS (RFC 8785)
+/// canonicalization of `{"op": <op>, "target_key_id": <target>[,
+/// "successor_key_id": <successor>]}`. `op` is [`OP_WITHDRAW_CANONICAL`] or
+/// [`OP_SUPERSEDE_CANONICAL`]; `successor_key_id` is present iff `successor` is
+/// `Some` (a supersede). Persist DEFINES this payload — it never trusts a
+/// caller-supplied digest — so a decision authorizing some OTHER payload cannot
+/// be replayed to withdraw a different key.
+pub fn canonical_withdrawal_payload_sha256(
+    op: &str,
+    target_key_id: &str,
+    successor_key_id: Option<&str>,
+) -> Result<String, Error> {
+    use sha2::{Digest, Sha256};
+    let mut payload = serde_json::Map::new();
+    payload.insert("op".to_owned(), serde_json::Value::String(op.to_owned()));
+    payload.insert(
+        "target_key_id".to_owned(),
+        serde_json::Value::String(target_key_id.to_owned()),
+    );
+    if let Some(succ) = successor_key_id {
+        payload.insert(
+            "successor_key_id".to_owned(),
+            serde_json::Value::String(succ.to_owned()),
+        );
+    }
+    let bytes = ciris_verify_core::jcs::canonicalize(&serde_json::Value::Object(payload))
+        .map_err(|e| Error::Backend(format!("canonicalize canonical-withdrawal payload: {e}")))?;
+    Ok(hex::encode(Sha256::digest(&bytes)))
+}
+
+/// v13.1.0 (CIRISPersist#377) — the **destructive quorum threshold** `M` for a
+/// canonical withdraw/supersede: **2 of 3** accord holders (A1/B1/C1) must vote
+/// YES. This is the genesis trust model's destructive floor (1-of-N bootstrap
+/// ADD — the anchor-scrub conferral — vs 2/3 for a DESTRUCTIVE op). Absolute,
+/// not a fraction of `|L|` — an adversary must present ≥2 distinct real accord
+/// holders' cryptographically-verified YES participations; inflating `|L|` with
+/// captured keys cannot lower the bar.
+pub const CANONICAL_WITHDRAW_QUORUM_M: usize = 2;
+/// The accord-holder set size `N` (A1/B1/C1) the [`CANONICAL_WITHDRAW_QUORUM_M`]
+/// threshold is `M`-of-.
+pub const CANONICAL_WITHDRAW_QUORUM_N: usize = 3;
+
+/// The accord-holder standing-roster `key_id`s (A1/B1/C1) — the FIXED identities
+/// whose PINNED directory pubkeys form the canonical-withdraw quorum roster.
+/// Sourced from the baked genesis records, never caller input.
+fn accord_holder_roster_key_ids() -> Vec<String> {
+    super::genesis::accord_holder_genesis_records()
+        .iter()
+        .map(|r| r.record.key_id.clone())
+        .collect()
+}
+
+/// v13.1.0 (CIRISPersist#377) — verify a withdraw/supersede authority by
+/// **re-tallying persist's OWN cryptographically-verified state**, never a
+/// caller-supplied `AccordDecision` (whose `authorized` bool is an
+/// unauthenticated assertion an attacker could fabricate — the #377 security
+/// fix). Fail-closed with [`Error::CanonicalWithdrawalAuthorityInvalid`].
+///
+/// Steps, against the live directory:
+/// 1. [`get_accord_proposal`](super::FederationDirectory::get_accord_proposal)`(proposal_digest)`
+///    MUST resolve to a stored proposal (#302 / V091).
+/// 2. The proposal MUST be over the HUMANITY_ACCORD family
+///    ([`HUMANITY_ACCORD_FAMILY_KEY_ID`](ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID))
+///    and its `payload_sha256` MUST equal the persist-computed
+///    [`canonical_withdrawal_payload_sha256`] for `(op, target[, successor])` —
+///    so the quorum voted on EXACTLY this op + target, no replay.
+/// 3. The standing roster is the accord holders (`roster_key_ids`) resolved to
+///    their PINNED directory pubkeys ([`ThresholdMember`](ciris_verify_core::threshold::ThresholdMember)).
+/// 4. [`list_accord_participations`](super::FederationDirectory::list_accord_participations)`(proposal_digest)`
+///    are the STORED, per-write-verified votes; re-tally them with verify-core
+///    [`tally_live_quorum`](ciris_verify_core::accord_live_quorum::tally_live_quorum)
+///    (each participation's hybrid signature + proposal-digest + seat binding is
+///    re-checked; signers resolve ONLY in the pinned roster; deduped by member).
+/// 5. Require `tally.yes >= `[`CANONICAL_WITHDRAW_QUORUM_M`] (2-of-3). A caller
+///    cannot forge YES votes: only real, signed participations the roster holders
+///    produced (and persist already verified at store time) count.
+///
+/// Returns the stored proposal's digest (the tombstone's `authority_decision_digest`).
+async fn verify_canonical_authority_over_roster(
+    directory: &dyn super::FederationDirectory,
+    proposal_digest: &str,
+    op: &str,
+    target_key_id: &str,
+    successor_key_id: Option<&str>,
+    roster_key_ids: &[String],
+) -> Result<String, Error> {
+    use ciris_verify_core::accord_live_quorum::tally_live_quorum;
+    use ciris_verify_core::threshold::ThresholdMember;
+
+    let invalid = |reason: String| Error::CanonicalWithdrawalAuthorityInvalid {
+        key_id: target_key_id.to_owned(),
+        reason,
+    };
+
+    // (1) The proposal MUST be stored (a caller cannot invent one).
+    let stored = directory
+        .get_accord_proposal(proposal_digest)
+        .await?
+        .ok_or_else(|| {
+            invalid(format!(
+                "no stored accord proposal for digest {proposal_digest:?} — the quorum \
+                 evidence does not exist in persist's own state"
+            ))
+        })?;
+    let proposal = stored.proposal;
+
+    // (2a) Family scope: only the HUMANITY_ACCORD family may authorize a
+    //      canonical withdraw/supersede (parity with the kill-switch path).
+    if proposal.family_key_id != ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID {
+        return Err(invalid(format!(
+            "proposal family_key_id {:?} is not the HUMANITY_ACCORD family {:?}",
+            proposal.family_key_id,
+            ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
+        )));
+    }
+
+    // (2b) Payload binding: the quorum voted on EXACTLY this op + target.
+    let expected = canonical_withdrawal_payload_sha256(op, target_key_id, successor_key_id)?;
+    if proposal.payload_sha256 != expected {
+        return Err(invalid(format!(
+            "proposal payload_sha256 ({got:?}) does not commit to the canonical `{op}` payload \
+             for target {target_key_id:?} (expected {expected:?}) — the quorum did not authorize \
+             THIS operation",
+            got = proposal.payload_sha256,
+        )));
+    }
+
+    // (3) Standing roster = accord holders resolved to their PINNED directory
+    //     pubkeys (never caller-supplied keys).
+    let mut roster: Vec<ThresholdMember> = Vec::with_capacity(roster_key_ids.len());
+    for kid in roster_key_ids {
+        if let Some(rec) = directory.lookup_public_key(kid).await? {
+            roster.push(ThresholdMember {
+                member_id: rec.key_id,
+                ed25519_public_key_base64: rec.pubkey_ed25519_base64,
+                mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
+                role: None,
+            });
+        }
+    }
+
+    // (4) Re-tally persist's own stored, per-write-verified participations. Each
+    //     is re-verified (sig + proposal-digest + seat) against the pinned roster.
+    let participations: Vec<_> = directory
+        .list_accord_participations(proposal_digest)
+        .await?
+        .into_iter()
+        .map(|s| s.participation)
+        .collect();
+    let tally = tally_live_quorum(&proposal, &participations, &roster)
+        .map_err(|e| invalid(format!("live-quorum tally failed (fail-closed): {e:?}")))?;
+
+    // (5) Destructive threshold: >= 2 distinct accord holders voting YES.
+    if tally.yes < CANONICAL_WITHDRAW_QUORUM_M {
+        return Err(invalid(format!(
+            "insufficient accord quorum: {yes} YES vote(s) among the live set {live:?}, but a \
+             canonical withdraw/supersede requires >= {m} of {n} accord holders (destructive \
+             threshold)",
+            yes = tally.yes,
+            live = tally.live_set,
+            m = CANONICAL_WITHDRAW_QUORUM_M,
+            n = CANONICAL_WITHDRAW_QUORUM_N,
+        )));
+    }
+
+    Ok(proposal.digest())
+}
+
+/// v13.1.0 (CIRISPersist#377) — verify a PLAIN-WITHDRAW authority binds a
+/// withdraw of `key_id`, against the production accord-holder roster (A1/B1/C1).
+/// Returns the authorizing proposal digest. See
+/// [`verify_canonical_authority_over_roster`].
+pub async fn verify_canonical_withdraw_authority(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+    proposal_digest: &str,
+) -> Result<String, Error> {
+    verify_canonical_authority_over_roster(
+        directory,
+        proposal_digest,
+        OP_WITHDRAW_CANONICAL,
+        key_id,
+        None,
+        &accord_holder_roster_key_ids(),
+    )
+    .await
+}
+
+/// v13.1.0 (CIRISPersist#377) — verify a SUPERSEDE authority binds
+/// `old_key_id → new_key_id`, against the production accord-holder roster.
+/// Returns the authorizing proposal digest. See
+/// [`verify_canonical_authority_over_roster`].
+pub async fn verify_canonical_supersede_authority(
+    directory: &dyn super::FederationDirectory,
+    old_key_id: &str,
+    new_key_id: &str,
+    proposal_digest: &str,
+) -> Result<String, Error> {
+    verify_canonical_authority_over_roster(
+        directory,
+        proposal_digest,
+        OP_SUPERSEDE_CANONICAL,
+        old_key_id,
+        Some(new_key_id),
+        &accord_holder_roster_key_ids(),
+    )
+    .await
+}
+
+/// v13.1.0 (CIRISPersist#377) — **withdraw** the `canonical` role from `key_id`.
+/// `proposal_digest` names a STORED accord proposal (#302) whose payload commits
+/// to `(withdraw, key_id)`; persist re-tallies its own cryptographically-verified
+/// participations against the accord-holder roster at the 2-of-3 destructive
+/// threshold (verify-before-mutation, AV-9 — never a caller-supplied
+/// `AccordDecision.authorized` bool), then records the durable tombstone (V095).
+/// Because [`check_canonical_role_admission`] consults it, a replicated re-offer
+/// of the old anchor-scrubbed `canonical` record for `key_id` is Refused, and
+/// [`is_canonical_effective`] reads `false`. Idempotent.
+pub async fn withdraw_canonical_role(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+    proposal_digest: &str,
+) -> Result<(), Error> {
+    withdraw_canonical_role_over_roster(
+        directory,
+        key_id,
+        proposal_digest,
+        &accord_holder_roster_key_ids(),
+    )
+    .await
+}
+
+/// [`withdraw_canonical_role`] with an explicit accord-holder roster keyset — the
+/// core primitive. Production callers use the [`withdraw_canonical_role`] wrapper
+/// (genesis A1/B1/C1 roster); this form exists so tests can supply their own
+/// signable holders, mirroring [`check_canonical_role_admission_anchored`].
+pub async fn withdraw_canonical_role_over_roster(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+    proposal_digest: &str,
+    roster_key_ids: &[String],
+) -> Result<(), Error> {
+    let authority_digest = verify_canonical_authority_over_roster(
+        directory,
+        proposal_digest,
+        OP_WITHDRAW_CANONICAL,
+        key_id,
+        None,
+        roster_key_ids,
+    )
+    .await?;
+    directory
+        .record_canonical_withdrawal(key_id, None, &authority_digest)
+        .await
+}
+
+/// v13.1.0 (CIRISPersist#377) — **supersede** (rotate) a canonical server:
+/// re-tally the stored quorum for `proposal_digest` (payload committing to
+/// `old_key_id → new_record`'s key_id) at the 2-of-3 destructive threshold
+/// (AV-9), then admit the successor (the normal anchor-scrub add-gate runs inside
+/// [`put_public_key`](super::FederationDirectory::put_public_key)) AND record
+/// `old_key_id`'s withdrawal with `superseded_by = new_key_id` (the old→new audit
+/// link). The authority is verified FIRST, so if the successor is refused no
+/// tombstone is written; the successor is admitted before the predecessor is
+/// tombstoned so the canonical set is never momentarily empty. Backend-agnostic
+/// (all three backends run identical steps — the ordering IS the atomicity
+/// guarantee and a re-record is idempotent).
+pub async fn supersede_canonical(
+    directory: &dyn super::FederationDirectory,
+    old_key_id: &str,
+    new_record: super::SignedKeyRecord,
+    proposal_digest: &str,
+) -> Result<(), Error> {
+    supersede_canonical_over_roster(
+        directory,
+        old_key_id,
+        new_record,
+        proposal_digest,
+        &accord_holder_roster_key_ids(),
+    )
+    .await
+}
+
+/// [`supersede_canonical`] with an explicit accord-holder roster keyset (tests).
+/// See [`withdraw_canonical_role_over_roster`].
+pub async fn supersede_canonical_over_roster(
+    directory: &dyn super::FederationDirectory,
+    old_key_id: &str,
+    new_record: super::SignedKeyRecord,
+    proposal_digest: &str,
+    roster_key_ids: &[String],
+) -> Result<(), Error> {
+    let new_key_id = new_record.record.key_id.clone();
+    let authority_digest = verify_canonical_authority_over_roster(
+        directory,
+        proposal_digest,
+        OP_SUPERSEDE_CANONICAL,
+        old_key_id,
+        Some(&new_key_id),
+        roster_key_ids,
+    )
+    .await?;
+    // Admit the successor first — the anchor-scrub add-gate + (for a key-id-
+    // preserving rotation) the `superseded_by == key_id` withdrawal exemption
+    // are enforced inside `put_public_key`.
+    directory.put_public_key(new_record).await?;
+    directory
+        .record_canonical_withdrawal(old_key_id, Some(&new_key_id), &authority_digest)
+        .await
+}
+
+/// v13.1.0 (CIRISPersist#377) — the **tombstone-aware** `canonical`-membership
+/// read: `true` iff `key_id` carries the `canonical` role AND has NO withdrawal
+/// tombstone (a superseded successor whose tombstone names itself is treated as
+/// withdrawn for its OWN key — the successor is a distinct key). Where
+/// [`is_canonical`] is the raw set-membership read (sufficient pre-#377 because
+/// the add-gate was the only enforcement point), this is the read consumers
+/// (and `list_canonical_servers` filtering) should use once withdrawals exist.
+pub async fn is_canonical_effective(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+) -> Result<bool, Error> {
+    if !is_canonical(directory, key_id).await? {
+        return Ok(false);
+    }
+    Ok(directory
+        .lookup_canonical_withdrawal(key_id)
+        .await?
+        .is_none())
 }
 
 /// #249 Cut B — the steward-binding **PATH** for audit: the actual delegation
@@ -5417,5 +5813,531 @@ mod canonical_gate_tests {
                 .all(|r| identity_type::set_contains(&r.identity_type, identity_type::CANONICAL)),
             "every listed row carries canonical"
         );
+    }
+}
+
+/// v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — the canonical-role
+/// WITHDRAW / SUPERSEDE decision table, run identically against SQLite and (when
+/// `CIRIS_PERSIST_TEST_PG_URL` is set) Postgres, plus a memory-backend gate
+/// consult. Authority is re-tallied from persist's OWN stored,
+/// cryptographically-verified `accord_participation` rows (never a
+/// caller-supplied `AccordDecision.authorized` bool) at the 2-of-3 destructive
+/// threshold. Exercises: tombstone recording; **forged-authority rejection** (a
+/// stored proposal with < 2 valid YES participations cannot withdraw); the
+/// revocation-wins gate consult; the #375 anti-entropy composition
+/// (`apply_replicated_key_record` refuses a re-add of a withdrawn canonical);
+/// atomic supersede; and payload-binding fail-closed. No pg/sqlite/memory
+/// asymmetry.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+mod canonical_withdrawal_tests {
+    use super::super::accord_quorum::test_fixtures::signed_participation;
+    use super::super::genesis::accord_holder_genesis_records;
+    use super::super::operational::test_support::Identity;
+    use super::super::types::{algorithm, identity_type};
+    use super::super::{FederationDirectory, KeyRecord, SignedKeyRecord};
+    use super::{
+        canonical_withdrawal_payload_sha256, is_canonical_effective,
+        supersede_canonical_over_roster, withdraw_canonical_role_over_roster,
+        OP_SUPERSEDE_CANONICAL, OP_WITHDRAW_CANONICAL,
+    };
+    use crate::verify::canonical::ceg_produce_canonicalize;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID;
+    use ciris_verify_core::accord_live_quorum::{AccordAction, AccordProposal, Vote};
+    use ciris_verify_core::threshold::ThresholdMember;
+    use ed25519_dalek::SigningKey;
+    use sha2::{Digest, Sha256};
+
+    /// A syntactically-valid `federation_keys` `KeyRecord` for `key_id` (the
+    /// scrub-signature is not verified at the `put_public_key` chokepoint, so a
+    /// well-formed record suffices to exercise the gate). Deterministic pubkey.
+    fn record(key_id: &str, identity_type: &str, scrub_key_id: &str) -> KeyRecord {
+        let mut seed = [0x22u8; 32];
+        for (i, b) in key_id.bytes().take(32).enumerate() {
+            seed[i] = b;
+        }
+        let ed = SigningKey::from_bytes(&seed);
+        let envelope = serde_json::json!({ "key_id": key_id });
+        let canonical = ceg_produce_canonicalize(&envelope).expect("canonicalize");
+        let now = chrono::Utc::now();
+        KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: B64.encode(ed.verifying_key().to_bytes()),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: algorithm::HYBRID.to_owned(),
+            identity_type: identity_type.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: envelope,
+            original_content_hash: hex::encode(Sha256::digest(&canonical)),
+            scrub_signature_classical: "AA".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: scrub_key_id.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+        }
+    }
+
+    async fn put(dir: &dyn FederationDirectory, rec: KeyRecord) -> Result<(), super::Error> {
+        dir.put_public_key(SignedKeyRecord { record: rec }).await
+    }
+
+    /// Register a signable roster holder as a `node`-role `federation_keys` row
+    /// whose PINNED pubkeys equal the `Identity`'s (so the authority tally
+    /// resolves the roster to the SAME keys the participations were signed with).
+    /// `node` (not `accord_holder`) avoids the hardware-attestation gate.
+    async fn register_holder(dir: &dyn FederationDirectory, id: &Identity) {
+        let m = id.member();
+        let mut rec = record(&id.key_id, identity_type::NODE, &id.key_id);
+        rec.pubkey_ed25519_base64 = m.ed25519_public_key_base64;
+        rec.pubkey_ml_dsa_65_base64 = m.mldsa65_public_key_base64;
+        put(dir, rec).await.expect("register roster holder");
+    }
+
+    /// Seed a STORED accord proposal (family = HUMANITY_ACCORD) committing to the
+    /// canonical `op`/`target`/`successor` payload, plus one signed YES
+    /// participation per holder index in `yes_voters`. Returns the proposal
+    /// digest. This is persist's OWN verified evidence — the authority re-tally
+    /// reads it back.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_quorum(
+        dir: &dyn FederationDirectory,
+        holders: &[Identity],
+        roster: &[ThresholdMember],
+        op: &str,
+        target: &str,
+        successor: Option<&str>,
+        yes_voters: &[usize],
+        nonce: &str,
+    ) -> String {
+        let payload_sha256 =
+            canonical_withdrawal_payload_sha256(op, target, successor).expect("payload sha256");
+        let proposal = AccordProposal {
+            family_key_id: HUMANITY_ACCORD_FAMILY_KEY_ID.to_owned(),
+            action: AccordAction::RosterChange,
+            nonce: nonce.to_owned(),
+            window_until: "2031-01-01T00:00:00Z".to_owned(),
+            prior_family_digest: "prior-family-digest".to_owned(),
+            payload_sha256,
+        };
+        dir.issue_accord_nonce(HUMANITY_ACCORD_FAMILY_KEY_ID, nonce)
+            .await
+            .expect("issue nonce");
+        dir.put_accord_proposal(proposal.clone(), None)
+            .await
+            .expect("put proposal");
+        for &i in yes_voters {
+            let part = signed_participation(&holders[i], &proposal, Vote::Yes);
+            dir.put_accord_participation(part, roster)
+                .await
+                .expect("put participation");
+        }
+        proposal.digest()
+    }
+
+    /// The full withdraw/supersede decision table over an anchor-seeded directory
+    /// (genesis A1/B1/C1 present for the anchor-scrub ADD gate) with a signable
+    /// 3-holder quorum roster (H0/H1/H2) for the destructive-op authority.
+    async fn run_withdrawal_matrix(dir: &dyn FederationDirectory, tag: &str) {
+        let a1 = &accord_holder_genesis_records()[0].record;
+        assert_eq!(a1.key_id, "A1");
+
+        // Signable quorum roster (3 holders) resolved from directory pinned keys.
+        let holders = [
+            Identity::new(&format!("H0-{tag}")),
+            Identity::new(&format!("H1-{tag}")),
+            Identity::new(&format!("H2-{tag}")),
+        ];
+        for h in &holders {
+            register_holder(dir, h).await;
+        }
+        let roster: Vec<ThresholdMember> = holders.iter().map(|h| h.member()).collect();
+        let roster_key_ids: Vec<String> = holders.iter().map(|h| h.key_id.clone()).collect();
+
+        // ── Admit an anchor-scrubbed canonical, then withdraw it. ──────────
+        let good = format!("cw-good-{tag}");
+        put(dir, record(&good, "canonical,node", &a1.key_id))
+            .await
+            .expect("anchor-scrubbed canonical must be ADMITTED");
+        assert!(is_canonical_effective(dir, &good).await.unwrap());
+
+        // (A) FORGED-AUTHORITY REJECTION: a stored proposal committing to
+        //     (withdraw, good) but with ZERO participations → the re-tally
+        //     yields 0 YES < 2 → REFUSED, role NOT withdrawn. A caller cannot
+        //     fabricate a quorum: only real signed participations count.
+        let d_zero = seed_quorum(
+            dir,
+            &holders,
+            &roster,
+            OP_WITHDRAW_CANONICAL,
+            &good,
+            None,
+            &[],
+            &format!("n-zero-{tag}"),
+        )
+        .await;
+        let err = withdraw_canonical_role_over_roster(dir, &good, &d_zero, &roster_key_ids)
+            .await
+            .expect_err("zero-participation authority must be REFUSED");
+        assert_eq!(err.kind(), "canonical_withdrawal_authority_invalid");
+        assert!(dir
+            .lookup_canonical_withdrawal(&good)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(is_canonical_effective(dir, &good).await.unwrap());
+
+        // (B) FEWER-THAN-2: a proposal with exactly ONE valid YES participation
+        //     → 1 < 2 destructive threshold → REFUSED.
+        let d_one = seed_quorum(
+            dir,
+            &holders,
+            &roster,
+            OP_WITHDRAW_CANONICAL,
+            &good,
+            None,
+            &[0],
+            &format!("n-one-{tag}"),
+        )
+        .await;
+        let err = withdraw_canonical_role_over_roster(dir, &good, &d_one, &roster_key_ids)
+            .await
+            .expect_err("single-vote authority must be REFUSED");
+        assert_eq!(err.kind(), "canonical_withdrawal_authority_invalid");
+        assert!(dir
+            .lookup_canonical_withdrawal(&good)
+            .await
+            .unwrap()
+            .is_none());
+
+        // (C) NO STORED PROPOSAL: a digest persist never stored → REFUSED (the
+        //     quorum evidence does not exist).
+        let err = withdraw_canonical_role_over_roster(
+            dir,
+            &good,
+            &format!("deadbeef-no-such-proposal-{tag}"),
+            &roster_key_ids,
+        )
+        .await
+        .expect_err("nonexistent proposal must be REFUSED");
+        assert_eq!(err.kind(), "canonical_withdrawal_authority_invalid");
+
+        // (D) PAYLOAD REPLAY: a genuinely-quorumed proposal for a DIFFERENT
+        //     target cannot be replayed to withdraw `good`.
+        let decoy = format!("cw-decoy-{tag}");
+        let d_decoy = seed_quorum(
+            dir,
+            &holders,
+            &roster,
+            OP_WITHDRAW_CANONICAL,
+            &decoy,
+            None,
+            &[0, 1],
+            &format!("n-decoy-{tag}"),
+        )
+        .await;
+        let err = withdraw_canonical_role_over_roster(dir, &good, &d_decoy, &roster_key_ids)
+            .await
+            .expect_err("payload-mismatch (wrong target) must be REFUSED");
+        assert_eq!(err.kind(), "canonical_withdrawal_authority_invalid");
+        assert!(dir
+            .lookup_canonical_withdrawal(&good)
+            .await
+            .unwrap()
+            .is_none());
+
+        // (E) POSITIVE: a proposal committing to (withdraw, good) with 2 distinct
+        //     valid YES votes → WITHDRAWS: tombstone recorded, is_canonical false.
+        let d_good = seed_quorum(
+            dir,
+            &holders,
+            &roster,
+            OP_WITHDRAW_CANONICAL,
+            &good,
+            None,
+            &[0, 1],
+            &format!("n-good-{tag}"),
+        )
+        .await;
+        withdraw_canonical_role_over_roster(dir, &good, &d_good, &roster_key_ids)
+            .await
+            .expect("2-of-3 quorum must withdraw");
+        let w = dir
+            .lookup_canonical_withdrawal(&good)
+            .await
+            .unwrap()
+            .expect("tombstone recorded");
+        assert_eq!(w.key_id, good);
+        assert_eq!(w.superseded_by, None);
+        assert_eq!(w.authority_decision_digest, d_good);
+        assert!(!is_canonical_effective(dir, &good).await.unwrap());
+        // Idempotent re-withdraw (same quorum) is a no-op.
+        withdraw_canonical_role_over_roster(dir, &good, &d_good, &roster_key_ids)
+            .await
+            .expect("idempotent re-withdraw");
+        assert!(dir
+            .list_canonical_withdrawals()
+            .await
+            .unwrap()
+            .iter()
+            .any(|x| x.key_id == good));
+
+        // (F) Revocation-wins gate consult: re-offering the anchor-scrubbed
+        //     canonical record for `good` via put_public_key is REFUSED.
+        let err = put(dir, record(&good, "canonical,node", &a1.key_id))
+            .await
+            .expect_err("re-confer of a withdrawn canonical must be REFUSED");
+        assert_eq!(err.kind(), "canonical_role_withdrawn");
+
+        // (G) #375 anti-entropy composition: withdraw a not-yet-admitted key,
+        //     then a peer replicates the anchor-scrubbed canonical record →
+        //     NOT re-conferred.
+        let repl = format!("cw-repl-{tag}");
+        let d_repl = seed_quorum(
+            dir,
+            &holders,
+            &roster,
+            OP_WITHDRAW_CANONICAL,
+            &repl,
+            None,
+            &[0, 1],
+            &format!("n-repl-{tag}"),
+        )
+        .await;
+        withdraw_canonical_role_over_roster(dir, &repl, &d_repl, &roster_key_ids)
+            .await
+            .expect("withdraw the (future) key");
+        let outcome = dir
+            .apply_replicated_key_record(SignedKeyRecord {
+                record: record(&repl, "canonical,node", &a1.key_id),
+            })
+            .await;
+        match outcome {
+            Err(e) => assert_eq!(e.kind(), "canonical_role_withdrawn"),
+            Ok(o) => assert_eq!(
+                o,
+                super::super::register::ReplicatedKeyOutcome::Refused,
+                "a withdrawn canonical must not be re-conferred over anti-entropy"
+            ),
+        }
+        assert!(!is_canonical_effective(dir, &repl).await.unwrap());
+        assert!(dir.lookup_public_key(&repl).await.unwrap().is_none());
+
+        // ── (H) SUPERSEDE: admit successor + withdraw predecessor atomically. ─
+        let old = format!("cw-old-{tag}");
+        let new = format!("cw-new-{tag}");
+        put(dir, record(&old, "canonical,node", &a1.key_id))
+            .await
+            .expect("admit predecessor canonical");
+        assert!(is_canonical_effective(dir, &old).await.unwrap());
+
+        // Fail-closed: a proposal committing to old→WRONG cannot supersede
+        // old→new (payload mismatch); neither mutation happens.
+        let d_wrong = seed_quorum(
+            dir,
+            &holders,
+            &roster,
+            OP_SUPERSEDE_CANONICAL,
+            &old,
+            Some(&format!("wrong-{tag}")),
+            &[0, 1],
+            &format!("n-wrong-{tag}"),
+        )
+        .await;
+        let err = supersede_canonical_over_roster(
+            dir,
+            &old,
+            SignedKeyRecord {
+                record: record(&new, "canonical,node", &a1.key_id),
+            },
+            &d_wrong,
+            &roster_key_ids,
+        )
+        .await
+        .expect_err("supersede with wrong-successor payload must be REFUSED");
+        assert_eq!(err.kind(), "canonical_withdrawal_authority_invalid");
+        assert!(dir.lookup_public_key(&new).await.unwrap().is_none());
+        assert!(dir
+            .lookup_canonical_withdrawal(&old)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Valid supersede: proposal committing to old→new with 2 YES votes.
+        let d_sup = seed_quorum(
+            dir,
+            &holders,
+            &roster,
+            OP_SUPERSEDE_CANONICAL,
+            &old,
+            Some(&new),
+            &[0, 1],
+            &format!("n-sup-{tag}"),
+        )
+        .await;
+        supersede_canonical_over_roster(
+            dir,
+            &old,
+            SignedKeyRecord {
+                record: record(&new, "canonical,node", &a1.key_id),
+            },
+            &d_sup,
+            &roster_key_ids,
+        )
+        .await
+        .expect("valid supersede");
+        assert!(is_canonical_effective(dir, &new).await.unwrap());
+        assert!(!is_canonical_effective(dir, &old).await.unwrap());
+        let w = dir
+            .lookup_canonical_withdrawal(&old)
+            .await
+            .unwrap()
+            .expect("predecessor tombstone");
+        assert_eq!(w.superseded_by.as_deref(), Some(new.as_str()));
+        assert!(dir
+            .lookup_canonical_withdrawal(&new)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn canonical_withdrawal_sqlite() {
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(accord_holder_genesis_records())
+            .await
+            .expect("genesis seed");
+
+        run_withdrawal_matrix(&backend, "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn canonical_withdrawal_postgres() {
+        use crate::store::backend::Backend as _;
+        use crate::store::postgres::PostgresBackend;
+
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping canonical_withdrawal_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let client = backend.pool().get().await.unwrap();
+        // Fresh state: clear our tagged withdrawals + accord rows, then delete
+        // the referencing canonical/tagged rows AND the A1/B1/C1 anchors + roster
+        // holders in ONE statement (a canonical row's scrub_key_id FKs to its
+        // anchor, so both must drop together — the delete is statement-atomic).
+        let _ = client
+            .execute("DELETE FROM cirislens.canonical_role_withdrawal", &[])
+            .await;
+        let _ = client
+            .execute("DELETE FROM cirislens.accord_participation", &[])
+            .await;
+        let _ = client
+            .execute("DELETE FROM cirislens.accord_proposal", &[])
+            .await;
+        let _ = client
+            .execute("DELETE FROM cirislens.accord_issued_nonce", &[])
+            .await;
+        let _ = client
+            .execute(
+                "DELETE FROM cirislens.federation_keys WHERE key_id = ANY($1) \
+                 OR key_id LIKE 'cw-%-pg' OR key_id LIKE 'H_-pg' \
+                 OR identity_type LIKE '%canonical%'",
+                &[&vec!["A1".to_string(), "B1".to_string(), "C1".to_string()]],
+            )
+            .await;
+        backend
+            .seed_genesis_accord_holders(accord_holder_genesis_records())
+            .await
+            .expect("pg genesis seed");
+
+        run_withdrawal_matrix(&backend, "pg").await;
+    }
+
+    /// Memory-backend symmetry: the withdrawal store (record/lookup/list,
+    /// idempotency) + the revocation-wins gate consult
+    /// ([`check_canonical_role_admission_anchored`](super::check_canonical_role_admission_anchored))
+    /// behave identically to the SQL backends. Uses a TEST anchor so no genesis
+    /// seed is required (the withdrawal consult runs BEFORE the anchor checks).
+    #[tokio::test]
+    async fn canonical_withdrawal_memory() {
+        use crate::store::memory::MemoryBackend;
+
+        let backend = MemoryBackend::new();
+        let dir: &dyn FederationDirectory = &backend;
+
+        // Record a tombstone for a key + idempotency + conflict on differing.
+        dir.record_canonical_withdrawal("K", None, "digest-1")
+            .await
+            .expect("record");
+        dir.record_canonical_withdrawal("K", None, "digest-1")
+            .await
+            .expect("idempotent");
+        let err = dir
+            .record_canonical_withdrawal("K", Some("K2"), "digest-1")
+            .await
+            .expect_err("conflicting re-record");
+        assert!(matches!(err, super::Error::Conflict(_)));
+
+        let w = dir.lookup_canonical_withdrawal("K").await.unwrap().unwrap();
+        assert_eq!(w.key_id, "K");
+        assert_eq!(w.superseded_by, None);
+        assert_eq!(dir.list_canonical_withdrawals().await.unwrap().len(), 1);
+        assert!(dir
+            .lookup_canonical_withdrawal("nope")
+            .await
+            .unwrap()
+            .is_none());
+
+        // The gate consult rejects re-conferring canonical on the withdrawn
+        // key K — regardless of anchor (the consult runs first). Use a test
+        // anchor containing K's scrubber so ONLY the withdrawal can be the
+        // rejection cause.
+        let scrubber_seed = [0x33u8; 32];
+        let scrubber = SigningKey::from_bytes(&scrubber_seed);
+        let anchor = vec![scrubber.verifying_key().to_bytes()];
+        put(dir, {
+            let mut r = record("scrubber", identity_type::STEWARD, "scrubber");
+            r.pubkey_ed25519_base64 = B64.encode(scrubber.verifying_key().to_bytes());
+            r
+        })
+        .await
+        .expect("register scrubber");
+        let rec = record("K", "canonical,node", "scrubber");
+        let err = super::check_canonical_role_admission_anchored(dir, &rec, &anchor)
+            .await
+            .expect_err("withdrawn key cannot be re-conferred canonical");
+        assert_eq!(err.kind(), "canonical_role_withdrawn");
+
+        // A NON-withdrawn key with the same anchor scrub is admitted by the gate.
+        let ok = record("J", "canonical,node", "scrubber");
+        super::check_canonical_role_admission_anchored(dir, &ok, &anchor)
+            .await
+            .expect("non-withdrawn anchor-scrubbed canonical passes the gate");
+
+        // Supersede exemption: a tombstone whose superseded_by names THIS key
+        // does NOT block re-confer (key-id-preserving rotation).
+        dir.record_canonical_withdrawal("S", Some("S"), "digest-2")
+            .await
+            .expect("self-superseded tombstone");
+        let rec_s = record("S", "canonical,node", "scrubber");
+        super::check_canonical_role_admission_anchored(dir, &rec_s, &anchor)
+            .await
+            .expect("a superseded-to-self key is exempt from the withdrawal block");
     }
 }

@@ -5,6 +5,55 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.1.0] — 2026-07-05 — canonical-mesh genesis bundle
+
+The canonical-server mesh seed (trust + reachability) plus the destructive
+Trust Root ops, the storage-contention shard, and the CC-rc2 evidence pin.
+verify re-pinned **v8.7.0 → v8.8.0** (additive: the CIRISVerify#172 producer
+half of #381 — `produce_*_key_record` embeds optional `transport_hints`; persist
+only reads the envelope, so no persist call site changed). Same major, wheel
+`Requires-Dist: ciris-verify>=8.0.0,<9` unchanged.
+
+### Added
+- **#380** — **bake the A1-conferred canonical genesis server** into the persist
+  seed (`canonical_seed.json`, embedded verbatim / byte-fidelity). Auto-loaded on
+  first boot exactly like the HUMANITY_ACCORD holder family, **after** the accord
+  seed so it is admitted **through** `check_canonical_role_admission` (A1 resolved
+  live — self-verifying accord-conferral, not a force-insert). A fresh node ships
+  with `is_canonical(ciris-canonical-1-…)` true and `list_canonical_servers()`
+  returning it, zero config. `seed_canonical_servers`/`verify_canonical_seeded`
+  are generic over `FederationDirectory` (pg/sqlite-symmetric); fail-secure.
+- **#377** — **canonical withdraw/supersede**, the destructive counterpart to the
+  monotonic add-canonical (#372). A durable, **m-of-n-quorum-verified TOMBSTONE**
+  (`canonical_role_withdrawal`, V095) that `check_canonical_role_admission`
+  consults — so the gate is "anchor-scrubbed **AND** not-withdrawn-by-quorum" and
+  withdrawal **defeats re-add over anti-entropy** (revocation-wins). Authority is
+  re-derived from persist's **own** cryptographically-verified `accord_participation`
+  rows (re-tallied against the pinned A1/B1/C1 roster at the **2-of-3 destructive
+  threshold**) — never a caller-supplied `AccordDecision` bool. `withdraw_canonical_role`
+  / `supersede_canonical` / `list_canonical_withdrawals` on the Engine + FFI;
+  errors `CanonicalRoleWithdrawn` / `CanonicalWithdrawalAuthorityInvalid`.
+- **#381** — **transport hints in the signed envelope** (reachability plane).
+  `TransportHint { kind, destination }` + `KeyRecord::transport_hints()` (a pure
+  typed READ over the opaque signed `registration_envelope`; absent/malformed →
+  `[]`, optional) + `Engine::canonical_bootstrap_hints()` (the zero-config
+  bootstrap dial set ciris-server 0.5.81 sources to retire `CANONICAL_BOOTSTRAP_PEERS`).
+  Producer half (embedding hints at sign time) tracked in CIRISVerify#172; the
+  hint-carrying re-bake + fail-closed-requires-hint gate follow on operator
+  re-signed bytes.
+- **#226** — **app-level hashed shards** for trace-events dedup-index contention
+  (operator decision: solve centrally, plain PG + sqlite, no extensions,
+  measure-first dropped). `shard_key` = FNV-1a/64 (process/backend-stable) over the
+  dedup key columns excluding `ts`, prefixing the UNIQUE index so concurrent ingest
+  spreads across 64 disjoint subtrees; dedup preserved exactly. V094 both backends
+  + idempotent, concurrency-safe backfill in `run_migrations`. `TRACE_DEDUP_SHARD_COUNT`.
+- **#374** — `evidence/cc_impl.tsv`: the CC 1.0-rc2 impl-evidence manifest the
+  Constitution `evidence_pins.tsv` resolves persist claims against (11 grep-verified
+  `path#symbol` rows; flips `CLM-storage-*`/`CLM-*` from staged to impl-backed).
+
+Migrations V094 (`trace_events` dedup shard) + V095 (`canonical_role_withdrawal`).
+Full suite green: **1419 pg+sqlite lib + integration, 0 failed** (fresh DB).
+
 ## [13.0.1] — 2026-07-04 — dyn-reachable replicated Key-plane apply (#375)
 
 Patch: no wire change, no schema change, verify pin unchanged (v8.7.0).

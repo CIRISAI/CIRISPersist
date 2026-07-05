@@ -3958,14 +3958,14 @@ impl PyEngine {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
-                        crate::federation::is_canonical(backend.as_ref(), &key_id).await
+                        crate::federation::is_canonical_effective(backend.as_ref(), &key_id).await
                     })
                 }
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(sq) => {
                     let backend = sq.clone();
                     runtime.block_on(async move {
-                        crate::federation::is_canonical(backend.as_ref(), &key_id).await
+                        crate::federation::is_canonical_effective(backend.as_ref(), &key_id).await
                     })
                 }
             })
@@ -3998,6 +3998,149 @@ impl PyEngine {
                 .map_err(federation_err_to_py)?;
             serde_json::to_string(&rows)
                 .map_err(|e| PyRuntimeError::new_err(format!("KeyRecord list JSON encode: {e}")))
+        })
+    }
+
+    /// v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — **withdraw**
+    /// the `canonical` role from `key_id` (the DESTRUCTIVE Trust Root op).
+    /// `proposal_digest` names a STORED accord live-quorum proposal (#302) whose
+    /// payload commits to `(withdraw, key_id)`. Persist re-tallies ITS OWN
+    /// cryptographically-verified `accord_participation` rows against the
+    /// accord-holder roster (A1/B1/C1) at the 2-of-3 destructive threshold — a
+    /// caller cannot fabricate a quorum. Records a durable tombstone the
+    /// admission gate consults, so a re-add over anti-entropy is refused.
+    fn withdraw_canonical_role(
+        &self,
+        py: Python<'_>,
+        key_id: &str,
+        proposal_digest: &str,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            let proposal_digest = proposal_digest.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::withdraw_canonical_role(
+                            backend.as_ref(),
+                            &key_id,
+                            &proposal_digest,
+                        )
+                        .await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::withdraw_canonical_role(
+                            backend.as_ref(),
+                            &key_id,
+                            &proposal_digest,
+                        )
+                        .await
+                    })
+                }
+            })
+            .map_err(federation_err_to_py)
+        })
+    }
+
+    /// v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — **supersede**
+    /// (rotate) a canonical server. `signed_key_record_json` is the successor's
+    /// `SignedKeyRecord` (admitted via the normal anchor-scrub add-gate);
+    /// `proposal_digest` names a STORED accord proposal committing to the
+    /// supersede `old_key_id → successor` payload (persist re-tallies its own
+    /// verified participations at the 2-of-3 destructive threshold). Admits the
+    /// successor AND records `old_key_id`'s withdrawal (`superseded_by =
+    /// successor`).
+    fn supersede_canonical(
+        &self,
+        py: Python<'_>,
+        old_key_id: &str,
+        signed_key_record_json: &str,
+        proposal_digest: &str,
+    ) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let old_key_id = old_key_id.to_owned();
+            let proposal_digest = proposal_digest.to_owned();
+            let new_record: crate::federation::SignedKeyRecord =
+                serde_json::from_str(signed_key_record_json).map_err(|e| {
+                    PyValueError::new_err(format!("SignedKeyRecord JSON decode: {e}"))
+                })?;
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::supersede_canonical(
+                            backend.as_ref(),
+                            &old_key_id,
+                            new_record,
+                            &proposal_digest,
+                        )
+                        .await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::supersede_canonical(
+                            backend.as_ref(),
+                            &old_key_id,
+                            new_record,
+                            &proposal_digest,
+                        )
+                        .await
+                    })
+                }
+            })
+            .map_err(federation_err_to_py)
+        })
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — the canonical-role withdrawal tombstones
+    /// (V095) as a JSON array of `CanonicalWithdrawal`s (stable-sorted by
+    /// `key_id`) — the withdrawn-history view alongside
+    /// [`list_canonical_servers`](Self::list_canonical_servers).
+    fn list_canonical_withdrawals(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let rows = py
+                .detach(move || match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::FederationDirectory::list_canonical_withdrawals(
+                                backend.as_ref(),
+                            )
+                            .await
+                        })
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::FederationDirectory::list_canonical_withdrawals(
+                                backend.as_ref(),
+                            )
+                            .await
+                        })
+                    }
+                })
+                .map_err(federation_err_to_py)?;
+            serde_json::to_string(&rows).map_err(|e| {
+                PyRuntimeError::new_err(format!("CanonicalWithdrawal list JSON encode: {e}"))
+            })
         })
     }
 
@@ -24870,6 +25013,15 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // ValueError (4xx). The `canonical` role is accord-CONFERRED, never
         // self-claimed.
         crate::federation::Error::CanonicalRoleNotAccordConferred { .. } => {
+            PyValueError::new_err(kind)
+        }
+        // v13.1.0 (CIRISPersist#377) — a re-add of a withdrawn canonical
+        // (revocation-wins gate consult) and an invalid withdraw/supersede
+        // authority (unauthorized decision / payload not committing to the
+        // target) are both caller-side authorization / state refusals;
+        // ValueError (4xx).
+        crate::federation::Error::CanonicalRoleWithdrawn { .. }
+        | crate::federation::Error::CanonicalWithdrawalAuthorityInvalid { .. } => {
             PyValueError::new_err(kind)
         }
         // v9.0.0 (CC 3.2 / CC 3.4.7.1) — admitting an unstewarded node/agent to

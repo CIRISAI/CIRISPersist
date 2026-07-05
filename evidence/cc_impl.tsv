@@ -1,0 +1,21 @@
+# CIRIS evidence registry — impl: tier (CIRISPersist#374 / CIRISConstitution
+# evidence_pins.tsv). The sibling spec-map manifest the Constitution's
+# check_claims.py / check_evidence.py resolves cross-repo impl pointers
+# against, mirroring the CIRISServer.cc_impl.tsv shape (CIRISServer#155).
+# Every path#symbol MUST resolve at the workspace-pinned crate version.
+# All rows below were grep-verified against this repo's src/ tree at the
+# pinned commit (ciris-persist@13.1.0 — the current released tag; NOT
+# 13.1.0, which does not exist as of this manifest's authorship).
+# Columns: decimal_id, claim_id, repo, path#symbol, crate@version
+decimal_id	claim_id	repo	path#symbol	crate@version
+3.2	CLM-trust-not-membership	CIRISPersist	src/federation/admission.rs#check_single_node_owner_admission	ciris-persist@13.1.0
+3.4.7.1	CLM-identity-set	CIRISPersist	src/federation/admission.rs#check_canonical_role_admission	ciris-persist@13.1.0
+3.4.7.2	CLM-consent-counter	CIRISPersist	src/federation/consent.rs#consent_role_of	ciris-persist@13.1.0
+3.4.8	CLM-detector-only	CIRISPersist	src/federation/admission.rs#default_reserved_prefix_rules	ciris-persist@13.1.0
+3.4.11	CLM-age-assurance	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@13.1.0
+3.4.12	CLM-adult-incapacity	CIRISPersist	src/federation/admission.rs#check_reserved_prefix_admission	ciris-persist@13.1.0
+4.5.4	CLM-registry-named	CIRISPersist	src/federation/admission.rs#check_no_moderator_federate_apply	ciris-persist@13.1.0
+5.3.2.2	CLM-revocation-promotion	CIRISPersist	src/federation/admission.rs#check_local_tier_eligibility	ciris-persist@13.1.0
+6.1.2	CLM-noise-descent	CIRISPersist	src/engine.rs#Engine::sweep_consent_decay_once	ciris-persist@13.1.0
+6.1.5.2	CLM-storage-budget	CIRISPersist	src/engine.rs#Engine::install_storage_budget_v1	ciris-persist@13.1.0
+6.1.5.2	CLM-storage-want	CIRISPersist	src/fountain/storage_contention.rs#CorpusWantWire	ciris-persist@13.1.0

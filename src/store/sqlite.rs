@@ -35,10 +35,11 @@
 //!   `INSERT INTO … VALUES (…), (…), … ON CONFLICT DO NOTHING`. SQLite
 //!   3.24+ supports `ON CONFLICT` clauses; the bundled rusqlite ships a
 //!   recent-enough libsqlite3.
-//! - **Idempotency**: the `trace_events_dedup` UNIQUE index in
-//!   `V001__trace_events.sql` is the conflict target — same shape as
-//!   the postgres index (THREAT_MODEL.md AV-9, includes
-//!   `agent_id_hash`).
+//! - **Idempotency**: the sharded `trace_events_dedup_sharded` UNIQUE index
+//!   in `V094__trace_events_dedup_shard.sql` (CIRISPersist#226) is the
+//!   conflict target — same shape as the postgres index (THREAT_MODEL.md
+//!   AV-9, includes `agent_id_hash`; #226 prefixes `shard_key`, a pure
+//!   function of the key, to spread concurrent inserts across shards).
 #![allow(clippy::redundant_closure_call)]
 // v3.14.0 (CIRISPersist#158) — inline-sync rewrite of all
 // tokio::task::spawn_blocking sites uses (closure)() to invoke
@@ -447,13 +448,14 @@ impl Backend for SqliteBackend {
                 agent_role, agent_template, deployment_domain, \
                 deployment_type, deployment_region, deployment_trust_mode, \
                 verification_source, cohort_scope, cohort_target_id, \
-                signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id\
+                signature_ml_dsa_65, pubkey_ml_dsa_65, pqc_key_id, \
+                shard_key\
                 ) VALUES (\
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, \
-                ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39\
-                ) ON CONFLICT (agent_id_hash, trace_id, thought_id, event_type, \
-                attempt_index, ts) DO NOTHING";
+                ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40\
+                ) ON CONFLICT (shard_key, agent_id_hash, trace_id, thought_id, \
+                event_type, attempt_index, ts) DO NOTHING";
 
             {
                 let mut stmt = tx.prepare(SQL)?;
@@ -491,8 +493,12 @@ impl Backend for SqliteBackend {
                             })?;
 
                     let attempt_index_i64 = i64::from(row.attempt_index);
+                    // #226 — app-level dedup shard (V094). Same FNV the
+                    // postgres path binds; a true duplicate maps to the same
+                    // shard and still collides on the sharded UNIQUE index.
+                    let shard_key = i64::from(super::decompose::trace_dedup_shard_key(row));
 
-                    let params: [SqlValue; 39] = [
+                    let params: [SqlValue; 40] = [
                         SqlValue::Text(row.trace_id.clone()),
                         SqlValue::Text(row.thought_id.clone()),
                         opt_text(row.task_id.as_deref()),
@@ -546,6 +552,8 @@ impl Backend for SqliteBackend {
                         opt_text(row.signature_ml_dsa_65.as_deref()),
                         opt_text(row.pubkey_ml_dsa_65.as_deref()),
                         opt_text(row.pqc_key_id.as_deref()),
+                        // #226 — shard_key (V094).
+                        SqlValue::Integer(shard_key),
                     ];
 
                     let n = stmt.execute(params_from_iter(params.iter()))?;
@@ -730,6 +738,10 @@ impl Backend for SqliteBackend {
             sqlstate: None,
             detail: format!("sqlite migrations: {e}"),
         })?;
+
+        // #226 (V094) — backfill shard_key for legacy rows, before the
+        // engine serves any write. See `backfill_trace_dedup_shard_keys`.
+        self.backfill_trace_dedup_shard_keys().await?;
         Ok(())
     }
 
@@ -1547,6 +1559,79 @@ struct RawAggregationRow {
 // JSONB→serde_json::Value decode. Wire shape matches PG byte-for-byte.
 
 impl SqliteBackend {
+    /// #226 (V094) — assign `shard_key` to legacy `trace_events` rows that
+    /// predate the sharded dedup index (their `shard_key` is `NULL`).
+    ///
+    /// Computes the byte-identical FNV shard the insert path binds
+    /// ([`super::decompose::trace_dedup_shard_key_parts`]) so a
+    /// post-migration re-ingest of the same trace still collides on the
+    /// V094 `trace_events_dedup_sharded` UNIQUE index — dedup semantics are
+    /// preserved across the migration, not just for new rows.
+    ///
+    /// Idempotent + batched. The V094 `trace_events_shard_backfill` partial
+    /// index makes the `WHERE shard_key IS NULL` probe O(1) and empties as
+    /// this runs; every new insert writes a non-`NULL` shard, so after the
+    /// one-time backfill this is a near-free empty-index probe on each boot.
+    /// Runs inside `run_migrations`, BEFORE the engine serves any write.
+    async fn backfill_trace_dedup_shard_keys(&self) -> Result<(), Error> {
+        const BATCH: i64 = 5_000;
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let mut conn = conn.lock();
+            loop {
+                // Collect a batch of rows still needing a shard.
+                let batch: Vec<(i64, Option<String>, String, String, String, i64)> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT event_id, agent_id_hash, trace_id, thought_id, \
+                         event_type, attempt_index \
+                         FROM trace_events WHERE shard_key IS NULL LIMIT ?1",
+                    )?;
+                    let rows = stmt.query_map([BATCH], |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, i64>(5)?,
+                        ))
+                    })?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                if batch.is_empty() {
+                    break;
+                }
+                let tx = conn.transaction()?;
+                {
+                    let mut up =
+                        tx.prepare("UPDATE trace_events SET shard_key = ?1 WHERE event_id = ?2")?;
+                    for (
+                        event_id,
+                        agent_id_hash,
+                        trace_id,
+                        thought_id,
+                        event_type,
+                        attempt_index,
+                    ) in &batch
+                    {
+                        let shard = i64::from(super::decompose::trace_dedup_shard_key_parts(
+                            agent_id_hash.as_deref().unwrap_or(""),
+                            trace_id,
+                            thought_id,
+                            event_type,
+                            u32::try_from(*attempt_index).unwrap_or(0),
+                        ));
+                        up.execute(rusqlite::params![shard, event_id])?;
+                    }
+                }
+                tx.commit()?;
+            }
+            Ok(())
+        })()
+        .map_err(|e| Error::Backend(format!("backfill trace shard_key: {e}")))?;
+        Ok(())
+    }
+
     /// v8.0.0 (CIRISPersist#227) — read the `content_manifest` row for
     /// `(content_id, corpus_kind)` back into a
     /// [`FountainManifestV1`](crate::fountain::FountainManifestV1).
@@ -1873,6 +1958,28 @@ fn decode_installed_storage_budget(
                 .with_timezone(&chrono::Utc),
         },
     )
+}
+
+/// #377 — decode one `canonical_role_withdrawal` row (V095) into a
+/// [`CanonicalWithdrawal`](crate::federation::CanonicalWithdrawal). Column order:
+/// `key_id, withdrawn_at, authority_decision_digest, superseded_by,
+/// persist_row_hash`.
+fn sqlite_row_to_canonical_withdrawal(
+    row: &rusqlite::Row<'_>,
+) -> Result<crate::federation::CanonicalWithdrawal, rusqlite::Error> {
+    let withdrawn_at_text: String = row.get(1)?;
+    let withdrawn_at = chrono::DateTime::parse_from_rfc3339(&withdrawn_at_text)
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+        })?
+        .with_timezone(&chrono::Utc);
+    Ok(crate::federation::CanonicalWithdrawal {
+        key_id: row.get(0)?,
+        withdrawn_at,
+        authority_decision_digest: row.get(2)?,
+        superseded_by: row.get(3)?,
+        persist_row_hash: row.get(4)?,
+    })
 }
 
 fn opt_text(v: Option<&str>) -> SqlValue {
@@ -2540,6 +2647,108 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             )));
         }
         Ok(())
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — record a canonical-role WITHDRAW/SUPERSEDE
+    /// tombstone (V095). Idempotent on `key_id`: an existing row with the same
+    /// `superseded_by` + `authority_decision_digest` is a no-op; a differing one
+    /// is a [`Conflict`](crate::federation::Error::Conflict). Backend-symmetric
+    /// with Postgres + memory.
+    async fn record_canonical_withdrawal(
+        &self,
+        key_id: &str,
+        superseded_by: Option<&str>,
+        authority_decision_digest: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut record = crate::federation::CanonicalWithdrawal {
+            key_id: key_id.to_owned(),
+            withdrawn_at: chrono::Utc::now(),
+            authority_decision_digest: authority_decision_digest.to_owned(),
+            superseded_by: superseded_by.map(str::to_owned),
+            persist_row_hash: String::new(),
+        };
+        record.persist_row_hash = crate::federation::types::compute_persist_row_hash(&record)?;
+        let conn = self.conn.clone();
+        let outcome = (move || -> Result<Result<(), crate::federation::Error>, rusqlite::Error> {
+            let conn = conn.lock();
+            let existing: Option<(Option<String>, String)> = conn
+                .query_row(
+                    "SELECT superseded_by, authority_decision_digest \
+                     FROM canonical_role_withdrawal WHERE key_id = ?1",
+                    [&record.key_id],
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            if let Some((existing_superseded, existing_auth)) = existing {
+                if existing_superseded == record.superseded_by
+                    && existing_auth == record.authority_decision_digest
+                {
+                    return Ok(Ok(())); // idempotent no-op
+                }
+                return Ok(Err(crate::federation::Error::Conflict(format!(
+                    "canonical_role_withdrawal for {} already exists with different content",
+                    record.key_id
+                ))));
+            }
+            conn.execute(
+                "INSERT INTO canonical_role_withdrawal (\
+                    key_id, withdrawn_at, authority_decision_digest, superseded_by, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    record.key_id,
+                    record.withdrawn_at.to_rfc3339(),
+                    record.authority_decision_digest,
+                    record.superseded_by,
+                    record.persist_row_hash,
+                ],
+            )?;
+            Ok(Ok(()))
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("record_canonical_withdrawal: {e}"))
+        })?;
+        outcome
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — consult the V095 withdrawal tombstone for
+    /// `key_id` (the load-bearing gate consult). Backend-symmetric.
+    async fn lookup_canonical_withdrawal(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::CanonicalWithdrawal>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key_id = key_id.to_owned();
+        (move || -> Result<Option<crate::federation::CanonicalWithdrawal>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT key_id, withdrawn_at, authority_decision_digest, superseded_by, \
+                        persist_row_hash \
+                     FROM canonical_role_withdrawal WHERE key_id = ?1",
+                [&key_id],
+                sqlite_row_to_canonical_withdrawal,
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("lookup_canonical_withdrawal: {e}")))
+    }
+
+    /// v13.1.0 (CIRISPersist#377) — all V095 withdrawal tombstones, stable-sorted
+    /// by `key_id`. Backend-symmetric.
+    async fn list_canonical_withdrawals(
+        &self,
+    ) -> Result<Vec<crate::federation::CanonicalWithdrawal>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        (move || -> Result<Vec<crate::federation::CanonicalWithdrawal>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT key_id, withdrawn_at, authority_decision_digest, superseded_by, \
+                        persist_row_hash \
+                     FROM canonical_role_withdrawal ORDER BY key_id",
+            )?;
+            let rows = stmt.query_map([], sqlite_row_to_canonical_withdrawal)?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_canonical_withdrawals: {e}")))
     }
 
     async fn put_attestation(
