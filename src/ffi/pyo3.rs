@@ -4795,18 +4795,28 @@ impl PyEngine {
     /// `delegate_key_id` within `scopes` (a list of scope tokens), with an
     /// explicit `sub_delegation` deputization flag. The recipient FKs to
     /// `federation_keys`; the CC 4.4.3.4.3 node-agency gate runs on the row.
+    ///
+    /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2) — `delegation_purpose` (optional,
+    /// default `None`) marks the ownership sub-relation: pass
+    /// `"responsible_for"` (`owner_binding::PURPOSE`) to build the node's
+    /// single-valued **owner-binding**, gated so a second DISTINCT owner is
+    /// rejected (`federation_node_already_owned`) and resolvable via
+    /// `owner_of_json`. `None` is the general (multi-parent) delegation.
+    #[pyo3(signature = (delegate_key_id, scopes, sub_delegation, delegation_purpose = None))]
     fn grant_delegation(
         &self,
         py: Python<'_>,
         delegate_key_id: &str,
         scopes: Vec<String>,
         sub_delegation: bool,
+        delegation_purpose: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let (backend, signer, local_signer) = self.cut_c_emit_handles()?;
             let delegate = delegate_key_id.to_owned();
+            let purpose = delegation_purpose.map(str::to_owned);
             py.detach(move || {
                 let engine = crate::Engine::from_shared_with_local(
                     backend,
@@ -4815,7 +4825,13 @@ impl PyEngine {
                 );
                 runtime.block_on(async move {
                     engine
-                        .grant_delegation(&local_signer, &delegate, scopes, sub_delegation)
+                        .grant_delegation(
+                            &local_signer,
+                            &delegate,
+                            scopes,
+                            sub_delegation,
+                            purpose.as_deref(),
+                        )
                         .await
                         .map_err(federation_err_to_py)
                 })
@@ -4827,17 +4843,26 @@ impl PyEngine {
     /// granting it `infra:*`-only scopes (passes the node-agency gate on a
     /// node-only key). A `grant_delegation` specialization,
     /// `sub_delegation=false`.
+    ///
+    /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2) — pass
+    /// `delegation_purpose="responsible_for"` (`owner_binding::PURPOSE`) to make
+    /// this the node's single-valued **owner-binding** (`infra:*`-only scope IS
+    /// the owner-binding shape); the single-owner gate then rejects a second
+    /// distinct owner. `None` (default) is a plain steward-binding.
+    #[pyo3(signature = (node_or_agent_key_id, infra_scopes, delegation_purpose = None))]
     fn steward_bind(
         &self,
         py: Python<'_>,
         node_or_agent_key_id: &str,
         infra_scopes: Vec<String>,
+        delegation_purpose: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let (backend, signer, local_signer) = self.cut_c_emit_handles()?;
             let key = node_or_agent_key_id.to_owned();
+            let purpose = delegation_purpose.map(str::to_owned);
             py.detach(move || {
                 let engine = crate::Engine::from_shared_with_local(
                     backend,
@@ -4846,7 +4871,7 @@ impl PyEngine {
                 );
                 runtime.block_on(async move {
                     engine
-                        .steward_bind(&local_signer, &key, infra_scopes)
+                        .steward_bind(&local_signer, &key, infra_scopes, purpose.as_deref())
                         .await
                         .map_err(federation_err_to_py)
                 })
@@ -17898,6 +17923,48 @@ impl PyEngine {
                 serde_json::to_string(&bindings).map_err(|e| {
                     PyValueError::new_err(format!("steward_bindings_of serialize: {e}"))
                 })
+            })
+        })
+    }
+
+    /// v13.2.0 (CIRISPersist#378, CC 3.2 rc2 single-owner) — the **single
+    /// responsible owner** of `key_id`, purpose-filtered to the owner-binding
+    /// sub-relation → **at most one**. Returns a JSON string: the owner's
+    /// `key_id` (JSON string) when owned, or `null` when unowned. This is the
+    /// resolver consumers MUST use for "who owns this node" — NEVER
+    /// `steward_bindings_of_json` / `delegations_to_json`, which conflate every
+    /// `delegates_to` purpose and can return cardinality > 1 (the CC 3.2
+    /// anti-pattern). A pre-gate ambiguous state (two live owners from before
+    /// the single-owner gate) raises `federation_ambiguous_node_owner`
+    /// (fail-closed).
+    fn owner_of_json(&self, py: Python<'_>, key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            py.detach(move || {
+                let owner: Option<String> = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::owner_of(&*backend, &key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::admission::owner_of(&*backend, &key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&owner)
+                    .map_err(|e| PyValueError::new_err(format!("owner_of serialize: {e}")))
             })
         })
     }

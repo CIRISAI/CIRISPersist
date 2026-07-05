@@ -182,8 +182,9 @@ pub use schema_resolver::{
     axis_from_dimension, AxisSchema, NoOpSchemaResolver, SchemaResolver, SchemaResolverError,
 };
 pub use self_at_login::{
-    delegates_to_agent_envelope, delegates_to_envelope, partnership_accept_envelope,
-    partnership_grant_envelope, TransportDestination, SELF_AT_LOGIN_DELEGATION_SCOPE,
+    delegates_to_agent_envelope, delegates_to_envelope, owner_binding_delegates_to_envelope,
+    partnership_accept_envelope, partnership_grant_envelope, TransportDestination,
+    SELF_AT_LOGIN_DELEGATION_SCOPE,
 };
 pub use shared_instance::{SharedInstanceLease, DEFAULT_STALE_AFTER};
 #[cfg(feature = "sqlite")]
