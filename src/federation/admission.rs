@@ -3055,18 +3055,14 @@ pub fn canonical_withdrawal_payload_sha256(
     Ok(hex::encode(Sha256::digest(&bytes)))
 }
 
-/// v13.1.0 (CIRISPersist#377) — the **destructive quorum threshold** `M` for a
-/// canonical withdraw/supersede: **2 of 3** accord holders (A1/B1/C1) must vote
-/// YES. Symmetric with the v13.2.0 (#383) 2-of-3 ADD gate — every
-/// capability-granting canonical op is m-of-n (no 1-of-N first-strike hole).
-/// Absolute,
-/// not a fraction of `|L|` — an adversary must present ≥2 distinct real accord
-/// holders' cryptographically-verified YES participations; inflating `|L|` with
-/// captured keys cannot lower the bar.
-pub const CANONICAL_WITHDRAW_QUORUM_M: usize = 2;
-/// The accord-holder set size `N` (A1/B1/C1) the [`CANONICAL_WITHDRAW_QUORUM_M`]
-/// threshold is `M`-of-.
-pub const CANONICAL_WITHDRAW_QUORUM_N: usize = 3;
+// v13.1.0 #377 destructive threshold: was a frozen `CANONICAL_WITHDRAW_QUORUM_M/N
+// = 2/3`. v13.2.0 (#383 follow-up) derives it as the **strict majority of the
+// LIVE accord roster** via `QuorumPolicy::new(n/2+1, n)` inside
+// `verify_canonical_authority_over_roster` — symmetric with the #383 canonical
+// ADD gate, so every capability-granting canonical op is m-of-n on the family
+// (no hardcoded constant, no 1-of-N first-strike hole). The threshold is
+// absolute (a strict majority of distinct real accord holders whose YES
+// participations verify) — inflating `|L|` with captured keys cannot lower it.
 
 /// The accord-holder standing-roster `key_id`s (A1/B1/C1) — the FIXED identities
 /// whose PINNED directory pubkeys form the canonical-withdraw quorum roster.
@@ -3099,7 +3095,8 @@ fn accord_holder_roster_key_ids() -> Vec<String> {
 ///    [`tally_live_quorum`](ciris_verify_core::accord_live_quorum::tally_live_quorum)
 ///    (each participation's hybrid signature + proposal-digest + seat binding is
 ///    re-checked; signers resolve ONLY in the pinned roster; deduped by member).
-/// 5. Require `tally.yes >= `[`CANONICAL_WITHDRAW_QUORUM_M`] (2-of-3). A caller
+/// 5. Require `tally.yes` ≥ a **strict majority of the live accord roster**
+///    (`QuorumPolicy::new(n/2+1, n)` — 2-of-3 today, tracks the family). A caller
 ///    cannot forge YES votes: only real, signed participations the roster holders
 ///    produced (and persist already verified at store time) count.
 ///
@@ -3178,16 +3175,27 @@ async fn verify_canonical_authority_over_roster(
     let tally = tally_live_quorum(&proposal, &participations, &roster)
         .map_err(|e| invalid(format!("live-quorum tally failed (fail-closed): {e:?}")))?;
 
-    // (5) Destructive threshold: >= 2 distinct accord holders voting YES.
-    if tally.yes < CANONICAL_WITHDRAW_QUORUM_M {
+    // (5) Destructive threshold = **strict majority of the LIVE accord roster**
+    // (CIRISPersist#383 follow-up — was a frozen 2/3). Derived via verify's
+    // `QuorumPolicy` (`2·M > N`, no M==1 escape), so withdraw/supersede tracks
+    // the family the same way canonical *add* does (2-of-3 today, 3-of-4 if the
+    // family grows) — never a hardcoded constant.
+    let n = roster.len();
+    let policy = ciris_verify_core::threshold::QuorumPolicy::new(n / 2 + 1, n);
+    policy.validate().map_err(|e| {
+        invalid(format!(
+            "accord roster quorum policy invalid ({n} holders): {e:?}"
+        ))
+    })?;
+    if tally.yes < policy.m {
         return Err(invalid(format!(
             "insufficient accord quorum: {yes} YES vote(s) among the live set {live:?}, but a \
-             canonical withdraw/supersede requires >= {m} of {n} accord holders (destructive \
-             threshold)",
+             canonical withdraw/supersede requires a strict majority of the accord family \
+             (>= {m} of {n})",
             yes = tally.yes,
             live = tally.live_set,
-            m = CANONICAL_WITHDRAW_QUORUM_M,
-            n = CANONICAL_WITHDRAW_QUORUM_N,
+            m = policy.m,
+            n = policy.n,
         )));
     }
 
