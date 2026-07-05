@@ -9,7 +9,10 @@ threat-model citations because this crate's audit story is the point.
 
 The canonical-server mesh seed (trust + reachability) plus the destructive
 Trust Root ops, the storage-contention shard, and the CC-rc2 evidence pin.
-verify pin **unchanged (v8.7.0)**.
+verify re-pinned **v8.7.0 → v8.8.0** (additive: the CIRISVerify#172 producer
+half of #381 — `produce_*_key_record` embeds optional `transport_hints`; persist
+only reads the envelope, so no persist call site changed). Same major, wheel
+`Requires-Dist: ciris-verify>=8.0.0,<9` unchanged.
 
 ### Added
 - **#380** — **bake the A1-conferred canonical genesis server** into the persist
