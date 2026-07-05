@@ -4797,6 +4797,15 @@ async fn build_backend(dsn: &str) -> Result<BackendDispatch, EngineError> {
             crate::federation::genesis::verify_anchor_seeded(&pg)
                 .await
                 .map_err(EngineError::GenesisSeed)?;
+            // v13.1.0 (CIRISPersist#380) — bake the A1-conferred canonical
+            // genesis server. Runs AFTER the accord seed so the canonical
+            // admission gate resolves A1 live. Idempotent + fail-secure.
+            crate::federation::genesis::seed_canonical_servers(&pg)
+                .await
+                .map_err(EngineError::GenesisSeed)?;
+            crate::federation::genesis::verify_canonical_seeded(&pg)
+                .await
+                .map_err(EngineError::GenesisSeed)?;
             Ok(BackendDispatch::Postgres(Arc::new(pg)))
         }
         #[cfg(not(feature = "postgres"))]
@@ -4834,6 +4843,15 @@ async fn build_backend(dsn: &str) -> Result<BackendDispatch, EngineError> {
             .await
             .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
             crate::federation::genesis::verify_anchor_seeded(&sq)
+                .await
+                .map_err(EngineError::GenesisSeed)?;
+            // v13.1.0 (CIRISPersist#380) — bake the A1-conferred canonical
+            // genesis server. Runs AFTER the accord seed so the canonical
+            // admission gate resolves A1 live. Idempotent + fail-secure.
+            crate::federation::genesis::seed_canonical_servers(&sq)
+                .await
+                .map_err(EngineError::GenesisSeed)?;
+            crate::federation::genesis::verify_canonical_seeded(&sq)
                 .await
                 .map_err(EngineError::GenesisSeed)?;
             Ok(BackendDispatch::Sqlite(Arc::new(sq)))
@@ -5022,6 +5040,33 @@ mod tests {
             .await
             .expect("sign");
         assert_eq!(sig.len(), 64);
+    }
+
+    /// v13.1.0 (CIRISPersist#380) — a FRESH engine auto-loads the baked
+    /// canonical genesis server, exactly as it auto-seeds the accord family:
+    /// no manual seed call, `is_canonical` is true and `list_canonical_servers`
+    /// returns `ciris-canonical-1-…` straight out of `Engine::with_signer`.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fresh_engine_auto_loads_canonical_genesis_seed() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let node = &crate::federation::genesis::canonical_genesis_records()[0].record;
+        assert!(
+            engine
+                .is_canonical(&node.key_id)
+                .await
+                .expect("is_canonical"),
+            "fresh engine must recognize the baked canonical server {}",
+            node.key_id
+        );
+        let listed = engine.list_canonical_servers().await.expect("list");
+        assert!(
+            listed.iter().any(|r| r.key_id == node.key_id),
+            "list_canonical_servers must include the baked {}",
+            node.key_id
+        );
     }
 
     #[cfg(feature = "sqlite")]
