@@ -840,6 +840,23 @@ pub fn envelope_dimension(envelope: &serde_json::Value) -> Option<&str> {
     envelope.get("dimension").and_then(|v| v.as_str())
 }
 
+/// v13.2.1 (CIRISPersist#378) — is this `delegates_to` envelope an
+/// **owner-binding** (CC 3.2 single-owner sub-relation)? True iff EITHER
+/// the internal versioned [`owner_binding::DIMENSION`](super::types::owner_binding::DIMENSION)
+/// is set (the `steward_bind`/`grant_delegation(Some(purpose))` path) OR the
+/// **CC 2.4.1.2 canonical** `delegation_purpose == "owner_binding"`
+/// ([`owner_binding::CC_DELEGATION_PURPOSE`](super::types::owner_binding::CC_DELEGATION_PURPOSE))
+/// is carried — the marker a raw `emit_attestation_self` `delegates_to` uses
+/// (the only expressible owner-binding path per CC 2.4.1.2, and what
+/// CIRISConformance `test_551` probes). Keying on the dimension ALONE let the
+/// raw-emit path bypass the single-owner admission gate + resolver, admitting
+/// a second distinct owner.
+pub fn is_owner_binding_envelope(envelope: &serde_json::Value) -> bool {
+    envelope_dimension(envelope) == Some(super::types::owner_binding::DIMENSION)
+        || envelope.get("delegation_purpose").and_then(|v| v.as_str())
+            == Some(super::types::owner_binding::CC_DELEGATION_PURPOSE)
+}
+
 /// v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10) — does an
 /// attestation `envelope` bind `content_sha256`? True iff the envelope's
 /// `evidence_refs` array contains the hex string. This is the exact
@@ -2659,12 +2676,13 @@ async fn live_owner_binding_granters(
         if r.attestation_type != attestation_type::DELEGATES_TO {
             continue;
         }
-        // Only OWNER-BINDING edges — the versioned ownership dimension. This is
+        // Only OWNER-BINDING edges — the internal dimension OR the CC 2.4.1.2
+        // `delegation_purpose: owner_binding` marker (v13.2.1 #378). This is
         // what keeps ownership single-valued WITHOUT constraining act-on-behalf
-        // / hierarchy delegations (multi-parent per CC 4.5.13).
-        if envelope_dimension(&r.attestation_envelope)
-            != Some(super::types::owner_binding::DIMENSION)
-        {
+        // / hierarchy delegations (multi-parent per CC 4.5.13). Must match
+        // `check_single_node_owner_admission` exactly so the gate and the
+        // `owner_of` resolver agree on what an owner-binding IS.
+        if !is_owner_binding_envelope(&r.attestation_envelope) {
             continue;
         }
         if let Some(exp) = r.expires_at {
@@ -2754,8 +2772,11 @@ pub async fn check_single_node_owner_admission(
     if row.attestation_type != attestation_type::DELEGATES_TO {
         return Ok(());
     }
-    if envelope_dimension(&row.attestation_envelope) != Some(super::types::owner_binding::DIMENSION)
-    {
+    // v13.2.1 (#378): recognize the owner-binding by EITHER the internal
+    // dimension OR the CC 2.4.1.2 `delegation_purpose: owner_binding` marker —
+    // the raw `emit_attestation_self` path carries only the latter, and gating
+    // on the dimension alone let it bypass the single-owner gate.
+    if !is_owner_binding_envelope(&row.attestation_envelope) {
         return Ok(());
     }
     // The incoming row is NOT yet stored (this runs pre-insert), so every

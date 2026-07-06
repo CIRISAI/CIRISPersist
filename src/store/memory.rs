@@ -9824,6 +9824,73 @@ mod tests {
         );
     }
 
+    /// v13.2.1 (CIRISPersist#378) — the owner-binding built with the **CC
+    /// 2.4.1.2 canonical marker only** (`delegation_purpose: "owner_binding"`,
+    /// **no `dimension`**) — the shape a raw `emit_attestation_self` `delegates_to`
+    /// carries, and exactly what CIRISConformance `test_551` probes. Before the
+    /// fix, the gate keyed on the internal dimension alone and this path was
+    /// UNGATED (a second distinct owner was admitted — CC 3.2 violated).
+    fn fix_owner_binding_cc(id: &str, owner: &str, node: &str) -> Attestation {
+        use crate::federation::types::{attestation_type, delegation_scope as ds, owner_binding};
+        let mut att = fix_attestation(id, owner, node, owner);
+        att.attestation_type = attestation_type::DELEGATES_TO.into();
+        // CC 2.4.1.2 marker ONLY (no `dimension`). Carries the infra scopes so
+        // it clears the node-agency gate and actually reaches the single-owner
+        // gate under test (the marker recognition is the thing being proven).
+        att.attestation_envelope = serde_json::json!({
+            "id": id,
+            "kind": "delegates_to",
+            "delegation_purpose": owner_binding::CC_DELEGATION_PURPOSE,
+            "scope": [ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+        });
+        resign_fix(&mut att);
+        att
+    }
+
+    /// v13.2.1 (CIRISPersist#378) — the single-owner gate + `owner_of` now fire
+    /// on the **CC-marker raw-emit path** (`delegation_purpose: "owner_binding"`,
+    /// no dimension), not only persist's internal-dimension `steward_bind` path.
+    /// A second distinct owner via the raw path is rejected; `owner_of` resolves
+    /// the first. This is the exact bypass CIRISConformance `test_551` caught.
+    #[tokio::test]
+    async fn single_owner_gate_rejects_second_distinct_owner_via_cc_marker() {
+        use crate::federation::admission::owner_of;
+        let backend = MemoryBackend::new();
+        seed_ob_keys(&backend).await;
+        seed_second_owner(&backend, "ob-owner2").await;
+
+        // First owner-binding (CC marker, no dimension) admits; owner_of resolves.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_owner_binding_cc("ob-cc1", "ob-owner", "ob-node"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_of(&backend, "ob-node").await.unwrap(),
+            Some("ob-owner".to_string()),
+            "owner_of must resolve the CC-marker owner-binding"
+        );
+
+        // A second, DIFFERENT owner via the same CC-marker path is REJECTED.
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_owner_binding_cc("ob-cc2", "ob-owner2", "ob-node"),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_node_already_owned",
+            "second distinct owner via the CC-marker raw-emit path must be rejected, got {err:?}"
+        );
+        assert_eq!(
+            owner_of(&backend, "ob-node").await.unwrap(),
+            Some("ob-owner".to_string()),
+            "the rejected second binding left no trace"
+        );
+    }
+
     /// A refresh by the SAME owner (new attestation id, same granter) is
     /// idempotently admitted — re-binding your own node is not a second owner.
     #[tokio::test]

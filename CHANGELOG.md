@@ -5,6 +5,25 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.2.1] — 2026-07-05 — single-owner gate fires on the CC 2.4.1.2 marker (#378)
+
+### Fixed
+- **#378** — the CC 3.2 single-owner **admission gate** was not enforced on the
+  canonical owner-binding path. `check_single_node_owner_admission` (and
+  `owner_of` / `live_owner_binding_granters`) keyed only on persist's internal
+  `dimension = "ownership:responsible_party:node:v1"`, but CC 2.4.1.2 (and the
+  only expressible owner-binding path — a raw `emit_attestation_self`
+  `delegates_to`, which CIRISConformance `test_551` probes) marks an owner-binding
+  with **`delegation_purpose: "owner_binding"`** and **no `dimension`**. The gate
+  returned `Ok` at its first guard on that path → **a second distinct owner was
+  admitted** (single-owner violated). Now a `delegates_to` is an owner-binding iff
+  EITHER the internal dimension OR the CC `delegation_purpose == "owner_binding"`
+  marker is present (`is_owner_binding_envelope` + `owner_binding::CC_DELEGATION_PURPOSE`),
+  so the gate + resolver fire on both the `steward_bind` and the raw-emit paths.
+  Flips `test_551`'s admission leg. (v13.2.0 shipped the resolver green but missed
+  this admission half — the agent tested only the dimension-setting `steward_bind`
+  path.) No schema change; no verify re-pin.
+
 ## [13.2.0] — 2026-07-05 — 2-of-3 canonical add + accord m-of-n hardening
 
 Closes the first-strike hole in the founding trust anchor: **canonical add is now

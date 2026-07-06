@@ -439,6 +439,15 @@ pub mod owner_binding {
     /// The owner-binding `delegation_purpose` (producer-side marker; the
     /// substrate gate keys on [`DIMENSION`], this documents the pair).
     pub const PURPOSE: &str = "responsible_for";
+    /// v13.2.1 (CIRISPersist#378) — the **CC 2.4.1.2 canonical** owner-binding
+    /// marker carried as `registration/attestation_envelope.delegation_purpose`.
+    /// The substrate recognizes an owner-binding by EITHER this
+    /// `delegation_purpose` value OR the internal [`DIMENSION`] (the
+    /// `steward_bind` path sets the dimension; a raw `emit_attestation_self`
+    /// `delegates_to` — the only expressible owner-binding path per CC 2.4.1.2,
+    /// and what CIRISConformance probes — carries only this). Keying on the
+    /// dimension ALONE let the raw-emit path bypass the single-owner gate.
+    pub const CC_DELEGATION_PURPOSE: &str = "owner_binding";
 }
 
 /// v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — the reserved
