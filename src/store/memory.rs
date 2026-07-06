@@ -1882,6 +1882,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v3.12.0 — value-validation admission (consensus_protocol
         // canonical form). Full signature-counting enforcement is v3.13+.
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        // v13.3.0 (CIRISPersist#386) — the real invariant (replaces the dropped
+        // family_key_id FK): every member key_id must be a registered key.
+        crate::federation::admission::validate_family_members(self, &row).await?;
         let mut state = self.state.lock().expect("memory backend lock");
         if !state.federation_keys.contains_key(&row.family_key_id) {
             return Err(crate::federation::Error::InvalidArgument(format!(

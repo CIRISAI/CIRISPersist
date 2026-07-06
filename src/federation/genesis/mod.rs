@@ -109,6 +109,107 @@ where
     Ok(())
 }
 
+/// The pinned genesis instant for the baked HUMANITY_ACCORD family row — a
+/// FIXED timestamp (not wall-clock) so the entrenched row + its
+/// `persist_row_hash` are deterministic across boots and backends
+/// (CIRISPersist#386). Matches the accord-holder seed's `valid_from`.
+const ACCORD_FAMILY_FOUNDED_AT: &str = "2026-05-01T00:00:00Z";
+
+/// The baked **HUMANITY_ACCORD `federation_families` row** (CIRISPersist#386) —
+/// the entrenched `quorum:2/3` family over the A1/B1/C1 founder seats. Fully
+/// determined by the pinned verify constants `HUMANITY_ACCORD_FAMILY_KEY_ID`
+/// and `ACCORD_CONSENSUS_PROTOCOL` plus the seeded accord-holder `key_id`s.
+/// persist's [`Family`](crate::federation::types::Family) carries no
+/// founder-signature field, so no signature is stored (bake-what-exists, same
+/// trust model as the holder-row seed). The member seats reuse the holder
+/// `key_id`s from [`accord_holder_genesis_records`], so the family stays
+/// coherent with the seeded holders by construction.
+pub fn accord_family_genesis_record() -> crate::federation::types::Family {
+    use crate::federation::types::{Family, FamilyMember};
+    let founded_at = ACCORD_FAMILY_FOUNDED_AT
+        .parse()
+        .expect("ACCORD_FAMILY_FOUNDED_AT is a valid RFC-3339 constant");
+    let members = accord_holder_genesis_records()
+        .iter()
+        .map(|sr| FamilyMember {
+            key_id: sr.record.key_id.clone(),
+            joined_at: founded_at,
+            role: Some("founder".to_owned()),
+        })
+        .collect();
+    Family {
+        family_key_id: ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID.to_owned(),
+        family_name: "HUMANITY_ACCORD".to_owned(),
+        members,
+        founded_at,
+        consensus_protocol: ciris_verify_core::accord_genesis::ACCORD_CONSENSUS_PROTOCOL.to_owned(),
+        consensus_protocol_entrenched: true,
+        persist_row_hash: String::new(),
+    }
+}
+
+/// First-boot-seed the baked HUMANITY_ACCORD **family row** (CIRISPersist#386).
+/// Generic over [`FederationDirectory`] so it stays **pg/sqlite-symmetric**.
+/// The untied tail of #344/#347: genesis bakes the accord-holder KEY rows but
+/// not the FAMILY row, so `lookup_family("humanity-accord")` returned `None` on
+/// a fresh node and every family/quorum display + entrenched-roster surface fell
+/// through. MUST run **after** [`accord_holder_genesis_records`] are seeded (the
+/// family's member seats FK-reference the holder `federation_keys` rows).
+///
+/// Idempotent: skips when the row is already present (reboot), inserts on first
+/// boot. Same bake-what-exists trust model as the holder seed.
+pub async fn seed_accord_family<D>(dir: &D) -> Result<(), String>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    let family = accord_family_genesis_record();
+    if dir
+        .lookup_family(&family.family_key_id)
+        .await
+        .map_err(|e| format!("lookup_family: {e}"))?
+        .is_some()
+    {
+        return Ok(()); // already entrenched (reboot) — idempotent no-op.
+    }
+    dir.put_family(crate::federation::SignedFamily { family })
+        .await
+        .map_err(|e| format!("seed accord family: {e} (are A1/B1/C1 seeded first?)"))
+}
+
+/// Fail-secure presence check (CIRISPersist#386): the baked HUMANITY_ACCORD
+/// family row is live with its entrenched `quorum:2/3` protocol and the full
+/// A1/B1/C1 founder seat set. Run at boot right after [`seed_accord_family`];
+/// `Err` is surfaced as
+/// [`EngineError::GenesisSeed`](crate::engine::EngineError::GenesisSeed).
+pub async fn verify_family_seeded<D>(dir: &D) -> Result<(), String>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    let expected = accord_family_genesis_record();
+    let row = dir
+        .lookup_family(&expected.family_key_id)
+        .await
+        .map_err(|e| format!("lookup_family: {e}"))?
+        .ok_or_else(|| format!("accord family {} not seeded", expected.family_key_id))?;
+    if row.consensus_protocol != expected.consensus_protocol || !row.consensus_protocol_entrenched {
+        return Err(format!(
+            "seeded accord family {} has non-entrenched / divergent protocol (got {:?}, entrenched={})",
+            expected.family_key_id, row.consensus_protocol, row.consensus_protocol_entrenched
+        ));
+    }
+    let seats: std::collections::BTreeSet<&str> =
+        row.members.iter().map(|m| m.key_id.as_str()).collect();
+    let want: std::collections::BTreeSet<&str> =
+        expected.members.iter().map(|m| m.key_id.as_str()).collect();
+    if seats != want {
+        return Err(format!(
+            "seeded accord family {} seats {seats:?} != the founder set {want:?}",
+            expected.family_key_id
+        ));
+    }
+    Ok(())
+}
+
 // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed (#380,
 // `ciris-canonical-1-d7bdeu223k` scrubbed by A1 ALONE) was REMOVED here
 // (`CANONICAL_SEED_JSON` / `canonical_genesis_records` / `seed_canonical_servers`
@@ -192,6 +293,91 @@ mod tests {
         assert!(
             verdict.is_confirmed(),
             "seeded real A1 must root (self-signed accord_holder ∈ anchor, real sig over canonical), got {verdict:?}"
+        );
+    }
+
+    /// v13.3.0 (CIRISPersist#386) — the baked accord FAMILY record is the
+    /// entrenched `quorum:2/3` HUMANITY_ACCORD over the A1/B1/C1 founder seats,
+    /// coherent with the seeded holder rows.
+    #[test]
+    fn accord_family_genesis_is_entrenched_2of3_over_the_holders() {
+        let fam = accord_family_genesis_record();
+        assert_eq!(fam.family_key_id, "humanity-accord");
+        assert_eq!(fam.consensus_protocol, "quorum:2/3");
+        assert!(fam.consensus_protocol_entrenched);
+        let seats: std::collections::BTreeSet<&str> =
+            fam.members.iter().map(|m| m.key_id.as_str()).collect();
+        let holders: std::collections::BTreeSet<&str> = accord_holder_genesis_records()
+            .iter()
+            .map(|sr| sr.record.key_id.as_str())
+            .collect();
+        assert_eq!(seats, holders, "family seats == the seeded holder key_ids");
+        assert!(fam
+            .members
+            .iter()
+            .all(|m| m.role.as_deref() == Some("founder")));
+    }
+
+    /// v13.3.0 (CIRISPersist#386) — end-to-end on a fresh backend: seed the
+    /// holders, then `seed_accord_family` entrenches the keyless family row
+    /// (its member seats FK-free now, validated at write-time against the
+    /// just-seeded holders), `verify_family_seeded` passes, and `lookup_family`
+    /// resolves the `quorum:2/3` row. Re-seeding is idempotent. A family whose
+    /// member is NOT a registered key is rejected (the invariant that replaced
+    /// the dropped FK).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn seeded_accord_family_resolves_and_is_idempotent() {
+        use crate::federation::types::{Family, FamilyMember};
+        use crate::federation::{FederationDirectory, SignedFamily};
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(accord_holder_genesis_records())
+            .await
+            .expect("holder seed");
+        // Family MUST go after the holders (members validated at write time).
+        seed_accord_family(&backend).await.expect("family seed");
+        verify_family_seeded(&backend).await.expect("family live");
+
+        let fam = backend
+            .lookup_family("humanity-accord")
+            .await
+            .expect("lookup")
+            .expect("family row present on a seeded node");
+        assert_eq!(fam.consensus_protocol, "quorum:2/3");
+        assert!(fam.consensus_protocol_entrenched);
+        assert_eq!(fam.members.len(), 3);
+
+        // Idempotent re-seed (reboot) — no error, no duplicate.
+        seed_accord_family(&backend)
+            .await
+            .expect("idempotent re-seed");
+
+        // The v13.3.0 invariant: a family with an UNREGISTERED member is refused.
+        let bad = Family {
+            family_key_id: "test-fam".into(),
+            family_name: "T".into(),
+            members: vec![FamilyMember {
+                key_id: "not-a-registered-key".into(),
+                joined_at: fam.founded_at,
+                role: Some("founder".into()),
+            }],
+            founded_at: fam.founded_at,
+            consensus_protocol: "quorum:1/1".into(),
+            consensus_protocol_entrenched: false,
+            persist_row_hash: String::new(),
+        };
+        let err = backend
+            .put_family(SignedFamily { family: bad })
+            .await
+            .expect_err("a family with an unregistered member must be refused");
+        assert!(
+            format!("{err:?}").contains("not a registered"),
+            "expected member-not-registered error, got {err:?}"
         );
     }
 

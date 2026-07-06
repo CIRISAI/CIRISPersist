@@ -3399,6 +3399,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     ) -> Result<(), crate::federation::Error> {
         let mut row = family.family;
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
+        // v13.3.0 (CIRISPersist#386) — the real invariant (replaces the dropped
+        // family_key_id FK): every member key_id must be a registered key.
+        crate::federation::admission::validate_family_members(self, &row).await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let members_json = serde_json::to_string(&row.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;

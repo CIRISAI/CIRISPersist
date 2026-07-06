@@ -1375,6 +1375,34 @@ pub fn check_consensus_protocol_form(consensus_protocol: &str) -> Result<(), Err
     }
 }
 
+/// v13.3.0 (CIRISPersist#386) — the REAL family invariant, enforced at
+/// `put_family` write time on every backend: **every member `key_id` MUST be a
+/// registered `federation_keys` row**. This replaces the dropped
+/// `family_key_id REFERENCES federation_keys` FK (V097) — a constitutional
+/// family is *keyless* (constituted by its founder quorum, NOT by owning a
+/// key), so the family's OWN key was never the meaningful constraint; the
+/// members being real keys always was. Applies uniformly to constitutional and
+/// ordinary families. Fail-secure: an unregistered member ⇒ `InvalidArgument`,
+/// verify-before-mutation.
+pub async fn validate_family_members<D>(
+    directory: &D,
+    family: &crate::federation::types::Family,
+) -> Result<(), Error>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    for m in &family.members {
+        if directory.lookup_public_key(&m.key_id).await?.is_none() {
+            return Err(Error::InvalidArgument(format!(
+                "family {} member {} is not a registered federation_keys row \
+                 (members MUST be registered keys)",
+                family.family_key_id, m.key_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ─── v6.4.0 — broadened `withdraws` admission gate (CEG §3.2.3) ────
 
 /// The delegation-scope token a `delegates_to` edge MUST carry for it
