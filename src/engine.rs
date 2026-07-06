@@ -293,13 +293,50 @@ impl Engine {
     /// same `Backend::run_migrations` path the PyO3 surface uses), so
     /// the returned Engine is ready to read/write immediately.
     pub async fn with_signer(signer: Arc<LocalSigner>, dsn: &str) -> Result<Self, EngineError> {
-        let backend = build_backend(dsn).await?;
+        let backend = build_backend(dsn, true).await?;
         // v2.12.0 (#112): preserve the original `LocalSigner` Arc so
         // `Engine::sign_hybrid` can reach `LocalSigner::sign_hybrid`.
         let local_signer = Some(signer.clone());
         // v1.13.0 (#92): the stored field is `Arc<dyn HardwareSigner>`;
         // wrap the caller's `Arc<LocalSigner>` so the constructor stays
         // source-compatible.
+        let signer: Arc<dyn HardwareSigner> = Arc::new(LocalSignerHardwareAdapter::new(signer));
+        Ok(Engine {
+            backend,
+            signer,
+            local_signer,
+            replication_config: None,
+            disk_pressure_config: None,
+            disk_pressure_state: None,
+            #[cfg(feature = "cirisnode")]
+            multimedia_config: Arc::new(std::sync::RwLock::new(None)),
+        })
+    }
+
+    /// v13.3.1 (CIRISPersist#387) — **TEST-ONLY** constructor: identical to
+    /// [`with_signer`](Self::with_signer) (connect + run migrations) but it
+    /// **SKIPS the HUMANITY_ACCORD genesis seed** — no baked A1/B1/C1 holder
+    /// rows, no entrenched family row. Gated behind the `test-genesis-seam`
+    /// cargo feature (default OFF, absent from release builds), so this cannot
+    /// be reached in production — a node without the baked trust root is broken.
+    ///
+    /// The seed is deliberately **unconditional** in prod ([`with_signer`]): the
+    /// baked accord family IS the immutable trust root, and the assemble
+    /// ceremony is idempotent (an already-entrenched family is a no-op, never a
+    /// replacement — else a node owner could overwrite the constitutional family
+    /// with their own holders). This seam exists ONLY so downstream integration
+    /// tests can assemble a *controllable* custom-holder `humanity-accord`
+    /// family (with holders they can sign as) without the baked A1/B1/C1 +
+    /// family causing a UNIQUE conflict or an unsignable roster. Enable it in
+    /// `[dev-dependencies]` (e.g. CIRISServer's test build), never in
+    /// `[dependencies]`.
+    #[cfg(feature = "test-genesis-seam")]
+    pub async fn with_signer_no_genesis_seed(
+        signer: Arc<LocalSigner>,
+        dsn: &str,
+    ) -> Result<Self, EngineError> {
+        let backend = build_backend(dsn, false).await?;
+        let local_signer = Some(signer.clone());
         let signer: Arc<dyn HardwareSigner> = Arc::new(LocalSignerHardwareAdapter::new(signer));
         Ok(Engine {
             backend,
@@ -355,7 +392,7 @@ impl Engine {
         signer: Arc<dyn HardwareSigner>,
         dsn: &str,
     ) -> Result<Self, EngineError> {
-        let backend = build_backend(dsn).await?;
+        let backend = build_backend(dsn, true).await?;
         Ok(Engine {
             backend,
             signer,
@@ -416,7 +453,7 @@ impl Engine {
             )
             .await?,
         );
-        let backend = build_backend(dsn).await?;
+        let backend = build_backend(dsn, true).await?;
         Ok(Engine {
             backend,
             // `signer` is the hardware classical itself — same shape as
@@ -4934,7 +4971,13 @@ pub enum EngineMaintenance {
 ///
 /// Factored out so `Engine::with_signer` and any future Engine
 /// constructors share the same URL-sniff + migration shape.
-async fn build_backend(dsn: &str) -> Result<BackendDispatch, EngineError> {
+// `seed_genesis` is consumed inside the postgres / sqlite `if` blocks; in a
+// no-backend build both arms are cfg'd out, so silence the unused-var lint there.
+#[cfg_attr(
+    not(any(feature = "postgres", feature = "sqlite")),
+    allow(unused_variables)
+)]
+async fn build_backend(dsn: &str, seed_genesis: bool) -> Result<BackendDispatch, EngineError> {
     if dsn.starts_with("postgresql://") || dsn.starts_with("postgres://") {
         #[cfg(feature = "postgres")]
         {
@@ -4942,26 +4985,34 @@ async fn build_backend(dsn: &str) -> Result<BackendDispatch, EngineError> {
                 .await
                 .map_err(EngineError::Store)?;
             pg.run_migrations().await.map_err(EngineError::Store)?;
-            // v12.0.2 (CIRISPersist#347) — first-boot-seed the HUMANITY_ACCORD
-            // holder rooting-anchor rows (idempotent), then fail-secure verify.
-            pg.seed_genesis_accord_holders(
-                crate::federation::genesis::accord_holder_genesis_records(),
-            )
-            .await
-            .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
-            crate::federation::genesis::verify_anchor_seeded(&pg)
+            // v13.3.1 (CIRISPersist#387) — the genesis seed is UNCONDITIONAL in
+            // production (`seed_genesis == true`): the baked HUMANITY_ACCORD
+            // holders + family ARE the immutable trust root. `seed_genesis ==
+            // false` is reachable ONLY via the feature-gated
+            // `with_signer_no_genesis_seed` (test-only, absent from prod builds),
+            // so downstream integration tests can assemble a controllable
+            // custom-holder family without the baked A1/B1/C1 + family blocking it.
+            if seed_genesis {
+                // v12.0.2 (#347) — first-boot-seed the HUMANITY_ACCORD holder
+                // rooting-anchor rows (idempotent), then fail-secure verify.
+                pg.seed_genesis_accord_holders(
+                    crate::federation::genesis::accord_holder_genesis_records(),
+                )
                 .await
-                .map_err(EngineError::GenesisSeed)?;
-            // v13.3.0 (CIRISPersist#386) — entrench the keyless HUMANITY_ACCORD
-            // FAMILY row (quorum:2/3, A1/B1/C1) after the holder rows, so
-            // lookup_family + the family/quorum surfaces resolve on a fresh node
-            // with zero ceremony. Idempotent + fail-secure. Untied tail of #344/#347.
-            crate::federation::genesis::seed_accord_family(&pg)
-                .await
-                .map_err(EngineError::GenesisSeed)?;
-            crate::federation::genesis::verify_family_seeded(&pg)
-                .await
-                .map_err(EngineError::GenesisSeed)?;
+                .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
+                crate::federation::genesis::verify_anchor_seeded(&pg)
+                    .await
+                    .map_err(EngineError::GenesisSeed)?;
+                // v13.3.0 (#386) — entrench the keyless HUMANITY_ACCORD FAMILY
+                // row (quorum:2/3, A1/B1/C1) after the holder rows. Idempotent +
+                // fail-secure. Untied tail of #344/#347.
+                crate::federation::genesis::seed_accord_family(&pg)
+                    .await
+                    .map_err(EngineError::GenesisSeed)?;
+                crate::federation::genesis::verify_family_seeded(&pg)
+                    .await
+                    .map_err(EngineError::GenesisSeed)?;
+            }
             // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
             // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
             // REMOVED: a single-anchor founding record is a first-strike
@@ -4999,25 +5050,27 @@ async fn build_backend(dsn: &str) -> Result<BackendDispatch, EngineError> {
                     .map_err(EngineError::Store)?
             };
             sq.run_migrations().await.map_err(EngineError::Store)?;
-            // v12.0.2 (CIRISPersist#347) — first-boot-seed the HUMANITY_ACCORD
-            // holder rooting-anchor rows (idempotent), then fail-secure verify.
-            sq.seed_genesis_accord_holders(
-                crate::federation::genesis::accord_holder_genesis_records(),
-            )
-            .await
-            .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
-            crate::federation::genesis::verify_anchor_seeded(&sq)
+            // v13.3.1 (CIRISPersist#387) — see the postgres leg: seed is
+            // unconditional in prod; skipped only via the feature-gated
+            // test-only `with_signer_no_genesis_seed`.
+            if seed_genesis {
+                // v12.0.2 (#347) — HUMANITY_ACCORD holder anchor rows, then verify.
+                sq.seed_genesis_accord_holders(
+                    crate::federation::genesis::accord_holder_genesis_records(),
+                )
                 .await
-                .map_err(EngineError::GenesisSeed)?;
-            // v13.3.0 (CIRISPersist#386) — entrench the keyless HUMANITY_ACCORD
-            // FAMILY row (quorum:2/3, A1/B1/C1) after the holder rows. Idempotent
-            // + fail-secure. Untied tail of #344/#347.
-            crate::federation::genesis::seed_accord_family(&sq)
-                .await
-                .map_err(EngineError::GenesisSeed)?;
-            crate::federation::genesis::verify_family_seeded(&sq)
-                .await
-                .map_err(EngineError::GenesisSeed)?;
+                .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
+                crate::federation::genesis::verify_anchor_seeded(&sq)
+                    .await
+                    .map_err(EngineError::GenesisSeed)?;
+                // v13.3.0 (#386) — entrench the keyless HUMANITY_ACCORD FAMILY row.
+                crate::federation::genesis::seed_accord_family(&sq)
+                    .await
+                    .map_err(EngineError::GenesisSeed)?;
+                crate::federation::genesis::verify_family_seeded(&sq)
+                    .await
+                    .map_err(EngineError::GenesisSeed)?;
+            }
             // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
             // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
             // REMOVED: a single-anchor founding record is a first-strike
@@ -5181,6 +5234,42 @@ mod tests {
         assert!(sq.admission_gate().is_some());
         engine.set_admission_gate(None);
         assert!(sq.admission_gate().is_none());
+    }
+
+    /// v13.3.1 (CIRISPersist#387) — the TEST-ONLY seam: `with_signer_no_genesis_seed`
+    /// yields a clean engine with **no baked trust root** — no accord holders
+    /// (A1 absent), no entrenched family — so downstream integration tests can
+    /// assemble a controllable custom-holder `humanity-accord` family. The
+    /// default `with_signer` (prev test) DOES seed both. Gated behind the
+    /// `test-genesis-seam` feature so it is absent from release builds.
+    #[cfg(all(feature = "sqlite", feature = "test-genesis-seam"))]
+    #[tokio::test]
+    async fn no_genesis_seed_seam_yields_a_clean_engine() {
+        let engine = Engine::with_signer_no_genesis_seed(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct no-seed engine");
+        let dir = engine.federation_directory();
+        assert!(
+            dir.lookup_family("humanity-accord")
+                .await
+                .unwrap()
+                .is_none(),
+            "the seam must NOT seed the entrenched accord family"
+        );
+        assert!(
+            dir.lookup_public_key("A1").await.unwrap().is_none(),
+            "the seam must NOT seed the A1 accord holder"
+        );
+        // And a normally-constructed engine DOES have both (the prod path).
+        let seeded = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct seeded engine");
+        assert!(seeded
+            .federation_directory()
+            .lookup_family("humanity-accord")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[cfg(feature = "sqlite")]
