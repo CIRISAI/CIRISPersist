@@ -5,6 +5,24 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.3.1] — 2026-07-06 — test-only genesis-seed seam (#387)
+
+### Added
+- **#387** — **`Engine::with_signer_no_genesis_seed`**, a **test-only** constructor
+  (connect + migrate, but SKIP the HUMANITY_ACCORD holder + family genesis seed),
+  gated behind the new **`test-genesis-seam`** cargo feature (default OFF, absent
+  from release builds). The genesis seed stays **unconditional in production** —
+  the baked accord holders + entrenched family ARE the immutable trust root, and
+  the assemble ceremony is idempotent (an already-entrenched family is a no-op,
+  never a replacement). This seam exists solely so downstream integration tests
+  (e.g. CIRISServer) can assemble a *controllable* custom-holder `humanity-accord`
+  family — enable it in `[dev-dependencies]`, never `[dependencies]`.
+  - Reconciliation note: persist already blocks trust-root takeover at the
+    substrate — `put_family` is an INSERT (a second `humanity-accord` UNIQUE-conflicts)
+    and `supersede_family` cannot de-entrench or change an entrenched family's M/N.
+    So no substrate guard was needed; the seam is the only persist-side change.
+  `build_backend` gained an internal `seed_genesis: bool` (prod callers pass `true`).
+
 ## [13.3.0] — 2026-07-06 — keyless accord family seed + single-owner CC-marker fix
 
 ### Added

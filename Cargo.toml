@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "13.3.0"
+version = "13.3.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -72,6 +72,16 @@ peer-replicate = []
 # slips past `except Exception`). NOT exposed in release wheels —
 # CI's pytest job is the only consumer.
 test-panic = []
+
+# v13.3.1 (CIRISPersist#387) — TEST-ONLY seam: exposes
+# `Engine::with_signer_no_genesis_seed`, which connects + migrates but
+# SKIPS the unconditional HUMANITY_ACCORD holder + family genesis seed.
+# Prod builds MUST NOT enable this (a node with no baked trust root is
+# broken); default-off so it is absent from release builds. Downstream
+# integration tests (e.g. CIRISServer) enable it in `[dev-dependencies]`
+# to assemble a controllable custom-holder family without the baked
+# A1/B1/C1 + family blocking them. Same test-only pattern as `test-panic`.
+test-genesis-seam = []
 
 # v0.6.0 (CIRISPersist#19) — post-ingest filter pipeline features.
 # Match FSD §2.4 shape. Lens-side scrub + extract code lift in
