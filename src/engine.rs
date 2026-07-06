@@ -5012,6 +5012,16 @@ async fn build_backend(dsn: &str, seed_genesis: bool) -> Result<BackendDispatch,
                 crate::federation::genesis::verify_family_seeded(&pg)
                     .await
                     .map_err(EngineError::GenesisSeed)?;
+                // v13.4.0 (#390) — bake the 2-of-3 accord-co-scrubbed canonical
+                // genesis server, admitted through the 2-of-3 gate against the
+                // just-seeded A1/B1 anchor + family. A fresh node ships trusting
+                // ciris-canonical-1 with zero ceremony. Idempotent + fail-secure.
+                crate::federation::genesis::seed_canonical_servers(&pg)
+                    .await
+                    .map_err(EngineError::GenesisSeed)?;
+                crate::federation::genesis::verify_canonical_seeded(&pg)
+                    .await
+                    .map_err(EngineError::GenesisSeed)?;
             }
             // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
             // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
@@ -5068,6 +5078,14 @@ async fn build_backend(dsn: &str, seed_genesis: bool) -> Result<BackendDispatch,
                     .await
                     .map_err(EngineError::GenesisSeed)?;
                 crate::federation::genesis::verify_family_seeded(&sq)
+                    .await
+                    .map_err(EngineError::GenesisSeed)?;
+                // v13.4.0 (#390) — bake the 2-of-3 canonical genesis server
+                // against the just-seeded anchor + family. Idempotent + fail-secure.
+                crate::federation::genesis::seed_canonical_servers(&sq)
+                    .await
+                    .map_err(EngineError::GenesisSeed)?;
+                crate::federation::genesis::verify_canonical_seeded(&sq)
                     .await
                     .map_err(EngineError::GenesisSeed)?;
             }
@@ -5270,6 +5288,30 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// v13.4.0 (CIRISPersist#390) — the operator's success criterion: a FRESH
+    /// install (no ceremony, no manual adopt) boots with `ciris-canonical-1`
+    /// already in the conferred canonical set, so the client Trust Root shows it
+    /// as canonical and peers can address it by key_id.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fresh_engine_auto_loads_2of3_canonical_server() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let node = &crate::federation::genesis::canonical_genesis_records()[0].record;
+        assert_eq!(node.key_id, "ciris-canonical-1-d7bdeu223k");
+        assert!(
+            engine
+                .is_canonical(&node.key_id)
+                .await
+                .expect("is_canonical"),
+            "a fresh install must trust {} out of the box",
+            node.key_id
+        );
+        let listed = engine.list_canonical_servers().await.expect("list");
+        assert!(listed.iter().any(|r| r.key_id == node.key_id));
     }
 
     #[cfg(feature = "sqlite")]
