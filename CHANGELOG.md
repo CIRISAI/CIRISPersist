@@ -5,6 +5,25 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.4.0] — 2026-07-06 — bake the 2-of-3 canonical genesis server (#390)
+
+### Added
+- **#390** — **restore the canonical genesis seed** with the operator's **2-of-3
+  accord-co-scrubbed** `ciris-canonical-1-d7bdeu223k` record (A1 primary scrub +
+  B1 in `additional_scrubs`, over a byte-identical envelope), replacing the 1-of-N
+  record #383 removed. `canonical_genesis_records` / `seed_canonical_servers` /
+  `verify_canonical_seeded` are restored (generic, pg/sqlite-symmetric, idempotent,
+  fail-secure), wired into `build_backend` **after** the accord holders + family so
+  the 2-of-3 verifies against the seeded A1/B1 anchor. The record is admitted
+  **through** `check_canonical_role_admission` (the ≥2-distinct-anchor-scrub gate —
+  so it proves its own accord-conferral, not a force-insert) and never silently
+  overwrites (put_public_key). **A fresh install now boots trusting
+  `ciris-canonical-1` with zero ceremony** — the client Trust Root shows it as
+  canonical and peers can address it by key_id. Field-proven: the record was
+  adopted onto a live node (0.5.85 / v13.3.1) via `adopt_scrub_upgrade` →
+  `outcome: upgraded`. Bake-what-was-conferred (live YubiKey scrub sigs), the same
+  trust model as the accord-holder seed. Seed-only, no schema change, no verify re-pin.
+
 ## [13.3.1] — 2026-07-06 — test-only genesis-seed seam (#387)
 
 ### Added

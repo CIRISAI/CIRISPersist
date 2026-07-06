@@ -210,15 +210,90 @@ where
     Ok(())
 }
 
-// v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed (#380,
-// `ciris-canonical-1-d7bdeu223k` scrubbed by A1 ALONE) was REMOVED here
-// (`CANONICAL_SEED_JSON` / `canonical_genesis_records` / `seed_canonical_servers`
-// / `verify_canonical_seeded`). A single-anchor founding record is a
-// first-strike weakness: with canonical ADD now a 2-of-3 accord co-scrub
-// (`check_canonical_role_admission`), a 1-of-N baked genesis would be a
-// permanent grandfathered exception. A fresh node therefore ships with an
-// EMPTY canonical set until the operator bakes the 2-of-3 replacement. The
-// accord-holder rooting anchor (A1/B1/C1) above is untouched.
+/// The baked **canonical genesis server** record — the operator's
+/// `ciris-canonical-1-d7bdeu223k` node, now **2-of-3 accord-co-scrubbed** (A1
+/// primary + B1 in `additional_scrubs`, over a byte-identical envelope)
+/// (CIRISPersist#390, v13.4.0). This REPLACES the 1-of-N record #383 removed:
+/// with canonical ADD requiring a 2-of-3 accord co-scrub, a single-anchor
+/// founding record was a first-strike weakness. Bake-what-was-conferred (live
+/// YubiKey scrub sigs), the same trust model as [`accord_holder_genesis_records`]
+/// — NOT a constant-derived artifact.
+const CANONICAL_SEED_JSON: &str = include_str!("canonical_seed.json");
+
+/// Parse-once accessor for the baked 2-of-3 canonical genesis record(s).
+///
+/// # Panics
+///
+/// Panics if the embedded JSON is malformed (build-time-checked constant;
+/// caught by [`tests::canonical_seed_parses_and_is_2of3_accord_conferred`]).
+pub fn canonical_genesis_records() -> &'static [SignedKeyRecord] {
+    use std::sync::OnceLock;
+    static PARSED: OnceLock<Vec<SignedKeyRecord>> = OnceLock::new();
+    PARSED.get_or_init(|| {
+        serde_json::from_str(CANONICAL_SEED_JSON)
+            .expect("embedded canonical_seed.json must be valid [SignedKeyRecord]")
+    })
+}
+
+/// First-boot-seed the baked 2-of-3 canonical genesis server(s)
+/// (CIRISPersist#390). Generic over [`FederationDirectory`] (pg/sqlite-symmetric).
+///
+/// Admitted **through the ordinary
+/// [`check_canonical_role_admission`](crate::federation::admission::check_canonical_role_admission)
+/// gate** inside [`FederationDirectory::put_public_key`] — so the record proves
+/// its own accord-conferral (both scrubs re-verified as ≥2 distinct
+/// HUMANITY_ACCORD holders via `verify_quorum_policy`), not a force-insert. MUST
+/// run **after** the accord holders + family are seeded (the 2-of-3 verifies
+/// against the seeded A1/B1 anchor). Idempotent: a byte-identical row already
+/// present is a `put_public_key` no-op; a `key_id` collision with different
+/// content surfaces as an `Err` (never a silent overwrite — the same
+/// trust-root-takeover invariant as the family bake).
+pub async fn seed_canonical_servers<D>(dir: &D) -> Result<(), String>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    for sr in canonical_genesis_records() {
+        dir.put_public_key(sr.clone()).await.map_err(|e| {
+            format!(
+                "seed canonical server {}: {e} (are A1/B1 holders + accord family seeded first?)",
+                sr.record.key_id
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Fail-secure presence check (CIRISPersist#390): every baked canonical record
+/// is live with matching pubkey and the `canonical` role still conferred. Run
+/// at boot right after [`seed_canonical_servers`]; `Err` surfaces as
+/// [`EngineError::GenesisSeed`](crate::engine::EngineError::GenesisSeed).
+pub async fn verify_canonical_seeded<D>(dir: &D) -> Result<(), String>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    use crate::federation::types::identity_type;
+    for sr in canonical_genesis_records() {
+        let r = &sr.record;
+        let row = dir
+            .lookup_public_key(&r.key_id)
+            .await
+            .map_err(|e| format!("lookup {}: {e}", r.key_id))?
+            .ok_or_else(|| format!("canonical server {} not seeded", r.key_id))?;
+        if row.pubkey_ed25519_base64 != r.pubkey_ed25519_base64 {
+            return Err(format!(
+                "canonical server {} present with a divergent pubkey (squatting)",
+                r.key_id
+            ));
+        }
+        if !identity_type::set_contains(&row.identity_type, identity_type::CANONICAL) {
+            return Err(format!(
+                "seeded canonical server {} lost its `canonical` role (identity_type={:?})",
+                r.key_id, row.identity_type
+            ));
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -316,6 +391,77 @@ mod tests {
             .members
             .iter()
             .all(|m| m.role.as_deref() == Some("founder")));
+    }
+
+    /// v13.4.0 (CIRISPersist#390) — the baked canonical seed parses, is
+    /// `canonical`, and is **2-of-3 accord-conferred**: primary scrub A1 + a
+    /// distinct additional anchor scrub (B1), ≥2 distinct scrubbers.
+    #[test]
+    fn canonical_seed_parses_and_is_2of3_accord_conferred() {
+        let recs = canonical_genesis_records();
+        assert_eq!(recs.len(), 1, "the founding canonical server");
+        let r = &recs[0].record;
+        assert_eq!(r.key_id, "ciris-canonical-1-d7bdeu223k");
+        assert!(identity_type::set_contains(
+            &r.identity_type,
+            identity_type::CANONICAL
+        ));
+        assert_eq!(r.scrub_key_id, "A1", "primary scrub");
+        assert!(
+            r.additional_scrubs.iter().any(|s| s.scrub_key_id == "B1"),
+            "co-scrub by a second distinct anchor holder (B1)"
+        );
+        assert!(
+            r.distinct_scrub_count() >= 2,
+            "must be a >=2 accord co-scrub, got {}",
+            r.distinct_scrub_count()
+        );
+    }
+
+    /// v13.4.0 (CIRISPersist#390) — end-to-end: seed holders → family → the
+    /// 2-of-3 canonical server. The canonical record is admitted THROUGH the
+    /// 2-of-3 `check_canonical_role_admission` gate against the seeded A1/B1
+    /// anchor, `verify_canonical_seeded` passes, and `is_canonical` /
+    /// `list_canonical_servers` report it. Re-seed is idempotent.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn seeded_2of3_canonical_server_is_admitted_and_listed() {
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(accord_holder_genesis_records())
+            .await
+            .expect("holder seed");
+        seed_accord_family(&backend).await.expect("family seed");
+        // The 2-of-3 canonical verifies against the just-seeded A1/B1 anchor.
+        seed_canonical_servers(&backend)
+            .await
+            .expect("canonical seed (2-of-3 must admit)");
+        verify_canonical_seeded(&backend)
+            .await
+            .expect("canonical live");
+
+        let node = &canonical_genesis_records()[0].record;
+        assert!(
+            crate::federation::is_canonical(&backend, &node.key_id)
+                .await
+                .expect("is_canonical"),
+            "{} must be canonical on a fresh node",
+            node.key_id
+        );
+        let listed = backend.list_canonical_servers().await.expect("list");
+        assert!(
+            listed.iter().any(|r| r.key_id == node.key_id),
+            "list_canonical_servers must include {}",
+            node.key_id
+        );
+
+        seed_canonical_servers(&backend)
+            .await
+            .expect("idempotent re-seed");
     }
 
     /// v13.3.0 (CIRISPersist#386) — end-to-end on a fresh backend: seed the
