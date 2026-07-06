@@ -5,6 +5,44 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.3.0] — 2026-07-06 — keyless accord family seed + single-owner CC-marker fix
+
+### Added
+- **#386** — **seed the entrenched HUMANITY_ACCORD `federation_families` row**
+  (quorum:2/3, A1/B1/C1) at first boot, right after the accord-holder rows — the
+  untied tail of #344/#347. A fresh node now resolves `lookup_family("humanity-accord")`
+  (and the family/quorum display, kill-switch quorum count, co-scrub `quorum_needed`)
+  with zero ceremony; previously it returned `None`. `seed_accord_family` /
+  `verify_family_seeded` are generic over `FederationDirectory` (pg/sqlite-symmetric),
+  idempotent, fail-secure.
+- **A constitutional family is KEYLESS** (migration **V097**). The original
+  `federation_families.family_key_id REFERENCES federation_keys(key_id)` FK encoded
+  the false assumption that a family owns a registered key — but the accord family
+  (`humanity-accord`) has *no keypair*; it is constituted by its founder quorum's
+  signatures. The FK is dropped; the REAL invariant — **every member `key_id` is a
+  registered `federation_keys` row** — moves to write-time validation in `put_family`
+  (`validate_family_members`), applying uniformly to every family. (This also makes
+  the server's `recognized_family_from_baked_genesis` read-time fallback + its
+  `ensure_accord_family_anchor` throwaway-key hack redundant — a durable row now
+  exists.) No verify re-pin.
+
+### Fixed
+- **#378** — the CC 3.2 single-owner **admission gate** was not enforced on the
+  canonical owner-binding path. `check_single_node_owner_admission` (and
+  `owner_of` / `live_owner_binding_granters`) keyed only on persist's internal
+  `dimension = "ownership:responsible_party:node:v1"`, but CC 2.4.1.2 (and the
+  only expressible owner-binding path — a raw `emit_attestation_self`
+  `delegates_to`, which CIRISConformance `test_551` probes) marks an owner-binding
+  with **`delegation_purpose: "owner_binding"`** and **no `dimension`**. The gate
+  returned `Ok` at its first guard on that path → **a second distinct owner was
+  admitted** (single-owner violated). Now a `delegates_to` is an owner-binding iff
+  EITHER the internal dimension OR the CC `delegation_purpose == "owner_binding"`
+  marker is present (`is_owner_binding_envelope` + `owner_binding::CC_DELEGATION_PURPOSE`),
+  so the gate + resolver fire on both the `steward_bind` and the raw-emit paths.
+  Flips `test_551`'s admission leg. (v13.2.0 shipped the resolver green but missed
+  this admission half — the agent tested only the dimension-setting `steward_bind`
+  path.) No schema change; no verify re-pin.
+
 ## [13.2.0] — 2026-07-05 — 2-of-3 canonical add + accord m-of-n hardening
 
 Closes the first-strike hole in the founding trust anchor: **canonical add is now

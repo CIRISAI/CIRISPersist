@@ -4952,6 +4952,16 @@ async fn build_backend(dsn: &str) -> Result<BackendDispatch, EngineError> {
             crate::federation::genesis::verify_anchor_seeded(&pg)
                 .await
                 .map_err(EngineError::GenesisSeed)?;
+            // v13.3.0 (CIRISPersist#386) — entrench the keyless HUMANITY_ACCORD
+            // FAMILY row (quorum:2/3, A1/B1/C1) after the holder rows, so
+            // lookup_family + the family/quorum surfaces resolve on a fresh node
+            // with zero ceremony. Idempotent + fail-secure. Untied tail of #344/#347.
+            crate::federation::genesis::seed_accord_family(&pg)
+                .await
+                .map_err(EngineError::GenesisSeed)?;
+            crate::federation::genesis::verify_family_seeded(&pg)
+                .await
+                .map_err(EngineError::GenesisSeed)?;
             // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
             // (#380, `ciris-canonical-1-d7bdeu223k` scrubbed by A1 alone) was
             // REMOVED: a single-anchor founding record is a first-strike
@@ -4997,6 +5007,15 @@ async fn build_backend(dsn: &str) -> Result<BackendDispatch, EngineError> {
             .await
             .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
             crate::federation::genesis::verify_anchor_seeded(&sq)
+                .await
+                .map_err(EngineError::GenesisSeed)?;
+            // v13.3.0 (CIRISPersist#386) — entrench the keyless HUMANITY_ACCORD
+            // FAMILY row (quorum:2/3, A1/B1/C1) after the holder rows. Idempotent
+            // + fail-secure. Untied tail of #344/#347.
+            crate::federation::genesis::seed_accord_family(&sq)
+                .await
+                .map_err(EngineError::GenesisSeed)?;
+            crate::federation::genesis::verify_family_seeded(&sq)
                 .await
                 .map_err(EngineError::GenesisSeed)?;
             // v13.2.0 (CIRISPersist#383) — the 1-of-N canonical genesis seed
@@ -5162,6 +5181,26 @@ mod tests {
         assert!(sq.admission_gate().is_some());
         engine.set_admission_gate(None);
         assert!(sq.admission_gate().is_none());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn fresh_engine_auto_loads_accord_family() {
+        // v13.3.0 (CIRISPersist#386) — a FRESH engine auto-loads the entrenched
+        // keyless HUMANITY_ACCORD family row (quorum:2/3, A1/B1/C1), like the
+        // accord holders — no manual seed, `lookup_family` resolves straight out
+        // of `Engine::with_signer`.
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let fam = engine
+            .federation_directory()
+            .lookup_family("humanity-accord")
+            .await
+            .expect("lookup")
+            .expect("fresh engine must recognize the baked accord family");
+        assert_eq!(fam.consensus_protocol, "quorum:2/3");
+        assert_eq!(fam.members.len(), 3);
     }
 
     #[cfg(feature = "sqlite")]
