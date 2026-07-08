@@ -253,11 +253,28 @@ where
     D: super::FederationDirectory + ?Sized,
 {
     for sr in canonical_genesis_records() {
-        dir.put_public_key(sr.clone()).await.map_err(|e| {
-            format!(
-                "seed canonical server {}: {e} (are A1/B1 holders + accord family seeded first?)",
-                sr.record.key_id
-            )
+        let kid = &sr.record.key_id;
+        // v13.4.2 (CIRISPersist#394) — the CANONICAL NODE ITSELF already holds
+        // this key_id as its OWN self-signed `node` row (it minted the
+        // identity). `put_public_key` would see same-key / different-content →
+        // Err → boot abort. So branch on presence:
+        //  - present → `adopt_scrub_upgrade`: upgrade the self-signed row to the
+        //    baked 2-of-3 scrubbed canonical (re-runs check_canonical_role_admission,
+        //    so the ≥2-anchor-scrub gate still holds; no-op if already adopted).
+        //  - absent (a FRESH node) → `put_public_key`: insert through the same gate.
+        // (`adopt_scrub_upgrade` errors on an absent row, so both arms are needed.)
+        let present = dir
+            .lookup_public_key(kid)
+            .await
+            .map_err(|e| format!("lookup canonical {kid}: {e}"))?
+            .is_some();
+        let res = if present {
+            dir.adopt_scrub_upgrade(sr.clone()).await.map(|_| ())
+        } else {
+            dir.put_public_key(sr.clone()).await
+        };
+        res.map_err(|e| {
+            format!("seed canonical server {kid}: {e} (are A1/B1 holders + accord family seeded first?)")
         })?;
     }
     Ok(())
@@ -492,6 +509,66 @@ mod tests {
         seed_canonical_servers(&backend)
             .await
             .expect("idempotent re-seed");
+    }
+
+    /// v13.4.2 (CIRISPersist#394) — the boot-panic regression: the **canonical
+    /// node itself** already holds `ciris-canonical-1` as its OWN self-signed
+    /// `node` row (it minted the identity). The genesis seed MUST **upgrade**
+    /// that row to the 2-of-3 scrubbed canonical (via `adopt_scrub_upgrade`),
+    /// not error on it (which `put_public_key` did → boot abort). After the
+    /// seed the node self-roots as canonical; re-seed is idempotent.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn canonical_seed_upgrades_the_nodes_own_self_signed_row() {
+        use crate::federation::{FederationDirectory, SignedKeyRecord};
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(accord_holder_genesis_records())
+            .await
+            .expect("holder seed");
+        seed_accord_family(&backend).await.expect("family seed");
+
+        // Pre-seed ciris-canonical-1 as the node's OWN self-signed `node` row —
+        // same pubkeys as the baked record, but self-signed and not canonical.
+        let baked = &canonical_genesis_records()[0].record;
+        let mut own = baked.clone();
+        own.scrub_key_id = own.key_id.clone(); // self-signed
+        own.identity_type = identity_type::NODE.to_owned();
+        own.additional_scrubs.clear();
+        own.roles.clear();
+        backend
+            .put_public_key(SignedKeyRecord { record: own })
+            .await
+            .expect("pre-seed the node's own self-signed row");
+        assert!(
+            !crate::federation::is_canonical(&backend, &baked.key_id)
+                .await
+                .unwrap(),
+            "the self-signed row is NOT canonical yet"
+        );
+
+        // The genesis seed must UPGRADE it (not error → boot abort).
+        seed_canonical_servers(&backend)
+            .await
+            .expect("must upgrade the pre-existing self-signed row, not error");
+        verify_canonical_seeded(&backend)
+            .await
+            .expect("canonical live after upgrade");
+        assert!(
+            crate::federation::is_canonical(&backend, &baked.key_id)
+                .await
+                .unwrap(),
+            "the node self-roots as canonical after the upgrade"
+        );
+
+        // Reboot idempotence — a second seed over the now-scrubbed row is a no-op.
+        seed_canonical_servers(&backend)
+            .await
+            .expect("idempotent re-seed over the upgraded row");
     }
 
     /// v13.3.0 (CIRISPersist#386) — end-to-end on a fresh backend: seed the

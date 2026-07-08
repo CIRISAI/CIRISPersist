@@ -5,6 +5,41 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.4.2] — 2026-07-08 — canonical seed must UPGRADE the node's own self-signed row, not boot-panic (#394)
+
+### Fixed
+- **#394 (CRITICAL — live canonical node could not boot)** — the #390 canonical
+  bake had `seed_canonical_servers` call `put_public_key` on the baked 2-of-3
+  record. But on the **canonical node itself**, `ciris-canonical-1` already
+  exists as that node's **own self-signed `node` row** (minted when it first
+  registered its federation identity). `put_public_key` sees same-key /
+  different-content → `Err` → `EngineError::GenesisSeed` → **boot abort**. So the
+  one node the bake was meant to serve — `ciris-canonical-1-d7bdeu223k` — could
+  not boot on persist v13.4.0/v13.4.1 (CIRISServer 0.5.86/0.5.87). This is the
+  idempotency correction raised on #390.
+- **Fix**: `seed_canonical_servers` now branches on presence —
+  - **present** → `adopt_scrub_upgrade` (self-signed → 2-of-3 accord-scrubbed
+    canonical). It **re-runs `check_canonical_role_admission`**, so the
+    ≥2-of-3 live-accord scrub gate still holds — the upgrade is *not* a bypass —
+    and it is a no-op if the row is already the adopted canonical. Unlike
+    `apply_replicated_key_record` (#375) there is **no `owner_of` gate**: the
+    accord scrub set itself is the authority. Delivers "A self-roots on upgrade,"
+    which the aborting seed prevented.
+  - **absent** → `put_public_key` (fresh-node insert through the same gate).
+- `adopt_scrub_upgrade` lifted onto the `FederationDirectory` trait
+  (sqlite/postgres delegate to the inherent impl; default returns
+  `InvalidArgument`) so the generic genesis seed can reach it — same ABI-stable
+  trait pattern as #375.
+- Regression test (`canonical_seed_upgrades_the_nodes_own_self_signed_row`):
+  pre-seed a backend that already holds `ciris-canonical-1` as a self-signed
+  row → run the genesis seed → assert it **upgrades** (not errors), the node
+  self-roots as canonical, and a re-seed is idempotent. Fresh-node insert +
+  every existing canonical test stay green.
+- **verify re-pin v8.9.0 → v8.10.0** (all 6 Cargo pins together;
+  `ciris-verify` PyPI dep stays `>=8.0.0,<9`). Picks up the v8.10.0 manifest-sign
+  producer line and the transitive **RUSTSEC-2026-0204** patch (crossbeam-epoch
+  bumped to 0.9.20). No persist API change from the re-pin.
+
 ## [13.4.1] — 2026-07-08 — pyo3 PyEngine::new was missing the family + canonical seed (#392)
 
 ### Fixed
