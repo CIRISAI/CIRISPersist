@@ -1265,9 +1265,14 @@ impl PyEngine {
                         )
                         .await
                         .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
-                        crate::federation::genesis::verify_anchor_seeded(&pg)
+                        // v13.4.1 (CIRISPersist#392) — run the SAME shared seed
+                        // routine `Engine::with_signer` does (verify anchor →
+                        // family #386 → canonical #390). Previously this pyo3 ctor
+                        // stopped at the holder seed, so wheel consumers got no
+                        // family + no canonical row — the seed paths had drifted.
+                        crate::federation::genesis::seed_family_and_canonical(&pg)
                             .await
-                            .map_err(|e| PyRuntimeError::new_err(format!("genesis anchor: {e}")))?;
+                            .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
                         Ok::<_, PyErr>(Arc::new(pg))
                     })
                 })?;
@@ -1329,9 +1334,13 @@ impl PyEngine {
                         )
                         .await
                         .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
-                        crate::federation::genesis::verify_anchor_seeded(&sq)
+                        // v13.4.1 (CIRISPersist#392) — same shared seed routine as
+                        // Engine::with_signer (verify anchor → family #386 →
+                        // canonical #390); this pyo3 ctor previously stopped at the
+                        // holder seed, so wheel consumers got no family + canonical.
+                        crate::federation::genesis::seed_family_and_canonical(&sq)
                             .await
-                            .map_err(|e| PyRuntimeError::new_err(format!("genesis anchor: {e}")))?;
+                            .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
                         Ok::<_, PyErr>(Arc::new(sq))
                     })
                 })?;

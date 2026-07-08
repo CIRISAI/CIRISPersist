@@ -5000,26 +5000,10 @@ async fn build_backend(dsn: &str, seed_genesis: bool) -> Result<BackendDispatch,
                 )
                 .await
                 .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
-                crate::federation::genesis::verify_anchor_seeded(&pg)
-                    .await
-                    .map_err(EngineError::GenesisSeed)?;
-                // v13.3.0 (#386) — entrench the keyless HUMANITY_ACCORD FAMILY
-                // row (quorum:2/3, A1/B1/C1) after the holder rows. Idempotent +
-                // fail-secure. Untied tail of #344/#347.
-                crate::federation::genesis::seed_accord_family(&pg)
-                    .await
-                    .map_err(EngineError::GenesisSeed)?;
-                crate::federation::genesis::verify_family_seeded(&pg)
-                    .await
-                    .map_err(EngineError::GenesisSeed)?;
-                // v13.4.0 (#390) — bake the 2-of-3 accord-co-scrubbed canonical
-                // genesis server, admitted through the 2-of-3 gate against the
-                // just-seeded A1/B1 anchor + family. A fresh node ships trusting
-                // ciris-canonical-1 with zero ceremony. Idempotent + fail-secure.
-                crate::federation::genesis::seed_canonical_servers(&pg)
-                    .await
-                    .map_err(EngineError::GenesisSeed)?;
-                crate::federation::genesis::verify_canonical_seeded(&pg)
+                // v13.4.1 (#392) — the SHARED seed routine (verify anchor →
+                // family #386 → canonical #390), identical to the pyo3
+                // `PyEngine::new` path so they can't drift.
+                crate::federation::genesis::seed_family_and_canonical(&pg)
                     .await
                     .map_err(EngineError::GenesisSeed)?;
             }
@@ -5070,22 +5054,9 @@ async fn build_backend(dsn: &str, seed_genesis: bool) -> Result<BackendDispatch,
                 )
                 .await
                 .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
-                crate::federation::genesis::verify_anchor_seeded(&sq)
-                    .await
-                    .map_err(EngineError::GenesisSeed)?;
-                // v13.3.0 (#386) — entrench the keyless HUMANITY_ACCORD FAMILY row.
-                crate::federation::genesis::seed_accord_family(&sq)
-                    .await
-                    .map_err(EngineError::GenesisSeed)?;
-                crate::federation::genesis::verify_family_seeded(&sq)
-                    .await
-                    .map_err(EngineError::GenesisSeed)?;
-                // v13.4.0 (#390) — bake the 2-of-3 canonical genesis server
-                // against the just-seeded anchor + family. Idempotent + fail-secure.
-                crate::federation::genesis::seed_canonical_servers(&sq)
-                    .await
-                    .map_err(EngineError::GenesisSeed)?;
-                crate::federation::genesis::verify_canonical_seeded(&sq)
+                // v13.4.1 (#392) — shared seed routine (verify anchor → family
+                // #386 → canonical #390); identical to the pyo3 path.
+                crate::federation::genesis::seed_family_and_canonical(&sq)
                     .await
                     .map_err(EngineError::GenesisSeed)?;
             }

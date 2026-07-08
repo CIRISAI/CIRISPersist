@@ -5,6 +5,25 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.4.1] — 2026-07-08 — pyo3 PyEngine::new was missing the family + canonical seed (#392)
+
+### Fixed
+- **#392** — `PyEngine::new` (the pyo3/wheel constructor the server + agent use)
+  hand-rolled its own genesis seed and stopped at the accord holders — it never
+  picked up the **#386 family** (v13.3.0) or **#390 canonical** (v13.4.0) bakes
+  that `Engine::with_signer` runs. So every wheel consumer got A1/B1/C1 but **no
+  entrenched HUMANITY_ACCORD family row** and **`list_canonical_servers() == []`**
+  — the canonical bake never reached the installs it was meant to light up. Root
+  cause: two hand-maintained seed paths that drifted. Fix: factored the full
+  post-holders sequence (verify anchor → family → canonical) into one shared
+  `genesis::seed_family_and_canonical(dir)` that **both** constructors call, so
+  they are seed-identical by construction and can't drift again. Any future
+  genesis bake goes in that one routine. Guard added: a Python-path test
+  (`test_pyengine_seeds_family_and_canonical`) asserting a fresh `ciris_persist.Engine`
+  yields `is_canonical(ciris-canonical-1)` + `list_canonical_servers().len() == 1`
+  + the quorum:2/3 family — verified against the built wheel. No schema change,
+  no verify re-pin.
+
 ## [13.4.0] — 2026-07-06 — bake the 2-of-3 canonical genesis server (#390)
 
 ### Added
