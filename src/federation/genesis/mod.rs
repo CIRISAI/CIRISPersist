@@ -295,6 +295,36 @@ where
     Ok(())
 }
 
+/// v13.4.1 (CIRISPersist#392) — the **single shared genesis-seed routine** run
+/// by BOTH engine constructors ([`Engine::with_signer`](crate::engine::Engine::with_signer)
+/// AND the pyo3 `PyEngine::new`), so they are **seed-identical by construction**
+/// and can never drift again. Called right after the backend-specific
+/// `seed_genesis_accord_holders` (the only inherent-per-backend step); this
+/// covers everything downstream of it, in order:
+/// 1. [`verify_anchor_seeded`] — the A1/B1/C1 rooting anchors are live;
+/// 2. [`seed_accord_family`] + [`verify_family_seeded`] — the entrenched
+///    `quorum:2/3` HUMANITY_ACCORD family (#386);
+/// 3. [`seed_canonical_servers`] + [`verify_canonical_seeded`] — the baked
+///    2-of-3 canonical genesis server (#390).
+///
+/// Any future genesis bake MUST be added HERE (not inline in a ctor) so both
+/// paths stay identical. Errors are `String`; each caller maps to its own error
+/// type (`EngineError::GenesisSeed` / a `PyErr`). Generic over
+/// [`FederationDirectory`] (pg/sqlite-symmetric); `seed_canonical_servers`
+/// verifies the 2-of-3 against the just-seeded A1/B1 anchor, so ordering is
+/// load-bearing and fail-secure.
+pub async fn seed_family_and_canonical<D>(dir: &D) -> Result<(), String>
+where
+    D: super::FederationDirectory + ?Sized,
+{
+    verify_anchor_seeded(dir).await?;
+    seed_accord_family(dir).await?;
+    verify_family_seeded(dir).await?;
+    seed_canonical_servers(dir).await?;
+    verify_canonical_seeded(dir).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

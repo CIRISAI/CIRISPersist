@@ -639,3 +639,37 @@ def test_accord_live_quorum_ffi_302():
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
+
+
+def test_pyengine_seeds_family_and_canonical() -> None:
+    """v13.4.1 (CIRISPersist#392) — the pyo3 `Engine()` ctor must run the SAME
+    genesis seed as the Rust `with_signer`: a fresh Engine has the entrenched
+    HUMANITY_ACCORD family (#386) AND the baked 2-of-3 `ciris-canonical-1`
+    canonical server (#390). This is the guard for the drift where the pyo3
+    ctor stopped at the holder seed, so wheel consumers (the server) got
+    neither. Skips on a non-sqlite wheel."""
+    import json
+    import pytest
+
+    try:
+        eng = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="genesis-seed-key")
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        # #390 — the baked 2-of-3 canonical server is trusted out of the box.
+        assert eng.is_canonical("ciris-canonical-1-d7bdeu223k") is True
+        servers = json.loads(eng.list_canonical_servers())
+        assert len(servers) == 1
+        assert servers[0]["key_id"] == "ciris-canonical-1-d7bdeu223k"
+
+        # #386 — the entrenched quorum:2/3 HUMANITY_ACCORD family resolves.
+        fam_json = eng.lookup_family_json("humanity-accord")
+        assert fam_json is not None, "the accord family must be seeded on the pyo3 path"
+        fam = json.loads(fam_json)
+        assert fam["consensus_protocol"] == "quorum:2/3"
+        assert len(fam["members"]) == 3
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()
