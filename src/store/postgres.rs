@@ -2664,6 +2664,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         PostgresBackend::apply_replicated_key_record(self, record).await
     }
 
+    // v13.4.2 (CIRISPersist#394) — trait upgrade path for the genesis canonical
+    // seed on the canonical node's own self-signed row. Delegates to inherent.
+    async fn adopt_scrub_upgrade(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::AdoptScrubOutcome, crate::federation::Error> {
+        PostgresBackend::adopt_scrub_upgrade(self, record).await
+    }
+
     async fn put_public_key(
         &self,
         record: crate::federation::SignedKeyRecord,

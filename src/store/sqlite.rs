@@ -2388,6 +2388,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     // anti-entropy bridge) reach the real path, not `put_public_key`'s
     // DO-NOTHING. Delegates to the inherent method (the single source of
     // truth for the plan + adopt_scrub_upgrade logic).
+    // v13.4.2 (CIRISPersist#394) — expose the self-signed→scrubbed upgrade on
+    // the trait (delegates to the inherent method) so the generic genesis seed
+    // can upgrade the canonical node's own row instead of erroring on it.
+    async fn adopt_scrub_upgrade(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::AdoptScrubOutcome, crate::federation::Error> {
+        SqliteBackend::adopt_scrub_upgrade(self, record).await
+    }
+
     async fn apply_replicated_key_record(
         &self,
         record: crate::federation::SignedKeyRecord,

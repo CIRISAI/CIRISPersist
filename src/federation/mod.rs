@@ -393,6 +393,27 @@ pub trait FederationDirectory: Send + Sync {
         }
     }
 
+    /// v13.4.2 (CIRISPersist#394) — the **self-signed → accord-scrubbed
+    /// upgrade** primitive, dyn-dispatchable (like #375's
+    /// [`apply_replicated_key_record`](Self::apply_replicated_key_record)).
+    /// Unlike that method it has **no `owner_of` gate** — the accord scrub set
+    /// IS the authority — so it is the correct primitive for the genesis
+    /// canonical seed on a node that already holds its OWN self-signed row
+    /// (`genesis::seed_canonical_servers`). Re-runs `check_canonical_role_admission`
+    /// (the ≥2-distinct-anchor-scrub gate), so a `canonical` role is still only
+    /// conferred on a valid 2-of-3. Requires the row to already EXIST (an absent
+    /// row ⇒ `InvalidArgument` — use `put_public_key` to insert). The
+    /// sqlite/postgres backends override this to delegate to their inherent
+    /// method; the default here is for backends without the upgrade path.
+    async fn adopt_scrub_upgrade(
+        &self,
+        _record: SignedKeyRecord,
+    ) -> Result<register::AdoptScrubOutcome, Error> {
+        Err(Error::InvalidArgument(
+            "adopt_scrub_upgrade is not supported on this backend".to_owned(),
+        ))
+    }
+
     /// Fetch a single pubkey row by `key_id`. Returns `None` if absent.
     async fn lookup_public_key(&self, key_id: &str) -> Result<Option<KeyRecord>, Error>;
 
