@@ -50,6 +50,16 @@ threat-model citations because this crate's audit story is the point.
   (sqlite storage) + `ops_directory_lookup_identity_for_occurrence_routes`
   (capsule routing regression — `Ok(None)`, not `Unsupported`).
 
+### CI
+- **De-duplicate the same-SHA double-run.** The CI `concurrency.group` keyed on
+  `github.ref`, so a merge (`refs/heads/main`) and its release tag
+  (`refs/tags/v*`) — the **same commit** — landed in different groups and both
+  ran the full wheel matrix on the identical SHA, racing each other for the same
+  CIRISCache keys (the restore-vs-save hang that skipped publish on v13.4.1).
+  Now push events key on the commit SHA (PRs keep ref-keying), so the tag run
+  (the superset that publishes) cancels the redundant main run. Halves the
+  release-time runner load and removes the cache race.
+
 ## [13.4.3] — 2026-07-09 — exact-pin the toolchain to 1.97.0 (cross-repo CIRISCache) + verify v8.10.1 (#396)
 
 ### Changed
