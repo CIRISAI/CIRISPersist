@@ -3325,6 +3325,10 @@ impl Engine {
                         destination: td.1.clone(),
                         asserted_at: now,
                         last_seen_at: Some(now),
+                        // Self-at-login reachability tuple carries (kind, dest)
+                        // only; the transport-tier Ed25519 (#397) is published
+                        // separately by edge when priming an explicit-hash peer.
+                        transport_ed25519_pubkey_base64: None,
                     })
                     .await?;
                 transport_rows += 1;
@@ -12408,6 +12412,7 @@ mod tests {
             destination: dest.to_owned(),
             asserted_at: now,
             last_seen_at: Some(now),
+            transport_ed25519_pubkey_base64: None,
         };
 
         dir.put_transport_destination(&mk("reticulum", "d1"))

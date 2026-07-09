@@ -452,6 +452,16 @@ pub enum DirectoryOp {
         /// The signed pubkey row to apply (fresh insert or scrub-upgrade).
         record: SignedKeyRecord,
     },
+    /// [`FederationDirectory::lookup_identity_for_occurrence`] (#397) — the
+    /// reverse occurrence→identity lookup the agent's embedded edge needs to
+    /// resolve a peer's kex pubkeys (`resolve_peer_kex_pubkeys`). Without this
+    /// op the capsule proxy surfaced [`Error::Unsupported`], so an
+    /// explicit-hash canonical (which cannot announce) was unrootable — the
+    /// resolve path erred instead of resolving. APPEND-ONLY: added at the end.
+    LookupIdentityForOccurrence {
+        /// The occurrence `key_id` to reverse-resolve to its identity row.
+        occurrence_key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -519,6 +529,9 @@ pub enum DirectoryOpResult {
     /// top-level [`DirectoryOpResult::Err`] (which is reserved for a real
     /// backend error that means the apply could not run). APPEND-ONLY.
     ReplicatedKeyOutcome(crate::federation::register::ReplicatedKeyOutcome),
+    /// `lookup_identity_for_occurrence` (#397) — the reverse occurrence→identity
+    /// row (`None` ⇒ the key is not bound as an occurrence). APPEND-ONLY.
+    IdentityOccurrence(Option<IdentityOccurrence>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -605,6 +618,12 @@ pub async fn dispatch_directory_op(
         DirectoryOp::ApplyReplicatedKeyRecord { record } => {
             match dir.apply_replicated_key_record(record).await {
                 Ok(outcome) => DirectoryOpResult::ReplicatedKeyOutcome(outcome),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::LookupIdentityForOccurrence { occurrence_key_id } => {
+            match dir.lookup_identity_for_occurrence(&occurrence_key_id).await {
+                Ok(v) => DirectoryOpResult::IdentityOccurrence(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -1787,9 +1806,39 @@ impl FederationDirectory for OpsDirectory {
         &self,
         occurrence_key_id: &str,
     ) -> Result<Option<IdentityOccurrence>, Error> {
-        Err(Error::Unsupported {
-            method: "lookup_identity_for_occurrence",
-        })
+        // #397 — routed (was Error::Unsupported). This is the reverse
+        // occurrence→identity lookup the agent's embedded edge drives inside
+        // `resolve_peer_kex_pubkeys`; unrouted, an explicit-hash canonical
+        // (which cannot announce) was unrootable.
+        match self
+            .run_op(&DirectoryOp::LookupIdentityForOccurrence {
+                occurrence_key_id: occurrence_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::IdentityOccurrence(v) => {
+                // Ask 3 — make the resolve outcome self-evident (a swallowed
+                // error here previously required an in-process resolver-map
+                // snapshot to diagnose).
+                if v.is_some() {
+                    tracing::info!(
+                        occurrence_key_id,
+                        "directory: identity resolved for occurrence"
+                    );
+                } else {
+                    tracing::warn!(
+                        occurrence_key_id,
+                        "directory: no identity bound for occurrence — peer cannot be \
+                         rooted from this key (occurrence not registered)"
+                    );
+                }
+                Ok(v)
+            }
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn add_family_member(
         &self,
@@ -2492,6 +2541,9 @@ mod tests {
             destination: "abcd".into(),
             asserted_at: chrono::Utc::now(),
             last_seen_at: Some(chrono::Utc::now()),
+            // #397 — the transport-tier Ed25519 must cross the ABI intact so a
+            // peer can prime an explicit-hash canonical.
+            transport_ed25519_pubkey_base64: Some("dHJhbnNwb3J0LWVkMjU1MTk=".into()),
         };
 
         let put = run_op(
@@ -2806,5 +2858,34 @@ mod tests {
             "got {err:?}"
         );
         assert_eq!(err.kind(), "federation_ops_proxy_unsupported");
+    }
+
+    #[test]
+    fn ops_directory_lookup_identity_for_occurrence_routes() {
+        // #397 regression — `lookup_identity_for_occurrence` was an
+        // `Error::Unsupported` stub, so the agent's embedded edge could not
+        // resolve a peer's kex pubkeys and an explicit-hash canonical was
+        // unrootable. It must now ROUTE: an unbound key resolves to
+        // `Ok(None)` (the real backend answer), NOT the Unsupported error.
+        let rt = test_runtime();
+        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> = backend;
+        let directory = build_persist_directory(dir.clone());
+        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+            rt.clone(),
+        ));
+        let proxy = build_ops_directory(directory, executor).expect("abi ok");
+
+        let via_proxy = rt
+            .block_on(proxy.lookup_identity_for_occurrence("not-bound"))
+            .expect("routed, not Unsupported");
+        let via_direct = rt
+            .block_on(dir.lookup_identity_for_occurrence("not-bound"))
+            .expect("direct lookup");
+        assert_eq!(
+            via_proxy, via_direct,
+            "proxy result must equal a direct backend call"
+        );
+        assert!(via_proxy.is_none(), "unbound occurrence resolves to None");
     }
 }

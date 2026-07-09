@@ -5096,17 +5096,20 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         client
             .execute(
                 "INSERT INTO cirislens.transport_destinations \
-                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at) \
-                 VALUES ($1, $2, $3, $4, $5) \
+                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                     transport_ed25519_pubkey_base64) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
                  ON CONFLICT (occurrence_key_id, transport_kind, destination) \
                  DO UPDATE SET asserted_at = EXCLUDED.asserted_at, \
-                    last_seen_at = EXCLUDED.last_seen_at",
+                    last_seen_at = EXCLUDED.last_seen_at, \
+                    transport_ed25519_pubkey_base64 = EXCLUDED.transport_ed25519_pubkey_base64",
                 &[
                     &destination.occurrence_key_id,
                     &destination.transport_kind,
                     &destination.destination,
                     &destination.asserted_at,
                     &destination.last_seen_at,
+                    &destination.transport_ed25519_pubkey_base64,
                 ],
             )
             .await
@@ -5126,7 +5129,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         let rows = client
             .query(
-                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at \
+                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                    transport_ed25519_pubkey_base64 \
                  FROM cirislens.transport_destinations WHERE occurrence_key_id = $1 \
                  ORDER BY transport_kind, destination",
                 &[&occurrence_key_id],
@@ -5143,6 +5147,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     destination: row.safe_get_with(2, crate::federation::Error::Backend)?,
                     asserted_at: row.safe_get_with(3, crate::federation::Error::Backend)?,
                     last_seen_at: row.safe_get_with(4, crate::federation::Error::Backend)?,
+                    transport_ed25519_pubkey_base64: row
+                        .safe_get_with(5, crate::federation::Error::Backend)?,
                 })
             })
             .collect()
