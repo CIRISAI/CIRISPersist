@@ -5,6 +5,61 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.5.0] — 2026-07-09 — canonical explicit-hash peer is rootable: occurrence→identity DirectoryOp + transport-tier binding (#397)
+
+### Added
+- **#397 — `lookup_identity_for_occurrence` is now a `DirectoryOp`** (was an
+  `Error::Unsupported` stub in the cross-wheel `directory_capsule`). The agent's
+  embedded edge drives this reverse occurrence→identity lookup inside
+  `resolve_peer_kex_pubkeys`; unrouted, the resolve **erred instead of
+  resolving**, so an explicit-hash canonical (`ciris-canonical-1`, a v7.0.0
+  baked-IP destination that **cannot announce** by design —
+  Leviculum `ExplicitHashCannotAnnounce`) could never be rooted and federation
+  delivery to Node A produced 0 anti-entropy rounds (CIRISServer#205). Appended
+  `DirectoryOp::LookupIdentityForOccurrence` + `DirectoryOpResult::IdentityOccurrence`
+  (ABI append-only) with the dispatch arm + proxy; the proxy now routes to the
+  real backend instead of surfacing `Unsupported`.
+- **#397 — transport-tier Ed25519 on `TransportDestination`** (V098, both
+  backends). `TransportDestination.destination` already carried the Reticulum
+  **dest-hash**, but `prime_peer(key_id, dest_hash, transport_ed25519_pubkey_b64)`
+  (CIRISEdge#214) also needs the transport-tier **Ed25519** — a **distinct,
+  edge-owned** key (the keyring-backed RNS transport identity, CIRISEdge#99) that
+  is **not derivable** from the identity-tier Ed25519 (§5.6.8.8.2 key-separation),
+  so a peer cannot compute it from the `KeyRecord`. Added the nullable
+  `transport_ed25519_pubkey_base64` column + struct field (serde-default,
+  additive; `None` for pre-#397 rows and non-Reticulum kinds). Node A derives it
+  at edge-runtime (`transport_identity_pubkeys()`) and publishes the companion
+  `transport_destination` row; a peer reads the full `(dest_hash,
+  transport_ed25519)` pair off `list_transport_destinations_for` (already a
+  `DirectoryOp`) and primes the otherwise-unannounceable canonical.
+
+### Changed
+- **#397 — the resolve path logs its outcome** (Ask 3). The capsule proxy's
+  `lookup_identity_for_occurrence` now emits `tracing::info!` when an identity
+  resolves and `tracing::warn!` when no identity is bound (the peer cannot be
+  rooted from that key) — the prior swallowed failure required an in-process
+  resolver-map snapshot to diagnose.
+
+### Notes
+- Substrate-side only: persist provides the DirectoryOp + the storage/resolution
+  surface for the binding. Node A actually deriving + publishing the row, and the
+  controller calling `prime_peer` once it resolves, are the edge/server legs
+  (CIRISEdge#214 / CIRISServer#205). Whether `transport_destinations` rows ride
+  anti-entropy to remote peers is the consumer `ReplicationRuntime`'s concern.
+- No verify re-pin (stays v8.10.1). New tests: `transport_ed25519_pubkey_round_trips`
+  (sqlite storage) + `ops_directory_lookup_identity_for_occurrence_routes`
+  (capsule routing regression — `Ok(None)`, not `Unsupported`).
+
+### CI
+- **De-duplicate the same-SHA double-run.** The CI `concurrency.group` keyed on
+  `github.ref`, so a merge (`refs/heads/main`) and its release tag
+  (`refs/tags/v*`) — the **same commit** — landed in different groups and both
+  ran the full wheel matrix on the identical SHA, racing each other for the same
+  CIRISCache keys (the restore-vs-save hang that skipped publish on v13.4.1).
+  Now push events key on the commit SHA (PRs keep ref-keying), so the tag run
+  (the superset that publishes) cancels the redundant main run. Halves the
+  release-time runner load and removes the cache race.
+
 ## [13.4.3] — 2026-07-09 — exact-pin the toolchain to 1.97.0 (cross-repo CIRISCache) + verify v8.10.1 (#396)
 
 ### Changed

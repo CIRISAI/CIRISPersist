@@ -247,6 +247,17 @@ pub struct TransportDestination {
     /// until first observed. NOT a lease.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// v13.5.0 (CIRISPersist#397) — the transport-tier **Ed25519 pubkey**,
+    /// base64 (standard alphabet) of the 32 raw bytes. For `transport_kind:
+    /// reticulum` this is the peer's RNS transport identity Ed25519 (the
+    /// keyring-backed, edge-owned key, CIRISEdge#99) that pairs with the
+    /// `destination` dest-hash to let any peer `prime_peer` an explicit-hash
+    /// canonical that cannot announce (CIRISEdge#214). `None` for pre-#397
+    /// rows and non-Reticulum kinds (websocket / https carry no RNS transport
+    /// key). Distinct from the identity-tier Ed25519 — NOT derivable from it
+    /// (§5.6.8.8.2 key-separation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_ed25519_pubkey_base64: Option<String>,
 }
 
 #[cfg(test)]

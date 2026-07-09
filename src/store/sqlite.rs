@@ -4828,17 +4828,20 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // timestamps in place (drop+re-register is the mutation model).
             conn.execute(
                 "INSERT INTO transport_destinations \
-                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                     transport_ed25519_pubkey_base64) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  ON CONFLICT(occurrence_key_id, transport_kind, destination) \
                  DO UPDATE SET asserted_at = excluded.asserted_at, \
-                    last_seen_at = excluded.last_seen_at",
+                    last_seen_at = excluded.last_seen_at, \
+                    transport_ed25519_pubkey_base64 = excluded.transport_ed25519_pubkey_base64",
                 rusqlite::params![
                     d.occurrence_key_id,
                     d.transport_kind,
                     d.destination,
                     asserted,
                     last_seen,
+                    d.transport_ed25519_pubkey_base64,
                 ],
             )?;
             Ok(())
@@ -4855,7 +4858,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         (move || -> Result<Vec<crate::federation::TransportDestination>, rusqlite::Error> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at \
+                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                    transport_ed25519_pubkey_base64 \
                  FROM transport_destinations WHERE occurrence_key_id = ?1 \
                  ORDER BY transport_kind, destination",
             )?;
@@ -4865,6 +4869,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 let destination: String = row.get(2)?;
                 let asserted_at_str: String = row.get(3)?;
                 let last_seen_str: Option<String> = row.get(4)?;
+                let transport_ed25519_pubkey_base64: Option<String> = row.get(5)?;
                 let asserted_at = chrono::DateTime::parse_from_rfc3339(&asserted_at_str)
                     .map(|t| t.with_timezone(&chrono::Utc))
                     .unwrap_or_else(|_| chrono::Utc::now());
@@ -4879,6 +4884,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     destination,
                     asserted_at,
                     last_seen_at,
+                    transport_ed25519_pubkey_base64,
                 })
             })?;
             rows.collect()
@@ -19993,6 +19999,80 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_none());
+    }
+
+    /// v13.5.0 (CIRISPersist#397, V098) — the transport-tier Ed25519 pubkey
+    /// round-trips through put/list. An explicit-hash canonical that cannot
+    /// announce is primed by a peer reading (dest_hash, transport_ed25519)
+    /// off its transport_destination row; without this column the pair was
+    /// unreachable. Also proves the column is nullable (non-Reticulum kinds
+    /// leave it None) and that a re-assert refreshes it in place.
+    #[tokio::test]
+    async fn transport_ed25519_pubkey_round_trips() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("canon-1", "canon", "canon-1"),
+            })
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        let ret = crate::federation::TransportDestination {
+            occurrence_key_id: "canon-1".into(),
+            transport_kind: "reticulum".into(),
+            destination: "deadbeef".into(),
+            asserted_at: now,
+            last_seen_at: Some(now),
+            transport_ed25519_pubkey_base64: Some("dHJhbnNwb3J0LWVkMjU1MTk=".into()),
+        };
+        // A non-Reticulum kind carries no RNS transport key → None.
+        let ws = crate::federation::TransportDestination {
+            occurrence_key_id: "canon-1".into(),
+            transport_kind: "websocket".into(),
+            destination: "wss://relay.example/x".into(),
+            asserted_at: now,
+            last_seen_at: Some(now),
+            transport_ed25519_pubkey_base64: None,
+        };
+        backend.put_transport_destination(&ret).await.unwrap();
+        backend.put_transport_destination(&ws).await.unwrap();
+
+        let rows = backend
+            .list_transport_destinations_for("canon-1")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // ORDER BY transport_kind, destination → reticulum before websocket.
+        assert_eq!(rows[0].transport_kind, "reticulum");
+        assert_eq!(
+            rows[0].transport_ed25519_pubkey_base64.as_deref(),
+            Some("dHJhbnNwb3J0LWVkMjU1MTk="),
+            "the transport-tier Ed25519 must survive the round-trip"
+        );
+        assert_eq!(rows[1].transport_kind, "websocket");
+        assert_eq!(
+            rows[1].transport_ed25519_pubkey_base64, None,
+            "non-Reticulum kinds carry no RNS transport key"
+        );
+
+        // A re-assert with a rotated transport key refreshes it in place.
+        let rotated = crate::federation::TransportDestination {
+            transport_ed25519_pubkey_base64: Some("cm90YXRlZC1lZDI1NTE5".into()),
+            ..ret.clone()
+        };
+        backend.put_transport_destination(&rotated).await.unwrap();
+        let rows = backend
+            .list_transport_destinations_for("canon-1")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "re-assert on the PK does not add a row");
+        assert_eq!(
+            rows[0].transport_ed25519_pubkey_base64.as_deref(),
+            Some("cm90YXRlZC1lZDI1NTE5"),
+            "re-assert refreshes the transport key in place"
+        );
     }
 
     /// v4.0 (CIRISPersist#160, V060, FSD §4.3) — cohort_scope +

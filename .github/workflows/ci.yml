@@ -10,7 +10,17 @@ on:
   pull_request:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # CIRISPersist#397 — dedup the same-SHA double-run. A merge lands the commit
+  # on `refs/heads/main`; the release tag push lands the SAME commit on
+  # `refs/tags/v*`. Keying on `github.ref` put them in DIFFERENT groups, so both
+  # ran the full wheel matrix on the identical SHA and raced each other for the
+  # same CIRISCache keys (the restore-vs-save hang that skipped publish on
+  # v13.4.1). Key push events on the SHA instead: main-push and tag-push on one
+  # commit now share a group, and cancel-in-progress lets the tag run (pushed
+  # after the merge; the strict superset that also publishes) cancel the
+  # redundant main run. PRs keep ref-keying so a new push still cancels the
+  # stale PR run. A tag-less merge still gets its single (non-redundant) main run.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: true
 
 env:
