@@ -191,7 +191,7 @@ jobs:
       # `core` leg saves — all 6 legs share the one per-platform key, so saving
       # from each would be a 6-way write of the same registry blob.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main' && matrix.substrate.name == 'core'
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core'
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -199,7 +199,7 @@ jobs:
       # …and the rolling `phead` blob (most-recent persist build) for
       # cross-version incremental restore (see the ciriscache composite).
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main' && matrix.substrate.name == 'core'
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core'
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY_HEAD }}
@@ -265,7 +265,7 @@ jobs:
 
       # Save the warmed cache (main only; PRs restore but never save).
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -274,7 +274,7 @@ jobs:
       # version's build restores this warm target/ and recompiles only changed
       # files instead of rebuilding persist's deps from the verify baseline.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY_HEAD }}
@@ -433,7 +433,7 @@ jobs:
 
       # Save the warmed cache (main only; PRs restore but never save).
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -442,7 +442,7 @@ jobs:
       # version's build restores this warm target/ and recompiles only changed
       # files instead of rebuilding persist's deps from the verify baseline.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY_HEAD }}
@@ -667,7 +667,7 @@ jobs:
 
       # Save the warmed cache (main only; PRs restore but never save).
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -676,7 +676,7 @@ jobs:
       # version's build restores this warm target/ and recompiles only changed
       # files instead of rebuilding persist's deps from the verify baseline.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY_HEAD }}
@@ -1203,7 +1203,7 @@ jobs:
       # CIRISCACHE_KEY was already computed by the composite restore near the top
       # of this job (same PLAT, same toolchain), so reuse it.
       - name: Save CIRISCache (linux-aarch64 + windows-x64 — #314)
-        if: github.ref == 'refs/heads/main' && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
         uses: CIRISAI/CIRISCache/save@v1
         continue-on-error: true
         with:
@@ -1212,7 +1212,7 @@ jobs:
       # …and the rolling `phead` blob (most-recent persist build) for
       # cross-version incremental restore (see the ciriscache composite).
       - name: Save CIRISCache phead blob
-        if: github.ref == 'refs/heads/main' && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
+        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
         uses: CIRISAI/CIRISCache/save@v1
         continue-on-error: true
         with:
