@@ -5,6 +5,41 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.4.3] — 2026-07-09 — exact-pin the toolchain to 1.97.0 (cross-repo CIRISCache) + verify v8.10.1 (#396)
+
+### Changed
+- **#396 — exact toolchain pin `rust-toolchain.toml` `stable` → `1.97.0`.** The
+  rustc version is a segment of the CIRISCache substrate key
+  (`ciris-substrate-v1-<PLAT>-release-rustc<VER>-…`). All four Rust repos
+  (verify/persist/edge/server) floated `channel = "stable"`, so each runner
+  resolved whatever stable its image shipped. GitHub bumped `windows-latest`
+  stable **1.96 → 1.97.0 on 2026-07-07**, re-keying blobs to `rustc1.97.0` while
+  older blobs were `rustc1.96.1` → **cross-repo cache MISS** (CIRISServer's
+  windows wheel cold-compiled the whole substrate). Pinning the exact channel in
+  lockstep across all four repos (verify CIRISVerify#180) restores byte-identical
+  keys. A floating `stable` re-introduces the drift on the next runner bump.
+- **GOTCHA fixed in the same change** — pinning `rust-toolchain.toml` alone
+  breaks every cross-compile job: `dtolnay/rust-toolchain@stable` installs
+  `stable` and adds the matrix target to *that* toolchain, but the channel pin
+  makes cargo run 1.97.0 (no target on it) → `error[E0463]: can't find crate for
+  core`. So the workflow action refs were pinned to the same exact version:
+  `dtolnay/rust-toolchain@stable` → `@1.97.0` (7 refs in `ci.yml`), the macOS
+  cache-poison heal reinstalls (`--default-toolchain` / `rustup default`),
+  `actions-rust-lang/setup-rust-toolchain` `toolchain:` in the manifest-sign job
+  and in `bench.yml`. **The channel pin and the workflow refs bump together** —
+  documented in `rust-toolchain.toml`. (No `@nightly`/`@1.86` MSRV lanes in this
+  repo to leave alone.)
+- **New Rust 1.97 clippy lint** `clippy::question_mark` fired on
+  `parse_qa_task_id` (the bare `qa` arm's `else { return None }` is exactly the
+  `?` short-circuit) — rewritten; behaviour identical.
+
+### Security / deps
+- **verify re-pin v8.10.0 → v8.10.1** (all 6 Cargo pins together; `ciris-verify`
+  PyPI dep stays `>=8,<9`) — CIRISVerify's toolchain-pin release. No persist API
+  change.
+
+Full suite green under the pinned 1.97.0 + verify v8.10.1.
+
 ## [13.4.2] — 2026-07-08 — canonical seed must UPGRADE the node's own self-signed row, not boot-panic (#394)
 
 ### Fixed

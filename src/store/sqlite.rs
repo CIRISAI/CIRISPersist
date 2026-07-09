@@ -14174,10 +14174,11 @@ fn parse_qa_task_id(task_id: &str) -> Option<(String, Option<i32>)> {
     // both `_` and `-` separators.
     let rest = if let Some(r) = task_id.strip_prefix("qa-eval") {
         r.strip_prefix(['_', '-'])?
-    } else if let Some(r) = task_id.strip_prefix("qa") {
-        r.strip_prefix(['_', '-'])?
     } else {
-        return None;
+        // clippy::question_mark (new on Rust 1.97) — the bare `qa` arm's
+        // `else { return None }` is exactly the `?` short-circuit.
+        let r = task_id.strip_prefix("qa")?;
+        r.strip_prefix(['_', '-'])?
     };
     // First token = language (lowercase alpha); second = question num.
     let mut segments = rest.split(['_', '-']);

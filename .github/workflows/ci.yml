@@ -83,7 +83,7 @@ jobs:
       # v10.7.0 (CIRISVerify v8.0.0) — no libtss2-dev: ciris-keyring deleted
       # the link-time tss-esapi backend (#141); the TPM plugin is dlopen'd at
       # runtime and the keyring link-binds no libtss2 on any target.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       # CIRISCache (CIRISPersist#311/#316) — canonical key + layered
       # verify→persist restore, via the shared composite (single source of
       # truth). ubuntu-x86_64 ⇒ PLAT=linux-x86_64. The 6 substrate legs share
@@ -211,7 +211,7 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       # v0.7.2 — `cache-bin: false` on macos-14: the runner image
       # ships a rustup stub at `/Users/runner/.cargo/bin/cargo` that
       # falls through to `rustup-init` when the toolchain isn't
@@ -240,10 +240,10 @@ jobs:
             echo "::warning::Detected rustup-init shadow in ~/.cargo/bin; reinstalling toolchain"
             rm -rf "$HOME/.cargo/bin"
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-              sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+              sh -s -- -y --default-toolchain 1.97.0 --profile minimal --no-modify-path
             export PATH="$HOME/.cargo/bin:$PATH"
           fi
-          rustup default stable
+          rustup default 1.97.0
           cargo --version
           cargo build --help >/dev/null
       - name: which cargo (diagnostic)
@@ -313,7 +313,7 @@ jobs:
         cirislens_occurrence cirislens_legacy_migration
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: ${{ matrix.target }}
       # CIRISCache (CIRISPersist#311) — canonical cross-repo key. The two iOS
@@ -341,10 +341,10 @@ jobs:
             echo "::warning::Detected rustup-init shadow in ~/.cargo/bin; reinstalling toolchain"
             rm -rf "$HOME/.cargo/bin"
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-              sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+              sh -s -- -y --default-toolchain 1.97.0 --profile minimal --no-modify-path
             export PATH="$HOME/.cargo/bin:$PATH"
           fi
-          rustup default stable
+          rustup default 1.97.0
           cargo --version
           cargo build --help >/dev/null
       - uses: actions/setup-python@v6
@@ -501,7 +501,7 @@ jobs:
         cirislens_occurrence cirislens_legacy_migration
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: ${{ matrix.target }}
       # CIRISCache (CIRISPersist#311) — canonical cross-repo key; PLAT token is
@@ -786,7 +786,7 @@ jobs:
       - uses: actions/checkout@v6
       # v10.7.0 (CIRISVerify v8.0.0, #141) — no libtss2-dev; clippy compiles
       # the full graph but ciris-keyring no longer link-binds tss-esapi.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy, rustfmt
       # CIRISCache (#316) — PLAT=linux-x86_64, the SAME key the linux-x86_64-test
@@ -817,7 +817,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       # #321 — run cargo-deny RUNNER-NATIVE instead of the containerized
       # EmbarkStudios/cargo-deny-action@v2. That Docker action ships its own
       # musl rustup which reads our rust-toolchain.toml and prints
@@ -942,7 +942,7 @@ jobs:
       # STABLE, like every other platform. The pinned nightly + `rust-src` +
       # `-Zbuild-std` existed ONLY for the Tier-3 `x86_64-win7-windows-msvc`
       # target (no precompiled std) — all removed with win7 support.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       # CIRISCache (#316) — layered restore for the RELEASE wheel build so the
       # cross-repo registry (verify crypto/keyring) + persist's own prior wheel
       # blob warm it instead of cold-recompiling. Placed AFTER the toolchain so
@@ -1381,7 +1381,8 @@ jobs:
       # compiles the crate but ciris-keyring no longer link-binds tss-esapi.
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          # CIRISPersist#396 — exact pin, lockstep with rust-toolchain.toml.
+          toolchain: "1.97.0"
       - name: extract version from Cargo.toml
         id: version
         run: |

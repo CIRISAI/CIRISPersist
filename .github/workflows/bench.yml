@@ -69,10 +69,11 @@ jobs:
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          # Match clippy.toml's MSRV pin (`msrv = "1.75"`) so the
-          # bench artifacts come from the same toolchain we ship
-          # against, not whatever stable happens to be on the runner.
-          toolchain: stable
+          # CIRISPersist#396 — exact 1.97.0 pin, lockstep with
+          # rust-toolchain.toml. Bench restores the persist substrate blob
+          # (keyed on `rustc -V`), so a floating `stable` would re-key and
+          # miss the restore. Bump in lockstep with the toolchain file.
+          toolchain: "1.97.0"
 
       # CIRISCache (#316) — warm the substrate registry/target from the
       # verify→persist layers so the bench build doesn't cold-compile the
