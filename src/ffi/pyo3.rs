@@ -4014,7 +4014,7 @@ impl PyEngine {
     /// bootstrap dial set** as a compact JSON list edge consumes directly:
     ///
     /// ```json
-    /// [{"key_id": "ciris-canonical-1", "kind": "ip", "destination": "108.61.242.236:4243"},
+    /// [{"key_id": "ciris-canonical-1", "kind": "ip", "destination": "108.61.242.236:4242"},
     ///  {"key_id": "ciris-canonical-1", "kind": "reticulum", "destination": "…"}]
     /// ```
     ///

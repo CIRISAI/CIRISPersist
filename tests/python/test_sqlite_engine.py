@@ -697,7 +697,7 @@ def test_pyengine_canonical_bootstrap_hints() -> None:
         assert len(ip_hints) == 1, f"expected exactly one ip dial hint, got {hints}"
         h = ip_hints[0]
         assert h["key_id"] == "ciris-canonical-1-d7bdeu223k"
-        assert h["destination"] == "108.61.242.236:4243"
+        assert h["destination"] == "108.61.242.236:4242"
         # Flat object shape — edge reads these keys directly, not a tuple/array.
         assert set(h.keys()) == {"key_id", "kind", "destination"}
     finally:
