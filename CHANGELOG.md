@@ -5,6 +5,27 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.6.0] — 2026-07-09 — expose canonical_bootstrap_hints() to Python for edge auto-seed (#402)
+
+### Added
+- **#402 (supports CIRISEdge#296)** — `PyEngine.canonical_bootstrap_hints()`, a
+  thin Python surface over the existing `Engine::canonical_bootstrap_hints()`
+  (#381). Returns the accord-attested bootstrap dial set as a compact JSON list
+  of flat objects:
+  ```json
+  [{"key_id": "ciris-canonical-1", "kind": "ip", "destination": "108.61.242.236:4243"}, …]
+  ```
+  Each `TransportHint` carried inside a `canonical` server's signed
+  `registration_envelope`, paired with its `key_id`. This lets
+  `init_edge_runtime` (CIRISEdge#296) auto-seed the canonical TCP dial from the
+  baked records — the agent-embedded edge reaches the mesh with zero caller glue
+  — **without** edge reaching into persist's signed-envelope internals. The
+  envelope→hint extraction stays inside persist (single source of truth); edge
+  gets a clean, stable read. No new query — a projection of
+  `list_canonical_servers`; sqlite/postgres cfg-gated like the underlying method.
+  Guard test `test_pyengine_canonical_bootstrap_hints` (verified against the
+  built wheel: a fresh `Engine` yields the baked `ip` dial `108.61.242.236:4243`).
+
 ## [13.5.0] — 2026-07-09 — canonical explicit-hash peer is rootable: occurrence→identity DirectoryOp + transport-tier binding (#397)
 
 ### Added
