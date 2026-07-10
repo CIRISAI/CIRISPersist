@@ -5,7 +5,28 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [13.7.0] — 2026-07-10 — canonical runtime address move: a newer quorum-signed record supersedes (#405)
+## [13.7.0] — 2026-07-10 — canonical runtime address move: a newer quorum-signed record supersedes (#405, #410)
+
+### Fixed
+- **#410 (CRITICAL — boot-brick on every canonical-record change for the upgraded
+  fleet)** — the genesis canonical seed (`seed_canonical_servers`, #394) routed a
+  *present* row through `adopt_scrub_upgrade`, which returns a **fatal
+  `Conflict("already anchored to a different record")`** when the node already
+  holds a DIFFERENT anchor-scrubbed record for the canonical key_id. The
+  :4243→:4242 re-bake (#404) is exactly that case, so every node that had already
+  upgraded to a prior canonical record **bricked on boot** (misreported one level
+  up as a signer error at `compose.rs`). Same class as #394, one level deeper: the
+  guard that correctly blocks an untrusted record swap also blocked the *trusted
+  genesis re-bake*. A fresh/wiped node was unaffected (clean `put_public_key`).
+- **Fix**: `seed_canonical_servers` now branches on the existing row's shape —
+  absent → `put_public_key`; present **self-signed** → `adopt_scrub_upgrade`
+  (#394, no `owner_of` gate); present **already anchor-scrubbed** → route through
+  `apply_replicated_key_record` so the #405 **Supersede** path takes it (the baked
+  record wins iff strictly-newer envelope `valid_from` + m-of-n re-verifies).
+  Byte-identical ⇒ `Unchanged`; a baked record older than a runtime-superseded one
+  ⇒ `Refused` → **skipped** (never downgrade, never brick). This both unbricks
+  boot AND propagates the :4242 correction to already-seeded nodes. Regression
+  test `canonical_seed_supersedes_a_prior_anchor_scrubbed_record`.
 
 ### Added
 - **#405 — CEG-native canonical supersede.** `list_canonical_servers` /
