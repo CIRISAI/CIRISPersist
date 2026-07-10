@@ -2558,6 +2558,134 @@ impl PostgresBackend {
         Ok(AdoptScrubOutcome::Upgraded)
     }
 
+    /// v13.7.0 (CIRISPersist#405) — the CANONICAL SUPERSEDE store, Postgres twin
+    /// of [`SqliteBackend::supersede_canonical_record`](crate::store::sqlite::SqliteBackend::supersede_canonical_record).
+    /// Replaces an existing anchor-scrubbed canonical row IN PLACE with a
+    /// strictly-newer, same-pubkey, m-of-n-re-verified re-scrubbed record (the
+    /// runtime address move). Re-verifies the full supersede policy
+    /// ([`verify_canonical_supersede`](crate::federation::register::verify_canonical_supersede))
+    /// at this mutation chokepoint and swaps atomically, optimistically guarded
+    /// on the planned-against version's `persist_row_hash`.
+    pub async fn supersede_canonical_record(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+    ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
+        use crate::federation::register::ReplicatedKeyOutcome;
+        let mut row = record.record;
+        crate::federation::register::validate_registration_pubkey(&row)?;
+        if row.algorithm != crate::federation::types::algorithm::HYBRID {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "supersede_canonical_record algorithm must be 'hybrid' (got '{}')",
+                row.algorithm
+            )));
+        }
+        if row.scrub_key_id == row.key_id {
+            return Err(crate::federation::Error::InvalidArgument(
+                "supersede_canonical_record requires an anchor-scrubbed record (scrub_key_id != key_id)"
+                    .into(),
+            ));
+        }
+
+        let existing = crate::federation::FederationDirectory::lookup_public_key(self, &row.key_id)
+            .await?
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "supersede_canonical_record: no existing row for {}",
+                    row.key_id
+                ))
+            })?;
+        if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64
+            || existing.pubkey_ml_dsa_65_base64 != row.pubkey_ml_dsa_65_base64
+        {
+            return Err(crate::federation::Error::Conflict(format!(
+                "supersede_canonical_record {}: pubkey change refused (different identity)",
+                row.key_id
+            )));
+        }
+        if existing.scrub_key_id == existing.key_id {
+            return Err(crate::federation::Error::Conflict(format!(
+                "supersede_canonical_record {}: existing row is self-signed (use adopt_scrub_upgrade)",
+                row.key_id
+            )));
+        }
+
+        // Re-verify the full supersede policy at the mutation chokepoint
+        // (defense in depth — never trust the plan alone on the Trust Root).
+        if !crate::federation::register::verify_canonical_supersede(self, &existing, &row).await? {
+            return Err(crate::federation::Error::Conflict(format!(
+                "supersede_canonical_record {}: supersede policy refused",
+                row.key_id
+            )));
+        }
+
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        if existing.persist_row_hash == row.persist_row_hash {
+            return Ok(ReplicatedKeyOutcome::Unchanged);
+        }
+
+        let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let roles_param: Option<&Vec<String>> = if row.roles.is_empty() {
+            None
+        } else {
+            Some(&row.roles)
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Atomic swap guarded on the planned-against version's persist_row_hash;
+        // `consent_role` stays out of the SET (operational marker).
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_keys SET \
+                    pubkey_ml_dsa_65_base64 = $2, algorithm = $3, identity_type = $4, \
+                    identity_ref = $5, valid_from = $6, valid_until = $7, \
+                    registration_envelope = $8, original_content_hash = $9, \
+                    scrub_signature_classical = $10, scrub_signature_pqc = $11, \
+                    scrub_key_id = $12, scrub_timestamp = $13, pqc_completed_at = $14, \
+                    persist_row_hash = $15, roles = $16, attestation_evidence = $17 \
+                 WHERE key_id = $1 AND pubkey_ed25519_base64 = $18 \
+                    AND scrub_key_id != key_id AND persist_row_hash = $19",
+                &[
+                    &row.key_id,
+                    &row.pubkey_ml_dsa_65_base64,
+                    &row.algorithm,
+                    &row.identity_type,
+                    &row.identity_ref,
+                    &row.valid_from,
+                    &row.valid_until,
+                    &row.registration_envelope,
+                    &original_content_hash,
+                    &row.scrub_signature_classical,
+                    &row.scrub_signature_pqc,
+                    &row.scrub_key_id,
+                    &row.scrub_timestamp,
+                    &row.pqc_completed_at,
+                    &row.persist_row_hash,
+                    &roles_param,
+                    &row.attestation_evidence,
+                    &row.pubkey_ed25519_base64,
+                    &existing.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "supersede_canonical_record {}: {e}",
+                    row.key_id
+                ))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "supersede_canonical_record {}: row changed concurrently",
+                row.key_id
+            )));
+        }
+        Ok(ReplicatedKeyOutcome::Superseded)
+    }
+
     /// v12.7.0 (CIRISPersist#371) — **upgrade-aware replicated Key-plane
     /// apply** — Postgres twin of
     /// [`SqliteBackend::apply_replicated_key_record`](crate::store::sqlite::SqliteBackend::apply_replicated_key_record).
@@ -2595,6 +2723,13 @@ impl PostgresBackend {
                 Ok(AdoptScrubOutcome::AlreadyAdopted) => Ok(ReplicatedKeyOutcome::Unchanged),
                 // The atomic WHERE (or its Rust pre-checks) saw different
                 // state than the plan — a concurrent mutation. Fail-closed.
+                Err(crate::federation::Error::Conflict(_)) => Ok(ReplicatedKeyOutcome::Refused),
+                Err(e) => Err(e),
+            },
+            // #405 — existing canonical → strictly-newer, m-of-n-re-verified
+            // re-scrub (runtime address move). Backend-symmetric with SQLite.
+            ReplicatedKeyPlan::Supersede => match self.supersede_canonical_record(record).await {
+                Ok(outcome) => Ok(outcome),
                 Err(crate::federation::Error::Conflict(_)) => Ok(ReplicatedKeyOutcome::Refused),
                 Err(e) => Err(e),
             },

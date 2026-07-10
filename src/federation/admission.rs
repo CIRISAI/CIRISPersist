@@ -6267,6 +6267,97 @@ mod canonical_gate_tests {
         run_gate_matrix(&backend, "mem").await;
     }
 
+    /// v13.7.0 (CIRISPersist#405) — the CANONICAL SUPERSEDE policy end-to-end
+    /// over a DISTINCT test roster, with REAL co-scrubs: proves the monotonic +
+    /// m-of-n composition of
+    /// [`verify_canonical_supersede_over_roster`](super::super::register::verify_canonical_supersede_over_roster).
+    /// A newer, validly 2-of-3-scrubbed canonical supersedes; an OLDER validly
+    /// scrubbed record does NOT (monotonicity beats a fresh quorum — the
+    /// downgrade guard); a newer 1-scrub does NOT (m-of-n shortfall); a newer
+    /// NON-canonical re-scrub does NOT (canonical-scope). All records share the
+    /// fixed test pubkey, so the same-pubkey precondition holds.
+    #[tokio::test]
+    async fn canonical_supersede_over_roster_matrix() {
+        use super::super::register::verify_canonical_supersede_over_roster;
+        use crate::store::memory::MemoryBackend;
+        let dir = MemoryBackend::new();
+        let founders = [
+            Identity::new("scah0"),
+            Identity::new("scah1"),
+            Identity::new("scah2"),
+        ];
+        for f in &founders {
+            register_founder(&dir, f).await;
+        }
+        let roster: Vec<String> = founders.iter().map(|f| f.key_id.clone()).collect();
+        let env_at = |kid: &str, vf: &str| serde_json::json!({ "key_id": kid, "valid_from": vf });
+        let (t_minus, t0, t1) = (
+            "2026-07-09T00:00:00+00:00",
+            "2026-07-10T00:00:00+00:00",
+            "2026-07-11T00:00:00+00:00",
+        );
+        let two = [&founders[0], &founders[1]];
+        let existing =
+            signed_canonical_record("canon-1", "canonical,node", env_at("canon-1", t0), &two);
+
+        let check = |record| {
+            let dir = &dir;
+            let existing = &existing;
+            let roster = roster.clone();
+            async move {
+                verify_canonical_supersede_over_roster(dir, existing, &record, &roster)
+                    .await
+                    .expect("no infra error")
+            }
+        };
+
+        // (a) newer + 2 distinct valid scrubs → SUPERSEDE.
+        assert!(
+            check(signed_canonical_record(
+                "canon-1",
+                "canonical,node",
+                env_at("canon-1", t1),
+                &two
+            ))
+            .await,
+            "newer 2-of-3 canonical must supersede"
+        );
+        // (b) OLDER envelope valid_from, still validly 2-scrubbed → REFUSED
+        //     (monotonicity beats a fresh quorum — the downgrade guard).
+        assert!(
+            !check(signed_canonical_record(
+                "canon-1",
+                "canonical,node",
+                env_at("canon-1", t_minus),
+                &two
+            ))
+            .await,
+            "an older validly-scrubbed record must NOT supersede"
+        );
+        // (c) newer but only ONE scrub → REFUSED (m-of-n shortfall).
+        assert!(
+            !check(signed_canonical_record(
+                "canon-1",
+                "canonical,node",
+                env_at("canon-1", t1),
+                &[&founders[0]]
+            ))
+            .await,
+            "a newer 1-scrub record must NOT supersede"
+        );
+        // (d) newer + 2 scrubs but NON-canonical → REFUSED (canonical-scope).
+        assert!(
+            !check(signed_canonical_record(
+                "canon-1",
+                "node",
+                env_at("canon-1", t1),
+                &two
+            ))
+            .await,
+            "a non-canonical re-scrub must NOT reach supersede"
+        );
+    }
+
     /// End-to-end via the PRODUCTION `check_canonical_role_admission` on the
     /// ISOLATED sqlite-in-memory backend (safe to seed test A1/B1/C1).
     #[cfg(feature = "sqlite")]

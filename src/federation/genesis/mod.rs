@@ -254,24 +254,48 @@ where
 {
     for sr in canonical_genesis_records() {
         let kid = &sr.record.key_id;
-        // v13.4.2 (CIRISPersist#394) — the CANONICAL NODE ITSELF already holds
-        // this key_id as its OWN self-signed `node` row (it minted the
-        // identity). `put_public_key` would see same-key / different-content →
-        // Err → boot abort. So branch on presence:
-        //  - present → `adopt_scrub_upgrade`: upgrade the self-signed row to the
-        //    baked 2-of-3 scrubbed canonical (re-runs check_canonical_role_admission,
-        //    so the ≥2-anchor-scrub gate still holds; no-op if already adopted).
-        //  - absent (a FRESH node) → `put_public_key`: insert through the same gate.
-        // (`adopt_scrub_upgrade` errors on an absent row, so both arms are needed.)
-        let present = dir
+        // Branch on the EXISTING row's shape (CIRISPersist#394 + #410):
+        //  - absent (a FRESH node) → `put_public_key`: insert through the m-of-n
+        //    canonical gate (holders are seeded first, so the scrubs verify).
+        //  - present + SELF-SIGNED (the canonical node holds its OWN minted
+        //    `node` row, #394) → `adopt_scrub_upgrade`: upgrade it to the baked
+        //    scrubbed canonical. NO `owner_of` gate (a fresh canonical has no
+        //    owner graph), which the replicated-apply Upgrade path would impose.
+        //  - present + ALREADY ANCHOR-SCRUBBED but DIFFERENT (#410 — an upgraded
+        //    fleet node holds a PRIOR baked canonical, e.g. the :4243 record
+        //    before the :4242 re-bake) → route through `apply_replicated_key_record`
+        //    so the #405 SUPERSEDE path takes it: the baked record wins iff it is
+        //    strictly-newer (envelope valid_from) AND m-of-n re-verifies. Byte-
+        //    identical ⇒ Unchanged; a baked record OLDER than a runtime-superseded
+        //    one ⇒ Refused → SKIP (never downgrade, never brick). Historically
+        //    `adopt_scrub_upgrade` returned a fatal Conflict here, bricking boot
+        //    on every canonical-record change (same class as #394, one deeper).
+        let existing = dir
             .lookup_public_key(kid)
             .await
-            .map_err(|e| format!("lookup canonical {kid}: {e}"))?
-            .is_some();
-        let res = if present {
-            dir.adopt_scrub_upgrade(sr.clone()).await.map(|_| ())
-        } else {
-            dir.put_public_key(sr.clone()).await
+            .map_err(|e| format!("lookup canonical {kid}: {e}"))?;
+        let res: Result<(), crate::federation::Error> = match existing {
+            None => dir.put_public_key(sr.clone()).await,
+            Some(row) if row.scrub_key_id == row.key_id => {
+                dir.adopt_scrub_upgrade(sr.clone()).await.map(|_| ())
+            }
+            Some(_) => {
+                use crate::federation::register::ReplicatedKeyOutcome as O;
+                match dir.apply_replicated_key_record(sr.clone()).await {
+                    Ok(O::Superseded | O::Unchanged | O::Upgraded | O::Inserted) => Ok(()),
+                    // Existing is same-or-newer (or not admissible against the
+                    // baked record): do NOT downgrade the node, do NOT brick.
+                    Ok(O::Refused) => {
+                        tracing::warn!(
+                            key_id = %kid,
+                            "genesis canonical seed: baked record REFUSED over the existing \
+                             anchor-scrubbed row (existing is same-or-newer) — skipping"
+                        );
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
         };
         res.map_err(|e| {
             format!("seed canonical server {kid}: {e} (are A1/B1 holders + accord family seeded first?)")
@@ -569,6 +593,83 @@ mod tests {
         seed_canonical_servers(&backend)
             .await
             .expect("idempotent re-seed over the upgraded row");
+    }
+
+    /// v13.7.0 (CIRISPersist#410) — the genesis seed must SUPERSEDE (not fatally
+    /// Conflict → boot-brick) when a node already holds a DIFFERENT anchor-scrubbed
+    /// record for the canonical key_id — the :4243→:4242 re-bake on an upgraded
+    /// fleet node. `adopt_scrub_upgrade` returned a fatal "already anchored to a
+    /// different record" here; the fix routes it through the #405 supersede path.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn canonical_seed_supersedes_a_prior_anchor_scrubbed_record() {
+        use crate::federation::{FederationDirectory, SignedKeyRecord};
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(accord_holder_genesis_records())
+            .await
+            .expect("holder seed");
+        seed_accord_family(&backend).await.expect("family seed");
+
+        // Pre-seed a PRIOR anchor-scrubbed row for the canonical key_id: same
+        // pubkey as the baked record, scrubbed by A1 (scrub_key_id != key_id),
+        // but a `node` row (so put_public_key's canonical gate doesn't re-verify
+        // the now-stale scrubs) whose envelope `valid_from` is strictly OLDER
+        // than the baked record's — i.e. "the address before the re-bake".
+        let baked = &canonical_genesis_records()[0].record;
+        assert_ne!(baked.scrub_key_id, baked.key_id, "baked is anchor-scrubbed");
+        let mut old = baked.clone();
+        old.identity_type = identity_type::NODE.to_owned();
+        old.additional_scrubs.clear();
+        old.roles.clear();
+        let mut env = old.registration_envelope.clone();
+        env["valid_from"] = serde_json::json!("2026-06-01T00:00:00+00:00");
+        old.registration_envelope = env.clone();
+        old.original_content_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            crate::verify::canonical::ceg_produce_canonicalize(&env).expect("canonicalize"),
+        ));
+        backend
+            .put_public_key(SignedKeyRecord { record: old })
+            .await
+            .expect("pre-seed the prior anchor-scrubbed row");
+        assert!(
+            !crate::federation::is_canonical(&backend, &baked.key_id)
+                .await
+                .unwrap(),
+            "the prior (node) row is NOT canonical yet"
+        );
+
+        // The genesis seed must SUPERSEDE it — not fatal-Conflict → boot brick.
+        seed_canonical_servers(&backend)
+            .await
+            .expect("must supersede the prior anchor-scrubbed row, not brick");
+        verify_canonical_seeded(&backend)
+            .await
+            .expect("canonical live after supersede");
+        assert!(
+            crate::federation::is_canonical(&backend, &baked.key_id)
+                .await
+                .unwrap(),
+            "canonical conferred after the supersede"
+        );
+        // The corrected (baked) envelope actually propagated in place.
+        let row = FederationDirectory::lookup_public_key(&backend, &baked.key_id)
+            .await
+            .unwrap()
+            .expect("row present");
+        assert_eq!(
+            row.registration_envelope["valid_from"], baked.registration_envelope["valid_from"],
+            "the baked (newer) envelope superseded the prior one"
+        );
+
+        // Reboot idempotence — a second seed over the now-baked row is a no-op.
+        seed_canonical_servers(&backend)
+            .await
+            .expect("idempotent re-seed over the superseded row");
     }
 
     /// v13.3.0 (CIRISPersist#386) — end-to-end on a fresh backend: seed the
