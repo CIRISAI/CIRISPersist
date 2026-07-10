@@ -1788,16 +1788,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         destination: &crate::federation::TransportDestination,
     ) -> Result<(), crate::federation::Error> {
         let mut state = self.state.lock().expect("memory backend lock");
-        // FK parity with postgres/sqlite: the occurrence key must exist.
-        if !state
-            .federation_keys
-            .contains_key(&destination.occurrence_key_id)
-        {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "occurrence_key_id {} does not exist in federation_keys",
-                destination.occurrence_key_id
-            )));
-        }
+        // v13.9.1 (CIRISPersist#416) — NO federation_keys existence check. The
+        // V078 FK was dropped in V101: an `Advisory` binding (CC 3.3.6.2) legit-
+        // imately names a not-yet-rooted key that is NOT in federation_keys, and
+        // admit-advisory MUST record it (the routing hint). Trust is composed by
+        // the consumer (prefer `Rooted`; content gate CC 6 N1), never a substrate
+        // reject. Kept backend-symmetric with the FK-less sqlite/postgres tables.
         // Idempotent on the composite PK (re-assert refreshes in place).
         state.transport_destinations.insert(
             (
