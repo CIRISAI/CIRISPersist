@@ -5,6 +5,36 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.9.0] — 2026-07-10 — transport-binding provenance (rooted|advisory) + admit competing claims (#413, CC 3.3.6.2)
+
+### Added
+- **#413 (CC 3.3.6.2 / part_3 §1056, §1331) — the transport-binding store records
+  trust provenance and admits competing claims.** An unauthenticated announce is
+  *advisory-only* — a routing hint, never an authorization; the substrate
+  **admits and records** the binding, and the trust that the announced key owns
+  the destination is composed by the **consumer**, not a substrate verdict.
+  - **`BindingProvenance { Rooted | Advisory }`** + a `binding_provenance` field
+    on `TransportDestination`. `Rooted` = federation-key-verified
+    `identity_occurrence`/`root_binding` (authoritative, part_3 §1054); `Advisory`
+    = a self-consistent announce whose key is unknown/not-yet-rooted (routing hint
+    only). `#[serde(default)]` + a `NOT NULL DEFAULT 'rooted'` column: pre-#413
+    rows were authoritative-by-assumption (canonical priming), so they read as
+    `Rooted`. Carried through `put` / `list_transport_destinations_for` /
+    `list_all_transport_destinations` (#411 boot-load) byte-for-byte.
+  - **Competing claims admitted, not rejected.** Two different `key_id`s asserting
+    the same dest-hash are BOTH persisted (distinct rows on the composite PK —
+    no uniqueness on `destination` collapses them) and surfaced via the new
+    **`list_transport_destinations_by_destination()`** (trait + sqlite/postgres/
+    memory + a `DirectoryOp`). The AV-42 spoof (an adversary announcing a
+    canonical `key_id` with its own destination) is defeated by the routing layer
+    **preferring `Rooted` over `Advisory`**, never by a substrate reject.
+  - **Migration V100** — `binding_provenance TEXT NOT NULL DEFAULT 'rooted'`, both
+    dialects, additive backfill.
+  - Tests: `competing_claims_admitted_with_provenance_and_surfaced` (the spoof:
+    both admitted, tags distinguish, `by_destination` + `list_all` surface them)
+    + `binding_provenance_token_back_compat` (NULL/unknown ⇒ `Rooted`). No verify
+    re-pin.
+
 ## [13.8.0] — 2026-07-10 — persist the transport X25519 (KEX) + list_all so rooted-peer KEX material survives a restart (#411)
 
 ### Added

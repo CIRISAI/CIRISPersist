@@ -2708,6 +2708,24 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
+    /// v13.9.0 (CIRISPersist#413, CC 3.3.6.2) — every claimant of a `destination`
+    /// (dest-hash), across all `occurrence_key_id`s. The **competing-claims**
+    /// read: two different keys asserting the same dest-hash are BOTH admitted
+    /// (distinct rows on the composite PK) and surfaced here so the routing layer
+    /// can PREFER a [`BindingProvenance::Rooted`](self_at_login::BindingProvenance::Rooted)
+    /// binding over an [`Advisory`](self_at_login::BindingProvenance::Advisory)
+    /// one — the AV-42 spoof is resolved by preference, never a substrate reject.
+    /// Default impl errors; backends override.
+    async fn list_transport_destinations_by_destination(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        let _ = destination;
+        Err(Error::Backend(
+            "list_transport_destinations_by_destination not implemented for this backend".into(),
+        ))
+    }
+
     /// v6.5.0 — drop one reachable address (e.g. a stale relay). Returns
     /// `true` if a row was removed, `false` if absent (idempotent).
     /// Default impl errors; the three backends override.

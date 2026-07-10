@@ -1843,6 +1843,25 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    async fn list_transport_destinations_by_destination(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .transport_destinations
+            .values()
+            .filter(|d| d.destination == destination)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.occurrence_key_id
+                .cmp(&b.occurrence_key_id)
+                .then_with(|| a.transport_kind.cmp(&b.transport_kind))
+        });
+        Ok(rows)
+    }
+
     async fn remove_transport_destination(
         &self,
         occurrence_key_id: &str,

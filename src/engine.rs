@@ -3330,6 +3330,9 @@ impl Engine {
                         // are published separately by edge on peer root.
                         transport_ed25519_pubkey_base64: None,
                         transport_x25519_pubkey_base64: None,
+                        // The node registering its OWN occurrence → authoritative.
+                        binding_provenance:
+                            crate::federation::self_at_login::BindingProvenance::Rooted,
                     })
                     .await?;
                 transport_rows += 1;
@@ -12415,6 +12418,7 @@ mod tests {
             last_seen_at: Some(now),
             transport_ed25519_pubkey_base64: None,
             transport_x25519_pubkey_base64: None,
+            binding_provenance: crate::federation::self_at_login::BindingProvenance::Rooted,
         };
 
         dir.put_transport_destination(&mk("reticulum", "d1"))

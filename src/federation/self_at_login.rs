@@ -221,6 +221,46 @@ pub fn partnership_accept_envelope(
 
 // ─── transport_destination (§5.6.8.8.1) ────────────────────────────
 
+/// v13.9.0 (CIRISPersist#413, CC 3.3.6.2 / part_3 §1056, §1331) — the trust
+/// provenance of a [`TransportDestination`] binding. The substrate ADMITS and
+/// RECORDS the binding either way; the trust that the announced key actually
+/// owns the destination is composed by the CONSUMER (routing prefers `Rooted`
+/// over `Advisory`; content gates on trust — CC 6 N1), never a substrate verdict.
+/// The AV-42 spoof (an adversary announcing a canonical `key_id` with its own
+/// destination) is defeated by that routing-time PREFERENCE, not by refusing the
+/// write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingProvenance {
+    /// The binding is backed by a federation-key-signed `identity_occurrence` /
+    /// `root_binding` that verified the announced key against `federation_keys`
+    /// (part_3 §1054) — **authoritative**. The back-compat default: pre-#413
+    /// rows were all authoritative-by-assumption (canonical priming), so an
+    /// untagged row reads as `Rooted`.
+    #[default]
+    Rooted,
+    /// A self-consistent announce whose federation key is unknown / not-yet-
+    /// rooted (part_3 §1056) — a **routing hint only, never an authorization**.
+    Advisory,
+}
+
+impl BindingProvenance {
+    /// Stable wire token (`"rooted"` / `"advisory"`) for the TEXT column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BindingProvenance::Rooted => "rooted",
+            BindingProvenance::Advisory => "advisory",
+        }
+    }
+    /// Parse from the stored token; unknown/NULL ⇒ the back-compat `Rooted`.
+    pub fn from_token(s: Option<&str>) -> Self {
+        match s {
+            Some("advisory") => BindingProvenance::Advisory,
+            _ => BindingProvenance::Rooted,
+        }
+    }
+}
+
 /// v6.5.0 (CIRISPersist#183, CEG §5.6.8.8.1) — one reachable network
 /// address for one identity_occurrence (the "show up on the network"
 /// reachability row). Backed by the V078 `transport_destinations`
@@ -271,11 +311,47 @@ pub struct TransportDestination {
     /// derivable from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_x25519_pubkey_base64: Option<String>,
+    /// v13.9.0 (CIRISPersist#413, CC 3.3.6.2) — the binding's trust provenance:
+    /// [`BindingProvenance::Rooted`] (federation-key-verified, authoritative) vs
+    /// [`BindingProvenance::Advisory`] (self-consistent announce, routing-hint
+    /// only). The substrate admits + records both; competing claims on one
+    /// dest-hash (different `occurrence_key_id`s) all coexist — the AV-42 spoof
+    /// is resolved by the consumer PREFERRING `Rooted` at routing time, never by
+    /// a substrate reject. `#[serde(default)]` ⇒ pre-#413 records read as
+    /// `Rooted` (their authoritative-by-assumption intent).
+    #[serde(default)]
+    pub binding_provenance: BindingProvenance,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v13.9.0 (CIRISPersist#413) — `BindingProvenance` back-compat: an untagged
+    /// (pre-#413, NULL) row reads as `Rooted` (its authoritative-by-assumption
+    /// intent); an unknown token also fails safe to `Rooted`; tokens round-trip.
+    #[test]
+    fn binding_provenance_token_back_compat() {
+        assert_eq!(BindingProvenance::default(), BindingProvenance::Rooted);
+        assert_eq!(
+            BindingProvenance::from_token(None),
+            BindingProvenance::Rooted
+        );
+        assert_eq!(
+            BindingProvenance::from_token(Some("advisory")),
+            BindingProvenance::Advisory
+        );
+        assert_eq!(
+            BindingProvenance::from_token(Some("rooted")),
+            BindingProvenance::Rooted
+        );
+        assert_eq!(
+            BindingProvenance::from_token(Some("nonsense")),
+            BindingProvenance::Rooted
+        );
+        assert_eq!(BindingProvenance::Rooted.as_str(), "rooted");
+        assert_eq!(BindingProvenance::Advisory.as_str(), "advisory");
+    }
 
     #[test]
     fn delegation_envelope_carries_full_scope_set_and_dimension() {

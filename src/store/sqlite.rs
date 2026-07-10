@@ -4981,13 +4981,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             conn.execute(
                 "INSERT INTO transport_destinations \
                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                     binding_provenance) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(occurrence_key_id, transport_kind, destination) \
                  DO UPDATE SET asserted_at = excluded.asserted_at, \
                     last_seen_at = excluded.last_seen_at, \
                     transport_ed25519_pubkey_base64 = excluded.transport_ed25519_pubkey_base64, \
-                    transport_x25519_pubkey_base64 = excluded.transport_x25519_pubkey_base64",
+                    transport_x25519_pubkey_base64 = excluded.transport_x25519_pubkey_base64, \
+                    binding_provenance = excluded.binding_provenance",
                 rusqlite::params![
                     d.occurrence_key_id,
                     d.transport_kind,
@@ -4996,6 +4998,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     last_seen,
                     d.transport_ed25519_pubkey_base64,
                     d.transport_x25519_pubkey_base64,
+                    d.binding_provenance.as_str(),
                 ],
             )?;
             Ok(())
@@ -5013,7 +5016,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64 \
+                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                    binding_provenance \
                  FROM transport_destinations WHERE occurrence_key_id = ?1 \
                  ORDER BY transport_kind, destination",
             )?;
@@ -5033,7 +5037,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64 \
+                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                    binding_provenance \
                  FROM transport_destinations \
                  ORDER BY occurrence_key_id, transport_kind, destination",
             )?;
@@ -5042,6 +5047,31 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("list_all_transport_destinations: {e}"))
+        })
+    }
+
+    async fn list_transport_destinations_by_destination(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let dest = destination.to_owned();
+        (move || -> Result<Vec<crate::federation::TransportDestination>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                    binding_provenance \
+                 FROM transport_destinations WHERE destination = ?1 \
+                 ORDER BY occurrence_key_id, transport_kind",
+            )?;
+            let rows = stmt.query_map([&dest], sqlite_row_to_transport_destination)?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_transport_destinations_by_destination: {e}"
+            ))
         })
     }
 
@@ -10939,6 +10969,7 @@ fn sqlite_row_to_transport_destination(
             .ok()
             .map(|t| t.with_timezone(&chrono::Utc))
     });
+    let provenance_token: Option<String> = row.get(7)?;
     Ok(crate::federation::TransportDestination {
         occurrence_key_id: row.get(0)?,
         transport_kind: row.get(1)?,
@@ -10947,6 +10978,9 @@ fn sqlite_row_to_transport_destination(
         last_seen_at,
         transport_ed25519_pubkey_base64: row.get(5)?,
         transport_x25519_pubkey_base64: row.get(6)?,
+        binding_provenance: crate::federation::self_at_login::BindingProvenance::from_token(
+            provenance_token.as_deref(),
+        ),
     })
 }
 
@@ -20208,6 +20242,7 @@ mod tests {
             last_seen_at: Some(now),
             transport_ed25519_pubkey_base64: Some("dHJhbnNwb3J0LWVkMjU1MTk=".into()),
             transport_x25519_pubkey_base64: Some("dHJhbnNwb3J0LXgyNTUxOQ==".into()),
+            binding_provenance: crate::federation::self_at_login::BindingProvenance::Rooted,
         };
         // A non-Reticulum kind carries no RNS transport key → None.
         let ws = crate::federation::TransportDestination {
@@ -20218,6 +20253,7 @@ mod tests {
             last_seen_at: Some(now),
             transport_ed25519_pubkey_base64: None,
             transport_x25519_pubkey_base64: None,
+            binding_provenance: crate::federation::self_at_login::BindingProvenance::Rooted,
         };
         backend.put_transport_destination(&ret).await.unwrap();
         backend.put_transport_destination(&ws).await.unwrap();
@@ -20289,6 +20325,7 @@ mod tests {
             last_seen_at: Some(now),
             transport_ed25519_pubkey_base64: Some("ZWQ=".into()),
             transport_x25519_pubkey_base64: Some(x.into()),
+            binding_provenance: crate::federation::self_at_login::BindingProvenance::Rooted,
         };
         backend
             .put_transport_destination(&td("node-a", "aaaa", "eDI1NTE5LWE="))
@@ -20322,6 +20359,74 @@ mod tests {
             all[1].transport_x25519_pubkey_base64.as_deref(),
             Some("eDI1NTE5LWI=")
         );
+    }
+
+    /// v13.9.0 (CIRISPersist#413, CC 3.3.6.2) — the AV-42 spoof is admitted, not
+    /// rejected: two different keys claiming the SAME dest-hash BOTH persist as
+    /// distinct rows (competing claims), each carrying its `binding_provenance`,
+    /// and `list_transport_destinations_by_destination` surfaces both so routing
+    /// can PREFER the `rooted` claim over the `advisory` spoof. The tag also
+    /// survives the boot-load (`list_all`) read.
+    #[tokio::test]
+    async fn competing_claims_admitted_with_provenance_and_surfaced() {
+        use crate::federation::self_at_login::BindingProvenance;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for kid in ["real-canon", "spoofer"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(kid, kid, kid),
+                })
+                .await
+                .unwrap();
+        }
+        let now = chrono::Utc::now();
+        let td = |occ: &str, prov: BindingProvenance| crate::federation::TransportDestination {
+            occurrence_key_id: occ.into(),
+            transport_kind: "reticulum".into(),
+            destination: "same-dest-hash".into(), // BOTH claim the same dest-hash
+            asserted_at: now,
+            last_seen_at: Some(now),
+            transport_ed25519_pubkey_base64: None,
+            transport_x25519_pubkey_base64: None,
+            binding_provenance: prov,
+        };
+        // The real canonical roots it; an adversary announces the SAME dest-hash
+        // under its own key (advisory) — the classic AV-42 spoof.
+        backend
+            .put_transport_destination(&td("real-canon", BindingProvenance::Rooted))
+            .await
+            .unwrap();
+        backend
+            .put_transport_destination(&td("spoofer", BindingProvenance::Advisory))
+            .await
+            .unwrap();
+
+        // BOTH admitted — the substrate never rejects a competing claim.
+        let claimants = backend
+            .list_transport_destinations_by_destination("same-dest-hash")
+            .await
+            .unwrap();
+        assert_eq!(claimants.len(), 2, "competing claims must BOTH be admitted");
+        let rooted: Vec<_> = claimants
+            .iter()
+            .filter(|c| c.binding_provenance == BindingProvenance::Rooted)
+            .collect();
+        let advisory: Vec<_> = claimants
+            .iter()
+            .filter(|c| c.binding_provenance == BindingProvenance::Advisory)
+            .collect();
+        assert_eq!(rooted.len(), 1, "one rooted claim");
+        assert_eq!(rooted[0].occurrence_key_id, "real-canon");
+        assert_eq!(advisory.len(), 1, "one advisory (spoof) claim");
+        assert_eq!(advisory[0].occurrence_key_id, "spoofer");
+
+        // The provenance tag survives the boot-load read too.
+        let all = backend.list_all_transport_destinations().await.unwrap();
+        assert!(all.iter().any(|d| d.occurrence_key_id == "real-canon"
+            && d.binding_provenance == BindingProvenance::Rooted));
+        assert!(all.iter().any(|d| d.occurrence_key_id == "spoofer"
+            && d.binding_provenance == BindingProvenance::Advisory));
     }
 
     /// v4.0 (CIRISPersist#160, V060, FSD §4.3) — cohort_scope +
