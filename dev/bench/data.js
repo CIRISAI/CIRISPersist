@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783658989342,
+  "lastUpdate": 1783665080978,
   "repoUrl": "https://github.com/CIRISAI/CIRISPersist",
   "entries": {
     "ciris-persist criterion benchmarks": [
@@ -56867,6 +56867,264 @@ window.BENCHMARK_DATA = {
             "name": "occurrence_registry/list_live_occurrences/1000",
             "value": 582032,
             "range": "± 2141",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "47533f2e52f435908a5547bd34a6f69039d8f221",
+          "message": "federation: growable region set + clarify write quorum is replication, not a vote (infra does not vote) (#407)\n\n* federation: growable region set + make clear the write quorum is replication, not a vote\n\nverify_coord.rs hardcoded N_REGIONS=3, QUORUM_WRITE_THRESHOLD=2, and a\nclosed [us,eu,apac] match. Regions are growable (jp/uk/et incoming), so:\n\n- region::ALL is now the single source of truth (a slice); N_REGIONS and\n  the write threshold DERIVE from it (len / ⌈2N/3⌉). Onboarding a region\n  is a one-line list edit + its wire-format version bump.\n- is_valid derives from ALL instead of duplicating the match arms.\n\nCrucially, this does NOT turn the construct into a governance quorum.\nInfrastructure does not vote: regions are replicas, not voters. The\nwrite quorum is a replication/durability CAP floor (how many replicas\nhold a write before it's visible) and the merge comparator is a CRDT\nconvergence tie-break — neither authorizes anything. Authorization is\nsignature verification against accord/steward keys, upstream and never\nhere. So it is deliberately NOT wired to the trust-root QuorumPolicy\nsignature primitive — coupling a replica ack-count to an agency vote is\nthe infra:* != agency:* conflation (CIRISVerify#77). Module docs, the\nthreshold doc, the comparator tier-1 doc, and the anti-rollback note are\nall reworded to remove vote-flavored language.\n\nNB the threshold is currently reported-not-enforced (only reader is\nverify_coord_constants_json); enforcement remains CIRISPersist#143.\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01SrobBoNHtgqo4DXKuxj6J4\n\n* chore: bump 13.6.1 → 13.6.2 (#407 growable regions + infra-does-not-vote clarification)\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01SrobBoNHtgqo4DXKuxj6J4\n\n---------\n\nCo-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-07-10T00:57:05-05:00",
+          "tree_id": "0e2b5a6c52d315ac9d88ae2bfa230ef706722af7",
+          "url": "https://github.com/CIRISAI/CIRISPersist/commit/47533f2e52f435908a5547bd34a6f69039d8f221"
+        },
+        "date": 1783665078493,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "calibration/splitmix64_10m",
+            "value": 40428503,
+            "range": "± 27328",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "calibration/dram_random_walk_500k",
+            "value": 3596566,
+            "range": "± 170031",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/1",
+            "value": 8133,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/6",
+            "value": 11840,
+            "range": "± 72",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/16",
+            "value": 19364,
+            "range": "± 341",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ingest_pipeline/64",
+            "value": 54204,
+            "range": "± 162",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/small",
+            "value": 8,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/typical",
+            "value": 35,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "canonicalize_python/large",
+            "value": 224,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_256_bytes",
+            "value": 524,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_1024_bytes",
+            "value": 599,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sign_16384_bytes",
+            "value": 2067,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/1",
+            "value": 10,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/6",
+            "value": 88,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/16",
+            "value": 260,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "decompose/64",
+            "value": 1151,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dedup_key_per_row",
+            "value": 15,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/8",
+            "value": 34527,
+            "range": "± 3394",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/32",
+            "value": 77085,
+            "range": "± 5860",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "queue_submit/128",
+            "value": 245750,
+            "range": "± 3828",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/1",
+            "value": 11079,
+            "range": "± 744",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/2",
+            "value": 13133,
+            "range": "± 849",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/8",
+            "value": 20744,
+            "range": "± 1808",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "sequence_contention_sqlite/next_sequence/32",
+            "value": 39578,
+            "range": "± 2205",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "engine_cold_start/sqlite_open_and_migrate",
+            "value": 2655050,
+            "range": "± 13796",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/1000",
+            "value": 4139708,
+            "range": "± 45606",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/1000",
+            "value": 259733,
+            "range": "± 9017",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/1000",
+            "value": 807065,
+            "range": "± 69231",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/10000",
+            "value": 40547336,
+            "range": "± 518494",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/10000",
+            "value": 1281598,
+            "range": "± 90154",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/10000",
+            "value": 7365928,
+            "range": "± 158685",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/list_trace_summaries/25000",
+            "value": 100551222,
+            "range": "± 524451",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/aggregate_llm_costs/25000",
+            "value": 3469398,
+            "range": "± 158941",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "read_engine_analytics/cross_agent_divergence/25000",
+            "value": 18521064,
+            "range": "± 371621",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/register_occurrence",
+            "value": 80361,
+            "range": "± 4485",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/heartbeat_occurrence",
+            "value": 79223,
+            "range": "± 4046",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/10",
+            "value": 6131,
+            "range": "± 77",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/100",
+            "value": 39514,
+            "range": "± 88",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "occurrence_registry/list_live_occurrences/1000",
+            "value": 367890,
+            "range": "± 1582",
             "unit": "ns/iter"
           }
         ]
