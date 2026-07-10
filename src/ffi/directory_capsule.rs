@@ -468,6 +468,15 @@ pub enum DirectoryOp {
     /// map + KEX resolver on startup, incl. the transport-tier x25519). Result
     /// rides the existing `TransportDestinations` variant. APPEND-ONLY.
     ListAllTransportDestinations {},
+    /// [`FederationDirectory::list_transport_destinations_by_destination`] (#413)
+    /// — every claimant of one dest-hash, so the routing layer can prefer a
+    /// `rooted` binding over an `advisory` one (competing-claims / AV-42-spoof
+    /// resolution by preference). Result rides `TransportDestinations`.
+    /// APPEND-ONLY.
+    ListTransportDestinationsByDestination {
+        /// The dest-hash (`TransportDestination::destination`) to list claimants of.
+        destination: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -573,6 +582,15 @@ pub async fn dispatch_directory_op(
         }
         DirectoryOp::ListAllTransportDestinations {} => {
             match dir.list_all_transport_destinations().await {
+                Ok(v) => DirectoryOpResult::TransportDestinations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListTransportDestinationsByDestination { destination } => {
+            match dir
+                .list_transport_destinations_by_destination(&destination)
+                .await
+            {
                 Ok(v) => DirectoryOpResult::TransportDestinations(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
@@ -1699,6 +1717,25 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
+    async fn list_transport_destinations_by_destination(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        // #413 — competing-claims read across the wheel boundary.
+        match self
+            .run_op(&DirectoryOp::ListTransportDestinationsByDestination {
+                destination: destination.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::TransportDestinations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     async fn list_held_fountain_content(
         &self,
         publisher_key_id: &str,
@@ -2573,6 +2610,8 @@ mod tests {
             // the ABI intact (prime + re-seal after restart).
             transport_ed25519_pubkey_base64: Some("dHJhbnNwb3J0LWVkMjU1MTk=".into()),
             transport_x25519_pubkey_base64: Some("dHJhbnNwb3J0LXgyNTUxOQ==".into()),
+            // #413 — the provenance tag rides the ABI via serde.
+            binding_provenance: self_at_login::BindingProvenance::Advisory,
         };
 
         let put = run_op(

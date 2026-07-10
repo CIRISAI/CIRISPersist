@@ -2059,6 +2059,7 @@ fn pg_row_to_transport_destination(
     row: tokio_postgres::Row,
 ) -> Result<crate::federation::TransportDestination, crate::federation::Error> {
     use crate::federation::Error as FErr;
+    let provenance_token: Option<String> = row.safe_get_with(7, FErr::Backend)?;
     Ok(crate::federation::TransportDestination {
         occurrence_key_id: row.safe_get_with(0, FErr::Backend)?,
         transport_kind: row.safe_get_with(1, FErr::Backend)?,
@@ -2067,6 +2068,9 @@ fn pg_row_to_transport_destination(
         last_seen_at: row.safe_get_with(4, FErr::Backend)?,
         transport_ed25519_pubkey_base64: row.safe_get_with(5, FErr::Backend)?,
         transport_x25519_pubkey_base64: row.safe_get_with(6, FErr::Backend)?,
+        binding_provenance: crate::federation::self_at_login::BindingProvenance::from_token(
+            provenance_token.as_deref(),
+        ),
     })
 }
 
@@ -5249,17 +5253,20 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         // Idempotent on the composite PK: a re-assert refreshes the
         // timestamps in place (drop+re-register is the mutation model).
+        let provenance_token = destination.binding_provenance.as_str();
         client
             .execute(
                 "INSERT INTO cirislens.transport_destinations \
                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                     binding_provenance) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
                  ON CONFLICT (occurrence_key_id, transport_kind, destination) \
                  DO UPDATE SET asserted_at = EXCLUDED.asserted_at, \
                     last_seen_at = EXCLUDED.last_seen_at, \
                     transport_ed25519_pubkey_base64 = EXCLUDED.transport_ed25519_pubkey_base64, \
-                    transport_x25519_pubkey_base64 = EXCLUDED.transport_x25519_pubkey_base64",
+                    transport_x25519_pubkey_base64 = EXCLUDED.transport_x25519_pubkey_base64, \
+                    binding_provenance = EXCLUDED.binding_provenance",
                 &[
                     &destination.occurrence_key_id,
                     &destination.transport_kind,
@@ -5268,6 +5275,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &destination.last_seen_at,
                     &destination.transport_ed25519_pubkey_base64,
                     &destination.transport_x25519_pubkey_base64,
+                    &provenance_token,
                 ],
             )
             .await
@@ -5288,7 +5296,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client
             .query(
                 "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64 \
+                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                    binding_provenance \
                  FROM cirislens.transport_destinations WHERE occurrence_key_id = $1 \
                  ORDER BY transport_kind, destination",
                 &[&occurrence_key_id],
@@ -5312,7 +5321,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client
             .query(
                 "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64 \
+                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                    binding_provenance \
                  FROM cirislens.transport_destinations \
                  ORDER BY occurrence_key_id, transport_kind, destination",
                 &[],
@@ -5320,6 +5330,34 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_all_transport_destinations: {e}"))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_transport_destination)
+            .collect()
+    }
+
+    async fn list_transport_destinations_by_destination(
+        &self,
+        destination: &str,
+    ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                    binding_provenance \
+                 FROM cirislens.transport_destinations WHERE destination = $1 \
+                 ORDER BY occurrence_key_id, transport_kind",
+                &[&destination],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_transport_destinations_by_destination: {e}"
+                ))
             })?;
         rows.into_iter()
             .map(pg_row_to_transport_destination)
