@@ -23,13 +23,35 @@
 //! consumers (verify-coord workers, regional gossip relays, edge
 //! caches) read them rather than redefine them.
 //!
+//! # Infrastructure does not vote
+//!
+//! Nothing in this module is an authorization decision. Regions are
+//! **replicas**, not voters — a region "acknowledging" a write means it
+//! *durably stored* the row, never that it *approved* the content. The
+//! "quorum" here is a **replication/durability consistency floor** (CAP:
+//! how many replicas must hold a write before it is client-visible) and a
+//! **deterministic CRDT merge tie-break** (which of two replicated copies
+//! of the *same* logical revocation wins convergence). Both are
+//! infrastructure mechanics.
+//!
+//! *Authorization* — whether a revocation is legitimate at all — is
+//! **signature verification against accord/steward keys** (agency), done
+//! upstream and never here. A Byzantine region cannot forge a signed
+//! revocation; it can only withhold one (an availability fault the
+//! signature layer is orthogonal to). So this module MUST NOT reuse the
+//! trust-root M-of-N *signature* quorum primitive
+//! (`ciris_verify_core::threshold::QuorumPolicy`): coupling a replication
+//! ack-count to a governance vote is exactly the `infra:* ≠ agency:*`
+//! conflation the constitution forbids (CIRISVerify#77).
+//!
 //! # Anti-rollback discipline
 //!
 //! The spec is explicit: anti-rollback is enforced **at admission**,
-//! before quorum is asked — a write that would decrease the monotonic
-//! counter for a `revoked_key_id` never enters the quorum gate, so a
-//! sufficient minority of regions cannot ratify a rollback. The
-//! comparator in this module is the determinism floor; the admission
+//! before replication is asked — a write that would decrease the
+//! monotonic counter for a `revoked_key_id` never enters the replication
+//! path, so no number of regions replicating a stale write can force a
+//! rollback into acceptance (regions replicate; they do not adjudicate).
+//! The comparator in this module is the determinism floor; the admission
 //! check at `put_revocation` is the temporal floor. Both are required.
 //!
 //! # Why these constants live here and not in CIRISVerify
@@ -67,17 +89,32 @@ pub const TAU_PARTIAL: Duration = Duration::from_secs(300);
 /// (300s) by spec.
 pub const BOUNDED_STALENESS: Duration = TAU_PARTIAL;
 
-/// **Q1 — N (region count).** Number of regions participating in
-/// the quorum-write contract. Spec value: 3 (`us` / `eu` / `apac`).
-///
-/// Pinned at 3 in v1.1; spec changes to N would be a wire-format
-/// version bump (different quorum threshold ratio).
-pub const N_REGIONS: usize = 3;
+/// **Q1 — N (region count).** Number of regions participating in the
+/// quorum-write contract, **derived** from [`region::ALL`] — the single
+/// source of truth. Currently 3 (`us` / `eu` / `apac`); the region set is
+/// **growable** (e.g. `jp` / `uk` / `et`), and N + the write threshold
+/// re-derive automatically when a region is added to that list. Adding a
+/// region is still a wire-format version bump (the closed admission
+/// vocabulary changes), but requires no other edit in this module.
+pub const N_REGIONS: usize = region::ALL.len();
 
-/// **Q1 — quorum write threshold.** Minimum regional acknowledgments
-/// for a revocation to be considered quorum-committed. Computed as
-/// `⌈2N/3⌉ = 2` for N=3.
-pub const QUORUM_WRITE_THRESHOLD: usize = 2;
+/// **Q1 — write-durability quorum (replication ack-count, NOT a vote).**
+/// Minimum number of regional **replicas** that must durably hold a
+/// revocation before it is treated as quorum-committed / client-visible.
+/// This is a CAP consistency floor — a replication acknowledgment count,
+/// like a Dynamo/Raft write quorum — **not** an authorization decision
+/// (see the module's "Infrastructure does not vote" note; authorization is
+/// signature verification upstream).
+///
+/// Derived from N as the §3.3.2 `⌈2N/3⌉` durability ratio (at N=3 → 2), so
+/// it re-derives as the region set grows. It is deliberately NOT wired to
+/// the trust-root `QuorumPolicy` signature primitive — that governs agency,
+/// this governs replica durability.
+///
+/// NB currently **reported, not enforced**: the only reader is
+/// `verify_coord_constants_json()` (the substrate publishes the CAP
+/// contract); row-lifecycle enforcement is tracked at CIRISPersist#143.
+pub const QUORUM_WRITE_THRESHOLD: usize = (2 * N_REGIONS).div_ceil(3);
 
 /// **F-AV-13 — revocation cache TTL.** Maximum age of a cached
 /// revocation-state entry before it MUST be re-read. Normatively
@@ -92,6 +129,12 @@ pub const REVOCATION_CACHE_TTL: Duration = Duration::from_secs(30);
 /// from this closed set; producers asserting anything else are
 /// rejected at admission. Same closed-set discipline as
 /// [`crate::federation::types::cohort_scope`].
+///
+/// The set is **closed at any given wire version but not hard-limited to
+/// three** — it grows as the federation adds regions (`jp` / `uk` / `et` /
+/// …). [`ALL`] is the single source of truth: [`is_valid`], [`N_REGIONS`],
+/// and [`QUORUM_WRITE_THRESHOLD`] all derive from it, so onboarding a region
+/// is a one-line addition here (plus its wire-format version bump).
 pub mod region {
     /// North-American region.
     pub const US: &str = "us";
@@ -100,14 +143,19 @@ pub mod region {
     /// Asia-Pacific region.
     pub const APAC: &str = "apac";
 
-    /// True iff `s` is one of the three closed-set region values.
-    pub fn is_valid(s: &str) -> bool {
-        matches!(s, US | EU | APAC)
-    }
+    /// All federation regions in spec-canonical order. **The single source of
+    /// truth** for the closed admission vocabulary and, via [`slice::len`], for
+    /// [`super::N_REGIONS`] / [`super::QUORUM_WRITE_THRESHOLD`]. Add a region
+    /// here (e.g. `JP` / `UK` / `ET`) to grow N — the write quorum re-derives
+    /// as `⌈2N/3⌉`.
+    pub const ALL: &[&str] = &[US, EU, APAC];
 
-    /// All three regions in spec-canonical order (`us`, `eu`, `apac`).
-    /// Used by the per-region observation tracker.
-    pub const ALL: [&str; 3] = [US, EU, APAC];
+    /// True iff `s` is one of the closed-set region values (derived from
+    /// [`ALL`], never a duplicated match arm).
+    #[must_use]
+    pub fn is_valid(s: &str) -> bool {
+        ALL.contains(&s)
+    }
 }
 
 /// One revocation's contribution to the 3-tier deterministic merge.
@@ -144,8 +192,11 @@ pub struct MergeBallot<'a> {
 /// Tier hierarchy (each tier is the tie-break for the previous):
 ///
 /// 1. **Higher [`quorum_weight`](MergeBallot::quorum_weight) wins**
-///    — a revocation acknowledged by more regions is more
-///    authoritative. Encodes the "majority-quorum dominance" rule.
+///    — a copy of the revocation held by more region replicas wins
+///    convergence (more independent replicas observed it). A CRDT
+///    merge-dominance rule for deterministic reconciliation — NOT a
+///    vote on the revocation's validity (that is settled by signatures
+///    upstream; see the module "Infrastructure does not vote" note).
 /// 2. **Later [`signed_timestamp`](MergeBallot::signed_timestamp)
 ///    wins** — anti-rollback monotonic. F-AV-FRONTRUN closure: a
 ///    racing writer can't undercut a later legitimate revocation by
@@ -197,23 +248,43 @@ mod tests {
         assert_eq!(TAU_NORMAL, Duration::from_secs(60));
         assert_eq!(TAU_PARTIAL, Duration::from_secs(300));
         assert_eq!(BOUNDED_STALENESS, TAU_PARTIAL);
+        // Current region set is the canonical three; N + threshold DERIVE
+        // from region::ALL (not hardcoded), so these track the list.
         assert_eq!(N_REGIONS, 3);
+        assert_eq!(N_REGIONS, region::ALL.len());
         assert_eq!(QUORUM_WRITE_THRESHOLD, 2);
         // F-AV-13: cache TTL is exactly τ_normal/2.
         assert_eq!(REVOCATION_CACHE_TTL * 2, TAU_NORMAL);
     }
 
     #[test]
-    fn region_closed_set_admits_only_three() {
-        assert!(region::is_valid("us"));
-        assert!(region::is_valid("eu"));
-        assert!(region::is_valid("apac"));
-        // Common evasions:
+    fn write_durability_quorum_is_derived_and_grows() {
+        // The write-durability quorum is the §3.3.2 replication ratio ⌈2N/3⌉
+        // — derived from N, not a literal — and re-derives as the region set
+        // grows. This is a replica ack-count, NOT a governance vote, so it is
+        // deliberately not routed through the trust-root QuorumPolicy.
+        for (n, want) in [(3, 2), (4, 3), (5, 4), (6, 4), (7, 5), (9, 6)] {
+            let n: usize = n;
+            assert_eq!((2 * n).div_ceil(3), want, "⌈2·{n}/3⌉");
+        }
+        // The live constant is exactly the formula applied to the live N.
+        assert_eq!(QUORUM_WRITE_THRESHOLD, (2 * N_REGIONS).div_ceil(3));
+    }
+
+    #[test]
+    fn region_closed_set_admits_only_listed() {
+        // Every listed region validates; the check derives from region::ALL,
+        // so growing the list (jp/uk/et/…) needs no edit here.
+        for r in region::ALL {
+            assert!(region::is_valid(r), "listed region {r} must validate");
+        }
+        assert!(region::ALL.starts_with(&["us", "eu", "apac"]));
+        // Common evasions stay rejected:
         assert!(!region::is_valid("US"));
         assert!(!region::is_valid("global"));
         assert!(!region::is_valid(""));
         assert!(!region::is_valid("us-east-1"));
-        assert_eq!(region::ALL, ["us", "eu", "apac"]);
+        assert!(!region::is_valid("jp")); // not yet onboarded
     }
 
     #[test]

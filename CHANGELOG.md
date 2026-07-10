@@ -69,6 +69,32 @@ threat-model citations because this crate's audit story is the point.
   spoof) + `canonical_supersede_over_roster_matrix` (real co-scrubs over a test
   roster: newer 2-of-3 supersedes; older 2-of-3 refused; newer 1-scrub refused;
   non-canonical refused). Full suite green. No verify re-pin.
+- Also includes the **#407/#408** region-set work merged to main pre-release
+  (its own `[13.6.2]` section below was never tagged separately; it ships here).
+
+## [13.6.2] — 2026-07-10 — growable region set + clarify the verify-coord write quorum is replication, not a vote (#407, #408)
+
+### Changed
+- **`federation/verify_coord.rs` — regions are growable, and the write quorum
+  is replication, not a vote.** `N_REGIONS` (was a hardcoded `3`) and
+  `QUORUM_WRITE_THRESHOLD` (was a hardcoded `2`) now **derive** from
+  `region::ALL` — the single source of truth (`len` / `⌈2N/3⌉`) — so onboarding
+  a region (jp/uk/et …) is a one-line list edit. `region::is_valid` derives from
+  `ALL` instead of duplicating match arms.
+- **Doc/framing (no behavior change):** made explicit that nothing in this
+  module is an authorization decision. Regions are **replicas, not voters** — a
+  region acknowledging a write means it *durably stored* the row, not that it
+  *approved* it. `QUORUM_WRITE_THRESHOLD` is a replication/durability CAP floor
+  (Dynamo/Raft-style write quorum, currently **reported-not-enforced** — sole
+  reader is `verify_coord_constants_json`; enforcement remains #143); the merge
+  comparator is a CRDT convergence tie-break. Authorization is signature
+  verification against accord/steward keys (agency), done upstream and never
+  here. Deliberately **not** wired to `ciris_verify_core::threshold::QuorumPolicy`
+  (the trust-root M-of-N *signature* primitive) — coupling a replica ack-count to
+  a governance vote is the `infra:* ≠ agency:*` conflation (CIRISVerify#77). See
+  #408 for the durable statement of the category error + the open threat-model
+  question (is BFT `⌈2N/3⌉` even the right *durability* ratio when regions carry
+  no agency).
 
 ## [13.6.1] — 2026-07-10 — re-bake canonical_seed.json with the Reticulum TCP port :4242, not the read-API :4243 (#404)
 
