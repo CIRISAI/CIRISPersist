@@ -5,6 +5,50 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.7.0] — 2026-07-10 — canonical runtime address move: a newer quorum-signed record supersedes (#405)
+
+### Added
+- **#405 — CEG-native canonical supersede.** `list_canonical_servers` /
+  `canonical_bootstrap_hints` now reflect whatever the **latest quorum-agreed
+  signed record** for a canonical `key_id` resolves to: a re-scrubbed record
+  whose **envelope `valid_from` is strictly newer supersedes** the stored one,
+  in place. This makes the m-of-n address-move path work with **no re-bake and
+  no key rotation** — the operator re-scrubs the canonical record with the new
+  address and it propagates over anti-entropy. (Previously an anchor-A→anchor-B
+  re-scrub was refused outright as a hijack, so an address change required
+  re-baking `canonical_seed.json`, as #404 had to.)
+- New `ReplicatedKeyPlan::Supersede` + `ReplicatedKeyOutcome::Superseded`
+  (append-only; `Superseded` crosses the directory-capsule ABI). Backend method
+  `supersede_canonical_record` on both SQLite and Postgres (atomic in-place swap,
+  optimistically guarded on the planned-against `persist_row_hash`), wired into
+  `apply_replicated_key_record`.
+
+### Security (Trust Root apply path — reviewed)
+- The supersede is admitted **only** when ALL hold, each fail-closed:
+  1. **Same identity** — same `key_id` (looked up) and byte-identical hybrid
+     pubkey (a swap is refused; never a key change).
+  2. **Canonical-scoped** — the incoming record carries the `canonical` role.
+     Load-bearing: `check_canonical_role_admission` fast-paths a *non*-canonical
+     row to `Ok`, so without this a single-anchor re-scrub of a plain node would
+     bypass the quorum.
+  3. **Monotonic over the SIGNED timestamp** — the incoming envelope's
+     `valid_from` is strictly greater than the stored envelope's. The comparison
+     reads `valid_from` **inside `registration_envelope`** (what the scrubs sign
+     via `JCS(registration_envelope)`), **not** the unsigned top-level
+     `KeyRecord::valid_from` — else a replay of an older validly-scrubbed record
+     with a bumped top-level field could **downgrade** the address. Adversarial
+     test `toplevel_valid_from_spoof_cannot_forge_recency` pins this.
+  4. **m-of-n quorum re-verified from persist's OWN state** —
+     `check_canonical_role_admission` re-derives the strict-majority policy over
+     the **live** accord roster (`verify_quorum_policy`, `n/2+1` of `n`, never a
+     hardcoded threshold) and re-checks every co-scrub; also enforces
+     withdrawal-wins. Re-run again at the store chokepoint (defense in depth).
+- Tests: 6 crypto-free `supersede_precheck` adversarial units (monotonicity,
+  equal/older refuse, non-canonical refuse, missing-timestamp refuse, top-level
+  spoof) + `canonical_supersede_over_roster_matrix` (real co-scrubs over a test
+  roster: newer 2-of-3 supersedes; older 2-of-3 refused; newer 1-scrub refused;
+  non-canonical refused). Full suite green. No verify re-pin.
+
 ## [13.6.1] — 2026-07-10 — re-bake canonical_seed.json with the Reticulum TCP port :4242, not the read-API :4243 (#404)
 
 ### Fixed

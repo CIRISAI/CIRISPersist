@@ -135,6 +135,13 @@ pub enum ReplicatedKeyOutcome {
     /// wins), unverifiable scrub-signature, or an absent/ambiguous node
     /// owner (`owner_of` fail-closed). The existing row is untouched.
     Refused,
+    /// v13.7.0 (CIRISPersist#405) — an existing **canonical** (anchor-scrubbed)
+    /// row was replaced in place by a **strictly-newer, same-pubkey, m-of-n
+    /// quorum-re-verified** record — the CEG-native runtime address move (a
+    /// re-scrubbed canonical whose `valid_from` is newer supersedes the older).
+    /// APPEND-ONLY (crosses the directory capsule ABI). Distinct from
+    /// `Upgraded` (self→scrubbed): `Superseded` is scrubbed→newer-scrubbed.
+    Superseded,
 }
 
 /// The classification half of the #371 replicated-key apply — which action
@@ -148,6 +155,11 @@ pub(crate) enum ReplicatedKeyPlan {
     /// Self-signed → anchor-scrubbed, all gates passed — run the backend's
     /// monotonic `adopt_scrub_upgrade`.
     Upgrade,
+    /// v13.7.0 (CIRISPersist#405) — existing canonical (anchor-scrubbed) →
+    /// strictly-newer, same-pubkey, m-of-n-re-verified canonical record. Run
+    /// the backend's `supersede_canonical_record` (the CEG-native runtime
+    /// address move).
+    Supersede,
     /// Byte-identical re-apply — no-op.
     Unchanged,
     /// Not admitted; leave the row untouched (fail-closed).
@@ -224,10 +236,21 @@ pub(crate) async fn plan_replicated_key_apply(
 
     let existing_self_signed = existing.scrub_key_id == existing.key_id;
     let incoming_anchor_scrubbed = record.scrub_key_id != record.key_id;
-    if !(existing_self_signed && incoming_anchor_scrubbed) {
-        // anchored→self downgrade, anchor-A→anchor-B re-scrub, or a
-        // conflicting second self-signed version: first-seen/duplicity.
+    if !incoming_anchor_scrubbed {
+        // anchored→self downgrade or a conflicting second self-signed version:
+        // first-seen/duplicity. Never demote an anchored row to self-signed.
         return Ok(ReplicatedKeyPlan::Refused);
+    }
+    if !existing_self_signed {
+        // Existing is ALREADY anchor-scrubbed + incoming is anchor-scrubbed,
+        // same pubkey (a pubkey swap was refused above). Historically an
+        // anchor-A→anchor-B re-scrub was refused outright as a hijack. #405:
+        // a re-scrubbed CANONICAL record whose `valid_from` is strictly newer
+        // SUPERSEDES the stored one — the CEG-native runtime address move — but
+        // ONLY through the same non-forgeable m-of-n quorum re-verify the add
+        // path uses, and ONLY monotonically forward. Anything else stays the
+        // fail-closed re-scrub refuse.
+        return plan_canonical_supersede(directory, &existing, record).await;
     }
 
     // Gate 1 — the incoming scrub must verify (Strict hybrid, scrubber
@@ -249,6 +272,153 @@ pub(crate) async fn plan_replicated_key_apply(
         Ok(None) => Ok(ReplicatedKeyPlan::Refused),
         Err(Error::AmbiguousNodeOwner { .. }) => Ok(ReplicatedKeyPlan::Refused),
         Err(e) => Err(e),
+    }
+}
+
+/// v13.7.0 (CIRISPersist#405) — plan a **canonical supersede**: an existing
+/// anchor-scrubbed canonical row replaced in place by a strictly-newer,
+/// same-pubkey, m-of-n-re-verified re-scrubbed record (the CEG-native runtime
+/// address move). Called only for `existing anchor-scrubbed + incoming
+/// anchor-scrubbed + same pubkey`; every rejection is fail-closed `Refused`,
+/// preserving the historical re-scrub-hijack guard for anything that doesn't
+/// clear ALL of:
+///
+/// 1. **Canonical-scoped.** The incoming record MUST carry the `canonical`
+///    role. Load-bearing: [`check_canonical_role_admission`] fast-paths a
+///    NON-canonical row to `Ok(())`, so without this guard a single-anchor
+///    re-scrub of a plain node would bypass the quorum entirely.
+/// 2. **Monotonic over the SIGNED timestamp.** The incoming envelope's
+///    `valid_from` MUST be strictly greater than the stored envelope's. This
+///    reads the `valid_from` INSIDE `registration_envelope` — the field the
+///    scrub signatures actually cover (`JCS(registration_envelope)`) — NOT the
+///    top-level `KeyRecord::valid_from`, which is unsigned and forgeable: using
+///    the top-level field would let an attacker replay an older validly-scrubbed
+///    record with a bumped timestamp to DOWNGRADE the address. An unreadable /
+///    absent envelope timestamp on either side ⇒ `Refused` (can't prove
+///    monotonicity → fail closed).
+/// 3. **m-of-n quorum re-verified from persist's OWN state.**
+///    [`check_canonical_role_admission`] re-derives the strict-majority policy
+///    over the LIVE accord roster (`verify_quorum_policy`) and re-checks every
+///    co-scrub — never the record's claim, never a hardcoded threshold. It also
+///    enforces withdrawal-wins (a tombstoned key stays refused).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn plan_canonical_supersede(
+    directory: &dyn FederationDirectory,
+    existing: &KeyRecord,
+    record: &KeyRecord,
+) -> Result<ReplicatedKeyPlan, Error> {
+    if verify_canonical_supersede(directory, existing, record).await? {
+        Ok(ReplicatedKeyPlan::Supersede)
+    } else {
+        Ok(ReplicatedKeyPlan::Refused)
+    }
+}
+
+/// v13.7.0 (CIRISPersist#405) — the CANONICAL-SUPERSEDE policy core, shared by
+/// [`plan_canonical_supersede`] (classification) and each backend's
+/// `supersede_canonical_record` (mutation chokepoint, defense-in-depth). Given
+/// the currently-stored `existing` row and the `record` proposing to replace
+/// it, returns `Ok(true)` iff ALL of the following hold; `Ok(false)` for any
+/// policy rejection (fail-closed); `Err` only for a real infrastructure/backend
+/// failure (never masked as a refusal).
+///
+/// Caller pre-conditions (enforced before this is reached): same `key_id`
+/// (looked up), same hybrid pubkey (a swap is refused earlier), and both rows
+/// anchor-scrubbed. This fn adds:
+///
+/// 1. **Canonical-scoped** — the incoming record carries the `canonical` role.
+///    Load-bearing: [`check_canonical_role_admission`] fast-paths a NON-canonical
+///    row to `Ok(())`, so without this a single-anchor re-scrub of a plain node
+///    would bypass the quorum.
+/// 2. **Monotonic over the SIGNED timestamp** — the incoming envelope's
+///    `valid_from` is strictly greater than the stored envelope's. Reads
+///    `valid_from` INSIDE `registration_envelope` (the field the scrubs cover
+///    via `JCS(registration_envelope)`), NOT the unsigned top-level
+///    `KeyRecord::valid_from` — else a replay of an older validly-scrubbed
+///    record with a bumped top-level timestamp could DOWNGRADE the address. An
+///    absent/unparseable envelope timestamp on either side ⇒ `false`.
+/// 3. **m-of-n quorum re-verified from persist's OWN state** —
+///    [`check_canonical_role_admission`] re-derives the strict-majority policy
+///    over the LIVE accord roster (`verify_quorum_policy`) and re-checks every
+///    co-scrub; also enforces withdrawal-wins.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) async fn verify_canonical_supersede(
+    directory: &dyn FederationDirectory,
+    existing: &KeyRecord,
+    record: &KeyRecord,
+) -> Result<bool, Error> {
+    if !supersede_precheck(existing, record) {
+        return Ok(false);
+    }
+    // m-of-n quorum re-verified from persist's own state (+ withdrawal-wins),
+    // against the PRODUCTION genesis accord roster.
+    match super::admission::check_canonical_role_admission(directory, record).await {
+        Ok(()) => Ok(true),
+        Err(Error::CanonicalRoleNotAccordConferred { .. })
+        | Err(Error::CanonicalRoleWithdrawn { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`verify_canonical_supersede`] with an EXPLICIT accord-holder roster — the
+/// testable core (tests co-scrub against a distinct test roster; the production
+/// wrapper pins the genesis A1/B1/C1). Mirrors
+/// [`check_canonical_role_admission_over_roster`](super::admission::check_canonical_role_admission_over_roster).
+/// Test-only: the production apply path always resolves the genesis roster via
+/// [`verify_canonical_supersede`].
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) async fn verify_canonical_supersede_over_roster(
+    directory: &dyn FederationDirectory,
+    existing: &KeyRecord,
+    record: &KeyRecord,
+    roster_key_ids: &[String],
+) -> Result<bool, Error> {
+    if !supersede_precheck(existing, record) {
+        return Ok(false);
+    }
+    match super::admission::check_canonical_role_admission_over_roster(
+        directory,
+        record,
+        roster_key_ids,
+    )
+    .await
+    {
+        Ok(()) => Ok(true),
+        Err(Error::CanonicalRoleNotAccordConferred { .. })
+        | Err(Error::CanonicalRoleWithdrawn { .. }) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The quorum-independent half of the #405 supersede policy (canonical-scope +
+/// strictly-newer SIGNED-envelope `valid_from`). Sync + crypto-free so the
+/// monotonicity / replay-spoof / scope decisions are unit-testable in isolation
+/// from the m-of-n quorum. Returns `true` iff the incoming record is canonical
+/// AND its envelope `valid_from` is strictly newer than the stored one.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn supersede_precheck(existing: &KeyRecord, record: &KeyRecord) -> bool {
+    use super::types::identity_type;
+
+    // (1) Canonical-scoped — a non-canonical anchor→anchor re-scrub stays the
+    // fail-closed hijack refuse (check_canonical_role_admission fast-paths a
+    // non-canonical row to Ok, so this guard is load-bearing).
+    if !identity_type::set_contains(&record.identity_type, identity_type::CANONICAL) {
+        return false;
+    }
+
+    // (2) Strictly-newer SIGNED (envelope) valid_from. Reads the field the
+    // scrubs cover — JCS(registration_envelope) — NOT the unsigned top-level
+    // KeyRecord::valid_from, which a replay could bump to forge recency.
+    let envelope_valid_from = |rec: &KeyRecord| -> Option<chrono::DateTime<chrono::Utc>> {
+        rec.registration_envelope
+            .get("valid_from")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+    };
+    match (envelope_valid_from(record), envelope_valid_from(existing)) {
+        (Some(incoming_vf), Some(existing_vf)) => incoming_vf > existing_vf,
+        _ => false,
     }
 }
 
@@ -1046,5 +1216,101 @@ mod tests {
             .expect("construct postgres engine");
         let tag = format!("pg-{}", uuid::Uuid::new_v4().simple());
         run_apply_replicated_matrix(&engine, &tag).await;
+    }
+}
+
+/// v13.7.0 (CIRISPersist#405) — adversarial unit tests for [`supersede_precheck`],
+/// the quorum-independent security half of the canonical-supersede policy
+/// (canonical-scope + strictly-newer SIGNED-envelope `valid_from`). Crypto-free
+/// so the monotonicity / replay-spoof / scope decisions are proven in isolation.
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+mod supersede_precheck_tests {
+    use super::supersede_precheck;
+    use crate::federation::types::{algorithm, KeyRecord};
+
+    const T0: &str = "2026-07-10T00:00:00+00:00";
+    const T1: &str = "2026-07-11T00:00:00+00:00"; // strictly newer than T0
+
+    /// Build a KeyRecord whose only meaningful fields for the precheck are the
+    /// `identity_type` and the ENVELOPE `valid_from`. `top_valid_from` sets the
+    /// UNSIGNED top-level field independently (for the spoof test).
+    fn mk(
+        identity_type: &str,
+        envelope_vf: &str,
+        top_valid_from: chrono::DateTime<chrono::Utc>,
+    ) -> KeyRecord {
+        KeyRecord {
+            key_id: "ciris-canonical-1".to_owned(),
+            pubkey_ed25519_base64: "AA".to_owned(),
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: algorithm::HYBRID.to_owned(),
+            identity_type: identity_type.to_owned(),
+            identity_ref: "ciris-canonical-1".to_owned(),
+            valid_from: top_valid_from,
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "valid_from": envelope_vf }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: "AA".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "A1".to_owned(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+    fn canonical(envelope_vf: &str) -> KeyRecord {
+        mk("canonical,node", envelope_vf, chrono::Utc::now())
+    }
+
+    #[test]
+    fn newer_canonical_envelope_passes() {
+        assert!(supersede_precheck(&canonical(T0), &canonical(T1)));
+    }
+
+    #[test]
+    fn equal_envelope_valid_from_refused() {
+        assert!(!supersede_precheck(&canonical(T0), &canonical(T0)));
+    }
+
+    #[test]
+    fn older_envelope_valid_from_refused() {
+        // incoming T0 is OLDER than existing T1 — downgrade refused.
+        assert!(!supersede_precheck(&canonical(T1), &canonical(T0)));
+    }
+
+    #[test]
+    fn non_canonical_incoming_refused_even_if_newer() {
+        // A non-canonical anchor→anchor re-scrub must NOT reach the quorum.
+        let incoming = mk("node", T1, chrono::Utc::now());
+        assert!(!supersede_precheck(&canonical(T0), &incoming));
+    }
+
+    #[test]
+    fn missing_envelope_valid_from_refused() {
+        let mut incoming = canonical(T1);
+        incoming.registration_envelope = serde_json::json!({});
+        assert!(!supersede_precheck(&canonical(T0), &incoming));
+    }
+
+    /// THE downgrade attack: replay the OLD record (envelope `valid_from` == the
+    /// stored one) but bump the UNSIGNED top-level `valid_from` far into the
+    /// future. The precheck reads the SIGNED envelope timestamp, so recency
+    /// cannot be forged — refused.
+    #[test]
+    fn toplevel_valid_from_spoof_cannot_forge_recency() {
+        let existing = canonical(T0);
+        let spoof = mk(
+            "canonical,node",
+            T0,
+            chrono::Utc::now() + chrono::Duration::days(3650),
+        );
+        assert!(
+            !supersede_precheck(&existing, &spoof),
+            "unsigned top-level valid_from must not override the signed envelope timestamp"
+        );
     }
 }
