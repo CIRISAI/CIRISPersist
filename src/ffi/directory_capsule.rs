@@ -462,6 +462,12 @@ pub enum DirectoryOp {
         /// The occurrence `key_id` to reverse-resolve to its identity row.
         occurrence_key_id: String,
     },
+    /// [`FederationDirectory::list_all_transport_destinations`] (#411) — every
+    /// stored reachable address across ALL occurrences, for the boot reload
+    /// (edge's embedded `dyn FederationDirectory` repopulates its rooted-peers
+    /// map + KEX resolver on startup, incl. the transport-tier x25519). Result
+    /// rides the existing `TransportDestinations` variant. APPEND-ONLY.
+    ListAllTransportDestinations {},
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -561,6 +567,12 @@ pub async fn dispatch_directory_op(
                 .list_transport_destinations_for(&occurrence_key_id)
                 .await
             {
+                Ok(v) => DirectoryOpResult::TransportDestinations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListAllTransportDestinations {} => {
+            match dir.list_all_transport_destinations().await {
                 Ok(v) => DirectoryOpResult::TransportDestinations(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
@@ -1671,6 +1683,22 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
+    async fn list_all_transport_destinations(
+        &self,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        // #411 — the boot reload across the wheel boundary.
+        match self
+            .run_op(&DirectoryOp::ListAllTransportDestinations {})
+            .await?
+        {
+            DirectoryOpResult::TransportDestinations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     async fn list_held_fountain_content(
         &self,
         publisher_key_id: &str,
@@ -2541,9 +2569,10 @@ mod tests {
             destination: "abcd".into(),
             asserted_at: chrono::Utc::now(),
             last_seen_at: Some(chrono::Utc::now()),
-            // #397 — the transport-tier Ed25519 must cross the ABI intact so a
-            // peer can prime an explicit-hash canonical.
+            // #397/#411 — the transport-tier Ed25519 + X25519 (KEX) must cross
+            // the ABI intact (prime + re-seal after restart).
             transport_ed25519_pubkey_base64: Some("dHJhbnNwb3J0LWVkMjU1MTk=".into()),
+            transport_x25519_pubkey_base64: Some("dHJhbnNwb3J0LXgyNTUxOQ==".into()),
         };
 
         let put = run_op(

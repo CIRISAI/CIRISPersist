@@ -3326,9 +3326,10 @@ impl Engine {
                         asserted_at: now,
                         last_seen_at: Some(now),
                         // Self-at-login reachability tuple carries (kind, dest)
-                        // only; the transport-tier Ed25519 (#397) is published
-                        // separately by edge when priming an explicit-hash peer.
+                        // only; the transport-tier Ed25519 (#397) + X25519 (#411)
+                        // are published separately by edge on peer root.
                         transport_ed25519_pubkey_base64: None,
+                        transport_x25519_pubkey_base64: None,
                     })
                     .await?;
                 transport_rows += 1;
@@ -12413,6 +12414,7 @@ mod tests {
             asserted_at: now,
             last_seen_at: Some(now),
             transport_ed25519_pubkey_base64: None,
+            transport_x25519_pubkey_base64: None,
         };
 
         dir.put_transport_destination(&mk("reticulum", "d1"))

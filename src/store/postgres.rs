@@ -2049,6 +2049,27 @@ impl Backend for PostgresBackend {
 /// re-serialized to the `wire_json` string (round-trips losslessly — JSONB
 /// key order is not signed material; the signatures verify over the CC
 /// 6.1.3 binary preimage rebuilt from the FIELDS, not over the JSON text).
+/// v13.8.0 (CIRISPersist#411) — decode a `transport_destinations` row into a
+/// [`TransportDestination`](crate::federation::TransportDestination). Shared by
+/// `list_transport_destinations_for` (per-key) and
+/// `list_all_transport_destinations` (boot reload) so the ed25519 (#397) +
+/// x25519 (#411) transport-tier pubkey mapping cannot drift. Column order
+/// matches both SELECTs (0..=6).
+fn pg_row_to_transport_destination(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::TransportDestination, crate::federation::Error> {
+    use crate::federation::Error as FErr;
+    Ok(crate::federation::TransportDestination {
+        occurrence_key_id: row.safe_get_with(0, FErr::Backend)?,
+        transport_kind: row.safe_get_with(1, FErr::Backend)?,
+        destination: row.safe_get_with(2, FErr::Backend)?,
+        asserted_at: row.safe_get_with(3, FErr::Backend)?,
+        last_seen_at: row.safe_get_with(4, FErr::Backend)?,
+        transport_ed25519_pubkey_base64: row.safe_get_with(5, FErr::Backend)?,
+        transport_x25519_pubkey_base64: row.safe_get_with(6, FErr::Backend)?,
+    })
+}
+
 fn pg_row_to_installed_storage_budget(
     row: tokio_postgres::Row,
 ) -> Result<crate::fountain::storage_contention::InstalledStorageBudget, Error> {
@@ -5232,12 +5253,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "INSERT INTO cirislens.transport_destinations \
                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                     transport_ed25519_pubkey_base64) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
+                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
                  ON CONFLICT (occurrence_key_id, transport_kind, destination) \
                  DO UPDATE SET asserted_at = EXCLUDED.asserted_at, \
                     last_seen_at = EXCLUDED.last_seen_at, \
-                    transport_ed25519_pubkey_base64 = EXCLUDED.transport_ed25519_pubkey_base64",
+                    transport_ed25519_pubkey_base64 = EXCLUDED.transport_ed25519_pubkey_base64, \
+                    transport_x25519_pubkey_base64 = EXCLUDED.transport_x25519_pubkey_base64",
                 &[
                     &destination.occurrence_key_id,
                     &destination.transport_kind,
@@ -5245,6 +5267,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &destination.asserted_at,
                     &destination.last_seen_at,
                     &destination.transport_ed25519_pubkey_base64,
+                    &destination.transport_x25519_pubkey_base64,
                 ],
             )
             .await
@@ -5265,7 +5288,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let rows = client
             .query(
                 "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                    transport_ed25519_pubkey_base64 \
+                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64 \
                  FROM cirislens.transport_destinations WHERE occurrence_key_id = $1 \
                  ORDER BY transport_kind, destination",
                 &[&occurrence_key_id],
@@ -5275,17 +5298,31 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::Error::Backend(format!("list_transport_destinations_for: {e}"))
             })?;
         rows.into_iter()
-            .map(|row| {
-                Ok(crate::federation::TransportDestination {
-                    occurrence_key_id: row.safe_get_with(0, crate::federation::Error::Backend)?,
-                    transport_kind: row.safe_get_with(1, crate::federation::Error::Backend)?,
-                    destination: row.safe_get_with(2, crate::federation::Error::Backend)?,
-                    asserted_at: row.safe_get_with(3, crate::federation::Error::Backend)?,
-                    last_seen_at: row.safe_get_with(4, crate::federation::Error::Backend)?,
-                    transport_ed25519_pubkey_base64: row
-                        .safe_get_with(5, crate::federation::Error::Backend)?,
-                })
-            })
+            .map(pg_row_to_transport_destination)
+            .collect()
+    }
+
+    async fn list_all_transport_destinations(
+        &self,
+    ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64 \
+                 FROM cirislens.transport_destinations \
+                 ORDER BY occurrence_key_id, transport_kind, destination",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_all_transport_destinations: {e}"))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_transport_destination)
             .collect()
     }
 

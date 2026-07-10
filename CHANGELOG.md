@@ -5,6 +5,39 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.8.0] — 2026-07-10 — persist the transport X25519 (KEX) + list_all so rooted-peer KEX material survives a restart (#411)
+
+### Added
+- **#411 — persist the complete transport identity so replication survives a
+  restart.** Replication seals envelopes to a peer with its transport-tier
+  **X25519 (KEX)** pubkey — the first 32 of the 64-byte Reticulum transport
+  identity (`x25519(32) ‖ ed25519(32)`). `TransportDestination` persisted the
+  dest-hash (`destination`) + the ed25519 half (#397) but **not** the x25519, so
+  after a restart `resolve_peer_kex_pubkeys` returned `None` and replication
+  could not seal (0 envelopes — CIRISServer#216). Persist is the source of truth
+  for rooted-peer transport state: on root the binding is written; on boot the
+  node/edge reloads it — **no re-announce, no re-peer**. For that guarantee the
+  store must persist the *complete* identity.
+  - **Field** `transport_x25519_pubkey_base64: Option<String>` on
+    `TransportDestination` (serde-default; pre-#411 / non-Reticulum rows
+    round-trip unchanged). **Key separation (§5.6.8.8.2):** the TRANSPORT-tier
+    link key, distinct from the identity-tier content-encryption X25519 in
+    `EncryptionPubkeys` — not derivable from it.
+  - **Write / per-key read** — `put_transport_destination` /
+    `list_transport_destinations_for` carry it byte-for-byte (both backends).
+  - **List-ALL read (NEW)** — `list_all_transport_destinations()` on the
+    `FederationDirectory` trait (+ a `DirectoryOp` so edge's embedded `dyn`
+    reloads cross-wheel): the **boot reload** loads every rooted binding in one
+    call to repopulate the rooted-peers map + KEX resolver. sqlite / postgres /
+    memory impls; the per-key variant couldn't reconstruct the whole set.
+  - **Migration V099** — nullable `transport_x25519_pubkey_base64 TEXT`, both
+    dialects, additive, no backfill (a peer re-roots once and write-through
+    persists it).
+  - Tests: full `{dest_hash, ed25519, x25519}` round-trip (both backends) +
+    `list_all_transport_destinations_reloads_every_binding_with_x25519` (boot
+    reload across occurrences) + the capsule ABI round-trip carries x25519. No
+    verify re-pin.
+
 ## [13.7.0] — 2026-07-10 — canonical runtime address move: a newer quorum-signed record supersedes (#405, #410)
 
 ### Fixed
