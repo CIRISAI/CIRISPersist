@@ -4981,12 +4981,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             conn.execute(
                 "INSERT INTO transport_destinations \
                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                     transport_ed25519_pubkey_base64) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(occurrence_key_id, transport_kind, destination) \
                  DO UPDATE SET asserted_at = excluded.asserted_at, \
                     last_seen_at = excluded.last_seen_at, \
-                    transport_ed25519_pubkey_base64 = excluded.transport_ed25519_pubkey_base64",
+                    transport_ed25519_pubkey_base64 = excluded.transport_ed25519_pubkey_base64, \
+                    transport_x25519_pubkey_base64 = excluded.transport_x25519_pubkey_base64",
                 rusqlite::params![
                     d.occurrence_key_id,
                     d.transport_kind,
@@ -4994,6 +4995,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     asserted,
                     last_seen,
                     d.transport_ed25519_pubkey_base64,
+                    d.transport_x25519_pubkey_base64,
                 ],
             )?;
             Ok(())
@@ -5011,38 +5013,35 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
                 "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
-                    transport_ed25519_pubkey_base64 \
+                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64 \
                  FROM transport_destinations WHERE occurrence_key_id = ?1 \
                  ORDER BY transport_kind, destination",
             )?;
-            let rows = stmt.query_map([&occ], |row| {
-                let occurrence_key_id: String = row.get(0)?;
-                let transport_kind: String = row.get(1)?;
-                let destination: String = row.get(2)?;
-                let asserted_at_str: String = row.get(3)?;
-                let last_seen_str: Option<String> = row.get(4)?;
-                let transport_ed25519_pubkey_base64: Option<String> = row.get(5)?;
-                let asserted_at = chrono::DateTime::parse_from_rfc3339(&asserted_at_str)
-                    .map(|t| t.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| chrono::Utc::now());
-                let last_seen_at = last_seen_str.and_then(|s| {
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .ok()
-                        .map(|t| t.with_timezone(&chrono::Utc))
-                });
-                Ok(crate::federation::TransportDestination {
-                    occurrence_key_id,
-                    transport_kind,
-                    destination,
-                    asserted_at,
-                    last_seen_at,
-                    transport_ed25519_pubkey_base64,
-                })
-            })?;
+            let rows = stmt.query_map([&occ], sqlite_row_to_transport_destination)?;
             rows.collect()
         })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("list_transport_destinations_for: {e}"))
+        })
+    }
+
+    async fn list_all_transport_destinations(
+        &self,
+    ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        (move || -> Result<Vec<crate::federation::TransportDestination>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64 \
+                 FROM transport_destinations \
+                 ORDER BY occurrence_key_id, transport_kind, destination",
+            )?;
+            let rows = stmt.query_map([], sqlite_row_to_transport_destination)?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_all_transport_destinations: {e}"))
         })
     }
 
@@ -10921,6 +10920,36 @@ fn sqlite_row_to_revocation(
 
 /// v3.12.0 (CIRISPersist#153 Ask 1) — SQLite row →
 /// [`crate::federation::IdentityOccurrence`].
+/// v13.8.0 (CIRISPersist#411) — decode a `transport_destinations` row into a
+/// [`TransportDestination`](crate::federation::TransportDestination). Shared by
+/// `list_transport_destinations_for` (per-key) and
+/// `list_all_transport_destinations` (boot reload) so the column mapping — incl.
+/// the ed25519 (#397) + x25519 (#411) transport-tier pubkeys — cannot drift.
+/// Column order matches both SELECTs (0..=6).
+fn sqlite_row_to_transport_destination(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::TransportDestination> {
+    let asserted_at_str: String = row.get(3)?;
+    let last_seen_str: Option<String> = row.get(4)?;
+    let asserted_at = chrono::DateTime::parse_from_rfc3339(&asserted_at_str)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+    let last_seen_at = last_seen_str.and_then(|s| {
+        chrono::DateTime::parse_from_rfc3339(&s)
+            .ok()
+            .map(|t| t.with_timezone(&chrono::Utc))
+    });
+    Ok(crate::federation::TransportDestination {
+        occurrence_key_id: row.get(0)?,
+        transport_kind: row.get(1)?,
+        destination: row.get(2)?,
+        asserted_at,
+        last_seen_at,
+        transport_ed25519_pubkey_base64: row.get(5)?,
+        transport_x25519_pubkey_base64: row.get(6)?,
+    })
+}
+
 fn sqlite_row_to_identity_occurrence(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<crate::federation::IdentityOccurrence> {
@@ -20178,6 +20207,7 @@ mod tests {
             asserted_at: now,
             last_seen_at: Some(now),
             transport_ed25519_pubkey_base64: Some("dHJhbnNwb3J0LWVkMjU1MTk=".into()),
+            transport_x25519_pubkey_base64: Some("dHJhbnNwb3J0LXgyNTUxOQ==".into()),
         };
         // A non-Reticulum kind carries no RNS transport key → None.
         let ws = crate::federation::TransportDestination {
@@ -20187,6 +20217,7 @@ mod tests {
             asserted_at: now,
             last_seen_at: Some(now),
             transport_ed25519_pubkey_base64: None,
+            transport_x25519_pubkey_base64: None,
         };
         backend.put_transport_destination(&ret).await.unwrap();
         backend.put_transport_destination(&ws).await.unwrap();
@@ -20202,6 +20233,11 @@ mod tests {
             rows[0].transport_ed25519_pubkey_base64.as_deref(),
             Some("dHJhbnNwb3J0LWVkMjU1MTk="),
             "the transport-tier Ed25519 must survive the round-trip"
+        );
+        assert_eq!(
+            rows[0].transport_x25519_pubkey_base64.as_deref(),
+            Some("dHJhbnNwb3J0LXgyNTUxOQ=="),
+            "the transport-tier X25519 (KEX) must survive the round-trip (#411)"
         );
         assert_eq!(rows[1].transport_kind, "websocket");
         assert_eq!(
@@ -20224,6 +20260,67 @@ mod tests {
             rows[0].transport_ed25519_pubkey_base64.as_deref(),
             Some("cm90YXRlZC1lZDI1NTE5"),
             "re-assert refreshes the transport key in place"
+        );
+    }
+
+    /// v13.8.0 (CIRISPersist#411) — the BOOT RELOAD: `list_all_transport_destinations`
+    /// returns every rooted binding across ALL occurrences (the per-key variant
+    /// can't reconstruct the whole set), with the transport-tier X25519 (KEX)
+    /// intact — so replication can re-seal envelopes after a restart without a
+    /// re-announce. Persist is the source of truth for rooted-peer transport state.
+    #[tokio::test]
+    async fn list_all_transport_destinations_reloads_every_binding_with_x25519() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for kid in ["node-a", "node-b"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(kid, kid, kid),
+                })
+                .await
+                .unwrap();
+        }
+        let now = chrono::Utc::now();
+        let td = |occ: &str, dest: &str, x: &str| crate::federation::TransportDestination {
+            occurrence_key_id: occ.into(),
+            transport_kind: "reticulum".into(),
+            destination: dest.into(),
+            asserted_at: now,
+            last_seen_at: Some(now),
+            transport_ed25519_pubkey_base64: Some("ZWQ=".into()),
+            transport_x25519_pubkey_base64: Some(x.into()),
+        };
+        backend
+            .put_transport_destination(&td("node-a", "aaaa", "eDI1NTE5LWE="))
+            .await
+            .unwrap();
+        backend
+            .put_transport_destination(&td("node-b", "bbbb", "eDI1NTE5LWI="))
+            .await
+            .unwrap();
+
+        // Per-key sees only its own; list-ALL is the boot reload of every binding.
+        assert_eq!(
+            backend
+                .list_transport_destinations_for("node-a")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let all = backend.list_all_transport_destinations().await.unwrap();
+        assert_eq!(all.len(), 2, "boot reload returns every rooted binding");
+        // ORDER BY occurrence_key_id → node-a before node-b.
+        assert_eq!(all[0].occurrence_key_id, "node-a");
+        assert_eq!(
+            all[0].transport_x25519_pubkey_base64.as_deref(),
+            Some("eDI1NTE5LWE="),
+            "the transport-tier X25519 (KEX) survives — replication can re-seal after restart"
+        );
+        assert_eq!(all[1].occurrence_key_id, "node-b");
+        assert_eq!(
+            all[1].transport_x25519_pubkey_base64.as_deref(),
+            Some("eDI1NTE5LWI=")
         );
     }
 

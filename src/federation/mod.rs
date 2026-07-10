@@ -2692,6 +2692,22 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
+    /// v13.8.0 (CIRISPersist#411) — every stored reachable address across ALL
+    /// occurrences, in one call. The **boot reload**: persist is the source of
+    /// truth for rooted-peer transport state, so on startup the node/edge (which
+    /// holds a `dyn FederationDirectory`) reloads every binding — dest-hash +
+    /// transport-tier ed25519 (#397) + x25519 KEX (#411) — to repopulate its
+    /// rooted-peers map + KEX resolver, with zero re-announces. The per-key
+    /// [`Self::list_transport_destinations_for`] cannot reconstruct the whole set
+    /// (it needs every key_id up front). Default impl errors; backends override.
+    async fn list_all_transport_destinations(
+        &self,
+    ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
+        Err(Error::Backend(
+            "list_all_transport_destinations not implemented for this backend".into(),
+        ))
+    }
+
     /// v6.5.0 — drop one reachable address (e.g. a stale relay). Returns
     /// `true` if a row was removed, `false` if absent (idempotent).
     /// Default impl errors; the three backends override.

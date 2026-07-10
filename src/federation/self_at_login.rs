@@ -258,6 +258,19 @@ pub struct TransportDestination {
     /// (§5.6.8.8.2 key-separation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_ed25519_pubkey_base64: Option<String>,
+    /// v13.8.0 (CIRISPersist#411) — the transport-tier **X25519 (KEX) pubkey**,
+    /// base64 (standard alphabet) of the 32 raw bytes: the FIRST 32 of the
+    /// 64-byte Reticulum transport identity (`x25519(32) ‖ ed25519(32)`, whose
+    /// `sha256[..16]` is the `destination` dest-hash). Replication SEALS
+    /// envelopes to a peer with this key, so it MUST survive a restart — persist
+    /// is the source of truth for rooted-peer transport state; the node/edge
+    /// reloads it on boot (`list_all_transport_destinations`), never re-announces.
+    /// `None` for pre-#411 rows and non-Reticulum kinds. **Key separation
+    /// (§5.6.8.8.2):** this is the TRANSPORT-tier link key, distinct from the
+    /// identity-tier content-encryption X25519 in `EncryptionPubkeys` — NOT
+    /// derivable from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_x25519_pubkey_base64: Option<String>,
 }
 
 #[cfg(test)]
