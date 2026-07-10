@@ -20429,6 +20429,45 @@ mod tests {
             && d.binding_provenance == BindingProvenance::Advisory));
     }
 
+    /// v13.9.1 (CIRISPersist#416) — an ADVISORY binding names a not-yet-rooted
+    /// key that is NOT in `federation_keys` (admit-advisory, CC 3.3.6.2). The
+    /// V078 FK rejected exactly this row; V101 dropped it. Proves the durable
+    /// write-through now succeeds for an unrooted key AND the KEX persists +
+    /// boot-loads (`resolve_peer_kex_pubkeys` will read it after a restart).
+    #[tokio::test]
+    async fn advisory_binding_for_unrooted_key_persists_without_fk() {
+        use crate::federation::self_at_login::BindingProvenance;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // "unrooted-peer" is deliberately NOT registered in federation_keys.
+        let now = chrono::Utc::now();
+        backend
+            .put_transport_destination(&crate::federation::TransportDestination {
+                occurrence_key_id: "unrooted-peer".into(),
+                transport_kind: "reticulum".into(),
+                destination: "deadbeef".into(),
+                asserted_at: now,
+                last_seen_at: Some(now),
+                transport_ed25519_pubkey_base64: Some("ZWQ=".into()),
+                transport_x25519_pubkey_base64: Some("eDI1".into()),
+                binding_provenance: BindingProvenance::Advisory,
+            })
+            .await
+            .expect("advisory binding for a not-yet-rooted key MUST persist (#416: FK dropped)");
+
+        // Durable: it reads back (survives a restart / boot-load), KEX intact.
+        let rows = backend.list_all_transport_destinations().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].occurrence_key_id, "unrooted-peer");
+        assert_eq!(rows[0].binding_provenance, BindingProvenance::Advisory);
+        assert_eq!(
+            rows[0].transport_x25519_pubkey_base64.as_deref(),
+            Some("eDI1"),
+            "the KEX half persists for the durable resolve after restart"
+        );
+    }
+
     /// v4.0 (CIRISPersist#160, V060, FSD §4.3) — cohort_scope +
     /// cohort_target_id round-trip through the real SQLite trace_events
     /// store: a community-scoped row with a target inserts and reads

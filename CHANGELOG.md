@@ -5,6 +5,35 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.9.1] — 2026-07-10 — drop the transport_destinations→federation_keys FK that blocked advisory bindings (#416)
+
+### Fixed
+- **#416 (CRITICAL — advisory write-through failing in production 0.5.96)** — the
+  V078 `transport_destinations.occurrence_key_id NOT NULL REFERENCES
+  federation_keys(key_id)` FK **contradicted** the #413 (V100) admit-advisory
+  model: an `Advisory` binding (CC 3.3.6.2, part_3 §1056/§1331) by definition
+  names a key that is **not-yet-rooted** and therefore **not in
+  `federation_keys`**, so the FK rejected exactly the row #413 was built to
+  record (`put_transport_destination → FOREIGN KEY constraint failed,
+  provenance=Advisory`). The peer rooted advisory in-memory but the durable
+  write-through failed → the binding was session-only, died on restart, and the
+  durable KEX path stayed dead (`resolve_peer_kex_pubkeys` reads the *persisted*
+  binding → `None` → 0 envelopes). I should have relaxed this FK in #413.
+- **Fix — V101 drops the FK.** Its integrity guarantee ("no address for an
+  unknown key") is exactly what admit-advisory supersedes; the replacement
+  correctness is already in place — the `binding_provenance` tag + routing-time
+  preference (prefer `Rooted` over `Advisory`; content gates on trust, CC 6 N1).
+  Rooted keys are in `federation_keys` anyway, so dropping the FK doesn't weaken
+  them. SQLite recreates the table without the `REFERENCES` (preserving the
+  composite PK, the by-occurrence index, and every V098/V099/V100 column);
+  Postgres drops the constraint (resolved name-agnostically). The MemoryBackend's
+  matching FK-parity check is removed too (backend-symmetric). Regression
+  `advisory_binding_for_unrooted_key_persists_without_fk`.
+- **This closes the last gap in the trace-flow arc**: advisory announce roots
+  (CIRISEdge#301) → `put_transport_destination` now **persists** → survives
+  restart + boot-loads (#411/#299) → `resolve_peer_kex_pubkeys` returns the
+  x25519 → KEX → envelopes ship (CIRISServer#216). No verify re-pin.
+
 ## [13.9.0] — 2026-07-10 — transport-binding provenance (rooted|advisory) + admit competing claims (#413, CC 3.3.6.2)
 
 ### Added
