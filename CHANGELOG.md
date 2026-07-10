@@ -5,6 +5,35 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [13.6.1] — 2026-07-10 — re-bake canonical_seed.json with the Reticulum TCP port :4242, not the read-API :4243 (#404)
+
+### Fixed
+- **#404 (CRITICAL — mesh-wide: every node dialed the wrong port and couldn't
+  root)** — the baked `src/federation/genesis/canonical_seed.json` (v13.6.0)
+  carried the canonical server's transport hint with the **HTTP read-API port**
+  (`108.61.242.236:4243`) instead of the **Reticulum TCP transport port**
+  (`:4242`). On the node, `:4242` is the RNS wire transport and `:4243` is the
+  read-API (`listen+1`), so an RNS handshake against `:4243` hits HTTP and fails.
+  Since `Engine::canonical_bootstrap_hints()` (#381) feeds this hint to **every**
+  node's auto-seed (#402 / CIRISEdge#296), the whole mesh — the canonical server
+  self-dialing, and every fresh agent/client edge — dialed `:4243` and could not
+  root (Node A logged 80+ failed self-dials). The `:4243` was the client base-URL
+  default a human copies as "the node's address," sealed into the scrub-signed
+  `registration_envelope` at co-scrub time.
+- **Fix**: re-baked `canonical_seed.json` with the operator's **re-scrubbed
+  2-of-3 record** (`transport_hints[0].destination = 108.61.242.236:4242`),
+  co-scrubbed A1 + B1 over the corrected envelope. **Same-key correction, not a
+  rotation** — `pubkey_ed25519_base64` is byte-identical to the v13.6.0 record;
+  only the sealed port changed. The scrub signatures were re-verified on bake by
+  the genesis-seeding tests (`seeded_2of3_canonical_server_is_admitted`,
+  `fresh_engine_auto_loads_2of3_canonical_server`) — the 2-of-3 admission gate
+  admits the corrected record, and `canonical_bootstrap_hints()` now returns the
+  `:4242` dial. No code/schema/API change — a corrected signed data blob.
+- Prevention (CIRISServer side, tracked on #404): a guard on the
+  add-canonical/update-address path rejecting an `ip` hint whose port == the
+  local read-API port, + fixing the client's `:4243`-flavored framing so the
+  wrong port can't be sealed again.
+
 ## [13.6.0] — 2026-07-09 — expose canonical_bootstrap_hints() to Python for edge auto-seed (#402)
 
 ### Added
