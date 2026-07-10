@@ -673,3 +673,33 @@ def test_pyengine_seeds_family_and_canonical() -> None:
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
+
+
+def test_pyengine_canonical_bootstrap_hints() -> None:
+    """v13.6.0 (CIRISPersist#402, CIRISEdge#296) — a fresh Engine exposes the
+    baked canonical's dial hints as a flat {key_id, kind, destination} list, so
+    the agent-embedded edge auto-seeds the canonical TCP dial without parsing
+    persist's signed registration_envelope. Skips on a non-sqlite wheel."""
+    import json
+    import pytest
+
+    try:
+        eng = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="genesis-seed-key")
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        hints = json.loads(eng.canonical_bootstrap_hints())
+        # The baked 2-of-3 canonical carries one `ip` dial hint (#390).
+        assert isinstance(hints, list) and len(hints) >= 1
+        ip_hints = [h for h in hints if h["kind"] == "ip"]
+        assert len(ip_hints) == 1, f"expected exactly one ip dial hint, got {hints}"
+        h = ip_hints[0]
+        assert h["key_id"] == "ciris-canonical-1-d7bdeu223k"
+        assert h["destination"] == "108.61.242.236:4243"
+        # Flat object shape — edge reads these keys directly, not a tuple/array.
+        assert set(h.keys()) == {"key_id", "kind", "destination"}
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()
