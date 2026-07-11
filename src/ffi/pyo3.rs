@@ -6906,13 +6906,16 @@ impl PyEngine {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
+            // v14.0.0 (CIRISPersist#418) — this endpoint takes a RAW (unsigned)
+            // occurrence, so it is the TRUSTED-LOCAL write path (server writing on
+            // behalf of the local user); it routes to put_identity_occurrence_local
+            // (grandfathered, no gate). A signed WIRE occurrence goes through the
+            // Rust FederationDirectory::put_identity_occurrence gate (edge bridge),
+            // never this raw-JSON FFI.
             let occurrence: crate::federation::IdentityOccurrence =
                 serde_json::from_str(payload_json).map_err(|e| {
                     PyValueError::new_err(format!("identity_occurrence decode: {e}"))
                 })?;
-            let signed = crate::federation::SignedIdentityOccurrence {
-                identity_occurrence: occurrence,
-            };
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
@@ -6920,7 +6923,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_identity_occurrence(signed)
+                            .put_identity_occurrence_local(occurrence)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -6931,7 +6934,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_identity_occurrence(signed)
+                            .put_identity_occurrence_local(occurrence)
                             .await
                             .map_err(federation_err_to_py)
                     })
