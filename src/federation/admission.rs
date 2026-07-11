@@ -1321,7 +1321,11 @@ pub fn check_encryption_pubkeys(
 ///    recompute) — `UnknownSigner` / bad sig / C4 / `Malformed` ⇒ reject;
 /// 4. `signer_acts_for`: `attesting_key_id` is the occurrence's own
 ///    `identity_key_id` OR an already-active occurrence key of the same identity.
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
+///
+/// NOT feature-gated: backend-agnostic (verify-core only), and the MemoryBackend
+/// (compiled without postgres/sqlite) calls it — a `cfg(any(postgres,sqlite))`
+/// gate here breaks reduced-feature builds (darwin no-postgres, the default-
+/// feature manifest bin) with E0425.
 pub async fn verify_signed_identity_occurrence(
     directory: &dyn super::FederationDirectory,
     signed: &crate::federation::types::SignedIdentityOccurrence,
