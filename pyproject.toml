@@ -67,8 +67,12 @@ classifiers = [
 # deps pin v8.0.0 → the recurring cohab-conflict class
 # (`pip install ciris-persist ciris-verify==8.0.0`). Same drift firewall as
 # the v2.0.1 / v4.10.0 / v9.0.3 entries above.
+# v15.0.0 (CIRISVerify v9.0.0 re-pin) — verify MAJOR 8→9 (ScrubTarget gained a
+# required `roles` field; CIRISVerify #185, the accord-co-scrub "same ceremony"
+# milestone that CIRISPersist#422's infra:attest adopt-gate pairs with). Floor
+# moves to v9.0.0 (`<10`) in lockstep with the six Rust pins.
 dependencies = [
-    "ciris-verify>=8.0.0,<9",
+    "ciris-verify>=9.0.0,<10",
 ]
 dynamic = ["version"]
 

@@ -235,6 +235,31 @@ pub mod identity_type {
     }
 }
 
+/// v15.0.0 (CIRISPersist#422) — accord-CONFERRED tokens that may appear in the
+/// V020 [`KeyRecord::roles`] `Vec<String>`. Most `roles` entries are plain
+/// persist-API authorization scopes (`cirislens_pipeline_writer`, …) that any
+/// writer may self-assert; these are the ones that are **not** self-assertable
+/// — they may only ever be conferred by an accord co-scrub, exactly like the
+/// `canonical` [`identity_type`] role.
+pub mod roles {
+    /// The **build-manifest / CI-pipeline trust-root** role
+    /// (CIRISPersist#422, CIRISVerify#185 — the "same ceremony, different CEG
+    /// object" milestone). A key carrying `infra:attest` is an accord-blessed
+    /// build-signing pipeline: blessed by the SAME m-of-n accord co-scrub as a
+    /// canonical server, but carrying `infra:attest` where a canonical server
+    /// carries `identity_type = canonical`.
+    ///
+    /// **Accord-conferred, never self-claimed** — monotonic and gated at every
+    /// `federation_keys` write chokepoint by
+    /// [`super::super::admission::check_infra_attest_role_admission`] (mirrors
+    /// the `canonical` gate): the role is admitted ONLY on an anchor-scrubbed
+    /// record whose scrub set meets the accord family m-of-n. A self-signed or
+    /// sub-quorum record asserting `infra:attest` is refused fail-closed
+    /// ([`super::super::Error::InfraAttestRoleNotAccordConferred`]). Resolver:
+    /// [`super::super::admission::is_infra_attest`].
+    pub const INFRA_ATTEST: &str = "infra:attest";
+}
+
 /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2 `consent-counter`) — the
 /// **Counter-RII `consent_role`** vocabulary: the role tokens carried on
 /// [`KeyRecord::consent_role`] that gate Counter-RII probe detection

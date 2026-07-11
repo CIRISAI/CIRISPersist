@@ -2490,6 +2490,9 @@ impl PostgresBackend {
         // if THIS incoming (anchor-scrubbed) record earned it via a real
         // accord-holder scrubber. Backend-symmetric with SQLite.
         crate::federation::admission::check_canonical_role_admission(self, &row).await?;
+        // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
+        // co-scrub gate as `canonical`. Fail-closed before any write.
+        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let existing = crate::federation::FederationDirectory::lookup_public_key(self, &row.key_id)
@@ -2869,6 +2872,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // `canonical` claim is refused here before any INSERT
         // (verify-before-mutation). Backend-symmetric with SQLite + memory.
         crate::federation::admission::check_canonical_role_admission(self, &row).await?;
+        // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
+        // co-scrub gate as `canonical`. Fail-closed before any write.
+        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
 
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 

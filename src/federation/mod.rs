@@ -130,11 +130,12 @@ pub(crate) mod serde_bytes_b64 {
 pub use admission::{
     canonical_withdrawal_payload_sha256, check_canonical_role_admission,
     check_canonical_role_admission_over_roster, check_cohort_scope, check_consensus_protocol_form,
-    check_device_class, check_encryption_pubkeys, check_observed_region, is_canonical,
-    is_canonical_effective, supersede_canonical, verify_canonical_supersede_authority,
-    verify_canonical_withdraw_authority, withdraw_canonical_role,
-    AttestationLadderTransitionPolicy, CanonicalWithdrawal, DimensionAdmissionPolicy,
-    DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule,
+    check_device_class, check_encryption_pubkeys, check_infra_attest_role_admission,
+    check_infra_attest_role_admission_over_roster, check_observed_region, is_canonical,
+    is_canonical_effective, is_infra_attest, supersede_canonical,
+    verify_canonical_supersede_authority, verify_canonical_withdraw_authority,
+    withdraw_canonical_role, AttestationLadderTransitionPolicy, CanonicalWithdrawal,
+    DimensionAdmissionPolicy, DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule,
     ATTESTATION_LADDER_MECHANISMS,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
@@ -3922,6 +3923,33 @@ pub enum Error {
         reason: String,
     },
 
+    /// v15.0.0 (CIRISPersist#422, CIRISVerify#185) — a `federation_keys` write
+    /// was REFUSED because it carries the `infra:attest` role (an accord-blessed
+    /// build-signing / CI pipeline key; [`types::roles::INFRA_ATTEST`]) but is
+    /// **not accord-co-scrubbed to the family m-of-n**. Exactly mirrors
+    /// [`Self::CanonicalRoleNotAccordConferred`] for the `roles`-vector role: the
+    /// build-manifest trust root folds onto the SAME accord co-scrub as a
+    /// canonical server, so `infra:attest` is accord-CONFERRED, never
+    /// self-claimed — a row may carry it only when anchor-scrubbed with a scrub
+    /// set meeting the live accord quorum. Fail-closed (verify-before-mutation,
+    /// AV-9 — the row is NOT stored). Stable `kind()` token
+    /// `infra_attest_role_not_accord_conferred`. See
+    /// [`admission::check_infra_attest_role_admission`].
+    #[error(
+        "federation_keys row {key_id:?} carries the `infra:attest` role but is not accord-conferred \
+         (scrub_key_id={scrub_key_id:?}, reason: {reason}); the `infra:attest` build-signing role is \
+         accord-CONFERRED via the same m-of-n accord co-scrub as `canonical`, never self-claimed"
+    )]
+    InfraAttestRoleNotAccordConferred {
+        /// The `key_id` of the row that attempted to carry `infra:attest`.
+        key_id: String,
+        /// The row's `scrub_key_id` (the claimed scrubber).
+        scrub_key_id: String,
+        /// Why the record failed the accord-conferred test (self-signed /
+        /// sub-quorum scrub set / non-anchor scrubbers).
+        reason: String,
+    },
+
     /// v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — a
     /// `federation_keys` write was REFUSED because it would confer the
     /// `canonical` role on a `key_id` the accord quorum has WITHDRAWN (a durable
@@ -4224,6 +4252,9 @@ impl Error {
             Error::NodeAlreadyOwned { .. } => "federation_node_already_owned",
             Error::AmbiguousNodeOwner { .. } => "federation_ambiguous_node_owner",
             Error::CanonicalRoleNotAccordConferred { .. } => "canonical_role_not_accord_conferred",
+            Error::InfraAttestRoleNotAccordConferred { .. } => {
+                "infra_attest_role_not_accord_conferred"
+            }
             Error::CanonicalRoleWithdrawn { .. } => "canonical_role_withdrawn",
             Error::CanonicalWithdrawalAuthorityInvalid { .. } => {
                 "canonical_withdrawal_authority_invalid"

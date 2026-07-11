@@ -3096,10 +3096,6 @@ pub async fn check_canonical_role_admission_over_roster(
     row: &super::KeyRecord,
     roster_key_ids: &[String],
 ) -> Result<(), Error> {
-    use ciris_verify_core::threshold::{
-        verify_quorum_policy, QuorumPolicy, Role, ThresholdMember, ThresholdSignature,
-    };
-
     // (1) Fast path: no `canonical` role in the set → nothing to gate.
     if !identity_type::set_contains(&row.identity_type, identity_type::CANONICAL) {
         return Ok(());
@@ -3117,12 +3113,61 @@ pub async fn check_canonical_role_admission_over_roster(
         }
     }
 
+    // (3)-(7) the shared accord-family m-of-n co-scrub quorum core.
+    verify_accord_family_coscrub(directory, row, roster_key_ids)
+        .await
+        .map_err(|reason| Error::CanonicalRoleNotAccordConferred {
+            key_id: row.key_id.clone(),
+            scrub_key_id: row.scrub_key_id.clone(),
+            reason,
+        })
+}
+
+/// The accord-family **m-of-n co-scrub quorum core** — the shared enforcement
+/// primitive behind the `canonical` ([`identity_type`]) and `infra:attest`
+/// ([`super::types::roles`]) conferral gates. Both roles fold onto the SAME
+/// ceremony (CIRISPersist#422, "same ceremony, different CEG object"), so the
+/// quorum math lives in exactly ONE place and cannot drift between them.
+///
+/// Verifies the record's full scrub set ([`KeyRecord::scrubs`]) meets a **strict
+/// majority of the LIVE accord roster** over `JCS(registration_envelope)`, via
+/// verify-core's [`verify_quorum_policy`](ciris_verify_core::threshold::verify_quorum_policy)
+/// — the SAME m-of-n primitive `ciris-canonical` registry-consensus, the
+/// HUMANITY_ACCORD, and every entrenched `quorum:M/N` community use. The count
+/// is DYNAMIC (strict-majority of the resolved roster, never a frozen `2`),
+/// non-forgeable (each hybrid sig is cryptographically verified; only DISTINCT
+/// founders count; a forged / garbage scrub silently does not count), and
+/// deadlock-safe (`2·M > N`, no `M==1` escape, declared `N` == live founder
+/// roster size).
+///
+/// Steps: (3) resolve `roster_key_ids` to their PINNED directory pubkeys as
+/// `Founder` members (skip unresolvable; `n = roster.len()`, never caller keys);
+/// (4) strict-majority policy `QuorumPolicy::new(n/2 + 1, n)`; (6) canonical
+/// bytes `ceg_produce_canonicalize(registration_envelope)` (JCS RFC 8785, the
+/// IDENTICAL form the single-scrub verify uses); (5) the scrub set →
+/// threshold signatures (a self-scrub's `member_id` is not in the founder
+/// roster, so it is silently not counted — self can never confer); (7)
+/// `verify_quorum_policy`. Returns `Ok(())` iff quorum met, else the failure
+/// reason (each caller maps it to its role-specific error variant).
+async fn verify_accord_family_coscrub(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+    roster_key_ids: &[String],
+) -> Result<(), String> {
+    use ciris_verify_core::threshold::{
+        verify_quorum_policy, QuorumPolicy, Role, ThresholdMember, ThresholdSignature,
+    };
+
     // (3) Standing founder roster = the accord family resolved to their PINNED
     // directory pubkeys (never caller-supplied keys). Skip any that don't
     // resolve; `n` tracks the LIVE roster so the policy is dynamic.
     let mut roster: Vec<ThresholdMember> = Vec::with_capacity(roster_key_ids.len());
     for kid in roster_key_ids {
-        if let Some(rec) = directory.lookup_public_key(kid).await? {
+        if let Some(rec) = directory
+            .lookup_public_key(kid)
+            .await
+            .map_err(|e| format!("roster resolve failed for {kid}: {e}"))?
+        {
             roster.push(ThresholdMember {
                 member_id: rec.key_id,
                 ed25519_public_key_base64: rec.pubkey_ed25519_base64,
@@ -3142,11 +3187,7 @@ pub async fn check_canonical_role_admission_over_roster(
     // — the IDENTICAL function the single-scrub verify uses, so a base-field
     // scrub and an `additional_scrubs` entry are over byte-identical content.
     let bytes = crate::verify::canonical::ceg_produce_canonicalize(&row.registration_envelope)
-        .map_err(|e| Error::CanonicalRoleNotAccordConferred {
-            key_id: row.key_id.clone(),
-            scrub_key_id: row.scrub_key_id.clone(),
-            reason: format!("registration_envelope canonicalize failed: {e}"),
-        })?;
+        .map_err(|e| format!("registration_envelope canonicalize failed: {e}"))?;
 
     // (5) The record's full scrub set → threshold signatures (member_id =
     // scrub_key_id; a self-scrub's member_id is not in the founder roster, so it
@@ -3165,18 +3206,94 @@ pub async fn check_canonical_role_admission_over_roster(
     // cryptographically verifies each hybrid sig and counts ONLY distinct
     // founders — a claimed-but-unsigned / garbage scrub does not count.
     verify_quorum_policy(&bytes, &roster, &sigs, policy).map_err(|e| {
-        Error::CanonicalRoleNotAccordConferred {
-            key_id: row.key_id.clone(),
-            scrub_key_id: row.scrub_key_id.clone(),
-            reason: format!(
-                "accord family m-of-n not met for canonical add ({m}-of-{n}): {e}",
-                m = policy.m,
-                n = policy.n
-            ),
-        }
+        format!(
+            "accord family m-of-n not met ({m}-of-{n}): {e}",
+            m = policy.m,
+            n = policy.n
+        )
     })?;
 
     Ok(())
+}
+
+/// **CIRISPersist#422 (CIRISVerify#185) — the `infra:attest`-role admission
+/// gate.** The `roles`-vector mirror of [`check_canonical_role_admission`]: a
+/// `federation_keys` row may carry [`super::types::roles::INFRA_ATTEST`] in its
+/// V020 `roles` set IFF the record is accord-co-scrubbed to the family m-of-n —
+/// the SAME ceremony that confers `canonical`, differing only in which CEG
+/// object the role names (a build-signing / CI pipeline key vs a founding
+/// server). Pins the trusted anchor to the HUMANITY_ACCORD holder keyset
+/// (A1/B1/C1); use [`check_infra_attest_role_admission_over_roster`] to inject a
+/// test roster.
+///
+/// - The row's `roles` does NOT contain `infra:attest` → `Ok(())` (no-op).
+/// - It contains `infra:attest` AND the scrub set meets the accord m-of-n →
+///   `Ok(())`.
+/// - It contains `infra:attest` but is self-signed / sub-quorum / scrubbed by
+///   non-anchor keys → [`Error::InfraAttestRoleNotAccordConferred`]
+///   (fail-closed; the caller must NOT store the row).
+///
+/// **Monotonicity.** Runs at every `federation_keys` write chokepoint
+/// (`put_public_key` on all three backends + the `adopt_scrub_upgrade`
+/// self→anchored path), so `infra:attest` can never be added by a later
+/// self-registration or by replication of an under-quorum row. Verify-before-
+/// mutation (AV-9); backend-agnostic.
+pub async fn check_infra_attest_role_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+) -> Result<(), Error> {
+    check_infra_attest_role_admission_over_roster(directory, row, &accord_holder_roster_key_ids())
+        .await
+}
+
+/// [`check_infra_attest_role_admission`] with an explicit accord-holder roster —
+/// the core primitive (tests inject their own signable holders). Shares the
+/// [`verify_accord_family_coscrub`] quorum core with the `canonical` gate.
+pub async fn check_infra_attest_role_admission_over_roster(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+    roster_key_ids: &[String],
+) -> Result<(), Error> {
+    // (1) Fast path: no `infra:attest` role → nothing to gate. (Plain
+    // authorization scopes in `roles` are untouched; only this token is gated.)
+    if !row
+        .roles
+        .iter()
+        .any(|r| r == super::types::roles::INFRA_ATTEST)
+    {
+        return Ok(());
+    }
+
+    // (2) The shared accord-family m-of-n co-scrub quorum core. (No withdrawal
+    // tombstone for `infra:attest` yet — quorum WITHDRAW of a CI key is a
+    // follow-up op, tracked separately; the ADD gate is what #422 asks.)
+    verify_accord_family_coscrub(directory, row, roster_key_ids)
+        .await
+        .map_err(|reason| Error::InfraAttestRoleNotAccordConferred {
+            key_id: row.key_id.clone(),
+            scrub_key_id: row.scrub_key_id.clone(),
+            reason,
+        })
+}
+
+/// **CIRISPersist#422 — is `key_id` an accord-blessed build-signing pipeline?**
+/// True iff `key_id` resolves to a `federation_keys` row whose `roles` set
+/// contains [`super::types::roles::INFRA_ATTEST`]. Because
+/// [`check_infra_attest_role_admission`] gates every write path, a stored row
+/// can carry `infra:attest` only if it earned it via the accord co-scrub — so
+/// this simple membership read is sufficient (the admission gate is the
+/// enforcement point). The manifest verifier + CIRISServer call this to ask "is
+/// this build-signing key trust-root-blessed?" `false` for an unknown `key_id`
+/// or a row without the role.
+pub async fn is_infra_attest(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+) -> Result<bool, Error> {
+    Ok(directory.lookup_public_key(key_id).await?.is_some_and(|r| {
+        r.roles
+            .iter()
+            .any(|role| role == super::types::roles::INFRA_ATTEST)
+    }))
 }
 
 /// **CIRISPersist#372 — is `key_id` a canonical / founding bootstrap server?**
@@ -6566,6 +6683,258 @@ mod canonical_gate_tests {
         use crate::store::memory::MemoryBackend;
         let backend = MemoryBackend::new();
         run_endtoend(&backend, "e2e-mem").await;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // CIRISPersist#422 — the `infra:attest` (build-manifest trust root)
+    // adopt-gate. Same accord m-of-n co-scrub as `canonical`, in the
+    // `roles` vector. Shares the `verify_accord_family_coscrub` core, so
+    // this matrix is the `canonical` matrix in the `roles`-field mirror.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Stamp `infra:attest` into a co-scrubbed record's `roles`. The scrubs sign
+    /// the `registration_envelope` (independent of `roles`), so a genuine 2-of-3
+    /// co-scrub is valid exactly as for `canonical` — the role token differs, the
+    /// ceremony does not.
+    fn with_infra_role(mut rec: KeyRecord) -> KeyRecord {
+        rec.roles = vec![super::super::types::roles::INFRA_ATTEST.to_owned()];
+        rec
+    }
+
+    /// The `infra:attest` core-gate decision table over a DISTINCT test roster
+    /// (runs on every backend without touching the real A1/B1/C1 anchor).
+    async fn run_infra_gate_matrix(dir: &dyn FederationDirectory, tag: &str) {
+        let founders = [
+            Identity::new(&format!("iah0-{tag}")),
+            Identity::new(&format!("iah1-{tag}")),
+            Identity::new(&format!("iah2-{tag}")),
+        ];
+        for f in &founders {
+            register_founder(dir, f).await;
+        }
+        let roster: Vec<String> = founders.iter().map(|f| f.key_id.clone()).collect();
+        let env = |kid: &str| serde_json::json!({ "key_id": kid });
+        let gate = |rec: KeyRecord, roster: Vec<String>| async move {
+            super::check_infra_attest_role_admission_over_roster(dir, &rec, &roster).await
+        };
+
+        // (1) ADMITTED: 2 distinct valid founder scrubs + `infra:attest`.
+        gate(
+            with_infra_role(signed_canonical_record(
+                "i1",
+                identity_type::NODE,
+                env("i1"),
+                &[&founders[0], &founders[1]],
+            )),
+            roster.clone(),
+        )
+        .await
+        .expect("(1) 2-of-3 distinct scrubs must confer infra:attest");
+
+        // (2) REFUSED: exactly ONE scrub; error cites the m-of-n shortfall.
+        let err = gate(
+            with_infra_role(signed_canonical_record(
+                "i2",
+                identity_type::NODE,
+                env("i2"),
+                &[&founders[0]],
+            )),
+            roster.clone(),
+        )
+        .await
+        .expect_err("(2) a single scrub must be REFUSED");
+        assert_eq!(err.kind(), "infra_attest_role_not_accord_conferred");
+        assert!(
+            format!("{err}").contains("2-of-3") || format!("{err}").contains("m-of-n"),
+            "(2) error must cite the m-of-n shortfall, got: {err}"
+        );
+
+        // (3) FORGERY: real cah0 scrub + a garbage-sig 2nd claiming cah1 → the
+        //     quorum primitive verifies each sig, so the forged one doesn't count.
+        let mut forged = with_infra_role(signed_canonical_record(
+            "i3",
+            identity_type::NODE,
+            env("i3"),
+            &[&founders[0]],
+        ));
+        forged.additional_scrubs = vec![ScrubSig {
+            scrub_key_id: founders[1].key_id.clone(),
+            scrub_signature_classical: B64.encode([0u8; 64]),
+            scrub_signature_pqc: Some(B64.encode([0u8; 64])),
+        }];
+        let err = gate(forged, roster.clone())
+            .await
+            .expect_err("(3) a forged 2nd scrub must be REFUSED");
+        assert_eq!(err.kind(), "infra_attest_role_not_accord_conferred");
+
+        // (4) NOT DISTINCT: two scrubs by the SAME founder → dedup → 1 < 2.
+        let err = gate(
+            with_infra_role(signed_canonical_record(
+                "i4",
+                identity_type::NODE,
+                env("i4"),
+                &[&founders[0], &founders[0]],
+            )),
+            roster.clone(),
+        )
+        .await
+        .expect_err("(4) two scrubs by the same holder must be REFUSED");
+        assert_eq!(err.kind(), "infra_attest_role_not_accord_conferred");
+
+        // (5) SELF-SCRUB + 1 founder: the self-scrub is not a founder → not
+        //     counted; a pipeline cannot bootstrap ITSELF into the blessed set.
+        let me_self = Identity::new(&format!("i5-{tag}"));
+        let err = gate(
+            with_infra_role(signed_canonical_record(
+                "i5",
+                identity_type::NODE,
+                env("i5"),
+                &[&me_self, &founders[0]],
+            )),
+            roster.clone(),
+        )
+        .await
+        .expect_err("(5) self-scrub + 1 founder must be REFUSED");
+        assert_eq!(err.kind(), "infra_attest_role_not_accord_conferred");
+
+        // (6) A record WITHOUT `infra:attest` fast-paths to Ok regardless of
+        //     scrubs (plain authorization scopes in `roles` are untouched).
+        let mut plain = record("i6", identity_type::NODE, &founders[0].key_id);
+        plain.roles = vec!["cirislens_pipeline_writer".to_owned()];
+        gate(plain, roster.clone())
+            .await
+            .expect("(6) a non-infra:attest record is not gated");
+
+        // (7) ROSTER-DERIVED policy: over a 4-founder roster the majority is 3,
+        //     so the SAME 2 scrubs that pass at n=3 are REFUSED at n=4.
+        let f3 = Identity::new(&format!("iah3-{tag}"));
+        register_founder(dir, &f3).await;
+        let roster4: Vec<String> = founders
+            .iter()
+            .map(|f| f.key_id.clone())
+            .chain(std::iter::once(f3.key_id.clone()))
+            .collect();
+        let err = gate(
+            with_infra_role(signed_canonical_record(
+                "i7",
+                identity_type::NODE,
+                env("i7"),
+                &[&founders[0], &founders[1]],
+            )),
+            roster4.clone(),
+        )
+        .await
+        .expect_err("(7) 2 scrubs over a 4-founder roster (needs 3) must be REFUSED");
+        assert_eq!(err.kind(), "infra_attest_role_not_accord_conferred");
+        gate(
+            with_infra_role(signed_canonical_record(
+                "i7b",
+                identity_type::NODE,
+                env("i7b"),
+                &[&founders[0], &founders[1], &f3],
+            )),
+            roster4,
+        )
+        .await
+        .expect("(7) 3-of-4 over the live roster confers infra:attest");
+    }
+
+    /// End-to-end through the PRODUCTION gate (real A1/B1/C1 roster) + storage +
+    /// the `is_infra_attest` resolver + the `adopt_scrub_upgrade` path, on an
+    /// ISOLATED backend (safe to seed test A1/B1/C1).
+    async fn run_infra_endtoend(dir: &dyn FederationDirectory, tag: &str) {
+        let accord: Vec<Identity> = accord_holder_roster_key_ids()
+            .iter()
+            .map(|k| Identity::new(k))
+            .collect();
+        for a in &accord {
+            register_founder(dir, a).await;
+        }
+
+        // 2-of-3 co-scrubbed pipeline key with `infra:attest` → admitted + blessed.
+        let good = format!("ci-good-{tag}");
+        dir.put_public_key(SignedKeyRecord {
+            record: with_infra_role(signed_canonical_record(
+                &good,
+                identity_type::NODE,
+                serde_json::json!({ "key_id": good }),
+                &[&accord[0], &accord[1]],
+            )),
+        })
+        .await
+        .expect("2-of-3 infra:attest admits through the production gate");
+        assert!(
+            super::is_infra_attest(dir, &good)
+                .await
+                .expect("is_infra_attest"),
+            "an accord-co-scrubbed pipeline key is blessed"
+        );
+        assert!(
+            !is_canonical(dir, &good).await.unwrap(),
+            "infra:attest is NOT canonical (distinct CEG object, same ceremony)"
+        );
+
+        // 1-scrub `infra:attest` → REFUSED end-to-end; not stored, not blessed.
+        let one = format!("ci-one-{tag}");
+        let err = dir
+            .put_public_key(SignedKeyRecord {
+                record: with_infra_role(signed_canonical_record(
+                    &one,
+                    identity_type::NODE,
+                    serde_json::json!({ "key_id": one }),
+                    &[&accord[0]],
+                )),
+            })
+            .await
+            .expect_err("a single-scrub infra:attest must be REFUSED end-to-end");
+        assert_eq!(err.kind(), "infra_attest_role_not_accord_conferred");
+        assert!(dir.lookup_public_key(&one).await.unwrap().is_none());
+        assert!(!super::is_infra_attest(dir, &one).await.unwrap());
+
+        // A self-signed record self-asserting `infra:attest` → REFUSED (no
+        // self-conferral, exactly like a self-asserted `canonical`).
+        let selfp = format!("ci-self-{tag}");
+        let err = dir
+            .put_public_key(SignedKeyRecord {
+                record: with_infra_role(record(&selfp, identity_type::NODE, &selfp)),
+            })
+            .await
+            .expect_err("a self-asserted infra:attest must be REFUSED");
+        assert_eq!(err.kind(), "infra_attest_role_not_accord_conferred");
+        assert!(!super::is_infra_attest(dir, &selfp).await.unwrap());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn infra_attest_gate_sqlite() {
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        run_infra_gate_matrix(&backend, "sq").await;
+        run_infra_endtoend(&backend, "e2e-sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn infra_attest_gate_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping infra_attest_gate_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        super::run_in_isolated_pg_db(&dsn, |backend| async move {
+            run_infra_gate_matrix(&backend, "pg").await;
+            run_infra_endtoend(&backend, "e2e-pg").await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn infra_attest_gate_memory() {
+        use crate::store::memory::MemoryBackend;
+        let backend = MemoryBackend::new();
+        run_infra_gate_matrix(&backend, "mem").await;
+        run_infra_endtoend(&backend, "e2e-mem").await;
     }
 }
 

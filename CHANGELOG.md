@@ -5,6 +5,52 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [15.0.0] — 2026-07-11 — `infra:attest` build-manifest trust root via the accord co-scrub + verify v9.0.0 re-pin (#422) — BREAKING (dep)
+
+### Added — the build-manifest trust root folds onto the accord co-scrub (#422, CIRISVerify#185)
+- **`infra:attest` in `roles` is accord-CONFERRED, never self-claimed.** A CI /
+  build-signing pipeline key is blessed by the **same m-of-n accord co-scrub** as
+  a canonical server, but carries `infra:attest` in its V020 `roles` set where a
+  canonical server carries `identity_type = canonical`. "Same ceremony, different
+  CEG object" is now literally true in the substrate.
+- **The gate — `check_infra_attest_role_admission`.** Runs at every
+  `federation_keys` write chokepoint (`put_public_key` + `adopt_scrub_upgrade`,
+  all three backends): a row may carry `infra:attest` **only** when its scrub set
+  meets a strict majority of the LIVE accord roster, verified over
+  `JCS(registration_envelope)` via verify-core's `verify_quorum_policy` — the
+  DYNAMIC m-of-n (2-of-3 today, 3-of-4 if the family grows), non-forgeable (each
+  hybrid sig cryptographically verified; only DISTINCT founders count), fail-closed
+  (`Error::InfraAttestRoleNotAccordConferred`, kind `infra_attest_role_not_accord_conferred`).
+  A self-signed or sub-quorum record asserting `infra:attest` is refused — no
+  self-conferral, exactly like a self-asserted `canonical`.
+- **Shared quorum core.** The canonical (`identity_type`) and `infra:attest`
+  (`roles`) gates now share ONE `verify_accord_family_coscrub` primitive, so the
+  m-of-n math cannot drift between them. Canonical path behaviourally unchanged
+  (7 canonical-gate tests green; refactor is internal).
+- **Resolver — `is_infra_attest(key_id)`.** The manifest verifier + CIRISServer
+  ask "is this build-signing key trust-root-blessed?" Mirrors `is_canonical`.
+- **Monotonic.** Because the gate runs at every write path incl. the anti-entropy
+  apply, `infra:attest` can never be added by a later self-registration or by
+  replication of an under-quorum row. (Quorum WITHDRAW of a CI key is a follow-up
+  op; #422 is the ADD gate.)
+- Tests: `infra_attest_gate_{sqlite,postgres,memory}` — the full decision table
+  (2-of-3 admits; 1-scrub / forged-2nd / same-founder-twice / self-scrub+1 /
+  4-founder-needs-3 all refused; non-`infra:attest` rows fast-path) + end-to-end
+  through the production gate (real A1/B1/C1 roster) with `is_infra_attest` and the
+  `adopt_scrub_upgrade` path.
+
+### Changed — verify v9.0.0 re-pin (BREAKING dep; cohabitation firewall)
+- **`ciris-verify*` 8.12.0 → 9.0.0** (all six Rust pins in lockstep + pyproject
+  `Requires-Dist: ciris-verify>=9.0.0,<10`). CIRISVerify v9.0.0 (CIRISVerify#185)
+  gave `ScrubTarget` a required `roles` field — the producer half of this arc.
+  Persist builds no `ScrubTarget`, so the bump is drop-in for persist's own code;
+  it is a **MAJOR** because persist re-exports verify-core types in its public API,
+  so cohabiting consumers (edge, server) must move to verify 9 in lockstep.
+- **Downstream:** CIRISServer#229 filed (bump verify pin + `ScrubTarget { …, roles }`
+  migration: `roles: vec![]` for node/canonical admits, `roles: vec!["infra:attest"]`
+  for the CI-key blessing). Then pin `ciris-persist>=15,<16` and wire
+  `/v1/accord/ci-key/{propose,cosign}` to the co-scrub → adopt path.
+
 ## [14.1.0] — 2026-07-11 — Signed-occurrence replication READ: `list_signed_identity_occurrences_for` (completes #418)
 
 ### Added (the missing replication half)
