@@ -20323,6 +20323,59 @@ mod tests {
         );
     }
 
+    /// v16.0.0 (CIRISPersist#425) — the uniform `list_signed_records` dispatch
+    /// returns byte-exact records per kind and empties cleanly for kinds with
+    /// no rows, so an edge engine can sweep a subject across
+    /// `ReplicatedKind::all()` through one call.
+    #[tokio::test]
+    async fn list_signed_records_dispatches_per_kind() {
+        use crate::federation::namespace::ReplicatedKind as K;
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("node-x", "node-x", "node-x"),
+            })
+            .await
+            .unwrap();
+
+        // KeyRecord kind → the subject's own row, byte-exact (embedded scrub sig).
+        let keys = backend
+            .list_signed_records(K::KeyRecord, "node-x")
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].kind, K::KeyRecord);
+        assert_eq!(keys[0].canonical_json["key_id"], "node-x");
+
+        // Kinds with no rows for this subject return empty, not error.
+        for k in [
+            K::IdentityOccurrence,
+            K::TransportDestination,
+            K::Attestation,
+            K::IdentityOccurrenceRevocation,
+        ] {
+            assert!(
+                backend
+                    .list_signed_records(k, "node-x")
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{k:?} must be empty for a bare subject"
+            );
+        }
+
+        // An unknown subject is empty across all kinds.
+        for k in K::all() {
+            assert!(backend
+                .list_signed_records(*k, "nobody")
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+
     /// The keystone: a newcomer self-occurrence gains access to a
     /// pre-existing self-scope blob via the retroactive ADD re-wrap, and a
     /// re-run is idempotent (adds no further grants).

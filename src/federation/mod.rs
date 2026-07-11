@@ -51,6 +51,7 @@ pub mod goal;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
 pub mod location;
+pub mod namespace;
 // v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — operational-
 // data admit + merge surface (organization / org_membership /
 // partner_record). Row shapes, the four admission checks, and the two
@@ -1395,6 +1396,64 @@ pub trait FederationDirectory: Send + Sync {
                 .map(cohort::RosterMember::from)
                 .collect(),
         })
+    }
+
+    /// **CIRISPersist#425 — the uniform signed read.** Fetch every replicated
+    /// record of `kind` for `subject_key_id` as a byte-exact
+    /// [`SignedReplicatedRecord`](namespace::SignedReplicatedRecord),
+    /// generalizing #418's [`Self::list_signed_identity_occurrences_for`] so an
+    /// edge replication engine sweeps a subject across ALL kinds through ONE
+    /// call ([`ReplicatedKind::all`](namespace::ReplicatedKind::all)) instead of
+    /// a bespoke `list_* + selector` per plane. A DEFAULT method composing the
+    /// existing per-kind reads — backend parity (pg / sqlite / memory) inherited,
+    /// no override. The occurrence arm uses the #418 SIGNED read so the detached
+    /// signature container survives; the embedded-signature kinds (key record,
+    /// attestation, transport) are byte-exact from their bare read. Each record
+    /// is serialized to canonical JSON; the receiver's put gate re-canonicalizes
+    /// via JCS, so the round-trip preserves verifiability.
+    async fn list_signed_records(
+        &self,
+        kind: namespace::ReplicatedKind,
+        subject_key_id: &str,
+    ) -> Result<Vec<namespace::SignedReplicatedRecord>, Error> {
+        use namespace::{ReplicatedKind as K, SignedReplicatedRecord as Rec};
+        fn wrap<T: serde::Serialize>(kind: K, items: Vec<T>) -> Result<Vec<Rec>, Error> {
+            items
+                .into_iter()
+                .map(|it| {
+                    Ok(Rec {
+                        kind,
+                        canonical_json: serde_json::to_value(it).map_err(|e| {
+                            Error::Backend(format!("serialize replicated record: {e}"))
+                        })?,
+                    })
+                })
+                .collect()
+        }
+        match kind {
+            K::KeyRecord => wrap(
+                kind,
+                self.lookup_public_key(subject_key_id)
+                    .await?
+                    .into_iter()
+                    .collect(),
+            ),
+            K::IdentityOccurrence => wrap(
+                kind,
+                self.list_signed_identity_occurrences_for(subject_key_id)
+                    .await?,
+            ),
+            K::TransportDestination => wrap(
+                kind,
+                self.list_transport_destinations_for(subject_key_id).await?,
+            ),
+            K::Attestation => wrap(kind, self.list_attestations_for(subject_key_id).await?),
+            K::IdentityOccurrenceRevocation => wrap(
+                kind,
+                self.list_identity_occurrence_revocations_for(subject_key_id)
+                    .await?,
+            ),
+        }
     }
 
     /// #249 Cut G1 (§2) — the active roster resolved to its **pinned hybrid
