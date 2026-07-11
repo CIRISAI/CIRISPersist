@@ -1298,6 +1298,155 @@ pub fn check_encryption_pubkeys(
     Ok(())
 }
 
+/// v14.0.0 (CIRISPersist#418, occurrence-KEX arc 2/4) — the SIGNED-occurrence
+/// admission gate: cryptographically prove the content-tier KEX pubkeys (+
+/// transport binding) belong to the identity BEFORE any write, closing the
+/// silent content-MITM where a consented replication peer could fabricate a
+/// victim's occurrence. Fail-secure; called by every `put_identity_occurrence`
+/// (HTTP + wire — one gate).
+///
+/// **Authority is `signed_envelope`, never the sender's typed projection.** The
+/// hybrid signature covers `JCS(signed_envelope)` only; persist therefore parses
+/// the authoritative `transport_destination` / `encryption_pubkeys` / ids FROM
+/// that envelope and REJECTS if the typed `identity_occurrence` diverges — else
+/// an attacker sends an envelope carrying the victim's keys but a typed
+/// projection carrying its own, and the MITM reopens.
+///
+/// Verifies, each fail-closed:
+/// 1. `signed_envelope` carries a `transport_destination` (REQUIRED — every
+///    signed occurrence binds transport, #418) + optional `encryption_pubkeys`;
+/// 2. the typed projection's transport/enc keys + ids EQUAL the envelope's;
+/// 3. [`verify_transport_binding`] is authentic against the PINNED federation
+///    signing key of `attesting_key_id` (hybrid sig, §5.6.8.8.2 C4, dest_hash
+///    recompute) — `UnknownSigner` / bad sig / C4 / `Malformed` ⇒ reject;
+/// 4. `signer_acts_for`: `attesting_key_id` is the occurrence's own
+///    `identity_key_id` OR an already-active occurrence key of the same identity.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub async fn verify_signed_identity_occurrence(
+    directory: &dyn super::FederationDirectory,
+    signed: &crate::federation::types::SignedIdentityOccurrence,
+) -> Result<(), Error> {
+    use ciris_verify_core::threshold::ThresholdMember;
+    use ciris_verify_core::transport_binding::{
+        verify_transport_binding, EncryptionPubkeys as VEnc, TransportBinding, TransportDestination,
+    };
+
+    let row = &signed.identity_occurrence;
+    let env = &signed.signed_envelope;
+
+    // (1) Parse the AUTHORITATIVE transport_destination from the signed envelope.
+    let str_field = |obj: &serde_json::Value, k: &str| -> Result<String, Error> {
+        obj.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned())
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "signed identity_occurrence envelope missing string field `{k}`"
+                ))
+            })
+    };
+    let td_env = env.get("transport_destination").ok_or_else(|| {
+        Error::InvalidArgument(
+            "signed identity_occurrence must carry a transport_destination (occurrence-KEX #418)"
+                .into(),
+        )
+    })?;
+    let transport_destination = TransportDestination {
+        reticulum_x25519_pubkey_base64: str_field(td_env, "reticulum_x25519_pubkey")?,
+        reticulum_ed25519_pubkey_base64: str_field(td_env, "reticulum_ed25519_pubkey")?,
+        destination_hash_base64: str_field(td_env, "destination_hash")?,
+        app_name: str_field(td_env, "app_name")?,
+        aspects: td_env
+            .get("aspects")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default(),
+    };
+    // Optional content-KEM half, from the envelope.
+    let encryption_pubkeys = match env.get("encryption_pubkeys") {
+        Some(e) if !e.is_null() => Some(VEnc {
+            x25519_base64: str_field(e, "x25519_base64")?,
+            ml_kem_768_base64: str_field(e, "ml_kem_768_base64")?,
+        }),
+        _ => None,
+    };
+
+    // (2) The typed projection persist will STORE must equal the envelope — the
+    // signature only covers the envelope, so a divergent projection is a MITM.
+    let diverges = |what: &str| Error::InvalidArgument(format!(
+        "signed identity_occurrence: typed {what} diverges from the signed envelope (rejected)"
+    ));
+    if str_field(env, "identity_key_id")? != row.identity_key_id {
+        return Err(diverges("identity_key_id"));
+    }
+    if str_field(env, "occurrence_key_id")? != row.occurrence_key_id {
+        return Err(diverges("occurrence_key_id"));
+    }
+    match row.transport_binding.as_ref() {
+        Some(tb)
+            if tb.reticulum_x25519_pubkey_base64
+                == transport_destination.reticulum_x25519_pubkey_base64
+                && tb.reticulum_ed25519_pubkey_base64
+                    == transport_destination.reticulum_ed25519_pubkey_base64
+                && tb.destination_hash_base64 == transport_destination.destination_hash_base64 => {}
+        _ => return Err(diverges("transport_destination")),
+    }
+    let env_enc_x = encryption_pubkeys.as_ref().map(|e| e.x25519_base64.clone());
+    let row_enc_x = row.encryption_pubkeys.as_ref().map(|e| e.x25519_base64.clone());
+    if env_enc_x != row_enc_x {
+        return Err(diverges("encryption_pubkeys"));
+    }
+
+    // (3) Verify the hybrid signature against the signer's PINNED federation key.
+    let Some(signer_key) = directory.lookup_public_key(&signed.attesting_key_id).await? else {
+        return Err(Error::SignatureInvalid(format!(
+            "signed identity_occurrence: attesting_key_id {} is not a registered federation key",
+            signed.attesting_key_id
+        )));
+    };
+    let key_directory = vec![ThresholdMember {
+        member_id: signer_key.key_id.clone(),
+        ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
+        mldsa65_public_key_base64: signer_key.pubkey_ml_dsa_65_base64.clone(),
+        role: None,
+    }];
+    let binding = TransportBinding {
+        attesting_key_id: signed.attesting_key_id.clone(),
+        signed_envelope: env.clone(),
+        transport_destination,
+        encryption_pubkeys,
+        signature: signed.signature.clone(),
+    };
+    let verdict = verify_transport_binding(&binding, &key_directory).map_err(|e| {
+        Error::InvalidArgument(format!("signed identity_occurrence canonicalize: {e}"))
+    })?;
+    if !verdict.authentic {
+        return Err(Error::SignatureInvalid(format!(
+            "signed identity_occurrence for {} not authentic: {:?}",
+            row.occurrence_key_id, verdict.reason
+        )));
+    }
+
+    // (4) signer_acts_for — the signer is the identity itself, or an already-
+    // active occurrence of the same identity (a peer can't sign a victim's
+    // occurrence with its own unrelated key).
+    if signed.attesting_key_id != row.identity_key_id {
+        let acts_for = matches!(
+            directory
+                .lookup_identity_for_occurrence(&signed.attesting_key_id)
+                .await?,
+            Some(sig_occ) if sig_occ.identity_key_id == row.identity_key_id
+        );
+        if !acts_for {
+            return Err(Error::SignatureInvalid(format!(
+                "signed identity_occurrence: signer {} is neither identity {} nor an active occurrence of it",
+                signed.attesting_key_id, row.identity_key_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
 /// §3.3.2 R1) — admission-gate validation of the producer-side
 /// `observed_region` field on a revocation.

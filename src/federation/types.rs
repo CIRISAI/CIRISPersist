@@ -1599,8 +1599,56 @@ pub struct IdentityOccurrence {
     /// ⇒ both halves present (the field-set is meaningful only as a pair).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_pubkeys: Option<EncryptionPubkeys>,
+    /// v14.0.0 (CIRISPersist#418, occurrence-KEX arc 2/4) — the occurrence's
+    /// **transport binding** (RNS reticulum x25519 + ed25519 + destination_hash
+    /// + app_name/aspects), the reticulum half of the SAME signed occurrence
+    /// envelope that carries [`Self::encryption_pubkeys`]. Stored here so the
+    /// occurrence is the single signed source of truth for
+    /// `{transport reticulum keys, dest_hash, content-KEM}` (authoritative over
+    /// the mutable `transport_destinations` overlay). `None` for a content-only
+    /// occurrence (no C4 check applies then). `verify_transport_binding` checks
+    /// the hybrid signature over the whole envelope + the §5.6.8.8.2 C4
+    /// separation (transport-x25519 ≠ this content-KEM x25519).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_binding: Option<OccurrenceTransportBinding>,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
+}
+
+/// v14.0.0 (CIRISPersist#418) — persist's stored form of an occurrence's RNS
+/// transport binding, mirroring `ciris_verify_core::transport_binding::TransportDestination`
+/// (the shape the signed occurrence envelope carries + `verify_transport_binding`
+/// checks). Kept as a persist type so the storage/wire surface doesn't leak the
+/// verify-core type; [`OccurrenceTransportBinding::to_verify`] converts for the
+/// verify call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OccurrenceTransportBinding {
+    /// Transport identity's X25519 (encryption/KEX) pubkey — base64, 32 raw bytes.
+    pub reticulum_x25519_pubkey_base64: String,
+    /// Transport identity's Ed25519 (signing) pubkey — base64, 32 raw bytes.
+    /// MUST differ from the occurrence's federation signing key (AV-17).
+    pub reticulum_ed25519_pubkey_base64: String,
+    /// RNS destination hash (truncated SHA-256), base64, 16 raw bytes; derives
+    /// from the two pubkeys + `app_name` + `aspects` (§5.6.8.8.1).
+    pub destination_hash_base64: String,
+    /// RNS destination app name (e.g. `"ciris.federation"`).
+    pub app_name: String,
+    /// RNS aspects (ordered; part of the hash preimage).
+    pub aspects: Vec<String>,
+}
+
+impl OccurrenceTransportBinding {
+    /// Convert to the verify-core `TransportDestination` for
+    /// `verify_transport_binding`.
+    pub fn to_verify(&self) -> ciris_verify_core::transport_binding::TransportDestination {
+        ciris_verify_core::transport_binding::TransportDestination {
+            reticulum_x25519_pubkey_base64: self.reticulum_x25519_pubkey_base64.clone(),
+            reticulum_ed25519_pubkey_base64: self.reticulum_ed25519_pubkey_base64.clone(),
+            destination_hash_base64: self.destination_hash_base64.clone(),
+            app_name: self.app_name.clone(),
+            aspects: self.aspects.clone(),
+        }
+    }
 }
 
 /// v4.13.0 (CIRISPersist#192, CEG 0.18 §5.6.8.8) — the hybrid
@@ -1617,11 +1665,33 @@ pub struct EncryptionPubkeys {
     pub ml_kem_768_base64: String,
 }
 
-/// Wraps an [`IdentityOccurrence`] payload for write submission.
+/// v14.0.0 (CIRISPersist#418, occurrence-KEX arc 2/4) — a **signed**
+/// identity-occurrence submission. Before this the type was just
+/// `{ identity_occurrence }` and `put_identity_occurrence` admitted on
+/// length/closed-set checks only, so the content-tier KEX pubkeys — the root
+/// of content confidentiality — were admitted from replication peers with ZERO
+/// proof they belong to the identity (silent content-MITM). Now the write MUST
+/// carry a hybrid signature over the exact producer envelope, verified via
+/// `ciris_verify_core::transport_binding::verify_transport_binding` at `put`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignedIdentityOccurrence {
-    /// The identity-occurrence binding being submitted.
+    /// Persist's typed projection of the occurrence (what gets stored). Its
+    /// members are parsed FROM [`Self::signed_envelope`]; the signature is
+    /// verified over `signed_envelope`, not over this projection, so the §0.9
+    /// member-presence discipline is preserved (persist never re-canonicalizes).
     pub identity_occurrence: IdentityOccurrence,
+    /// The claimed signer — a `federation_keys.key_id`. MUST be the identity's
+    /// own registered key or an already-ACTIVE occurrence key of the same
+    /// identity (`signer_acts_for`).
+    pub attesting_key_id: String,
+    /// The EXACT `identity_occurrence` envelope the producer signed (signature
+    /// container stripped), as received — the bytes `verify_transport_binding`
+    /// JCS-canonicalizes. Byte-exact by construction (never rebuilt from the
+    /// typed projection).
+    pub signed_envelope: serde_json::Value,
+    /// The detached hybrid signature over `JCS(signed_envelope)` (Ed25519 over
+    /// the bytes; ML-DSA-65 over `bytes ‖ ed25519_sig`).
+    pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
 }
 
 /// One member of a [`Family`] — an IDENTITY key plus when they
@@ -1788,11 +1858,23 @@ pub struct IdentityOccurrenceRevocation {
     pub persist_row_hash: String,
 }
 
-/// Wraps an [`IdentityOccurrenceRevocation`] for write submission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// v14.0.0 (CIRISPersist#418) — a **signed** identity-occurrence revocation.
+/// Same signature discipline as [`SignedIdentityOccurrence`]: an admitted
+/// (signed) revocation is what `resolve_encryption_keys` honours to fail-closed
+/// exclude a revoked KEX key from sealing — so the revocation itself must be
+/// authenticated, not just shape-checked.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignedIdentityOccurrenceRevocation {
-    /// The revocation being submitted.
+    /// Persist's typed projection of the revocation (what gets stored), parsed
+    /// from [`Self::signed_envelope`].
     pub identity_occurrence_revocation: IdentityOccurrenceRevocation,
+    /// The claimed signer — the identity's own key or an active occurrence key
+    /// of the same identity (`signer_acts_for`).
+    pub attesting_key_id: String,
+    /// The EXACT revocation envelope the producer signed.
+    pub signed_envelope: serde_json::Value,
+    /// The detached hybrid signature over `JCS(signed_envelope)`.
+    pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
 }
 
 /// Removes one identity from a V059 family roster. The family's
