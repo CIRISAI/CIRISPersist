@@ -3636,6 +3636,36 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    async fn list_signed_identity_occurrences_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::SignedIdentityOccurrence>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let key = identity_key_id.to_owned();
+        (move || -> Result<Vec<crate::federation::SignedIdentityOccurrence>, rusqlite::Error> {
+            let conn = conn.lock();
+            // #418 replication read: only rows that were signed-put carry the
+            // signature container; trusted-local rows (NULL sig cols) are omitted.
+            let mut stmt = conn.prepare(
+                "SELECT identity_key_id, occurrence_key_id, device_class, \
+                        hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                        pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding, \
+                        attesting_key_id, signed_envelope, signature \
+                     FROM federation_identity_occurrences \
+                     WHERE identity_key_id = ?1 \
+                       AND attesting_key_id IS NOT NULL \
+                       AND signed_envelope IS NOT NULL \
+                       AND signature IS NOT NULL \
+                     ORDER BY occurrence_key_id ASC",
+            )?;
+            let rows = stmt.query_map([&key], sqlite_row_to_signed_identity_occurrence)?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_signed_identity_occurrences_for: {e}"))
+        })
+    }
+
     async fn lookup_identity_for_occurrence(
         &self,
         occurrence_key_id: &str,
@@ -11120,6 +11150,38 @@ fn sqlite_row_to_identity_occurrence(
         encryption_pubkeys: encryption_pubkeys_from_cols(enc_x25519, enc_ml_kem),
         transport_binding,
         persist_row_hash: row.get("persist_row_hash")?,
+    })
+}
+
+/// v14.1.0 (#418 replication read) — SQLite row →
+/// [`crate::federation::SignedIdentityOccurrence`]. Reconstructs the signature
+/// container byte-exact from the stored `{attesting_key_id, signed_envelope,
+/// signature}` columns so a transport replicator can re-wrap the already-signed
+/// occurrence verbatim. Callers must gate on non-NULL sig columns; a NULL here
+/// is a read-time backend error (the projection mapper handles unsigned rows).
+fn sqlite_row_to_signed_identity_occurrence(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::SignedIdentityOccurrence> {
+    let identity_occurrence = sqlite_row_to_identity_occurrence(row)?;
+    let attesting_key_id: String = row.get("attesting_key_id")?;
+    let signed_envelope_json: String = row.get("signed_envelope")?;
+    let signature_json: String = row.get("signature")?;
+    let json_err = |e: serde_json::Error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    };
+    let signed_envelope: serde_json::Value =
+        serde_json::from_str(&signed_envelope_json).map_err(json_err)?;
+    let signature: ciris_verify_core::transport_binding::TransportBindingSignature =
+        serde_json::from_str(&signature_json).map_err(json_err)?;
+    Ok(crate::federation::SignedIdentityOccurrence {
+        identity_occurrence,
+        attesting_key_id,
+        signed_envelope,
+        signature,
     })
 }
 
@@ -20101,6 +20163,157 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a REVOKED occurrence must NOT resolve its KEX key (fail-closed seal)"
+        );
+    }
+
+    /// v14.1.0 (CIRISPersist#418 replication read) — the load-bearing property
+    /// for CIRISEdge#305: `list_signed_identity_occurrences_for` reconstructs
+    /// the signature container BYTE-EXACT, so re-`put`ting the read row on a
+    /// FRESH backend passes the same signature gate (edge can re-publish an
+    /// occurrence it cannot re-sign). Trusted-local rows are OMITTED.
+    #[tokio::test]
+    async fn list_signed_occurrences_roundtrips_through_the_put_gate() {
+        use crate::federation::FederationDirectory;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
+        use ciris_verify_core::self_at_login::HybridSigningIdentity;
+        use ciris_verify_core::transport_binding::{
+            compute_destination_hash, produce_signed_identity_occurrence,
+        };
+
+        // A backend factory: fresh, migrated, with alice + occurrence keys
+        // registered to the SIGNER's real pubkeys (so the gate resolves them).
+        async fn seeded(member: &ciris_verify_core::ThresholdMember) -> SqliteBackend {
+            let backend = SqliteBackend::open_in_memory().await.unwrap();
+            backend.run_migrations().await.unwrap();
+            let mut alice = fed_key("alice", "alice", "alice");
+            alice.pubkey_ed25519_base64 = member.ed25519_public_key_base64.clone();
+            alice.pubkey_ml_dsa_65_base64 = member.mldsa65_public_key_base64.clone();
+            backend
+                .put_public_key(SignedKeyRecord { record: alice })
+                .await
+                .unwrap();
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key("alice-phone", "alice", "alice-phone"),
+                })
+                .await
+                .unwrap();
+            // A content-only trusted-local occurrence — MUST be omitted from
+            // list_signed (it was never signed-put).
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key("alice-laptop", "alice", "alice-laptop"),
+                })
+                .await
+                .unwrap();
+            backend
+                .put_identity_occurrence_local(occ_signed(
+                    "alice",
+                    "alice-laptop",
+                    Some(keyed_enc(0x55)),
+                ))
+                .await
+                .unwrap();
+            backend
+        }
+
+        let signer = Box::new(HybridSigningIdentity::new(
+            "alice",
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let member = signer.directory_member().unwrap();
+
+        let transport_ed = [0x01u8; 32];
+        let transport_x = [0x02u8; 32];
+        let content_x = [0x03u8; 32];
+        let app = "ciris.federation";
+        let aspects = vec!["announce".to_string(), "v1".to_string()];
+        let dest_hash =
+            compute_destination_hash(app, &aspects, &transport_x, &transport_ed).unwrap();
+        let envelope = serde_json::json!({
+            "identity_key_id": "alice",
+            "occurrence_key_id": "alice-phone",
+            "transport_destination": {
+                "reticulum_x25519_pubkey": B64.encode(transport_x),
+                "reticulum_ed25519_pubkey": B64.encode(transport_ed),
+                "destination_hash": B64.encode(dest_hash),
+                "app_name": app,
+                "aspects": aspects,
+            },
+            "encryption_pubkeys": {
+                "x25519_base64": B64.encode(content_x),
+                "ml_kem_768_base64": B64.encode(vec![0x11u8; 1184]),
+            },
+            "asserted_at": "2026-06-14T00:00:00.000Z",
+        });
+        let (signed_envelope, signature) =
+            produce_signed_identity_occurrence(signer.as_ref(), envelope)
+                .await
+                .unwrap();
+        let signed = crate::federation::SignedIdentityOccurrence {
+            identity_occurrence: crate::federation::IdentityOccurrence {
+                identity_key_id: "alice".into(),
+                occurrence_key_id: "alice-phone".into(),
+                device_class: crate::federation::types::device_class::AGENT.into(),
+                hardware_attestation: None,
+                asserted_at: "2026-06-14T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
+                    x25519_base64: B64.encode(content_x),
+                    ml_kem_768_base64: B64.encode(vec![0x11u8; 1184]),
+                }),
+                transport_binding: Some(crate::federation::types::OccurrenceTransportBinding {
+                    reticulum_x25519_pubkey_base64: B64.encode(transport_x),
+                    reticulum_ed25519_pubkey_base64: B64.encode(transport_ed),
+                    destination_hash_base64: B64.encode(dest_hash),
+                    app_name: app.into(),
+                    aspects: aspects.clone(),
+                }),
+                persist_row_hash: String::new(),
+            },
+            attesting_key_id: "alice".to_string(),
+            signed_envelope: signed_envelope.clone(),
+            signature: signature.clone(),
+        };
+
+        // Origin backend: signed-put + one trusted-local row.
+        let origin = seeded(&member).await;
+        origin
+            .put_identity_occurrence(signed.clone())
+            .await
+            .expect("valid signed occurrence admitted");
+
+        // list_signed returns ONLY the signed-put row (the trusted-local
+        // alice-laptop occurrence is omitted).
+        let read = origin
+            .list_signed_identity_occurrences_for("alice")
+            .await
+            .unwrap();
+        assert_eq!(read.len(), 1, "only the signed-put occurrence is listed");
+        assert_eq!(read[0].attesting_key_id, "alice");
+        assert_eq!(read[0].identity_occurrence.occurrence_key_id, "alice-phone");
+        // The signature container round-trips byte-exact.
+        assert_eq!(read[0].signed_envelope, signed_envelope);
+        assert_eq!(
+            read[0].signature.ed25519_signature_base64,
+            signature.ed25519_signature_base64
+        );
+
+        // The keystone: re-`put` the READ tuple on a fresh peer backend — the
+        // gate re-verifies over the reconstructed signed_envelope and admits.
+        // (Edge holds no identity key; it can only replay what it read.)
+        let peer = seeded(&member).await;
+        peer.put_identity_occurrence(read.into_iter().next().unwrap())
+            .await
+            .expect("a re-published signed occurrence must pass the peer's gate byte-exact");
+        assert!(
+            peer.resolve_encryption_keys("alice-phone")
+                .await
+                .unwrap()
+                .is_some(),
+            "the replicated occurrence resolves its KEX key on the peer"
         );
     }
 

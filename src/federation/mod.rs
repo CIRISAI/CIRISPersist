@@ -771,6 +771,34 @@ pub trait FederationDirectory: Send + Sync {
         identity_key_id: &str,
     ) -> Result<Vec<IdentityOccurrence>, Error>;
 
+    /// v14.1.0 (CIRISPersist#418, completing the replication half) — list the
+    /// stored occurrences of `identity_key_id` **with their original signature
+    /// container** ([`SignedIdentityOccurrence`]), reconstructed byte-exact from
+    /// the persisted `{attesting_key_id, signed_envelope, signature}` columns.
+    ///
+    /// This is the read counterpart to [`Self::put_identity_occurrence`]: the
+    /// signature only ever existed on the put input, never on
+    /// [`Self::list_identity_occurrences_for`]'s bare rows. A transport-layer
+    /// replicator (CIRISEdge#305) that re-publishes an occurrence to a peer
+    /// cannot re-sign it — it holds the transport signer, not the identity's
+    /// federation key — so it MUST re-wrap the already-signed tuple verbatim.
+    /// The receiver's [`Self::put_identity_occurrence`] gate then re-verifies
+    /// over the same `signed_envelope`.
+    ///
+    /// Only rows that were **signed-put** are returned: trusted-local rows
+    /// ([`Self::put_identity_occurrence_local`], signature columns NULL) are
+    /// omitted — you can only signed-replicate what was signed-put. Default impl
+    /// errors; backends override.
+    async fn list_signed_identity_occurrences_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<SignedIdentityOccurrence>, Error> {
+        let _ = identity_key_id;
+        Err(Error::Backend(
+            "list_signed_identity_occurrences_for not implemented for this backend".into(),
+        ))
+    }
+
     /// v3.12.0 — reverse lookup: which identity does this
     /// `occurrence_key_id` speak for? Returns `None` if the key is
     /// not bound as an occurrence.

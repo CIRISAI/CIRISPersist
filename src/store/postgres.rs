@@ -3931,6 +3931,41 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
+    async fn list_signed_identity_occurrences_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::SignedIdentityOccurrence>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // #418 replication read: only signed-put rows carry the signature
+        // container; trusted-local rows (NULL sig cols) are omitted.
+        let rows = client
+            .query(
+                "SELECT identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding, \
+                    attesting_key_id, signed_envelope, signature \
+                 FROM cirislens.federation_identity_occurrences \
+                 WHERE identity_key_id = $1 \
+                   AND attesting_key_id IS NOT NULL \
+                   AND signed_envelope IS NOT NULL \
+                   AND signature IS NOT NULL \
+                 ORDER BY occurrence_key_id ASC",
+                &[&identity_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_signed_identity_occurrences_for: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_signed_identity_occurrence)
+            .collect()
+    }
+
     async fn lookup_identity_for_occurrence(
         &self,
         occurrence_key_id: &str,
@@ -11169,6 +11204,30 @@ fn pg_row_to_identity_occurrence(
             })?
         },
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+/// v14.1.0 (#418 replication read) — Postgres row →
+/// [`crate::federation::SignedIdentityOccurrence`]. Reconstructs the signature
+/// container from the stored JSONB `{attesting_key_id, signed_envelope,
+/// signature}` columns. The extra columns are read before delegating to
+/// [`pg_row_to_identity_occurrence`], which consumes `row`. Callers gate on
+/// non-NULL sig columns.
+fn pg_row_to_signed_identity_occurrence(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::SignedIdentityOccurrence, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let attesting_key_id: String = row.safe_get_with("attesting_key_id", mk_err)?;
+    let signed_envelope: serde_json::Value = row.safe_get_with("signed_envelope", mk_err)?;
+    let signature_value: serde_json::Value = row.safe_get_with("signature", mk_err)?;
+    let signature = serde_json::from_value(signature_value)
+        .map_err(|e| crate::federation::Error::Backend(format!("signature decode: {e}")))?;
+    let identity_occurrence = pg_row_to_identity_occurrence(row)?;
+    Ok(crate::federation::SignedIdentityOccurrence {
+        identity_occurrence,
+        attesting_key_id,
+        signed_envelope,
+        signature,
     })
 }
 

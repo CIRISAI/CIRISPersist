@@ -5,6 +5,40 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [14.1.0] — 2026-07-11 — Signed-occurrence replication READ: `list_signed_identity_occurrences_for` (completes #418)
+
+### Added (the missing replication half)
+- **#418 (completing) — `FederationDirectory::list_signed_identity_occurrences_for(identity_key_id)`.**
+  v14.0.0 made `put_identity_occurrence` verify a hybrid signature over the
+  producer's exact envelope and stored the `{attesting_key_id, signed_envelope,
+  signature}` container (V102) — but the **read** side
+  (`list_identity_occurrences_for` / `_active`) returns bare
+  `IdentityOccurrence`, dropping the signature. The signature only ever existed
+  on the put **input**. A transport-layer replicator (CIRISEdge#305) that
+  re-publishes an occurrence to a peer **cannot re-sign it** — it holds the
+  transport signer, not the identity's federation key — so it must re-wrap the
+  already-signed tuple **byte-exact**. This method reconstructs
+  `SignedIdentityOccurrence` from the stored columns so the peer's
+  `put_identity_occurrence` gate re-verifies over the same `signed_envelope`.
+- **Signed-put only.** Trusted-local rows
+  (`put_identity_occurrence_local`, signature columns NULL) are **omitted** —
+  you can only signed-replicate what was signed-put.
+- **Byte-exact round-trip is load-bearing.** `signed_envelope` is stored/returned
+  as-is; the gate JCS-canonicalizes it on both sides, so storage key-order is
+  immaterial and the signature re-verifies. New sqlite test
+  `list_signed_occurrences_roundtrips_through_the_put_gate` proves put→list→
+  re-put-on-a-fresh-peer passes the gate, and that a trusted-local row is omitted.
+
+### Surface
+- **Backend-symmetric** across sqlite / postgres / memory (memory keeps a parallel
+  signature map, superseded in lockstep with the projection under
+  last-signed-wins). Default trait impl errors; backends override.
+- **ABI-stable directory capsule** (#320): new append-only
+  `DirectoryOp::ListSignedIdentityOccurrencesFor` + `DirectoryOpResult::
+  SignedIdentityOccurrences`, routed in the capsule proxy (the embedded edge's
+  actual surface). PyO3: `list_signed_identity_occurrences_for_json`.
+- No schema change (reads the V102 columns); no verify re-pin (stays 8.12.0).
+
 ## [14.0.0] — 2026-07-10 — SIGNED identity occurrences: verify KEX pubkeys on put, close the content-MITM (#418, occurrence-KEX arc 2/4) — BREAKING
 
 ### Security (the fix)
