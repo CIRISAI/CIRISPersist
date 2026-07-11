@@ -18839,8 +18839,7 @@ mod tests {
         let (_mp, ml_pub) = ciris_crypto::ml_kem::generate_keypair().unwrap();
 
         let occ = |occ_key: &str, enc: Option<EncryptionPubkeys>| {
-            crate::federation::SignedIdentityOccurrence {
-                identity_occurrence: crate::federation::IdentityOccurrence {
+             crate::federation::IdentityOccurrence {
                     identity_key_id: root.clone(),
                     occurrence_key_id: occ_key.into(),
                     device_class: crate::federation::types::device_class::AGENT.into(),
@@ -18848,12 +18847,12 @@ mod tests {
                     asserted_at: now,
                     valid_until: None,
                     encryption_pubkeys: enc,
+                    transport_binding: None,
                     persist_row_hash: String::new(),
-                },
-            }
+                }
         };
         backend
-            .put_identity_occurrence(occ(
+            .put_identity_occurrence_local(occ(
                 &keyed,
                 Some(EncryptionPubkeys {
                     x25519_base64: B64.encode(x_pub),
@@ -18863,7 +18862,7 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_identity_occurrence(occ(&bare, None))
+            .put_identity_occurrence_local(occ(&bare, None))
             .await
             .unwrap();
 
@@ -18964,8 +18963,7 @@ mod tests {
         let keyed = |occ_key: &str, identity: &str, seed: u8| {
             let x_pub = ciris_crypto::x25519::public_from_secret(&[seed; 32]);
             let (_mp, ml_pub) = ciris_crypto::ml_kem::generate_keypair().unwrap();
-            crate::federation::SignedIdentityOccurrence {
-                identity_occurrence: crate::federation::IdentityOccurrence {
+             crate::federation::IdentityOccurrence {
                     identity_key_id: identity.into(),
                     occurrence_key_id: occ_key.into(),
                     device_class: crate::federation::types::device_class::AGENT.into(),
@@ -18976,12 +18974,11 @@ mod tests {
                         x25519_base64: B64.encode(x_pub),
                         ml_kem_768_base64: B64.encode(&ml_pub),
                     }),
+                    transport_binding: None,
                     persist_row_hash: String::new(),
-                },
-            }
+                }
         };
-        let bare = |occ_key: &str, identity: &str| crate::federation::SignedIdentityOccurrence {
-            identity_occurrence: crate::federation::IdentityOccurrence {
+        let bare = |occ_key: &str, identity: &str|  crate::federation::IdentityOccurrence {
                 identity_key_id: identity.into(),
                 occurrence_key_id: occ_key.into(),
                 device_class: crate::federation::types::device_class::AGENT.into(),
@@ -18989,13 +18986,13 @@ mod tests {
                 asserted_at: now,
                 valid_until: None,
                 encryption_pubkeys: None,
+                transport_binding: None,
                 persist_row_hash: String::new(),
-            },
-        };
+            };
 
         // alice founds the family + writes a family blob.
         backend
-            .put_identity_occurrence(keyed(&alice_p, &alice, 0x11))
+            .put_identity_occurrence_local(keyed(&alice_p, &alice, 0x11))
             .await
             .unwrap();
         let family = |members: Vec<&str>| crate::federation::SignedFamily {
@@ -19032,7 +19029,7 @@ mod tests {
 
         // bob registers a KEYED occurrence → gains access via the walk.
         backend
-            .put_identity_occurrence(keyed(&bob_p, &bob, 0x22))
+            .put_identity_occurrence_local(keyed(&bob_p, &bob, 0x22))
             .await
             .unwrap();
         let observed = chrono::Utc::now();
@@ -19055,7 +19052,7 @@ mod tests {
 
         // carol registers a KEYLESS occurrence → fail-secure excluded.
         backend
-            .put_identity_occurrence(bare(&carol_p, &carol))
+            .put_identity_occurrence_local(bare(&carol_p, &carol))
             .await
             .unwrap();
         let observed2 = chrono::Utc::now();
@@ -19151,8 +19148,7 @@ mod tests {
         let keyed = |occ_key: &str, identity: &str, seed: u8| {
             let x_pub = ciris_crypto::x25519::public_from_secret(&[seed; 32]);
             let (_mp, ml_pub) = ciris_crypto::ml_kem::generate_keypair().unwrap();
-            crate::federation::SignedIdentityOccurrence {
-                identity_occurrence: crate::federation::IdentityOccurrence {
+             crate::federation::IdentityOccurrence {
                     identity_key_id: identity.into(),
                     occurrence_key_id: occ_key.into(),
                     device_class: crate::federation::types::device_class::AGENT.into(),
@@ -19163,12 +19159,11 @@ mod tests {
                         x25519_base64: B64.encode(x_pub),
                         ml_kem_768_base64: B64.encode(&ml_pub),
                     }),
+                    transport_binding: None,
                     persist_row_hash: String::new(),
-                },
-            }
+                }
         };
-        let bare = |occ_key: &str, identity: &str| crate::federation::SignedIdentityOccurrence {
-            identity_occurrence: crate::federation::IdentityOccurrence {
+        let bare = |occ_key: &str, identity: &str|  crate::federation::IdentityOccurrence {
                 identity_key_id: identity.into(),
                 occurrence_key_id: occ_key.into(),
                 device_class: crate::federation::types::device_class::AGENT.into(),
@@ -19176,15 +19171,15 @@ mod tests {
                 asserted_at: now,
                 valid_until: None,
                 encryption_pubkeys: None,
+                transport_binding: None,
                 persist_row_hash: String::new(),
-            },
-        };
+            };
         backend
-            .put_identity_occurrence(keyed(&alice_p, &alice, 0x11))
+            .put_identity_occurrence_local(keyed(&alice_p, &alice, 0x11))
             .await
             .unwrap();
         backend
-            .put_identity_occurrence(bare(&bob_p, &bob))
+            .put_identity_occurrence_local(bare(&bob_p, &bob))
             .await
             .unwrap();
 
@@ -19643,8 +19638,7 @@ mod tests {
         let keyed = |occ_key: &str, identity: &str, seed: u8| {
             let x_pub = ciris_crypto::x25519::public_from_secret(&[seed; 32]);
             let (_mp, ml_pub) = ciris_crypto::ml_kem::generate_keypair().unwrap();
-            crate::federation::SignedIdentityOccurrence {
-                identity_occurrence: crate::federation::IdentityOccurrence {
+             crate::federation::IdentityOccurrence {
                     identity_key_id: identity.into(),
                     occurrence_key_id: occ_key.into(),
                     device_class: crate::federation::types::device_class::AGENT.into(),
@@ -19655,12 +19649,12 @@ mod tests {
                         x25519_base64: B64.encode(x_pub),
                         ml_kem_768_base64: B64.encode(&ml_pub),
                     }),
+                    transport_binding: None,
                     persist_row_hash: String::new(),
-                },
-            }
+                }
         };
         backend
-            .put_identity_occurrence(keyed(&alice_p, &alice, 0x11))
+            .put_identity_occurrence_local(keyed(&alice_p, &alice, 0x11))
             .await
             .unwrap();
         // Roster starts with alice ONLY — bob is genuinely new.
@@ -19689,7 +19683,7 @@ mod tests {
         assert_eq!(blob1.granted, vec![alice_p.clone()]);
 
         backend
-            .put_identity_occurrence(keyed(&bob_p, &bob, 0x22))
+            .put_identity_occurrence_local(keyed(&bob_p, &bob, 0x22))
             .await
             .unwrap();
         let rk = rekey_family_member_add(&backend, &fam, &bob, chrono::Utc::now())
@@ -29420,8 +29414,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let occ = |o: &str| SignedIdentityOccurrence {
-            identity_occurrence: IdentityOccurrence {
+        let occ = |o: &str|  IdentityOccurrence {
                 identity_key_id: root.clone(),
                 occurrence_key_id: o.to_string(),
                 device_class: crate::federation::types::device_class::PHONE.into(),
@@ -29429,11 +29422,11 @@ mod tests {
                 asserted_at: "2026-06-01T00:00:00Z".parse().unwrap(),
                 valid_until: None,
                 encryption_pubkeys: None,
+                transport_binding: None,
                 persist_row_hash: String::new(),
-            },
-        };
-        backend.put_identity_occurrence(occ(&phone)).await.unwrap();
-        backend.put_identity_occurrence(occ(&laptop)).await.unwrap();
+            };
+        backend.put_identity_occurrence_local(occ(&phone)).await.unwrap();
+        backend.put_identity_occurrence_local(occ(&laptop)).await.unwrap();
 
         // Past-effective revocation of phone.
         backend
@@ -29956,8 +29949,7 @@ mod tests {
         let x25519 = B64.encode([7u8; 32]);
         let ml_kem = B64.encode([9u8; 1184]);
         backend
-            .put_identity_occurrence(SignedIdentityOccurrence {
-                identity_occurrence: crate::federation::IdentityOccurrence {
+            .put_identity_occurrence_local( crate::federation::IdentityOccurrence {
                     identity_key_id: root.clone(),
                     occurrence_key_id: occ.clone(),
                     device_class: crate::federation::types::device_class::AGENT.into(),
@@ -29968,9 +29960,9 @@ mod tests {
                         x25519_base64: x25519.clone(),
                         ml_kem_768_base64: ml_kem.clone(),
                     }),
+                    transport_binding: None,
                     persist_row_hash: String::new(),
-                },
-            })
+                })
             .await
             .unwrap();
         let resolved = backend
