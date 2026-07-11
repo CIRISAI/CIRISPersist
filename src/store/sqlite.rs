@@ -2183,6 +2183,9 @@ impl SqliteBackend {
         // accord-holder scrubber. (The scrub_key_id != key_id guard above is
         // necessary but not sufficient — the scrubber must be in the anchor.)
         crate::federation::admission::check_canonical_role_admission(self, &row).await?;
+        // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
+        // co-scrub gate as `canonical`. Fail-closed before any write.
+        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         // Resolve the existing row + classify the transition.
@@ -2592,6 +2595,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // INSERT (verify-before-mutation). Backend-symmetric with Postgres +
         // memory.
         crate::federation::admission::check_canonical_role_admission(self, &row).await?;
+        // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
+        // co-scrub gate as `canonical`. Fail-closed before any write.
+        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
 
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 

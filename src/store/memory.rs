@@ -1338,6 +1338,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // non-anchor-scrubbed `canonical` claim leaves no trace. Backend-
         // symmetric with SQLite + Postgres.
         crate::federation::admission::check_canonical_role_admission(self, &row).await?;
+        // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
+        // co-scrub gate as `canonical`. Fail-closed before any write.
+        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
         // Server-computed hash (excludes the field itself).
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let mut state = self.state.lock().expect("memory backend lock");

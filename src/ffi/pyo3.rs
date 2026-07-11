@@ -25202,6 +25202,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::CanonicalRoleNotAccordConferred { .. } => {
             PyValueError::new_err(kind)
         }
+        // #422 — self-asserting `infra:attest` without the accord co-scrub is
+        // the same class of caller-side authorization refusal; ValueError (4xx).
+        crate::federation::Error::InfraAttestRoleNotAccordConferred { .. } => {
+            PyValueError::new_err(kind)
+        }
         // v13.1.0 (CIRISPersist#377) — a re-add of a withdrawn canonical
         // (revocation-wins gate consult) and an invalid withdraw/supersede
         // authority (unauthorized decision / payload not committing to the
