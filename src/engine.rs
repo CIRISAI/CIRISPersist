@@ -3213,7 +3213,11 @@ impl Engine {
         let now = chrono::Utc::now();
         let directory = self.federation_directory();
 
-        // (1) Co-admit both occurrences under the one identity key.
+        // (1) Co-admit both occurrences under the one identity key. These are
+        // engine-internal, content-only (DEK-cascade KEX target, no reticulum
+        // transport) writes on behalf of the LOCAL user — not peer-received, so
+        // they take the trusted-local path (#418 ask 4 grandfather-local), NOT
+        // the signature gate (which requires a transport binding they lack).
         for occ in [&input.app, &input.agent] {
             let row = IdentityOccurrence {
                 identity_key_id: input.identity_key_id.clone(),
@@ -3223,13 +3227,10 @@ impl Engine {
                 asserted_at: now,
                 valid_until: None,
                 encryption_pubkeys: occ.encryption_pubkeys.clone(),
+                transport_binding: None,
                 persist_row_hash: String::new(),
             };
-            directory
-                .put_identity_occurrence(SignedIdentityOccurrence {
-                    identity_occurrence: row,
-                })
-                .await?;
+            directory.put_identity_occurrence_local(row).await?;
         }
 
         // (2) Self-DEK cascade to both newcomers (§8.1.12.4). Composes

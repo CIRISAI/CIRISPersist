@@ -3549,6 +3549,69 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         Ok(())
     }
 
+    async fn put_identity_occurrence_local(
+        &self,
+        occurrence: crate::federation::IdentityOccurrence,
+    ) -> Result<(), crate::federation::Error> {
+        // #418 — trusted-local (grandfathered) write: NO signature gate, signed
+        // columns NULL. Used only by engine-internal self-writes; never reached
+        // from the replication apply.
+        let mut row = occurrence;
+        crate::federation::check_device_class(&row.device_class)?;
+        crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let (enc_x25519, enc_ml_kem) = match &row.encryption_pubkeys {
+            Some(k) => (
+                Some(k.x25519_base64.clone()),
+                Some(k.ml_kem_768_base64.clone()),
+            ),
+            None => (None, None),
+        };
+        let transport_binding_json = match &row.transport_binding {
+            Some(tb) => Some(serde_json::to_string(tb).map_err(|e| {
+                crate::federation::Error::Backend(format!("transport_binding: {e}"))
+            })?),
+            None => None,
+        };
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO federation_identity_occurrences (\
+                    identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT(identity_key_id, occurrence_key_id) DO UPDATE SET \
+                    device_class = excluded.device_class, \
+                    hardware_attestation = excluded.hardware_attestation, \
+                    asserted_at = excluded.asserted_at, \
+                    valid_until = excluded.valid_until, \
+                    persist_row_hash = excluded.persist_row_hash, \
+                    pubkey_x25519_base64 = excluded.pubkey_x25519_base64, \
+                    pubkey_ml_kem_768_base64 = excluded.pubkey_ml_kem_768_base64, \
+                    transport_binding = excluded.transport_binding",
+                rusqlite::params![
+                    row.identity_key_id,
+                    row.occurrence_key_id,
+                    row.device_class,
+                    row.hardware_attestation,
+                    row.asserted_at.to_rfc3339(),
+                    row.valid_until.map(|t| t.to_rfc3339()),
+                    row.persist_row_hash,
+                    enc_x25519,
+                    enc_ml_kem,
+                    transport_binding_json,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("put_identity_occurrence_local: {e}"))
+        })?;
+        Ok(())
+    }
+
     async fn list_identity_occurrences_for(
         &self,
         identity_key_id: &str,

@@ -737,6 +737,26 @@ pub trait FederationDirectory: Send + Sync {
         occurrence: SignedIdentityOccurrence,
     ) -> Result<(), Error>;
 
+    /// v14.0.0 (CIRISPersist#418, issue ask 4) — write a **trusted-local**
+    /// occurrence, bypassing the [`Self::put_identity_occurrence`] signature
+    /// gate. For engine-internal writes on behalf of the local user
+    /// (`Engine::self_at_login`, the HTTP self-bind) where the occurrence is
+    /// **content-only** (a DEK-cascade KEX target with no reticulum transport)
+    /// and locally produced — NOT peer-received, so not the content-MITM threat
+    /// the gate closes. Grandfathered: the `attesting_key_id`/`signed_envelope`/
+    /// `signature` columns are stored NULL. **Never reachable from the
+    /// replication apply** (the bridge only calls the gated path), so a peer
+    /// cannot forge a local write. Default impl errors; backends override.
+    async fn put_identity_occurrence_local(
+        &self,
+        occurrence: types::IdentityOccurrence,
+    ) -> Result<(), Error> {
+        let _ = occurrence;
+        Err(Error::Backend(
+            "put_identity_occurrence_local not implemented for this backend".into(),
+        ))
+    }
+
     /// v3.12.0 — list every currently-stored occurrence of
     /// `identity_key_id`. The DEK-cascade fan-out path
     /// (#152 v3.13+): when a `cohort_scope: self` Contribution
