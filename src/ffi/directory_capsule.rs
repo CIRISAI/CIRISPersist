@@ -489,6 +489,19 @@ pub enum DirectoryOp {
         /// The identity `key_id` whose signed occurrences to enumerate.
         identity_key_id: String,
     },
+    /// [`FederationDirectory::list_signed_records`] (#425) — the uniform signed
+    /// read: every replicated record of `kind` for `subject_key_id` as a
+    /// byte-exact [`SignedReplicatedRecord`](crate::federation::namespace::SignedReplicatedRecord).
+    /// The edge replication engine sweeps a subject across
+    /// [`ReplicatedKind::all`](crate::federation::namespace::ReplicatedKind::all)
+    /// through this ONE op instead of a bespoke selector per plane. Result rides
+    /// the new `SignedReplicatedRecords` variant. APPEND-ONLY.
+    ListSignedRecords {
+        /// Which replicated CEG object kind to fetch.
+        kind: crate::federation::namespace::ReplicatedKind,
+        /// The subject `key_id` whose records to enumerate.
+        subject_key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -563,6 +576,9 @@ pub enum DirectoryOpResult {
     /// occurrences with their signature container, for transport replication.
     /// APPEND-ONLY.
     SignedIdentityOccurrences(Vec<crate::federation::SignedIdentityOccurrence>),
+    /// `list_signed_records` (#425) — the uniform per-kind signed read.
+    /// APPEND-ONLY.
+    SignedReplicatedRecords(Vec<crate::federation::namespace::SignedReplicatedRecord>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -682,6 +698,13 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
+        DirectoryOp::ListSignedRecords {
+            kind,
+            subject_key_id,
+        } => match dir.list_signed_records(kind, &subject_key_id).await {
+            Ok(v) => DirectoryOpResult::SignedReplicatedRecords(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
         DirectoryOp::PutLocationProof { proof } => match dir.put_location_proof(proof).await {
             Ok(()) => DirectoryOpResult::Unit,
             Err(e) => DirectoryOpResult::Err(e.to_string()),
@@ -1945,6 +1968,27 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::SignedIdentityOccurrences(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn list_signed_records(
+        &self,
+        kind: crate::federation::namespace::ReplicatedKind,
+        subject_key_id: &str,
+    ) -> Result<Vec<crate::federation::namespace::SignedReplicatedRecord>, Error> {
+        // #425 uniform signed read — routed so the embedded edge's one
+        // replication engine fetches every kind byte-exact through the ABI.
+        match self
+            .run_op(&DirectoryOp::ListSignedRecords {
+                kind,
+                subject_key_id: subject_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::SignedReplicatedRecords(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),
