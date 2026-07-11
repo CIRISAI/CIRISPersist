@@ -783,11 +783,27 @@ pub trait FederationDirectory: Send + Sync {
         occurrence_key_id: &str,
     ) -> Result<Option<EncryptionPubkeys>, Error> {
         let now = chrono::Utc::now();
-        Ok(self
-            .lookup_identity_for_occurrence(occurrence_key_id)
+        let Some(occ) = self.lookup_identity_for_occurrence(occurrence_key_id).await? else {
+            return Ok(None);
+        };
+        // Validity window (§10.1.4 fail-secure exclusion).
+        if occ.valid_until.is_some_and(|vu| vu <= now) {
+            return Ok(None);
+        }
+        // v14.0.0 (CIRISPersist#418) — REVOCATION-AWARE seal lookup. This is the
+        // single per-occurrence lookup used for SEALING; without the revocation
+        // filter it returns the KEX key of a REVOKED occurrence, and content
+        // seals to a key the identity has repudiated (fail-open). An admitted
+        // (signed) revocation whose `effective_at <= now` fail-closed excludes it.
+        let revoked = self
+            .list_identity_occurrence_revocations_for(&occ.identity_key_id)
             .await?
-            .filter(|o| o.valid_until.is_none_or(|vu| vu > now))
-            .and_then(|o| o.encryption_pubkeys))
+            .into_iter()
+            .any(|r| r.occurrence_key_id == occurrence_key_id && r.effective_at <= now);
+        if revoked {
+            return Ok(None);
+        }
+        Ok(occ.encryption_pubkeys)
     }
 
     /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — admit a

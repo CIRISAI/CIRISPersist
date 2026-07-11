@@ -3460,7 +3460,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         occurrence: crate::federation::SignedIdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
-        let mut row = occurrence.identity_occurrence;
+        // v14.0.0 (CIRISPersist#418) — verify the hybrid signature over the exact
+        // producer envelope, the signer's authority, and §5.6.8.8.2 C4 key
+        // separation BEFORE any write. ONE gate for HTTP + wire; fail-secure.
+        crate::federation::admission::verify_signed_identity_occurrence(self, &occurrence).await?;
+
+        let crate::federation::SignedIdentityOccurrence {
+            identity_occurrence: mut row,
+            attesting_key_id,
+            signed_envelope,
+            signature,
+        } = occurrence;
         crate::federation::check_device_class(&row.device_class)?;
         crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
@@ -3471,15 +3481,43 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ),
             None => (None, None),
         };
+        let signed_envelope_json = serde_json::to_string(&signed_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
+        let signature_json = serde_json::to_string(&signature)
+            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
+        let transport_binding_json = match &row.transport_binding {
+            Some(tb) => Some(serde_json::to_string(tb).map_err(|e| {
+                crate::federation::Error::Backend(format!("transport_binding: {e}"))
+            })?),
+            None => None,
+        };
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
+            // Last-signed-wins: UPSERT only when the incoming `asserted_at` is
+            // strictly newer (RFC-3339 UTC sorts lexically == chronologically).
+            // A stale/equal replay is a safe no-op — a poisoned or older signed
+            // row can never overwrite the current one (#418 anti-first-writer).
             conn.execute(
                 "INSERT INTO federation_identity_occurrences (\
                     identity_key_id, occurrence_key_id, device_class, \
                     hardware_attestation, asserted_at, valid_until, persist_row_hash, \
-                    pubkey_x25519_base64, pubkey_ml_kem_768_base64\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, \
+                    attesting_key_id, signed_envelope, signature, transport_binding\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+                 ON CONFLICT(identity_key_id, occurrence_key_id) DO UPDATE SET \
+                    device_class = excluded.device_class, \
+                    hardware_attestation = excluded.hardware_attestation, \
+                    asserted_at = excluded.asserted_at, \
+                    valid_until = excluded.valid_until, \
+                    persist_row_hash = excluded.persist_row_hash, \
+                    pubkey_x25519_base64 = excluded.pubkey_x25519_base64, \
+                    pubkey_ml_kem_768_base64 = excluded.pubkey_ml_kem_768_base64, \
+                    attesting_key_id = excluded.attesting_key_id, \
+                    signed_envelope = excluded.signed_envelope, \
+                    signature = excluded.signature, \
+                    transport_binding = excluded.transport_binding \
+                 WHERE excluded.asserted_at > federation_identity_occurrences.asserted_at",
                 rusqlite::params![
                     row.identity_key_id,
                     row.occurrence_key_id,
@@ -3490,6 +3528,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.persist_row_hash,
                     enc_x25519,
                     enc_ml_kem,
+                    attesting_key_id,
+                    signed_envelope_json,
+                    signature_json,
+                    transport_binding_json,
                 ],
             )?;
             Ok(())
@@ -3518,7 +3560,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             let mut stmt = conn.prepare(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
                         hardware_attestation, asserted_at, valid_until, persist_row_hash, \
-                        pubkey_x25519_base64, pubkey_ml_kem_768_base64 \
+                        pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding \
                      FROM federation_identity_occurrences \
                      WHERE identity_key_id = ?1 \
                      ORDER BY occurrence_key_id ASC",
@@ -3542,7 +3584,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             conn.query_row(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
                         hardware_attestation, asserted_at, valid_until, persist_row_hash, \
-                        pubkey_x25519_base64, pubkey_ml_kem_768_base64 \
+                        pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding \
                      FROM federation_identity_occurrences \
                      WHERE occurrence_key_id = ?1 LIMIT 1",
                 [&key],
@@ -10991,6 +11033,20 @@ fn sqlite_row_to_identity_occurrence(
     let valid_until: Option<String> = row.get("valid_until")?;
     let enc_x25519: Option<String> = row.get("pubkey_x25519_base64")?;
     let enc_ml_kem: Option<String> = row.get("pubkey_ml_kem_768_base64")?;
+    // #418 — transport_binding is a nullable JSON column (grandfathered rows
+    // are NULL); a malformed blob is a read-time backend error, not silently
+    // dropped.
+    let transport_binding_json: Option<String> = row.get("transport_binding")?;
+    let transport_binding = match transport_binding_json {
+        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                12,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })?),
+        None => None,
+    };
     Ok(crate::federation::IdentityOccurrence {
         identity_key_id: row.get("identity_key_id")?,
         occurrence_key_id: row.get("occurrence_key_id")?,
@@ -10999,6 +11055,7 @@ fn sqlite_row_to_identity_occurrence(
         asserted_at: parse_rfc3339(&asserted_at),
         valid_until: valid_until.as_deref().map(parse_rfc3339),
         encryption_pubkeys: encryption_pubkeys_from_cols(enc_x25519, enc_ml_kem),
+        transport_binding,
         persist_row_hash: row.get("persist_row_hash")?,
     })
 }
