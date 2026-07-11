@@ -18801,11 +18801,11 @@ mod tests {
         // Two occurrences of alice-root.
         for occ in ["alice-phone", "alice-laptop"] {
             backend
-                .put_identity_occurrence_local( fed_identity_occurrence(
-                        "alice-root",
-                        occ,
-                        crate::federation::types::device_class::PHONE,
-                    ))
+                .put_identity_occurrence_local(fed_identity_occurrence(
+                    "alice-root",
+                    occ,
+                    crate::federation::types::device_class::PHONE,
+                ))
                 .await
                 .unwrap();
         }
@@ -18950,18 +18950,17 @@ mod tests {
         }
         let x25519 = B64.encode([7u8; 32]); // valid 32-byte x25519
         let ml_kem = B64.encode([9u8; 1184]); // valid 1184-byte ML-KEM-768
-        let occ =
-            |k: &str, enc: Option<EncryptionPubkeys>|  crate::federation::IdentityOccurrence {
-                    identity_key_id: "root".into(),
-                    occurrence_key_id: k.into(),
-                    device_class: crate::federation::types::device_class::AGENT.into(),
-                    hardware_attestation: None,
-                    asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
-                    valid_until: None,
-                    encryption_pubkeys: enc,
-                    transport_binding: None,
-                    persist_row_hash: String::new(),
-                };
+        let occ = |k: &str, enc: Option<EncryptionPubkeys>| crate::federation::IdentityOccurrence {
+            identity_key_id: "root".into(),
+            occurrence_key_id: k.into(),
+            device_class: crate::federation::types::device_class::AGENT.into(),
+            hardware_attestation: None,
+            asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            encryption_pubkeys: enc,
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        };
 
         // Occurrence WITH encryption keys → round-trips + resolves.
         backend
@@ -19065,18 +19064,17 @@ mod tests {
         let x_pub = ciris_crypto::x25519::public_from_secret(&x_priv);
         let (_ml_priv, ml_pub) = ciris_crypto::ml_kem::generate_keypair().unwrap();
 
-        let occ =
-            |k: &str, enc: Option<EncryptionPubkeys>|  crate::federation::IdentityOccurrence {
-                    identity_key_id: "root".into(),
-                    occurrence_key_id: k.into(),
-                    device_class: crate::federation::types::device_class::AGENT.into(),
-                    hardware_attestation: None,
-                    asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
-                    valid_until: None,
-                    encryption_pubkeys: enc,
-                    transport_binding: None,
-                    persist_row_hash: String::new(),
-                };
+        let occ = |k: &str, enc: Option<EncryptionPubkeys>| crate::federation::IdentityOccurrence {
+            identity_key_id: "root".into(),
+            occurrence_key_id: k.into(),
+            device_class: crate::federation::types::device_class::AGENT.into(),
+            hardware_attestation: None,
+            asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            encryption_pubkeys: enc,
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        };
         backend
             .put_identity_occurrence_local(occ(
                 "occ-keyed",
@@ -19200,17 +19198,17 @@ mod tests {
         let (_mp, ml_pub) = ciris_crypto::ml_kem::generate_keypair().unwrap();
 
         let occ = |identity: &str, occ_key: &str, enc: Option<EncryptionPubkeys>| {
-             crate::federation::IdentityOccurrence {
-                    identity_key_id: identity.into(),
-                    occurrence_key_id: occ_key.into(),
-                    device_class: crate::federation::types::device_class::AGENT.into(),
-                    hardware_attestation: None,
-                    asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
-                    valid_until: None,
-                    encryption_pubkeys: enc,
-                    transport_binding: None,
-                    persist_row_hash: String::new(),
-                }
+            crate::federation::IdentityOccurrence {
+                identity_key_id: identity.into(),
+                occurrence_key_id: occ_key.into(),
+                device_class: crate::federation::types::device_class::AGENT.into(),
+                hardware_attestation: None,
+                asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                encryption_pubkeys: enc,
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            }
         };
         backend
             .put_identity_occurrence_local(occ(
@@ -19909,6 +19907,203 @@ mod tests {
         }
     }
 
+    /// v14.0.0 (CIRISPersist#418) — the ADVERSARIAL gate test. Proves
+    /// `put_identity_occurrence` (the wire/HTTP path) cryptographically admits a
+    /// genuinely-signed occurrence and REJECTS every forgery, closing the
+    /// content-MITM where a peer fabricates a victim's KEX keys.
+    #[tokio::test]
+    async fn signed_identity_occurrence_gate_admits_valid_rejects_forged() {
+        use crate::federation::FederationDirectory;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
+        use ciris_verify_core::self_at_login::HybridSigningIdentity;
+        use ciris_verify_core::transport_binding::{
+            compute_destination_hash, produce_signed_identity_occurrence,
+        };
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // The identity signs its own occurrence (attesting_key_id == identity →
+        // signer_acts_for trivially true). Box the ML-DSA signer (large key) and
+        // build BEFORE any await (2 MB test-stack discipline).
+        let signer = Box::new(HybridSigningIdentity::new(
+            "alice",
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let member = signer.directory_member().unwrap();
+
+        // Register "alice" in federation_keys with the SIGNER's real pubkeys so
+        // the gate resolves them; register the occurrence key too (FK).
+        let mut alice = fed_key("alice", "alice", "alice");
+        alice.pubkey_ed25519_base64 = member.ed25519_public_key_base64.clone();
+        alice.pubkey_ml_dsa_65_base64 = member.mldsa65_public_key_base64.clone();
+        backend
+            .put_public_key(SignedKeyRecord { record: alice })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("alice-phone", "alice", "alice-phone"),
+            })
+            .await
+            .unwrap();
+
+        // Transport + content keys: transport-x ≠ content-KEM-x (§5.6.8.8.2 C4);
+        // a derivation-consistent RNS destination_hash.
+        let transport_ed = [0x01u8; 32];
+        let transport_x = [0x02u8; 32];
+        let content_x = [0x03u8; 32];
+        let app = "ciris.federation";
+        let aspects = vec!["announce".to_string(), "v1".to_string()];
+        let dest_hash =
+            compute_destination_hash(app, &aspects, &transport_x, &transport_ed).unwrap();
+        let tb_env = serde_json::json!({
+            "reticulum_x25519_pubkey": B64.encode(transport_x),
+            "reticulum_ed25519_pubkey": B64.encode(transport_ed),
+            "destination_hash": B64.encode(dest_hash),
+            "app_name": app,
+            "aspects": aspects,
+        });
+        let enc_env = serde_json::json!({
+            "x25519_base64": B64.encode(content_x),
+            "ml_kem_768_base64": B64.encode(vec![0x11u8; 1184]),
+        });
+        let envelope = serde_json::json!({
+            "identity_key_id": "alice",
+            "occurrence_key_id": "alice-phone",
+            "transport_destination": tb_env,
+            "encryption_pubkeys": enc_env,
+            "asserted_at": "2026-06-14T00:00:00.000Z",
+        });
+        let (signed_envelope, signature) =
+            produce_signed_identity_occurrence(signer.as_ref(), envelope)
+                .await
+                .unwrap();
+
+        // Persist's typed projection, matching the signed envelope.
+        let typed = |enc_x: &[u8]| crate::federation::IdentityOccurrence {
+            identity_key_id: "alice".into(),
+            occurrence_key_id: "alice-phone".into(),
+            device_class: crate::federation::types::device_class::AGENT.into(),
+            hardware_attestation: None,
+            asserted_at: "2026-06-14T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
+                x25519_base64: B64.encode(enc_x),
+                ml_kem_768_base64: B64.encode(vec![0x11u8; 1184]),
+            }),
+            transport_binding: Some(crate::federation::types::OccurrenceTransportBinding {
+                reticulum_x25519_pubkey_base64: B64.encode(transport_x),
+                reticulum_ed25519_pubkey_base64: B64.encode(transport_ed),
+                destination_hash_base64: B64.encode(dest_hash),
+                app_name: app.into(),
+                aspects: aspects.clone(),
+            }),
+            persist_row_hash: String::new(),
+        };
+        let signed = |occ, sig| crate::federation::SignedIdentityOccurrence {
+            identity_occurrence: occ,
+            attesting_key_id: "alice".to_string(),
+            signed_envelope: signed_envelope.clone(),
+            signature: sig,
+        };
+
+        // (1) VALID → admitted.
+        backend
+            .put_identity_occurrence(signed(typed(&content_x), signature.clone()))
+            .await
+            .expect("a genuinely-signed occurrence must be admitted");
+        assert!(backend
+            .resolve_encryption_keys("alice-phone")
+            .await
+            .unwrap()
+            .is_some());
+
+        // (2) DIVERGENT typed projection (envelope says content_x, typed claims
+        // attacker_x) → REJECTED (the MITM: sig covers only the envelope).
+        let err = backend
+            .put_identity_occurrence(signed(typed(&[0x44u8; 32]), signature.clone()))
+            .await
+            .expect_err("a typed projection diverging from the signed envelope must be rejected");
+        assert!(format!("{err}").contains("diverges"), "got {err}");
+
+        // (3) FORGED signature → REJECTED.
+        let mut bad_sig = signature.clone();
+        bad_sig.ed25519_signature_base64 = B64.encode([0u8; 64]);
+        let err = backend
+            .put_identity_occurrence(signed(typed(&content_x), bad_sig))
+            .await
+            .expect_err("a forged signature must be rejected");
+        assert_eq!(err.kind(), "federation_signature_invalid");
+
+        // (4) WRONG signer (not the identity, not an active occurrence of it) →
+        // REJECTED by signer_acts_for.
+        let mut wrong = signed(typed(&content_x), signature.clone());
+        wrong.attesting_key_id = "alice-phone".to_string(); // registered, but not alice's identity key nor an occurrence
+        let err = backend.put_identity_occurrence(wrong).await.expect_err(
+            "a signer who is neither the identity nor its active occurrence must be rejected",
+        );
+        assert_eq!(err.kind(), "federation_signature_invalid");
+    }
+
+    /// v14.0.0 (CIRISPersist#418 ask 3) — `resolve_encryption_keys` (the SEALING
+    /// lookup) must fail-CLOSED on an admitted revocation. Before this it filtered
+    /// only on `valid_until`, so content sealed to a REVOKED KEX key (fail-open).
+    #[tokio::test]
+    async fn resolve_encryption_keys_excludes_revoked_occurrence() {
+        use crate::federation::{FederationDirectory, SignedIdentityOccurrenceRevocation};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["root", "phone"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "root", k),
+                })
+                .await
+                .unwrap();
+        }
+        // A content-only occurrence with KEX keys (trusted-local path).
+        backend
+            .put_identity_occurrence_local(occ_signed("root", "phone", Some(keyed_enc(0x33))))
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .resolve_encryption_keys("phone")
+                .await
+                .unwrap()
+                .is_some(),
+            "an un-revoked occurrence resolves its KEX key"
+        );
+
+        // Revoke it (effective in the past).
+        backend
+            .put_identity_occurrence_revocation(SignedIdentityOccurrenceRevocation {
+                identity_occurrence_revocation: crate::federation::IdentityOccurrenceRevocation {
+                    identity_key_id: "root".into(),
+                    occurrence_key_id: "phone".into(),
+                    revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                    reason: Some("compromised".into()),
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            backend
+                .resolve_encryption_keys("phone")
+                .await
+                .unwrap()
+                .is_none(),
+            "a REVOKED occurrence must NOT resolve its KEX key (fail-closed seal)"
+        );
+    }
+
     /// The keystone: a newcomer self-occurrence gains access to a
     /// pre-existing self-scope blob via the retroactive ADD re-wrap, and a
     /// re-run is idempotent (adds no further grants).
@@ -20022,7 +20217,11 @@ mod tests {
         // occurrence is registered only afterwards, so the original write
         // could not reach her.
         backend
-            .put_identity_occurrence_local(occ_signed("alice", "alice-phone", Some(keyed_enc(0x33))))
+            .put_identity_occurrence_local(occ_signed(
+                "alice",
+                "alice-phone",
+                Some(keyed_enc(0x33)),
+            ))
             .await
             .unwrap();
         backend
@@ -20115,7 +20314,11 @@ mod tests {
                 .unwrap();
         }
         backend
-            .put_identity_occurrence_local(occ_signed("alice", "alice-phone", Some(keyed_enc(0x66))))
+            .put_identity_occurrence_local(occ_signed(
+                "alice",
+                "alice-phone",
+                Some(keyed_enc(0x66)),
+            ))
             .await
             .unwrap();
         // Roster starts with alice ONLY — bob is a genuinely-new member.
@@ -20210,7 +20413,11 @@ mod tests {
                 .unwrap();
         }
         backend
-            .put_identity_occurrence_local(occ_signed("alice", "alice-phone", Some(keyed_enc(0x44))))
+            .put_identity_occurrence_local(occ_signed(
+                "alice",
+                "alice-phone",
+                Some(keyed_enc(0x44)),
+            ))
             .await
             .unwrap();
         backend
@@ -20286,19 +20493,19 @@ mod tests {
             .unwrap();
 
         backend
-            .put_identity_occurrence_local( fed_identity_occurrence(
-                    "alice-root",
-                    "alice-phone",
-                    crate::federation::types::device_class::PHONE,
-                ))
+            .put_identity_occurrence_local(fed_identity_occurrence(
+                "alice-root",
+                "alice-phone",
+                crate::federation::types::device_class::PHONE,
+            ))
             .await
             .unwrap();
         backend
-            .put_identity_occurrence_local( fed_identity_occurrence(
-                    "alice-root",
-                    "alice-laptop",
-                    crate::federation::types::device_class::LAPTOP,
-                ))
+            .put_identity_occurrence_local(fed_identity_occurrence(
+                "alice-root",
+                "alice-laptop",
+                crate::federation::types::device_class::LAPTOP,
+            ))
             .await
             .unwrap();
 
@@ -20968,11 +21175,11 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_identity_occurrence_local( fed_identity_occurrence(
-                    "alice-root",
-                    "alice-phone",
-                    crate::federation::types::device_class::PHONE,
-                ))
+            .put_identity_occurrence_local(fed_identity_occurrence(
+                "alice-root",
+                "alice-phone",
+                crate::federation::types::device_class::PHONE,
+            ))
             .await
             .unwrap();
 
@@ -21014,7 +21221,7 @@ mod tests {
             .unwrap();
         let bad = fed_identity_occurrence("alice-root", "alice-watch", "wearable");
         let err = backend
-            .put_identity_occurrence_local( bad)
+            .put_identity_occurrence_local(bad)
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_device_class_rejected");

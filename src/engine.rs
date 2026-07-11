@@ -10569,17 +10569,17 @@ mod tests {
 
         // self cohort: identity_occurrences through the SAME read API.
         for occ in [&occ1, &occ2] {
-            d.put_identity_occurrence_local( types::IdentityOccurrence {
-                    identity_key_id: ident.clone(),
-                    occurrence_key_id: occ.clone(),
-                    device_class: types::device_class::SERVER.into(),
-                    hardware_attestation: None,
-                    asserted_at: joined,
-                    valid_until: None,
-                    encryption_pubkeys: None,
-                    transport_binding: None,
-                    persist_row_hash: String::new(),
-                })
+            d.put_identity_occurrence_local(types::IdentityOccurrence {
+                identity_key_id: ident.clone(),
+                occurrence_key_id: occ.clone(),
+                device_class: types::device_class::SERVER.into(),
+                hardware_attestation: None,
+                asserted_at: joined,
+                valid_until: None,
+                encryption_pubkeys: None,
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
             .await
             .expect("put_identity_occurrence");
         }
@@ -12324,17 +12324,17 @@ mod tests {
                 self_login_seed_key(engine, &occ, identity_type::AGENT).await;
                 engine
                     .federation_directory()
-                    .put_identity_occurrence_local( types::IdentityOccurrence {
-                            identity_key_id: identity_key,
-                            occurrence_key_id: occ,
-                            device_class: types::device_class::SERVER.into(),
-                            hardware_attestation: None,
-                            asserted_at: chrono::Utc::now(),
-                            valid_until: None,
-                            encryption_pubkeys: Some(keys),
-                            transport_binding: None,
-                            persist_row_hash: String::new(),
-                        })
+                    .put_identity_occurrence_local(types::IdentityOccurrence {
+                        identity_key_id: identity_key,
+                        occurrence_key_id: occ,
+                        device_class: types::device_class::SERVER.into(),
+                        hardware_attestation: None,
+                        asserted_at: chrono::Utc::now(),
+                        valid_until: None,
+                        encryption_pubkeys: Some(keys),
+                        transport_binding: None,
+                        persist_row_hash: String::new(),
+                    })
                     .await
                     .expect("put_identity_occurrence");
             }

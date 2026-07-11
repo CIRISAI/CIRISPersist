@@ -803,7 +803,10 @@ pub trait FederationDirectory: Send + Sync {
         occurrence_key_id: &str,
     ) -> Result<Option<EncryptionPubkeys>, Error> {
         let now = chrono::Utc::now();
-        let Some(occ) = self.lookup_identity_for_occurrence(occurrence_key_id).await? else {
+        let Some(occ) = self
+            .lookup_identity_for_occurrence(occurrence_key_id)
+            .await?
+        else {
             return Ok(None);
         };
         // Validity window (§10.1.4 fail-secure exclusion).

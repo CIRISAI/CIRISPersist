@@ -1359,7 +1359,11 @@ pub async fn verify_signed_identity_occurrence(
         aspects: td_env
             .get("aspects")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_owned))
+                    .collect()
+            })
             .unwrap_or_default(),
     };
     // Optional content-KEM half, from the envelope.
@@ -1373,9 +1377,11 @@ pub async fn verify_signed_identity_occurrence(
 
     // (2) The typed projection persist will STORE must equal the envelope — the
     // signature only covers the envelope, so a divergent projection is a MITM.
-    let diverges = |what: &str| Error::InvalidArgument(format!(
-        "signed identity_occurrence: typed {what} diverges from the signed envelope (rejected)"
-    ));
+    let diverges = |what: &str| {
+        Error::InvalidArgument(format!(
+            "signed identity_occurrence: typed {what} diverges from the signed envelope (rejected)"
+        ))
+    };
     if str_field(env, "identity_key_id")? != row.identity_key_id {
         return Err(diverges("identity_key_id"));
     }
@@ -1392,13 +1398,19 @@ pub async fn verify_signed_identity_occurrence(
         _ => return Err(diverges("transport_destination")),
     }
     let env_enc_x = encryption_pubkeys.as_ref().map(|e| e.x25519_base64.clone());
-    let row_enc_x = row.encryption_pubkeys.as_ref().map(|e| e.x25519_base64.clone());
+    let row_enc_x = row
+        .encryption_pubkeys
+        .as_ref()
+        .map(|e| e.x25519_base64.clone());
     if env_enc_x != row_enc_x {
         return Err(diverges("encryption_pubkeys"));
     }
 
     // (3) Verify the hybrid signature against the signer's PINNED federation key.
-    let Some(signer_key) = directory.lookup_public_key(&signed.attesting_key_id).await? else {
+    let Some(signer_key) = directory
+        .lookup_public_key(&signed.attesting_key_id)
+        .await?
+    else {
         return Err(Error::SignatureInvalid(format!(
             "signed identity_occurrence: attesting_key_id {} is not a registered federation key",
             signed.attesting_key_id

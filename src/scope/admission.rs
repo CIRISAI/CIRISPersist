@@ -236,7 +236,7 @@ mod revocation_honesty_tests {
     use crate::federation::{
         FamilyMembershipRevocation, FederationDirectory, IdentityOccurrence,
         IdentityOccurrenceRevocation, KeyRecord, SignedFamily, SignedFamilyMembershipRevocation,
-        SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
+        SignedIdentityOccurrenceRevocation, SignedKeyRecord,
     };
     use crate::signing::LocalSigner;
     use crate::Engine;
@@ -288,17 +288,17 @@ mod revocation_honesty_tests {
         for k in ["alice-root", "alice-phone", "fam-1"] {
             sq.put_public_key(key(k)).await.unwrap();
         }
-        sq.put_identity_occurrence_local( IdentityOccurrence {
-                identity_key_id: "alice-root".into(),
-                occurrence_key_id: "alice-phone".into(),
-                device_class: crate::federation::types::device_class::PHONE.into(),
-                hardware_attestation: None,
-                asserted_at: "2026-06-01T00:00:00Z".parse().unwrap(),
-                valid_until: None,
-                encryption_pubkeys: None,
-                transport_binding: None,
-                persist_row_hash: String::new(),
-            })
+        sq.put_identity_occurrence_local(IdentityOccurrence {
+            identity_key_id: "alice-root".into(),
+            occurrence_key_id: "alice-phone".into(),
+            device_class: crate::federation::types::device_class::PHONE.into(),
+            hardware_attestation: None,
+            asserted_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+            valid_until: None,
+            encryption_pubkeys: None,
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        })
         .await
         .unwrap();
         sq.put_family(SignedFamily {

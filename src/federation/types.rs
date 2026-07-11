@@ -1600,15 +1600,15 @@ pub struct IdentityOccurrence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_pubkeys: Option<EncryptionPubkeys>,
     /// v14.0.0 (CIRISPersist#418, occurrence-KEX arc 2/4) — the occurrence's
-    /// **transport binding** (RNS reticulum x25519 + ed25519 + destination_hash
-    /// + app_name/aspects), the reticulum half of the SAME signed occurrence
+    /// **transport binding** (RNS reticulum x25519, ed25519, destination_hash,
+    /// app_name, aspects): the reticulum half of the SAME signed occurrence
     /// envelope that carries [`Self::encryption_pubkeys`]. Stored here so the
-    /// occurrence is the single signed source of truth for
-    /// `{transport reticulum keys, dest_hash, content-KEM}` (authoritative over
-    /// the mutable `transport_destinations` overlay). `None` for a content-only
+    /// occurrence is the single signed source of truth for the transport
+    /// reticulum keys, dest_hash, and content-KEM (authoritative over the
+    /// mutable `transport_destinations` overlay). `None` for a content-only
     /// occurrence (no C4 check applies then). `verify_transport_binding` checks
-    /// the hybrid signature over the whole envelope + the §5.6.8.8.2 C4
-    /// separation (transport-x25519 ≠ this content-KEM x25519).
+    /// the hybrid signature over the whole envelope and the §5.6.8.8.2 C4
+    /// separation (transport-x25519 must not equal this content-KEM x25519).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_binding: Option<OccurrenceTransportBinding>,
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].

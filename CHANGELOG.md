@@ -5,6 +5,70 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [14.0.0] — 2026-07-10 — SIGNED identity occurrences: verify KEX pubkeys on put, close the content-MITM (#418, occurrence-KEX arc 2/4) — BREAKING
+
+### Security (the fix)
+- **#418 (CRITICAL content-MITM) — `SignedIdentityOccurrence` must BE signed.**
+  Before this, `put_identity_occurrence` admitted an occurrence on
+  device-class/length checks only, so the **content-tier KEX pubkeys — the root
+  of content confidentiality — were admitted from replication peers with zero
+  proof they belong to the identity**, while the signing-key plane was rigorously
+  hybrid-verified. A malicious consented peer could fabricate
+  `{identity: victim, encryption_pubkeys: attacker}`, first-writer-win it, and
+  every peer sealing to the victim's KEX keys sealed **to the attacker** (silent,
+  unrecoverable over the wire).
+- **The gate.** `put_identity_occurrence` (HTTP + wire — one gate) now verifies
+  via `ciris_verify_core::transport_binding::verify_transport_binding` (v8.12.0,
+  CIRISVerify#183) BEFORE any write: hybrid signature over `JCS(signed_envelope)`,
+  the §5.6.8.8.2 **C4** transport-x25519 ≠ content-KEM-x25519 separation, and the
+  RNS `destination_hash` recompute. **Authority is `signed_envelope`, never the
+  sender's typed projection** — persist parses the authoritative
+  transport/enc keys from the signed envelope and REJECTS a divergent typed
+  projection (else the MITM reopens via a projection carrying the attacker's
+  keys). Signer authorization (`signer_acts_for`): the signer is the identity's
+  own key or an already-active occurrence of it.
+- **Rotation: last-signed-wins.** First-writer-wins is replaced by a
+  strictly-newer-`asserted_at` UPSERT (a stale/older signed row is a safe no-op,
+  never overwriting the current one) — so a poisoned row is not permanent and key
+  rotation propagates.
+- **Revocation-aware seal.** `resolve_encryption_keys` (the per-occurrence SEALING
+  lookup) now fail-**closed** excludes an occurrence with an admitted revocation
+  (`effective_at <= now`); it previously filtered only on `valid_until`, so
+  content could seal to a REVOKED KEX key (fail-open).
+
+### BREAKING
+- `SignedIdentityOccurrence` gains `attesting_key_id`, `signed_envelope:
+  serde_json::Value`, and `signature: TransportBindingSignature`;
+  `IdentityOccurrence` gains `transport_binding: Option<OccurrenceTransportBinding>`
+  (the occurrence is now the single signed source of truth for
+  `{reticulum keys, dest_hash, content-KEM}`, authoritative over the mutable
+  `transport_destinations` overlay).
+- **verify re-pin 8.10.1 → 8.12.0** (all 6 pins; `ciris-verify` PyPI dep stays
+  `>=8,<9`).
+
+### Local / grandfather
+- Engine-internal, content-only writes (`Engine::self_at_login`, the raw-JSON FFI
+  `put_identity_occurrence_json`) take a new **trusted-local** path,
+  `put_identity_occurrence_local(IdentityOccurrence)` — no signature gate,
+  signature columns NULL. They are locally produced (not peer-received), so not
+  the MITM threat, and the replication bridge only ever calls the gated path
+  (issue ask 4). Pre-#418 rows grandfather to NULL and are not re-verified; the
+  **wire path rejects unsigned** from this version.
+- **V102** (both backends): `federation_identity_occurrences` += `attesting_key_id`,
+  `signed_envelope`, `signature`, `transport_binding` (nullable).
+
+### Tests
+- `signed_identity_occurrence_gate_admits_valid_rejects_forged` — real crypto: a
+  genuinely-signed occurrence is admitted; a **divergent typed projection** (the
+  MITM), a **forged signature**, and a **wrong signer** are each rejected.
+- `resolve_encryption_keys_excludes_revoked_occurrence` — a revoked occurrence's
+  KEX key is no longer resolvable for sealing.
+- Full suite green on both backends.
+
+### Deferred (arc-adjacent, non-blocking)
+- Revocation *signing* (a forged wire revocation is availability, not
+  confidentiality; ask-3's seal goal is met by the revocation-aware resolve).
+
 ## [13.9.1] — 2026-07-10 — drop the transport_destinations→federation_keys FK that blocked advisory bindings (#416)
 
 ### Fixed
