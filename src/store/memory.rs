@@ -1754,11 +1754,45 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         occurrence: crate::federation::SignedIdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
+        // v14.0.0 (CIRISPersist#418) — verify the signature gate BEFORE any write
+        // (before locking; the gate locks state internally). Backend-symmetric.
+        crate::federation::admission::verify_signed_identity_occurrence(self, &occurrence).await?;
         let mut row = occurrence.identity_occurrence;
-        // v3.12.0 — value-validation admission (closed-set
-        // device_class). Trust-graph admission per §5.6.8.8 is v3.13+.
         crate::federation::check_device_class(&row.device_class)?;
-        // v4.13.0 (#192) — validate optional content-encryption pubkeys.
+        crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        if !state.federation_keys.contains_key(&row.identity_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "identity_key_id {} does not exist in federation_keys",
+                row.identity_key_id
+            )));
+        }
+        if !state.federation_keys.contains_key(&row.occurrence_key_id) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "occurrence_key_id {} does not exist in federation_keys",
+                row.occurrence_key_id
+            )));
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // Last-signed-wins: only a strictly-newer asserted_at supersedes.
+        let key = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
+        let newer = state
+            .federation_identity_occurrences
+            .get(&key)
+            .is_none_or(|ex| row.asserted_at > ex.asserted_at);
+        if newer {
+            state.federation_identity_occurrences.insert(key, row);
+        }
+        Ok(())
+    }
+
+    async fn put_identity_occurrence_local(
+        &self,
+        occurrence: crate::federation::IdentityOccurrence,
+    ) -> Result<(), crate::federation::Error> {
+        // #418 — trusted-local (grandfathered) write; NO signature gate.
+        let mut row = occurrence;
+        crate::federation::check_device_class(&row.device_class)?;
         crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
         let mut state = self.state.lock().expect("memory backend lock");
         if !state.federation_keys.contains_key(&row.identity_key_id) {

@@ -3757,7 +3757,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         occurrence: crate::federation::SignedIdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
-        let mut row = occurrence.identity_occurrence;
+        // v14.0.0 (CIRISPersist#418) — verify the hybrid signature over the exact
+        // producer envelope + signer authority + C4 BEFORE any write (one gate,
+        // HTTP + wire; fail-secure). Backend-symmetric with SQLite.
+        crate::federation::admission::verify_signed_identity_occurrence(self, &occurrence).await?;
+        let crate::federation::SignedIdentityOccurrence {
+            identity_occurrence: mut row,
+            attesting_key_id,
+            signed_envelope,
+            signature,
+        } = occurrence;
         crate::federation::check_device_class(&row.device_class)?;
         crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
@@ -3768,17 +3777,41 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             ),
             None => (None, None),
         };
+        let signature_json = serde_json::to_value(&signature)
+            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
+        let transport_binding_json = match &row.transport_binding {
+            Some(tb) => Some(serde_json::to_value(tb).map_err(|e| {
+                crate::federation::Error::Backend(format!("transport_binding: {e}"))
+            })?),
+            None => None,
+        };
         let client = self
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Last-signed-wins: UPSERT only when strictly newer asserted_at; a
+        // stale/equal replay is a safe no-op (poisoned/older row can't win).
         client
             .execute(
                 "INSERT INTO cirislens.federation_identity_occurrences (\
                     identity_key_id, occurrence_key_id, device_class, \
                     hardware_attestation, asserted_at, valid_until, persist_row_hash, \
-                    pubkey_x25519_base64, pubkey_ml_kem_768_base64\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, \
+                    attesting_key_id, signed_envelope, signature, transport_binding\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                 ON CONFLICT (identity_key_id, occurrence_key_id) DO UPDATE SET \
+                    device_class = EXCLUDED.device_class, \
+                    hardware_attestation = EXCLUDED.hardware_attestation, \
+                    asserted_at = EXCLUDED.asserted_at, \
+                    valid_until = EXCLUDED.valid_until, \
+                    persist_row_hash = EXCLUDED.persist_row_hash, \
+                    pubkey_x25519_base64 = EXCLUDED.pubkey_x25519_base64, \
+                    pubkey_ml_kem_768_base64 = EXCLUDED.pubkey_ml_kem_768_base64, \
+                    attesting_key_id = EXCLUDED.attesting_key_id, \
+                    signed_envelope = EXCLUDED.signed_envelope, \
+                    signature = EXCLUDED.signature, \
+                    transport_binding = EXCLUDED.transport_binding \
+                 WHERE EXCLUDED.asserted_at > cirislens.federation_identity_occurrences.asserted_at",
                 &[
                     &row.identity_key_id,
                     &row.occurrence_key_id,
@@ -3789,6 +3822,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.persist_row_hash,
                     &enc_x25519,
                     &enc_ml_kem,
+                    &attesting_key_id,
+                    &signed_envelope,
+                    &signature_json,
+                    &transport_binding_json,
                 ],
             )
             .await
@@ -3805,6 +3842,68 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(())
     }
 
+    async fn put_identity_occurrence_local(
+        &self,
+        occurrence: crate::federation::IdentityOccurrence,
+    ) -> Result<(), crate::federation::Error> {
+        // #418 — trusted-local (grandfathered) write; NO gate, signed cols NULL.
+        let mut row = occurrence;
+        crate::federation::check_device_class(&row.device_class)?;
+        crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let (enc_x25519, enc_ml_kem) = match &row.encryption_pubkeys {
+            Some(k) => (
+                Some(k.x25519_base64.clone()),
+                Some(k.ml_kem_768_base64.clone()),
+            ),
+            None => (None, None),
+        };
+        let transport_binding_json = match &row.transport_binding {
+            Some(tb) => Some(serde_json::to_value(tb).map_err(|e| {
+                crate::federation::Error::Backend(format!("transport_binding: {e}"))
+            })?),
+            None => None,
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_identity_occurrences (\
+                    identity_key_id, occurrence_key_id, device_class, \
+                    hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                 ON CONFLICT (identity_key_id, occurrence_key_id) DO UPDATE SET \
+                    device_class = EXCLUDED.device_class, \
+                    hardware_attestation = EXCLUDED.hardware_attestation, \
+                    asserted_at = EXCLUDED.asserted_at, \
+                    valid_until = EXCLUDED.valid_until, \
+                    persist_row_hash = EXCLUDED.persist_row_hash, \
+                    pubkey_x25519_base64 = EXCLUDED.pubkey_x25519_base64, \
+                    pubkey_ml_kem_768_base64 = EXCLUDED.pubkey_ml_kem_768_base64, \
+                    transport_binding = EXCLUDED.transport_binding",
+                &[
+                    &row.identity_key_id,
+                    &row.occurrence_key_id,
+                    &row.device_class,
+                    &row.hardware_attestation,
+                    &row.asserted_at,
+                    &row.valid_until,
+                    &row.persist_row_hash,
+                    &enc_x25519,
+                    &enc_ml_kem,
+                    &transport_binding_json,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("put_identity_occurrence_local: {e}"))
+            })?;
+        Ok(())
+    }
+
     async fn list_identity_occurrences_for(
         &self,
         identity_key_id: &str,
@@ -3817,7 +3916,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .query(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
                     hardware_attestation, asserted_at, valid_until, persist_row_hash, \
-                    pubkey_x25519_base64, pubkey_ml_kem_768_base64 \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding \
                  FROM cirislens.federation_identity_occurrences \
                  WHERE identity_key_id = $1 \
                  ORDER BY occurrence_key_id ASC",
@@ -3844,7 +3943,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .query_opt(
                 "SELECT identity_key_id, occurrence_key_id, device_class, \
                     hardware_attestation, asserted_at, valid_until, persist_row_hash, \
-                    pubkey_x25519_base64, pubkey_ml_kem_768_base64 \
+                    pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding \
                  FROM cirislens.federation_identity_occurrences \
                  WHERE occurrence_key_id = $1 LIMIT 1",
                 &[&occurrence_key_id],
@@ -11061,6 +11160,14 @@ fn pg_row_to_identity_occurrence(
                 })
             }
             _ => None,
+        },
+        // #418 — nullable JSONB (grandfathered rows are NULL).
+        transport_binding: {
+            let tb: Option<serde_json::Value> =
+                row.safe_get_with("transport_binding", mk_err)?;
+            tb.map(serde_json::from_value).transpose().map_err(|e| {
+                crate::federation::Error::Backend(format!("transport_binding decode: {e}"))
+            })?
         },
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
     })

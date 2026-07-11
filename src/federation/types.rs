@@ -1858,23 +1858,18 @@ pub struct IdentityOccurrenceRevocation {
     pub persist_row_hash: String,
 }
 
-/// v14.0.0 (CIRISPersist#418) — a **signed** identity-occurrence revocation.
-/// Same signature discipline as [`SignedIdentityOccurrence`]: an admitted
-/// (signed) revocation is what `resolve_encryption_keys` honours to fail-closed
-/// exclude a revoked KEX key from sealing — so the revocation itself must be
-/// authenticated, not just shape-checked.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Wraps an [`IdentityOccurrenceRevocation`] for write submission.
+///
+/// v14.0.0 note (CIRISPersist#418): the occurrence-KEX cut signs the OCCURRENCE
+/// (the confidentiality MITM). Revocation *signing* is tracked as a follow-up
+/// (a forged wire revocation is an availability, not confidentiality, attack);
+/// the ask-3 security goal — never SEAL to a revoked KEX key — is met by the
+/// revocation-aware [`FederationDirectory::resolve_encryption_keys`](crate::federation::FederationDirectory::resolve_encryption_keys),
+/// so this wrapper is unchanged for now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedIdentityOccurrenceRevocation {
-    /// Persist's typed projection of the revocation (what gets stored), parsed
-    /// from [`Self::signed_envelope`].
+    /// The revocation being submitted.
     pub identity_occurrence_revocation: IdentityOccurrenceRevocation,
-    /// The claimed signer — the identity's own key or an active occurrence key
-    /// of the same identity (`signer_acts_for`).
-    pub attesting_key_id: String,
-    /// The EXACT revocation envelope the producer signed.
-    pub signed_envelope: serde_json::Value,
-    /// The detached hybrid signature over `JCS(signed_envelope)`.
-    pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
 }
 
 /// Removes one identity from a V059 family roster. The family's

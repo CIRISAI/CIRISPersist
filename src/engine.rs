@@ -3207,7 +3207,7 @@ impl Engine {
         use crate::federation::types::{attestation_type, cohort_scope, LocalAttestationInput};
         use crate::federation::{
             delegates_to_agent_envelope, partnership_accept_envelope, partnership_grant_envelope,
-            IdentityOccurrence, SignedIdentityOccurrence, TransportDestination,
+            IdentityOccurrence, TransportDestination,
         };
 
         let now = chrono::Utc::now();
