@@ -477,6 +477,18 @@ pub enum DirectoryOp {
         /// The dest-hash (`TransportDestination::destination`) to list claimants of.
         destination: String,
     },
+    /// [`FederationDirectory::list_signed_identity_occurrences_for`] (#418
+    /// replication read) — the signed-put occurrences of an identity, each
+    /// carrying its original `{attesting_key_id, signed_envelope, signature}`
+    /// container. The embedded edge (CIRISEdge#305) re-wraps these verbatim to
+    /// re-publish to a peer: it holds the transport signer, not the identity's
+    /// federation key, so it CANNOT re-sign — the tuple must round-trip
+    /// byte-exact. Result rides the new `SignedIdentityOccurrences` variant.
+    /// APPEND-ONLY.
+    ListSignedIdentityOccurrencesFor {
+        /// The identity `key_id` whose signed occurrences to enumerate.
+        identity_key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -547,6 +559,10 @@ pub enum DirectoryOpResult {
     /// `lookup_identity_for_occurrence` (#397) — the reverse occurrence→identity
     /// row (`None` ⇒ the key is not bound as an occurrence). APPEND-ONLY.
     IdentityOccurrence(Option<IdentityOccurrence>),
+    /// `list_signed_identity_occurrences_for` (#418) — the signed-put
+    /// occurrences with their signature container, for transport replication.
+    /// APPEND-ONLY.
+    SignedIdentityOccurrences(Vec<crate::federation::SignedIdentityOccurrence>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -654,6 +670,15 @@ pub async fn dispatch_directory_op(
         DirectoryOp::LookupIdentityForOccurrence { occurrence_key_id } => {
             match dir.lookup_identity_for_occurrence(&occurrence_key_id).await {
                 Ok(v) => DirectoryOpResult::IdentityOccurrence(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedIdentityOccurrencesFor { identity_key_id } => {
+            match dir
+                .list_signed_identity_occurrences_for(&identity_key_id)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SignedIdentityOccurrences(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -1899,6 +1924,27 @@ impl FederationDirectory for OpsDirectory {
                 }
                 Ok(v)
             }
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+    async fn list_signed_identity_occurrences_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::SignedIdentityOccurrence>, Error> {
+        // #418 replication read — routed so the embedded edge (CIRISEdge#305)
+        // can re-publish an occurrence to a peer verbatim. Edge holds only the
+        // transport signer, not the identity's federation key, so it cannot
+        // re-sign; the signed tuple must round-trip byte-exact through the ABI.
+        match self
+            .run_op(&DirectoryOp::ListSignedIdentityOccurrencesFor {
+                identity_key_id: identity_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::SignedIdentityOccurrences(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),

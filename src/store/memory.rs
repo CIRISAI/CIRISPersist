@@ -91,6 +91,21 @@ struct State {
     /// the V059 PG/SQLite composite-PK shape.
     federation_identity_occurrences:
         HashMap<(String, String), crate::federation::IdentityOccurrence>,
+    /// v14.1.0 (CIRISPersist#418, replication read) — signature container for
+    /// signed-put occurrences, keyed like `federation_identity_occurrences`
+    /// (`(attesting_key_id, signed_envelope, signature)`). Absent for
+    /// trusted-local rows, so `list_signed_identity_occurrences_for` returns
+    /// only what was signed-put. Superseded in lockstep with the projection
+    /// under last-signed-wins; preserved on a local overwrite (matching the
+    /// sqlite/postgres `DO UPDATE` that omits the sig columns).
+    federation_identity_occurrence_sigs: HashMap<
+        (String, String),
+        (
+            String,
+            serde_json::Value,
+            ciris_verify_core::transport_binding::TransportBindingSignature,
+        ),
+    >,
     /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — family
     /// rows keyed by `family_key_id`. Mirrors V059 PG/SQLite PK.
     federation_families: HashMap<String, crate::federation::Family>,
@@ -231,6 +246,7 @@ impl Default for MemoryBackend {
                 federation_goals: HashMap::new(),
                 federation_peer_metadata: HashMap::new(),
                 federation_identity_occurrences: HashMap::new(),
+                federation_identity_occurrence_sigs: HashMap::new(),
                 federation_families: HashMap::new(),
                 federation_communities: HashMap::new(),
                 federation_group_current_version: HashMap::new(),
@@ -1781,6 +1797,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .get(&key)
             .is_none_or(|ex| row.asserted_at > ex.asserted_at);
         if newer {
+            // #418 — store the signature container in lockstep so the
+            // replication read reconstructs the tuple that was put.
+            state.federation_identity_occurrence_sigs.insert(
+                key.clone(),
+                (
+                    occurrence.attesting_key_id,
+                    occurrence.signed_envelope,
+                    occurrence.signature,
+                ),
+            );
             state.federation_identity_occurrences.insert(key, row);
         }
         Ok(())
@@ -1922,6 +1948,38 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.occurrence_key_id.cmp(&b.occurrence_key_id));
+        Ok(rows)
+    }
+
+    async fn list_signed_identity_occurrences_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::SignedIdentityOccurrence>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        // #418 replication read: join each occurrence with its stored signature
+        // container; trusted-local rows (no sig entry) are omitted.
+        let mut rows: Vec<crate::federation::SignedIdentityOccurrence> = state
+            .federation_identity_occurrences
+            .iter()
+            .filter(|((id, _), _)| id == identity_key_id)
+            .filter_map(|(key, occ)| {
+                state.federation_identity_occurrence_sigs.get(key).map(
+                    |(attesting_key_id, signed_envelope, signature)| {
+                        crate::federation::SignedIdentityOccurrence {
+                            identity_occurrence: occ.clone(),
+                            attesting_key_id: attesting_key_id.clone(),
+                            signed_envelope: signed_envelope.clone(),
+                            signature: signature.clone(),
+                        }
+                    },
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.identity_occurrence
+                .occurrence_key_id
+                .cmp(&b.identity_occurrence.occurrence_key_id)
+        });
         Ok(rows)
     }
 

@@ -6987,6 +6987,54 @@ impl PyEngine {
         })
     }
 
+    /// v14.1.0 (CIRISPersist#418, replication read) — the signed-put
+    /// occurrences of `identity_key_id`, each as a full
+    /// `SignedIdentityOccurrence` JSON object (`{identity_occurrence,
+    /// attesting_key_id, signed_envelope, signature}`). A Python replicator
+    /// re-submits these verbatim to a peer's `put_identity_occurrence`; the
+    /// signature only ever existed on the put input, so it must be read back
+    /// intact rather than re-derived. Trusted-local rows are omitted.
+    fn list_signed_identity_occurrences_for_json(
+        &self,
+        py: Python<'_>,
+        identity_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let identity_key_id = identity_key_id.to_owned();
+            py.detach(move || {
+                let rows: Vec<crate::federation::SignedIdentityOccurrence> = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_signed_identity_occurrences_for(&identity_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_signed_identity_occurrences_for(&identity_key_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyValueError::new_err(format!("signed_identity_occurrences serialize: {e}"))
+                })
+            })
+        })
+    }
+
     /// v3.12.0 — reverse lookup: which identity does this
     /// `occurrence_key_id` speak for? Returns JSON `IdentityOccurrence`
     /// object or `None` (null) if the key is not bound.
