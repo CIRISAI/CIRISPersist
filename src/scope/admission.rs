@@ -135,11 +135,14 @@ pub async fn build_caller_admission(
         .await?
     {
         Some(occurrence) => {
+            // v16.0.0 (#421): THE fold comparator — a re-established
+            // occurrence (asserted after its revocation) regains identity
+            // admission; a still-revoked one speaks only for itself.
             let revoked = directory
                 .list_identity_occurrence_revocations_for(&occurrence.identity_key_id)
                 .await?
                 .into_iter()
-                .any(|r| r.occurrence_key_id == *occurrence_key_id && r.effective_at <= now);
+                .any(|r| r.revokes(&occurrence, now));
             if revoked {
                 occurrence_key_id.clone()
             } else {
@@ -236,7 +239,7 @@ mod revocation_honesty_tests {
     use crate::federation::{
         FamilyMembershipRevocation, FederationDirectory, IdentityOccurrence,
         IdentityOccurrenceRevocation, KeyRecord, SignedFamily, SignedFamilyMembershipRevocation,
-        SignedIdentityOccurrenceRevocation, SignedKeyRecord,
+        SignedKeyRecord,
     };
     use crate::signing::LocalSigner;
     use crate::Engine;
@@ -326,17 +329,17 @@ mod revocation_honesty_tests {
         assert_eq!(adm.identity_key_id, "alice-root");
         assert!(adm.family_key_ids.contains("fam-1"));
 
-        // Revoke the occurrence binding (effective in the past).
-        sq.put_identity_occurrence_revocation(SignedIdentityOccurrenceRevocation {
-            identity_occurrence_revocation: IdentityOccurrenceRevocation {
-                identity_key_id: "alice-root".into(),
-                occurrence_key_id: "alice-phone".into(),
-                revoked_at: "2026-06-02T00:00:00Z".parse().unwrap(),
-                effective_at: "2026-06-02T00:00:00Z".parse().unwrap(),
-                reason: None,
-                witness_set: vec!["alice-root".into()],
-                persist_row_hash: String::new(),
-            },
+        // Revoke the occurrence binding (effective in the past). Trusted-local
+        // write (#421): the test acts as the engine-internal path; the gated
+        // put is for wire-received, signed revocations.
+        sq.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
+            identity_key_id: "alice-root".into(),
+            occurrence_key_id: "alice-phone".into(),
+            revoked_at: "2026-06-02T00:00:00Z".parse().unwrap(),
+            effective_at: "2026-06-02T00:00:00Z".parse().unwrap(),
+            reason: None,
+            witness_set: vec!["alice-root".into()],
+            persist_row_hash: String::new(),
         })
         .await
         .unwrap();

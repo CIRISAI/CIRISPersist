@@ -2517,6 +2517,74 @@ impl Engine {
         .await
     }
 
+    /// v16.0.0 (CIRISPersist#433, CC 3.4.12) — the **adult-incapacity
+    /// guardianship** emit aperture: construct a `delegates_to(S → ward)`
+    /// carrying the CC 3.4.12 binding fields the admission predicate
+    /// ([`check_adult_incapacity_binding`](crate::federation::admission::check_adult_incapacity_binding),
+    /// green since v11.9.0/#309) demands — which [`Self::steward_bind`] /
+    /// [`Self::grant_delegation`] cannot stamp, leaving the aperture
+    /// unreachable end-to-end (#433's probe: `steward_bind` onto an
+    /// incapacitated adult rejected regardless of `delegation_purpose`).
+    ///
+    /// This helper only SHAPES the envelope; admissibility remains entirely the
+    /// gate's: the target must be a witness-attested-incapacitated adult in
+    /// every scoped `domain` (each with its `reversible_excluded` companion, or
+    /// the acute T1 `reversible_pending` path when `binding_tier` is T1 +
+    /// `legitimacy_source` is emergency), no protected domain, assessor
+    /// independence vs the steward/`petitioner_key_id`, `legitimacy_source` ∈
+    /// the closed set (NEVER the steward's signature alone), and a bounded
+    /// `valid_until` within the T2 review cadence (fail-to-liberty lapse at
+    /// read time). A capacitated adult still rejects
+    /// `target_is_self_sovereign` — the presumption of capacity.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn steward_bind_incapacity(
+        &self,
+        signer: &crate::signing::LocalSigner,
+        ward_key_id: &str,
+        domains: Vec<String>,
+        legitimacy_source: &str,
+        valid_until: &str,
+        binding_tier: Option<&str>,
+        petitioner_key_id: Option<&str>,
+    ) -> Result<String, crate::federation::Error> {
+        use crate::federation::capacity::binding_field;
+        // The base delegates_to envelope (scope = the incapacitated decision
+        // domains; a guardianship is a leaf, never a deputization)…
+        let mut envelope = crate::federation::delegates_to_envelope(ward_key_id, &domains, false);
+        // …plus the CC 3.4.12 binding fields the gate reads.
+        if let Some(obj) = envelope.as_object_mut() {
+            obj.insert(
+                binding_field::LEGITIMACY_SOURCE.to_owned(),
+                serde_json::Value::String(legitimacy_source.to_owned()),
+            );
+            obj.insert(
+                binding_field::VALID_UNTIL.to_owned(),
+                serde_json::Value::String(valid_until.to_owned()),
+            );
+            if let Some(t) = binding_tier {
+                obj.insert(
+                    binding_field::TIER.to_owned(),
+                    serde_json::Value::String(t.to_owned()),
+                );
+            }
+            if let Some(p) = petitioner_key_id {
+                obj.insert(
+                    binding_field::PETITIONER_KEY_ID.to_owned(),
+                    serde_json::Value::String(p.to_owned()),
+                );
+            }
+        }
+        let mut input = crate::federation::EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::DELEGATES_TO,
+            envelope,
+        );
+        // Keyed by recipient, like every delegation edge (the §11.10 walk +
+        // `steward_bindings_of` match by `attested_key_id`).
+        input.attested_key_id = Some(ward_key_id.to_owned());
+        self.emit_attestation(signer, input).await
+    }
+
     /// v9.3.0 (CIRISPersist#249, CEG §11.10/§11.11 appointment) — appoint
     /// `moderator_key_id` a named moderator of `community_id` for `duty`
     /// (`moderate` / `takedown` / `review`). A [`Self::grant_delegation`]
@@ -9653,6 +9721,151 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_node_agency_forbidden");
+    }
+
+    /// v16.0.0 (CIRISPersist#433, CC 3.4.12) — the adult-incapacity
+    /// guardianship aperture END-TO-END over the Engine emit path: the
+    /// (v11.9.0/#309) admission predicate was green but unreachable — plain
+    /// `steward_bind` cannot stamp the binding fields. Proves:
+    /// `steward_bind_incapacity` onto a witness-attested-incapacitated adult
+    /// ADMITS (and the ward is steward-bound); plain `steward_bind` on the
+    /// same ward still rejects (the #433 probe shape); a capacitated adult
+    /// rejects `target_is_self_sovereign` (presumption of capacity); a
+    /// protected domain is never delegable.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn steward_bind_incapacity_aperture_end_to_end_sqlite() {
+        use crate::federation::admission::steward_bindings_of;
+        use crate::federation::FederationDirectory;
+
+        let s_signer = crate::federation::tier_ingest::test_support::local_signer("guardian-S");
+        let w_signer = crate::federation::tier_ingest::test_support::local_signer("cap-witness");
+        let s = s_signer.derived_key_id();
+        let w = w_signer.derived_key_id();
+        let engine = Engine::with_signer(s_signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(user_test_key_derived_for(&s, "guardian-S"))
+            .await
+            .expect("seed steward");
+        sq.put_public_key(witness_test_key_derived_for(&w, "cap-witness"))
+            .await
+            .expect("seed witness");
+        for k in ["ward-A", "adult-B"] {
+            let mut key = sweeper_test_key(k);
+            key.record.identity_type = crate::federation::types::identity_type::USER.into();
+            sq.put_public_key(key).await.expect("seed user");
+        }
+
+        // The witness attests: S + B + A are adults; A is incapacitated
+        // (financial) with the reversible mimics ruled out. All over the REAL
+        // emit path (reserved-prefix + witness-targets-subject gates live).
+        let witness_emit = |subject: &str, token: &str, id: &str| {
+            let mut input = crate::federation::EmitAttestationInput::with_envelope(
+                token,
+                serde_json::json!({ "id": id }),
+            );
+            input.attested_key_id = Some(subject.to_owned());
+            (input, w_signer.clone())
+        };
+        for (subject, token, id) in [
+            (s.as_str(), "age_assurance:government:adult:v1", "sbi-s-age"),
+            ("ward-A", "age_assurance:government:adult:v1", "sbi-a-age"),
+            ("adult-B", "age_assurance:government:adult:v1", "sbi-b-age"),
+            (
+                "ward-A",
+                "capacity_assurance:panel:financial:incapacitated:v1",
+                "sbi-a-cap",
+            ),
+            (
+                "ward-A",
+                "capacity_assurance:reversible_excluded:financial",
+                "sbi-a-rev",
+            ),
+        ] {
+            let (input, signer) = witness_emit(subject, token, id);
+            engine
+                .emit_attestation(&signer, input)
+                .await
+                .expect("witness attestation admitted");
+        }
+
+        // (1) The #433 probe shape: plain steward_bind on the ward is STILL
+        // rejected — it cannot stamp the CC 3.4.12 binding fields.
+        let err = engine
+            .steward_bind(&s_signer, "ward-A", vec!["financial".into()], None)
+            .await
+            .expect_err("(1) plain steward_bind cannot reach the aperture");
+        assert_eq!(
+            err.kind(),
+            "federation_user_target_steward_binding_forbidden"
+        );
+
+        // (2) The aperture: a conforming CC 3.4.12 binding ADMITS end-to-end.
+        let valid_until = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        engine
+            .steward_bind_incapacity(
+                &s_signer,
+                "ward-A",
+                vec!["financial".into()],
+                "prior_will_proxy",
+                &valid_until,
+                None,
+                None,
+            )
+            .await
+            .expect("(2) a conforming adult-incapacity guardianship must ADMIT");
+        assert!(
+            steward_bindings_of(&*sq, "ward-A")
+                .await
+                .unwrap()
+                .contains(&s),
+            "(2) the ward is steward-bound to S"
+        );
+
+        // (3) Presumption of capacity: the SAME conforming shape onto a
+        // capacitated adult rejects target_is_self_sovereign.
+        let err = engine
+            .steward_bind_incapacity(
+                &s_signer,
+                "adult-B",
+                vec!["financial".into()],
+                "prior_will_proxy",
+                &valid_until,
+                None,
+                None,
+            )
+            .await
+            .expect_err("(3) a capacitated adult stays sovereign");
+        assert_eq!(
+            err.kind(),
+            "federation_user_target_steward_binding_forbidden"
+        );
+        assert!(
+            format!("{err}").contains("target_is_self_sovereign"),
+            "got {err}"
+        );
+
+        // (4) The apophatic floor: a protected domain is never delegable, even
+        // for an attested-incapacitated ward.
+        let err = engine
+            .steward_bind_incapacity(
+                &s_signer,
+                "ward-A",
+                vec!["voting".into()],
+                "prior_will_proxy",
+                &valid_until,
+                None,
+                None,
+            )
+            .await
+            .expect_err("(4) protected domains are never delegable");
+        assert!(
+            format!("{err}").contains("scope_touches_protected_domain")
+                || format!("{err}").contains("scope_exceeds_attested_domains"),
+            "got {err}"
+        );
     }
 
     // ── v12.7.0 (CIRISPersist#368 + #367, CC 3.4.11/3.4.13 + CC 3.2) ──

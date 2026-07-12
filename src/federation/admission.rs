@@ -1446,21 +1446,175 @@ pub async fn verify_signed_identity_occurrence(
     // (4) signer_acts_for — the signer is the identity itself, or an already-
     // active occurrence of the same identity (a peer can't sign a victim's
     // occurrence with its own unrelated key).
-    if signed.attesting_key_id != row.identity_key_id {
-        let acts_for = matches!(
-            directory
-                .lookup_identity_for_occurrence(&signed.attesting_key_id)
-                .await?,
-            Some(sig_occ) if sig_occ.identity_key_id == row.identity_key_id
-        );
-        if !acts_for {
-            return Err(Error::SignatureInvalid(format!(
-                "signed identity_occurrence: signer {} is neither identity {} nor an active occurrence of it",
-                signed.attesting_key_id, row.identity_key_id
-            )));
-        }
+    check_signer_acts_for(
+        directory,
+        &signed.attesting_key_id,
+        &row.identity_key_id,
+        "identity_occurrence",
+    )
+    .await
+}
+
+/// v16.0.0 (#421) — **THE `signer_acts_for` check**, shared by the signed
+/// occurrence AND signed revocation gates (one authorization rule, one place):
+/// `attesting_key_id` may act for `identity_key_id` iff it IS that identity's
+/// own key, or it is bound as an occurrence of that identity (the §11.7.4
+/// single-vouch-for-self). Anything else — including another *registered* but
+/// unrelated key — is refused: a peer cannot sign (or revoke) a victim's
+/// occurrence with its own key.
+async fn check_signer_acts_for(
+    directory: &dyn super::FederationDirectory,
+    attesting_key_id: &str,
+    identity_key_id: &str,
+    what: &str,
+) -> Result<(), Error> {
+    if attesting_key_id == identity_key_id {
+        return Ok(());
+    }
+    let acts_for = matches!(
+        directory
+            .lookup_identity_for_occurrence(attesting_key_id)
+            .await?,
+        Some(sig_occ) if sig_occ.identity_key_id == identity_key_id
+    );
+    if !acts_for {
+        return Err(Error::SignatureInvalid(format!(
+            "signed {what}: signer {attesting_key_id} is neither identity {identity_key_id} \
+             nor an active occurrence of it"
+        )));
     }
     Ok(())
+}
+
+/// v16.0.0 (CIRISPersist#421) — the SIGNED-revocation admission gate: the
+/// revocation-plane mirror of [`verify_signed_identity_occurrence`], closing the
+/// **permanent-DoS forgery** the #418 cut deferred. An unsigned revocation on
+/// the replication plane would let any consented peer fabricate
+/// `{identity: victim, occurrence: victim}` and brick the victim's sealability
+/// (`resolve_encryption_keys → None`) — worse than the occurrence MITM because
+/// it was terminal. Fail-secure; called by every
+/// `put_identity_occurrence_revocation` (HTTP + wire — one gate; edge's
+/// replication apply delegates to `put`, exactly like the occurrence).
+///
+/// **Authority is `signed_envelope`, never the sender's typed projection** —
+/// the #418 discipline verbatim. Verifies, each fail-closed:
+/// 1. the envelope carries `identity_key_id` / `occurrence_key_id` /
+///    `revoked_at` / `effective_at`, and the typed projection persist will
+///    store EQUALS them (a divergent projection is the MITM reopening);
+/// 2. the detached hybrid signature over `JCS(signed_envelope)` verifies at
+///    threshold **1-of-1** against the PINNED federation pubkeys of
+///    `attesting_key_id` ([`verify_threshold_signatures`] — the same bound-sig
+///    rule `verify_transport_binding` composes; that fn itself is NOT reusable
+///    here because it hard-requires a `transport_destination`, which a
+///    revocation envelope rightly lacks);
+/// 3. `signer_acts_for`: the signer is the identity's own key OR an
+///    already-active occurrence of the same identity — the §11.7.4
+///    single-vouch-for-self, ENFORCED (the `witness_set` only shaped it).
+///
+/// NOT feature-gated: backend-agnostic, and the MemoryBackend calls it (the
+/// #418 cfg lesson).
+///
+/// [`verify_threshold_signatures`]: ciris_verify_core::threshold::verify_threshold_signatures
+pub async fn verify_signed_identity_occurrence_revocation(
+    directory: &dyn super::FederationDirectory,
+    signed: &crate::federation::types::SignedIdentityOccurrenceRevocation,
+) -> Result<(), Error> {
+    use ciris_verify_core::threshold::{
+        verify_threshold_signatures, ThresholdMember, ThresholdSignature,
+    };
+
+    let row = &signed.identity_occurrence_revocation;
+    let env = &signed.signed_envelope;
+
+    // (1) Authoritative fields FROM the signed envelope; the typed projection
+    // must equal them (the signature covers only the envelope).
+    let str_field = |k: &str| -> Result<String, Error> {
+        env.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned())
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "signed identity_occurrence_revocation envelope missing string field `{k}`"
+                ))
+            })
+    };
+    let ts_field = |k: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
+        let s = str_field(k)?;
+        chrono::DateTime::parse_from_rfc3339(&s)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                Error::InvalidArgument(format!(
+                    "signed identity_occurrence_revocation envelope `{k}` not RFC-3339: {e}"
+                ))
+            })
+    };
+    let diverges = |what: &str| {
+        Error::InvalidArgument(format!(
+            "signed identity_occurrence_revocation: typed {what} diverges from the signed \
+             envelope (rejected)"
+        ))
+    };
+    if str_field("identity_key_id")? != row.identity_key_id {
+        return Err(diverges("identity_key_id"));
+    }
+    if str_field("occurrence_key_id")? != row.occurrence_key_id {
+        return Err(diverges("occurrence_key_id"));
+    }
+    if ts_field("revoked_at")? != row.revoked_at {
+        return Err(diverges("revoked_at"));
+    }
+    // `effective_at` is the terminality clock (the re-establish comparator
+    // reads it), so a divergence here is the whole attack.
+    if ts_field("effective_at")? != row.effective_at {
+        return Err(diverges("effective_at"));
+    }
+
+    // (2) Hybrid signature over JCS(signed_envelope) against the PINNED
+    // federation pubkeys of the claimed signer, threshold 1-of-1 (RequireHybrid
+    // — a classical-only revocation does not count, RC7 §10.1.5.1.1).
+    let Some(signer_key) = directory
+        .lookup_public_key(&signed.attesting_key_id)
+        .await?
+    else {
+        return Err(Error::SignatureInvalid(format!(
+            "signed identity_occurrence_revocation: attesting_key_id {} is not a registered \
+             federation key",
+            signed.attesting_key_id
+        )));
+    };
+    let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
+        Error::InvalidArgument(format!(
+            "signed identity_occurrence_revocation canonicalize: {e}"
+        ))
+    })?;
+    let members = [ThresholdMember {
+        member_id: signer_key.key_id.clone(),
+        ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
+        mldsa65_public_key_base64: signer_key.pubkey_ml_dsa_65_base64.clone(),
+        role: None,
+    }];
+    let sigs = [ThresholdSignature {
+        member_id: signed.attesting_key_id.clone(),
+        ed25519_signature_base64: signed.signature.ed25519_signature_base64.clone(),
+        mldsa65_signature_base64: signed.signature.mldsa65_signature_base64.clone(),
+    }];
+    if verify_threshold_signatures(&bytes, &members, &sigs, 1).is_err() {
+        return Err(Error::SignatureInvalid(format!(
+            "signed identity_occurrence_revocation for {} not authentic (hybrid 1-of-1 over \
+             JCS(envelope) failed against the pinned key of {})",
+            row.occurrence_key_id, signed.attesting_key_id
+        )));
+    }
+
+    // (3) signer_acts_for — THE shared check ([`check_signer_acts_for`]): a
+    // peer cannot revoke a victim's occurrence with its own unrelated key.
+    check_signer_acts_for(
+        directory,
+        &signed.attesting_key_id,
+        &row.identity_key_id,
+        "identity_occurrence_revocation",
+    )
+    .await
 }
 
 /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
@@ -3264,9 +3418,24 @@ pub async fn check_infra_attest_role_admission_over_roster(
         return Ok(());
     }
 
-    // (2) The shared accord-family m-of-n co-scrub quorum core. (No withdrawal
-    // tombstone for `infra:attest` yet — quorum WITHDRAW of a CI key is a
-    // follow-up op, tracked separately; the ADD gate is what #422 asks.)
+    // (2) Revocation-wins (#424, the #377 rule generalized): a quorum-withdrawn
+    // key stays refused EVEN with a valid co-scrub set — the ADD gate is
+    // monotonic and anti-entropy re-runs it, so without this consult a peer
+    // still holding the old co-scrubbed record silently re-adds the role. A
+    // SUPERSEDE successor whose tombstone names THIS key_id is exempt.
+    if let Some(w) = directory
+        .lookup_role_withdrawal(super::types::roles::INFRA_ATTEST, &row.key_id)
+        .await?
+    {
+        if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
+            return Err(Error::InfraAttestRoleWithdrawn {
+                key_id: row.key_id.clone(),
+                superseded_by: w.superseded_by.clone(),
+            });
+        }
+    }
+
+    // (3) The shared accord-family m-of-n co-scrub quorum core.
     verify_accord_family_coscrub(directory, row, roster_key_ids)
         .await
         .map_err(|reason| Error::InfraAttestRoleNotAccordConferred {
@@ -3294,6 +3463,32 @@ pub async fn is_infra_attest(
             .iter()
             .any(|role| role == super::types::roles::INFRA_ATTEST)
     }))
+}
+
+/// v16.0.0 (CIRISPersist#424) — the WITHDRAWAL-AWARE trust-root read:
+/// [`is_infra_attest`] AND no un-superseded V104 tombstone. The mirror of
+/// [`is_canonical_effective`]: a stored row may still carry `infra:attest`
+/// (the tombstone never mutates rows) but a quorum-withdrawn key is NOT an
+/// effective build-signing trust root. Consumers deciding whether to TRUST a
+/// pipeline key call THIS; the bare read is the storage-state accessor.
+pub async fn is_infra_attest_effective(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+) -> Result<bool, Error> {
+    if !is_infra_attest(directory, key_id).await? {
+        return Ok(false);
+    }
+    Ok(
+        match directory
+            .lookup_role_withdrawal(super::types::roles::INFRA_ATTEST, key_id)
+            .await?
+        {
+            // A supersede tombstone naming THIS key as its own successor is a
+            // rotate-in; anything else withdrawn ⇒ not effective.
+            Some(w) => w.superseded_by.as_deref() == Some(key_id),
+            None => true,
+        },
+    )
 }
 
 /// **CIRISPersist#372 — is `key_id` a canonical / founding bootstrap server?**
@@ -3328,6 +3523,10 @@ pub async fn is_canonical(
 /// The canonical `op` token committed by a plain-WITHDRAW authority payload
 /// (bound into `AccordProposal::payload_sha256`).
 pub const OP_WITHDRAW_CANONICAL: &str = "withdraw_canonical";
+/// v16.0.0 (#424) — the `op` token committed by an `infra:attest`-WITHDRAW
+/// authority payload. Rides the same op-parameterized #377 authority machinery
+/// ([`verify_canonical_authority_over_roster`]) — same ceremony, different role.
+pub const OP_WITHDRAW_INFRA_ATTEST: &str = "withdraw_infra_attest";
 /// The canonical `op` token committed by a SUPERSEDE authority payload.
 pub const OP_SUPERSEDE_CANONICAL: &str = "supersede_canonical";
 
@@ -3346,6 +3545,28 @@ pub struct CanonicalWithdrawal {
     /// The authorizing accord **proposal digest** (V091 / #302) — the audit
     /// anchor for the m-of-n quorum whose stored, verified participations
     /// persist re-tallied to authorize this withdrawal.
+    pub authority_decision_digest: String,
+    /// The successor key_id for a SUPERSEDE (old→new link); `None` for a plain
+    /// WITHDRAW.
+    pub superseded_by: Option<String>,
+    /// Substrate row hash (canonical SHA-256 of the stored row).
+    pub persist_row_hash: String,
+}
+
+/// v16.0.0 (CIRISPersist#424) — a GENERIC accord-conferred-role withdrawal
+/// tombstone (V104 `federation_role_withdrawals`) — [`CanonicalWithdrawal`]
+/// generalized with a `role` discriminant. `canonical` stays on its V095
+/// table; every later accord-conferred role tombstones HERE, starting with
+/// [`roles::INFRA_ATTEST`](crate::federation::types::roles::INFRA_ATTEST).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RoleWithdrawal {
+    /// The withdrawn role token (e.g. `"infra:attest"`).
+    pub role: String,
+    /// The `federation_keys.key_id` whose role is tombstoned.
+    pub key_id: String,
+    /// When the withdrawal was recorded.
+    pub withdrawn_at: chrono::DateTime<chrono::Utc>,
+    /// The authorizing accord **proposal digest** (V091 / #302).
     pub authority_decision_digest: String,
     /// The successor key_id for a SUPERSEDE (old→new link); `None` for a plain
     /// WITHDRAW.
@@ -3618,6 +3839,62 @@ pub async fn withdraw_canonical_role_over_roster(
     .await?;
     directory
         .record_canonical_withdrawal(key_id, None, &authority_digest)
+        .await
+}
+
+/// v16.0.0 (CIRISPersist#424) — **withdraw** the `infra:attest` role from
+/// `key_id` (a compromised/retired build-signing pipeline). The #377 canonical
+/// withdraw, re-used for the roles-vector role: `proposal_digest` names a
+/// STORED accord proposal whose payload commits to
+/// `(withdraw_infra_attest, key_id)`; persist re-tallies its OWN
+/// cryptographically-verified participations against the accord-holder roster
+/// at the strict-majority destructive threshold (verify-before-mutation, AV-9 —
+/// never a caller `AccordDecision.authorized` bool), then records the durable
+/// V104 tombstone. Because [`check_infra_attest_role_admission`] consults it, a
+/// replicated re-offer of the old co-scrubbed record is Refused, and
+/// [`is_infra_attest_effective`] reads `false`. Reverse quorum per the accord-
+/// ops invariant: the ADD needed m-of-n; the WITHDRAW (protective) needs m-of-n
+/// too. Idempotent.
+pub async fn withdraw_infra_attest_role(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+    proposal_digest: &str,
+) -> Result<(), Error> {
+    withdraw_infra_attest_role_over_roster(
+        directory,
+        key_id,
+        proposal_digest,
+        &accord_holder_roster_key_ids(),
+    )
+    .await
+}
+
+/// [`withdraw_infra_attest_role`] with an explicit accord-holder roster keyset
+/// (tests). Shares [`verify_canonical_authority_over_roster`] — the
+/// op-parameterized #377 authority core — with the canonical withdraw, so the
+/// quorum math lives in ONE place.
+pub async fn withdraw_infra_attest_role_over_roster(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+    proposal_digest: &str,
+    roster_key_ids: &[String],
+) -> Result<(), Error> {
+    let authority_digest = verify_canonical_authority_over_roster(
+        directory,
+        proposal_digest,
+        OP_WITHDRAW_INFRA_ATTEST,
+        key_id,
+        None,
+        roster_key_ids,
+    )
+    .await?;
+    directory
+        .record_role_withdrawal(
+            crate::federation::types::roles::INFRA_ATTEST,
+            key_id,
+            None,
+            &authority_digest,
+        )
         .await
 }
 
@@ -7480,5 +7757,195 @@ mod canonical_withdrawal_tests {
         super::check_canonical_role_admission_over_roster(dir, &rec_s, &roster)
             .await
             .expect("a superseded-to-self key is exempt from the withdrawal block");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // CIRISPersist#424 — the `infra:attest` WITHDRAW decision table: the
+    // #377 canonical machinery re-used for the roles-vector role (same
+    // op-parameterized authority core, the generic V104 tombstone). Lives
+    // in this module to share record/register_holder/seed_quorum verbatim.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Stamp `infra:attest` into a co-scrubbed record's `roles` (the #422
+    /// conferral shape; the co-scrub signs the envelope, not the role field).
+    fn with_infra(mut rec: KeyRecord) -> KeyRecord {
+        rec.roles = vec![super::super::types::roles::INFRA_ATTEST.to_owned()];
+        rec
+    }
+
+    async fn run_infra_withdrawal_matrix(dir: &dyn FederationDirectory, tag: &str) {
+        use super::{
+            is_infra_attest, is_infra_attest_effective, withdraw_infra_attest_role_over_roster,
+            OP_WITHDRAW_INFRA_ATTEST,
+        };
+        // Accord family (test keys) for the ADD co-scrub + signable H roster
+        // for the destructive quorum — same fixture shape as canonical.
+        let accord: Vec<Identity> = accord_holder_roster_key_ids()
+            .iter()
+            .map(|k| Identity::new(k))
+            .collect();
+        for a in &accord {
+            register_holder(dir, a).await;
+        }
+        let holders = [
+            Identity::new(&format!("IH0-{tag}")),
+            Identity::new(&format!("IH1-{tag}")),
+            Identity::new(&format!("IH2-{tag}")),
+        ];
+        for h in &holders {
+            register_holder(dir, h).await;
+        }
+        let roster: Vec<ThresholdMember> = holders.iter().map(|h| h.member()).collect();
+        let roster_key_ids: Vec<String> = holders.iter().map(|h| h.key_id.clone()).collect();
+        let env = |kid: &str| serde_json::json!({ "key_id": kid });
+
+        // Admit a 2-of-3 co-scrubbed pipeline key carrying `infra:attest`.
+        let ci = format!("ci-key-{tag}");
+        put(
+            dir,
+            with_infra(signed_canonical_record(
+                &ci,
+                identity_type::NODE,
+                env(&ci),
+                &[&accord[0], &accord[1]],
+            )),
+        )
+        .await
+        .expect("2-of-3 co-scrubbed infra:attest pipeline must be ADMITTED");
+        assert!(is_infra_attest_effective(dir, &ci).await.unwrap());
+
+        // (A) FORGED AUTHORITY: a stored proposal with ZERO participations →
+        //     re-tally 0 YES < majority → REFUSED; still effective.
+        let d_zero = seed_quorum(
+            dir,
+            &holders,
+            &roster,
+            OP_WITHDRAW_INFRA_ATTEST,
+            &ci,
+            None,
+            &[],
+            &format!("iw-zero-{tag}"),
+        )
+        .await;
+        withdraw_infra_attest_role_over_roster(dir, &ci, &d_zero, &roster_key_ids)
+            .await
+            .expect_err("(A) zero-participation authority must be REFUSED");
+        assert!(is_infra_attest_effective(dir, &ci).await.unwrap());
+
+        // (B) GENUINE strict-majority quorum → withdrawn. The stored row still
+        //     carries the role (tombstones never mutate rows); the EFFECTIVE
+        //     read flips false; a replicated re-offer of the co-scrubbed
+        //     record is refused by the gate consult (revocation-wins).
+        let d_yes = seed_quorum(
+            dir,
+            &holders,
+            &roster,
+            OP_WITHDRAW_INFRA_ATTEST,
+            &ci,
+            None,
+            &[0, 1],
+            &format!("iw-yes-{tag}"),
+        )
+        .await;
+        withdraw_infra_attest_role_over_roster(dir, &ci, &d_yes, &roster_key_ids)
+            .await
+            .expect("(B) a genuine strict-majority withdraw must succeed");
+        assert!(
+            is_infra_attest(dir, &ci).await.unwrap(),
+            "(B) row untouched"
+        );
+        assert!(
+            !is_infra_attest_effective(dir, &ci).await.unwrap(),
+            "(B) effective read flips false"
+        );
+        let re_offer = with_infra(signed_canonical_record(
+            &ci,
+            identity_type::NODE,
+            env(&ci),
+            &[&accord[0], &accord[1]],
+        ));
+        let err = super::check_infra_attest_role_admission_over_roster(
+            dir,
+            &re_offer,
+            &accord_holder_roster_key_ids(),
+        )
+        .await
+        .expect_err("(B) a withdrawn key cannot be re-conferred, even validly co-scrubbed");
+        assert_eq!(err.kind(), "infra_attest_role_withdrawn");
+
+        // (C) Idempotent re-withdraw (same digest) is a no-op.
+        withdraw_infra_attest_role_over_roster(dir, &ci, &d_yes, &roster_key_ids)
+            .await
+            .expect("(C) idempotent re-withdraw");
+
+        // (D) CROSS-OP replay: the infra-withdraw digest CANNOT authorize a
+        //     CANONICAL withdraw of the same key — the payload op-token binding
+        //     refuses (same ceremony, different CEG object, non-fungible).
+        let err = super::withdraw_canonical_role_over_roster(dir, &ci, &d_yes, &roster_key_ids)
+            .await
+            .expect_err("(D) an infra-withdraw authority must not withdraw canonical");
+        assert_eq!(err.kind(), "canonical_withdrawal_authority_invalid");
+
+        // (E) Supersede-to-self exemption (key-id-preserving rotate-in): a
+        //     tombstone whose superseded_by names THIS key does not block the
+        //     gate; a valid co-scrub then re-confers.
+        let rot = format!("ci-rot-{tag}");
+        put(
+            dir,
+            record(&rot, identity_type::NODE, &rot), // plain row first (no role)
+        )
+        .await
+        .expect("seed rotation key row");
+        dir.record_role_withdrawal(
+            super::super::types::roles::INFRA_ATTEST,
+            &rot,
+            Some(&rot),
+            "digest-rot",
+        )
+        .await
+        .expect("self-superseded tombstone");
+        let rot_offer = with_infra(signed_canonical_record(
+            &rot,
+            identity_type::NODE,
+            env(&rot),
+            &[&accord[0], &accord[1]],
+        ));
+        super::check_infra_attest_role_admission_over_roster(
+            dir,
+            &rot_offer,
+            &accord_holder_roster_key_ids(),
+        )
+        .await
+        .expect("(E) a superseded-to-self key is exempt from the withdrawal block");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn infra_attest_withdrawal_sqlite() {
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        run_infra_withdrawal_matrix(&backend, "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn infra_attest_withdrawal_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping infra_attest_withdrawal_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        super::run_in_isolated_pg_db(&dsn, |backend| async move {
+            run_infra_withdrawal_matrix(&backend, "pg").await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn infra_attest_withdrawal_memory() {
+        use crate::store::memory::MemoryBackend;
+        let backend = MemoryBackend::new();
+        run_infra_withdrawal_matrix(&backend, "mem").await;
     }
 }

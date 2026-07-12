@@ -502,6 +502,17 @@ pub enum DirectoryOp {
         /// The subject `key_id` whose records to enumerate.
         subject_key_id: String,
     },
+    /// [`FederationDirectory::put_identity_occurrence_revocation`] (#421) — the
+    /// SIGNED revocation apply: the wire path edge's replication bridge drives
+    /// (`apply_identity_occurrence_revocation` delegates to `put`, exactly like
+    /// the occurrence). The gate (hybrid 1-of-1 over `JCS(signed_envelope)` +
+    /// `signer_acts_for` + divergence check) runs INSIDE persist's `.so` at
+    /// dispatch — a forged revocation is refused before any write. Result rides
+    /// `Unit`. APPEND-ONLY.
+    PutIdentityOccurrenceRevocation {
+        /// The signed revocation container to admit.
+        revocation: crate::federation::SignedIdentityOccurrenceRevocation,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -705,6 +716,12 @@ pub async fn dispatch_directory_op(
             Ok(v) => DirectoryOpResult::SignedReplicatedRecords(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
+        DirectoryOp::PutIdentityOccurrenceRevocation { revocation } => {
+            match dir.put_identity_occurrence_revocation(revocation).await {
+                Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
         DirectoryOp::PutLocationProof { proof } => match dir.put_location_proof(proof).await {
             Ok(()) => DirectoryOpResult::Unit,
             Err(e) => DirectoryOpResult::Err(e.to_string()),
@@ -2034,9 +2051,20 @@ impl FederationDirectory for OpsDirectory {
         &self,
         revocation: SignedIdentityOccurrenceRevocation,
     ) -> Result<(), Error> {
-        Err(Error::Unsupported {
-            method: "put_identity_occurrence_revocation",
-        })
+        // #421 — routed (was Error::Unsupported): the wire apply for SIGNED
+        // revocations, so the replication bridge's
+        // `apply_identity_occurrence_revocation` reaches persist's gate
+        // (verify-before-mutation inside the .so) exactly like the occurrence.
+        match self
+            .run_op(&DirectoryOp::PutIdentityOccurrenceRevocation { revocation })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn put_family_membership_revocation(
         &self,

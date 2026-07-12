@@ -1441,16 +1441,28 @@ jobs:
           # Self-contained Rust binary; only deps should be libc +
           # libdl + libpthread.
           ldd "$(command -v ciris-build-sign)" || true
+      # v16.0.0 (CIRISPersist#400) — warm the compile before the emit step:
+      # this job previously COLD-compiled persist + the whole verify crypto
+      # graph in release, for a JSON blob whose content (migration-set hash +
+      # `cargo tree` metadata + a const) is independent of how the binary is
+      # compiled. Restore the substrate blob the core leg already saved.
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: linux-x86_64
       - name: emit PersistExtras JSON
         # Reads the source tree (migrations/ + cargo tree) and emits
         # the typed extras blob. Deterministic per checkout. Target
         # is set so dep_tree_sha256 reflects the linux-x86_64 build
         # closure — the target this manifest applies to.
+        #
+        # #400: DEBUG build (no --release) — the output is byte-identical
+        # (opt level affects none of the three inputs: fs hash, `cargo tree`
+        # metadata, a const) and debug is ~2-3× faster atop the warm cache.
         env:
           CIRIS_PERSIST_DEP_TARGET: x86_64-unknown-linux-gnu
         run: |
           mkdir -p dist
-          cargo run --release --bin emit_persist_extras \
+          cargo run --bin emit_persist_extras \
             > "dist/persist-extras-${{ steps.version.outputs.version }}.json"
           echo "PersistExtras emitted:"
           cat "dist/persist-extras-${{ steps.version.outputs.version }}.json"

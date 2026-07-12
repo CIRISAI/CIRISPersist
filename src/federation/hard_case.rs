@@ -142,6 +142,31 @@ pub struct ConsentWatchReport {
     pub promotion_overdue: usize,
 }
 
+/// One overdue subject-side revocation surfaced by
+/// [`list_consent_revocation_promotion_overdue`](crate::federation::FederationDirectory::list_consent_revocation_promotion_overdue)
+/// (CIRISPersist#434, CC 5.3.2.2's never-rest-local tripwire): a
+/// `consent:state:revoked` still at local tier (unpromoted) with
+/// `now - asserted_at > sla`. Serializable — the PyO3
+/// `list_consent_revocation_promotion_overdue_json` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsentPromotionOverdueRow {
+    /// The overdue attestation row's id (the `attestation_promote`
+    /// handle that clears the condition).
+    pub attestation_id: String,
+    /// The target Contribution `T` the revocation is against.
+    pub target_key_id: String,
+    /// The revoking subject `s`.
+    pub subject_key_id: String,
+    /// When the subject revoked (the SLA clock's start).
+    pub asserted_at: DateTime<Utc>,
+    /// How long the revocation has rested local-tier, whole seconds
+    /// (`now - asserted_at`).
+    pub age_seconds: u64,
+    /// The row's current (non-federation) tier — always `local` today;
+    /// carried so the reader stays honest if tiers ever grow.
+    pub tier: String,
+}
+
 /// Parse the SLA window (days) from a `consent:deletion_sla:{days}`
 /// dimension (§5.6.8.6). Tolerates a trailing `:vN` version segment —
 /// takes the first integer-valued segment after the prefix. `None` if the

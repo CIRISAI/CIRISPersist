@@ -124,6 +124,18 @@ struct State {
     /// removal/revocation rows. Keyed by the V067 composite PKs.
     federation_identity_occurrence_revocations:
         HashMap<(String, String), crate::federation::IdentityOccurrenceRevocation>,
+    /// v16.0.0 (CIRISPersist#421, replication read) — signature container for
+    /// signed-put occurrence REVOCATIONS, keyed like the revocation map
+    /// (`(attesting_key_id, signed_envelope, signature)`). Absent for
+    /// trusted-local rows. Mirror of `federation_identity_occurrence_sigs`.
+    federation_identity_occurrence_revocation_sigs: HashMap<
+        (String, String),
+        (
+            String,
+            serde_json::Value,
+            ciris_verify_core::transport_binding::TransportBindingSignature,
+        ),
+    >,
     federation_family_membership_revocations:
         HashMap<(String, String), crate::federation::FamilyMembershipRevocation>,
     federation_community_membership_revocations:
@@ -215,6 +227,9 @@ struct State {
     /// #377 — canonical-role WITHDRAW/SUPERSEDE tombstones (V095), keyed by the
     /// withdrawn `key_id`. The in-memory mirror of `canonical_role_withdrawal`.
     canonical_withdrawals: HashMap<String, crate::federation::CanonicalWithdrawal>,
+    /// v16.0.0 (CIRISPersist#424) — generic role-withdrawal tombstones (V104
+    /// mirror), keyed `(role, key_id)`.
+    role_withdrawals: HashMap<(String, String), crate::federation::admission::RoleWithdrawal>,
 }
 
 /// v9.1.0 (CIRISPersist#243) — one in-memory scope-blob symbol + its LRU
@@ -252,6 +267,7 @@ impl Default for MemoryBackend {
                 federation_group_current_version: HashMap::new(),
                 federation_group_versions: HashMap::new(),
                 federation_identity_occurrence_revocations: HashMap::new(),
+                federation_identity_occurrence_revocation_sigs: HashMap::new(),
                 federation_family_membership_revocations: HashMap::new(),
                 federation_community_membership_revocations: HashMap::new(),
                 federation_community_dek_epoch: HashMap::new(),
@@ -276,6 +292,7 @@ impl Default for MemoryBackend {
                 accord_active_halts: HashMap::new(),
                 accord_issued_nonces: std::collections::HashSet::new(),
                 canonical_withdrawals: HashMap::new(),
+                role_withdrawals: HashMap::new(),
             }),
         }
     }
@@ -1482,6 +1499,55 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(out)
     }
 
+    /// v16.0.0 (CIRISPersist#424) — the GENERIC role-withdrawal tombstone
+    /// (V104 mirror), same idempotency/Conflict semantics as canonical.
+    async fn record_role_withdrawal(
+        &self,
+        role: &str,
+        key_id: &str,
+        superseded_by: Option<&str>,
+        authority_decision_digest: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut record = crate::federation::admission::RoleWithdrawal {
+            role: role.to_owned(),
+            key_id: key_id.to_owned(),
+            withdrawn_at: chrono::Utc::now(),
+            authority_decision_digest: authority_decision_digest.to_owned(),
+            superseded_by: superseded_by.map(str::to_owned),
+            persist_row_hash: String::new(),
+        };
+        record.persist_row_hash = crate::federation::types::compute_persist_row_hash(&record)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        let map_key = (role.to_owned(), key_id.to_owned());
+        if let Some(existing) = state.role_withdrawals.get(&map_key) {
+            if existing.superseded_by == record.superseded_by
+                && existing.authority_decision_digest == record.authority_decision_digest
+            {
+                return Ok(()); // idempotent no-op
+            }
+            return Err(crate::federation::Error::Conflict(format!(
+                "role_withdrawal ({role}, {key_id}) already exists with different content"
+            )));
+        }
+        state.role_withdrawals.insert(map_key, record);
+        Ok(())
+    }
+
+    /// v16.0.0 (CIRISPersist#424) — consult the generic tombstone for
+    /// `(role, key_id)`. Backend-symmetric.
+    async fn lookup_role_withdrawal(
+        &self,
+        role: &str,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::admission::RoleWithdrawal>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .role_withdrawals
+            .get(&(role.to_owned(), key_id.to_owned()))
+            .cloned())
+    }
+
     async fn put_attestation(
         &self,
         attestation: crate::federation::SignedAttestation,
@@ -2590,7 +2656,48 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         revocation: crate::federation::SignedIdentityOccurrenceRevocation,
     ) -> Result<(), crate::federation::Error> {
-        let mut row = revocation.identity_occurrence_revocation;
+        // v16.0.0 (CIRISPersist#421) — verify the signature gate BEFORE any
+        // write (before locking; the gate locks state internally).
+        crate::federation::admission::verify_signed_identity_occurrence_revocation(
+            self,
+            &revocation,
+        )
+        .await?;
+        let crate::federation::SignedIdentityOccurrenceRevocation {
+            identity_occurrence_revocation: mut row,
+            attesting_key_id,
+            signed_envelope,
+            signature,
+        } = revocation;
+        let mut state = self.state.lock().expect("memory backend lock");
+        for k in [&row.identity_key_id, &row.occurrence_key_id] {
+            if !state.federation_keys.contains_key(k) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{k} does not exist in federation_keys"
+                )));
+            }
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let key = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
+        // #421 — store the signature container in lockstep so the replication
+        // read reconstructs the tuple that was put (mirror of the occurrence
+        // sig map).
+        state
+            .federation_identity_occurrence_revocation_sigs
+            .insert(key.clone(), (attesting_key_id, signed_envelope, signature));
+        state
+            .federation_identity_occurrence_revocations
+            .insert(key, row);
+        Ok(())
+    }
+
+    async fn put_identity_occurrence_revocation_local(
+        &self,
+        revocation: crate::federation::IdentityOccurrenceRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        // #421 — trusted-local (grandfathered) write; NO signature gate, no sig
+        // map entry (the signed read omits local rows).
+        let mut row = revocation;
         let mut state = self.state.lock().expect("memory backend lock");
         for k in [&row.identity_key_id, &row.occurrence_key_id] {
             if !state.federation_keys.contains_key(k) {
@@ -2726,6 +2833,40 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.occurrence_key_id.cmp(&b.occurrence_key_id));
+        Ok(rows)
+    }
+
+    async fn list_signed_identity_occurrence_revocations_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::SignedIdentityOccurrenceRevocation>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        // #421 replication read: join each revocation with its stored signature
+        // container; trusted-local rows (no sig entry) are omitted.
+        let mut rows: Vec<crate::federation::SignedIdentityOccurrenceRevocation> = state
+            .federation_identity_occurrence_revocations
+            .iter()
+            .filter(|((id, _), _)| id == identity_key_id)
+            .filter_map(|(key, rev)| {
+                state
+                    .federation_identity_occurrence_revocation_sigs
+                    .get(key)
+                    .map(|(attesting_key_id, signed_envelope, signature)| {
+                        crate::federation::SignedIdentityOccurrenceRevocation {
+                            identity_occurrence_revocation: rev.clone(),
+                            attesting_key_id: attesting_key_id.clone(),
+                            signed_envelope: signed_envelope.clone(),
+                            signature: signature.clone(),
+                        }
+                    })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.identity_occurrence_revocation
+                .occurrence_key_id
+                .cmp(&b.identity_occurrence_revocation.occurrence_key_id)
+        });
         Ok(rows)
     }
 
@@ -2904,6 +3045,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .wholeness_witnesses
             .get(peer_id)
             .and_then(|b| b.iter().map(|w| w.epoch_id).max()))
+    }
+
+    async fn list_witness_peer_ids(&self) -> Result<Vec<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut peers: Vec<String> = state
+            .wholeness_witnesses
+            .iter()
+            .filter(|(_, b)| !b.is_empty())
+            .map(|(p, _)| p.clone())
+            .collect();
+        // Sorted (parity with the SQL backends' ORDER BY).
+        peers.sort_unstable();
+        Ok(peers)
     }
 
     // ─── v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8.1) — location proofs.
@@ -9780,6 +9934,169 @@ mod tests {
             matches!(unsigned, crate::federation::Error::InvalidArgument(ref m) if m.contains("bound-hybrid signature")),
             "unsigned revocation rejected at admission, got {unsigned:?}"
         );
+    }
+
+    /// v16 (CIRISPersist#434, CC 5.3.2.2) — the promotion-overdue READER
+    /// (`list_consent_revocation_promotion_overdue`, what the PyO3
+    /// `list_consent_revocation_promotion_overdue_json` dispatches onto),
+    /// over the REAL local-write admission path on the memory backend: an
+    /// over-SLA transit revocation is returned + flagged idempotently, a
+    /// within-SLA one never appears, and promotion clears it.
+    #[tokio::test]
+    async fn consent_promotion_overdue_reader_memory() {
+        use crate::federation::hard_case::{kind, HardCaseFilter};
+        use crate::federation::tier_ingest::test_support::sign_envelope;
+        use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
+        use crate::federation::FederationDirectory;
+        use std::time::Duration;
+        let backend = MemoryBackend::new();
+        for k in ["subject-r", "target-r"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        // A crypto-valid subject-side revocation, admitted as a TRANSIT
+        // local-tier write (same real-admission fixture as the SLA loop
+        // test above).
+        let env = serde_json::json!({
+            "id": "rev-r", "dimension": "consent:state:revoked:v1",
+            "score": 1.0, "confidence": 0.9,
+        });
+        let (_hash, sig_classical, sig_pqc) = sign_envelope("subject-r", &env);
+        let att_id = backend
+            .attestation_upsert_local(LocalAttestationInput {
+                attesting_key_id: "subject-r".into(),
+                attested_key_id: Some("target-r".into()),
+                attestation_type: attestation_type::SCORES.into(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: env,
+                subject_key_ids: vec!["subject-r".into()],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                scrub_signature_classical: Some(sig_classical),
+                scrub_signature_pqc: sig_pqc,
+            })
+            .await
+            .expect("transit local-tier revocation admits");
+        let revoked_at = backend.list_consent_revocations(None).await.unwrap()[0].asserted_at;
+        let sla = Duration::from_secs(86_400); // 24 h
+
+        // Within the SLA → never appears, nothing flagged.
+        let before = revoked_at + chrono::Duration::seconds(86_400 - 1);
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(before, sla)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "a within-SLA revocation never appears");
+        assert!(backend
+            .list_hard_case_events(HardCaseFilter::default())
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Past the SLA → returned (with the promote handle + age) + flagged.
+        let after = revoked_at + chrono::Duration::seconds(86_400 + 60);
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(after, sla)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the over-SLA revocation is overdue");
+        assert_eq!(rows[0].attestation_id, att_id);
+        assert_eq!(rows[0].target_key_id, "target-r");
+        assert_eq!(rows[0].subject_key_id, "subject-r");
+        assert_eq!(rows[0].age_seconds, 86_400 + 60);
+        assert_eq!(rows[0].tier, attestation_tier::LOCAL);
+        let evs = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1, "the overdue row was flagged");
+
+        // Re-scan: still listed, NO duplicate hard_case.
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(after, sla)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            backend
+                .list_hard_case_events(HardCaseFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "re-scan writes no duplicate hard_case"
+        );
+
+        // Promote (tier=federation) → drops out of subsequent scans.
+        {
+            let mut st = backend.state.lock().unwrap();
+            for a in st.federation_attestations.iter_mut() {
+                if a.attestation_id == att_id {
+                    a.tier = attestation_tier::FEDERATION.into();
+                    a.promoted_at = Some(after);
+                }
+            }
+        }
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(after + chrono::Duration::seconds(1), sla)
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "a promoted revocation is no longer overdue"
+        );
+    }
+
+    /// v16 (CIRISPersist#431) — the compare surface REFUSES a corpus row
+    /// it cannot round-trip back to the verify-core witness shape
+    /// (substrate corruption), rather than classifying over it. This is
+    /// the "never compare an unverifiable witness" assertion: the F-5
+    /// rule means every stored row passed the gate, so the only
+    /// unverifiable row is a corrupted one — and it errors, fail-closed.
+    #[tokio::test]
+    async fn compare_refuses_corrupted_witness_row() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        // Simulate at-rest corruption: a row whose merkle_root column is
+        // not 64 hex chars (unreachable via put_wholeness_witness — the
+        // gate writes only encode_root_hex output).
+        {
+            let mut st = backend.state.lock().unwrap();
+            st.wholeness_witnesses
+                .entry("corrupt-peer".into())
+                .or_default()
+                .push(crate::witness::StoredWitness {
+                    peer_id: "corrupt-peer".into(),
+                    epoch_id: 1,
+                    claim_namespaces: vec!["scores:medical".into()],
+                    merkle_root_hex: "not-hex".into(), // corrupted column
+                    leaf_count: 1,
+                    observed_at_unix_ms: 1000,
+                    witness_version: 1,
+                    signature: "AA==".into(),
+                    signature_ml_dsa_65: "AA==".into(),
+                    pqc_key_id: "k".into(),
+                });
+        }
+        let peers = ["corrupt-peer".to_string()];
+        let err = backend
+            .compare_stored_witnesses(Some(&peers))
+            .await
+            .expect_err("a corrupted row REFUSES comparison (never a verdict)");
+        assert_eq!(err.kind(), "witness_admit_malformed_root");
+        // The N4 read-back refuses identically.
+        let err = backend
+            .list_witness_equivocations("corrupt-peer")
+            .await
+            .expect_err("read-back refuses the corrupted row too");
+        assert_eq!(err.kind(), "witness_admit_malformed_root");
     }
 
     /// steward_bindings_of: an steward-bound node (live `delegates_to(user →

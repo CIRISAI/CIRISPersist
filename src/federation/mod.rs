@@ -133,11 +133,12 @@ pub use admission::{
     check_canonical_role_admission_over_roster, check_cohort_scope, check_consensus_protocol_form,
     check_device_class, check_encryption_pubkeys, check_infra_attest_role_admission,
     check_infra_attest_role_admission_over_roster, check_observed_region, is_canonical,
-    is_canonical_effective, is_infra_attest, supersede_canonical,
+    is_canonical_effective, is_infra_attest, is_infra_attest_effective, supersede_canonical,
     verify_canonical_supersede_authority, verify_canonical_withdraw_authority,
-    withdraw_canonical_role, AttestationLadderTransitionPolicy, CanonicalWithdrawal,
+    verify_signed_identity_occurrence_revocation, withdraw_canonical_role,
+    withdraw_infra_attest_role, AttestationLadderTransitionPolicy, CanonicalWithdrawal,
     DimensionAdmissionPolicy, DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule,
-    ATTESTATION_LADDER_MECHANISMS,
+    RoleWithdrawal, ATTESTATION_LADDER_MECHANISMS,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
@@ -152,7 +153,9 @@ pub use goal::{
     canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
     MetaGoalAlignment,
 };
-pub use hard_case::{ConsentState, ConsentWatchReport, HardCaseEvent, HardCaseFilter};
+pub use hard_case::{
+    ConsentPromotionOverdueRow, ConsentState, ConsentWatchReport, HardCaseEvent, HardCaseFilter,
+};
 pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE};
 pub use identity_aggregate::{
     ContentKemIdentity, LocalIdentityAggregate, LOCAL_IDENTITY_AGGREGATE_VERSION,
@@ -526,6 +529,44 @@ pub trait FederationDirectory: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// v16.0.0 (CIRISPersist#424) — record a GENERIC accord-conferred-role
+    /// withdrawal tombstone (V104 `federation_role_withdrawals`; the #377
+    /// primitive generalized — `canonical` stays on its V095 table, every LATER
+    /// role lands here, starting with
+    /// [`roles::INFRA_ATTEST`](types::roles::INFRA_ATTEST)). Same semantics as
+    /// [`Self::record_canonical_withdrawal`]: idempotent re-record; a
+    /// conflicting `superseded_by` is [`Error::Conflict`]; callers verify the
+    /// accord authority BEFORE this write
+    /// ([`admission::withdraw_infra_attest_role`]). Default errors; the real
+    /// backends override.
+    async fn record_role_withdrawal(
+        &self,
+        role: &str,
+        key_id: &str,
+        superseded_by: Option<&str>,
+        authority_decision_digest: &str,
+    ) -> Result<(), Error> {
+        let _ = (role, key_id, superseded_by, authority_decision_digest);
+        Err(Error::Backend(
+            "record_role_withdrawal is not supported by this backend".to_owned(),
+        ))
+    }
+
+    /// v16.0.0 (CIRISPersist#424) — consult the generic role-withdrawal
+    /// tombstone for `(role, key_id)` (V104). The load-bearing gate consult:
+    /// [`check_infra_attest_role_admission`](admission::check_infra_attest_role_admission)
+    /// calls it so a withdrawn `infra:attest` key cannot be re-conferred the
+    /// role over anti-entropy. Default returns `None`; the real backends
+    /// override.
+    async fn lookup_role_withdrawal(
+        &self,
+        role: &str,
+        key_id: &str,
+    ) -> Result<Option<admission::RoleWithdrawal>, Error> {
+        let _ = (role, key_id);
+        Ok(None)
+    }
+
     // ── Attestations ───────────────────────────────────────────────
 
     /// Insert a new attestation row.
@@ -848,11 +889,19 @@ pub trait FederationDirectory: Send + Sync {
         // filter it returns the KEX key of a REVOKED occurrence, and content
         // seals to a key the identity has repudiated (fail-open). An admitted
         // (signed) revocation whose `effective_at <= now` fail-closed excludes it.
+        //
+        // v16.0.0 (CIRISPersist#421) — RE-ESTABLISHMENT: a revocation is no
+        // longer terminal-forever. The single fold comparator
+        // ([`IdentityOccurrenceRevocation::revokes`]) kills occurrences
+        // asserted AT OR BEFORE the revocation; a FRESH signed occurrence with
+        // a strictly-newer `asserted_at` re-establishes sealability under the
+        // same key_id (compromise → signed revoke → re-key → publish →
+        // recovered), and a replayed OLD revocation is a no-op.
         let revoked = self
             .list_identity_occurrence_revocations_for(&occ.identity_key_id)
             .await?
             .into_iter()
-            .any(|r| r.occurrence_key_id == occurrence_key_id && r.effective_at <= now);
+            .any(|r| r.revokes(&occ, now));
         if revoked {
             return Ok(None);
         }
@@ -970,6 +1019,44 @@ pub trait FederationDirectory: Send + Sync {
         &self,
         revocation: SignedIdentityOccurrenceRevocation,
     ) -> Result<(), Error>;
+
+    /// v16.0.0 (CIRISPersist#421) — write a **trusted-local** occurrence
+    /// revocation, bypassing the [`Self::put_identity_occurrence_revocation`]
+    /// signature gate. For engine-internal writes on behalf of the local user
+    /// where the revocation is locally produced — NOT peer-received, so not the
+    /// permanent-DoS forgery the gate closes. Grandfathered: the signature
+    /// columns are stored NULL, so the signed replication read omits these rows
+    /// (you can only signed-replicate what was signed-put). **Never reachable
+    /// from the replication apply.** Default impl errors; backends override.
+    /// Mirrors [`Self::put_identity_occurrence_local`].
+    async fn put_identity_occurrence_revocation_local(
+        &self,
+        revocation: types::IdentityOccurrenceRevocation,
+    ) -> Result<(), Error> {
+        let _ = revocation;
+        Err(Error::Backend(
+            "put_identity_occurrence_revocation_local not implemented for this backend".into(),
+        ))
+    }
+
+    /// v16.0.0 (CIRISPersist#421) — list the stored occurrence revocations of
+    /// `identity_key_id` **with their original signature container**,
+    /// reconstructed byte-exact from the persisted `{attesting_key_id,
+    /// signed_envelope, signature}` columns — the revocation twin of
+    /// [`Self::list_signed_identity_occurrences_for`], so a transport
+    /// replicator re-publishes a revocation it cannot re-sign. Signed-put rows
+    /// only (trusted-local NULL-signature rows omitted). Default impl errors;
+    /// backends override.
+    async fn list_signed_identity_occurrence_revocations_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<SignedIdentityOccurrenceRevocation>, Error> {
+        let _ = identity_key_id;
+        Err(Error::Backend(
+            "list_signed_identity_occurrence_revocations_for not implemented for this backend"
+                .into(),
+        ))
+    }
 
     /// v4.8.0 — record a family-membership removal. Append-only;
     /// idempotent on the `(family_key_id, removed_identity_key_id)` PK.
@@ -1194,16 +1281,15 @@ pub trait FederationDirectory: Send + Sync {
             .list_identity_occurrence_revocations_for(identity_key_id)
             .await?;
         let now = chrono::Utc::now();
-        let revoked: std::collections::HashSet<&str> = revs
-            .iter()
-            .filter(|r| r.effective_at <= now)
-            .map(|r| r.occurrence_key_id.as_str())
-            .collect();
+        // v16.0.0 (#421): per-occurrence fold via THE comparator
+        // ([`IdentityOccurrenceRevocation::revokes`]) — a re-established
+        // occurrence (asserted after its revocation) is ACTIVE again; the old
+        // key-id set was blind to `asserted_at` and stayed terminal.
         Ok(self
             .list_identity_occurrences_for(identity_key_id)
             .await?
             .into_iter()
-            .filter(|o| !revoked.contains(o.occurrence_key_id.as_str()))
+            .filter(|o| !revs.iter().any(|r| r.revokes(o, now)))
             .collect())
     }
 
@@ -1448,9 +1534,12 @@ pub trait FederationDirectory: Send + Sync {
                 self.list_transport_destinations_for(subject_key_id).await?,
             ),
             K::Attestation => wrap(kind, self.list_attestations_for(subject_key_id).await?),
+            // v16.0.0 (#421): the revocation arm returns the SIGNED container
+            // (byte-exact re-publish; signed-put rows only) now that the
+            // revocation plane carries the #418 signature discipline.
             K::IdentityOccurrenceRevocation => wrap(
                 kind,
-                self.list_identity_occurrence_revocations_for(subject_key_id)
+                self.list_signed_identity_occurrence_revocations_for(subject_key_id)
                     .await?,
             ),
         }
@@ -1698,17 +1787,19 @@ pub trait FederationDirectory: Send + Sync {
                 .await?;
             }
             cohort::Cohort::SelfId => {
-                self.put_identity_occurrence_revocation(
-                    types::SignedIdentityOccurrenceRevocation {
-                        identity_occurrence_revocation: types::IdentityOccurrenceRevocation {
-                            identity_key_id: group_key_id.to_string(),
-                            occurrence_key_id: removed_key_id.to_string(),
-                            revoked_at: now,
-                            effective_at,
-                            reason,
-                            witness_set,
-                            persist_row_hash: String::new(),
-                        },
+                // v16.0.0 (#421): the rostered-group removal is an ENGINE-
+                // INTERNAL op on behalf of the local user (never peer-received),
+                // so it takes the trusted-local path — the gated
+                // `put_identity_occurrence_revocation` is for the wire.
+                self.put_identity_occurrence_revocation_local(
+                    types::IdentityOccurrenceRevocation {
+                        identity_key_id: group_key_id.to_string(),
+                        occurrence_key_id: removed_key_id.to_string(),
+                        revoked_at: now,
+                        effective_at,
+                        reason,
+                        witness_set,
+                        persist_row_hash: String::new(),
                     },
                 )
                 .await?;
@@ -3010,6 +3101,109 @@ pub trait FederationDirectory: Send + Sync {
         Ok(action)
     }
 
+    /// v16 (CIRISPersist#431, CC 6.1.1) — the distinct `peer_id`s with at
+    /// least one witness in the corpus. Feeds the compare-all path of
+    /// [`compare_stored_witnesses`](Self::compare_stored_witnesses).
+    async fn list_witness_peer_ids(&self) -> Result<Vec<String>, Error> {
+        Err(Error::Backend(
+            "list_witness_peer_ids not implemented for this backend".into(),
+        ))
+    }
+
+    /// v16 (CIRISPersist#431, CC 6.1.1) — classify the stored, VERIFIED
+    /// witnesses of `peer_ids` (`None` = every peer in the corpus) into
+    /// the §19.1 verdict. Read-only: unlike
+    /// [`reconcile_peer_witnesses`](Self::reconcile_peer_witnesses) it
+    /// emits nothing (emission happens at put-time reconcile).
+    ///
+    /// Verified-inputs precondition (the `compare_witnesses` contract):
+    /// every corpus row passed the ingest gate by construction — the F-5
+    /// rule stores no unverified rows and no in-band `verified` flag to
+    /// forge. The only way a stored row can fail to round-trip back to
+    /// the verify-core shape is substrate corruption (a malformed root
+    /// column), and that REFUSES with an error rather than comparing —
+    /// an unverifiable row never reaches `compare_witnesses`.
+    async fn compare_stored_witnesses(
+        &self,
+        peer_ids: Option<&[String]>,
+    ) -> Result<crate::witness::WitnessReconcileAction, Error> {
+        let peers: Vec<String> = match peer_ids {
+            Some(ids) => ids.to_vec(),
+            None => self.list_witness_peer_ids().await?,
+        };
+        let mut stored = Vec::new();
+        for peer in &peers {
+            stored.extend(self.list_wholeness_witnesses_for_peer(peer).await?);
+        }
+        Ok(crate::witness::classify_stored(&stored)?)
+    }
+
+    /// v16 (CIRISPersist#431, N4 read-back) — the non-repudiable
+    /// equivocations visible in `peer_id`'s corpus: for each proof, BOTH
+    /// conflicting [`StoredWitness`](crate::witness::StoredWitness) rows
+    /// (retained, never reconciled) plus the recorded
+    /// `hard_case:witness_equivocation` marker (matched by its
+    /// deterministic event_id). Default impl composing
+    /// [`list_wholeness_witnesses_for_peer`](Self::list_wholeness_witnesses_for_peer),
+    /// [`crate::witness::classify_stored`], and
+    /// [`list_hard_case_events`](Self::list_hard_case_events).
+    async fn list_witness_equivocations(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<crate::witness::WitnessEquivocationRecord>, Error> {
+        let stored = self.list_wholeness_witnesses_for_peer(peer_id).await?;
+        let action = crate::witness::classify_stored(&stored)?;
+        let crate::witness::WitnessReconcileAction::Equivocation(proofs) = action else {
+            return Ok(Vec::new());
+        };
+        // The recorded markers for this kind, keyed by event_id so each
+        // proof pairs with exactly its own emission (or None pre-emit).
+        let cases = self
+            .list_hard_case_events(hard_case::HardCaseFilter {
+                kind: Some(crate::witness::WITNESS_EQUIVOCATION.to_owned()),
+                since: None,
+            })
+            .await?;
+        let mut records = Vec::with_capacity(proofs.len());
+        for proof in &proofs {
+            let root_a = crate::witness::encode_root_hex(&proof.roots.0);
+            let root_b = crate::witness::encode_root_hex(&proof.roots.1);
+            // The two conflicting corpus rows (match either root at the
+            // proof's (epoch, namespace-set) identity).
+            let mut ns_sorted = proof.claim_namespaces.clone();
+            ns_sorted.sort_unstable();
+            let witnesses: Vec<_> = stored
+                .iter()
+                .filter(|w| {
+                    let mut w_ns = w.claim_namespaces.clone();
+                    w_ns.sort_unstable();
+                    w_ns.dedup();
+                    w.epoch_id == proof.epoch_id
+                        && w_ns == ns_sorted
+                        && (w.merkle_root_hex == root_a || w.merkle_root_hex == root_b)
+                })
+                .cloned()
+                .collect();
+            // The marker's event_id is deterministic on (peer, epoch,
+            // roots) — derive it through `equivocation_hard_case` itself
+            // (the timestamp does not enter the id) so there is exactly
+            // one derivation to keep coherent.
+            let event_id =
+                crate::witness::equivocation_hard_case(proof, chrono::Utc::now()).event_id;
+            let hard_case = cases.iter().find(|c| c.event_id == event_id).cloned();
+            records.push(crate::witness::WitnessEquivocationRecord {
+                peer_id: proof.peer_id.clone(),
+                epoch_id: proof.epoch_id,
+                claim_namespaces: proof.claim_namespaces.clone(),
+                root_a,
+                root_b,
+                witnesses,
+                hard_case,
+            });
+        }
+        Ok(records)
+    }
+
     /// CEG §8.1.11.1 — effective consent stance of subject `s` over
     /// target Contribution `T` at `now`. Default impl over
     /// [`list_attestations_for`](Self::list_attestations_for): the latest
@@ -3191,6 +3385,71 @@ pub trait FederationDirectory: Send + Sync {
             }
         }
         Ok(report)
+    }
+
+    /// v16 (CIRISPersist#434, CC 5.3.2.2) — the 24h-SLA detector's READ
+    /// surface: every subject-side `consent:state:revoked` still resting
+    /// at LOCAL tier (unpromoted) with `now - asserted_at > sla`,
+    /// returned as [`ConsentPromotionOverdueRow`](hard_case::ConsentPromotionOverdueRow)s.
+    /// This is the never-rest-local tripwire's reader half — the
+    /// `run_consent_sla_watch` (b) branch surfaces the same condition as
+    /// a `hard_case`; this method returns the rows so a caller can drive
+    /// the promotion (`attestation_promote`) that clears them.
+    ///
+    /// Each overdue row is ALSO recorded as
+    /// `hard_case:consent_revocation_promotion_overdue`, idempotently:
+    /// the deterministic [`hard_case::watch_event_id`] is the SAME one
+    /// the watcher derives, so a reader scan and a watcher tick never
+    /// double-emit for one observed condition.
+    ///
+    /// Backend-agnostic default composing
+    /// [`list_consent_revocations`](Self::list_consent_revocations) +
+    /// [`record_hard_case`](Self::record_hard_case).
+    async fn list_consent_revocation_promotion_overdue(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        sla: std::time::Duration,
+    ) -> Result<Vec<hard_case::ConsentPromotionOverdueRow>, Error> {
+        let window =
+            chrono::Duration::from_std(sla).unwrap_or_else(|_| chrono::Duration::hours(24));
+        let revocations = self.list_consent_revocations(None).await?;
+        let mut overdue = Vec::new();
+        for rev in &revocations {
+            // §10.1.3 transit-not-rest: only a LOCAL-tier, unpromoted row
+            // past the window is overdue (a promoted row's terminal state
+            // is `federation`, which drops it out of the fire condition).
+            let local = rev.tier != crate::federation::types::attestation_tier::FEDERATION;
+            if !(local && rev.promoted_at.is_none() && now - rev.asserted_at > window) {
+                continue;
+            }
+            // Flag it (idempotent — the watcher's own event_id derivation,
+            // so reader + watcher dedup against each other).
+            self.record_hard_case(hard_case::HardCaseEvent {
+                event_id: hard_case::watch_event_id(
+                    hard_case::kind::CONSENT_REVOCATION_PROMOTION_OVERDUE,
+                    &rev.attested_key_id,
+                    rev.asserted_at,
+                ),
+                kind: hard_case::kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.to_string(),
+                target_key_id: Some(rev.attested_key_id.clone()),
+                subject_key_id: Some(rev.attesting_key_id.clone()),
+                detail: serde_json::json!({
+                    "revocation_at": rev.asserted_at.to_rfc3339(),
+                    "promotion_window_secs": sla.as_secs(),
+                }),
+                emitted_at: now,
+            })
+            .await?;
+            overdue.push(hard_case::ConsentPromotionOverdueRow {
+                attestation_id: rev.attestation_id.clone(),
+                target_key_id: rev.attested_key_id.clone(),
+                subject_key_id: rev.attesting_key_id.clone(),
+                asserted_at: rev.asserted_at,
+                age_seconds: (now - rev.asserted_at).num_seconds().max(0) as u64,
+                tier: rev.tier.clone(),
+            });
+        }
+        Ok(overdue)
     }
 
     // ─── v10.0.0 — fountain holdings/eviction surface (CIRISPersist#270) ──
@@ -4009,6 +4268,29 @@ pub enum Error {
         reason: String,
     },
 
+    /// v16.0.0 (CIRISPersist#424) — a `federation_keys` write was REFUSED
+    /// because it would confer `infra:attest` on a `key_id` the accord quorum
+    /// has WITHDRAWN (a durable V104 tombstone exists whose `superseded_by`
+    /// does not name this key). The revocation-wins consult that makes
+    /// withdrawal defeat a re-add over anti-entropy — the #377 canonical rule,
+    /// generalized to the roles vector. Stable `kind()` token
+    /// `infra_attest_role_withdrawn`. See
+    /// [`admission::check_infra_attest_role_admission`] and
+    /// [`admission::withdraw_infra_attest_role`].
+    #[error(
+        "federation_keys row {key_id:?} was refused the `infra:attest` role: the accord quorum \
+         withdrew it (V104 tombstone; superseded_by={superseded_by:?}) — a withdrawn \
+         build-signing key cannot be re-conferred the role, even by a valid co-scrub \
+         (revocation-wins, #424)"
+    )]
+    InfraAttestRoleWithdrawn {
+        /// The `key_id` that carries a withdrawal tombstone.
+        key_id: String,
+        /// The successor `key_id` the withdrawal points to (a supersede), or
+        /// `None` for a plain withdraw.
+        superseded_by: Option<String>,
+    },
+
     /// v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — a
     /// `federation_keys` write was REFUSED because it would confer the
     /// `canonical` role on a `key_id` the accord quorum has WITHDRAWN (a durable
@@ -4314,6 +4596,7 @@ impl Error {
             Error::InfraAttestRoleNotAccordConferred { .. } => {
                 "infra_attest_role_not_accord_conferred"
             }
+            Error::InfraAttestRoleWithdrawn { .. } => "infra_attest_role_withdrawn",
             Error::CanonicalRoleWithdrawn { .. } => "canonical_role_withdrawn",
             Error::CanonicalWithdrawalAuthorityInvalid { .. } => {
                 "canonical_withdrawal_authority_invalid"

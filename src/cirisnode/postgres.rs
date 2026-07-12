@@ -1265,6 +1265,14 @@ impl NodeCoreService for PostgresBackend {
         rows.into_iter().map(row_to_contribution).collect()
     }
 
+    async fn put_key_grant(&self, env: ContributionEnvelope) -> Result<(), Error> {
+        // v16 (CIRISPersist#432, CC 5.1) — fail-closed shape gate
+        // FIRST (must BE a key_grant), then the full put_contribution
+        // admission (trust gate + signature + projection).
+        super::media_sharing::require_key_grant_envelope(&env)?;
+        self.put_contribution(env).await
+    }
+
     async fn retire_key_grants(
         &self,
         actor_key_id: &str,
@@ -2926,6 +2934,138 @@ mod tests {
         env.signature = sign_envelope(&env, &author_key);
         let err = backend.put_contribution(env).await.unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
+    }
+
+    /// v16 (#432, CC 5.1 `CLM-epoch-keying`) — the dedicated
+    /// `put_key_grant` writer populates the `(stream_id, epoch)`
+    /// reader with epoch isolation: a grant for (S, n) appears in
+    /// list(S, n) and NOT in list(S, n+1) or list(S', n); a second
+    /// grantee in the same epoch is listed alongside; a duplicate
+    /// `contribution_id` (the PK) is a Conflict while a re-grant
+    /// under a fresh id appends; a non-key_grant envelope is
+    /// rejected fail-closed leaving no row.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_put_key_grant_writer_round_trip_epoch_isolation() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC7; 32]);
+        let stream = format!("stream-{}", Uuid::new_v4());
+        let other_stream = format!("stream-{}", Uuid::new_v4());
+        let recip_a = format!("rec-{}", Uuid::new_v4());
+        let recip_b = format!("rec-{}", Uuid::new_v4());
+
+        // (S, 1) grantee A — reused below for the Conflict check.
+        let grant_a = build_stream_key_grant(&author_key, &stream, 1, &recip_a);
+        backend.put_key_grant(grant_a.clone()).await.unwrap();
+        // (S, 1) grantee B — second grantee, same epoch.
+        backend
+            .put_key_grant(build_stream_key_grant(&author_key, &stream, 1, &recip_b))
+            .await
+            .unwrap();
+        // Epoch + stream noise: (S, 2) and (S', 1).
+        backend
+            .put_key_grant(build_stream_key_grant(&author_key, &stream, 2, &recip_a))
+            .await
+            .unwrap();
+        backend
+            .put_key_grant(build_stream_key_grant(
+                &author_key,
+                &other_stream,
+                1,
+                &recip_a,
+            ))
+            .await
+            .unwrap();
+
+        // list(S, 1) = both grantees, and ONLY epoch-1 rows.
+        let rows = backend
+            .list_key_grants_for_stream_epoch(&stream, 1)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "both (S,1) grantees listed");
+        let recipients: std::collections::HashSet<String> = rows
+            .iter()
+            .map(|env| {
+                let p: crate::cirisnode::KeyGrantPayload =
+                    serde_json::from_value(env.payload.clone()).unwrap();
+                assert_eq!(p.stream_id.as_deref(), Some(stream.as_str()));
+                assert_eq!(p.stream_epoch, Some(1));
+                p.recipient_key_id
+            })
+            .collect();
+        assert!(recipients.contains(&recip_a) && recipients.contains(&recip_b));
+        // Epoch isolation: (S, 2) sees only its own grant; (S', 1)
+        // likewise; (S, 3) is empty.
+        assert_eq!(
+            backend
+                .list_key_grants_for_stream_epoch(&stream, 2)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            backend
+                .list_key_grants_for_stream_epoch(&other_stream, 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(backend
+            .list_key_grants_for_stream_epoch(&stream, 3)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Conflict: same contribution_id (the PK) re-written → Conflict.
+        let dup = backend.put_key_grant(grant_a.clone()).await.unwrap_err();
+        assert!(matches!(dup, Error::Conflict(_)), "got: {dup:?}");
+        // Re-grant same (S, 1, recip_a) under a FRESH id appends.
+        backend
+            .put_key_grant(build_stream_key_grant(&author_key, &stream, 1, &recip_a))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .list_key_grants_for_stream_epoch(&stream, 1)
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "re-grant under a fresh contribution_id appends"
+        );
+
+        // Fail-closed: a non-key_grant envelope through the dedicated
+        // writer is rejected with no row.
+        let mut not_grant = build_stream_key_grant(&author_key, &stream, 5, &recip_a);
+        not_grant.subject.subject = Some("arc_question".into());
+        not_grant.signature = sign_envelope(&not_grant, &author_key);
+        let err = backend.put_key_grant(not_grant).await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains("subject_kind")),
+            "got: {err:?}"
+        );
+        // Wrong contribution_type is equally rejected.
+        let mut wrong_type = build_stream_key_grant(&author_key, &stream, 5, &recip_a);
+        wrong_type.contribution_type = ContributionType::ModerationEvent;
+        wrong_type.signature = sign_envelope(&wrong_type, &author_key);
+        let err = backend.put_key_grant(wrong_type).await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains("contribution_type=proposal")),
+            "got: {err:?}"
+        );
+        assert!(backend
+            .list_key_grants_for_stream_epoch(&stream, 5)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

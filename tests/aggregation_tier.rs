@@ -51,26 +51,52 @@ async fn signed_verify_inputs(
 
 /// As [`signed_verify_inputs`] but with an explicit signed `n_eff`, so a test
 /// can model a **dominated** fold (`n_eff` far below `source_count`) that the
-/// §19.7.1.2 dominance gate must reject.
+/// §19.7.1.2 dominance gate must reject. Balanced multiplicity (all members
+/// content-distinct).
 async fn signed_verify_inputs_n_eff(
     member_ids: &[String],
     tamper: bool,
     drop_pqc: bool,
     n_eff: u32,
 ) -> (AggregationMetaVerifyInputsV1, String) {
+    signed_verify_inputs_v3(member_ids, tamper, drop_pqc, n_eff, 1, 3).await
+}
+
+/// The full-knob builder: explicit signed `n_eff`, `max_source_multiplicity`,
+/// and schema `version` — so tests model a dominated fold (§19.7.1.2), a
+/// near-duplicate-heavy fold (§19.7.1.3), and a pre-v3 tier (which the #435
+/// flag-day multiplicity gate must fail closed). A `version >= 3` preimage
+/// appends `u32(max_source_multiplicity) ‖ mass_commitment`; the mass root is
+/// built over equal per-member masses via the verify-core producer (the honest
+/// balanced case — the admission gate carries but does not recompute it).
+async fn signed_verify_inputs_v3(
+    member_ids: &[String],
+    tamper: bool,
+    drop_pqc: bool,
+    n_eff: u32,
+    max_source_multiplicity: u32,
+    version: u32,
+) -> (AggregationMetaVerifyInputsV1, String) {
     let (ed_sk, _ed_pk_b64, mldsa) = producer_pubkeys();
     let commitment = member_commitment(member_ids);
     let commitment_hex = hex_lower(&commitment);
-    // A signed version-2 tier. The signature covers n_eff because the
-    // version-2 signing_preimage appends u32(n_eff).
+    // §19.7.1.3: equal-mass members (the honest 900/1000 shape — the mass gate
+    // sees a balanced fold; only the multiplicity surface exposes the cluster).
+    let masses: Vec<(String, u64)> = member_ids
+        .iter()
+        .map(|id| (id.clone(), 1_000_000u64))
+        .collect();
+    let mass_root = ciris_persist::fountain::aggregation::mass_commitment(&masses);
     let meta = ciris_verify_core::holonomic::AggregationMetaV1 {
-        version: 2,
+        version,
         content_id: "content-root-agg".to_owned(),
         corpus_kind: "trace".to_owned(),
         tier: 2,
         aggregation_algorithm_id: "raptorq-pyramid-v1".to_owned(),
         source_count: member_ids.len() as u32,
         n_eff,
+        max_source_multiplicity,
+        mass_commitment: mass_root,
         member_commitment: commitment,
         noise_floor_descriptor: "mean+stddev".to_owned(),
     };
@@ -90,6 +116,13 @@ async fn signed_verify_inputs_n_eff(
         aggregation_algorithm_id: meta.aggregation_algorithm_id.clone(),
         source_count: meta.source_count,
         n_eff: meta.n_eff,
+        max_source_multiplicity: meta.max_source_multiplicity,
+        // A pre-v3 tier has no mass surface on the wire (not in its preimage).
+        mass_commitment_hex: if version >= 3 {
+            hex_lower(&mass_root)
+        } else {
+            String::new()
+        },
         member_commitment_hex: commitment_hex.clone(),
         noise_floor_descriptor: meta.noise_floor_descriptor.clone(),
         sig_ed25519_b64: BASE64.encode(ed_sig),
@@ -371,6 +404,84 @@ async fn run_aggregation_assertions<B: Backend>(backend: &B, suffix: &str) {
     assert!(
         backend.get_aggregation(&dom_cid).await.unwrap().is_none(),
         "(b2) rejected dominated composite wrote ZERO content_aggregation rows"
+    );
+
+    // ── (b3) §19.7.1.3 multiplicity gate (CIRISVerify#191 / #435): a fully
+    //        HYBRID-signed, dominance-CLEAN composite (equal masses, honest
+    //        n_eff == source_count) whose authenticated content-similarity
+    //        cluster violates the corpus-pinned floor (multiplicity=2 of
+    //        source_count=3 at n_min=2 → 4 > 3 — the scaled 900/1000 shape)
+    //        is REJECTED at admission with zero rows. The near-duplicate
+    //        false-erasure the mass gate honestly admits.
+    let mult_cid = format!("agg-multiplicity-{suffix}");
+    let (m_mult, s_mult) = build_manifest_and_symbols(
+        &mult_cid,
+        &composite_corpus,
+        n_source,
+        k_repair,
+        symbol_size,
+        true,
+    )
+    .await;
+    let (verif_mult, commitment_mult) =
+        signed_verify_inputs_v3(&member_ids, false, false, member_ids.len() as u32, 2, 3).await;
+    let agg_mult = AggregationMetaV1 {
+        aggregate_content_id: mult_cid.clone(),
+        source_corpus_kind: source_corpus.to_owned(),
+        aggregation_level: 1,
+        fan_in: 3,
+        member_commitment: commitment_mult,
+        aggregation_meta: vec![0x02],
+        verification: verif_mult,
+    };
+    let mult_err = backend
+        .put_aggregated_tier(&m_mult, &s_mult, &agg_mult, 2_500)
+        .await
+        .expect_err("(b3) near-duplicate-heavy fold MUST be rejected");
+    assert_eq!(
+        mult_err.kind(),
+        "aggregation_meta_multiplicity",
+        "(b3) §19.7.1.3 multiplicity token"
+    );
+    assert!(
+        backend.get_aggregation(&mult_cid).await.unwrap().is_none(),
+        "(b3) rejected multiplicity composite wrote ZERO content_aggregation rows"
+    );
+
+    // ── (b4) §19.7.1.3 flag-day cut (CIRISVerify#191): a validly-signed
+    //        VERSION-2 tier (no signed multiplicity surface) now FAILS CLOSED
+    //        at the multiplicity gate — a pre-v3 writer cannot bypass the
+    //        content-similarity floor by declaring the older schema (the same
+    //        argument that strands v1 at the dominance gate).
+    let v2_cid = format!("agg-v2-flagday-{suffix}");
+    let (m_v2, s_v2) = build_manifest_and_symbols(
+        &v2_cid,
+        &composite_corpus,
+        n_source,
+        k_repair,
+        symbol_size,
+        true,
+    )
+    .await;
+    let (verif_v2, commitment_v2) =
+        signed_verify_inputs_v3(&member_ids, false, false, member_ids.len() as u32, 1, 2).await;
+    let agg_v2 = AggregationMetaV1 {
+        aggregate_content_id: v2_cid.clone(),
+        source_corpus_kind: source_corpus.to_owned(),
+        aggregation_level: 1,
+        fan_in: 3,
+        member_commitment: commitment_v2,
+        aggregation_meta: vec![0x02],
+        verification: verif_v2,
+    };
+    let v2_err = backend
+        .put_aggregated_tier(&m_v2, &s_v2, &agg_v2, 2_500)
+        .await
+        .expect_err("(b4) a pre-v3 tier MUST fail the multiplicity gate closed");
+    assert_eq!(
+        v2_err.kind(),
+        "aggregation_meta_multiplicity",
+        "(b4) flag-day fail-closed token"
     );
 
     // ── (b2) §19.7.1 store-path gate: a valid composite manifest but a

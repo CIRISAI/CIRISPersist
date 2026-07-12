@@ -300,6 +300,37 @@ pub trait NodeCoreService: Send + Sync {
         epoch: u64,
     ) -> impl Future<Output = Result<Vec<ContributionEnvelope>, Error>> + Send;
 
+    /// v16 (CIRISPersist#432, CC 5.1 `CLM-epoch-keying`) — the
+    /// dedicated `key_grant` WRITER. Verifies the envelope IS a
+    /// well-formed `key_grant` Contribution
+    /// ([`super::media_sharing::require_key_grant_envelope`]:
+    /// `contribution_type=proposal`, `subject_kind=key_grant`, payload
+    /// valid in exactly one addressing mode), then runs the FULL
+    /// [`put_contribution`](Self::put_contribution) admission — trust
+    /// gate + hybrid signature verification + payload re-validation +
+    /// V054/V064 column projection. A stream/epoch-addressed grant
+    /// written here for `(stream_id, epoch)` is served by
+    /// [`list_key_grants_for_stream_epoch`](Self::list_key_grants_for_stream_epoch);
+    /// a content-addressed grant is served by the
+    /// [`list_key_grants_for`](Self::list_key_grants_for) /
+    /// [`list_key_grants_for_content`](Self::list_key_grants_for_content)
+    /// axes.
+    ///
+    /// # Conflict semantics
+    ///
+    /// The table PK is `contribution_id` — NOT `(stream_id, epoch,
+    /// recipient)`. A duplicate `contribution_id` surfaces as
+    /// [`Error::Conflict`]; re-granting the SAME `(stream_id, epoch,
+    /// recipient_key_id)` under a fresh `contribution_id` appends a
+    /// new grant row (reads are newest-first; supersession is
+    /// expressed via `rotation_chain` /
+    /// [`retire_key_grants`](Self::retire_key_grants), never by
+    /// mutating a prior grant — grants are immutable audit rows).
+    fn put_key_grant(
+        &self,
+        env: ContributionEnvelope,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
     /// v3.6.0 (CIRISPersist#134) — emit a supersession `key_grant`
     /// Contribution against every prior `key_grant` Contribution
     /// issued by `actor_key_id`. Used when an actor's keying material

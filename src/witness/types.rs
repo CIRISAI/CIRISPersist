@@ -136,6 +136,64 @@ impl StoredWitness {
     }
 }
 
+/// The PyO3 wire shape of a WholenessWitness (CIRISPersist#431 — the
+/// CC 6.1.1 Engine projection). Mirrors the verify-core
+/// [`WholenessWitness`](ciris_verify_core::holonomic::WholenessWitness)
+/// scalars with the Merkle root carried as lowercase hex (the JSON-safe
+/// form of the 32-byte `Hash`), plus the producer's ML-DSA-65 key id
+/// (provenance — a [`StoredWitness`] column, not a signed scalar, so it
+/// rides the wire object rather than the signature params).
+///
+/// No `verified` field (the §19.0 F-5 rule): a verdict is recomputed at
+/// the ingest gate, never read from the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessWire {
+    /// The witnessing peer's stable id.
+    pub peer_id: String,
+    /// Per-peer monotonic epoch (anti-rollback / eclipse guard, N4).
+    pub epoch_id: u64,
+    /// The namespaces this root covers. MUST NOT name anonymous/`self`
+    /// (WW-2) — enforced at the gate by `verify_witness`.
+    pub claim_namespaces: Vec<String>,
+    /// The §19.1 Merkle root — lowercase hex (64 chars).
+    pub merkle_root_hex: String,
+    /// Number of Merkle leaves the root covers.
+    pub leaf_count: u32,
+    /// Producer observation time, unix-ms.
+    pub observed_at_unix_ms: u64,
+    /// Witness schema version. Defaults to V1 when omitted.
+    #[serde(default = "default_witness_version")]
+    pub witness_version: u16,
+    /// The producer's ML-DSA-65 key id (provenance / re-verify lookup).
+    /// Defaults empty when the caller has no keyring alias to record.
+    #[serde(default)]
+    pub pqc_key_id: String,
+}
+
+fn default_witness_version() -> u16 {
+    WITNESS_VERSION_V1
+}
+
+impl WitnessWire {
+    /// Decode the wire shape into the verify-core
+    /// [`WholenessWitness`](ciris_verify_core::holonomic::WholenessWitness)
+    /// the ingest gate verifies. Errors on a non-64-hex-char root.
+    pub fn to_verify_witness(
+        &self,
+    ) -> Result<ciris_verify_core::holonomic::WholenessWitness, crate::witness::WitnessAdmitError>
+    {
+        Ok(ciris_verify_core::holonomic::WholenessWitness {
+            peer_id: self.peer_id.clone(),
+            epoch_id: self.epoch_id,
+            claim_namespaces: self.claim_namespaces.clone(),
+            merkle_root: decode_root_hex(&self.merkle_root_hex)?,
+            leaf_count: self.leaf_count,
+            observed_at_unix_ms: self.observed_at_unix_ms,
+            witness_version: self.witness_version,
+        })
+    }
+}
+
 /// Lowercase-hex of a 32-byte Merkle root (the corpus column shape).
 #[must_use]
 pub fn encode_root_hex(root: &[u8; 32]) -> String {

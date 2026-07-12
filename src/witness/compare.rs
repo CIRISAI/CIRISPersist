@@ -108,6 +108,57 @@ pub fn accept_if_monotonic(last_accepted_epoch: Option<u64>, candidate_epoch: u6
     }
 }
 
+/// The JSON verdict shape the PyO3 projection returns (CIRISPersist#431):
+/// `"consistent"` | `"divergent"` |
+/// `{"equivocation": [{peer_id, epoch_id, claim_namespaces, root_a,
+/// root_b}, ...]}`. Roots are lowercase hex (the corpus column shape).
+#[must_use]
+pub fn verdict_json(action: &WitnessReconcileAction) -> serde_json::Value {
+    match action {
+        WitnessReconcileAction::NoAction => serde_json::json!("consistent"),
+        WitnessReconcileAction::TriggerQuorumMerge => serde_json::json!("divergent"),
+        WitnessReconcileAction::Equivocation(proofs) => serde_json::json!({
+            "equivocation": proofs
+                .iter()
+                .map(|p| serde_json::json!({
+                    "peer_id": p.peer_id,
+                    "epoch_id": p.epoch_id,
+                    "claim_namespaces": p.claim_namespaces,
+                    "root_a": super::types::encode_root_hex(&p.roots.0),
+                    "root_b": super::types::encode_root_hex(&p.roots.1),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    }
+}
+
+/// The N4 read-back record for one non-repudiable equivocation
+/// (CIRISPersist#431 item 4): the proof scalars, BOTH conflicting
+/// [`StoredWitness`] rows (retained, never reconciled), and the
+/// `hard_case:witness_equivocation` marker if one has been recorded.
+/// Serializable — the PyO3 `list_witness_equivocations_json` payload.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WitnessEquivocationRecord {
+    /// The equivocating peer.
+    pub peer_id: String,
+    /// The epoch both witnesses claimed.
+    pub epoch_id: u64,
+    /// The sorted namespace set both witnesses scoped.
+    pub claim_namespaces: Vec<String>,
+    /// The two conflicting roots, lowercase hex (sorted — canonical proof).
+    pub root_a: String,
+    /// See [`root_a`](Self::root_a).
+    pub root_b: String,
+    /// The conflicting corpus rows themselves (both retained — N4).
+    pub witnesses: Vec<StoredWitness>,
+    /// The recorded `hard_case:witness_equivocation` marker, when the
+    /// reconcile pass has emitted it (idempotent on the deterministic
+    /// event_id). `None` only if the equivocation is visible but no
+    /// reconcile has run yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hard_case: Option<crate::federation::HardCaseEvent>,
+}
+
 /// Build the `hard_case:witness_equivocation` event for one equivocation
 /// proof (CIRISPersist#146 emitter). `target_key_id` = the equivocating
 /// peer; `detail` carries the epoch, namespace set, and the two conflicting

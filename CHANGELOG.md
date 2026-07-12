@@ -5,6 +5,105 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [16.0.0] — 2026-07-12 — the CC 1.0-final holistic cut: full key lifecycle wire-safe + trust-root rotation + the four conformance-evidence gaps + the R9 residual — BREAKING
+
+One coordinated cut (operator-directed: no incremental releases) closing everything
+that stood between the substrate and CC 1.0-final machine evidence. Verify re-pin
+**9.0.2 → 10.1.0** (MAJOR 9→10 = cohab firewall; 10.1.0 adds the CC 5.1 epoch-key
+derivation + the #194 re-exports).
+
+### #421 — SIGNED occurrence revocation + the full lifecycle (BREAKING; closes the permanent-DoS forgery)
+- `SignedIdentityOccurrenceRevocation` now carries `{attesting_key_id,
+  signed_envelope, signature}` (was an unsigned thin wrapper) —
+  `put_identity_occurrence_revocation` hybrid-verifies **1-of-1 over
+  `JCS(signed_envelope)`** against the pinned key (RequireHybrid), with the #418
+  envelope-is-authority divergence checks (ids + `revoked_at` + `effective_at`,
+  the terminality clock) and THE shared `check_signer_acts_for` (extracted — one
+  authorization rule for both the occurrence and revocation gates). Without this,
+  any consented peer could fabricate `{identity: victim, occurrence: victim}` and
+  permanently brick the victim's sealability. Producer = the envelope-generic
+  `produce_signed_identity_occurrence` (no verify ask needed).
+- **Terminality retired — the lifecycle is publish → rotate → revoke →
+  re-establish.** `IdentityOccurrenceRevocation::revokes(occ, now)` is THE single
+  fold comparator (used by `resolve_encryption_keys`,
+  `list_identity_occurrences_active`, AND `build_caller_admission` — it cannot
+  drift): a revocation kills occurrences asserted at-or-before it; a FRESH signed
+  occurrence re-establishes under the same key_id; a replayed old revocation is a
+  no-op.
+- `put_identity_occurrence_revocation_local` (trusted-local, NULL sig columns) +
+  `list_signed_identity_occurrence_revocations_for` (byte-exact replication read,
+  signed-put rows only; the `list_signed_records` revocation arm rewired to it).
+  V103 signature columns; capsule op `PutIdentityOccurrenceRevocation` routed
+  (was `Unsupported`) — **unblocks CIRISServer#227 S2**: the revocation kind can
+  finally ride the wire. Full-lifecycle test with real hybrid crypto + 3
+  forgeries (garbage sig / unrelated-registered signer / divergent projection).
+
+### #424 — `infra:attest` WITHDRAW (trust-root rotation completes)
+- V104 `federation_role_withdrawals` — the **generic** accord-conferred-role
+  tombstone (#377's V095 stays canonical-only; every later role lands here).
+  `OP_WITHDRAW_INFRA_ATTEST` rides the SAME op-parameterized #377 authority core
+  (strict-majority re-tally of persist's own verified participations — quorum
+  math in ONE place); revocation-wins consult in
+  `check_infra_attest_role_admission` (supersede-to-self exempt);
+  `is_infra_attest_effective`. Decision-table matrix on all three backends,
+  including the cross-op replay refuse (an infra-withdraw digest cannot
+  authorize a canonical withdraw — payload op-token binding).
+
+### #431 — WholenessWitness PyO3 projection (CC 6.1.1 staged→green)
+- The v8.2.0/#228 witness corpus substrate (V085, all three backends) projected
+  onto the Engine: `wholeness_witness_root_hex` (WW-scheme builder,
+  `WW-v1-empty` sentinel), `put_wholeness_witness_json` (N3
+  verify-before-persist; equivocation retained-both + idempotent
+  `hard_case:witness_equivocation`, N4), `compare_wholeness_witnesses_json`
+  (`consistent` / `divergent` / equivocation verdict),
+  `list_witness_equivocations_json`. New backend-symmetric
+  `list_witness_peer_ids` / `compare_stored_witnesses` /
+  `list_witness_equivocations` trait reads.
+
+### #432 — epoch-keyed key_grant WRITER (CC 5.1 staged→green, with verify 10.1.0's derivation)
+- `cirisnode_put_key_grant` (+ PyO3 `cirisnode_put_key_grant_json`): the
+  first-class emission path for `(stream_id, epoch)` grants (V064 rows rode
+  `proposal`+`subject_kind=key_grant` with no discoverable writer). Full sibling
+  discipline (trust gate → hybrid envelope verify → payload validation → V064
+  projection; v2 PQC wrap mandatory); epoch isolation proven ((S,1) ∉ (S,2) ∪
+  (S',1)). The per-epoch DEK/nonce derivation is verify 10.1.0's `epoch_key`
+  (CIRISVerify#193, golden-pinned).
+
+### #433 — adult-incapacity guardianship emit aperture (CC 3.4.12 end-to-end)
+- `Engine::steward_bind_incapacity` (+ PyO3): shapes the `delegates_to` with the
+  CC 3.4.12 binding fields (`binding_legitimacy_source`, `valid_until`,
+  `binding_tier?`, `petitioner_key_id?`) the v11.9.0/#309 admission predicate
+  demands — which plain `steward_bind` cannot stamp, leaving the (green) gate
+  unreachable. Admissibility remains entirely the gate's; end-to-end test:
+  attested ward admits + steward-bound, capacitated adult stays
+  `target_is_self_sovereign`, protected domains never delegable.
+
+### #434 — consent promotion-overdue SLA detector (CC 5.3.2.2 tripwire)
+- `list_consent_revocation_promotion_overdue` (+ PyO3, default SLA 86400s): a
+  subject-side consent revocation resting local-tier past the SLA surfaces as
+  `hard_case:consent_revocation_promotion_overdue`, deduped against the
+  consent-SLA watcher's own event ids; promotion clears it.
+
+### #435/#430 — the v3 multiplicity gate (CC 6.1.2.1.2 R9 residual closes)
+- Aggregated-tier admission now requires BOTH `passes_dominance_gate` AND
+  `passes_multiplicity_gate` (`max_source_multiplicity · n_min ≤ source_count`,
+  `n_min` corpus-pinned in `multiplicity_n_min_for` — never a caller knob).
+  Rejects the 900-near-duplicates-under-distinct-ids fold whose HONEST
+  `n_eff = 1000` the mass gate admits (the composite blur IS the data subject).
+  Fail-closed for pre-v3 tiers (the CIRISVerify#191 flag-day cut). New wire
+  fields `max_source_multiplicity` + `mass_commitment_hex`; reject token
+  `aggregation_meta_multiplicity`. v1/v2 goldens byte-untouched.
+
+### Rides
+- **#408**: the infra-does-not-vote pin is durable in `verify_coord.rs` module
+  docs (landed via #407); thread 1 (BFT ⌈2N/3⌉ vs plain-majority durability)
+  filed as CIRISVerify#196; thread 2 noted on #143.
+- **#400**: the build-manifest job no longer cold-compiles the crypto graph for
+  the PersistExtras JSON (CIRISCache restore + debug build; output
+  byte-identical).
+- verify pins 9.0.2 → **10.1.0** (six Cargo pins + pyproject
+  `ciris-verify>=10.0.0,<11`).
+
 ## [15.1.2] — 2026-07-12 — verify 9.0.2 re-pin (mesh coherence; build-only upstream)
 
 - **`ciris-verify` 9.0.1 → 9.0.2** (all six Rust git-tag pins). verify 9.0.2

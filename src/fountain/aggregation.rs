@@ -60,8 +60,10 @@
 use serde::{Deserialize, Serialize};
 
 pub use ciris_verify_core::holonomic::aggregation::descend_order;
+// v10.1.0 (CIRISVerify#194) restored root re-exports for the #191 v3 fns.
 pub use ciris_verify_core::holonomic::{
-    ejection_verdict, member_commitment, passes_dominance_gate, verify_aggregation_meta,
+    ejection_verdict, mass_commitment, member_commitment, passes_dominance_gate,
+    passes_multiplicity_gate, verify_aggregation_meta, verify_mass_commitment,
     verify_member_commitment, AggregationMetaVerification, EjectionVerdict,
 };
 
@@ -77,6 +79,45 @@ pub use ciris_verify_core::holonomic::{
 /// §19.7.1.2 posture (a dominated aggregator cannot bypass the floor by
 /// declaring the pre-#167 schema). Pinned here; twins with CIRISConstitution#6.
 pub const MIN_DOMINANCE_RATIO: f64 = 0.5;
+
+/// §19.7.1.3 (CIRISVerify#191 / CIRISPersist#435, CC 6.1.2.1.2 R9) — the
+/// **content-similarity multiplicity floor** persist enforces at admission,
+/// alongside [`MIN_DOMINANCE_RATIO`]. A tier passes iff its signed largest
+/// content-similar cluster is at most `1/n_min` of its raw `source_count`
+/// (`max_source_multiplicity · n_min ≤ source_count`).
+///
+/// `n_min = 2` ⇒ no content-similar cluster may exceed **half** the fold. The
+/// 900-near-duplicates-under-distinct-ids case (`max_source_multiplicity = 900`,
+/// `source_count = 1000`) yields `1800 > 1000` → **rejected** — the fold the
+/// mass-based [`passes_dominance_gate`] honestly admits (900 distinct members at
+/// equal mass carry a truthful `n_eff = 1000`) but whose composite blur IS the
+/// data subject.
+///
+/// **Fail-closed:** [`passes_multiplicity_gate`] is `false` for a v1/v2 tier (no
+/// *signed* `max_source_multiplicity`) — the flag-day hard cut CIRISVerify#191
+/// declares (no deprecation window; nothing is deployed on v3-less writers).
+///
+/// `n_min` is **`corpus_kind`-pinned** (CC 6.1.2 `(R, ε)` — two conformant impls
+/// MUST agree); [`multiplicity_n_min_for`] is the pin. Twins with
+/// CIRISConstitution#6.
+pub const DEFAULT_MULTIPLICITY_N_MIN: u32 = 2;
+
+/// The `corpus_kind`-pinned multiplicity floor `n_min` the §19.7.1.3 gate uses
+/// for a given corpus. Pinned in ONE place so persist and every other conformant
+/// impl agree (CC 6.1.2 `(R, ε)`); today every corpus takes the
+/// [`DEFAULT_MULTIPLICITY_N_MIN`] floor, and a corpus needing a stricter floor
+/// (a higher `n_min` ⇒ a smaller admissible cluster) gets an arm here rather
+/// than a caller-supplied knob — a caller-tunable `n_min` would let a dominated
+/// aggregator pick its own floor.
+// The match-shape is deliberate: per-corpus pins land HERE, centrally, rather
+// than as caller knobs. Allow the single-binding lint until a second arm exists.
+#[allow(clippy::match_single_binding)]
+pub fn multiplicity_n_min_for(corpus_kind: &str) -> u32 {
+    match corpus_kind {
+        // No corpus currently pins a stricter floor than the default.
+        _ => DEFAULT_MULTIPLICITY_N_MIN,
+    }
+}
 
 /// `corpus_kind` prefix for an aggregate composite: a composite folding
 /// `"trace"` sources has `corpus_kind = "aggregate:trace"`.
@@ -128,6 +169,28 @@ pub struct AggregationMetaVerifyInputsV1 {
     /// [`ciris_verify_core::holonomic::passes_dominance_gate`] closed).
     #[serde(default)]
     pub n_eff: u32,
+    /// §19.7.1.3 (CIRISVerify#191 / CC 6.1.2.1.2 R9) — the signed
+    /// **content-similarity multiplicity**: the size of the largest cluster of
+    /// members whose pairwise content similarity exceeds the `corpus_kind`-pinned
+    /// threshold, computed by the aggregator at fold time (edge — the only point
+    /// holding member payloads). Closes what the mass-based [`Self::n_eff`]
+    /// cannot see: 900 near-duplicate contents folded as 900 *distinct members at
+    /// equal mass* honestly yield `n_eff == 1000`, yet the composite blur IS the
+    /// data subject. **Signed only when `version >= 3`**; a v1/v2 tier lacks the
+    /// surface and **fails closed** at
+    /// [`ciris_verify_core::holonomic::passes_multiplicity_gate`] (flag-day cut,
+    /// no deprecation window). `#[serde(default)]` so pre-v3 wire inputs parse.
+    #[serde(default)]
+    pub max_source_multiplicity: u32,
+    /// §19.7.1.3 (CIRISVerify#191) — Merkle root over the per-member masses —
+    /// base16 (hex) of the raw 32 bytes. Makes both `n_eff` AND the clustering
+    /// **auditable**: an auditor holding the members + their masses recomputes
+    /// this root ([`ciris_verify_core::holonomic::verify_mass_commitment`]) and
+    /// can *prove* a lying `n_eff`/multiplicity from held evidence — converting
+    /// "slashable in principle" into "mechanically provable". **Signed only when
+    /// `version >= 3`**; empty for a pre-v3 tier (not in its preimage).
+    #[serde(default)]
+    pub mass_commitment_hex: String,
     /// §19.7.1.1 Merkle root over the source member ids — base16 (hex) of the
     /// raw 32 bytes. Mirrors the stored
     /// [`AggregationMetaV1::member_commitment`] (which is the SAME hex value).
@@ -149,6 +212,15 @@ impl AggregationMetaVerifyInputsV1 {
         &self,
     ) -> Result<ciris_verify_core::holonomic::AggregationMetaV1, AggregationMetaError> {
         let mc = decode_member_commitment_hex(&self.member_commitment_hex)?;
+        // #435 (CIRISVerify#191) — the v3 mass commitment. Absent/empty on a
+        // pre-v3 tier (not in its preimage), where the all-zero root is
+        // verification-neutral; a v3 tier's preimage appends it, so a malformed
+        // value must fail loudly rather than silently zero out.
+        let mass_c = if self.mass_commitment_hex.is_empty() {
+            [0u8; 32]
+        } else {
+            decode_mass_commitment_hex(&self.mass_commitment_hex)?
+        };
         Ok(ciris_verify_core::holonomic::AggregationMetaV1 {
             version: self.version,
             content_id: self.content_id.clone(),
@@ -157,6 +229,8 @@ impl AggregationMetaVerifyInputsV1 {
             aggregation_algorithm_id: self.aggregation_algorithm_id.clone(),
             source_count: self.source_count,
             n_eff: self.n_eff,
+            max_source_multiplicity: self.max_source_multiplicity,
+            mass_commitment: mass_c,
             member_commitment: mc,
             noise_floor_descriptor: self.noise_floor_descriptor.clone(),
         })
@@ -197,6 +271,21 @@ pub enum AggregationMetaError {
          the noise-floor ratio (n_eff too low, or a version-1 tier with no signed n_eff)"
     )]
     Dominated,
+    /// §19.7.1.3 (CIRISVerify#191 / CIRISPersist#435, CC 6.1.2.1.2 R9) — the
+    /// tier's authenticated **content-similarity multiplicity** violates the
+    /// `corpus_kind`-pinned floor ([`multiplicity_n_min_for`]): a cluster of
+    /// near-duplicate members is too large a share of the fold, so the composite
+    /// blur IS the data subject even though the mass-based `n_eff` is honest
+    /// (the 900-near-duplicates-under-distinct-ids case the
+    /// [`Self::Dominated`] gate admits). **Fail-closed:** a v1/v2 tier carries no
+    /// signed `max_source_multiplicity` and is rejected here — the CIRISVerify#191
+    /// flag-day cut.
+    #[error(
+        "aggregation_meta §19.7.1.3 multiplicity gate: content-similar cluster exceeds the \
+         corpus-pinned floor (max_source_multiplicity too high, or a pre-v3 tier with no \
+         signed multiplicity surface)"
+    )]
+    Multiplicity,
 }
 
 impl AggregationMetaError {
@@ -208,6 +297,7 @@ impl AggregationMetaError {
             Self::MalformedInput(_) => "aggregation_meta_invalid",
             Self::MemberCommitmentMismatch => "aggregation_meta_member_commitment",
             Self::Dominated => "aggregation_meta_dominated",
+            Self::Multiplicity => "aggregation_meta_multiplicity",
         }
     }
 }
@@ -228,6 +318,19 @@ fn decode_member_commitment_hex(hex: &str) -> Result<[u8; 32], AggregationMetaEr
     bytes
         .try_into()
         .map_err(|_| AggregationMetaError::MalformedInput("member_commitment_hex not 32 bytes"))
+}
+
+/// #435 (CIRISVerify#191) — decode the §19.7.1.3 v3 mass-commitment hex (the
+/// Merkle root over per-member masses). Same 32-byte discipline as the member
+/// commitment; a NON-EMPTY malformed value fails loudly (the caller treats
+/// empty as the pre-v3 absent case).
+fn decode_mass_commitment_hex(hex: &str) -> Result<[u8; 32], AggregationMetaError> {
+    let bytes = hex_decode(hex).ok_or(AggregationMetaError::MalformedInput(
+        "mass_commitment_hex not hex",
+    ))?;
+    bytes
+        .try_into()
+        .map_err(|_| AggregationMetaError::MalformedInput("mass_commitment_hex not 32 bytes"))
 }
 
 /// Minimal lowercase/uppercase hex decode (no extra dep — the codec-dep rule).
@@ -364,6 +467,20 @@ impl AggregationMetaV1 {
                 // carries no signed n_eff). §10.1.5.1.1: BEFORE persistence.
                 if !passes_dominance_gate(&verify_meta, MIN_DOMINANCE_RATIO) {
                     return Err(AggregationMetaError::Dominated);
+                }
+                // §19.7.1.3 (CIRISVerify#191 / CIRISPersist#435) — multiplicity
+                // gate, the content-similarity sibling BOTH must pass: the
+                // authenticated `max_source_multiplicity` must respect the
+                // corpus-pinned floor. Rejects the 900-near-duplicates-under-
+                // distinct-ids fold the mass gate honestly admits (equal masses
+                // ⇒ truthful n_eff = 1000, yet the composite blur IS the data
+                // subject). Fail-closed for a pre-v3 tier (no signed
+                // multiplicity surface — the CIRISVerify#191 flag-day cut).
+                if !passes_multiplicity_gate(
+                    &verify_meta,
+                    multiplicity_n_min_for(&verify_meta.corpus_kind),
+                ) {
+                    return Err(AggregationMetaError::Multiplicity);
                 }
                 Ok(())
             }
@@ -535,6 +652,11 @@ pub async fn descend_aggregated_sources_on_backend<B: crate::store::Backend>(
         // This meta drives only `verify_member_commitment` (membership), and a
         // v1 preimage excludes n_eff, so the value is verification-neutral.
         n_eff: member_ids.len() as u32,
+        // §19.7.1.3 (#435): same v1-neutral rule — this rebuild feeds ONLY the
+        // membership check, never the multiplicity/mass gates (a v1 preimage
+        // excludes both), so zero placeholders are verification-neutral.
+        max_source_multiplicity: 0,
+        mass_commitment: [0u8; 32],
         member_commitment: aggregation_member_commitment_from_hex(&record.member_commitment)
             .map_err(crate::store::Error::AggregationMetaRejected)?,
         noise_floor_descriptor: String::new(),
@@ -648,6 +770,77 @@ mod tests {
         assert_eq!(hex_decode("AABB"), Some(vec![0xaa, 0xbb]));
         assert_eq!(hex_decode("0"), None, "odd length");
         assert_eq!(hex_decode("zz"), None, "non-hex");
+    }
+
+    /// §19.7.1.3 (#435) — the literal CC 6.1.2.1.2 R9 case at the pinned floor:
+    /// 900 near-duplicates among 1000 distinct-id members, equal masses (an
+    /// HONEST `n_eff = 1000` that clears the mass gate) — rejected by the
+    /// multiplicity gate; the balanced fold passes; pre-v3 fails closed.
+    #[test]
+    fn multiplicity_gate_rejects_the_900_of_1000_fold() {
+        let meta =
+            |version: u32, multiplicity: u32| ciris_verify_core::holonomic::AggregationMetaV1 {
+                version,
+                content_id: "c".into(),
+                corpus_kind: "trace".into(),
+                tier: 1,
+                aggregation_algorithm_id: "raptorq-pyramid-v1".into(),
+                source_count: 1000,
+                n_eff: 1000, // honest: 1000 distinct members at equal mass
+                max_source_multiplicity: multiplicity,
+                mass_commitment: [0u8; 32],
+                member_commitment: [0u8; 32],
+                noise_floor_descriptor: String::new(),
+            };
+        let n_min = multiplicity_n_min_for("aggregate:trace");
+        assert_eq!(n_min, DEFAULT_MULTIPLICITY_N_MIN);
+        // 900 · 2 = 1800 > 1000 → the R9 false-erasure is REJECTED.
+        assert!(!passes_multiplicity_gate(&meta(3, 900), n_min));
+        // ...even though the mass gate honestly admits it (n_eff == N).
+        assert!(passes_dominance_gate(&meta(3, 900), MIN_DOMINANCE_RATIO));
+        // A genuinely-diverse fold passes: 500 · 2 = 1000 ≤ 1000.
+        assert!(passes_multiplicity_gate(&meta(3, 500), n_min));
+        // Flag-day: a v2 tier (no signed multiplicity) fails CLOSED.
+        assert!(!passes_multiplicity_gate(&meta(2, 1), n_min));
+    }
+
+    /// #435 — the v3 mass-commitment wire decode: empty ⇒ pre-v3 neutral zero
+    /// root; malformed non-empty ⇒ loud reject (never silently zeroed).
+    #[test]
+    fn mass_commitment_hex_decode_empty_neutral_malformed_loud() {
+        let inputs = |hex: &str| AggregationMetaVerifyInputsV1 {
+            version: 3,
+            content_id: "c".into(),
+            corpus_kind: "trace".into(),
+            tier: 1,
+            aggregation_algorithm_id: "a".into(),
+            source_count: 2,
+            n_eff: 2,
+            max_source_multiplicity: 1,
+            mass_commitment_hex: hex.into(),
+            member_commitment_hex: "00".repeat(32),
+            noise_floor_descriptor: String::new(),
+            sig_ed25519_b64: String::new(),
+            sig_ml_dsa_65_b64: String::new(),
+        };
+        assert_eq!(
+            inputs("").to_verify_meta().unwrap().mass_commitment,
+            [0u8; 32],
+            "empty = pre-v3 absent, neutral zero root"
+        );
+        let good = "11".repeat(32);
+        assert_eq!(
+            inputs(&good).to_verify_meta().unwrap().mass_commitment,
+            [0x11u8; 32]
+        );
+        assert!(
+            inputs("zz").to_verify_meta().is_err(),
+            "malformed non-empty mass hex must fail loudly"
+        );
+        assert!(
+            inputs("1234").to_verify_meta().is_err(),
+            "wrong-length mass hex must fail loudly"
+        );
     }
 
     #[test]
