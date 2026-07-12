@@ -4948,6 +4948,61 @@ impl PyEngine {
         })
     }
 
+    /// v16.0.0 (#433, CC 3.4.12) — the adult-incapacity **guardianship** emit
+    /// aperture: a `delegates_to(S → ward)` carrying the CC 3.4.12 binding
+    /// fields (`binding_legitimacy_source`, `valid_until`, optional
+    /// `binding_tier` / `petitioner_key_id`) the admission predicate demands —
+    /// which plain `steward_bind` cannot stamp. Admissibility remains entirely
+    /// the gate's: witness-attested incapacity in every scoped domain (+
+    /// reversible exclusion / the acute T1 pending path), no protected domain,
+    /// assessor independence, a closed-set legitimacy source, and a bounded
+    /// `valid_until` (fail-to-liberty lapse at read). A capacitated adult
+    /// still rejects `target_is_self_sovereign`.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (ward_key_id, domains, legitimacy_source, valid_until, binding_tier = None, petitioner_key_id = None))]
+    fn steward_bind_incapacity(
+        &self,
+        py: Python<'_>,
+        ward_key_id: &str,
+        domains: Vec<String>,
+        legitimacy_source: &str,
+        valid_until: &str,
+        binding_tier: Option<&str>,
+        petitioner_key_id: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let (backend, signer, local_signer) = self.cut_c_emit_handles()?;
+            let ward = ward_key_id.to_owned();
+            let legit = legitimacy_source.to_owned();
+            let vu = valid_until.to_owned();
+            let tier = binding_tier.map(str::to_owned);
+            let petitioner = petitioner_key_id.map(str::to_owned);
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(
+                    backend,
+                    signer,
+                    Some(local_signer.clone()),
+                );
+                runtime.block_on(async move {
+                    engine
+                        .steward_bind_incapacity(
+                            &local_signer,
+                            &ward,
+                            domains,
+                            &legit,
+                            &vu,
+                            tier.as_deref(),
+                            petitioner.as_deref(),
+                        )
+                        .await
+                        .map_err(federation_err_to_py)
+                })
+            })
+        })
+    }
+
     /// v9.3.0 (#249, §11.10/§11.11) — appoint `moderator_key_id` a named
     /// moderator of `community_id` for `duty` (`moderate`/`takedown`/
     /// `review`). Admissible IFF the engine's signer is a community
