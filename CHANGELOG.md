@@ -5,6 +5,18 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [15.1.1] — 2026-07-12 — verify 9.0.1 re-pin (mesh coherence; build-only upstream)
+
+- **`ciris-verify` 9.0.0 → 9.0.1** (all six Rust git-tag pins). verify 9.0.1
+  (CIRISVerify#188) is an additive crate-type change: `ciris-verify-ffi` now also
+  emits an **rlib** so ciris-server can bundle the verify FFI and the agent drops
+  its standalone verify pin (killing the v9.0.0-vs-v5.1.3 skew; CIRISServer#232 /
+  CIRISAgent#917). **Persist consumes `verify-core`/`keyring`/`crypto`, NOT the
+  ffi rlib**, so this is a functional no-op for persist — pure mesh coherence.
+- Drop-in: `version = "9"` (Cargo) + `ciris-verify>=9.0.0,<10` (pyproject) already
+  cover 9.0.1, so only the git tags flip. No API/schema change; 1471 tests
+  unchanged.
+
 ## [15.1.0] — 2026-07-11 — Namespace registry + replication-policy resolution: resolve, don't hand-wire per-object planes (#425)
 
 ### Added — persist owns the replication-policy inputs; edge collapses its per-object selectors
