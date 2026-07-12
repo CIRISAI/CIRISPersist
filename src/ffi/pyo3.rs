@@ -7326,6 +7326,61 @@ impl PyEngine {
         })
     }
 
+    /// v16 (CIRISPersist#434, CC 5.3.2.2) — the consent-revocation
+    /// promotion-overdue reader: every subject-side
+    /// `consent:state:revoked` still resting LOCAL-tier (unpromoted) past
+    /// the SLA (`sla_seconds`, default 86400 = the 24 h never-rest-local
+    /// tripwire). Returns a JSON array of `{attestation_id,
+    /// target_key_id, subject_key_id, asserted_at, age_seconds, tier}` —
+    /// `attestation_id` is the [`attestation_promote`](Self::attestation_promote)
+    /// handle that clears the condition.
+    ///
+    /// Each overdue row is also flagged as
+    /// `hard_case:consent_revocation_promotion_overdue`, idempotently
+    /// (the same deterministic event_id the consent-SLA watcher derives,
+    /// so repeated scans and watcher ticks never duplicate the event).
+    #[pyo3(signature = (sla_seconds=None))]
+    fn list_consent_revocation_promotion_overdue_json(
+        &self,
+        py: Python<'_>,
+        sla_seconds: Option<u64>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sla = std::time::Duration::from_secs(sla_seconds.unwrap_or(86_400));
+            py.detach(move || {
+                let now = chrono::Utc::now();
+                let rows: Vec<crate::federation::ConsentPromotionOverdueRow> = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_consent_revocation_promotion_overdue(now, sla)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_consent_revocation_promotion_overdue(now, sla)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows)
+                    .map_err(|e| PyValueError::new_err(format!("promotion_overdue serialize: {e}")))
+            })
+        })
+    }
+
     /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — admit a
     /// `family` row.
     ///

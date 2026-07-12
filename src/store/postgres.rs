@@ -16379,6 +16379,166 @@ mod tests {
         );
     }
 
+    /// v16 (CIRISPersist#434, CC 5.3.2.2) — the promotion-overdue READER
+    /// (`list_consent_revocation_promotion_overdue`, what the PyO3
+    /// `list_consent_revocation_promotion_overdue_json` dispatches onto)
+    /// on live PG, over the REAL local-write admission path: an over-SLA
+    /// transit revocation is returned + flagged idempotently (deduping
+    /// against the watcher's event_id), a within-SLA scan returns nothing
+    /// of ours, and promotion clears it. Suffix-scoped for the shared DB.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_consent_promotion_overdue_reader() {
+        use crate::federation::hard_case::{kind, HardCaseFilter};
+        use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
+        use crate::federation::FederationDirectory;
+        use std::time::Duration;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+
+        let now0 = chrono::Utc::now();
+        let suffix = uuid_like();
+        let subject = format!("subject-r-{suffix}");
+        let target = format!("target-r-{suffix}");
+        for kid in [&subject, &target] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: fix_section_i_key(kid, "registry", now0, true),
+                })
+                .await
+                .unwrap();
+        }
+        let env = serde_json::json!({
+            "id": format!("rev-r-{suffix}"), "dimension": "consent:state:revoked:v1",
+            "score": 1.0, "confidence": 0.9,
+        });
+        let (_hash, sig_classical, sig_pqc) =
+            crate::federation::tier_ingest::test_support::sign_envelope(&subject, &env);
+        let att_id = backend
+            .attestation_upsert_local(LocalAttestationInput {
+                attesting_key_id: subject.clone(),
+                attested_key_id: Some(target.clone()),
+                attestation_type: attestation_type::SCORES.into(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: env,
+                subject_key_ids: vec![subject.clone()],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                scrub_signature_classical: Some(sig_classical),
+                scrub_signature_pqc: sig_pqc,
+            })
+            .await
+            .expect("transit local-tier revocation admits");
+        let revoked_at = backend
+            .list_consent_revocations(Some(now0))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.attesting_key_id == subject)
+            .expect("our transit row is scanned")
+            .asserted_at;
+        let sla = Duration::from_secs(86_400);
+        // Shared test DB → bind assertions to OUR rows only.
+        let mine = |rows: Vec<crate::federation::ConsentPromotionOverdueRow>| {
+            rows.into_iter()
+                .filter(|r| r.subject_key_id == subject)
+                .collect::<Vec<_>>()
+        };
+
+        // Within the SLA → our row never appears.
+        let before = revoked_at + chrono::Duration::seconds(86_400 - 1);
+        let rows = mine(
+            backend
+                .list_consent_revocation_promotion_overdue(before, sla)
+                .await
+                .unwrap(),
+        );
+        assert!(rows.is_empty(), "within-SLA: our revocation never appears");
+
+        // Past the SLA → returned (with the promote handle) + flagged.
+        let after = revoked_at + chrono::Duration::seconds(86_400 + 60);
+        let rows = mine(
+            backend
+                .list_consent_revocation_promotion_overdue(after, sla)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), 1, "our over-SLA revocation is overdue");
+        assert_eq!(rows[0].attestation_id, att_id);
+        assert_eq!(rows[0].target_key_id, target);
+        assert_eq!(rows[0].tier, attestation_tier::LOCAL);
+        let our_flags = |events: Vec<crate::federation::HardCaseEvent>| {
+            events
+                .into_iter()
+                .filter(|e| e.subject_key_id.as_deref() == Some(subject.as_str()))
+                .collect::<Vec<_>>()
+        };
+        let evs = our_flags(
+            backend
+                .list_hard_case_events(HardCaseFilter {
+                    kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                    since: Some(now0),
+                })
+                .await
+                .unwrap(),
+        );
+        assert_eq!(evs.len(), 1, "our overdue row was flagged");
+
+        // Re-scan → still listed, NO duplicate hard_case.
+        let rows = mine(
+            backend
+                .list_consent_revocation_promotion_overdue(after, sla)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            our_flags(
+                backend
+                    .list_hard_case_events(HardCaseFilter {
+                        kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                        since: Some(now0),
+                    })
+                    .await
+                    .unwrap(),
+            )
+            .len(),
+            1,
+            "re-scan writes no duplicate hard_case"
+        );
+
+        // Promote (tier=federation) → drops out of subsequent scans.
+        // (Bind a parsed Uuid — see the put_revocation `$1::uuid` note.)
+        let att_uuid = uuid::Uuid::parse_str(&att_id).unwrap();
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "UPDATE cirislens.federation_attestations \
+                 SET tier = 'federation', promoted_at = $2 \
+                 WHERE attestation_id = $1",
+                &[&att_uuid, &after],
+            )
+            .await
+            .unwrap();
+        let rows = mine(
+            backend
+                .list_consent_revocation_promotion_overdue(
+                    after + chrono::Duration::seconds(1),
+                    sla,
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            rows.is_empty(),
+            "a promoted revocation is no longer overdue"
+        );
+    }
+
     // ─── Lens-derived schemas (v0.4.3, CIRISPersist#18) ────────────
 
     /// Smoke: detection event round-trip through put + get.

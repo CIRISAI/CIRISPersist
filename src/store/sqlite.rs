@@ -17632,6 +17632,139 @@ mod tests {
         );
     }
 
+    /// v16 (CIRISPersist#434, CC 5.3.2.2) — the promotion-overdue READER
+    /// (`list_consent_revocation_promotion_overdue`, what the PyO3
+    /// `list_consent_revocation_promotion_overdue_json` dispatches onto)
+    /// on the SQLite backend: an over-SLA local-tier revocation is
+    /// returned + flagged (idempotently, deduping against the watcher's
+    /// event_id); a within-SLA one never appears; promotion clears it.
+    #[tokio::test]
+    async fn consent_promotion_overdue_reader_sqlite() {
+        use crate::federation::{
+            hard_case::kind, hard_case::HardCaseFilter, FederationDirectory, SignedAttestation,
+        };
+        use std::time::Duration;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["subject-r", "target-r"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, &format!("prim-{k}"), k),
+                })
+                .await
+                .unwrap();
+        }
+        let revoked_at: chrono::DateTime<chrono::Utc> = "2026-06-01T00:00:00Z".parse().unwrap();
+        // Stage two subject-side revocations: one over-SLA ("rev-old"), one
+        // fresh ("rev-new"), then flip both to the local-tier TRANSIT state
+        // (same staging rationale as the watcher boundary test above).
+        for (id, at) in [
+            ("rev-old", revoked_at),
+            ("rev-new", revoked_at + chrono::Duration::hours(12)),
+        ] {
+            let mut rev = fed_attestation(id, "subject-r", "target-r", "subject-r");
+            rev.attestation_envelope =
+                serde_json::json!({ "id": id, "dimension": "consent:state:revoked:v1" });
+            rev.asserted_at = at;
+            rev.subject_key_ids = vec!["subject-r".into()];
+            resign_fed(&mut rev);
+            backend
+                .put_attestation(SignedAttestation { attestation: rev })
+                .await
+                .unwrap();
+        }
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "UPDATE federation_attestations SET tier = 'local', promoted_at = NULL \
+                 WHERE attestation_id IN ('rev-old', 'rev-new')",
+                [],
+            )
+            .unwrap();
+        }
+        let sla = Duration::from_secs(86_400); // 24 h
+        let now = revoked_at + chrono::Duration::seconds(86_400 + 60);
+
+        // The over-SLA row surfaces (with its promote handle + age); the
+        // fresh one does not.
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(now, sla)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly the over-SLA revocation is overdue");
+        assert_eq!(rows[0].attestation_id, "rev-old");
+        assert_eq!(rows[0].target_key_id, "target-r");
+        assert_eq!(rows[0].subject_key_id, "subject-r");
+        assert_eq!(rows[0].asserted_at, revoked_at);
+        assert_eq!(rows[0].age_seconds, 86_400 + 60);
+        assert_eq!(rows[0].tier, "local");
+        // …and was flagged as the hard_case.
+        let evs = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1, "the overdue row was flagged");
+        assert_eq!(evs[0].target_key_id.as_deref(), Some("target-r"));
+
+        // Re-scan: still listed, but NO duplicate hard_case (idempotent on
+        // the watcher's deterministic event_id).
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(now, sla)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "condition still active on re-scan");
+        assert_eq!(
+            backend
+                .list_hard_case_events(HardCaseFilter {
+                    kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                    since: None,
+                })
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "re-scan writes no duplicate hard_case"
+        );
+        // The watcher and the reader share the event_id derivation, so a
+        // watcher tick over the same condition also dedups.
+        let r = backend.run_consent_sla_watch(now, sla).await.unwrap();
+        assert_eq!(r.promotion_overdue, 1);
+        assert_eq!(
+            backend
+                .list_hard_case_events(HardCaseFilter {
+                    kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                    since: None,
+                })
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "reader + watcher share one deterministic event_id"
+        );
+
+        // Promote (tier=federation) → drops out of subsequent scans.
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "UPDATE federation_attestations SET tier = 'federation', promoted_at = ?1 \
+                 WHERE attestation_id = 'rev-old'",
+                [now.to_rfc3339()],
+            )
+            .unwrap();
+        }
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(now + chrono::Duration::seconds(1), sla)
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "a promoted revocation is no longer overdue"
+        );
+    }
+
     fn fed_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
         Revocation {
             revocation_id: id.into(),

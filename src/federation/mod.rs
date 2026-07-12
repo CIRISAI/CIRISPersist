@@ -152,7 +152,9 @@ pub use goal::{
     canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
     MetaGoalAlignment,
 };
-pub use hard_case::{ConsentState, ConsentWatchReport, HardCaseEvent, HardCaseFilter};
+pub use hard_case::{
+    ConsentPromotionOverdueRow, ConsentState, ConsentWatchReport, HardCaseEvent, HardCaseFilter,
+};
 pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE};
 pub use identity_aggregate::{
     ContentKemIdentity, LocalIdentityAggregate, LOCAL_IDENTITY_AGGREGATE_VERSION,
@@ -3294,6 +3296,71 @@ pub trait FederationDirectory: Send + Sync {
             }
         }
         Ok(report)
+    }
+
+    /// v16 (CIRISPersist#434, CC 5.3.2.2) — the 24h-SLA detector's READ
+    /// surface: every subject-side `consent:state:revoked` still resting
+    /// at LOCAL tier (unpromoted) with `now - asserted_at > sla`,
+    /// returned as [`ConsentPromotionOverdueRow`](hard_case::ConsentPromotionOverdueRow)s.
+    /// This is the never-rest-local tripwire's reader half — the
+    /// `run_consent_sla_watch` (b) branch surfaces the same condition as
+    /// a `hard_case`; this method returns the rows so a caller can drive
+    /// the promotion (`attestation_promote`) that clears them.
+    ///
+    /// Each overdue row is ALSO recorded as
+    /// `hard_case:consent_revocation_promotion_overdue`, idempotently:
+    /// the deterministic [`hard_case::watch_event_id`] is the SAME one
+    /// the watcher derives, so a reader scan and a watcher tick never
+    /// double-emit for one observed condition.
+    ///
+    /// Backend-agnostic default composing
+    /// [`list_consent_revocations`](Self::list_consent_revocations) +
+    /// [`record_hard_case`](Self::record_hard_case).
+    async fn list_consent_revocation_promotion_overdue(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        sla: std::time::Duration,
+    ) -> Result<Vec<hard_case::ConsentPromotionOverdueRow>, Error> {
+        let window =
+            chrono::Duration::from_std(sla).unwrap_or_else(|_| chrono::Duration::hours(24));
+        let revocations = self.list_consent_revocations(None).await?;
+        let mut overdue = Vec::new();
+        for rev in &revocations {
+            // §10.1.3 transit-not-rest: only a LOCAL-tier, unpromoted row
+            // past the window is overdue (a promoted row's terminal state
+            // is `federation`, which drops it out of the fire condition).
+            let local = rev.tier != crate::federation::types::attestation_tier::FEDERATION;
+            if !(local && rev.promoted_at.is_none() && now - rev.asserted_at > window) {
+                continue;
+            }
+            // Flag it (idempotent — the watcher's own event_id derivation,
+            // so reader + watcher dedup against each other).
+            self.record_hard_case(hard_case::HardCaseEvent {
+                event_id: hard_case::watch_event_id(
+                    hard_case::kind::CONSENT_REVOCATION_PROMOTION_OVERDUE,
+                    &rev.attested_key_id,
+                    rev.asserted_at,
+                ),
+                kind: hard_case::kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.to_string(),
+                target_key_id: Some(rev.attested_key_id.clone()),
+                subject_key_id: Some(rev.attesting_key_id.clone()),
+                detail: serde_json::json!({
+                    "revocation_at": rev.asserted_at.to_rfc3339(),
+                    "promotion_window_secs": sla.as_secs(),
+                }),
+                emitted_at: now,
+            })
+            .await?;
+            overdue.push(hard_case::ConsentPromotionOverdueRow {
+                attestation_id: rev.attestation_id.clone(),
+                target_key_id: rev.attested_key_id.clone(),
+                subject_key_id: rev.attesting_key_id.clone(),
+                asserted_at: rev.asserted_at,
+                age_seconds: (now - rev.asserted_at).num_seconds().max(0) as u64,
+                tier: rev.tier.clone(),
+            });
+        }
+        Ok(overdue)
     }
 
     // ─── v10.0.0 — fountain holdings/eviction surface (CIRISPersist#270) ──

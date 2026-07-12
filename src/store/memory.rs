@@ -9795,6 +9795,124 @@ mod tests {
         );
     }
 
+    /// v16 (CIRISPersist#434, CC 5.3.2.2) — the promotion-overdue READER
+    /// (`list_consent_revocation_promotion_overdue`, what the PyO3
+    /// `list_consent_revocation_promotion_overdue_json` dispatches onto),
+    /// over the REAL local-write admission path on the memory backend: an
+    /// over-SLA transit revocation is returned + flagged idempotently, a
+    /// within-SLA one never appears, and promotion clears it.
+    #[tokio::test]
+    async fn consent_promotion_overdue_reader_memory() {
+        use crate::federation::hard_case::{kind, HardCaseFilter};
+        use crate::federation::tier_ingest::test_support::sign_envelope;
+        use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
+        use crate::federation::FederationDirectory;
+        use std::time::Duration;
+        let backend = MemoryBackend::new();
+        for k in ["subject-r", "target-r"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        // A crypto-valid subject-side revocation, admitted as a TRANSIT
+        // local-tier write (same real-admission fixture as the SLA loop
+        // test above).
+        let env = serde_json::json!({
+            "id": "rev-r", "dimension": "consent:state:revoked:v1",
+            "score": 1.0, "confidence": 0.9,
+        });
+        let (_hash, sig_classical, sig_pqc) = sign_envelope("subject-r", &env);
+        let att_id = backend
+            .attestation_upsert_local(LocalAttestationInput {
+                attesting_key_id: "subject-r".into(),
+                attested_key_id: Some("target-r".into()),
+                attestation_type: attestation_type::SCORES.into(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: env,
+                subject_key_ids: vec!["subject-r".into()],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                scrub_signature_classical: Some(sig_classical),
+                scrub_signature_pqc: sig_pqc,
+            })
+            .await
+            .expect("transit local-tier revocation admits");
+        let revoked_at = backend.list_consent_revocations(None).await.unwrap()[0].asserted_at;
+        let sla = Duration::from_secs(86_400); // 24 h
+
+        // Within the SLA → never appears, nothing flagged.
+        let before = revoked_at + chrono::Duration::seconds(86_400 - 1);
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(before, sla)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "a within-SLA revocation never appears");
+        assert!(backend
+            .list_hard_case_events(HardCaseFilter::default())
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Past the SLA → returned (with the promote handle + age) + flagged.
+        let after = revoked_at + chrono::Duration::seconds(86_400 + 60);
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(after, sla)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the over-SLA revocation is overdue");
+        assert_eq!(rows[0].attestation_id, att_id);
+        assert_eq!(rows[0].target_key_id, "target-r");
+        assert_eq!(rows[0].subject_key_id, "subject-r");
+        assert_eq!(rows[0].age_seconds, 86_400 + 60);
+        assert_eq!(rows[0].tier, attestation_tier::LOCAL);
+        let evs = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1, "the overdue row was flagged");
+
+        // Re-scan: still listed, NO duplicate hard_case.
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(after, sla)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            backend
+                .list_hard_case_events(HardCaseFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "re-scan writes no duplicate hard_case"
+        );
+
+        // Promote (tier=federation) → drops out of subsequent scans.
+        {
+            let mut st = backend.state.lock().unwrap();
+            for a in st.federation_attestations.iter_mut() {
+                if a.attestation_id == att_id {
+                    a.tier = attestation_tier::FEDERATION.into();
+                    a.promoted_at = Some(after);
+                }
+            }
+        }
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(after + chrono::Duration::seconds(1), sla)
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "a promoted revocation is no longer overdue"
+        );
+    }
+
     /// v16 (CIRISPersist#431) — the compare surface REFUSES a corpus row
     /// it cannot round-trip back to the verify-core witness shape
     /// (substrate corruption), rather than classifying over it. This is
