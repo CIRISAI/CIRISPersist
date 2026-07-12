@@ -25207,6 +25207,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::InfraAttestRoleNotAccordConferred { .. } => {
             PyValueError::new_err(kind)
         }
+        // #424 — re-conferring a quorum-withdrawn `infra:attest` key: the same
+        // revocation-wins refusal class as CanonicalRoleWithdrawn; ValueError.
+        crate::federation::Error::InfraAttestRoleWithdrawn { .. } => PyValueError::new_err(kind),
         // v13.1.0 (CIRISPersist#377) — a re-add of a withdrawn canonical
         // (revocation-wins gate consult) and an invalid withdraw/supersede
         // authority (unauthorized decision / payload not committing to the

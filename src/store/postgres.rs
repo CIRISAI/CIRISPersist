@@ -2114,6 +2114,23 @@ fn pg_row_to_canonical_withdrawal(
     })
 }
 
+/// v16.0.0 (#424) — Postgres row → the generic V104
+/// [`RoleWithdrawal`](crate::federation::admission::RoleWithdrawal).
+fn pg_row_to_role_withdrawal(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::admission::RoleWithdrawal, crate::federation::Error> {
+    use crate::federation::Error as FedError;
+    Ok(crate::federation::admission::RoleWithdrawal {
+        role: row.safe_get_with("role", FedError::Backend)?,
+        key_id: row.safe_get_with("key_id", FedError::Backend)?,
+        withdrawn_at: row.safe_get_with("withdrawn_at", FedError::Backend)?,
+        authority_decision_digest: row
+            .safe_get_with("authority_decision_digest", FedError::Backend)?,
+        superseded_by: row.safe_get_with("superseded_by", FedError::Backend)?,
+        persist_row_hash: row.safe_get_with("persist_row_hash", FedError::Backend)?,
+    })
+}
+
 // ─── Pipeline read surface (v0.6.0-α5, CIRISPersist#19) ───────────
 //
 // Inherent methods on `PostgresBackend` for reading the V009
@@ -3219,6 +3236,103 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter()
             .map(pg_row_to_canonical_withdrawal)
             .collect()
+    }
+
+    /// v16.0.0 (CIRISPersist#424) — the GENERIC role-withdrawal tombstone
+    /// (V104), same idempotency/Conflict semantics as the V095 canonical path.
+    async fn record_role_withdrawal(
+        &self,
+        role: &str,
+        key_id: &str,
+        superseded_by: Option<&str>,
+        authority_decision_digest: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut record = crate::federation::admission::RoleWithdrawal {
+            role: role.to_owned(),
+            key_id: key_id.to_owned(),
+            withdrawn_at: chrono::Utc::now(),
+            authority_decision_digest: authority_decision_digest.to_owned(),
+            superseded_by: superseded_by.map(str::to_owned),
+            persist_row_hash: String::new(),
+        };
+        record.persist_row_hash = crate::federation::types::compute_persist_row_hash(&record)?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let existing = client
+            .query_opt(
+                "SELECT superseded_by, authority_decision_digest \
+                 FROM cirislens.federation_role_withdrawals WHERE role = $1 AND key_id = $2",
+                &[&record.role, &record.key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("record_role_withdrawal read: {e}"))
+            })?;
+        if let Some(row) = existing {
+            let existing_superseded: Option<String> =
+                row.safe_get_with("superseded_by", crate::federation::Error::Backend)?;
+            let existing_auth: String = row.safe_get_with(
+                "authority_decision_digest",
+                crate::federation::Error::Backend,
+            )?;
+            if existing_superseded == record.superseded_by
+                && existing_auth == record.authority_decision_digest
+            {
+                return Ok(()); // idempotent no-op
+            }
+            return Err(crate::federation::Error::Conflict(format!(
+                "role_withdrawal ({}, {}) already exists with different content",
+                record.role, record.key_id
+            )));
+        }
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_role_withdrawals (\
+                    role, key_id, withdrawn_at, authority_decision_digest, superseded_by, \
+                    persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &record.role,
+                    &record.key_id,
+                    &record.withdrawn_at,
+                    &record.authority_decision_digest,
+                    &record.superseded_by,
+                    &record.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("record_role_withdrawal: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// v16.0.0 (CIRISPersist#424) — consult the V104 tombstone for
+    /// `(role, key_id)` (the gate consult). Backend-symmetric.
+    async fn lookup_role_withdrawal(
+        &self,
+        role: &str,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::admission::RoleWithdrawal>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row = client
+            .query_opt(
+                "SELECT role, key_id, withdrawn_at, authority_decision_digest, superseded_by, \
+                    persist_row_hash \
+                 FROM cirislens.federation_role_withdrawals WHERE role = $1 AND key_id = $2",
+                &[&role, &key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("lookup_role_withdrawal: {e}"))
+            })?;
+        row.map(pg_row_to_role_withdrawal).transpose()
     }
 
     async fn put_attestation(
@@ -4952,7 +5066,59 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         revocation: crate::federation::SignedIdentityOccurrenceRevocation,
     ) -> Result<(), crate::federation::Error> {
-        let mut row = revocation.identity_occurrence_revocation;
+        // v16.0.0 (CIRISPersist#421) — verify the signature gate BEFORE any
+        // write (the revocation-plane mirror of the #418 occurrence gate).
+        crate::federation::admission::verify_signed_identity_occurrence_revocation(
+            self,
+            &revocation,
+        )
+        .await?;
+        let crate::federation::SignedIdentityOccurrenceRevocation {
+            identity_occurrence_revocation: mut row,
+            attesting_key_id,
+            signed_envelope,
+            signature,
+        } = revocation;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let witness = serde_json::json!(row.witness_set);
+        let signature_value = serde_json::to_value(&signature)
+            .map_err(|e| crate::federation::Error::Backend(format!("signature encode: {e}")))?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_identity_occurrence_revocations (\
+                    identity_key_id, occurrence_key_id, revoked_at, effective_at, \
+                    reason, witness_set, persist_row_hash, \
+                    attesting_key_id, signed_envelope, signature\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                &[
+                    &row.identity_key_id,
+                    &row.occurrence_key_id,
+                    &row.revoked_at,
+                    &row.effective_at,
+                    &row.reason,
+                    &witness,
+                    &row.persist_row_hash,
+                    &attesting_key_id,
+                    &signed_envelope,
+                    &signature_value,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("identity_occurrence_revocation"))?;
+        Ok(())
+    }
+
+    async fn put_identity_occurrence_revocation_local(
+        &self,
+        revocation: crate::federation::IdentityOccurrenceRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        // #421 — trusted-local (grandfathered) write: NO signature gate, signed
+        // columns NULL. Mirrors `put_identity_occurrence_local`.
+        let mut row = revocation;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let witness = serde_json::json!(row.witness_set);
         let client = self
@@ -5136,6 +5302,41 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             })?;
         rows.into_iter()
             .map(pg_row_to_identity_occurrence_revocation)
+            .collect()
+    }
+
+    async fn list_signed_identity_occurrence_revocations_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::SignedIdentityOccurrenceRevocation>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // #421 replication read: only signed-put rows carry the signature
+        // container; trusted-local rows (NULL sig cols) are omitted.
+        let rows = client
+            .query(
+                "SELECT identity_key_id, occurrence_key_id, revoked_at, effective_at, \
+                    reason, witness_set, persist_row_hash, \
+                    attesting_key_id, signed_envelope, signature \
+                 FROM cirislens.federation_identity_occurrence_revocations \
+                 WHERE identity_key_id = $1 \
+                   AND attesting_key_id IS NOT NULL \
+                   AND signed_envelope IS NOT NULL \
+                   AND signature IS NOT NULL \
+                 ORDER BY occurrence_key_id ASC",
+                &[&identity_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_signed_identity_occurrence_revocations_for: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_signed_identity_occurrence_revocation)
             .collect()
     }
 
@@ -11390,6 +11591,29 @@ fn pg_row_to_identity_occurrence_revocation(
         reason: row.safe_get_with("reason", mk_err)?,
         witness_set,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
+    })
+}
+
+/// v16.0.0 (#421 replication read) — Postgres row →
+/// [`crate::federation::SignedIdentityOccurrenceRevocation`]. Reconstructs the
+/// signature container from the stored JSONB V103 trio; the extra columns are
+/// read before delegating to [`pg_row_to_identity_occurrence_revocation`],
+/// which consumes `row`. Callers gate on non-NULL sig columns.
+fn pg_row_to_signed_identity_occurrence_revocation(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::SignedIdentityOccurrenceRevocation, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let attesting_key_id: String = row.safe_get_with("attesting_key_id", mk_err)?;
+    let signed_envelope: serde_json::Value = row.safe_get_with("signed_envelope", mk_err)?;
+    let signature_value: serde_json::Value = row.safe_get_with("signature", mk_err)?;
+    let signature = serde_json::from_value(signature_value)
+        .map_err(|e| crate::federation::Error::Backend(format!("signature decode: {e}")))?;
+    let identity_occurrence_revocation = pg_row_to_identity_occurrence_revocation(row)?;
+    Ok(crate::federation::SignedIdentityOccurrenceRevocation {
+        identity_occurrence_revocation,
+        attesting_key_id,
+        signed_envelope,
+        signature,
     })
 }
 
@@ -29454,7 +29678,6 @@ mod tests {
     async fn pg_membership_revocation_round_trip_and_active_filtering() {
         use crate::federation::{
             FederationDirectory, IdentityOccurrence, IdentityOccurrenceRevocation,
-            SignedIdentityOccurrenceRevocation,
         };
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
@@ -29497,18 +29720,16 @@ mod tests {
             .await
             .unwrap();
 
-        // Past-effective revocation of phone.
+        // Past-effective revocation of phone (trusted-local, #421).
         backend
-            .put_identity_occurrence_revocation(SignedIdentityOccurrenceRevocation {
-                identity_occurrence_revocation: IdentityOccurrenceRevocation {
-                    identity_key_id: root.clone(),
-                    occurrence_key_id: phone.clone(),
-                    revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
-                    effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
-                    reason: Some("lost".into()),
-                    witness_set: vec![root.clone(), laptop.clone()],
-                    persist_row_hash: String::new(),
-                },
+            .put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
+                identity_key_id: root.clone(),
+                occurrence_key_id: phone.clone(),
+                revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                reason: Some("lost".into()),
+                witness_set: vec![root.clone(), laptop.clone()],
+                persist_row_hash: String::new(),
             })
             .await
             .unwrap();
@@ -29533,18 +29754,16 @@ mod tests {
         let ids: Vec<_> = active.iter().map(|o| o.occurrence_key_id.clone()).collect();
         assert_eq!(ids, vec![laptop.clone()], "revoked phone excluded on PG");
 
-        // FK violation surfaces as InvalidArgument.
+        // FK violation surfaces as InvalidArgument (local path, same table).
         let err = backend
-            .put_identity_occurrence_revocation(SignedIdentityOccurrenceRevocation {
-                identity_occurrence_revocation: IdentityOccurrenceRevocation {
-                    identity_key_id: root.clone(),
-                    occurrence_key_id: format!("ghost-{}", uuid_like()),
-                    revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
-                    effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
-                    reason: None,
-                    witness_set: vec![],
-                    persist_row_hash: String::new(),
-                },
+            .put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
+                identity_key_id: root.clone(),
+                occurrence_key_id: format!("ghost-{}", uuid_like()),
+                revoked_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
             })
             .await
             .unwrap_err();

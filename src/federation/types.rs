@@ -1883,18 +1883,66 @@ pub struct IdentityOccurrenceRevocation {
     pub persist_row_hash: String,
 }
 
-/// Wraps an [`IdentityOccurrenceRevocation`] for write submission.
+impl IdentityOccurrenceRevocation {
+    /// v16.0.0 (CIRISPersist#421) — **THE revocation-fold comparator**: does
+    /// this revocation kill `occurrence` as of `now`? The single predicate
+    /// every active/seal/admission fold composes (`resolve_encryption_keys`,
+    /// `list_identity_occurrences_active`, `build_caller_admission`), so the
+    /// re-establishment rule can never drift between them.
+    ///
+    /// True iff all three hold:
+    /// - it names the occurrence (`occurrence_key_id` matches);
+    /// - it is in effect (`effective_at <= now` — future-dated waits);
+    /// - it is **not superseded by re-establishment**
+    ///   (`effective_at >= occurrence.asserted_at`): a FRESH occurrence
+    ///   asserted strictly after the revocation re-establishes under the same
+    ///   key_id (compromise → revoke → re-key → publish → recovered), and a
+    ///   replayed OLD revocation is a no-op. Without this clause a single
+    ///   (even legitimate) self-revoke was terminal-forever.
+    pub fn revokes(&self, occurrence: &IdentityOccurrence, now: DateTime<Utc>) -> bool {
+        self.occurrence_key_id == occurrence.occurrence_key_id
+            && self.effective_at <= now
+            && self.effective_at >= occurrence.asserted_at
+    }
+}
+
+/// A SIGNED [`IdentityOccurrenceRevocation`] — the revocation-plane mirror of
+/// [`SignedIdentityOccurrence`] (v16.0.0, CIRISPersist#421; closes the
+/// availability half #418 deferred).
 ///
-/// v14.0.0 note (CIRISPersist#418): the occurrence-KEX cut signs the OCCURRENCE
-/// (the confidentiality MITM). Revocation *signing* is tracked as a follow-up
-/// (a forged wire revocation is an availability, not confidentiality, attack);
-/// the ask-3 security goal — never SEAL to a revoked KEX key — is met by the
-/// revocation-aware [`FederationDirectory::resolve_encryption_keys`](crate::federation::FederationDirectory::resolve_encryption_keys),
-/// so this wrapper is unchanged for now.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// An **unsigned, terminal** revocation on the wire is a permanent-DoS forgery:
+/// any consented replication peer could fabricate `{identity: victim,
+/// occurrence: victim}` and brick the victim's sealability forever
+/// (`resolve_encryption_keys → None`, unrecoverable). This container carries the
+/// same detached-signature discipline as the occurrence: the signature is over
+/// `JCS(signed_envelope)` (the producer's EXACT revocation envelope — persist
+/// never re-canonicalizes, §0.9), verified at
+/// [`put_identity_occurrence_revocation`](crate::federation::FederationDirectory::put_identity_occurrence_revocation)
+/// BEFORE any write, with the #418 `signer_acts_for` + divergent-typed-projection
+/// rejection. Terminality is retired in the same cut:
+/// [`resolve_encryption_keys`](crate::federation::FederationDirectory::resolve_encryption_keys)
+/// lets a strictly-newer signed occurrence re-establish (publish → rotate →
+/// revoke → re-establish, every transition authenticated and recoverable).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignedIdentityOccurrenceRevocation {
-    /// The revocation being submitted.
+    /// Persist's typed projection of the revocation (what gets stored). Its
+    /// members are parsed FROM [`Self::signed_envelope`]; the signature is
+    /// verified over `signed_envelope`, not over this projection, so the §0.9
+    /// member-presence discipline is preserved.
     pub identity_occurrence_revocation: IdentityOccurrenceRevocation,
+    /// The claimed signer — a `federation_keys.key_id`. MUST be the identity's
+    /// own registered key or an already-ACTIVE occurrence of the same identity
+    /// (`signer_acts_for` — the §11.7.4 single-vouch-for-self, enforced).
+    pub attesting_key_id: String,
+    /// The EXACT revocation envelope the producer signed (signature container
+    /// stripped), as received — the bytes the gate JCS-canonicalizes.
+    /// Byte-exact by construction (never rebuilt from the typed projection).
+    pub signed_envelope: serde_json::Value,
+    /// The detached hybrid signature over `JCS(signed_envelope)` (Ed25519 over
+    /// the bytes; ML-DSA-65 over `bytes ‖ ed25519_sig`). Same container type as
+    /// the occurrence — the producer is the same envelope-generic
+    /// `produce_signed_identity_occurrence`.
+    pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
 }
 
 /// Removes one identity from a V059 family roster. The family's

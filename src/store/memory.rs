@@ -124,6 +124,18 @@ struct State {
     /// removal/revocation rows. Keyed by the V067 composite PKs.
     federation_identity_occurrence_revocations:
         HashMap<(String, String), crate::federation::IdentityOccurrenceRevocation>,
+    /// v16.0.0 (CIRISPersist#421, replication read) — signature container for
+    /// signed-put occurrence REVOCATIONS, keyed like the revocation map
+    /// (`(attesting_key_id, signed_envelope, signature)`). Absent for
+    /// trusted-local rows. Mirror of `federation_identity_occurrence_sigs`.
+    federation_identity_occurrence_revocation_sigs: HashMap<
+        (String, String),
+        (
+            String,
+            serde_json::Value,
+            ciris_verify_core::transport_binding::TransportBindingSignature,
+        ),
+    >,
     federation_family_membership_revocations:
         HashMap<(String, String), crate::federation::FamilyMembershipRevocation>,
     federation_community_membership_revocations:
@@ -215,6 +227,9 @@ struct State {
     /// #377 — canonical-role WITHDRAW/SUPERSEDE tombstones (V095), keyed by the
     /// withdrawn `key_id`. The in-memory mirror of `canonical_role_withdrawal`.
     canonical_withdrawals: HashMap<String, crate::federation::CanonicalWithdrawal>,
+    /// v16.0.0 (CIRISPersist#424) — generic role-withdrawal tombstones (V104
+    /// mirror), keyed `(role, key_id)`.
+    role_withdrawals: HashMap<(String, String), crate::federation::admission::RoleWithdrawal>,
 }
 
 /// v9.1.0 (CIRISPersist#243) — one in-memory scope-blob symbol + its LRU
@@ -252,6 +267,7 @@ impl Default for MemoryBackend {
                 federation_group_current_version: HashMap::new(),
                 federation_group_versions: HashMap::new(),
                 federation_identity_occurrence_revocations: HashMap::new(),
+                federation_identity_occurrence_revocation_sigs: HashMap::new(),
                 federation_family_membership_revocations: HashMap::new(),
                 federation_community_membership_revocations: HashMap::new(),
                 federation_community_dek_epoch: HashMap::new(),
@@ -276,6 +292,7 @@ impl Default for MemoryBackend {
                 accord_active_halts: HashMap::new(),
                 accord_issued_nonces: std::collections::HashSet::new(),
                 canonical_withdrawals: HashMap::new(),
+                role_withdrawals: HashMap::new(),
             }),
         }
     }
@@ -1482,6 +1499,55 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(out)
     }
 
+    /// v16.0.0 (CIRISPersist#424) — the GENERIC role-withdrawal tombstone
+    /// (V104 mirror), same idempotency/Conflict semantics as canonical.
+    async fn record_role_withdrawal(
+        &self,
+        role: &str,
+        key_id: &str,
+        superseded_by: Option<&str>,
+        authority_decision_digest: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let mut record = crate::federation::admission::RoleWithdrawal {
+            role: role.to_owned(),
+            key_id: key_id.to_owned(),
+            withdrawn_at: chrono::Utc::now(),
+            authority_decision_digest: authority_decision_digest.to_owned(),
+            superseded_by: superseded_by.map(str::to_owned),
+            persist_row_hash: String::new(),
+        };
+        record.persist_row_hash = crate::federation::types::compute_persist_row_hash(&record)?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        let map_key = (role.to_owned(), key_id.to_owned());
+        if let Some(existing) = state.role_withdrawals.get(&map_key) {
+            if existing.superseded_by == record.superseded_by
+                && existing.authority_decision_digest == record.authority_decision_digest
+            {
+                return Ok(()); // idempotent no-op
+            }
+            return Err(crate::federation::Error::Conflict(format!(
+                "role_withdrawal ({role}, {key_id}) already exists with different content"
+            )));
+        }
+        state.role_withdrawals.insert(map_key, record);
+        Ok(())
+    }
+
+    /// v16.0.0 (CIRISPersist#424) — consult the generic tombstone for
+    /// `(role, key_id)`. Backend-symmetric.
+    async fn lookup_role_withdrawal(
+        &self,
+        role: &str,
+        key_id: &str,
+    ) -> Result<Option<crate::federation::admission::RoleWithdrawal>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        Ok(state
+            .role_withdrawals
+            .get(&(role.to_owned(), key_id.to_owned()))
+            .cloned())
+    }
+
     async fn put_attestation(
         &self,
         attestation: crate::federation::SignedAttestation,
@@ -2590,7 +2656,48 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         revocation: crate::federation::SignedIdentityOccurrenceRevocation,
     ) -> Result<(), crate::federation::Error> {
-        let mut row = revocation.identity_occurrence_revocation;
+        // v16.0.0 (CIRISPersist#421) — verify the signature gate BEFORE any
+        // write (before locking; the gate locks state internally).
+        crate::federation::admission::verify_signed_identity_occurrence_revocation(
+            self,
+            &revocation,
+        )
+        .await?;
+        let crate::federation::SignedIdentityOccurrenceRevocation {
+            identity_occurrence_revocation: mut row,
+            attesting_key_id,
+            signed_envelope,
+            signature,
+        } = revocation;
+        let mut state = self.state.lock().expect("memory backend lock");
+        for k in [&row.identity_key_id, &row.occurrence_key_id] {
+            if !state.federation_keys.contains_key(k) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "{k} does not exist in federation_keys"
+                )));
+            }
+        }
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let key = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
+        // #421 — store the signature container in lockstep so the replication
+        // read reconstructs the tuple that was put (mirror of the occurrence
+        // sig map).
+        state
+            .federation_identity_occurrence_revocation_sigs
+            .insert(key.clone(), (attesting_key_id, signed_envelope, signature));
+        state
+            .federation_identity_occurrence_revocations
+            .insert(key, row);
+        Ok(())
+    }
+
+    async fn put_identity_occurrence_revocation_local(
+        &self,
+        revocation: crate::federation::IdentityOccurrenceRevocation,
+    ) -> Result<(), crate::federation::Error> {
+        // #421 — trusted-local (grandfathered) write; NO signature gate, no sig
+        // map entry (the signed read omits local rows).
+        let mut row = revocation;
         let mut state = self.state.lock().expect("memory backend lock");
         for k in [&row.identity_key_id, &row.occurrence_key_id] {
             if !state.federation_keys.contains_key(k) {
@@ -2726,6 +2833,40 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .cloned()
             .collect();
         rows.sort_by(|a, b| a.occurrence_key_id.cmp(&b.occurrence_key_id));
+        Ok(rows)
+    }
+
+    async fn list_signed_identity_occurrence_revocations_for(
+        &self,
+        identity_key_id: &str,
+    ) -> Result<Vec<crate::federation::SignedIdentityOccurrenceRevocation>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        // #421 replication read: join each revocation with its stored signature
+        // container; trusted-local rows (no sig entry) are omitted.
+        let mut rows: Vec<crate::federation::SignedIdentityOccurrenceRevocation> = state
+            .federation_identity_occurrence_revocations
+            .iter()
+            .filter(|((id, _), _)| id == identity_key_id)
+            .filter_map(|(key, rev)| {
+                state
+                    .federation_identity_occurrence_revocation_sigs
+                    .get(key)
+                    .map(|(attesting_key_id, signed_envelope, signature)| {
+                        crate::federation::SignedIdentityOccurrenceRevocation {
+                            identity_occurrence_revocation: rev.clone(),
+                            attesting_key_id: attesting_key_id.clone(),
+                            signed_envelope: signed_envelope.clone(),
+                            signature: signature.clone(),
+                        }
+                    })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.identity_occurrence_revocation
+                .occurrence_key_id
+                .cmp(&b.identity_occurrence_revocation.occurrence_key_id)
+        });
         Ok(rows)
     }
 

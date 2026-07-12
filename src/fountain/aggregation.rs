@@ -59,15 +59,11 @@
 
 use serde::{Deserialize, Serialize};
 
-// NOTE (#435): the v3 fns (`passes_multiplicity_gate` / `mass_commitment` /
-// `verify_mass_commitment`) are NOT re-exported at the `holonomic::` root the
-// way their older siblings are (a verify v10.0.0 re-export gap, path-direct
-// works fine) — imported from `holonomic::aggregation` directly.
-pub use ciris_verify_core::holonomic::aggregation::{
-    descend_order, mass_commitment, passes_multiplicity_gate, verify_mass_commitment,
-};
+pub use ciris_verify_core::holonomic::aggregation::descend_order;
+// v10.1.0 (CIRISVerify#194) restored root re-exports for the #191 v3 fns.
 pub use ciris_verify_core::holonomic::{
-    ejection_verdict, member_commitment, passes_dominance_gate, verify_aggregation_meta,
+    ejection_verdict, mass_commitment, member_commitment, passes_dominance_gate,
+    passes_multiplicity_gate, verify_aggregation_meta, verify_mass_commitment,
     verify_member_commitment, AggregationMetaVerification, EjectionVerdict,
 };
 
