@@ -1629,6 +1629,15 @@ impl NodeCoreService for SqliteNodeCoreBackend {
         rows.into_iter().map(materialize_contribution).collect()
     }
 
+    async fn put_key_grant(&self, env: ContributionEnvelope) -> Result<(), Error> {
+        // v16 (CIRISPersist#432, CC 5.1) — fail-closed shape gate
+        // FIRST (must BE a key_grant), then the full put_contribution
+        // admission (trust gate + signature + projection). Mirrors the
+        // PG impl.
+        super::media_sharing::require_key_grant_envelope(&env)?;
+        self.put_contribution(env).await
+    }
+
     async fn retire_key_grants(
         &self,
         actor_key_id: &str,
@@ -3258,6 +3267,136 @@ mod tests {
 
         let err = cn.put_contribution(env).await.unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
+    }
+
+    /// v16 (#432, CC 5.1 `CLM-epoch-keying`) — SQLite parity for the
+    /// dedicated `put_key_grant` writer: (S, n) grant appears in
+    /// list(S, n) and NOT in list(S, n+1) / list(S', n); a second
+    /// grantee in the same epoch is listed alongside; duplicate
+    /// `contribution_id` (the PK) → Conflict, re-grant under a fresh
+    /// id appends; non-key_grant envelopes are rejected fail-closed.
+    #[tokio::test]
+    async fn sqlite_put_key_grant_writer_round_trip_epoch_isolation() {
+        let (_b, cn) = fresh_backend().await;
+        let author_key = ed25519_dalek::SigningKey::from_bytes(&[0xC7; 32]);
+        let stream = format!("stream-{}", Uuid::new_v4());
+        let other_stream = format!("stream-{}", Uuid::new_v4());
+        let recip_a = format!("rec-{}", Uuid::new_v4());
+        let recip_b = format!("rec-{}", Uuid::new_v4());
+
+        // (S, 1) grantee A — reused below for the Conflict check.
+        let grant_a = build_stream_key_grant_sqlite(&author_key, &stream, 1, &recip_a);
+        cn.put_key_grant(grant_a.clone()).await.unwrap();
+        // (S, 1) grantee B — second grantee, same epoch.
+        cn.put_key_grant(build_stream_key_grant_sqlite(
+            &author_key,
+            &stream,
+            1,
+            &recip_b,
+        ))
+        .await
+        .unwrap();
+        // Epoch + stream noise: (S, 2) and (S', 1).
+        cn.put_key_grant(build_stream_key_grant_sqlite(
+            &author_key,
+            &stream,
+            2,
+            &recip_a,
+        ))
+        .await
+        .unwrap();
+        cn.put_key_grant(build_stream_key_grant_sqlite(
+            &author_key,
+            &other_stream,
+            1,
+            &recip_a,
+        ))
+        .await
+        .unwrap();
+
+        // list(S, 1) = both grantees, and ONLY epoch-1 rows.
+        let rows = cn
+            .list_key_grants_for_stream_epoch(&stream, 1)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "both (S,1) grantees listed");
+        let recipients: std::collections::HashSet<String> = rows
+            .iter()
+            .map(|env| {
+                let p: crate::cirisnode::KeyGrantPayload =
+                    serde_json::from_value(env.payload.clone()).unwrap();
+                assert_eq!(p.stream_id.as_deref(), Some(stream.as_str()));
+                assert_eq!(p.stream_epoch, Some(1));
+                p.recipient_key_id
+            })
+            .collect();
+        assert!(recipients.contains(&recip_a) && recipients.contains(&recip_b));
+        // Epoch isolation: (S, 2) and (S', 1) see only their own
+        // grants; (S, 3) is empty.
+        assert_eq!(
+            cn.list_key_grants_for_stream_epoch(&stream, 2)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            cn.list_key_grants_for_stream_epoch(&other_stream, 1)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(cn
+            .list_key_grants_for_stream_epoch(&stream, 3)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Conflict: same contribution_id (the PK) re-written → Conflict.
+        let dup = cn.put_key_grant(grant_a.clone()).await.unwrap_err();
+        assert!(matches!(dup, Error::Conflict(_)), "got: {dup:?}");
+        // Re-grant same (S, 1, recip_a) under a FRESH id appends.
+        cn.put_key_grant(build_stream_key_grant_sqlite(
+            &author_key,
+            &stream,
+            1,
+            &recip_a,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            cn.list_key_grants_for_stream_epoch(&stream, 1)
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "re-grant under a fresh contribution_id appends"
+        );
+
+        // Fail-closed: non-key_grant envelopes through the dedicated
+        // writer are rejected with no row.
+        let mut not_grant = build_stream_key_grant_sqlite(&author_key, &stream, 5, &recip_a);
+        not_grant.subject.subject = Some("arc_question".into());
+        not_grant.signature = sign_envelope(&not_grant, &author_key);
+        let err = cn.put_key_grant(not_grant).await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains("subject_kind")),
+            "got: {err:?}"
+        );
+        let mut wrong_type = build_stream_key_grant_sqlite(&author_key, &stream, 5, &recip_a);
+        wrong_type.contribution_type = ContributionType::ModerationEvent;
+        wrong_type.signature = sign_envelope(&wrong_type, &author_key);
+        let err = cn.put_key_grant(wrong_type).await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains("contribution_type=proposal")),
+            "got: {err:?}"
+        );
+        assert!(cn
+            .list_key_grants_for_stream_epoch(&stream, 5)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// CEG 0.3 §5.6.8.4 — option (b) supersession: retire_key_grants

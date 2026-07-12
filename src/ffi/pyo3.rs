@@ -16373,6 +16373,66 @@ impl PyEngine {
         })
     }
 
+    /// v16 (CIRISPersist#432, CC 5.1 `CLM-epoch-keying`) — the
+    /// dedicated `key_grant` WRITER; the emission half of
+    /// [`cirisnode_list_key_grants_for_stream_epoch_json`](Self::cirisnode_list_key_grants_for_stream_epoch_json)
+    /// (and of the content-addressed grant readers).
+    ///
+    /// `envelope_json` is a full signed
+    /// [`ContributionEnvelope`](crate::cirisnode::ContributionEnvelope)
+    /// whose `contribution_type` is `proposal`, `subject.subject`
+    /// (subject_kind) is `key_grant`, and whose payload is a
+    /// [`KeyGrantPayload`](crate::cirisnode::KeyGrantPayload) in
+    /// exactly ONE addressing mode — stream/epoch-addressed
+    /// (`stream_id` + `stream_epoch`, `wrap_algorithm: v2`,
+    /// `scope: stream_epoch`) or content-addressed (`content_sha256`).
+    /// Anything else is rejected fail-closed BEFORE any admission
+    /// state is touched; a well-shaped grant then runs the full
+    /// `put_contribution` discipline (trust gate + hybrid signature
+    /// verification + V054/V064 column projection).
+    ///
+    /// Conflict semantics: the row PK is `contribution_id` — a
+    /// duplicate raises `Conflict`; re-granting the same
+    /// `(stream_id, epoch, recipient_key_id)` under a fresh
+    /// `contribution_id` appends (reads are newest-first; supersession
+    /// rides `rotation_chain` / retire, never row mutation).
+    #[cfg(feature = "cirisnode")]
+    fn cirisnode_put_key_grant_json(&self, py: Python<'_>, envelope_json: &str) -> PyResult<()> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let env: crate::cirisnode::ContributionEnvelope = serde_json::from_str(envelope_json)
+                .map_err(|e| {
+                PyValueError::new_err(format!("ContributionEnvelope decode: {e}"))
+            })?;
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_key_grant(env)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend =
+                        crate::cirisnode::sqlite::SqliteNodeCoreBackend::new(sq.conn_handle());
+                    runtime.block_on(async move {
+                        use crate::cirisnode::NodeCoreService;
+                        backend
+                            .put_key_grant(env)
+                            .await
+                            .map_err(|e| translate_error_kind(e.kind(), e.to_string()))
+                    })
+                }
+            })
+        })
+    }
+
     /// v3.6.0 (CIRISPersist#134) — install / clear the media-sharing
     /// operator config ([`MultimediaConfig`](crate::cirisnode::MultimediaConfig)).
     /// Wire shape: see [`MultimediaConfigWire`](crate::cirisnode::MultimediaConfigWire).
