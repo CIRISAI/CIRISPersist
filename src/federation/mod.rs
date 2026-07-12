@@ -153,7 +153,9 @@ pub use goal::{
     canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
     MetaGoalAlignment,
 };
-pub use hard_case::{ConsentState, ConsentWatchReport, HardCaseEvent, HardCaseFilter};
+pub use hard_case::{
+    ConsentPromotionOverdueRow, ConsentState, ConsentWatchReport, HardCaseEvent, HardCaseFilter,
+};
 pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE};
 pub use identity_aggregate::{
     ContentKemIdentity, LocalIdentityAggregate, LOCAL_IDENTITY_AGGREGATE_VERSION,
@@ -3099,6 +3101,109 @@ pub trait FederationDirectory: Send + Sync {
         Ok(action)
     }
 
+    /// v16 (CIRISPersist#431, CC 6.1.1) — the distinct `peer_id`s with at
+    /// least one witness in the corpus. Feeds the compare-all path of
+    /// [`compare_stored_witnesses`](Self::compare_stored_witnesses).
+    async fn list_witness_peer_ids(&self) -> Result<Vec<String>, Error> {
+        Err(Error::Backend(
+            "list_witness_peer_ids not implemented for this backend".into(),
+        ))
+    }
+
+    /// v16 (CIRISPersist#431, CC 6.1.1) — classify the stored, VERIFIED
+    /// witnesses of `peer_ids` (`None` = every peer in the corpus) into
+    /// the §19.1 verdict. Read-only: unlike
+    /// [`reconcile_peer_witnesses`](Self::reconcile_peer_witnesses) it
+    /// emits nothing (emission happens at put-time reconcile).
+    ///
+    /// Verified-inputs precondition (the `compare_witnesses` contract):
+    /// every corpus row passed the ingest gate by construction — the F-5
+    /// rule stores no unverified rows and no in-band `verified` flag to
+    /// forge. The only way a stored row can fail to round-trip back to
+    /// the verify-core shape is substrate corruption (a malformed root
+    /// column), and that REFUSES with an error rather than comparing —
+    /// an unverifiable row never reaches `compare_witnesses`.
+    async fn compare_stored_witnesses(
+        &self,
+        peer_ids: Option<&[String]>,
+    ) -> Result<crate::witness::WitnessReconcileAction, Error> {
+        let peers: Vec<String> = match peer_ids {
+            Some(ids) => ids.to_vec(),
+            None => self.list_witness_peer_ids().await?,
+        };
+        let mut stored = Vec::new();
+        for peer in &peers {
+            stored.extend(self.list_wholeness_witnesses_for_peer(peer).await?);
+        }
+        Ok(crate::witness::classify_stored(&stored)?)
+    }
+
+    /// v16 (CIRISPersist#431, N4 read-back) — the non-repudiable
+    /// equivocations visible in `peer_id`'s corpus: for each proof, BOTH
+    /// conflicting [`StoredWitness`](crate::witness::StoredWitness) rows
+    /// (retained, never reconciled) plus the recorded
+    /// `hard_case:witness_equivocation` marker (matched by its
+    /// deterministic event_id). Default impl composing
+    /// [`list_wholeness_witnesses_for_peer`](Self::list_wholeness_witnesses_for_peer),
+    /// [`crate::witness::classify_stored`], and
+    /// [`list_hard_case_events`](Self::list_hard_case_events).
+    async fn list_witness_equivocations(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<crate::witness::WitnessEquivocationRecord>, Error> {
+        let stored = self.list_wholeness_witnesses_for_peer(peer_id).await?;
+        let action = crate::witness::classify_stored(&stored)?;
+        let crate::witness::WitnessReconcileAction::Equivocation(proofs) = action else {
+            return Ok(Vec::new());
+        };
+        // The recorded markers for this kind, keyed by event_id so each
+        // proof pairs with exactly its own emission (or None pre-emit).
+        let cases = self
+            .list_hard_case_events(hard_case::HardCaseFilter {
+                kind: Some(crate::witness::WITNESS_EQUIVOCATION.to_owned()),
+                since: None,
+            })
+            .await?;
+        let mut records = Vec::with_capacity(proofs.len());
+        for proof in &proofs {
+            let root_a = crate::witness::encode_root_hex(&proof.roots.0);
+            let root_b = crate::witness::encode_root_hex(&proof.roots.1);
+            // The two conflicting corpus rows (match either root at the
+            // proof's (epoch, namespace-set) identity).
+            let mut ns_sorted = proof.claim_namespaces.clone();
+            ns_sorted.sort_unstable();
+            let witnesses: Vec<_> = stored
+                .iter()
+                .filter(|w| {
+                    let mut w_ns = w.claim_namespaces.clone();
+                    w_ns.sort_unstable();
+                    w_ns.dedup();
+                    w.epoch_id == proof.epoch_id
+                        && w_ns == ns_sorted
+                        && (w.merkle_root_hex == root_a || w.merkle_root_hex == root_b)
+                })
+                .cloned()
+                .collect();
+            // The marker's event_id is deterministic on (peer, epoch,
+            // roots) — derive it through `equivocation_hard_case` itself
+            // (the timestamp does not enter the id) so there is exactly
+            // one derivation to keep coherent.
+            let event_id =
+                crate::witness::equivocation_hard_case(proof, chrono::Utc::now()).event_id;
+            let hard_case = cases.iter().find(|c| c.event_id == event_id).cloned();
+            records.push(crate::witness::WitnessEquivocationRecord {
+                peer_id: proof.peer_id.clone(),
+                epoch_id: proof.epoch_id,
+                claim_namespaces: proof.claim_namespaces.clone(),
+                root_a,
+                root_b,
+                witnesses,
+                hard_case,
+            });
+        }
+        Ok(records)
+    }
+
     /// CEG §8.1.11.1 — effective consent stance of subject `s` over
     /// target Contribution `T` at `now`. Default impl over
     /// [`list_attestations_for`](Self::list_attestations_for): the latest
@@ -3280,6 +3385,71 @@ pub trait FederationDirectory: Send + Sync {
             }
         }
         Ok(report)
+    }
+
+    /// v16 (CIRISPersist#434, CC 5.3.2.2) — the 24h-SLA detector's READ
+    /// surface: every subject-side `consent:state:revoked` still resting
+    /// at LOCAL tier (unpromoted) with `now - asserted_at > sla`,
+    /// returned as [`ConsentPromotionOverdueRow`](hard_case::ConsentPromotionOverdueRow)s.
+    /// This is the never-rest-local tripwire's reader half — the
+    /// `run_consent_sla_watch` (b) branch surfaces the same condition as
+    /// a `hard_case`; this method returns the rows so a caller can drive
+    /// the promotion (`attestation_promote`) that clears them.
+    ///
+    /// Each overdue row is ALSO recorded as
+    /// `hard_case:consent_revocation_promotion_overdue`, idempotently:
+    /// the deterministic [`hard_case::watch_event_id`] is the SAME one
+    /// the watcher derives, so a reader scan and a watcher tick never
+    /// double-emit for one observed condition.
+    ///
+    /// Backend-agnostic default composing
+    /// [`list_consent_revocations`](Self::list_consent_revocations) +
+    /// [`record_hard_case`](Self::record_hard_case).
+    async fn list_consent_revocation_promotion_overdue(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        sla: std::time::Duration,
+    ) -> Result<Vec<hard_case::ConsentPromotionOverdueRow>, Error> {
+        let window =
+            chrono::Duration::from_std(sla).unwrap_or_else(|_| chrono::Duration::hours(24));
+        let revocations = self.list_consent_revocations(None).await?;
+        let mut overdue = Vec::new();
+        for rev in &revocations {
+            // §10.1.3 transit-not-rest: only a LOCAL-tier, unpromoted row
+            // past the window is overdue (a promoted row's terminal state
+            // is `federation`, which drops it out of the fire condition).
+            let local = rev.tier != crate::federation::types::attestation_tier::FEDERATION;
+            if !(local && rev.promoted_at.is_none() && now - rev.asserted_at > window) {
+                continue;
+            }
+            // Flag it (idempotent — the watcher's own event_id derivation,
+            // so reader + watcher dedup against each other).
+            self.record_hard_case(hard_case::HardCaseEvent {
+                event_id: hard_case::watch_event_id(
+                    hard_case::kind::CONSENT_REVOCATION_PROMOTION_OVERDUE,
+                    &rev.attested_key_id,
+                    rev.asserted_at,
+                ),
+                kind: hard_case::kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.to_string(),
+                target_key_id: Some(rev.attested_key_id.clone()),
+                subject_key_id: Some(rev.attesting_key_id.clone()),
+                detail: serde_json::json!({
+                    "revocation_at": rev.asserted_at.to_rfc3339(),
+                    "promotion_window_secs": sla.as_secs(),
+                }),
+                emitted_at: now,
+            })
+            .await?;
+            overdue.push(hard_case::ConsentPromotionOverdueRow {
+                attestation_id: rev.attestation_id.clone(),
+                target_key_id: rev.attested_key_id.clone(),
+                subject_key_id: rev.attesting_key_id.clone(),
+                asserted_at: rev.asserted_at,
+                age_seconds: (now - rev.asserted_at).num_seconds().max(0) as u64,
+                tier: rev.tier.clone(),
+            });
+        }
+        Ok(overdue)
     }
 
     // ─── v10.0.0 — fountain holdings/eviction surface (CIRISPersist#270) ──

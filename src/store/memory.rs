@@ -3047,6 +3047,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .and_then(|b| b.iter().map(|w| w.epoch_id).max()))
     }
 
+    async fn list_witness_peer_ids(&self) -> Result<Vec<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut peers: Vec<String> = state
+            .wholeness_witnesses
+            .iter()
+            .filter(|(_, b)| !b.is_empty())
+            .map(|(p, _)| p.clone())
+            .collect();
+        // Sorted (parity with the SQL backends' ORDER BY).
+        peers.sort_unstable();
+        Ok(peers)
+    }
+
     // ─── v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8.1) — location proofs.
 
     async fn put_location_proof(
@@ -9921,6 +9934,169 @@ mod tests {
             matches!(unsigned, crate::federation::Error::InvalidArgument(ref m) if m.contains("bound-hybrid signature")),
             "unsigned revocation rejected at admission, got {unsigned:?}"
         );
+    }
+
+    /// v16 (CIRISPersist#434, CC 5.3.2.2) — the promotion-overdue READER
+    /// (`list_consent_revocation_promotion_overdue`, what the PyO3
+    /// `list_consent_revocation_promotion_overdue_json` dispatches onto),
+    /// over the REAL local-write admission path on the memory backend: an
+    /// over-SLA transit revocation is returned + flagged idempotently, a
+    /// within-SLA one never appears, and promotion clears it.
+    #[tokio::test]
+    async fn consent_promotion_overdue_reader_memory() {
+        use crate::federation::hard_case::{kind, HardCaseFilter};
+        use crate::federation::tier_ingest::test_support::sign_envelope;
+        use crate::federation::types::{attestation_tier, attestation_type, LocalAttestationInput};
+        use crate::federation::FederationDirectory;
+        use std::time::Duration;
+        let backend = MemoryBackend::new();
+        for k in ["subject-r", "target-r"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "primitive", k),
+                })
+                .await
+                .unwrap();
+        }
+        // A crypto-valid subject-side revocation, admitted as a TRANSIT
+        // local-tier write (same real-admission fixture as the SLA loop
+        // test above).
+        let env = serde_json::json!({
+            "id": "rev-r", "dimension": "consent:state:revoked:v1",
+            "score": 1.0, "confidence": 0.9,
+        });
+        let (_hash, sig_classical, sig_pqc) = sign_envelope("subject-r", &env);
+        let att_id = backend
+            .attestation_upsert_local(LocalAttestationInput {
+                attesting_key_id: "subject-r".into(),
+                attested_key_id: Some("target-r".into()),
+                attestation_type: attestation_type::SCORES.into(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: env,
+                subject_key_ids: vec!["subject-r".into()],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
+                scrub_signature_classical: Some(sig_classical),
+                scrub_signature_pqc: sig_pqc,
+            })
+            .await
+            .expect("transit local-tier revocation admits");
+        let revoked_at = backend.list_consent_revocations(None).await.unwrap()[0].asserted_at;
+        let sla = Duration::from_secs(86_400); // 24 h
+
+        // Within the SLA → never appears, nothing flagged.
+        let before = revoked_at + chrono::Duration::seconds(86_400 - 1);
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(before, sla)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "a within-SLA revocation never appears");
+        assert!(backend
+            .list_hard_case_events(HardCaseFilter::default())
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Past the SLA → returned (with the promote handle + age) + flagged.
+        let after = revoked_at + chrono::Duration::seconds(86_400 + 60);
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(after, sla)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the over-SLA revocation is overdue");
+        assert_eq!(rows[0].attestation_id, att_id);
+        assert_eq!(rows[0].target_key_id, "target-r");
+        assert_eq!(rows[0].subject_key_id, "subject-r");
+        assert_eq!(rows[0].age_seconds, 86_400 + 60);
+        assert_eq!(rows[0].tier, attestation_tier::LOCAL);
+        let evs = backend
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::CONSENT_REVOCATION_PROMOTION_OVERDUE.into()),
+                since: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 1, "the overdue row was flagged");
+
+        // Re-scan: still listed, NO duplicate hard_case.
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(after, sla)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            backend
+                .list_hard_case_events(HardCaseFilter::default())
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "re-scan writes no duplicate hard_case"
+        );
+
+        // Promote (tier=federation) → drops out of subsequent scans.
+        {
+            let mut st = backend.state.lock().unwrap();
+            for a in st.federation_attestations.iter_mut() {
+                if a.attestation_id == att_id {
+                    a.tier = attestation_tier::FEDERATION.into();
+                    a.promoted_at = Some(after);
+                }
+            }
+        }
+        let rows = backend
+            .list_consent_revocation_promotion_overdue(after + chrono::Duration::seconds(1), sla)
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "a promoted revocation is no longer overdue"
+        );
+    }
+
+    /// v16 (CIRISPersist#431) — the compare surface REFUSES a corpus row
+    /// it cannot round-trip back to the verify-core witness shape
+    /// (substrate corruption), rather than classifying over it. This is
+    /// the "never compare an unverifiable witness" assertion: the F-5
+    /// rule means every stored row passed the gate, so the only
+    /// unverifiable row is a corrupted one — and it errors, fail-closed.
+    #[tokio::test]
+    async fn compare_refuses_corrupted_witness_row() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        // Simulate at-rest corruption: a row whose merkle_root column is
+        // not 64 hex chars (unreachable via put_wholeness_witness — the
+        // gate writes only encode_root_hex output).
+        {
+            let mut st = backend.state.lock().unwrap();
+            st.wholeness_witnesses
+                .entry("corrupt-peer".into())
+                .or_default()
+                .push(crate::witness::StoredWitness {
+                    peer_id: "corrupt-peer".into(),
+                    epoch_id: 1,
+                    claim_namespaces: vec!["scores:medical".into()],
+                    merkle_root_hex: "not-hex".into(), // corrupted column
+                    leaf_count: 1,
+                    observed_at_unix_ms: 1000,
+                    witness_version: 1,
+                    signature: "AA==".into(),
+                    signature_ml_dsa_65: "AA==".into(),
+                    pqc_key_id: "k".into(),
+                });
+        }
+        let peers = ["corrupt-peer".to_string()];
+        let err = backend
+            .compare_stored_witnesses(Some(&peers))
+            .await
+            .expect_err("a corrupted row REFUSES comparison (never a verdict)");
+        assert_eq!(err.kind(), "witness_admit_malformed_root");
+        // The N4 read-back refuses identically.
+        let err = backend
+            .list_witness_equivocations("corrupt-peer")
+            .await
+            .expect_err("read-back refuses the corrupted row too");
+        assert_eq!(err.kind(), "witness_admit_malformed_root");
     }
 
     /// steward_bindings_of: an steward-bound node (live `delegates_to(user →

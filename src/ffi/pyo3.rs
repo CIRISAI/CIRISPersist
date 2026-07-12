@@ -7137,6 +7137,305 @@ impl PyEngine {
         })
     }
 
+    // ── v16 (CIRISPersist#431, CC 6.1.1) — §19.1 WholenessWitness gates
+    //    projected onto the Engine. The corpus + verify-before-persist
+    //    gate + verdict routing shipped in v8.2.0 (#228) on the
+    //    FederationDirectory; these four methods make CC 6.1.1 drivable
+    //    over PyO3. The crypto (Merkle, bound-hybrid gate, equivocation
+    //    classifier) stays frozen in `ciris_verify_core::holonomic` —
+    //    persist calls it, never re-rolls it. ──
+
+    /// v16 (CIRISPersist#431) — pure §19.1 root builder: the WW-scheme
+    /// Merkle root (lexicographic leaf order, odd-duplication,
+    /// `WW-v1-empty` empty sentinel) over a JSON array of base64 leaf
+    /// byte-strings, as lowercase hex (64 chars). An empty array yields
+    /// the sentinel root. No backend touch — a witness producer composes
+    /// this into the wire object it then hybrid-signs.
+    fn wholeness_witness_root_hex(
+        &self,
+        py: Python<'_>,
+        leaf_bytes_b64_json: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let leaf_bytes_b64_json = leaf_bytes_b64_json.to_owned();
+            py.detach(move || {
+                let leaves = decode_b64_leaves(&leaf_bytes_b64_json)?;
+                let root = ciris_verify_core::holonomic::compute_merkle_root(&leaves);
+                Ok(crate::witness::encode_root_hex(&root))
+            })
+        })
+    }
+
+    /// v16 (CIRISPersist#431, N3 + N4) — admit a WholenessWitness to the
+    /// corpus, **PQC-verified-BEFORE-persist**: the full hybrid gate over
+    /// the §19.1 canonical preimage + the WW-1/WW-2 namespace guard +
+    /// (when `leaves_b64_json` is passed) the leaf/root recompute run
+    /// BEFORE any row is durable; on any failure NOTHING is written
+    /// (verify-before-mutation, AV-9) and the rejection raises
+    /// `ValueError` with the stable `witness_admit_*` token.
+    ///
+    /// `witness_json` is the wire object (`{peer_id, epoch_id,
+    /// claim_namespaces, merkle_root_hex, leaf_count,
+    /// observed_at_unix_ms, witness_version?, pqc_key_id?}`); the
+    /// signature halves are base64, bound-hybrid over the canonical
+    /// preimage (ML-DSA-65 over `preimage ‖ ed25519_sig`).
+    ///
+    /// After the store, the peer's corpus is re-classified (N4): a
+    /// witness whose `(peer_id, epoch_id, namespace-set)` already holds a
+    /// DIFFERENT root is a non-repudiable equivocation — BOTH rows are
+    /// RETAINED (never reconciled, never overwritten) and a
+    /// `hard_case:witness_equivocation` is emitted (idempotent on its
+    /// deterministic event_id). Returns JSON
+    /// `{"admitted": true, "verdict": <"consistent"|"divergent"|{"equivocation": [...]}>}`.
+    #[pyo3(signature = (witness_json, sig_ed25519_b64, sig_mldsa65_b64,
+                        ed25519_pubkey_b64, mldsa65_pubkey_b64, leaves_b64_json=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn put_wholeness_witness_json(
+        &self,
+        py: Python<'_>,
+        witness_json: &str,
+        sig_ed25519_b64: &str,
+        sig_mldsa65_b64: &str,
+        ed25519_pubkey_b64: &str,
+        mldsa65_pubkey_b64: &str,
+        leaves_b64_json: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let wire: crate::witness::WitnessWire = serde_json::from_str(witness_json)
+                .map_err(|e| PyValueError::new_err(format!("witness_json deserialize: {e}")))?;
+            let witness = wire
+                .to_verify_witness()
+                .map_err(|e| PyValueError::new_err(e.kind()))?;
+            let disclosed: Option<Vec<Vec<u8>>> =
+                leaves_b64_json.map(decode_b64_leaves).transpose()?;
+            let sig_ed = sig_ed25519_b64.to_owned();
+            let sig_pqc = sig_mldsa65_b64.to_owned();
+            let ed_pub = ed25519_pubkey_b64.to_owned();
+            let pqc_pub = mldsa65_pubkey_b64.to_owned();
+            py.detach(move || {
+                let verdict = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            // N3: verify-BEFORE-persist inside the put.
+                            backend
+                                .put_wholeness_witness(
+                                    &witness,
+                                    &sig_ed,
+                                    Some(&sig_pqc),
+                                    &wire.pqc_key_id,
+                                    &ed_pub,
+                                    Some(&pqc_pub),
+                                    disclosed.as_deref(),
+                                )
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            // N4: retain + surface an equivocation
+                            // (idempotent hard_case), never reconcile.
+                            backend
+                                .reconcile_peer_witnesses(&witness.peer_id, chrono::Utc::now())
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            // N3: verify-BEFORE-persist inside the put.
+                            backend
+                                .put_wholeness_witness(
+                                    &witness,
+                                    &sig_ed,
+                                    Some(&sig_pqc),
+                                    &wire.pqc_key_id,
+                                    &ed_pub,
+                                    Some(&pqc_pub),
+                                    disclosed.as_deref(),
+                                )
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            // N4: retain + surface an equivocation
+                            // (idempotent hard_case), never reconcile.
+                            backend
+                                .reconcile_peer_witnesses(&witness.peer_id, chrono::Utc::now())
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                let out = serde_json::json!({
+                    "admitted": true,
+                    "verdict": crate::witness::verdict_json(&verdict),
+                });
+                serde_json::to_string(&out)
+                    .map_err(|e| PyValueError::new_err(format!("witness verdict serialize: {e}")))
+            })
+        })
+    }
+
+    /// v16 (CIRISPersist#431, N4) — classify the stored, VERIFIED
+    /// witnesses of `peer_ids_json` (a JSON array of peer ids; `None` =
+    /// every peer in the corpus) into the §19.1 verdict:
+    /// `"consistent"` | `"divergent"` | `{"equivocation": [...]}`.
+    ///
+    /// Only gate-verified rows exist to compare (F-5: the corpus stores
+    /// no unverified rows and no in-band `verified` flag) — the
+    /// `compare_witnesses` verified-inputs precondition holds by
+    /// construction. A stored row that cannot round-trip back to the
+    /// verify-core shape (substrate corruption) REFUSES with an error
+    /// rather than comparing.
+    #[pyo3(signature = (peer_ids_json=None))]
+    fn compare_wholeness_witnesses_json(
+        &self,
+        py: Python<'_>,
+        peer_ids_json: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let peer_ids: Option<Vec<String>> = peer_ids_json
+                .map(|s| {
+                    serde_json::from_str(s).map_err(|e| {
+                        PyValueError::new_err(format!("peer_ids_json deserialize: {e}"))
+                    })
+                })
+                .transpose()?;
+            py.detach(move || {
+                let action = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .compare_stored_witnesses(peer_ids.as_deref())
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .compare_stored_witnesses(peer_ids.as_deref())
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&crate::witness::verdict_json(&action))
+                    .map_err(|e| PyValueError::new_err(format!("witness verdict serialize: {e}")))
+            })
+        })
+    }
+
+    /// v16 (CIRISPersist#431, N4 read-back) — the non-repudiable
+    /// equivocations visible for `peer_id`: a JSON array of records each
+    /// carrying the proof scalars (`peer_id`, `epoch_id`,
+    /// `claim_namespaces`, `root_a`, `root_b`), BOTH conflicting stored
+    /// witnesses (retained, never reconciled), and the recorded
+    /// `hard_case:witness_equivocation` marker.
+    fn list_witness_equivocations_json(&self, py: Python<'_>, peer_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let peer_id = peer_id.to_owned();
+            py.detach(move || {
+                let records: Vec<crate::witness::WitnessEquivocationRecord> = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_witness_equivocations(&peer_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_witness_equivocations(&peer_id)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&records).map_err(|e| {
+                    PyValueError::new_err(format!("witness_equivocations serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// v16 (CIRISPersist#434, CC 5.3.2.2) — the consent-revocation
+    /// promotion-overdue reader: every subject-side
+    /// `consent:state:revoked` still resting LOCAL-tier (unpromoted) past
+    /// the SLA (`sla_seconds`, default 86400 = the 24 h never-rest-local
+    /// tripwire). Returns a JSON array of `{attestation_id,
+    /// target_key_id, subject_key_id, asserted_at, age_seconds, tier}` —
+    /// `attestation_id` is the [`attestation_promote`](Self::attestation_promote)
+    /// handle that clears the condition.
+    ///
+    /// Each overdue row is also flagged as
+    /// `hard_case:consent_revocation_promotion_overdue`, idempotently
+    /// (the same deterministic event_id the consent-SLA watcher derives,
+    /// so repeated scans and watcher ticks never duplicate the event).
+    #[pyo3(signature = (sla_seconds=None))]
+    fn list_consent_revocation_promotion_overdue_json(
+        &self,
+        py: Python<'_>,
+        sla_seconds: Option<u64>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sla = std::time::Duration::from_secs(sla_seconds.unwrap_or(86_400));
+            py.detach(move || {
+                let now = chrono::Utc::now();
+                let rows: Vec<crate::federation::ConsentPromotionOverdueRow> = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_consent_revocation_promotion_overdue(now, sla)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_consent_revocation_promotion_overdue(now, sla)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows)
+                    .map_err(|e| PyValueError::new_err(format!("promotion_overdue serialize: {e}")))
+            })
+        })
+    }
+
     /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — admit a
     /// `family` row.
     ///
@@ -25162,6 +25461,22 @@ fn cohort_from_token(cohort: &str) -> PyResult<crate::federation::cohort::Cohort
             "unknown cohort {bad:?} (expected one of: self | family | community | affiliations)"
         ))
     })
+}
+
+/// v16 (CIRISPersist#431) — decode a JSON array of base64 strings into
+/// raw leaf byte-vectors (the §19.1 Merkle leaf input shape shared by
+/// `wholeness_witness_root_hex` and `put_wholeness_witness_json`).
+fn decode_b64_leaves(leaf_bytes_b64_json: &str) -> PyResult<Vec<Vec<u8>>> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let encoded: Vec<String> = serde_json::from_str(leaf_bytes_b64_json)
+        .map_err(|e| PyValueError::new_err(format!("leaf_bytes_b64_json deserialize: {e}")))?;
+    encoded
+        .iter()
+        .map(|s| {
+            B64.decode(s)
+                .map_err(|e| PyValueError::new_err(format!("leaf base64 decode: {e}")))
+        })
+        .collect()
 }
 
 fn federation_err_to_py(e: crate::federation::Error) -> PyErr {

@@ -26,8 +26,8 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::store::Backend;
 use ciris_persist::witness::{
-    accept_if_monotonic, build_local_witness, classify, WitnessLeaf, WitnessReconcileAction,
-    QUORUM_MERGE_SUBJECT_KINDS, WITNESS_EQUIVOCATION,
+    accept_if_monotonic, build_local_witness, classify, verdict_json, WitnessLeaf,
+    WitnessReconcileAction, WitnessWire, QUORUM_MERGE_SUBJECT_KINDS, WITNESS_EQUIVOCATION,
 };
 use ciris_verify_core::holonomic::WholenessWitness;
 
@@ -230,6 +230,303 @@ async fn run_corpus_assertions<B: FederationDirectory + Sync>(backend: &B, suffi
     assert!(accept_if_monotonic(last, 6), "(f) advance accepted");
 
     let _ = now;
+}
+
+/// v16 (CIRISPersist#431, CC 6.1.1) — the Engine-projection surface the
+/// four new PyO3 methods dispatch onto:
+/// `compare_stored_witnesses` (peer-set + all-peers via
+/// `list_witness_peer_ids`), the put→reconcile equivocation path
+/// (retain-both + `hard_case:witness_equivocation`), the
+/// `list_witness_equivocations` N4 read-back, the WW-2 self-namespace
+/// put rejection, and the tampered-signature zero-row rejection.
+/// `fresh_store` gates the all-peers assertions (a shared PG database
+/// may hold other runs' peers).
+async fn run_projection_assertions<B: FederationDirectory + Sync>(
+    backend: &B,
+    suffix: &str,
+    fresh_store: bool,
+) {
+    let producer = Producer::new(0x33);
+    let pqc_pub = producer.mldsa_pub_b64().await;
+    let now = chrono::Utc::now();
+    let leaves = vec![WitnessLeaf {
+        claim_namespace: "scores:medical".into(),
+        cohort_scope: "community".into(),
+        anonymous_tier: false,
+        leaf_bytes: b"proj-leaf".to_vec(),
+    }];
+
+    // ── (a) valid witness admits; same root twice → idempotent, and the
+    //        compare verdict over the peer is Consistent. ──
+    let peer = format!("proj-consistent-{suffix}");
+    let w = build_local_witness(&peer, 1, 1000, &leaves);
+    let (ed, pqc) = producer.sign(&w).await;
+    for _ in 0..2 {
+        backend
+            .put_wholeness_witness(
+                &w,
+                &ed,
+                Some(&pqc),
+                "witness-mldsa",
+                &producer.ed_pub_b64,
+                Some(&pqc_pub),
+                None,
+            )
+            .await
+            .expect("(a) valid witness admits (idempotent re-put)");
+    }
+    assert_eq!(
+        backend
+            .list_wholeness_witnesses_for_peer(&peer)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "(a) same (peer, epoch, observed_at) put twice → one row"
+    );
+    let action = backend
+        .compare_stored_witnesses(Some(std::slice::from_ref(&peer)))
+        .await
+        .expect("(a) compare over the peer set");
+    assert_eq!(action, WitnessReconcileAction::NoAction, "(a) consistent");
+    assert_eq!(verdict_json(&action), serde_json::json!("consistent"));
+
+    // ── (b) tampered Ed25519 half → rejected BEFORE persist, zero rows. ──
+    let peer_tamper = format!("proj-tamper-{suffix}");
+    let wt = build_local_witness(&peer_tamper, 1, 1000, &leaves);
+    let (ed_t, pqc_t) = producer.sign(&wt).await;
+    let mut ed_bytes = BASE64.decode(&ed_t).unwrap();
+    ed_bytes[0] ^= 0x01; // flip one bit → classical half no longer verifies
+    let err = backend
+        .put_wholeness_witness(
+            &wt,
+            &BASE64.encode(&ed_bytes),
+            Some(&pqc_t),
+            "witness-mldsa",
+            &producer.ed_pub_b64,
+            Some(&pqc_pub),
+            None,
+        )
+        .await
+        .expect_err("(b) tampered signature MUST be rejected");
+    assert_eq!(err.kind(), "witness_admit_hybrid_verify", "(b) gate token");
+    assert!(
+        backend
+            .list_wholeness_witnesses_for_peer(&peer_tamper)
+            .await
+            .unwrap()
+            .is_empty(),
+        "(b) tampered witness wrote ZERO rows (verify-before-persist)"
+    );
+
+    // ── (c) two validly-signed witnesses, same (peer, epoch, namespaces),
+    //        different roots → BOTH retained + hard_case emitted +
+    //        compare returns Equivocation + the N4 read-back pairs the
+    //        conflicting rows with the marker. ──
+    let peer_eq = format!("proj-equiv-{suffix}");
+    let leaves_b = vec![WitnessLeaf {
+        claim_namespace: "scores:medical".into(),
+        cohort_scope: "community".into(),
+        anonymous_tier: false,
+        leaf_bytes: b"proj-leaf-b".to_vec(),
+    }];
+    let wa = build_local_witness(&peer_eq, 7, 7000, &leaves);
+    let wb = build_local_witness(&peer_eq, 7, 7001, &leaves_b);
+    assert_ne!(wa.merkle_root, wb.merkle_root);
+    for w in [&wa, &wb] {
+        let (ed, pqc) = producer.sign(w).await;
+        backend
+            .put_wholeness_witness(
+                w,
+                &ed,
+                Some(&pqc),
+                "witness-mldsa",
+                &producer.ed_pub_b64,
+                Some(&pqc_pub),
+                None,
+            )
+            .await
+            .expect("(c) equivocating halves each admit (validly signed)");
+    }
+    // The put path's post-store reconcile (what put_wholeness_witness_json
+    // runs): retain + surface, never reconcile.
+    let action = backend
+        .reconcile_peer_witnesses(&peer_eq, now)
+        .await
+        .expect("(c) reconcile");
+    assert!(
+        matches!(&action, WitnessReconcileAction::Equivocation(p) if !p.is_empty()),
+        "(c) reconcile → Equivocation, got {action:?}"
+    );
+    assert_eq!(
+        backend
+            .list_wholeness_witnesses_for_peer(&peer_eq)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "(c) BOTH equivocating witnesses retained (never overwritten)"
+    );
+    // The compare surface agrees, and the JSON verdict is the
+    // equivocation object shape.
+    let action = backend
+        .compare_stored_witnesses(Some(std::slice::from_ref(&peer_eq)))
+        .await
+        .unwrap();
+    let verdict = verdict_json(&action);
+    assert!(
+        verdict.get("equivocation").is_some_and(|v| v.is_array()),
+        "(c) verdict JSON carries the equivocation proofs: {verdict}"
+    );
+    // N4 read-back: both conflicting rows + the recorded marker.
+    let records = backend
+        .list_witness_equivocations(&peer_eq)
+        .await
+        .expect("(c) equivocation read-back");
+    assert_eq!(records.len(), 1, "(c) one equivocation record");
+    assert_eq!(records[0].peer_id, peer_eq);
+    assert_eq!(records[0].epoch_id, 7);
+    assert_eq!(
+        records[0].witnesses.len(),
+        2,
+        "(c) the record carries BOTH conflicting witnesses"
+    );
+    assert_ne!(records[0].root_a, records[0].root_b);
+    let marker = records[0]
+        .hard_case
+        .as_ref()
+        .expect("(c) hard_case:witness_equivocation marker recorded");
+    assert_eq!(marker.kind, WITNESS_EQUIVOCATION);
+    assert_eq!(marker.target_key_id.as_deref(), Some(peer_eq.as_str()));
+
+    // ── (d) a `self`-namespace witness is rejected at put (WW-2). ──
+    let peer_self = format!("proj-self-{suffix}");
+    let w_self = WholenessWitness {
+        peer_id: peer_self.clone(),
+        epoch_id: 1,
+        claim_namespaces: vec!["scores:self".into()], // WW-2 violation
+        merkle_root: ciris_verify_core::holonomic::compute_merkle_root(&[b"x".to_vec()]),
+        leaf_count: 1,
+        observed_at_unix_ms: 1000,
+        witness_version: 1,
+    };
+    let (ed_s, pqc_s) = producer.sign(&w_self).await;
+    let err = backend
+        .put_wholeness_witness(
+            &w_self,
+            &ed_s,
+            Some(&pqc_s),
+            "witness-mldsa",
+            &producer.ed_pub_b64,
+            Some(&pqc_pub),
+            None,
+        )
+        .await
+        .expect_err("(d) a self-namespace witness MUST be rejected (WW-2)");
+    assert_eq!(err.kind(), "witness_admit_namespace_invalid");
+    assert!(
+        backend
+            .list_wholeness_witnesses_for_peer(&peer_self)
+            .await
+            .unwrap()
+            .is_empty(),
+        "(d) rejected self-namespace witness wrote ZERO rows"
+    );
+
+    // ── (e) all-peers compare path (`peer_ids = None` →
+    //        `list_witness_peer_ids`) — fresh stores only. ──
+    if fresh_store {
+        let peers = backend.list_witness_peer_ids().await.unwrap();
+        assert!(
+            peers.contains(&peer) && peers.contains(&peer_eq),
+            "(e) corpus peers enumerated: {peers:?}"
+        );
+        assert!(
+            !peers.contains(&peer_tamper) && !peers.contains(&peer_self),
+            "(e) rejected witnesses never minted a peer"
+        );
+        let action = backend.compare_stored_witnesses(None).await.unwrap();
+        assert!(
+            matches!(action, WitnessReconcileAction::Equivocation(_)),
+            "(e) the all-peers verdict surfaces the equivocation"
+        );
+    }
+}
+
+/// v16 (CIRISPersist#431) — the pure PyO3 builder halves: the WW-scheme
+/// root over leaves (incl. the `WW-v1-empty` sentinel) and the
+/// `WitnessWire` JSON shape round-tripping to the verify-core witness.
+#[test]
+fn root_hex_builder_and_wire_shape() {
+    use ciris_persist::witness::{decode_root_hex, encode_root_hex};
+    use sha2::{Digest as _, Sha256};
+
+    // Empty leaf set → the §19.1 empty sentinel root.
+    let empty = ciris_verify_core::holonomic::compute_merkle_root(&[]);
+    let sentinel: [u8; 32] = Sha256::digest(b"WW-v1-empty").into();
+    assert_eq!(empty, sentinel, "empty array → the WW-v1-empty sentinel");
+
+    // Non-empty parity with the verify-core scheme + hex round-trip.
+    let leaves = vec![b"l1".to_vec(), b"l2".to_vec()];
+    let root = ciris_verify_core::holonomic::compute_merkle_root(&leaves);
+    let hex = encode_root_hex(&root);
+    assert_eq!(hex.len(), 64);
+    assert_eq!(decode_root_hex(&hex).unwrap(), root);
+
+    // WitnessWire (the put_wholeness_witness_json input) decodes to the
+    // exact verify-core shape; witness_version defaults to V1.
+    let wire: WitnessWire = serde_json::from_str(&format!(
+        r#"{{"peer_id":"p","epoch_id":3,"claim_namespaces":["scores:medical"],
+            "merkle_root_hex":"{hex}","leaf_count":2,"observed_at_unix_ms":9}}"#
+    ))
+    .unwrap();
+    let w = wire.to_verify_witness().unwrap();
+    assert_eq!(w.peer_id, "p");
+    assert_eq!(w.epoch_id, 3);
+    assert_eq!(w.merkle_root, root);
+    assert_eq!(w.witness_version, 1, "witness_version defaults to V1");
+    // A malformed root refuses (never a silent zero-root).
+    let bad = WitnessWire {
+        merkle_root_hex: "zz".into(),
+        ..wire
+    };
+    assert!(bad.to_verify_witness().is_err());
+}
+
+#[tokio::test]
+async fn memory_witness_projection() {
+    let backend = ciris_persist::store::MemoryBackend::default();
+    run_projection_assertions(&backend, "memory", true).await;
+}
+
+#[tokio::test]
+async fn sqlite_witness_projection() {
+    let backend = ciris_persist::store::SqliteBackend::open_in_memory()
+        .await
+        .expect("open sqlite");
+    backend
+        .run_migrations()
+        .await
+        .expect("sqlite migrations (incl. V085)");
+    run_projection_assertions(&backend, "sqlite", true).await;
+}
+
+#[tokio::test]
+async fn postgres_witness_projection() {
+    let Some(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL").ok() else {
+        eprintln!("postgres_witness_projection skipped: CIRIS_PERSIST_TEST_PG_URL unset");
+        return;
+    };
+    let backend = ciris_persist::store::PostgresBackend::connect(&dsn)
+        .await
+        .expect("connect postgres");
+    backend
+        .run_migrations()
+        .await
+        .expect("pg migrations (incl. V085)");
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    // Shared database — skip the all-peers sweep (other runs' peers).
+    run_projection_assertions(&backend, &suffix, false).await;
 }
 
 /// (d) compare_witnesses Equivocation → hard_case emitted, both witnesses
