@@ -5,6 +5,18 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [16.0.1] — 2026-07-12 — verify 10.1.1 re-pin (mesh coherence; loader-callback fix is ffi-crate-only)
+
+- **`ciris-verify` 10.1.0 → 10.1.1** (all six Rust git-tag pins). verify 10.1.1
+  (CIRISVerify#197) deletes the `DllMain`/dyld library constructors from
+  `ciris-verify-ffi` (a network round-trip under the Windows loader lock hung
+  Python imports on the CIRISServer#232 fold; the macOS twin removed on
+  principle) + adds the source-level no-loader-callbacks CI guard. **Persist
+  links `verify-core`/`keyring`/`crypto`, NOT the ffi crate** — our wheel never
+  carried the constructor, so this is a functional no-op for persist; pure mesh
+  coherence with the server fold line. `version = "10"` + pyproject
+  `>=10.0.0,<11` already cover it; only the git tags flip.
+
 ## [16.0.0] — 2026-07-12 — the CC 1.0-final holistic cut: full key lifecycle wire-safe + trust-root rotation + the four conformance-evidence gaps + the R9 residual — BREAKING
 
 One coordinated cut (operator-directed: no incremental releases) closing everything
