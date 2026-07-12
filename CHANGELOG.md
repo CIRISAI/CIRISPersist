@@ -5,6 +5,18 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [15.1.2] — 2026-07-12 — verify 9.0.2 re-pin (mesh coherence; build-only upstream)
+
+- **`ciris-verify` 9.0.1 → 9.0.2** (all six Rust git-tag pins). verify 9.0.2
+  (CIRISVerify#189) adds `ciris_verify_ffi_link_anchor()` — one `#[used]`
+  reference that keeps all 84 `ciris_verify_*` symbols from dead-stripping out of
+  `ciris_server._native.so` when ciris-server bundles the verify FFI rlib (the
+  #187→#189→CIRISServer#232 fold), with a CI drift-guard. **Persist consumes
+  `verify-core`/`keyring`/`crypto`, NOT the ffi crate**, so this is a functional
+  no-op for persist — pure mesh coherence.
+- Drop-in: `version = "9"` (Cargo) + `ciris-verify>=9.0.0,<10` (pyproject) already
+  cover 9.0.2; only the git tags flip. No API/schema change.
+
 ## [15.1.1] — 2026-07-12 — verify 9.0.1 re-pin (mesh coherence; build-only upstream)
 
 - **`ciris-verify` 9.0.0 → 9.0.1** (all six Rust git-tag pins). verify 9.0.1
