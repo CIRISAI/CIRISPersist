@@ -64,3 +64,42 @@ pub async fn consent_role_of(
         .await?
         .and_then(|record| record.consent_role))
 }
+
+/// v16.1.0 (CIRISPersist#389) — the envelope's `dimension` string (the same
+/// axis admission keys on), read straight off the stored
+/// `attestation_envelope`. Shared by the consent folds
+/// ([`resolve_consent_state`](super::FederationDirectory::resolve_consent_state)
+/// / [`resolve_scoped_consent`](super::FederationDirectory::resolve_scoped_consent)).
+pub fn envelope_dimension(a: &super::Attestation) -> Option<&str> {
+    a.attestation_envelope
+        .get("dimension")
+        .and_then(|v| v.as_str())
+}
+
+/// v16.1.0 (CIRISPersist#389) — THE `consent:state:*` dimension → stance
+/// classifier, the single mapping both consent folds share (so the closed-set
+/// rule cannot drift). A `consent:state:*` value outside the closed set — or
+/// no candidate at all — is `Unspecified` (forward-compat: an unknown stance
+/// value never silently reads as granted).
+pub fn consent_state_of(dimension: Option<&str>) -> super::hard_case::ConsentState {
+    use super::hard_case::ConsentState;
+    match dimension {
+        Some(d) if d.starts_with("consent:state:granted") => ConsentState::Granted,
+        Some(d) if d.starts_with("consent:state:revoked") => ConsentState::Revoked,
+        Some(d) if d.starts_with("consent:state:expired") => ConsentState::Expired,
+        _ => ConsentState::Unspecified,
+    }
+}
+
+/// v16.1.0 (CIRISPersist#389) — does the attestation's envelope name `scope`?
+/// Accepts BOTH envelope shapes: a bare string (`"scope": "view"`) and an
+/// array set (`"scope": ["view", …]`) — the same duality
+/// `delegation_scope_set` reads. A scope-less envelope names nothing
+/// (fail-closed for scoped queries).
+pub fn envelope_names_scope(a: &super::Attestation, scope: &str) -> bool {
+    match a.attestation_envelope.get("scope") {
+        Some(serde_json::Value::String(s)) => s == scope,
+        Some(serde_json::Value::Array(items)) => items.iter().any(|v| v.as_str() == Some(scope)),
+        _ => false,
+    }
+}

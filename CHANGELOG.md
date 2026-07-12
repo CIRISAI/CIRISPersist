@@ -5,6 +5,41 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [16.1.0] — 2026-07-12 — scoped consent resolver (#389) + verify 10.1.1 re-pin
+
+### Added — `resolve_scoped_consent` (#389, CC 4.5.13; the last unblocked backlog item)
+- **`FederationDirectory::resolve_scoped_consent(target, subject, scope,
+  qualifier, now) -> ConsentState`** — the same latest-wins/expiry fold as
+  `resolve_consent_state`, folded ONLY over `consent:state:*` rows whose
+  envelope names the queried `scope` (bare string or array member) and — when
+  `qualifier` is given — a matching `content_class`. The substrate half of
+  CIRISServer's CC 4.5.13 infohazard gate (`resolve_view_consent`,
+  CIRISServer#161): a scoped `view` grant opens the gate and an UNRELATED
+  `consent:state:revoked` (scope-less or different scope) does NOT re-close it
+  — the property the all-dimensions fold cannot express, which forced the
+  server's parallel fold (the DRY-audit H2 finding). One canonical resolver;
+  the server deletes its copy.
+- Shared classifier extracted (`consent::consent_state_of` /
+  `envelope_dimension` / `envelope_names_scope`) — both folds ride ONE
+  closed-set mapping, so the semantics cannot drift. Scope-less rows never
+  match a scoped query (fail-closed toward `Unspecified`, never `Granted`).
+- Default trait method (backend parity inherited); decision-table test:
+  scoped grant opens / scope-less + different-scope revocations don't re-close
+  (while the all-dimensions fold reads Revoked — the divergence, now
+  expressible) / class mismatch → Unspecified / scope-naming revocation
+  re-closes (array shape) / scope-only query.
+
+### Changed — verify 10.1.1 re-pin (mesh coherence; loader-callback fix is ffi-crate-only)
+- **`ciris-verify` 10.1.0 → 10.1.1** (all six Rust git-tag pins). verify 10.1.1
+  (CIRISVerify#197) deletes the `DllMain`/dyld library constructors from
+  `ciris-verify-ffi` (a network round-trip under the Windows loader lock hung
+  Python imports on the CIRISServer#232 fold; the macOS twin removed on
+  principle) + adds the source-level no-loader-callbacks CI guard. **Persist
+  links `verify-core`/`keyring`/`crypto`, NOT the ffi crate** — our wheel never
+  carried the constructor, so this is a functional no-op for persist; pure mesh
+  coherence with the server fold line. `version = "10"` + pyproject
+  `>=10.0.0,<11` already cover it; only the git tags flip.
+
 ## [16.0.0] — 2026-07-12 — the CC 1.0-final holistic cut: full key lifecycle wire-safe + trust-root rotation + the four conformance-evidence gaps + the R9 residual — BREAKING
 
 One coordinated cut (operator-directed: no incremental releases) closing everything

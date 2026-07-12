@@ -3220,30 +3220,66 @@ pub trait FederationDirectory: Send + Sync {
         subject_key_id: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<hard_case::ConsentState, Error> {
-        // `dimension` is the envelope's "dimension" string (the same
-        // axis admission keys on); read it straight off the stored
-        // `attestation_envelope`.
-        fn envelope_dimension(a: &Attestation) -> Option<&str> {
-            a.attestation_envelope
-                .get("dimension")
-                .and_then(|v| v.as_str())
-        }
         let rows = self.list_attestations_for(target_key_id).await?;
         let latest = rows
             .into_iter()
             .filter(|a| a.attesting_key_id == subject_key_id)
-            .filter(|a| envelope_dimension(a).is_some_and(|d| d.starts_with("consent:state:")))
+            .filter(|a| {
+                consent::envelope_dimension(a).is_some_and(|d| d.starts_with("consent:state:"))
+            })
             .filter(|a| a.expires_at.is_none_or(|exp| exp > now))
             .max_by_key(|a| a.asserted_at);
-        Ok(match latest.as_ref().and_then(envelope_dimension) {
-            Some(d) if d.starts_with("consent:state:granted") => hard_case::ConsentState::Granted,
-            Some(d) if d.starts_with("consent:state:revoked") => hard_case::ConsentState::Revoked,
-            Some(d) if d.starts_with("consent:state:expired") => hard_case::ConsentState::Expired,
-            // A consent:state:* whose value isn't in the closed set, or
-            // no candidate at all → unspecified (forward-compat: an
-            // unknown stance value never silently reads as granted).
-            _ => hard_case::ConsentState::Unspecified,
-        })
+        Ok(consent::consent_state_of(
+            latest.as_ref().and_then(consent::envelope_dimension),
+        ))
+    }
+
+    /// v16.1.0 (CIRISPersist#389, CC 4.5.13) — the **scope/class-scoped**
+    /// consent resolver: the same latest-wins/expiry fold as
+    /// [`Self::resolve_consent_state`], but folded ONLY over `consent:state:*`
+    /// rows whose envelope names the given `scope` (bare string or array
+    /// member) and — when `qualifier` is given — a matching `content_class`.
+    ///
+    /// This is the substrate half of the CIRISServer infohazard gate
+    /// (`resolve_view_consent`, CIRISServer#161): the gate needs a grant that
+    /// SPECIFICALLY names `scope:view` + the content class, and an unrelated
+    /// `consent:state:revoked` (different scope, or scope-less) must NOT
+    /// re-close it — which the all-dimensions fold above cannot express. One
+    /// canonical resolver; the server deletes its parallel fold (the DRY-audit
+    /// H2 finding).
+    ///
+    /// Scope-less rows never match a scoped query (fail-closed toward
+    /// `Unspecified`, never toward `Granted` — a broad grant does not open a
+    /// scoped gate; the gate's own policy decides how `Unspecified` composes).
+    async fn resolve_scoped_consent(
+        &self,
+        target_key_id: &str,
+        subject_key_id: &str,
+        scope: &str,
+        qualifier: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<hard_case::ConsentState, Error> {
+        let rows = self.list_attestations_for(target_key_id).await?;
+        let latest = rows
+            .into_iter()
+            .filter(|a| a.attesting_key_id == subject_key_id)
+            .filter(|a| {
+                consent::envelope_dimension(a).is_some_and(|d| d.starts_with("consent:state:"))
+            })
+            .filter(|a| a.expires_at.is_none_or(|exp| exp > now))
+            .filter(|a| consent::envelope_names_scope(a, scope))
+            .filter(|a| match qualifier {
+                Some(q) => a
+                    .attestation_envelope
+                    .get("content_class")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|c| c == q),
+                None => true,
+            })
+            .max_by_key(|a| a.asserted_at);
+        Ok(consent::consent_state_of(
+            latest.as_ref().and_then(consent::envelope_dimension),
+        ))
     }
 
     /// Subject-side revocations (consent observability scan, §8.1.11.3 /
