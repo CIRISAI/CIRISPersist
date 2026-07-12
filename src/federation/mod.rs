@@ -3010,6 +3010,109 @@ pub trait FederationDirectory: Send + Sync {
         Ok(action)
     }
 
+    /// v16 (CIRISPersist#431, CC 6.1.1) — the distinct `peer_id`s with at
+    /// least one witness in the corpus. Feeds the compare-all path of
+    /// [`compare_stored_witnesses`](Self::compare_stored_witnesses).
+    async fn list_witness_peer_ids(&self) -> Result<Vec<String>, Error> {
+        Err(Error::Backend(
+            "list_witness_peer_ids not implemented for this backend".into(),
+        ))
+    }
+
+    /// v16 (CIRISPersist#431, CC 6.1.1) — classify the stored, VERIFIED
+    /// witnesses of `peer_ids` (`None` = every peer in the corpus) into
+    /// the §19.1 verdict. Read-only: unlike
+    /// [`reconcile_peer_witnesses`](Self::reconcile_peer_witnesses) it
+    /// emits nothing (emission happens at put-time reconcile).
+    ///
+    /// Verified-inputs precondition (the `compare_witnesses` contract):
+    /// every corpus row passed the ingest gate by construction — the F-5
+    /// rule stores no unverified rows and no in-band `verified` flag to
+    /// forge. The only way a stored row can fail to round-trip back to
+    /// the verify-core shape is substrate corruption (a malformed root
+    /// column), and that REFUSES with an error rather than comparing —
+    /// an unverifiable row never reaches `compare_witnesses`.
+    async fn compare_stored_witnesses(
+        &self,
+        peer_ids: Option<&[String]>,
+    ) -> Result<crate::witness::WitnessReconcileAction, Error> {
+        let peers: Vec<String> = match peer_ids {
+            Some(ids) => ids.to_vec(),
+            None => self.list_witness_peer_ids().await?,
+        };
+        let mut stored = Vec::new();
+        for peer in &peers {
+            stored.extend(self.list_wholeness_witnesses_for_peer(peer).await?);
+        }
+        Ok(crate::witness::classify_stored(&stored)?)
+    }
+
+    /// v16 (CIRISPersist#431, N4 read-back) — the non-repudiable
+    /// equivocations visible in `peer_id`'s corpus: for each proof, BOTH
+    /// conflicting [`StoredWitness`](crate::witness::StoredWitness) rows
+    /// (retained, never reconciled) plus the recorded
+    /// `hard_case:witness_equivocation` marker (matched by its
+    /// deterministic event_id). Default impl composing
+    /// [`list_wholeness_witnesses_for_peer`](Self::list_wholeness_witnesses_for_peer),
+    /// [`crate::witness::classify_stored`], and
+    /// [`list_hard_case_events`](Self::list_hard_case_events).
+    async fn list_witness_equivocations(
+        &self,
+        peer_id: &str,
+    ) -> Result<Vec<crate::witness::WitnessEquivocationRecord>, Error> {
+        let stored = self.list_wholeness_witnesses_for_peer(peer_id).await?;
+        let action = crate::witness::classify_stored(&stored)?;
+        let crate::witness::WitnessReconcileAction::Equivocation(proofs) = action else {
+            return Ok(Vec::new());
+        };
+        // The recorded markers for this kind, keyed by event_id so each
+        // proof pairs with exactly its own emission (or None pre-emit).
+        let cases = self
+            .list_hard_case_events(hard_case::HardCaseFilter {
+                kind: Some(crate::witness::WITNESS_EQUIVOCATION.to_owned()),
+                since: None,
+            })
+            .await?;
+        let mut records = Vec::with_capacity(proofs.len());
+        for proof in &proofs {
+            let root_a = crate::witness::encode_root_hex(&proof.roots.0);
+            let root_b = crate::witness::encode_root_hex(&proof.roots.1);
+            // The two conflicting corpus rows (match either root at the
+            // proof's (epoch, namespace-set) identity).
+            let mut ns_sorted = proof.claim_namespaces.clone();
+            ns_sorted.sort_unstable();
+            let witnesses: Vec<_> = stored
+                .iter()
+                .filter(|w| {
+                    let mut w_ns = w.claim_namespaces.clone();
+                    w_ns.sort_unstable();
+                    w_ns.dedup();
+                    w.epoch_id == proof.epoch_id
+                        && w_ns == ns_sorted
+                        && (w.merkle_root_hex == root_a || w.merkle_root_hex == root_b)
+                })
+                .cloned()
+                .collect();
+            // The marker's event_id is deterministic on (peer, epoch,
+            // roots) — derive it through `equivocation_hard_case` itself
+            // (the timestamp does not enter the id) so there is exactly
+            // one derivation to keep coherent.
+            let event_id =
+                crate::witness::equivocation_hard_case(proof, chrono::Utc::now()).event_id;
+            let hard_case = cases.iter().find(|c| c.event_id == event_id).cloned();
+            records.push(crate::witness::WitnessEquivocationRecord {
+                peer_id: proof.peer_id.clone(),
+                epoch_id: proof.epoch_id,
+                claim_namespaces: proof.claim_namespaces.clone(),
+                root_a,
+                root_b,
+                witnesses,
+                hard_case,
+            });
+        }
+        Ok(records)
+    }
+
     /// CEG §8.1.11.1 — effective consent stance of subject `s` over
     /// target Contribution `T` at `now`. Default impl over
     /// [`list_attestations_for`](Self::list_attestations_for): the latest

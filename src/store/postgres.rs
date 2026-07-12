@@ -5784,6 +5784,26 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         .transpose()
     }
 
+    async fn list_witness_peer_ids(&self) -> Result<Vec<String>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT DISTINCT peer_id FROM cirislens.wholeness_witness_corpus \
+                 ORDER BY peer_id",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_witness_peer_ids: {e}"))
+            })?;
+        rows.iter()
+            .map(|row| row.safe_get_with("peer_id", crate::federation::Error::Backend))
+            .collect()
+    }
+
     async fn list_consent_revocations(
         &self,
         since: Option<chrono::DateTime<chrono::Utc>>,

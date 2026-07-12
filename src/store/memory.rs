@@ -2906,6 +2906,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .and_then(|b| b.iter().map(|w| w.epoch_id).max()))
     }
 
+    async fn list_witness_peer_ids(&self) -> Result<Vec<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut peers: Vec<String> = state
+            .wholeness_witnesses
+            .iter()
+            .filter(|(_, b)| !b.is_empty())
+            .map(|(p, _)| p.clone())
+            .collect();
+        // Sorted (parity with the SQL backends' ORDER BY).
+        peers.sort_unstable();
+        Ok(peers)
+    }
+
     // ─── v4.10.0 (CIRISPersist#154, CEG 0.8 §0.8.1) — location proofs.
 
     async fn put_location_proof(
@@ -9780,6 +9793,51 @@ mod tests {
             matches!(unsigned, crate::federation::Error::InvalidArgument(ref m) if m.contains("bound-hybrid signature")),
             "unsigned revocation rejected at admission, got {unsigned:?}"
         );
+    }
+
+    /// v16 (CIRISPersist#431) — the compare surface REFUSES a corpus row
+    /// it cannot round-trip back to the verify-core witness shape
+    /// (substrate corruption), rather than classifying over it. This is
+    /// the "never compare an unverifiable witness" assertion: the F-5
+    /// rule means every stored row passed the gate, so the only
+    /// unverifiable row is a corrupted one — and it errors, fail-closed.
+    #[tokio::test]
+    async fn compare_refuses_corrupted_witness_row() {
+        use crate::federation::FederationDirectory;
+        let backend = MemoryBackend::new();
+        // Simulate at-rest corruption: a row whose merkle_root column is
+        // not 64 hex chars (unreachable via put_wholeness_witness — the
+        // gate writes only encode_root_hex output).
+        {
+            let mut st = backend.state.lock().unwrap();
+            st.wholeness_witnesses
+                .entry("corrupt-peer".into())
+                .or_default()
+                .push(crate::witness::StoredWitness {
+                    peer_id: "corrupt-peer".into(),
+                    epoch_id: 1,
+                    claim_namespaces: vec!["scores:medical".into()],
+                    merkle_root_hex: "not-hex".into(), // corrupted column
+                    leaf_count: 1,
+                    observed_at_unix_ms: 1000,
+                    witness_version: 1,
+                    signature: "AA==".into(),
+                    signature_ml_dsa_65: "AA==".into(),
+                    pqc_key_id: "k".into(),
+                });
+        }
+        let peers = ["corrupt-peer".to_string()];
+        let err = backend
+            .compare_stored_witnesses(Some(&peers))
+            .await
+            .expect_err("a corrupted row REFUSES comparison (never a verdict)");
+        assert_eq!(err.kind(), "witness_admit_malformed_root");
+        // The N4 read-back refuses identically.
+        let err = backend
+            .list_witness_equivocations("corrupt-peer")
+            .await
+            .expect_err("read-back refuses the corrupted row too");
+        assert_eq!(err.kind(), "witness_admit_malformed_root");
     }
 
     /// steward_bindings_of: an steward-bound node (live `delegates_to(user →

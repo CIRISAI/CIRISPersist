@@ -5456,6 +5456,19 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("last_witness_epoch_for_peer: {e}")))
     }
 
+    async fn list_witness_peer_ids(&self) -> Result<Vec<String>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        (move || -> Result<Vec<String>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT peer_id FROM wholeness_witness_corpus ORDER BY peer_id",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_witness_peer_ids: {e}")))
+    }
+
     async fn list_consent_revocations(
         &self,
         since: Option<chrono::DateTime<chrono::Utc>>,

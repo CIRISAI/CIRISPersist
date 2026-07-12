@@ -47,10 +47,11 @@ pub use admit::{
     WitnessAdmitError,
 };
 pub use compare::{
-    accept_if_monotonic, classify, classify_stored, equivocation_hard_case, WitnessReconcileAction,
-    QUORUM_MERGE_SUBJECT_KINDS, WITNESS_EQUIVOCATION,
+    accept_if_monotonic, classify, classify_stored, equivocation_hard_case, verdict_json,
+    WitnessEquivocationRecord, WitnessReconcileAction, QUORUM_MERGE_SUBJECT_KINDS,
+    WITNESS_EQUIVOCATION,
 };
 pub use types::{
-    decode_root_hex, encode_root_hex, StoredWitness, WitnessLeaf, WITNESS_CORPUS_K,
+    decode_root_hex, encode_root_hex, StoredWitness, WitnessLeaf, WitnessWire, WITNESS_CORPUS_K,
     WITNESS_VERSION_V1,
 };
