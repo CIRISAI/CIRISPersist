@@ -74,9 +74,10 @@ pub use federation_announcement::{
     DELIVERY_ATTESTATION_DOMAIN, SUBJECT_KIND,
 };
 pub use media_sharing::{
-    extract_key_grant_payload, extract_takedown_notice_payload, KeyGrantPayload, KeyGrantScope,
-    KeyValidityWindow, LegalBasis, MultimediaConfig, MultimediaConfigWire, TakedownNoticePayload,
-    WrapAlgorithm, KEY_GRANT_SUBJECT_KIND, TAKEDOWN_NOTICE_SUBJECT_KIND,
+    extract_key_grant_payload, extract_takedown_notice_payload, require_key_grant_envelope,
+    KeyGrantPayload, KeyGrantScope, KeyValidityWindow, LegalBasis, MultimediaConfig,
+    MultimediaConfigWire, TakedownNoticePayload, WrapAlgorithm, KEY_GRANT_SUBJECT_KIND,
+    TAKEDOWN_NOTICE_SUBJECT_KIND,
 };
 pub use service::{NodeCoreService, RetireKeyGrantsReport};
 #[cfg(any(feature = "postgres", feature = "sqlite"))]

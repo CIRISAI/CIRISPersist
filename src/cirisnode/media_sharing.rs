@@ -778,6 +778,51 @@ pub fn extract_key_grant_payload(
     Ok(Some(typed))
 }
 
+/// v16 (CIRISPersist#432, CC 5.1 `CLM-epoch-keying`) — assert an
+/// envelope IS a `key_grant` Contribution before the dedicated
+/// [`super::NodeCoreService::put_key_grant`] write runs.
+///
+/// Fail-closed admission for the first-class grant emission path:
+///
+///   - `contribution_type` MUST be `proposal` — grants ride the
+///     `proposal` discriminator sub-discriminated by `subject_kind`
+///     (the V011 CHECK pins the 7-value `contribution_type`
+///     vocabulary; there is deliberately NO `key_grant`
+///     contribution_type — see `retire_key_grants` + every existing
+///     grant row).
+///   - `subject.subject` (subject_kind) MUST be
+///     [`KEY_GRANT_SUBJECT_KIND`].
+///   - The payload MUST validate as a [`KeyGrantPayload`] in exactly
+///     one addressing mode (content-addressed XOR
+///     stream/epoch-addressed) via [`extract_key_grant_payload`].
+///
+/// Returns the validated payload so the caller can inspect the
+/// addressing mode without re-decoding. Signature/trust admission is
+/// NOT run here — `put_contribution` (which `put_key_grant`
+/// delegates to) owns that discipline.
+pub fn require_key_grant_envelope(
+    env: &super::types::ContributionEnvelope,
+) -> Result<KeyGrantPayload, Error> {
+    if env.contribution_type != super::types::ContributionType::Proposal {
+        return Err(Error::InvalidArgument(
+            "put_key_grant: key_grant Contributions ride contribution_type=proposal \
+             (sub-discriminated by subject_kind); no other contribution_type is admitted"
+                .into(),
+        ));
+    }
+    let subject_kind = env.subject.subject.as_deref().unwrap_or_default();
+    if subject_kind != KEY_GRANT_SUBJECT_KIND {
+        return Err(Error::InvalidArgument(format!(
+            "put_key_grant: subject_kind must be '{KEY_GRANT_SUBJECT_KIND}', got '{subject_kind}'"
+        )));
+    }
+    extract_key_grant_payload(subject_kind, &env.payload)?.ok_or_else(|| {
+        // Unreachable: subject_kind matched above, so the extractor
+        // either returns Some or errs. Fail closed regardless.
+        Error::Internal("put_key_grant: key_grant payload extraction returned None".into())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,5 +1346,95 @@ mod tests {
         assert!(cfg.is_immediate(LegalBasis::CourtOrder));
         // CEG 0.3 §11.4: the hardcoded helper agrees with the default.
         assert!(LegalBasis::CourtOrder.requires_immediate_eviction());
+    }
+
+    // ── v16 (#432): require_key_grant_envelope (put_key_grant gate) ──
+
+    /// Wrap a payload in a proposal-typed key_grant envelope shell.
+    /// Signature is a dummy — the shape gate deliberately does NOT
+    /// verify signatures (put_contribution owns that).
+    fn fixture_grant_envelope(
+        payload: &KeyGrantPayload,
+    ) -> crate::cirisnode::types::ContributionEnvelope {
+        use crate::cirisnode::types::{Cell, ContributionEnvelope, ContributionType};
+        ContributionEnvelope {
+            contribution_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            contribution_type: ContributionType::Proposal,
+            author_id: "author-1".into(),
+            subject: Cell {
+                domain: "stream-dom".into(),
+                language: "en".into(),
+                subject: Some(KEY_GRANT_SUBJECT_KIND.into()),
+            },
+            payload: serde_json::to_value(payload).unwrap(),
+            witness_set: None,
+            signature: crate::cirisnode::types::HybridSignature {
+                ed25519: "sig".into(),
+                ml_dsa_65: None,
+                signed_at: Utc::now(),
+            },
+            submitted_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn require_key_grant_envelope_admits_stream_epoch_grant() {
+        let payload = fixture_stream_grant();
+        let env = fixture_grant_envelope(&payload);
+        let parsed = require_key_grant_envelope(&env).unwrap();
+        assert_eq!(parsed, payload);
+        assert_eq!(parsed.stream_id.as_deref(), Some("stream-abc"));
+        assert_eq!(parsed.stream_epoch, Some(7));
+    }
+
+    #[test]
+    fn require_key_grant_envelope_admits_content_grant() {
+        let payload = fixture_key_grant();
+        let env = fixture_grant_envelope(&payload);
+        let parsed = require_key_grant_envelope(&env).unwrap();
+        assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn require_key_grant_envelope_rejects_non_proposal_type() {
+        // Grants ride contribution_type=proposal — any other
+        // discriminator is rejected fail-closed even with a valid
+        // key_grant payload + subject_kind.
+        let mut env = fixture_grant_envelope(&fixture_stream_grant());
+        env.contribution_type = crate::cirisnode::types::ContributionType::ModerationEvent;
+        let err = require_key_grant_envelope(&env).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains("contribution_type=proposal")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn require_key_grant_envelope_rejects_wrong_subject_kind() {
+        let mut env = fixture_grant_envelope(&fixture_stream_grant());
+        env.subject.subject = Some("arc_question".into());
+        let err = require_key_grant_envelope(&env).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains("subject_kind")),
+            "got: {err:?}"
+        );
+        // Missing subject_kind entirely is equally rejected.
+        env.subject.subject = None;
+        let err = require_key_grant_envelope(&env).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn require_key_grant_envelope_rejects_malformed_payload() {
+        // A v1 wrap on a stream/epoch grant fails the payload
+        // validator inside the gate (same rule as ingest).
+        let mut payload = fixture_stream_grant();
+        payload.wrap_algorithm = WrapAlgorithm::HpkeRfc9180BaseX25519AesGcm;
+        let env = fixture_grant_envelope(&payload);
+        let err = require_key_grant_envelope(&env).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref m) if m.contains("wrap_algorithm v2")),
+            "got: {err:?}"
+        );
     }
 }
