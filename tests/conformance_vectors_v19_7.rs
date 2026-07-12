@@ -113,6 +113,14 @@ fn aggregation_meta_canonical_bytes_reproduced() {
             n_eff: v["n_eff"]
                 .as_u64()
                 .unwrap_or_else(|| v["source_count"].as_u64().unwrap()) as u32,
+            // §19.7.1.3 (#191/#435): v3 surface from the vector when present;
+            // zero-neutral for the byte-untouched v1/v2 goldens (append-only —
+            // a pre-v3 preimage excludes both fields).
+            max_source_multiplicity: v["max_source_multiplicity"].as_u64().unwrap_or(0) as u32,
+            mass_commitment: v["mass_commitment_hex"]
+                .as_str()
+                .map(|h| hex_decode(h).try_into().expect("32-byte mass root"))
+                .unwrap_or([0u8; 32]),
             member_commitment: mc,
             noise_floor_descriptor: v["noise_floor_descriptor"].as_str().unwrap().to_owned(),
         };
@@ -205,6 +213,13 @@ async fn verify_aggregation_meta_admit_and_reject() {
         n_eff: v["n_eff"]
             .as_u64()
             .unwrap_or_else(|| v["source_count"].as_u64().unwrap()) as u32,
+        // §19.7.1.3 (#191/#435): v3 surface from the vector when present;
+        // zero-neutral for the byte-untouched v1/v2 goldens.
+        max_source_multiplicity: v["max_source_multiplicity"].as_u64().unwrap_or(0) as u32,
+        mass_commitment: v["mass_commitment_hex"]
+            .as_str()
+            .map(|h| hex_decode(h).try_into().expect("32-byte mass root"))
+            .unwrap_or([0u8; 32]),
         member_commitment: member_commitment(&source_ids),
         noise_floor_descriptor: v["noise_floor_descriptor"].as_str().unwrap().to_owned(),
     };
