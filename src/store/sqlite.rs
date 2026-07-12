@@ -17590,6 +17590,150 @@ mod tests {
         );
     }
 
+    /// v16.1.0 (CIRISPersist#389, CC 4.5.13) — the scope/class-scoped consent
+    /// resolver: the fold runs ONLY over rows naming the queried scope (+
+    /// content_class), so a scoped `view` grant opens the infohazard gate and
+    /// an UNRELATED `consent:state:revoked` (scope-less or different scope)
+    /// does NOT re-close it — the property `resolve_consent_state` (all
+    /// dimensions) cannot express and CIRISServer's gate re-implemented.
+    #[tokio::test]
+    async fn resolve_scoped_consent_scoped_fold_ignores_unrelated_revocations() {
+        use crate::federation::{hard_case::ConsentState, FederationDirectory, SignedAttestation};
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for (k, ir) in [("target-2", "prim-t2"), ("subject-2", "prim-s2")] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, ir, k),
+                })
+                .await
+                .unwrap();
+        }
+        let mk = |id: &str, dim: &str, at: &str, extras: serde_json::Value| {
+            let mut a = fed_attestation(id, "subject-2", "target-2", "subject-2");
+            let mut env = serde_json::json!({ "id": id, "dimension": dim });
+            if let (Some(obj), Some(extra)) = (env.as_object_mut(), extras.as_object()) {
+                for (k, v) in extra {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            a.attestation_envelope = env;
+            a.asserted_at = at.parse().unwrap();
+            resign_fed(&mut a); // envelope changed → re-sign (CC 5.3.2.4.3.1)
+            SignedAttestation { attestation: a }
+        };
+        let now = chrono::Utc::now();
+        let scoped = |scope: &str, q: Option<&str>| (scope.to_owned(), q.map(str::to_owned), now);
+
+        // (1) A scoped grant: scope "view" + content_class "medical".
+        backend
+            .put_attestation(mk(
+                "sc-grant",
+                "consent:state:granted:v1",
+                "2026-06-01T00:00:00Z",
+                serde_json::json!({ "scope": "view", "content_class": "medical" }),
+            ))
+            .await
+            .unwrap();
+        let (s, q, _) = scoped("view", Some("medical"));
+        assert_eq!(
+            backend
+                .resolve_scoped_consent("target-2", "subject-2", &s, q.as_deref(), now)
+                .await
+                .unwrap(),
+            ConsentState::Granted,
+            "(1) the scoped grant opens (scope + class match)"
+        );
+
+        // (2) An UNRELATED, NEWER revocation (scope-less) must NOT re-close.
+        backend
+            .put_attestation(mk(
+                "sc-unrelated-revoke",
+                "consent:state:revoked:v1",
+                "2026-06-02T00:00:00Z",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .resolve_scoped_consent("target-2", "subject-2", "view", Some("medical"), now)
+                .await
+                .unwrap(),
+            ConsentState::Granted,
+            "(2) a scope-less revocation does not re-close the scoped gate"
+        );
+        // …while the ALL-dimensions fold reads Revoked (the very divergence
+        // that forced the server's parallel fold — now expressible here).
+        assert_eq!(
+            backend
+                .resolve_consent_state("target-2", "subject-2", now)
+                .await
+                .unwrap(),
+            ConsentState::Revoked
+        );
+
+        // (3) A DIFFERENT-scope revocation also does not re-close.
+        backend
+            .put_attestation(mk(
+                "sc-other-scope-revoke",
+                "consent:state:revoked:v1",
+                "2026-06-03T00:00:00Z",
+                serde_json::json!({ "scope": "replicate" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .resolve_scoped_consent("target-2", "subject-2", "view", Some("medical"), now)
+                .await
+                .unwrap(),
+            ConsentState::Granted,
+            "(3) a different-scope revocation does not re-close"
+        );
+
+        // (4) Qualifier discipline: a different content_class reads Unspecified
+        //     (a broad grant never opens a scoped gate it didn't name).
+        assert_eq!(
+            backend
+                .resolve_scoped_consent("target-2", "subject-2", "view", Some("legal"), now)
+                .await
+                .unwrap(),
+            ConsentState::Unspecified,
+            "(4) class mismatch → Unspecified, never Granted"
+        );
+
+        // (5) A NEWER revocation NAMING the scope (array form) re-closes —
+        //     latest-wins within the scoped fold; bare-vs-array shapes unify.
+        backend
+            .put_attestation(mk(
+                "sc-scoped-revoke",
+                "consent:state:revoked:v1",
+                "2026-06-04T00:00:00Z",
+                serde_json::json!({ "scope": ["view", "export"], "content_class": "medical" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .resolve_scoped_consent("target-2", "subject-2", "view", Some("medical"), now)
+                .await
+                .unwrap(),
+            ConsentState::Revoked,
+            "(5) a revocation naming the scope re-closes (array shape)"
+        );
+
+        // (6) No qualifier = scope-only query: the scoped revoke still wins.
+        assert_eq!(
+            backend
+                .resolve_scoped_consent("target-2", "subject-2", "view", None, now)
+                .await
+                .unwrap(),
+            ConsentState::Revoked,
+            "(6) scope-only query folds all classes of that scope"
+        );
+    }
+
     /// CIRISPersist#146 Ask 3 — hard_case:* emission surface: record +
     /// list with kind/since filters, and idempotency on the deterministic
     /// `event_id` (a re-scan never double-emits).
