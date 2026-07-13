@@ -3242,15 +3242,23 @@ pub trait FederationDirectory: Send + Sync {
     ///
     /// This is the substrate half of the CIRISServer infohazard gate
     /// (`resolve_view_consent`, CIRISServer#161): the gate needs a grant that
-    /// SPECIFICALLY names `scope:view` + the content class, and an unrelated
-    /// `consent:state:revoked` (different scope, or scope-less) must NOT
-    /// re-close it — which the all-dimensions fold above cannot express. One
-    /// canonical resolver; the server deletes its parallel fold (the DRY-audit
-    /// H2 finding).
+    /// SPECIFICALLY names `scope:view` + the content class, and a revocation
+    /// naming a DIFFERENT scope must NOT re-close it — which the
+    /// all-dimensions fold above cannot express. One canonical resolver; the
+    /// server deletes its parallel fold (the DRY-audit H2 finding).
     ///
-    /// Scope-less rows never match a scoped query (fail-closed toward
-    /// `Unspecified`, never toward `Granted` — a broad grant does not open a
-    /// scoped gate; the gate's own policy decides how `Unspecified` composes).
+    /// **Scope-matching is asymmetric on the fail direction (v16.1.1,
+    /// CIRISServer#243):** a scope-less **NON-grant** (`consent:state:revoked`
+    /// / `expired` / any unknown stance) is a **blanket** stance — "I withdraw
+    /// my consent" with nothing qualifying it reads as wholesale withdrawal
+    /// and matches EVERY scoped query (on a CC 4.5.13 child-safety gate the
+    /// safe reading is the right default). A scope-less **grant** matches
+    /// NOTHING — `granted` is the sole fail-open stance, so it must name its
+    /// scope exactly (a broad grant never backs a gate it didn't name). A
+    /// scoped row still matches only its own scope (+ `content_class`), so a
+    /// revocation naming a *different* scope stays unrelated. Latest-wins
+    /// composes naturally: a scoped re-grant NEWER than a blanket revoke
+    /// re-opens that scope.
     async fn resolve_scoped_consent(
         &self,
         target_key_id: &str,
@@ -3267,15 +3275,7 @@ pub trait FederationDirectory: Send + Sync {
                 consent::envelope_dimension(a).is_some_and(|d| d.starts_with("consent:state:"))
             })
             .filter(|a| a.expires_at.is_none_or(|exp| exp > now))
-            .filter(|a| consent::envelope_names_scope(a, scope))
-            .filter(|a| match qualifier {
-                Some(q) => a
-                    .attestation_envelope
-                    .get("content_class")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|c| c == q),
-                None => true,
-            })
+            .filter(|a| consent::matches_scoped_query(a, scope, qualifier))
             .max_by_key(|a| a.asserted_at);
         Ok(consent::consent_state_of(
             latest.as_ref().and_then(consent::envelope_dimension),

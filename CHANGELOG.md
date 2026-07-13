@@ -5,6 +5,33 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [16.1.1] — 2026-07-12 — blanket-revoke semantics for `resolve_scoped_consent` (CIRISServer#243 divergence)
+
+### Changed (behavior fix to the hours-old #389 resolver; no adopters yet)
+- **A scope-less `consent:state:revoked` is BLANKET, not unrelated.** The
+  CIRISServer fold-equivalence review surfaced the one divergence: what a
+  revocation naming no scope means. Decision (operator-confirmed): "I revoke my
+  consent" with nothing qualifying it is wholesale withdrawal — on a CC 4.5.13
+  child-safety gate the fail-closed reading is the right default. The scope
+  filter is now **asymmetric on the fail direction**
+  (`consent::matches_scoped_query`):
+  - a row genuinely naming the queried scope matches (with the `content_class`
+    qualifier when given) — unchanged;
+  - a row naming only OTHER scopes stays unrelated — unchanged;
+  - a **non-grant naming no genuine scope** (absent — or junk: `null` / `[]` /
+    `""` / wrong-typed — `scope` member; `revoked`/`expired`/unknown stances)
+    is **blanket** and matches every scoped query (a malformed revocation never
+    fails toward leaving a gate open);
+  - a **grant naming no genuine scope** matches NOTHING — `granted` is the sole
+    fail-open stance and must name its scope exactly.
+  Latest-wins composes: a scoped re-grant newer than a blanket revoke re-opens
+  that scope. `resolve_scoped_consent` is now a strict superset of the server's
+  fold — the server deletes its copy with zero behaviour change (#243).
+- Tests: predicate unit suite (the five defining cases + the junk-shape /
+  unknown-stance / array-shape fail-closed edges) + the fold decision table
+  extended (blanket re-close, re-grant re-open, bare-grant-never-opens, expiry,
+  cross-subject isolation).
+
 ## [16.1.0] — 2026-07-12 — scoped consent resolver (#389) + verify 10.1.1 re-pin
 
 ### Added — `resolve_scoped_consent` (#389, CC 4.5.13; the last unblocked backlog item)

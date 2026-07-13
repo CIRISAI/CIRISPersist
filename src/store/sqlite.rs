@@ -17590,12 +17590,14 @@ mod tests {
         );
     }
 
-    /// v16.1.0 (CIRISPersist#389, CC 4.5.13) — the scope/class-scoped consent
-    /// resolver: the fold runs ONLY over rows naming the queried scope (+
-    /// content_class), so a scoped `view` grant opens the infohazard gate and
-    /// an UNRELATED `consent:state:revoked` (scope-less or different scope)
-    /// does NOT re-close it — the property `resolve_consent_state` (all
-    /// dimensions) cannot express and CIRISServer's gate re-implemented.
+    /// v16.1.0/#389 + v16.1.1 blanket semantics (CIRISServer#243) — the
+    /// scope/class-scoped consent resolver, asymmetric on the fail direction:
+    /// a scoped `view` grant opens the infohazard gate; a revocation naming a
+    /// DIFFERENT scope does not re-close (unrelated); a SCOPE-LESS revocation
+    /// is BLANKET (wholesale withdrawal — re-closes every scoped gate, the
+    /// CC 4.5.13 fail-closed reading); a scope-less GRANT matches nothing
+    /// (`granted` is the sole fail-open stance and must name its scope); and a
+    /// scoped re-grant newer than a blanket revoke re-opens (latest-wins).
     #[tokio::test]
     async fn resolve_scoped_consent_scoped_fold_ignores_unrelated_revocations() {
         use crate::federation::{hard_case::ConsentState, FederationDirectory, SignedAttestation};
@@ -17645,10 +17647,12 @@ mod tests {
             "(1) the scoped grant opens (scope + class match)"
         );
 
-        // (2) An UNRELATED, NEWER revocation (scope-less) must NOT re-close.
+        // (2) A NEWER SCOPE-LESS revocation is BLANKET — wholesale withdrawal
+        //     re-closes the scoped gate (v16.1.1, the CC 4.5.13 fail-closed
+        //     reading; agrees with the all-dimensions fold on this case).
         backend
             .put_attestation(mk(
-                "sc-unrelated-revoke",
+                "sc-blanket-revoke",
                 "consent:state:revoked:v1",
                 "2026-06-02T00:00:00Z",
                 serde_json::json!({}),
@@ -17660,17 +17664,58 @@ mod tests {
                 .resolve_scoped_consent("target-2", "subject-2", "view", Some("medical"), now)
                 .await
                 .unwrap(),
-            ConsentState::Granted,
-            "(2) a scope-less revocation does not re-close the scoped gate"
+            ConsentState::Revoked,
+            "(2) a scope-less revocation is BLANKET and re-closes every scoped gate"
         );
-        // …while the ALL-dimensions fold reads Revoked (the very divergence
-        // that forced the server's parallel fold — now expressible here).
         assert_eq!(
             backend
                 .resolve_consent_state("target-2", "subject-2", now)
                 .await
                 .unwrap(),
-            ConsentState::Revoked
+            ConsentState::Revoked,
+            "(2) the all-dimensions fold agrees on the blanket case"
+        );
+
+        // (2b) A SCOPED RE-GRANT newer than the blanket revoke re-opens that
+        //      scope (latest-wins composes: revoke-then-re-grant works).
+        backend
+            .put_attestation(mk(
+                "sc-regrant",
+                "consent:state:granted:v1",
+                "2026-06-02T12:00:00Z",
+                serde_json::json!({ "scope": "view", "content_class": "medical" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .resolve_scoped_consent("target-2", "subject-2", "view", Some("medical"), now)
+                .await
+                .unwrap(),
+            ConsentState::Granted,
+            "(2b) a scoped re-grant newer than the blanket revoke re-opens"
+        );
+
+        // (2c) A scope-less GRANT matches NOTHING — `granted` is the sole
+        //      fail-open stance and must name its scope exactly.
+        backend
+            .put_attestation(mk(
+                "sc-bare-grant",
+                "consent:state:granted:v1",
+                "2026-06-02T13:00:00Z",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .resolve_scoped_consent("target-2", "subject-2", "export", None, now)
+                .await
+                .unwrap(),
+            // The blanket revoke (06-02T00) is the latest matching row for the
+            // never-granted `export` scope — never the bare grant.
+            ConsentState::Revoked,
+            "(2c) a bare consent:state:granted never backs a scoped gate"
         );
 
         // (3) A DIFFERENT-scope revocation also does not re-close.
@@ -17692,15 +17737,18 @@ mod tests {
             "(3) a different-scope revocation does not re-close"
         );
 
-        // (4) Qualifier discipline: a different content_class reads Unspecified
-        //     (a broad grant never opens a scoped gate it didn't name).
+        // (4) Qualifier discipline: a different content_class never sees the
+        //     medical-scoped grant — its latest matching row is the BLANKET
+        //     revoke (which covers all classes by construction) → Revoked.
+        //     Never Granted: a grant can only back the exact (scope, class) it
+        //     names.
         assert_eq!(
             backend
                 .resolve_scoped_consent("target-2", "subject-2", "view", Some("legal"), now)
                 .await
                 .unwrap(),
-            ConsentState::Unspecified,
-            "(4) class mismatch → Unspecified, never Granted"
+            ConsentState::Revoked,
+            "(4) class mismatch never reads the scoped grant (blanket revoke wins)"
         );
 
         // (5) A NEWER revocation NAMING the scope (array form) re-closes —
@@ -17731,6 +17779,71 @@ mod tests {
                 .unwrap(),
             ConsentState::Revoked,
             "(6) scope-only query folds all classes of that scope"
+        );
+
+        // (7) EXPIRY: an expires_at in the past drops the row from the fold —
+        //     the latest LIVE row wins. A newer-but-expired scoped grant does
+        //     not re-open over the (5) scoped revoke.
+        let mut expired_grant =
+            fed_attestation("sc-expired-grant", "subject-2", "target-2", "subject-2");
+        expired_grant.attestation_envelope = serde_json::json!({
+            "id": "sc-expired-grant", "dimension": "consent:state:granted:v1",
+            "scope": "view", "content_class": "medical",
+        });
+        expired_grant.asserted_at = "2026-06-05T00:00:00Z".parse().unwrap();
+        expired_grant.expires_at = Some(now - chrono::Duration::hours(1));
+        resign_fed(&mut expired_grant);
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: expired_grant,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .resolve_scoped_consent("target-2", "subject-2", "view", Some("medical"), now)
+                .await
+                .unwrap(),
+            ConsentState::Revoked,
+            "(7) an expired scoped grant never re-opens"
+        );
+
+        // (8) CROSS-SUBJECT isolation: another subject's blanket revoke on the
+        //     same target does not touch subject-2's stance, and the OTHER
+        //     subject's own scoped query reads their blanket revoke.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("subject-3", "prim-s3", "subject-3"),
+            })
+            .await
+            .unwrap();
+        let mut s3_blanket = fed_attestation("sc-s3-blanket", "subject-3", "target-2", "subject-3");
+        s3_blanket.attestation_envelope = serde_json::json!({
+            "id": "sc-s3-blanket", "dimension": "consent:state:revoked:v1",
+        });
+        s3_blanket.asserted_at = "2026-06-06T00:00:00Z".parse().unwrap();
+        resign_fed(&mut s3_blanket);
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: s3_blanket,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .resolve_scoped_consent("target-2", "subject-3", "view", None, now)
+                .await
+                .unwrap(),
+            ConsentState::Revoked,
+            "(8) the other subject's own query reads their blanket revoke"
+        );
+        assert_eq!(
+            backend
+                .resolve_scoped_consent("target-2", "subject-2", "view", Some("medical"), now)
+                .await
+                .unwrap(),
+            ConsentState::Revoked,
+            "(8) subject-2's stance is untouched by subject-3's rows (still the (5) revoke)"
         );
     }
 
