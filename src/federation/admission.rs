@@ -1617,6 +1617,178 @@ pub async fn verify_signed_identity_occurrence_revocation(
     .await
 }
 
+/// v16.2.0 (CIRISPersist#443) — the SIGNED transport-destination admission
+/// gate: the route-plane mirror of
+/// [`verify_signed_identity_occurrence_revocation`], closing the
+/// **route-hijack confused deputy** (CIRISEdge#336): before this the
+/// replication plane applied a bare unsigned `TransportDestination` through
+/// the plain local upsert, so any cohort node could overwrite the durable
+/// route — with an attacker-chosen `binding_provenance: Rooted` — for any
+/// key_id. Fail-secure; called by every `put_signed_transport_destination`
+/// (all three backends — one gate) BEFORE any write.
+///
+/// **Authority is `signed_envelope`, never the sender's typed projection** —
+/// the #418 discipline verbatim. `binding_provenance` in particular is read
+/// ONLY from the verified envelope. Verifies, each fail-closed:
+/// 1. the envelope carries `occurrence_key_id` / `transport_kind` /
+///    `destination` / `asserted_at` / `epoch` (+ optional `retired_at`,
+///    transport pubkeys, `binding_provenance`), and the typed projection
+///    persist will store EQUALS them (a divergent projection is the hijack
+///    reopening). `last_seen_at` is advisory liveness, not signed material.
+/// 2. the detached hybrid signature over `JCS(signed_envelope)` verifies at
+///    threshold **1-of-1** against the PINNED federation pubkeys of
+///    `attesting_key_id` ([`verify_threshold_signatures`] — RequireHybrid; a
+///    classical-only route assertion does not count);
+/// 3. `signer_acts_for`: the signer IS the route's `occurrence_key_id` or a
+///    key bound as an occurrence of it ([`check_signer_acts_for`]) — a peer
+///    cannot assert (or retire) a victim's route with its own unrelated key.
+///
+/// NOT feature-gated: backend-agnostic, and the MemoryBackend calls it (the
+/// #418 cfg lesson).
+///
+/// [`verify_threshold_signatures`]: ciris_verify_core::threshold::verify_threshold_signatures
+pub async fn verify_signed_transport_destination(
+    directory: &dyn super::FederationDirectory,
+    signed: &crate::federation::self_at_login::SignedTransportDestination,
+) -> Result<(), Error> {
+    use ciris_verify_core::threshold::{
+        verify_threshold_signatures, ThresholdMember, ThresholdSignature,
+    };
+
+    let row = &signed.transport_destination;
+    let env = &signed.signed_envelope;
+
+    // (1) Authoritative fields FROM the signed envelope; the typed projection
+    // must equal them (the signature covers only the envelope).
+    let str_field = |k: &str| -> Result<String, Error> {
+        env.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned())
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "signed transport_destination envelope missing string field `{k}`"
+                ))
+            })
+    };
+    let parse_ts = |k: &str, s: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                Error::InvalidArgument(format!(
+                    "signed transport_destination envelope `{k}` not RFC-3339: {e}"
+                ))
+            })
+    };
+    // Optional string field: absent/null ⇒ None; a non-string is malformed.
+    let opt_str_field = |k: &str| -> Result<Option<String>, Error> {
+        match env.get(k) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(Error::InvalidArgument(format!(
+                "signed transport_destination envelope `{k}` must be a string"
+            ))),
+        }
+    };
+    let diverges = |what: &str| {
+        Error::InvalidArgument(format!(
+            "signed transport_destination: typed {what} diverges from the signed envelope \
+             (rejected)"
+        ))
+    };
+    if str_field("occurrence_key_id")? != row.occurrence_key_id {
+        return Err(diverges("occurrence_key_id"));
+    }
+    if str_field("transport_kind")? != row.transport_kind {
+        return Err(diverges("transport_kind"));
+    }
+    if str_field("destination")? != row.destination {
+        return Err(diverges("destination"));
+    }
+    if parse_ts("asserted_at", &str_field("asserted_at")?)? != row.asserted_at {
+        return Err(diverges("asserted_at"));
+    }
+    // `epoch` is the anti-rollback clock — REQUIRED in the envelope (a
+    // serde-default 0 in the typed projection must not be silently trusted).
+    let env_epoch = env.get("epoch").and_then(|v| v.as_u64()).ok_or_else(|| {
+        Error::InvalidArgument(
+            "signed transport_destination envelope missing unsigned-integer field `epoch`".into(),
+        )
+    })?;
+    if env_epoch != row.epoch {
+        return Err(diverges("epoch"));
+    }
+    // `retired_at` is the tombstone — a divergence here is a resurrection
+    // (or fabricated retirement) attack.
+    let env_retired = match opt_str_field("retired_at")? {
+        Some(s) => Some(parse_ts("retired_at", &s)?),
+        None => None,
+    };
+    if env_retired != row.retired_at {
+        return Err(diverges("retired_at"));
+    }
+    if opt_str_field("transport_ed25519_pubkey_base64")? != row.transport_ed25519_pubkey_base64 {
+        return Err(diverges("transport_ed25519_pubkey_base64"));
+    }
+    if opt_str_field("transport_x25519_pubkey_base64")? != row.transport_x25519_pubkey_base64 {
+        return Err(diverges("transport_x25519_pubkey_base64"));
+    }
+    // `binding_provenance` comes ONLY from the verified envelope (the AV-42 /
+    // #336 hijack asserted `Rooted` on an unauthenticated wire field). An
+    // absent/unknown token reads `Rooted` per the V100 back-compat rule, so a
+    // typed `Advisory` with an envelope that omits the field DIVERGES —
+    // fail-closed either way.
+    let env_provenance = crate::federation::self_at_login::BindingProvenance::from_token(
+        opt_str_field("binding_provenance")?.as_deref(),
+    );
+    if env_provenance != row.binding_provenance {
+        return Err(diverges("binding_provenance"));
+    }
+
+    // (2) Hybrid signature over JCS(signed_envelope) against the PINNED
+    // federation pubkeys of the claimed signer, threshold 1-of-1.
+    let Some(signer_key) = directory
+        .lookup_public_key(&signed.attesting_key_id)
+        .await?
+    else {
+        return Err(Error::SignatureInvalid(format!(
+            "signed transport_destination: attesting_key_id {} is not a registered federation key",
+            signed.attesting_key_id
+        )));
+    };
+    let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
+        Error::InvalidArgument(format!("signed transport_destination canonicalize: {e}"))
+    })?;
+    let members = [ThresholdMember {
+        member_id: signer_key.key_id.clone(),
+        ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
+        mldsa65_public_key_base64: signer_key.pubkey_ml_dsa_65_base64.clone(),
+        role: None,
+    }];
+    let sigs = [ThresholdSignature {
+        member_id: signed.attesting_key_id.clone(),
+        ed25519_signature_base64: signed.signature.ed25519_signature_base64.clone(),
+        mldsa65_signature_base64: signed.signature.mldsa65_signature_base64.clone(),
+    }];
+    if verify_threshold_signatures(&bytes, &members, &sigs, 1).is_err() {
+        return Err(Error::SignatureInvalid(format!(
+            "signed transport_destination for ({}, {}) not authentic (hybrid 1-of-1 over \
+             JCS(envelope) failed against the pinned key of {})",
+            row.occurrence_key_id, row.transport_kind, signed.attesting_key_id
+        )));
+    }
+
+    // (3) signer_acts_for — THE shared check ([`check_signer_acts_for`]),
+    // with the route's `occurrence_key_id` as the subject: the signer is the
+    // route's own key, or a key bound as an occurrence of it.
+    check_signer_acts_for(
+        directory,
+        &signed.attesting_key_id,
+        &row.occurrence_key_id,
+        "transport_destination",
+    )
+    .await
+}
+
 /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
 /// §3.3.2 R1) — admission-gate validation of the producer-side
 /// `observed_region` field on a revocation.

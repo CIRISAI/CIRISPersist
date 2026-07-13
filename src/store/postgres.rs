@@ -2056,10 +2056,14 @@ impl Backend for PostgresBackend {
 /// x25519 (#411) transport-tier pubkey mapping cannot drift. Column order
 /// matches both SELECTs (0..=6).
 fn pg_row_to_transport_destination(
-    row: tokio_postgres::Row,
+    row: &tokio_postgres::Row,
 ) -> Result<crate::federation::TransportDestination, crate::federation::Error> {
     use crate::federation::Error as FErr;
     let provenance_token: Option<String> = row.safe_get_with(7, FErr::Backend)?;
+    let epoch_raw: i64 = row.safe_get_with(8, FErr::Backend)?;
+    let epoch = u64::try_from(epoch_raw).map_err(|_| {
+        FErr::Backend("transport_destinations.epoch negative (decode refused)".into())
+    })?;
     Ok(crate::federation::TransportDestination {
         occurrence_key_id: row.safe_get_with(0, FErr::Backend)?,
         transport_kind: row.safe_get_with(1, FErr::Backend)?,
@@ -2071,6 +2075,34 @@ fn pg_row_to_transport_destination(
         binding_provenance: crate::federation::self_at_login::BindingProvenance::from_token(
             provenance_token.as_deref(),
         ),
+        epoch,
+        retired_at: row.safe_get_with(9, FErr::Backend)?,
+    })
+}
+
+/// v16.2.0 (#443 replication read) — Postgres row →
+/// [`crate::federation::SignedTransportDestination`]. Columns 0..=9 are the
+/// shared typed decode; 10..=12 the byte-exact signature container (TEXT —
+/// JSONB would not preserve the producer's serialization). Callers gate on
+/// non-NULL sig columns.
+fn pg_row_to_signed_transport_destination(
+    row: &tokio_postgres::Row,
+) -> Result<crate::federation::SignedTransportDestination, crate::federation::Error> {
+    use crate::federation::Error as FErr;
+    let transport_destination = pg_row_to_transport_destination(row)?;
+    let attesting_key_id: String = row.safe_get_with(10, FErr::Backend)?;
+    let signed_envelope_json: String = row.safe_get_with(11, FErr::Backend)?;
+    let signature_json: String = row.safe_get_with(12, FErr::Backend)?;
+    let signed_envelope: serde_json::Value = serde_json::from_str(&signed_envelope_json)
+        .map_err(|e| FErr::Backend(format!("transport_destinations.signed_envelope: {e}")))?;
+    let signature: ciris_verify_core::transport_binding::TransportBindingSignature =
+        serde_json::from_str(&signature_json)
+            .map_err(|e| FErr::Backend(format!("transport_destinations.signature: {e}")))?;
+    Ok(crate::federation::SignedTransportDestination {
+        transport_destination,
+        attesting_key_id,
+        signed_envelope,
+        signature,
     })
 }
 
@@ -5601,22 +5633,38 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
-        // Idempotent on the composite PK: a re-assert refreshes the
-        // timestamps in place (drop+re-register is the mutation model).
+        // #443 route-table put: keyed on (occ, kind) — `destination` is
+        // payload — and GUARDED monotonic on (epoch, asserted_at)
+        // lexicographic. A stale assertion is a silent no-op. A local
+        // (trusted) put that supersedes a SIGNED row NULLs the signature
+        // columns: they attested the OLD content.
         let provenance_token = destination.binding_provenance.as_str();
+        let epoch = i64::try_from(destination.epoch).map_err(|_| {
+            crate::federation::Error::InvalidArgument(
+                "transport_destination epoch exceeds i64".into(),
+            )
+        })?;
         client
             .execute(
                 "INSERT INTO cirislens.transport_destinations \
                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
                      transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                     binding_provenance) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-                 ON CONFLICT (occurrence_key_id, transport_kind, destination) \
-                 DO UPDATE SET asserted_at = EXCLUDED.asserted_at, \
+                     binding_provenance, epoch, retired_at, \
+                     attesting_key_id, signed_envelope, signature) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, NULL) \
+                 ON CONFLICT (occurrence_key_id, transport_kind) \
+                 DO UPDATE SET destination = EXCLUDED.destination, \
+                    asserted_at = EXCLUDED.asserted_at, \
                     last_seen_at = EXCLUDED.last_seen_at, \
                     transport_ed25519_pubkey_base64 = EXCLUDED.transport_ed25519_pubkey_base64, \
                     transport_x25519_pubkey_base64 = EXCLUDED.transport_x25519_pubkey_base64, \
-                    binding_provenance = EXCLUDED.binding_provenance",
+                    binding_provenance = EXCLUDED.binding_provenance, \
+                    epoch = EXCLUDED.epoch, \
+                    retired_at = EXCLUDED.retired_at, \
+                    attesting_key_id = NULL, signed_envelope = NULL, signature = NULL \
+                 WHERE EXCLUDED.epoch > cirislens.transport_destinations.epoch \
+                    OR (EXCLUDED.epoch = cirislens.transport_destinations.epoch \
+                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at)",
                 &[
                     &destination.occurrence_key_id,
                     &destination.transport_kind,
@@ -5626,6 +5674,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &destination.transport_ed25519_pubkey_base64,
                     &destination.transport_x25519_pubkey_base64,
                     &provenance_token,
+                    &epoch,
+                    &destination.retired_at,
                 ],
             )
             .await
@@ -5633,6 +5683,120 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::Error::Backend(format!("put_transport_destination: {e}"))
             })?;
         Ok(())
+    }
+
+    async fn put_signed_transport_destination(
+        &self,
+        signed: &crate::federation::SignedTransportDestination,
+    ) -> Result<crate::federation::TransportDestinationApplyOutcome, crate::federation::Error> {
+        use crate::federation::TransportDestinationApplyOutcome as Outcome;
+        // #443 — the admission gate BEFORE any write (one gate, all backends).
+        crate::federation::admission::verify_signed_transport_destination(self, signed).await?;
+        let d = &signed.transport_destination;
+        let envelope_json = serde_json::to_string(&signed.signed_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
+        let signature_json = serde_json::to_string(&signed.signature)
+            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
+        let epoch = i64::try_from(d.epoch).map_err(|_| {
+            crate::federation::Error::InvalidArgument(
+                "transport_destination epoch exceeds i64".into(),
+            )
+        })?;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Classify against the current row (retired rows INCLUDED — the
+        // tombstone must keep winning) ...
+        let existing = client
+            .query_opt(
+                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, \
+                    last_seen_at, transport_ed25519_pubkey_base64, \
+                    transport_x25519_pubkey_base64, binding_provenance, epoch, retired_at \
+                 FROM cirislens.transport_destinations \
+                 WHERE occurrence_key_id = $1 AND transport_kind = $2",
+                &[&d.occurrence_key_id, &d.transport_kind],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("put_signed_transport_destination: {e}"))
+            })?
+            .map(|row| pg_row_to_transport_destination(&row))
+            .transpose()?;
+        let fresh = match existing {
+            Some(ref ex) if *ex == *d => return Ok(Outcome::Unchanged),
+            Some(ref ex) if (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) => {
+                return Ok(Outcome::Refused {
+                    reason: format!(
+                        "incoming (epoch {}, asserted_at {}) does not supersede stored \
+                         (epoch {}, asserted_at {})",
+                        d.epoch,
+                        d.asserted_at.to_rfc3339(),
+                        ex.epoch,
+                        ex.asserted_at.to_rfc3339()
+                    ),
+                })
+            }
+            Some(_) => false,
+            None => true,
+        };
+        // ... then write with the SAME guard in the SQL (defense in depth: a
+        // concurrent supersession between plan and act loses monotonically).
+        let n = client
+            .execute(
+                "INSERT INTO cirislens.transport_destinations \
+                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                     binding_provenance, epoch, retired_at, \
+                     attesting_key_id, signed_envelope, signature) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                 ON CONFLICT (occurrence_key_id, transport_kind) \
+                 DO UPDATE SET destination = EXCLUDED.destination, \
+                    asserted_at = EXCLUDED.asserted_at, \
+                    last_seen_at = EXCLUDED.last_seen_at, \
+                    transport_ed25519_pubkey_base64 = EXCLUDED.transport_ed25519_pubkey_base64, \
+                    transport_x25519_pubkey_base64 = EXCLUDED.transport_x25519_pubkey_base64, \
+                    binding_provenance = EXCLUDED.binding_provenance, \
+                    epoch = EXCLUDED.epoch, \
+                    retired_at = EXCLUDED.retired_at, \
+                    attesting_key_id = EXCLUDED.attesting_key_id, \
+                    signed_envelope = EXCLUDED.signed_envelope, \
+                    signature = EXCLUDED.signature \
+                 WHERE EXCLUDED.epoch > cirislens.transport_destinations.epoch \
+                    OR (EXCLUDED.epoch = cirislens.transport_destinations.epoch \
+                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at)",
+                &[
+                    &d.occurrence_key_id,
+                    &d.transport_kind,
+                    &d.destination,
+                    &d.asserted_at,
+                    &d.last_seen_at,
+                    &d.transport_ed25519_pubkey_base64,
+                    &d.transport_x25519_pubkey_base64,
+                    &d.binding_provenance.as_str(),
+                    &epoch,
+                    &d.retired_at,
+                    &signed.attesting_key_id,
+                    &envelope_json,
+                    &signature_json,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("put_signed_transport_destination: {e}"))
+            })?;
+        if n == 0 {
+            // Lost a race to a concurrent (newer) write — fail-closed,
+            // re-offerable (the replication-plane Conflict rule).
+            return Ok(Outcome::Refused {
+                reason: "superseded concurrently by a newer record".into(),
+            });
+        }
+        Ok(if fresh {
+            Outcome::Inserted
+        } else {
+            Outcome::Superseded
+        })
     }
 
     async fn list_transport_destinations_for(
@@ -5643,21 +5807,58 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // #443 — live routes only: retired tombstones are excluded from
+        // every list_* read (they still gossip via the signed read).
         let rows = client
             .query(
                 "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                    binding_provenance \
-                 FROM cirislens.transport_destinations WHERE occurrence_key_id = $1 \
-                 ORDER BY transport_kind, destination",
+                    binding_provenance, epoch, retired_at \
+                 FROM cirislens.transport_destinations \
+                 WHERE occurrence_key_id = $1 AND retired_at IS NULL \
+                 ORDER BY transport_kind",
                 &[&occurrence_key_id],
             )
             .await
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_transport_destinations_for: {e}"))
             })?;
-        rows.into_iter()
-            .map(pg_row_to_transport_destination)
+        rows.iter().map(pg_row_to_transport_destination).collect()
+    }
+
+    async fn list_signed_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::SignedTransportDestination>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // #443 replication read: only signed-put rows carry the signature
+        // container; trusted-local rows (NULL sig cols) are omitted.
+        // RETIRED rows are INCLUDED — tombstones must gossip.
+        let rows = client
+            .query(
+                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                    binding_provenance, epoch, retired_at, \
+                    attesting_key_id, signed_envelope, signature \
+                 FROM cirislens.transport_destinations \
+                 WHERE occurrence_key_id = $1 \
+                   AND attesting_key_id IS NOT NULL \
+                   AND signed_envelope IS NOT NULL \
+                   AND signature IS NOT NULL \
+                 ORDER BY transport_kind",
+                &[&occurrence_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_signed_transport_destinations_for: {e}"
+                ))
+            })?;
+        rows.iter()
+            .map(pg_row_to_signed_transport_destination)
             .collect()
     }
 
@@ -5668,22 +5869,23 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // #443 — live routes only, ordered by the route key (deterministic
+        // restore; one row per (occ, kind) is structural).
         let rows = client
             .query(
                 "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                    binding_provenance \
+                    binding_provenance, epoch, retired_at \
                  FROM cirislens.transport_destinations \
-                 ORDER BY occurrence_key_id, transport_kind, destination",
+                 WHERE retired_at IS NULL \
+                 ORDER BY occurrence_key_id, transport_kind",
                 &[],
             )
             .await
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("list_all_transport_destinations: {e}"))
             })?;
-        rows.into_iter()
-            .map(pg_row_to_transport_destination)
-            .collect()
+        rows.iter().map(pg_row_to_transport_destination).collect()
     }
 
     async fn list_transport_destinations_by_destination(
@@ -5694,12 +5896,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get_client()
             .await
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // #443 — live routes only.
         let rows = client
             .query(
                 "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                    binding_provenance \
-                 FROM cirislens.transport_destinations WHERE destination = $1 \
+                    binding_provenance, epoch, retired_at \
+                 FROM cirislens.transport_destinations \
+                 WHERE destination = $1 AND retired_at IS NULL \
                  ORDER BY occurrence_key_id, transport_kind",
                 &[&destination],
             )
@@ -5709,9 +5913,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     "list_transport_destinations_by_destination: {e}"
                 ))
             })?;
-        rows.into_iter()
-            .map(pg_row_to_transport_destination)
-            .collect()
+        rows.iter().map(pg_row_to_transport_destination).collect()
     }
 
     async fn remove_transport_destination(
@@ -16379,6 +16581,44 @@ mod tests {
         let suffix = uuid_like();
         crate::federation::accord_quorum::test_fixtures::exercise_accord_storage(&backend, &suffix)
             .await;
+    }
+
+    /// #443 — the transport route-table (epoch, asserted_at) monotonic-guard
+    /// matrix on postgres. Shares the assertion body with the memory + sqlite
+    /// parity tests; the unique suffix scopes fixtures in the shared test DB.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn transport_route_guard_matrix_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::self_at_login::test_support::run_transport_route_guard_matrix(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
+    /// #443 — the authenticated route apply + signed tombstone matrix (real
+    /// hybrid crypto) on postgres. Shares the assertion body with the memory
+    /// + sqlite parity tests.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn signed_transport_route_matrix_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::self_at_login::test_support::run_signed_transport_route_matrix(
+            &backend, &suffix,
+        )
+        .await;
     }
 
     /// Smoke: connect + run_migrations. Skipped if no test DB is

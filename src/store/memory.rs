@@ -163,11 +163,27 @@ struct State {
     federation_partner_record_sigs:
         HashMap<String, (Vec<ciris_verify_core::threshold::ThresholdSignature>, usize)>,
     /// v6.5.0 (CIRISPersist#183, CEG §5.6.8.8.1) — per-occurrence
-    /// reachability rows, keyed by the composite PK
-    /// `(occurrence_key_id, transport_kind, destination)`. Parity with
-    /// the postgres/sqlite `transport_destinations` table.
-    transport_destinations:
-        HashMap<(String, String, String), crate::federation::TransportDestination>,
+    /// reachability rows. v16.2.0 (#443): keyed by the ROUTE-TABLE PK
+    /// `(occurrence_key_id, transport_kind)` (`destination` is payload — one
+    /// live route per peer per transport), superseded under the
+    /// `(epoch, asserted_at)` monotonic guard. Parity with the
+    /// postgres/sqlite `transport_destinations` table (V105).
+    transport_destinations: HashMap<(String, String), crate::federation::TransportDestination>,
+    /// v16.2.0 (CIRISPersist#443, replication read) — signature container for
+    /// SIGNED-put routes, keyed like `transport_destinations`
+    /// (`(attesting_key_id, signed_envelope, signature)`). Absent for
+    /// trusted-local rows (and REMOVED when a local put supersedes a signed
+    /// row — the container attested the old content), so
+    /// `list_signed_transport_destinations_for` returns only what was
+    /// signed-put. Mirror of `federation_identity_occurrence_sigs`.
+    transport_destination_sigs: HashMap<
+        (String, String),
+        (
+            String,
+            serde_json::Value,
+            ciris_verify_core::transport_binding::TransportBindingSignature,
+        ),
+    >,
     /// v6.7.0 (CIRISPersist#146 Ask 3 / #161 Ask 5, CEG §7.7/§8.1.11.3) —
     /// the `hard_case:*` emission surface, keyed by the deterministic
     /// `event_id` (idempotent insert = no-op on conflict). Parity with the
@@ -278,6 +294,7 @@ impl Default for MemoryBackend {
                 federation_partner_record_sigs: HashMap::new(),
                 blackhole_rules: HashMap::new(),
                 transport_destinations: HashMap::new(),
+                transport_destination_sigs: HashMap::new(),
                 federation_hard_case_events: HashMap::new(),
                 fountain_manifests: HashMap::new(),
                 fountain_symbols: HashMap::new(),
@@ -1926,16 +1943,73 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // admit-advisory MUST record it (the routing hint). Trust is composed by
         // the consumer (prefer `Rooted`; content gate CC 6 N1), never a substrate
         // reject. Kept backend-symmetric with the FK-less sqlite/postgres tables.
-        // Idempotent on the composite PK (re-assert refreshes in place).
-        state.transport_destinations.insert(
-            (
-                destination.occurrence_key_id.clone(),
-                destination.transport_kind.clone(),
-                destination.destination.clone(),
-            ),
-            destination.clone(),
+        //
+        // v16.2.0 (#443) — route-table PK (occ, kind) + the (epoch,
+        // asserted_at) monotonic guard: a stale assertion is a silent no-op.
+        // A local put that supersedes a SIGNED row drops the signature
+        // container (it attested the old content) — parity with the
+        // sqlite/postgres NULLing of the signed columns.
+        let key = (
+            destination.occurrence_key_id.clone(),
+            destination.transport_kind.clone(),
         );
+        let applies = state.transport_destinations.get(&key).is_none_or(|ex| {
+            (destination.epoch, destination.asserted_at) > (ex.epoch, ex.asserted_at)
+        });
+        if applies {
+            state.transport_destination_sigs.remove(&key);
+            state
+                .transport_destinations
+                .insert(key, destination.clone());
+        }
         Ok(())
+    }
+
+    async fn put_signed_transport_destination(
+        &self,
+        signed: &crate::federation::SignedTransportDestination,
+    ) -> Result<crate::federation::TransportDestinationApplyOutcome, crate::federation::Error> {
+        use crate::federation::TransportDestinationApplyOutcome as Outcome;
+        // #443 — the admission gate BEFORE any write (before locking; the
+        // gate locks state internally). Backend-symmetric.
+        crate::federation::admission::verify_signed_transport_destination(self, signed).await?;
+        let d = &signed.transport_destination;
+        let mut state = self.state.lock().expect("memory backend lock");
+        let key = (d.occurrence_key_id.clone(), d.transport_kind.clone());
+        let fresh = match state.transport_destinations.get(&key) {
+            Some(ex) if *ex == *d => return Ok(Outcome::Unchanged),
+            Some(ex) if (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) => {
+                return Ok(Outcome::Refused {
+                    reason: format!(
+                        "incoming (epoch {}, asserted_at {}) does not supersede stored \
+                         (epoch {}, asserted_at {})",
+                        d.epoch,
+                        d.asserted_at.to_rfc3339(),
+                        ex.epoch,
+                        ex.asserted_at.to_rfc3339()
+                    ),
+                })
+            }
+            Some(_) => false,
+            None => true,
+        };
+        // Store the signature container in lockstep so the replication read
+        // reconstructs the tuple that was put (mirror of the occurrence /
+        // revocation sig maps).
+        state.transport_destination_sigs.insert(
+            key.clone(),
+            (
+                signed.attesting_key_id.clone(),
+                signed.signed_envelope.clone(),
+                signed.signature.clone(),
+            ),
+        );
+        state.transport_destinations.insert(key, d.clone());
+        Ok(if fresh {
+            Outcome::Inserted
+        } else {
+            Outcome::Superseded
+        })
     }
 
     async fn list_transport_destinations_for(
@@ -1943,16 +2017,46 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         occurrence_key_id: &str,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
+        // #443 — live routes only (retired tombstones excluded).
         let mut rows: Vec<_> = state
             .transport_destinations
             .values()
-            .filter(|d| d.occurrence_key_id == occurrence_key_id)
+            .filter(|d| d.occurrence_key_id == occurrence_key_id && d.retired_at.is_none())
             .cloned()
             .collect();
+        rows.sort_by(|a, b| a.transport_kind.cmp(&b.transport_kind));
+        Ok(rows)
+    }
+
+    async fn list_signed_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::SignedTransportDestination>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        // #443 replication read: join each route with its stored signature
+        // container; trusted-local rows (no sig entry) are omitted. RETIRED
+        // rows are INCLUDED — tombstones must gossip.
+        let mut rows: Vec<crate::federation::SignedTransportDestination> = state
+            .transport_destinations
+            .iter()
+            .filter(|((occ, _), _)| occ == occurrence_key_id)
+            .filter_map(|(key, td)| {
+                state.transport_destination_sigs.get(key).map(
+                    |(attesting_key_id, signed_envelope, signature)| {
+                        crate::federation::SignedTransportDestination {
+                            transport_destination: td.clone(),
+                            attesting_key_id: attesting_key_id.clone(),
+                            signed_envelope: signed_envelope.clone(),
+                            signature: signature.clone(),
+                        }
+                    },
+                )
+            })
+            .collect();
         rows.sort_by(|a, b| {
-            a.transport_kind
-                .cmp(&b.transport_kind)
-                .then_with(|| a.destination.cmp(&b.destination))
+            a.transport_destination
+                .transport_kind
+                .cmp(&b.transport_destination.transport_kind)
         });
         Ok(rows)
     }
@@ -1961,12 +2065,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<_> = state.transport_destinations.values().cloned().collect();
+        // #443 — live routes only, ordered by the route key (deterministic
+        // restore; one row per (occ, kind) is structural).
+        let mut rows: Vec<_> = state
+            .transport_destinations
+            .values()
+            .filter(|d| d.retired_at.is_none())
+            .cloned()
+            .collect();
         rows.sort_by(|a, b| {
             a.occurrence_key_id
                 .cmp(&b.occurrence_key_id)
                 .then_with(|| a.transport_kind.cmp(&b.transport_kind))
-                .then_with(|| a.destination.cmp(&b.destination))
         });
         Ok(rows)
     }
@@ -1976,10 +2086,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         destination: &str,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
         let state = self.state.lock().expect("memory backend lock");
+        // #443 — live routes only.
         let mut rows: Vec<_> = state
             .transport_destinations
             .values()
-            .filter(|d| d.destination == destination)
+            .filter(|d| d.destination == destination && d.retired_at.is_none())
             .cloned()
             .collect();
         rows.sort_by(|a, b| {
@@ -1997,15 +2108,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         destination: &str,
     ) -> Result<bool, crate::federation::Error> {
         let mut state = self.state.lock().expect("memory backend lock");
-        let removed = state
+        // #443 — local-only DELETE (never replicated; retirement on the mesh
+        // is a signed tombstone put). `destination` still selects: only the
+        // row currently carrying that address is dropped — parity with the
+        // sqlite/postgres `AND destination = ?` DELETE.
+        let key = (occurrence_key_id.to_owned(), transport_kind.to_owned());
+        let matches = state
             .transport_destinations
-            .remove(&(
-                occurrence_key_id.to_owned(),
-                transport_kind.to_owned(),
-                destination.to_owned(),
-            ))
-            .is_some();
-        Ok(removed)
+            .get(&key)
+            .is_some_and(|d| d.destination == destination);
+        if matches {
+            state.transport_destinations.remove(&key);
+            state.transport_destination_sigs.remove(&key);
+        }
+        Ok(matches)
     }
 
     async fn list_identity_occurrences_for(
@@ -5063,6 +5179,30 @@ mod accord_tests {
         let backend = MemoryBackend::new();
         crate::federation::accord_quorum::test_fixtures::exercise_accord_storage(&backend, "mem")
             .await;
+    }
+
+    /// #443 — the transport route-table (epoch, asserted_at) monotonic-guard
+    /// matrix on the memory backend. Shares the assertion body with the
+    /// sqlite + pg parity tests.
+    #[tokio::test]
+    async fn transport_route_guard_matrix_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::self_at_login::test_support::run_transport_route_guard_matrix(
+            &backend, "mem",
+        )
+        .await;
+    }
+
+    /// #443 — the authenticated route apply + signed tombstone matrix (real
+    /// hybrid crypto) on the memory backend. Shares the assertion body with
+    /// the sqlite + pg parity tests.
+    #[tokio::test]
+    async fn signed_transport_route_matrix_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::self_at_login::test_support::run_signed_transport_route_matrix(
+            &backend, "mem",
+        )
+        .await;
     }
 }
 
