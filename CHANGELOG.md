@@ -5,6 +5,117 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.0.0] — 2026-07-13 — the mesh-unblocking cut: transport route table rebuilt (#443) + role-surface unification (#441) + CC 3.4.9 co-stewards (#440) + pg roles readback (#442)
+
+### BREAKING — `transport_destinations` is now a well-formed superseding route table (#443; the persist root of CIRISEdge#336)
+
+Audited at v16.1.1, the CEG route-table records edge treats as its
+authoritative restart-durable route table were structurally an append-only
+multi-claim advisory set: `destination` sat in the PRIMARY KEY (a dest-hash
+rotation INSERTed a new row and the stale route lived forever), the UPSERT
+was last-physical-writer-wins (a replayed older frame clobbered a newer
+binding), and inbound replication applied bare unsigned rows with an
+attacker-chosen `binding_provenance` — any cohort node could overwrite the
+durable route for ANY key_id (confused deputy). Rebuilt end-to-end, all
+three backends + both DDLs in lockstep (V105):
+
+- **Authoritative key = `(occurrence_key_id, transport_kind)`** —
+  `destination` demoted to payload. V105 collapses existing duplicates
+  deterministically (newest `asserted_at`, tie-break greatest
+  `destination`); sqlite = recreate-table (V101 pattern), postgres =
+  window-function DELETE + dynamic PK swap.
+- **Durable monotonic supersession**: new `epoch: u64` on
+  `TransportDestination` (the edge `RootedPeer.epoch` counter finally has a
+  durable home) + `(epoch, asserted_at)`-guarded UPSERT on every backend —
+  a delayed/replayed older assertion can no longer clobber a newer binding.
+  Local trusted puts that supersede a signed row NULL the signed columns.
+  Self-at-login is epoch-aware (same destination refreshes; a changed
+  destination bumps epoch).
+- **Authenticated replication apply** (`put_signed_transport_destination` +
+  `verify_signed_transport_destination`): authority IS the signed envelope
+  (typed projection must equal it, `binding_provenance` read only from
+  inside it), hybrid signature over `JCS(envelope)` verified against the
+  PINNED federation pubkeys of `attesting_key_id`, then
+  `check_signer_acts_for(…, occurrence_key_id)` — a peer can assert routes
+  only for identities it provably acts for. Outcomes classified
+  Inserted/Superseded/Unchanged/Refused (fail-closed, re-offerable).
+- **BREAKING**: the `list_signed_records` TransportDestination arm now
+  emits ONLY signed-put rows as `SignedTransportDestination` containers,
+  and the replication apply path REFUSES a bare unsigned
+  `TransportDestination` payload. Bare local rows no longer replicate.
+  CIRISEdge#336 adopts (its bridge.rs confused-deputy half).
+- **Replicated tombstone**: route retirement = a signed put with
+  `retired_at` set at a higher epoch — the epoch guard makes resurrection
+  via older gossip impossible. `remove_transport_destination` stays a
+  local-only DELETE. `list_*` reads exclude retired rows; the signed
+  replication read includes them (tombstones must gossip).
+- Decoder hardening: the sqlite `asserted_at` `Utc::now()` fallback (a
+  corrupt row read as freshest) is now a hard decode error, symmetric with
+  postgres; `list_all_transport_destinations` orders by `(occurrence_key_id,
+  transport_kind)`. Capsule ABI extended append-only
+  (`PutSignedTransportDestination`, `ListSignedTransportDestinationsFor`).
+
+### BREAKING — the `roles=[...]` set path runs the SAME accord-conferral gates as scalar `identity_type` (#441, CC 4.5.8.1)
+
+`register_self_federation_key(..., roles=["agent","canonical"])` was
+ADMITTED where `identity_type="canonical"` was refused — the CC 4.5.8.1
+self-claim backdoor, held shut only by the accident that `roles` was
+decorative. Now `KeyRecord::claims_role(role)` (identity_type set ∪ roles
+vector) is THE predicate every role admission gate evaluates, so the two
+claim surfaces cannot disagree by construction:
+
+- `roles=[.., "canonical"]` → `canonical_role_not_accord_conferred`;
+  `identity_type="infra:attest,node"` → the infra gate; an `accord_holder`
+  claim in ANY shape (scalar, comma-set, roles vector) → the
+  hardware-attestation evidence gate. Breaking only for writers that
+  depended on smuggling constitutional tokens decoratively; the genesis
+  A1/B1/C1 seed path is unaffected (pinned ceremony bake, not a
+  per-registration admission).
+- CIRISConformance test_580 can now assert the set path is gated
+  identically to the scalar path on both backends.
+
+### Added — CC 3.4.9 co-steward vocabulary + role-generic conferral machinery (#440)
+
+- `identity_type::REGISTRY` (`"registry"`) / `identity_type::VERIFY`
+  (`"verify"`): the two co-stewards of `licensure:{authority_id}`,
+  resolvable from the registered key record alone — CIRISServer's
+  `licensure_cap` drops its by-pin fallback (CIRISServer#159 workaround
+  retired). Accord-CONFERRED (capability-granting ⇒ m-of-n per the
+  accord-ops invariant) via the role-generic
+  `check_accord_role_admission_over_roster` riding the ONE shared
+  `verify_accord_family_coscrub` quorum core; every future
+  accord-conferred role rides it with zero new gate code. New stable error
+  kinds `role_not_accord_conferred` / `role_withdrawn`.
+- Withdrawal: `withdraw_accord_role` on the op-parameterized #377
+  authority core with the role INSIDE the payload op
+  (`"withdraw_role:{role}"` — a decision for one role can never be
+  replayed against another); V104 generic tombstone; `canonical` /
+  `infra:attest` keep their dedicated frozen ops.
+- `has_effective_role(key_id, role)` (Rust + PyO3): the SELF-AUTHENTICATING
+  consumer read — claim present AND the stored row's co-scrub set
+  re-verifies to the live accord m-of-n AND no un-superseded tombstone. A
+  decorative pre-17.0.0 self-claimed token reads `false` by construction
+  (conferral is re-derived from the row's own cryptography, never from
+  write-gate history).
+
+### Fixed — postgres `list_federation_keys` returned `roles=[]` (#442)
+
+The pg SELECT omitted the `roles` column and the tolerant decoder
+(`try_get(..).ok()`) silently defaulted — a backend-parity divergence on a
+gate-relevant field (sqlite returned the populated set; the column itself
+was always stored correctly). Column added to the projection; both
+backends' list tests now assert the roles readback (the assertion gap that
+hid it). All four sibling readers already projected `roles`.
+
+### Tests
+
+Full suites green on the merged cut: sqlite+postgres 1501/1501 (local
+`postgres:16`), sqlite+memory 1222/1222. New: (epoch, asserted_at) guard +
+authenticated-apply/tombstone matrices on all three backends (real ML-DSA
+hybrid crypto), V105 collapse against the real migration SQL, capsule
+fail-closed round-trips, set-path parity matrix, co-steward decision table,
+roles-projection assertions.
+
 ## [16.1.1] — 2026-07-12 — blanket-revoke semantics for `resolve_scoped_consent` (CIRISServer#243 divergence)
 
 ### Changed (behavior fix to the hours-old #389 resolver; no adopters yet)

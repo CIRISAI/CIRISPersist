@@ -3982,6 +3982,44 @@ impl PyEngine {
         })
     }
 
+    /// v17.0.0 (CIRISPersist#440, CC 3.4.9) — does `key_id` hold `role`
+    /// **effectively**? `True` iff the stored `federation_keys` row claims
+    /// `role` on either role surface (the `identity_type` set or the `roles`
+    /// vector), its scrub set re-verifies to the accord family m-of-n (the
+    /// read is self-authenticating — a decorative pre-17.0.0 self-claimed
+    /// token reads `False`), and no un-superseded V104 withdrawal tombstone
+    /// names `(role, key_id)`. The consumer resolver for the CC 3.4.9
+    /// co-steward roles (`registry` / `verify`): a consumer applying the
+    /// single-source licensure confidence cap resolves "which co-steward is
+    /// this attesting key" from the substrate instead of a local pin.
+    fn has_effective_role(&self, py: Python<'_>, key_id: &str, role: &str) -> PyResult<bool> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let key_id = key_id.to_owned();
+            let role = role.to_owned();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        crate::federation::has_effective_role(backend.as_ref(), &key_id, &role)
+                            .await
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        crate::federation::has_effective_role(backend.as_ref(), &key_id, &role)
+                            .await
+                    })
+                }
+            })
+            .map_err(federation_err_to_py)
+        })
+    }
+
     /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — enumerate the **canonical /
     /// founding bootstrap servers** as a JSON array of `KeyRecord`s
     /// (`federation_keys` rows whose `identity_type` set contains `canonical`,
@@ -25640,6 +25678,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // #424 — re-conferring a quorum-withdrawn `infra:attest` key: the same
         // revocation-wins refusal class as CanonicalRoleWithdrawn; ValueError.
         crate::federation::Error::InfraAttestRoleWithdrawn { .. } => PyValueError::new_err(kind),
+        // v17.0.0 (#440/#441) — the role-generic mirrors of the two refusal
+        // classes above (carried by the CC 3.4.9 co-steward roles); ValueError.
+        crate::federation::Error::RoleNotAccordConferred { .. }
+        | crate::federation::Error::RoleWithdrawn { .. } => PyValueError::new_err(kind),
         // v13.1.0 (CIRISPersist#377) — a re-add of a withdrawn canonical
         // (revocation-wins gate consult) and an invalid withdraw/supersede
         // authority (unauthorized decision / payload not committing to the

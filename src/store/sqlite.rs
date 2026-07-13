@@ -2210,6 +2210,9 @@ impl SqliteBackend {
         // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
         // co-scrub gate as `canonical`. Fail-closed before any write.
         crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
+        // #440 — the CC 3.4.9 co-steward roles (`registry`/`verify`) are
+        // accord-conferred, same ceremony. Fail-closed before any write.
+        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         // Resolve the existing row + classify the transition.
@@ -2600,7 +2603,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation
         // admission gate for accord_holder rows. Runs BEFORE
         // persist_row_hash + INSERT so rejected rows leave no trace.
-        if row.identity_type == crate::federation::types::identity_type::ACCORD_HOLDER {
+        // #441: evaluated over identity_type ∪ roles (claims_role) — an
+        // `accord_holder` claim in the set form ("agent,accord_holder")
+        // or in the roles vector hits the same gate as the scalar.
+        if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
             self.hardware_attestation_policy().check(
                 &row.key_id,
                 row.attestation_evidence.as_ref(),
@@ -2622,6 +2628,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
         // co-scrub gate as `canonical`. Fail-closed before any write.
         crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
+        // #440 — the CC 3.4.9 co-steward roles (`registry`/`verify`) are
+        // accord-conferred, same ceremony. Fail-closed before any write.
+        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
 
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
@@ -5314,22 +5323,41 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let d = destination.clone();
         let asserted = d.asserted_at.to_rfc3339();
         let last_seen = d.last_seen_at.map(|t| t.to_rfc3339());
+        let retired = d.retired_at.map(|t| t.to_rfc3339());
+        let epoch = i64::try_from(d.epoch).map_err(|_| {
+            crate::federation::Error::InvalidArgument(
+                "transport_destination epoch exceeds i64".into(),
+            )
+        })?;
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
-            // Idempotent on the composite PK: a re-assert refreshes the
-            // timestamps in place (drop+re-register is the mutation model).
+            // #443 route-table put: keyed on (occ, kind) — `destination` is
+            // payload — and GUARDED monotonic on (epoch, asserted_at)
+            // lexicographic. A stale assertion is a silent no-op. A local
+            // (trusted) put that supersedes a SIGNED row NULLs the signature
+            // columns: they attested the OLD content. The asserted_at TEXT
+            // comparison is chronological for our uniform RFC-3339 UTC
+            // encoding (to_rfc3339, "+00:00").
             conn.execute(
                 "INSERT INTO transport_destinations \
                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
                      transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                     binding_provenance) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-                 ON CONFLICT(occurrence_key_id, transport_kind, destination) \
-                 DO UPDATE SET asserted_at = excluded.asserted_at, \
+                     binding_provenance, epoch, retired_at, \
+                     attesting_key_id, signed_envelope, signature) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, NULL) \
+                 ON CONFLICT(occurrence_key_id, transport_kind) \
+                 DO UPDATE SET destination = excluded.destination, \
+                    asserted_at = excluded.asserted_at, \
                     last_seen_at = excluded.last_seen_at, \
                     transport_ed25519_pubkey_base64 = excluded.transport_ed25519_pubkey_base64, \
                     transport_x25519_pubkey_base64 = excluded.transport_x25519_pubkey_base64, \
-                    binding_provenance = excluded.binding_provenance",
+                    binding_provenance = excluded.binding_provenance, \
+                    epoch = excluded.epoch, \
+                    retired_at = excluded.retired_at, \
+                    attesting_key_id = NULL, signed_envelope = NULL, signature = NULL \
+                 WHERE excluded.epoch > transport_destinations.epoch \
+                    OR (excluded.epoch = transport_destinations.epoch \
+                        AND excluded.asserted_at > transport_destinations.asserted_at)",
                 rusqlite::params![
                     d.occurrence_key_id,
                     d.transport_kind,
@@ -5339,11 +5367,130 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     d.transport_ed25519_pubkey_base64,
                     d.transport_x25519_pubkey_base64,
                     d.binding_provenance.as_str(),
+                    epoch,
+                    retired,
                 ],
             )?;
             Ok(())
         })()
         .map_err(|e| crate::federation::Error::Backend(format!("put_transport_destination: {e}")))
+    }
+
+    async fn put_signed_transport_destination(
+        &self,
+        signed: &crate::federation::SignedTransportDestination,
+    ) -> Result<crate::federation::TransportDestinationApplyOutcome, crate::federation::Error> {
+        use crate::federation::TransportDestinationApplyOutcome as Outcome;
+        // #443 — the admission gate BEFORE any write: hybrid 1-of-1 over
+        // JCS(signed_envelope) against the pinned key of attesting_key_id,
+        // typed projection ≡ envelope, signer_acts_for.
+        crate::federation::admission::verify_signed_transport_destination(self, signed).await?;
+        let d = signed.transport_destination.clone();
+        let attesting = signed.attesting_key_id.clone();
+        let envelope_json = serde_json::to_string(&signed.signed_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
+        let signature_json = serde_json::to_string(&signed.signature)
+            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
+        let asserted = d.asserted_at.to_rfc3339();
+        let last_seen = d.last_seen_at.map(|t| t.to_rfc3339());
+        let retired = d.retired_at.map(|t| t.to_rfc3339());
+        let epoch = i64::try_from(d.epoch).map_err(|_| {
+            crate::federation::Error::InvalidArgument(
+                "transport_destination epoch exceeds i64".into(),
+            )
+        })?;
+        let conn = self.conn.clone();
+        (move || -> Result<Outcome, rusqlite::Error> {
+            let conn = conn.lock();
+            // Classify against the current row (retired rows INCLUDED — the
+            // tombstone must keep winning), then write with the same guard in
+            // the SQL (single connection lock ⇒ no plan/act race).
+            use rusqlite::OptionalExtension;
+            let existing = conn
+                .query_row(
+                    "SELECT occurrence_key_id, transport_kind, destination, asserted_at, \
+                        last_seen_at, transport_ed25519_pubkey_base64, \
+                        transport_x25519_pubkey_base64, binding_provenance, epoch, retired_at \
+                     FROM transport_destinations \
+                     WHERE occurrence_key_id = ?1 AND transport_kind = ?2",
+                    rusqlite::params![d.occurrence_key_id, d.transport_kind],
+                    sqlite_row_to_transport_destination,
+                )
+                .optional()?;
+            if let Some(ex) = existing {
+                if ex == d {
+                    // Byte-identical typed content — idempotent re-offer.
+                    return Ok(Outcome::Unchanged);
+                }
+                if (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) {
+                    return Ok(Outcome::Refused {
+                        reason: format!(
+                            "incoming (epoch {}, asserted_at {}) does not supersede stored \
+                             (epoch {}, asserted_at {})",
+                            d.epoch,
+                            d.asserted_at.to_rfc3339(),
+                            ex.epoch,
+                            ex.asserted_at.to_rfc3339()
+                        ),
+                    });
+                }
+            }
+            let inserted_fresh = conn
+                .query_row(
+                    "SELECT 1 FROM transport_destinations \
+                     WHERE occurrence_key_id = ?1 AND transport_kind = ?2",
+                    rusqlite::params![d.occurrence_key_id, d.transport_kind],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_none();
+            conn.execute(
+                "INSERT INTO transport_destinations \
+                    (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                     binding_provenance, epoch, retired_at, \
+                     attesting_key_id, signed_envelope, signature) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+                 ON CONFLICT(occurrence_key_id, transport_kind) \
+                 DO UPDATE SET destination = excluded.destination, \
+                    asserted_at = excluded.asserted_at, \
+                    last_seen_at = excluded.last_seen_at, \
+                    transport_ed25519_pubkey_base64 = excluded.transport_ed25519_pubkey_base64, \
+                    transport_x25519_pubkey_base64 = excluded.transport_x25519_pubkey_base64, \
+                    binding_provenance = excluded.binding_provenance, \
+                    epoch = excluded.epoch, \
+                    retired_at = excluded.retired_at, \
+                    attesting_key_id = excluded.attesting_key_id, \
+                    signed_envelope = excluded.signed_envelope, \
+                    signature = excluded.signature \
+                 WHERE excluded.epoch > transport_destinations.epoch \
+                    OR (excluded.epoch = transport_destinations.epoch \
+                        AND excluded.asserted_at > transport_destinations.asserted_at)",
+                rusqlite::params![
+                    d.occurrence_key_id,
+                    d.transport_kind,
+                    d.destination,
+                    asserted,
+                    last_seen,
+                    d.transport_ed25519_pubkey_base64,
+                    d.transport_x25519_pubkey_base64,
+                    d.binding_provenance.as_str(),
+                    epoch,
+                    retired,
+                    attesting,
+                    envelope_json,
+                    signature_json,
+                ],
+            )?;
+            Ok(if inserted_fresh {
+                Outcome::Inserted
+            } else {
+                Outcome::Superseded
+            })
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("put_signed_transport_destination: {e}"))
+        })
     }
 
     async fn list_transport_destinations_for(
@@ -5354,12 +5501,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let occ = occurrence_key_id.to_owned();
         (move || -> Result<Vec<crate::federation::TransportDestination>, rusqlite::Error> {
             let conn = conn.lock();
+            // #443 — live routes only: retired tombstones are excluded from
+            // every list_* read (they still gossip via the signed read).
             let mut stmt = conn.prepare(
                 "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                    binding_provenance \
-                 FROM transport_destinations WHERE occurrence_key_id = ?1 \
-                 ORDER BY transport_kind, destination",
+                    binding_provenance, epoch, retired_at \
+                 FROM transport_destinations \
+                 WHERE occurrence_key_id = ?1 AND retired_at IS NULL \
+                 ORDER BY transport_kind",
             )?;
             let rows = stmt.query_map([&occ], sqlite_row_to_transport_destination)?;
             rows.collect()
@@ -5369,18 +5519,54 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    async fn list_signed_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<crate::federation::SignedTransportDestination>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let occ = occurrence_key_id.to_owned();
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            // #443 replication read: only signed-put rows carry the signature
+            // container; trusted-local rows (NULL sig cols) are omitted.
+            // RETIRED rows are INCLUDED — tombstones must gossip.
+            let mut stmt = conn.prepare(
+                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                    binding_provenance, epoch, retired_at, \
+                    attesting_key_id, signed_envelope, signature \
+                 FROM transport_destinations \
+                 WHERE occurrence_key_id = ?1 \
+                   AND attesting_key_id IS NOT NULL \
+                   AND signed_envelope IS NOT NULL \
+                   AND signature IS NOT NULL \
+                 ORDER BY transport_kind",
+            )?;
+            let rows = stmt.query_map([&occ], sqlite_row_to_signed_transport_destination)?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_signed_transport_destinations_for: {e}"
+            ))
+        })
+    }
+
     async fn list_all_transport_destinations(
         &self,
     ) -> Result<Vec<crate::federation::TransportDestination>, crate::federation::Error> {
         let conn = self.conn.clone();
         (move || -> Result<Vec<crate::federation::TransportDestination>, rusqlite::Error> {
             let conn = conn.lock();
+            // #443 — live routes only, ordered by the route key (the restore
+            // order is deterministic; one row per (occ, kind) is structural).
             let mut stmt = conn.prepare(
                 "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                    binding_provenance \
+                    binding_provenance, epoch, retired_at \
                  FROM transport_destinations \
-                 ORDER BY occurrence_key_id, transport_kind, destination",
+                 WHERE retired_at IS NULL \
+                 ORDER BY occurrence_key_id, transport_kind",
             )?;
             let rows = stmt.query_map([], sqlite_row_to_transport_destination)?;
             rows.collect()
@@ -5398,11 +5584,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let dest = destination.to_owned();
         (move || -> Result<Vec<crate::federation::TransportDestination>, rusqlite::Error> {
             let conn = conn.lock();
+            // #443 — live routes only.
             let mut stmt = conn.prepare(
                 "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
                     transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
-                    binding_provenance \
-                 FROM transport_destinations WHERE destination = ?1 \
+                    binding_provenance, epoch, retired_at \
+                 FROM transport_destinations \
+                 WHERE destination = ?1 AND retired_at IS NULL \
                  ORDER BY occurrence_key_id, transport_kind",
             )?;
             let rows = stmt.query_map([&dest], sqlite_row_to_transport_destination)?;
@@ -11305,24 +11493,47 @@ fn sqlite_row_to_revocation(
 /// [`crate::federation::IdentityOccurrence`].
 /// v13.8.0 (CIRISPersist#411) — decode a `transport_destinations` row into a
 /// [`TransportDestination`](crate::federation::TransportDestination). Shared by
-/// `list_transport_destinations_for` (per-key) and
-/// `list_all_transport_destinations` (boot reload) so the column mapping — incl.
-/// the ed25519 (#397) + x25519 (#411) transport-tier pubkeys — cannot drift.
-/// Column order matches both SELECTs (0..=6).
+/// every `list_transport_destinations*` read (and the signed decoder below) so
+/// the column mapping — incl. the ed25519 (#397) + x25519 (#411) transport-tier
+/// pubkeys and the #443 `epoch` / `retired_at` — cannot drift. Column order
+/// matches every SELECT (0..=9).
+///
+/// #443: an unparseable `asserted_at` (or `retired_at`) is a HARD decode error
+/// — never a fabricated `Utc::now()`, which made a corrupt row look freshest
+/// and win the recency guard. `last_seen_at` stays lenient (advisory liveness,
+/// never load-bearing).
 fn sqlite_row_to_transport_destination(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<crate::federation::TransportDestination> {
+    let strict_ts = |idx: usize, s: &str| -> rusqlite::Result<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    idx,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+    };
     let asserted_at_str: String = row.get(3)?;
     let last_seen_str: Option<String> = row.get(4)?;
-    let asserted_at = chrono::DateTime::parse_from_rfc3339(&asserted_at_str)
-        .map(|t| t.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|_| chrono::Utc::now());
+    let asserted_at = strict_ts(3, &asserted_at_str)?;
     let last_seen_at = last_seen_str.and_then(|s| {
         chrono::DateTime::parse_from_rfc3339(&s)
             .ok()
             .map(|t| t.with_timezone(&chrono::Utc))
     });
     let provenance_token: Option<String> = row.get(7)?;
+    let epoch_raw: i64 = row.get(8)?;
+    let epoch = u64::try_from(epoch_raw).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Integer, Box::new(e))
+    })?;
+    let retired_str: Option<String> = row.get(9)?;
+    let retired_at = match retired_str {
+        Some(s) => Some(strict_ts(9, &s)?),
+        None => None,
+    };
     Ok(crate::federation::TransportDestination {
         occurrence_key_id: row.get(0)?,
         transport_kind: row.get(1)?,
@@ -11334,6 +11545,43 @@ fn sqlite_row_to_transport_destination(
         binding_provenance: crate::federation::self_at_login::BindingProvenance::from_token(
             provenance_token.as_deref(),
         ),
+        epoch,
+        retired_at,
+    })
+}
+
+/// v17.0.0 (#443 replication read) — SQLite row →
+/// [`crate::federation::SignedTransportDestination`]. Reconstructs the
+/// signature container byte-exact from the stored `{attesting_key_id,
+/// signed_envelope, signature}` columns (V105) so a transport replicator
+/// re-wraps the already-signed route verbatim. Columns 0..=9 are the shared
+/// typed decode; 10..=12 the container. Callers gate on non-NULL sig columns
+/// (the mirror of the V103 revocation read).
+fn sqlite_row_to_signed_transport_destination(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::SignedTransportDestination> {
+    let transport_destination = sqlite_row_to_transport_destination(row)?;
+    let attesting_key_id: String = row.get(10)?;
+    let signed_envelope_json: String = row.get(11)?;
+    let signature_json: String = row.get(12)?;
+    let json_err = |idx: usize| {
+        move |e: serde_json::Error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        }
+    };
+    let signed_envelope: serde_json::Value =
+        serde_json::from_str(&signed_envelope_json).map_err(json_err(11))?;
+    let signature: ciris_verify_core::transport_binding::TransportBindingSignature =
+        serde_json::from_str(&signature_json).map_err(json_err(12))?;
+    Ok(crate::federation::SignedTransportDestination {
+        transport_destination,
+        attesting_key_id,
+        signed_envelope,
+        signature,
     })
 }
 
@@ -21715,6 +21963,8 @@ mod tests {
             transport_ed25519_pubkey_base64: Some("dHJhbnNwb3J0LWVkMjU1MTk=".into()),
             transport_x25519_pubkey_base64: Some("dHJhbnNwb3J0LXgyNTUxOQ==".into()),
             binding_provenance: crate::federation::self_at_login::BindingProvenance::Rooted,
+            epoch: 0,
+            retired_at: None,
         };
         // A non-Reticulum kind carries no RNS transport key → None.
         let ws = crate::federation::TransportDestination {
@@ -21726,6 +21976,8 @@ mod tests {
             transport_ed25519_pubkey_base64: None,
             transport_x25519_pubkey_base64: None,
             binding_provenance: crate::federation::self_at_login::BindingProvenance::Rooted,
+            epoch: 0,
+            retired_at: None,
         };
         backend.put_transport_destination(&ret).await.unwrap();
         backend.put_transport_destination(&ws).await.unwrap();
@@ -21753,9 +22005,13 @@ mod tests {
             "non-Reticulum kinds carry no RNS transport key"
         );
 
-        // A re-assert with a rotated transport key refreshes it in place.
+        // A re-assert with a rotated transport key refreshes it in place —
+        // #443: the re-assert must be NEWER (the monotonic guard drops a
+        // same-clock replay; a genuine rotation always carries a fresh
+        // asserted_at).
         let rotated = crate::federation::TransportDestination {
             transport_ed25519_pubkey_base64: Some("cm90YXRlZC1lZDI1NTE5".into()),
+            asserted_at: now + chrono::Duration::seconds(1),
             ..ret.clone()
         };
         backend.put_transport_destination(&rotated).await.unwrap();
@@ -21798,6 +22054,8 @@ mod tests {
             transport_ed25519_pubkey_base64: Some("ZWQ=".into()),
             transport_x25519_pubkey_base64: Some(x.into()),
             binding_provenance: crate::federation::self_at_login::BindingProvenance::Rooted,
+            epoch: 0,
+            retired_at: None,
         };
         backend
             .put_transport_destination(&td("node-a", "aaaa", "eDI1NTE5LWE="))
@@ -21862,6 +22120,8 @@ mod tests {
             transport_ed25519_pubkey_base64: None,
             transport_x25519_pubkey_base64: None,
             binding_provenance: prov,
+            epoch: 0,
+            retired_at: None,
         };
         // The real canonical roots it; an adversary announces the SAME dest-hash
         // under its own key (advisory) — the classic AV-42 spoof.
@@ -21924,6 +22184,8 @@ mod tests {
                 transport_ed25519_pubkey_base64: Some("ZWQ=".into()),
                 transport_x25519_pubkey_base64: Some("eDI1".into()),
                 binding_provenance: BindingProvenance::Advisory,
+                epoch: 0,
+                retired_at: None,
             })
             .await
             .expect("advisory binding for a not-yet-rooted key MUST persist (#416: FK dropped)");
@@ -26277,10 +26539,12 @@ mod tests {
     async fn re_federation_lists() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // #442: populate the roles set on one key so the list projection
+        // is asserted on both backends (the pg SELECT once dropped it).
+        let mut key_a = fed_key("k-a", "agent-a", "k-a");
+        key_a.roles = vec!["agent".into(), "substrate_persist".into()];
         backend
-            .put_public_key(SignedKeyRecord {
-                record: fed_key("k-a", "agent-a", "k-a"),
-            })
+            .put_public_key(SignedKeyRecord { record: key_a })
             .await
             .unwrap();
         backend
@@ -26312,6 +26576,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys.items.len(), 2);
+        let k_a = keys.items.iter().find(|k| k.key_id == "k-a").unwrap();
+        assert_eq!(
+            k_a.roles,
+            vec!["agent".to_string(), "substrate_persist".to_string()],
+            "#442: list_federation_keys must project the stored roles set"
+        );
 
         // revoked filter: k-b appears in federation_revocations.
         let revoked = backend
@@ -33122,5 +33392,111 @@ mod tests {
         assert!(inbound.iter().all(
             |a| a.attestation_type == crate::federation::types::attestation_type::DELEGATES_TO
         ));
+    }
+
+    /// #443 — the transport route-table (epoch, asserted_at) monotonic-guard
+    /// matrix on sqlite. Shares the assertion body with the memory + pg
+    /// parity tests.
+    #[tokio::test]
+    async fn transport_route_guard_matrix_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::self_at_login::test_support::run_transport_route_guard_matrix(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// #443 — the authenticated route apply + signed tombstone matrix (real
+    /// hybrid crypto) on sqlite. Shares the assertion body with the memory +
+    /// pg parity tests.
+    #[tokio::test]
+    async fn signed_transport_route_matrix_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::self_at_login::test_support::run_signed_transport_route_matrix(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// #443 — the V105 collapse rule, against the REAL migration SQL applied
+    /// to a hand-built pre-V105 table: per (occ, kind) keep the newest
+    /// asserted_at, tie-break the lexicographically greatest destination;
+    /// survivors land at epoch 0, live (retired_at NULL), unsigned.
+    #[tokio::test]
+    async fn v105_migration_collapses_duplicate_routes_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // The exact post-V101 (pre-V105) table shape.
+        conn.execute_batch(
+            "CREATE TABLE transport_destinations (
+                occurrence_key_id               TEXT NOT NULL,
+                transport_kind                  TEXT NOT NULL,
+                destination                     TEXT NOT NULL,
+                asserted_at                     TEXT NOT NULL,
+                last_seen_at                    TEXT,
+                transport_ed25519_pubkey_base64 TEXT,
+                transport_x25519_pubkey_base64  TEXT,
+                binding_provenance              TEXT NOT NULL DEFAULT 'rooted',
+                PRIMARY KEY (occurrence_key_id, transport_kind, destination)
+            );
+            CREATE INDEX transport_destinations_by_occurrence
+                ON transport_destinations (occurrence_key_id);
+            INSERT INTO transport_destinations
+                (occurrence_key_id, transport_kind, destination, asserted_at)
+            VALUES
+                ('occ',  'reticulum', 'd1', '2026-06-10T00:00:00+00:00'),
+                ('occ',  'reticulum', 'd2', '2026-06-12T00:00:00+00:00'),
+                ('occ',  'reticulum', 'd3', '2026-06-12T00:00:00+00:00'),
+                ('occ',  'websocket', 'w1', '2026-06-01T00:00:00+00:00'),
+                ('occ2', 'reticulum', 'x1', '2026-06-05T00:00:00+00:00');",
+        )
+        .unwrap();
+        conn.execute_batch(include_str!(
+            "../../migrations/sqlite/lens/V105__transport_route_table.sql"
+        ))
+        .unwrap();
+        // (occ, reticulum): d2/d3 share the newest asserted_at → the
+        // lexicographically greatest destination (d3) wins deterministically.
+        let dest: String = conn
+            .query_row(
+                "SELECT destination FROM transport_destinations \
+                 WHERE occurrence_key_id = 'occ' AND transport_kind = 'reticulum'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dest, "d3");
+        // One row per (occ, kind) — 3 survivors of 5.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transport_destinations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 3);
+        // Grandfathered rows: epoch 0, live, unsigned.
+        let (epoch, retired, attesting): (i64, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT epoch, retired_at, attesting_key_id FROM transport_destinations \
+                 WHERE occurrence_key_id = 'occ2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(epoch, 0);
+        assert!(retired.is_none());
+        assert!(attesting.is_none());
+        // The new PK really is (occ, kind): a second destination for the same
+        // kind conflicts instead of inserting.
+        let err = conn.execute(
+            "INSERT INTO transport_destinations \
+                (occurrence_key_id, transport_kind, destination, asserted_at) \
+             VALUES ('occ2', 'reticulum', 'x2', '2026-06-06T00:00:00+00:00')",
+            [],
+        );
+        assert!(
+            err.is_err(),
+            "duplicate (occ, kind) must violate the new PK"
+        );
     }
 }

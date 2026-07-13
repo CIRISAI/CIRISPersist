@@ -263,12 +263,16 @@ impl BindingProvenance {
 
 /// v6.5.0 (CIRISPersist#183, CEG §5.6.8.8.1) — one reachable network
 /// address for one identity_occurrence (the "show up on the network"
-/// reachability row). Backed by the V078 `transport_destinations`
-/// table.
+/// reachability row). Backed by the `transport_destinations` table
+/// (V078; route-table shape since V105).
 ///
-/// Reachability is mutable + disposable: a stale address is dropped and
-/// re-registered, not signed or revoked — so (unlike the V069
-/// occurrence binding) this row carries no signature / `persist_row_hash`.
+/// v17.0.0 (CIRISPersist#443) — this is now a **superseding route table**:
+/// the authoritative key is `(occurrence_key_id, transport_kind)` (one live
+/// route per peer per transport), `destination` is payload, and supersession
+/// is `(epoch, asserted_at)`-lexicographic (never last-physical-writer-wins).
+/// A row written via the SIGNED replication path additionally stores its
+/// detached signature container (see [`SignedTransportDestination`]); a
+/// trusted-local write carries none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportDestination {
     /// The occurrence this address reaches — a
@@ -321,6 +325,101 @@ pub struct TransportDestination {
     /// `Rooted` (their authoritative-by-assumption intent).
     #[serde(default)]
     pub binding_provenance: BindingProvenance,
+    /// v17.0.0 (CIRISPersist#443) — the **durable monotonic supersession
+    /// counter** (the edge-side `RootedPeer.epoch` finally has a durable
+    /// home). Supersession is `(epoch, asserted_at)`-lexicographic: a put
+    /// applies iff its `epoch` is strictly greater, or equal with a strictly
+    /// newer `asserted_at` — so mesh convergence never rides wall clocks
+    /// alone and a delayed/replayed frame carrying an older assertion can
+    /// never clobber a newer binding. `#[serde(default)]` ⇒ pre-#443 records
+    /// (and capsule peers built against an older wheel) read as epoch 0.
+    #[serde(default)]
+    pub epoch: u64,
+    /// v17.0.0 (CIRISPersist#443) — the **replicated tombstone**: when set,
+    /// the route is RETIRED. Retirement travels as a signed put with a higher
+    /// `(epoch, asserted_at)`, so the monotonic guard keeps older gossip from
+    /// resurrecting the route. Retired rows are EXCLUDED from the three
+    /// `list_transport_destinations*` reads but INCLUDED in the signed
+    /// replication read (tombstones must gossip).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<DateTime<Utc>>,
+}
+
+/// v17.0.0 (CIRISPersist#443) — a **signed** transport-destination submission:
+/// the route-plane mirror of
+/// [`SignedIdentityOccurrence`](crate::federation::types::SignedIdentityOccurrence) /
+/// [`SignedIdentityOccurrenceRevocation`](crate::federation::types::SignedIdentityOccurrenceRevocation).
+///
+/// Before this, the replication plane applied a BARE unsigned
+/// [`TransportDestination`] through the plain local upsert — no signature and
+/// no check that the delivering origin has authority over `occurrence_key_id`,
+/// so any cohort node could overwrite the durable route (with an
+/// attacker-chosen `binding_provenance: Rooted`) for any key_id — the
+/// CIRISEdge#336 confused deputy. Now the replicated apply
+/// ([`put_signed_transport_destination`](crate::federation::FederationDirectory::put_signed_transport_destination))
+/// MUST carry a hybrid signature over the exact producer envelope, verified
+/// against the PINNED federation pubkeys of `attesting_key_id` plus
+/// `signer_acts_for` — a bare unsigned record on the replication path no
+/// longer deserializes (breaking, intended; CIRISEdge#336 adopts).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedTransportDestination {
+    /// Persist's typed projection of the route row (what gets stored). Its
+    /// members are parsed FROM [`Self::signed_envelope`]; the signature is
+    /// verified over `signed_envelope`, not over this projection, so the §0.9
+    /// member-presence discipline is preserved (persist never
+    /// re-canonicalizes). `last_seen_at` is advisory liveness and is NOT
+    /// signed material.
+    pub transport_destination: TransportDestination,
+    /// The claimed signer — a `federation_keys.key_id`. MUST be the route's
+    /// own `occurrence_key_id` or a key bound as an occurrence of it
+    /// (`signer_acts_for` — a peer cannot sign a victim's route with its own
+    /// unrelated key).
+    pub attesting_key_id: String,
+    /// The EXACT route envelope the producer signed (signature container
+    /// stripped), as received — the bytes the gate JCS-canonicalizes.
+    /// Byte-exact by construction (never rebuilt from the typed projection).
+    /// `binding_provenance` is read ONLY from here, never from an
+    /// unauthenticated wire field.
+    pub signed_envelope: serde_json::Value,
+    /// The detached hybrid signature over `JCS(signed_envelope)` (Ed25519
+    /// over the bytes; ML-DSA-65 over `bytes ‖ ed25519_sig`). Same container
+    /// type as the occurrence/revocation planes — the producer is the same
+    /// envelope-generic `produce_signed_identity_occurrence`.
+    pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
+}
+
+/// v17.0.0 (CIRISPersist#443) — outcome of a
+/// [`put_signed_transport_destination`](crate::federation::FederationDirectory::put_signed_transport_destination)
+/// monotonic apply. Modeled on
+/// [`ReplicatedKeyOutcome`](crate::federation::register::ReplicatedKeyOutcome)
+/// (a sibling, not a reuse: the Key plane's `Upgraded` transition has no
+/// route-table analog, and route refusals carry a reason). Serde tokens are
+/// snake_case, so the wire shape mirrors the Key plane's.
+///
+/// A `Refused` is a *policy* outcome, not an error: the anti-entropy route
+/// plane receives unsolicited records, so "this record is not admitted
+/// against the current row" resolves to `Refused` (fail-closed,
+/// deterministic, safe to re-offer) rather than aborting the apply loop.
+/// Signature/authority failures still surface as `Err` — they mean the
+/// record itself is inadmissible, not merely stale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportDestinationApplyOutcome {
+    /// No row existed for `(occurrence_key_id, transport_kind)` — inserted.
+    Inserted,
+    /// The existing row was replaced: the incoming `(epoch, asserted_at)` is
+    /// strictly greater (lexicographic). Retirement (a tombstone put) also
+    /// lands here.
+    Superseded,
+    /// The row already carries this exact typed content — idempotent no-op.
+    Unchanged,
+    /// NOT applied: the incoming `(epoch, asserted_at)` is older, or equal
+    /// with different content (a same-clock fork — fail-closed). The existing
+    /// row is untouched; the record is safe to re-offer.
+    Refused {
+        /// Why the record was not admitted against the current row.
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -414,5 +513,528 @@ mod tests {
         assert_eq!(g["bilateral_pair_id"], a["bilateral_pair_id"]);
         assert_eq!(g["dimension"], DIMENSION_PARTNERSHIP_GRANT);
         assert_eq!(a["dimension"], DIMENSION_PARTNERSHIP_ACCEPT);
+    }
+
+    /// v17.0.0 (#443) — a BARE unsigned `TransportDestination` payload does
+    /// NOT deserialize as a `SignedTransportDestination`: the replication
+    /// path's structural refusal of the pre-#443 confused-deputy wire shape
+    /// (a peer can no longer push an unauthenticated route). Also: the #443
+    /// fields are serde-defaulted, so a pre-#443 record (no epoch /
+    /// retired_at) still decodes — capsule ABI back-compat.
+    #[test]
+    fn bare_unsigned_transport_destination_refused_on_signed_plane() {
+        let bare = serde_json::json!({
+            "occurrence_key_id": "occ-1",
+            "transport_kind": "reticulum",
+            "destination": "d1",
+            "asserted_at": "2026-06-10T00:00:00Z",
+            "binding_provenance": "rooted",
+        });
+        // Pre-#443 back-compat: the bare TYPED row still decodes, epoch 0, live.
+        let td: TransportDestination = serde_json::from_value(bare.clone()).unwrap();
+        assert_eq!(td.epoch, 0);
+        assert!(td.retired_at.is_none());
+        // ...but it is NOT admissible as a signed record (missing container).
+        assert!(
+            serde_json::from_value::<SignedTransportDestination>(bare).is_err(),
+            "a bare unsigned route must not deserialize as SignedTransportDestination"
+        );
+    }
+}
+
+/// v17.0.0 (CIRISPersist#443) — shared, backend-agnostic conformance matrices
+/// for the transport route table, run by the sqlite / postgres / memory test
+/// suites against `&dyn FederationDirectory` so the three backends cannot
+/// drift (the CIRISConformance parity rule). `suffix` scopes every fixture id
+/// so runs against a shared test DB (postgres) don't collide.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::federation::{FederationDirectory, KeyRecord, SignedKeyRecord};
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        s.parse().expect("test timestamp")
+    }
+
+    /// A minimal live route row (local-put shape: no signature container).
+    pub(crate) fn route(
+        occ: &str,
+        kind: &str,
+        dest: &str,
+        epoch: u64,
+        asserted: &str,
+    ) -> TransportDestination {
+        TransportDestination {
+            occurrence_key_id: occ.into(),
+            transport_kind: kind.into(),
+            destination: dest.into(),
+            asserted_at: ts(asserted),
+            last_seen_at: None,
+            transport_ed25519_pubkey_base64: None,
+            transport_x25519_pubkey_base64: None,
+            binding_provenance: BindingProvenance::Rooted,
+            epoch,
+            retired_at: None,
+        }
+    }
+
+    /// A `federation_keys` fixture with REAL hybrid pubkeys (so the #443
+    /// signature gate can verify envelopes signed by the matching signer).
+    /// `put_public_key` does not itself hybrid-verify the registration, so
+    /// the scrub fields stay placeholders — only the PUBKEYS must be real.
+    fn fixture_key(key_id: &str, ed_pk: String, mldsa_pk: Option<String>) -> KeyRecord {
+        KeyRecord {
+            key_id: key_id.into(),
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
+            algorithm: crate::federation::types::algorithm::HYBRID.into(),
+            identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
+            identity_ref: key_id.into(),
+            valid_from: ts("2026-05-01T00:00:00Z"),
+            valid_until: None,
+            registration_envelope: serde_json::json!({ "id": key_id }),
+            original_content_hash: "deadbeef".into(),
+            scrub_signature_classical: "c2lnbmF0dXJl".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.into(),
+            scrub_timestamp: ts("2026-05-01T00:00:00Z"),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+
+    /// **The (epoch, asserted_at) monotonic-guard matrix** for the trusted-
+    /// LOCAL put: newer supersedes (in place — never a second row per kind),
+    /// older asserted_at at the same epoch is refused, an older epoch is
+    /// refused even with a newer wall clock, and a higher epoch wins even
+    /// with an older wall clock (epoch dominates — clock skew cannot roll a
+    /// route back). Plus list ordering + the local remove.
+    pub(crate) async fn run_transport_route_guard_matrix(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        let occ_id = format!("route-guard-occ-{suffix}");
+        let occ = occ_id.as_str();
+        let ws_dest_id = format!("wss://route-guard-{suffix}");
+        let ws_dest = ws_dest_id.as_str();
+
+        // (1) Fresh insert.
+        dir.put_transport_destination(&route(occ, "reticulum", "d1", 0, "2026-06-10T00:00:00Z"))
+            .await
+            .expect("insert");
+        // (2) Same epoch, newer asserted_at, rotated destination → SUPERSEDES
+        // in place (the dest-hash rotation that used to append a row).
+        dir.put_transport_destination(&route(occ, "reticulum", "d2", 0, "2026-06-11T00:00:00Z"))
+            .await
+            .expect("rotate");
+        let rows = dir.list_transport_destinations_for(occ).await.unwrap();
+        assert_eq!(rows.len(), 1, "rotation must not append: {rows:?}");
+        assert_eq!(rows[0].destination, "d2");
+        // (3) Same epoch, OLDER asserted_at → silent no-op (replayed frame).
+        dir.put_transport_destination(&route(
+            occ,
+            "reticulum",
+            "d-stale",
+            0,
+            "2026-06-09T00:00:00Z",
+        ))
+        .await
+        .expect("stale put is not an error");
+        assert_eq!(
+            dir.list_transport_destinations_for(occ).await.unwrap()[0].destination,
+            "d2",
+            "an older assertion must not clobber a newer binding"
+        );
+        // (4) Epoch advance supersedes...
+        dir.put_transport_destination(&route(occ, "reticulum", "d3", 2, "2026-06-12T00:00:00Z"))
+            .await
+            .expect("epoch advance");
+        // ...and an OLDER epoch is refused even with a NEWER wall clock.
+        dir.put_transport_destination(&route(
+            occ,
+            "reticulum",
+            "d-old-epoch",
+            1,
+            "2026-07-01T00:00:00Z",
+        ))
+        .await
+        .expect("old-epoch put is not an error");
+        let rows = dir.list_transport_destinations_for(occ).await.unwrap();
+        assert_eq!(rows[0].destination, "d3", "epoch guard: {rows:?}");
+        assert_eq!(rows[0].epoch, 2);
+        // (5) A HIGHER epoch wins even with an older asserted_at (epoch
+        // dominates the lexicographic order).
+        dir.put_transport_destination(&route(occ, "reticulum", "d4", 3, "2026-06-01T00:00:00Z"))
+            .await
+            .expect("higher epoch, older clock");
+        let rows = dir.list_transport_destinations_for(occ).await.unwrap();
+        assert_eq!(rows[0].destination, "d4");
+        assert_eq!(rows[0].epoch, 3);
+
+        // (6) A second transport_kind is an independent route row; list_all
+        // orders by the route key (occurrence_key_id, transport_kind).
+        dir.put_transport_destination(&route(occ, "websocket", ws_dest, 0, "2026-06-10T00:00:00Z"))
+            .await
+            .expect("second kind");
+        let all = dir.list_all_transport_destinations().await.unwrap();
+        let keys: Vec<(String, String)> = all
+            .iter()
+            .map(|r| (r.occurrence_key_id.clone(), r.transport_kind.clone()))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "list_all must order by (occ, kind)");
+        assert_eq!(all.iter().filter(|r| r.occurrence_key_id == occ).count(), 2);
+
+        // (7) by-destination sees the live claimant; local remove keys on the
+        // CURRENT destination and is idempotent.
+        assert_eq!(
+            dir.list_transport_destinations_by_destination(ws_dest)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(dir
+            .remove_transport_destination(occ, "websocket", ws_dest)
+            .await
+            .unwrap());
+        assert!(!dir
+            .remove_transport_destination(occ, "websocket", ws_dest)
+            .await
+            .unwrap());
+        assert_eq!(
+            dir.list_transport_destinations_for(occ)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// **The authenticated-apply + tombstone matrix** for
+    /// `put_signed_transport_destination`, with REAL hybrid crypto:
+    /// - a valid self-signed route is admitted (`Inserted`), its
+    ///   `binding_provenance` honored from the VERIFIED envelope;
+    /// - a byte-identical replay is `Unchanged`;
+    /// - a forged signature / an unrelated-but-registered signer / a typed
+    ///   projection diverging from the envelope are each `Err` (fail-closed);
+    /// - an acts-for occurrence key of the subject is admitted;
+    /// - an older `(epoch, asserted_at)` replay is `Refused`; a same-clock
+    ///   fork is `Refused`;
+    /// - a signed RETIREMENT (`retired_at`, higher epoch) supersedes; the
+    ///   retired route disappears from every `list_*` read but keeps
+    ///   gossiping via the signed reads; older gossip cannot resurrect it;
+    /// - a trusted-local put that supersedes a signed row drops the stored
+    ///   signature container.
+    pub(crate) async fn run_signed_transport_route_matrix(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
+        use ciris_verify_core::self_at_login::HybridSigningIdentity;
+        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
+        use TransportDestinationApplyOutcome as Outcome;
+
+        let alice_id = format!("sig-alice-{suffix}");
+        let phone_id = format!("sig-alice-phone-{suffix}");
+        let mallory_id = format!("sig-mallory-{suffix}");
+
+        // Box the hybrid signers and build them BEFORE any await — a multi-KiB
+        // ML-DSA signer held across an await inlines into the caller's future
+        // and overflows the 2MB test stack.
+        let alice = Box::new(HybridSigningIdentity::new(
+            &alice_id,
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let phone = Box::new(HybridSigningIdentity::new(
+            &phone_id,
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let mallory = Box::new(HybridSigningIdentity::new(
+            &mallory_id,
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        for (id, ident) in [
+            (&alice_id, alice.as_ref()),
+            (&phone_id, phone.as_ref()),
+            (&mallory_id, mallory.as_ref()),
+        ] {
+            let member = ident.directory_member().unwrap();
+            dir.put_public_key(SignedKeyRecord {
+                record: fixture_key(
+                    id,
+                    member.ed25519_public_key_base64.clone(),
+                    member.mldsa65_public_key_base64.clone(),
+                ),
+            })
+            .await
+            .expect("register fixture key");
+        }
+        // Bind the phone key as an occurrence of alice, so it may act-for
+        // routes whose subject is alice.
+        dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+            identity_key_id: alice_id.clone(),
+            occurrence_key_id: phone_id.clone(),
+            device_class: crate::federation::types::device_class::AGENT.into(),
+            hardware_attestation: None,
+            asserted_at: ts("2026-06-01T00:00:00Z"),
+            valid_until: None,
+            encryption_pubkeys: None,
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        })
+        .await
+        .expect("bind acts-for occurrence");
+
+        // The envelope IS the serialized typed row (minus the unsigned
+        // last_seen_at, which route() leaves None) — projection ≡ envelope by
+        // construction; the gate re-derives every field from the envelope.
+        let mut r1 = route(&alice_id, "reticulum", "d1", 0, "2026-06-10T00:00:00Z");
+        r1.binding_provenance = BindingProvenance::Advisory;
+        let (env1, sig1) =
+            produce_signed_identity_occurrence(alice.as_ref(), serde_json::to_value(&r1).unwrap())
+                .await
+                .unwrap();
+        let s1 = SignedTransportDestination {
+            transport_destination: r1.clone(),
+            attesting_key_id: alice_id.clone(),
+            signed_envelope: env1.clone(),
+            signature: sig1.clone(),
+        };
+
+        // (1) Valid self-signed → Inserted; provenance honored from the
+        // VERIFIED envelope (Advisory in, Advisory stored — no unauthenticated
+        // Rooted upgrade possible).
+        assert_eq!(
+            dir.put_signed_transport_destination(&s1).await.unwrap(),
+            Outcome::Inserted
+        );
+        let rows = dir
+            .list_transport_destinations_for(&alice_id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].binding_provenance, BindingProvenance::Advisory);
+
+        // (2) Byte-identical replay → Unchanged.
+        assert_eq!(
+            dir.put_signed_transport_destination(&s1).await.unwrap(),
+            Outcome::Unchanged
+        );
+
+        // (3) Forged signature → Err; row untouched.
+        let mut bad = s1.clone();
+        bad.signature.ed25519_signature_base64 = B64.encode([0u8; 64]);
+        let err = dir
+            .put_signed_transport_destination(&bad)
+            .await
+            .expect_err("forged signature must be rejected");
+        assert_eq!(err.kind(), "federation_signature_invalid");
+
+        // (4) Unrelated-but-REGISTERED signer: mallory validly signs the
+        // victim's envelope with her own key → signer_acts_for rejects.
+        let (m_env, m_sig) = produce_signed_identity_occurrence(
+            mallory.as_ref(),
+            serde_json::to_value(&r1).unwrap(),
+        )
+        .await
+        .unwrap();
+        let err = dir
+            .put_signed_transport_destination(&SignedTransportDestination {
+                transport_destination: r1.clone(),
+                attesting_key_id: mallory_id.clone(),
+                signed_envelope: m_env,
+                signature: m_sig,
+            })
+            .await
+            .expect_err("a peer's route assertion for a victim must be rejected");
+        assert_eq!(err.kind(), "federation_signature_invalid");
+
+        // (5) Divergent typed projection (envelope says d1, typed claims
+        // attacker-dest) → Err.
+        let mut divergent = s1.clone();
+        divergent.transport_destination.destination = "attacker-dest".into();
+        let err = dir
+            .put_signed_transport_destination(&divergent)
+            .await
+            .expect_err("typed projection diverging from the envelope must be rejected");
+        assert!(format!("{err}").contains("diverges"), "got {err}");
+        // ... including a provenance-only divergence (the AV-42 upgrade).
+        let mut prov_divergent = s1.clone();
+        prov_divergent.transport_destination.binding_provenance = BindingProvenance::Rooted;
+        let err = dir
+            .put_signed_transport_destination(&prov_divergent)
+            .await
+            .expect_err("typed Rooted over an Advisory envelope must be rejected");
+        assert!(format!("{err}").contains("diverges"), "got {err}");
+
+        // (6) Acts-for: the phone key (a bound occurrence of alice) signs the
+        // epoch-1 rotation → Superseded.
+        let r2 = route(&alice_id, "reticulum", "d2", 1, "2026-06-11T00:00:00Z");
+        let (env2, sig2) =
+            produce_signed_identity_occurrence(phone.as_ref(), serde_json::to_value(&r2).unwrap())
+                .await
+                .unwrap();
+        let s2 = SignedTransportDestination {
+            transport_destination: r2.clone(),
+            attesting_key_id: phone_id.clone(),
+            signed_envelope: env2,
+            signature: sig2,
+        };
+        assert_eq!(
+            dir.put_signed_transport_destination(&s2).await.unwrap(),
+            Outcome::Superseded
+        );
+
+        // (7) Older (epoch, asserted_at) replay → Refused (never an error).
+        assert!(matches!(
+            dir.put_signed_transport_destination(&s1).await.unwrap(),
+            Outcome::Refused { .. }
+        ));
+
+        // (8) Same (epoch, asserted_at), DIFFERENT content → Refused
+        // (a same-clock fork is fail-closed, not last-writer-wins).
+        let fork = route(&alice_id, "reticulum", "d2-fork", 1, "2026-06-11T00:00:00Z");
+        let (fork_env, fork_sig) = produce_signed_identity_occurrence(
+            alice.as_ref(),
+            serde_json::to_value(&fork).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            dir.put_signed_transport_destination(&SignedTransportDestination {
+                transport_destination: fork.clone(),
+                attesting_key_id: alice_id.clone(),
+                signed_envelope: fork_env,
+                signature: fork_sig,
+            })
+            .await
+            .unwrap(),
+            Outcome::Refused { .. }
+        ));
+
+        // (9) Signed RETIREMENT: retired_at set, higher epoch → Superseded.
+        let mut tomb = route(&alice_id, "reticulum", "d2", 2, "2026-06-12T00:00:00Z");
+        tomb.retired_at = Some(ts("2026-06-12T00:00:00Z"));
+        let (tomb_env, tomb_sig) = produce_signed_identity_occurrence(
+            alice.as_ref(),
+            serde_json::to_value(&tomb).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dir.put_signed_transport_destination(&SignedTransportDestination {
+                transport_destination: tomb.clone(),
+                attesting_key_id: alice_id.clone(),
+                signed_envelope: tomb_env.clone(),
+                signature: tomb_sig,
+            })
+            .await
+            .unwrap(),
+            Outcome::Superseded
+        );
+        // Retired ⇒ gone from every list_* read...
+        assert!(dir
+            .list_transport_destinations_for(&alice_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!dir
+            .list_all_transport_destinations()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.occurrence_key_id == alice_id));
+        assert!(dir
+            .list_transport_destinations_by_destination("d2")
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.occurrence_key_id != alice_id));
+        // ...but the tombstone keeps gossiping via the signed reads,
+        // byte-exact.
+        let signed_rows = dir
+            .list_signed_transport_destinations_for(&alice_id)
+            .await
+            .unwrap();
+        assert_eq!(signed_rows.len(), 1, "tombstones must gossip");
+        assert_eq!(signed_rows[0].signed_envelope, tomb_env);
+        assert!(signed_rows[0].transport_destination.retired_at.is_some());
+        let records = dir
+            .list_signed_records(
+                crate::federation::namespace::ReplicatedKind::TransportDestination,
+                &alice_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "list_signed_records carries the tombstone"
+        );
+        let round_trip: SignedTransportDestination =
+            serde_json::from_value(records[0].canonical_json.clone()).unwrap();
+        assert_eq!(round_trip.signed_envelope, tomb_env);
+
+        // (10) A replayed OLDER live put cannot resurrect the retired route.
+        assert!(matches!(
+            dir.put_signed_transport_destination(&s2).await.unwrap(),
+            Outcome::Refused { .. }
+        ));
+        assert!(dir
+            .list_transport_destinations_for(&alice_id)
+            .await
+            .unwrap()
+            .is_empty());
+        // ...and neither can a stale LOCAL put (silent no-op).
+        dir.put_transport_destination(&route(
+            &alice_id,
+            "reticulum",
+            "d-necromancer",
+            1,
+            "2026-07-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        assert!(dir
+            .list_transport_destinations_for(&alice_id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // (11) A trusted-local put with a HIGHER epoch re-establishes the
+        // route AND drops the stored signature container (it attested the
+        // old content) — the signed read goes quiet until the next signed put.
+        dir.put_transport_destination(&route(
+            &alice_id,
+            "reticulum",
+            "d3",
+            3,
+            "2026-06-13T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        let rows = dir
+            .list_transport_destinations_for(&alice_id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].destination, "d3");
+        assert!(
+            dir.list_signed_transport_destinations_for(&alice_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a local supersede must drop the stale signature container"
+        );
     }
 }

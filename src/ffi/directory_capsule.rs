@@ -513,6 +513,30 @@ pub enum DirectoryOp {
         /// The signed revocation container to admit.
         revocation: crate::federation::SignedIdentityOccurrenceRevocation,
     },
+    /// [`FederationDirectory::put_signed_transport_destination`] (#443) — the
+    /// AUTHENTICATED route-plane replication apply: the wire path edge's
+    /// replication bridge drives instead of the trusted-local
+    /// `PutTransportDestination` (which stays for the node's OWN routes). The
+    /// gate (hybrid 1-of-1 over `JCS(signed_envelope)` against the pinned key
+    /// of `attesting_key_id` + `signer_acts_for` + divergence check) runs
+    /// INSIDE persist's `.so` at dispatch, then the `(epoch, asserted_at)`
+    /// monotonic guard applies — a forged or stale route is refused before /
+    /// without any write. Result rides the new
+    /// `TransportDestinationApplyOutcome` variant. APPEND-ONLY.
+    PutSignedTransportDestination {
+        /// The signed route record to apply.
+        signed: self_at_login::SignedTransportDestination,
+    },
+    /// [`FederationDirectory::list_signed_transport_destinations_for`] (#443)
+    /// — the route-plane signed replication read: SIGNED-put rows (incl.
+    /// retired tombstones) with their byte-exact signature container, so the
+    /// edge re-publishes routes it cannot re-sign (the #418/#421 pattern).
+    /// Result rides the new `SignedTransportDestinations` variant.
+    /// APPEND-ONLY.
+    ListSignedTransportDestinationsFor {
+        /// The occurrence `key_id` whose signed routes to enumerate.
+        occurrence_key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -590,6 +614,16 @@ pub enum DirectoryOpResult {
     /// `list_signed_records` (#425) — the uniform per-kind signed read.
     /// APPEND-ONLY.
     SignedReplicatedRecords(Vec<crate::federation::namespace::SignedReplicatedRecord>),
+    /// `put_signed_transport_destination` (#443) — the monotonic route apply
+    /// OUTCOME (`Inserted` / `Superseded` / `Unchanged` / `Refused{reason}`).
+    /// A `Refused` is a *policy* outcome carried HERE, NOT flattened to the
+    /// top-level [`DirectoryOpResult::Err`] (which is reserved for gate
+    /// failures / real backend errors). APPEND-ONLY.
+    TransportDestinationApplyOutcome(self_at_login::TransportDestinationApplyOutcome),
+    /// `list_signed_transport_destinations_for` (#443) — the signed-put
+    /// routes with their signature container, for transport replication.
+    /// APPEND-ONLY.
+    SignedTransportDestinations(Vec<self_at_login::SignedTransportDestination>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -719,6 +753,24 @@ pub async fn dispatch_directory_op(
         DirectoryOp::PutIdentityOccurrenceRevocation { revocation } => {
             match dir.put_identity_occurrence_revocation(revocation).await {
                 Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        // #443 — the gate + monotonic apply run INSIDE persist's .so against
+        // persist's own vtable; the consumer gets the policy outcome, and a
+        // gate failure flattens to the top-level Err (record inadmissible).
+        DirectoryOp::PutSignedTransportDestination { signed } => {
+            match dir.put_signed_transport_destination(&signed).await {
+                Ok(outcome) => DirectoryOpResult::TransportDestinationApplyOutcome(outcome),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedTransportDestinationsFor { occurrence_key_id } => {
+            match dir
+                .list_signed_transport_destinations_for(&occurrence_key_id)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SignedTransportDestinations(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -1801,6 +1853,46 @@ impl FederationDirectory for OpsDirectory {
         }
     }
 
+    async fn put_signed_transport_destination(
+        &self,
+        signed: &self_at_login::SignedTransportDestination,
+    ) -> Result<self_at_login::TransportDestinationApplyOutcome, Error> {
+        // #443 — the authenticated route apply across the wheel boundary;
+        // gate + monotonic guard run inside persist's .so.
+        match self
+            .run_op(&DirectoryOp::PutSignedTransportDestination {
+                signed: signed.clone(),
+            })
+            .await?
+        {
+            DirectoryOpResult::TransportDestinationApplyOutcome(outcome) => Ok(outcome),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    async fn list_signed_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<self_at_login::SignedTransportDestination>, Error> {
+        // #443 — the route-plane signed replication read across the wheel
+        // boundary (byte-exact container round-trip).
+        match self
+            .run_op(&DirectoryOp::ListSignedTransportDestinationsFor {
+                occurrence_key_id: occurrence_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::SignedTransportDestinations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     async fn list_held_fountain_content(
         &self,
         publisher_key_id: &str,
@@ -2730,6 +2822,10 @@ mod tests {
             transport_x25519_pubkey_base64: Some("dHJhbnNwb3J0LXgyNTUxOQ==".into()),
             // #413 — the provenance tag rides the ABI via serde.
             binding_provenance: self_at_login::BindingProvenance::Advisory,
+            // #443 — the route-table epoch + tombstone ride the ABI via serde
+            // (serde-default ⇒ older consumers' records read epoch 0, live).
+            epoch: 7,
+            retired_at: None,
         };
 
         let put = run_op(
@@ -2760,6 +2856,74 @@ mod tests {
             (DirectoryOpResult::TransportDestinations(v), Ok(w)) => assert_eq!(v, w),
             (DirectoryOpResult::Err(_), Err(_)) => {}
             (a, b) => panic!("capsule/direct list mismatch: {a:?} vs {b:?}"),
+        }
+
+        // SAFETY: single-drop, matched vtable.
+        unsafe { (directory.vtable.drop)(directory.data) };
+    }
+
+    /// #443 — the appended signed-route ops cross the ABI: an unauthenticated
+    /// container is REFUSED inside the .so (fail-closed, top-level Err — the
+    /// confused-deputy write can no longer ride the capsule), and the signed
+    /// list round-trips its (empty) result shape.
+    #[test]
+    fn signed_transport_destination_ops_fail_closed_and_round_trip() {
+        let rt = test_runtime();
+        let (dir, directory) = memory_directory();
+
+        let signed = self_at_login::SignedTransportDestination {
+            transport_destination: self_at_login::TransportDestination {
+                occurrence_key_id: "occ-1".into(),
+                transport_kind: "reticulum".into(),
+                destination: "abcd".into(),
+                asserted_at: chrono::Utc::now(),
+                last_seen_at: None,
+                transport_ed25519_pubkey_base64: None,
+                transport_x25519_pubkey_base64: None,
+                binding_provenance: self_at_login::BindingProvenance::Rooted,
+                epoch: 1,
+                retired_at: None,
+            },
+            attesting_key_id: "nobody".into(),
+            // No verifiable envelope/signature — the gate must refuse.
+            signed_envelope: serde_json::json!({}),
+            signature: ciris_verify_core::transport_binding::TransportBindingSignature {
+                ed25519_signature_base64: String::new(),
+                mldsa65_signature_base64: None,
+            },
+        };
+        let put = run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::PutSignedTransportDestination {
+                signed: signed.clone(),
+            },
+        );
+        assert!(
+            matches!(put, DirectoryOpResult::Err(_)),
+            "an unauthenticated signed-route apply must fail closed, got {put:?}"
+        );
+        // Direct call agrees (same gate, same vtable).
+        assert!(rt
+            .block_on(dir.put_signed_transport_destination(&signed))
+            .is_err());
+        // Nothing was written.
+        assert!(rt
+            .block_on(dir.list_transport_destinations_for("occ-1"))
+            .unwrap()
+            .is_empty());
+
+        // The signed list op round-trips its result shape (empty here).
+        let listed = run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ListSignedTransportDestinationsFor {
+                occurrence_key_id: "occ-1".into(),
+            },
+        );
+        match listed {
+            DirectoryOpResult::SignedTransportDestinations(v) => assert!(v.is_empty()),
+            other => panic!("expected SignedTransportDestinations, got {other:?}"),
         }
 
         // SAFETY: single-drop, matched vtable.

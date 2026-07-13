@@ -129,13 +129,17 @@ pub(crate) mod serde_bytes_b64 {
 }
 
 pub use admission::{
-    canonical_withdrawal_payload_sha256, check_canonical_role_admission,
-    check_canonical_role_admission_over_roster, check_cohort_scope, check_consensus_protocol_form,
-    check_device_class, check_encryption_pubkeys, check_infra_attest_role_admission,
-    check_infra_attest_role_admission_over_roster, check_observed_region, is_canonical,
-    is_canonical_effective, is_infra_attest, is_infra_attest_effective, supersede_canonical,
+    canonical_withdrawal_payload_sha256, check_accord_role_admission_over_roster,
+    check_canonical_role_admission, check_canonical_role_admission_over_roster,
+    check_co_steward_role_admission, check_co_steward_role_admission_over_roster,
+    check_cohort_scope, check_consensus_protocol_form, check_device_class,
+    check_encryption_pubkeys, check_infra_attest_role_admission,
+    check_infra_attest_role_admission_over_roster, check_observed_region, has_effective_role,
+    has_effective_role_over_roster, is_canonical, is_canonical_effective, is_infra_attest,
+    is_infra_attest_effective, op_withdraw_role, supersede_canonical,
     verify_canonical_supersede_authority, verify_canonical_withdraw_authority,
-    verify_signed_identity_occurrence_revocation, withdraw_canonical_role,
+    verify_signed_identity_occurrence_revocation, verify_signed_transport_destination,
+    withdraw_accord_role, withdraw_accord_role_over_roster, withdraw_canonical_role,
     withdraw_infra_attest_role, AttestationLadderTransitionPolicy, CanonicalWithdrawal,
     DimensionAdmissionPolicy, DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule,
     RoleWithdrawal, ATTESTATION_LADDER_MECHANISMS,
@@ -188,8 +192,8 @@ pub use schema_resolver::{
 };
 pub use self_at_login::{
     delegates_to_agent_envelope, delegates_to_envelope, owner_binding_delegates_to_envelope,
-    partnership_accept_envelope, partnership_grant_envelope, TransportDestination,
-    SELF_AT_LOGIN_DELEGATION_SCOPE,
+    partnership_accept_envelope, partnership_grant_envelope, SignedTransportDestination,
+    TransportDestination, TransportDestinationApplyOutcome, SELF_AT_LOGIN_DELEGATION_SCOPE,
 };
 pub use shared_instance::{SharedInstanceLease, DEFAULT_STALE_AFTER};
 #[cfg(feature = "sqlite")]
@@ -1492,9 +1496,10 @@ pub trait FederationDirectory: Send + Sync {
     /// call ([`ReplicatedKind::all`](namespace::ReplicatedKind::all)) instead of
     /// a bespoke `list_* + selector` per plane. A DEFAULT method composing the
     /// existing per-kind reads — backend parity (pg / sqlite / memory) inherited,
-    /// no override. The occurrence arm uses the #418 SIGNED read so the detached
-    /// signature container survives; the embedded-signature kinds (key record,
-    /// attestation, transport) are byte-exact from their bare read. Each record
+    /// no override. The occurrence, revocation and (since #443) transport arms
+    /// use their SIGNED reads so the detached signature container survives; the
+    /// embedded-signature kinds (key record, attestation) are byte-exact from
+    /// their bare read. Each record
     /// is serialized to canonical JSON; the receiver's put gate re-canonicalizes
     /// via JCS, so the round-trip preserves verifiability.
     async fn list_signed_records(
@@ -1529,9 +1534,14 @@ pub trait FederationDirectory: Send + Sync {
                 self.list_signed_identity_occurrences_for(subject_key_id)
                     .await?,
             ),
+            // v17.0.0 (#443): the route arm returns the SIGNED container
+            // (byte-exact re-publish; signed-put rows only — a bare local
+            // route is not replicable) INCLUDING retired tombstones, which
+            // must gossip so the mesh converges on the retirement.
             K::TransportDestination => wrap(
                 kind,
-                self.list_transport_destinations_for(subject_key_id).await?,
+                self.list_signed_transport_destinations_for(subject_key_id)
+                    .await?,
             ),
             K::Attestation => wrap(kind, self.list_attestations_for(subject_key_id).await?),
             // v16.0.0 (#421): the revocation arm returns the SIGNED container
@@ -2877,14 +2887,20 @@ pub trait FederationDirectory: Send + Sync {
 
     // ── transport_destination (CIRISPersist#183, CEG §5.6.8.8.1) ───
 
-    /// v6.5.0 (CIRISPersist#183, CEG §5.6.8.8.1) — register (or refresh)
-    /// one reachable network address for an occurrence. **Idempotent on
-    /// the `(occurrence_key_id, transport_kind, destination)` PK** — a
-    /// re-assert updates `asserted_at` / `last_seen_at` in place. The
-    /// occurrence key must exist in `federation_keys` (FK).
+    /// v6.5.0 (CIRISPersist#183, CEG §5.6.8.8.1) — register (or refresh) the
+    /// reachable network address for an occurrence. **The trusted-LOCAL
+    /// put** (self-at-login, the node's own engine); the replication plane
+    /// goes through [`Self::put_signed_transport_destination`] instead.
     ///
-    /// Reachability is mutable + disposable (drop + re-register, not
-    /// revoke), so this row carries no signature / `persist_row_hash`.
+    /// v17.0.0 (CIRISPersist#443) — route-table semantics: keyed on the
+    /// `(occurrence_key_id, transport_kind)` PK (`destination` is payload —
+    /// one live route per peer per transport), and **guarded monotonic**: the
+    /// write applies iff no row exists or the incoming `(epoch, asserted_at)`
+    /// is lexicographically greater than the stored one. A stale assertion is
+    /// a silent no-op (never an error — the local caller re-reads if it
+    /// cares). A local put that supersedes a SIGNED row NULLs the stored
+    /// signature container (it attested the old content).
+    ///
     /// Default impl errors; the three backends override.
     async fn put_transport_destination(
         &self,
@@ -2896,9 +2912,56 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
-    /// v6.5.0 — list every reachable address registered for
-    /// `occurrence_key_id` ("how do I reach this occurrence?"). Empty
-    /// when none. Liveness filtering (on `last_seen_at` age) is
+    /// v17.0.0 (CIRISPersist#443) — the **authenticated replication apply**
+    /// for the route plane: verify the
+    /// [`verify_signed_transport_destination`](admission::verify_signed_transport_destination)
+    /// gate (hybrid 1-of-1 over `JCS(signed_envelope)` against the PINNED
+    /// federation pubkeys of `attesting_key_id`, typed-projection ≡ envelope,
+    /// `signer_acts_for`) BEFORE any write, then apply under the same
+    /// `(epoch, asserted_at)` monotonic guard as the local put, storing the
+    /// signature container for byte-exact re-publish.
+    ///
+    /// Outcomes ([`TransportDestinationApplyOutcome`](self_at_login::TransportDestinationApplyOutcome)):
+    /// fresh `(occ, kind)` ⇒ `Inserted`; strictly newer ⇒ `Superseded`
+    /// (retirement — `retired_at` set — rides this too); identical typed
+    /// content ⇒ `Unchanged`; older, or same `(epoch, asserted_at)` with
+    /// different content ⇒ `Refused` (fail-closed, re-offerable). Gate
+    /// failures surface as `Err` — the record itself is inadmissible.
+    ///
+    /// Default impl errors; the three backends override.
+    async fn put_signed_transport_destination(
+        &self,
+        signed: &self_at_login::SignedTransportDestination,
+    ) -> Result<self_at_login::TransportDestinationApplyOutcome, Error> {
+        let _ = signed;
+        Err(Error::Backend(
+            "put_signed_transport_destination not implemented for this backend".into(),
+        ))
+    }
+
+    /// v17.0.0 (CIRISPersist#443) — the route-plane **signed replication
+    /// read**: every SIGNED-put route row of `occurrence_key_id` with its
+    /// original `{attesting_key_id, signed_envelope, signature}` container,
+    /// byte-exact (the mirror of
+    /// [`Self::list_signed_identity_occurrence_revocations_for`]). Trusted-
+    /// local rows (NULL signature columns) are OMITTED — a bare local route
+    /// is not replicable (the receiver could not verify it). RETIRED rows are
+    /// INCLUDED: tombstones must gossip. Default impl errors; the three
+    /// backends override.
+    async fn list_signed_transport_destinations_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Vec<self_at_login::SignedTransportDestination>, Error> {
+        let _ = occurrence_key_id;
+        Err(Error::Backend(
+            "list_signed_transport_destinations_for not implemented for this backend".into(),
+        ))
+    }
+
+    /// v6.5.0 — list every LIVE route registered for `occurrence_key_id`
+    /// ("how do I reach this occurrence?"): at most one row per
+    /// `transport_kind` since #443, RETIRED (tombstoned) rows excluded.
+    /// Empty when none. Liveness filtering (on `last_seen_at` age) is
     /// caller-side. Default impl errors; the three backends override.
     async fn list_transport_destinations_for(
         &self,
@@ -2917,7 +2980,10 @@ pub trait FederationDirectory: Send + Sync {
     /// transport-tier ed25519 (#397) + x25519 KEX (#411) — to repopulate its
     /// rooted-peers map + KEX resolver, with zero re-announces. The per-key
     /// [`Self::list_transport_destinations_for`] cannot reconstruct the whole set
-    /// (it needs every key_id up front). Default impl errors; backends override.
+    /// (it needs every key_id up front). #443: RETIRED rows excluded; ordered
+    /// by `(occurrence_key_id, transport_kind)` — the route key, so the
+    /// restore order is deterministic and "which is current" is structural
+    /// (one row per key). Default impl errors; backends override.
     async fn list_all_transport_destinations(
         &self,
     ) -> Result<Vec<self_at_login::TransportDestination>, Error> {
@@ -2933,7 +2999,7 @@ pub trait FederationDirectory: Send + Sync {
     /// can PREFER a [`BindingProvenance::Rooted`](self_at_login::BindingProvenance::Rooted)
     /// binding over an [`Advisory`](self_at_login::BindingProvenance::Advisory)
     /// one — the AV-42 spoof is resolved by preference, never a substrate reject.
-    /// Default impl errors; backends override.
+    /// #443: RETIRED rows excluded. Default impl errors; backends override.
     async fn list_transport_destinations_by_destination(
         &self,
         destination: &str,
@@ -2946,7 +3012,15 @@ pub trait FederationDirectory: Send + Sync {
 
     /// v6.5.0 — drop one reachable address (e.g. a stale relay). Returns
     /// `true` if a row was removed, `false` if absent (idempotent).
-    /// Default impl errors; the three backends override.
+    ///
+    /// **LOCAL-ONLY DELETE (#443)** — this is a node-local hygiene operation
+    /// that does NOT replicate: a peer that gossiped the route will offer it
+    /// again, and a plain delete carries no anti-resurrection state. Route
+    /// RETIREMENT on the mesh is a signed put with `retired_at` set and a
+    /// higher `(epoch, asserted_at)` via
+    /// [`Self::put_signed_transport_destination`] — the durable tombstone the
+    /// monotonic guard defends. Default impl errors; the three backends
+    /// override.
     async fn remove_transport_destination(
         &self,
         occurrence_key_id: &str,
@@ -4354,6 +4428,58 @@ pub enum Error {
         superseded_by: Option<String>,
     },
 
+    /// v17.0.0 (CIRISPersist#440/#441) — a `federation_keys` write was REFUSED
+    /// because it claims an accord-conferred `role` (on EITHER role surface —
+    /// the `identity_type` set or the `roles` vector,
+    /// [`types::KeyRecord::claims_role`]) without the accord family m-of-n
+    /// co-scrub. The role-generic mirror of
+    /// [`Self::CanonicalRoleNotAccordConferred`] /
+    /// [`Self::InfraAttestRoleNotAccordConferred`], carried by the CC 3.4.9
+    /// co-steward roles (`registry`/`verify`) and every future
+    /// accord-conferred role. Fail-closed (verify-before-mutation, AV-9 — the
+    /// row is NOT stored). Stable `kind()` token `role_not_accord_conferred`.
+    /// See [`admission::check_accord_role_admission_over_roster`].
+    #[error(
+        "federation_keys row {key_id:?} claims the accord-conferred role {role:?} but is not \
+         accord-conferred (scrub_key_id={scrub_key_id:?}, reason: {reason}); accord-conferred \
+         roles are conferred by the accord family m-of-n co-scrub, never self-claimed — on \
+         either role surface (identity_type set or roles vector)"
+    )]
+    RoleNotAccordConferred {
+        /// The accord-conferred role token the row claimed.
+        role: String,
+        /// The `key_id` of the row that attempted to carry the role.
+        key_id: String,
+        /// The row's `scrub_key_id` (the claimed scrubber).
+        scrub_key_id: String,
+        /// Why the record failed the accord-conferred test (self-signed /
+        /// sub-quorum scrub set / non-anchor scrubbers).
+        reason: String,
+    },
+
+    /// v17.0.0 (CIRISPersist#440) — a `federation_keys` write was REFUSED
+    /// because it would confer `role` on a `key_id` the accord quorum has
+    /// WITHDRAWN (a durable V104 tombstone whose `superseded_by` does not name
+    /// this key). The role-generic revocation-wins consult — the #377 rule
+    /// carried by [`admission::check_accord_role_admission_over_roster`].
+    /// Stable `kind()` token `role_withdrawn`. See
+    /// [`admission::withdraw_accord_role`].
+    #[error(
+        "federation_keys row {key_id:?} was refused the accord-conferred role {role:?}: the \
+         accord quorum withdrew it (V104 tombstone; superseded_by={superseded_by:?}) — a \
+         withdrawn key cannot be re-conferred the role, even by a valid co-scrub \
+         (revocation-wins)"
+    )]
+    RoleWithdrawn {
+        /// The withdrawn role token.
+        role: String,
+        /// The `key_id` that carries a withdrawal tombstone.
+        key_id: String,
+        /// The successor `key_id` the withdrawal points to (a supersede), or
+        /// `None` for a plain withdraw.
+        superseded_by: Option<String>,
+    },
+
     /// v13.1.0 (CIRISPersist#377, FSD Trust Root m-of-n) — a canonical
     /// withdraw/supersede was REFUSED because its accord live-quorum authority
     /// [`AccordDecision`](ciris_verify_core::accord_live_quorum::AccordDecision)
@@ -4634,6 +4760,8 @@ impl Error {
             }
             Error::InfraAttestRoleWithdrawn { .. } => "infra_attest_role_withdrawn",
             Error::CanonicalRoleWithdrawn { .. } => "canonical_role_withdrawn",
+            Error::RoleNotAccordConferred { .. } => "role_not_accord_conferred",
+            Error::RoleWithdrawn { .. } => "role_withdrawn",
             Error::CanonicalWithdrawalAuthorityInvalid { .. } => {
                 "canonical_withdrawal_authority_invalid"
             }

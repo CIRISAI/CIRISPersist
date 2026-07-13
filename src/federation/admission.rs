@@ -1617,6 +1617,178 @@ pub async fn verify_signed_identity_occurrence_revocation(
     .await
 }
 
+/// v17.0.0 (CIRISPersist#443) — the SIGNED transport-destination admission
+/// gate: the route-plane mirror of
+/// [`verify_signed_identity_occurrence_revocation`], closing the
+/// **route-hijack confused deputy** (CIRISEdge#336): before this the
+/// replication plane applied a bare unsigned `TransportDestination` through
+/// the plain local upsert, so any cohort node could overwrite the durable
+/// route — with an attacker-chosen `binding_provenance: Rooted` — for any
+/// key_id. Fail-secure; called by every `put_signed_transport_destination`
+/// (all three backends — one gate) BEFORE any write.
+///
+/// **Authority is `signed_envelope`, never the sender's typed projection** —
+/// the #418 discipline verbatim. `binding_provenance` in particular is read
+/// ONLY from the verified envelope. Verifies, each fail-closed:
+/// 1. the envelope carries `occurrence_key_id` / `transport_kind` /
+///    `destination` / `asserted_at` / `epoch` (+ optional `retired_at`,
+///    transport pubkeys, `binding_provenance`), and the typed projection
+///    persist will store EQUALS them (a divergent projection is the hijack
+///    reopening). `last_seen_at` is advisory liveness, not signed material.
+/// 2. the detached hybrid signature over `JCS(signed_envelope)` verifies at
+///    threshold **1-of-1** against the PINNED federation pubkeys of
+///    `attesting_key_id` ([`verify_threshold_signatures`] — RequireHybrid; a
+///    classical-only route assertion does not count);
+/// 3. `signer_acts_for`: the signer IS the route's `occurrence_key_id` or a
+///    key bound as an occurrence of it ([`check_signer_acts_for`]) — a peer
+///    cannot assert (or retire) a victim's route with its own unrelated key.
+///
+/// NOT feature-gated: backend-agnostic, and the MemoryBackend calls it (the
+/// #418 cfg lesson).
+///
+/// [`verify_threshold_signatures`]: ciris_verify_core::threshold::verify_threshold_signatures
+pub async fn verify_signed_transport_destination(
+    directory: &dyn super::FederationDirectory,
+    signed: &crate::federation::self_at_login::SignedTransportDestination,
+) -> Result<(), Error> {
+    use ciris_verify_core::threshold::{
+        verify_threshold_signatures, ThresholdMember, ThresholdSignature,
+    };
+
+    let row = &signed.transport_destination;
+    let env = &signed.signed_envelope;
+
+    // (1) Authoritative fields FROM the signed envelope; the typed projection
+    // must equal them (the signature covers only the envelope).
+    let str_field = |k: &str| -> Result<String, Error> {
+        env.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned())
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "signed transport_destination envelope missing string field `{k}`"
+                ))
+            })
+    };
+    let parse_ts = |k: &str, s: &str| -> Result<chrono::DateTime<chrono::Utc>, Error> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                Error::InvalidArgument(format!(
+                    "signed transport_destination envelope `{k}` not RFC-3339: {e}"
+                ))
+            })
+    };
+    // Optional string field: absent/null ⇒ None; a non-string is malformed.
+    let opt_str_field = |k: &str| -> Result<Option<String>, Error> {
+        match env.get(k) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(Error::InvalidArgument(format!(
+                "signed transport_destination envelope `{k}` must be a string"
+            ))),
+        }
+    };
+    let diverges = |what: &str| {
+        Error::InvalidArgument(format!(
+            "signed transport_destination: typed {what} diverges from the signed envelope \
+             (rejected)"
+        ))
+    };
+    if str_field("occurrence_key_id")? != row.occurrence_key_id {
+        return Err(diverges("occurrence_key_id"));
+    }
+    if str_field("transport_kind")? != row.transport_kind {
+        return Err(diverges("transport_kind"));
+    }
+    if str_field("destination")? != row.destination {
+        return Err(diverges("destination"));
+    }
+    if parse_ts("asserted_at", &str_field("asserted_at")?)? != row.asserted_at {
+        return Err(diverges("asserted_at"));
+    }
+    // `epoch` is the anti-rollback clock — REQUIRED in the envelope (a
+    // serde-default 0 in the typed projection must not be silently trusted).
+    let env_epoch = env.get("epoch").and_then(|v| v.as_u64()).ok_or_else(|| {
+        Error::InvalidArgument(
+            "signed transport_destination envelope missing unsigned-integer field `epoch`".into(),
+        )
+    })?;
+    if env_epoch != row.epoch {
+        return Err(diverges("epoch"));
+    }
+    // `retired_at` is the tombstone — a divergence here is a resurrection
+    // (or fabricated retirement) attack.
+    let env_retired = match opt_str_field("retired_at")? {
+        Some(s) => Some(parse_ts("retired_at", &s)?),
+        None => None,
+    };
+    if env_retired != row.retired_at {
+        return Err(diverges("retired_at"));
+    }
+    if opt_str_field("transport_ed25519_pubkey_base64")? != row.transport_ed25519_pubkey_base64 {
+        return Err(diverges("transport_ed25519_pubkey_base64"));
+    }
+    if opt_str_field("transport_x25519_pubkey_base64")? != row.transport_x25519_pubkey_base64 {
+        return Err(diverges("transport_x25519_pubkey_base64"));
+    }
+    // `binding_provenance` comes ONLY from the verified envelope (the AV-42 /
+    // #336 hijack asserted `Rooted` on an unauthenticated wire field). An
+    // absent/unknown token reads `Rooted` per the V100 back-compat rule, so a
+    // typed `Advisory` with an envelope that omits the field DIVERGES —
+    // fail-closed either way.
+    let env_provenance = crate::federation::self_at_login::BindingProvenance::from_token(
+        opt_str_field("binding_provenance")?.as_deref(),
+    );
+    if env_provenance != row.binding_provenance {
+        return Err(diverges("binding_provenance"));
+    }
+
+    // (2) Hybrid signature over JCS(signed_envelope) against the PINNED
+    // federation pubkeys of the claimed signer, threshold 1-of-1.
+    let Some(signer_key) = directory
+        .lookup_public_key(&signed.attesting_key_id)
+        .await?
+    else {
+        return Err(Error::SignatureInvalid(format!(
+            "signed transport_destination: attesting_key_id {} is not a registered federation key",
+            signed.attesting_key_id
+        )));
+    };
+    let bytes = crate::verify::canonical::ceg_produce_canonicalize(env).map_err(|e| {
+        Error::InvalidArgument(format!("signed transport_destination canonicalize: {e}"))
+    })?;
+    let members = [ThresholdMember {
+        member_id: signer_key.key_id.clone(),
+        ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
+        mldsa65_public_key_base64: signer_key.pubkey_ml_dsa_65_base64.clone(),
+        role: None,
+    }];
+    let sigs = [ThresholdSignature {
+        member_id: signed.attesting_key_id.clone(),
+        ed25519_signature_base64: signed.signature.ed25519_signature_base64.clone(),
+        mldsa65_signature_base64: signed.signature.mldsa65_signature_base64.clone(),
+    }];
+    if verify_threshold_signatures(&bytes, &members, &sigs, 1).is_err() {
+        return Err(Error::SignatureInvalid(format!(
+            "signed transport_destination for ({}, {}) not authentic (hybrid 1-of-1 over \
+             JCS(envelope) failed against the pinned key of {})",
+            row.occurrence_key_id, row.transport_kind, signed.attesting_key_id
+        )));
+    }
+
+    // (3) signer_acts_for — THE shared check ([`check_signer_acts_for`]),
+    // with the route's `occurrence_key_id` as the subject: the signer is the
+    // route's own key, or a key bound as an occurrence of it.
+    check_signer_acts_for(
+        directory,
+        &signed.attesting_key_id,
+        &row.occurrence_key_id,
+        "transport_destination",
+    )
+    .await
+}
+
 /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
 /// §3.3.2 R1) — admission-gate validation of the producer-side
 /// `observed_region` field on a revocation.
@@ -3250,8 +3422,10 @@ pub async fn check_canonical_role_admission_over_roster(
     row: &super::KeyRecord,
     roster_key_ids: &[String],
 ) -> Result<(), Error> {
-    // (1) Fast path: no `canonical` role in the set → nothing to gate.
-    if !identity_type::set_contains(&row.identity_type, identity_type::CANONICAL) {
+    // (1) Fast path: no `canonical` role on EITHER surface → nothing to gate.
+    // #441: evaluated over identity_type ∪ roles — `roles=["canonical"]` is
+    // the same claim as `identity_type="canonical"` and hits the same gate.
+    if !row.claims_role(identity_type::CANONICAL) {
         return Ok(());
     }
 
@@ -3408,13 +3582,11 @@ pub async fn check_infra_attest_role_admission_over_roster(
     row: &super::KeyRecord,
     roster_key_ids: &[String],
 ) -> Result<(), Error> {
-    // (1) Fast path: no `infra:attest` role → nothing to gate. (Plain
-    // authorization scopes in `roles` are untouched; only this token is gated.)
-    if !row
-        .roles
-        .iter()
-        .any(|r| r == super::types::roles::INFRA_ATTEST)
-    {
+    // (1) Fast path: no `infra:attest` role on EITHER surface → nothing to
+    // gate. (Plain authorization scopes in `roles` are untouched; only this
+    // token is gated.) #441: evaluated over identity_type ∪ roles so an
+    // `identity_type` self-claim cannot slip the roles-vector gate.
+    if !row.claims_role(super::types::roles::INFRA_ATTEST) {
         return Ok(());
     }
 
@@ -3443,6 +3615,153 @@ pub async fn check_infra_attest_role_admission_over_roster(
             scrub_key_id: row.scrub_key_id.clone(),
             reason,
         })
+}
+
+/// v17.0.0 (CIRISPersist#440, CC 3.4.9) — the **CC 3.4.9 co-steward role
+/// admission gate**: a `federation_keys` row may claim
+/// [`identity_type::REGISTRY`] or [`identity_type::VERIFY`] (on either role
+/// surface, [`super::KeyRecord::claims_role`]) IFF the record carries the
+/// accord family m-of-n co-scrub — the SAME ceremony that confers `canonical`
+/// and `infra:attest` ("same ceremony, different CEG object"). The co-steward
+/// relation is capability-granting (a consumer lifts the CC 3.4.9
+/// `confidence <= 0.5` single-source licensure cap on its say-so), so per the
+/// accord-ops invariant it is m-of-n conferred, never self-claimed.
+///
+/// Runs at every `federation_keys` write chokepoint (`put_public_key` on all
+/// three backends + `adopt_scrub_upgrade`); rides the role-generic core
+/// [`check_accord_role_admission_over_roster`]. Fail-closed
+/// ([`Error::RoleNotAccordConferred`], kind `role_not_accord_conferred`);
+/// withdrawal-aware via the V104 generic tombstone
+/// ([`Error::RoleWithdrawn`], kind `role_withdrawn`).
+pub async fn check_co_steward_role_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+) -> Result<(), Error> {
+    check_co_steward_role_admission_over_roster(directory, row, &accord_holder_roster_key_ids())
+        .await
+}
+
+/// [`check_co_steward_role_admission`] with an explicit accord-holder roster
+/// (tests inject their own signable holders).
+pub async fn check_co_steward_role_admission_over_roster(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+    roster_key_ids: &[String],
+) -> Result<(), Error> {
+    for role in identity_type::CO_STEWARD_ROLES {
+        check_accord_role_admission_over_roster(directory, row, role, roster_key_ids).await?;
+    }
+    Ok(())
+}
+
+/// v17.0.0 (CIRISPersist#440/#441) — the **role-generic accord-conferral
+/// admission gate**: `role` may be claimed (on either role surface,
+/// [`super::KeyRecord::claims_role`]) only by a record carrying the accord
+/// family m-of-n co-scrub, and only while no un-superseded V104 withdrawal
+/// tombstone names `(role, key_id)`. This is the third instantiation of the
+/// `canonical` / `infra:attest` gate shape, parameterized so every FUTURE
+/// accord-conferred role rides it with zero new gate code (`canonical` and
+/// `infra:attest` keep their dedicated functions for their CC-pinned error
+/// kinds).
+///
+/// - `row` does not claim `role` → `Ok(())` (no-op; the vast majority of rows).
+/// - `(role, key_id)` is quorum-withdrawn and not this key's own SUPERSEDE
+///   rotate-in → [`Error::RoleWithdrawn`] (revocation-wins, the #377 rule:
+///   anti-entropy re-runs this gate, so a peer re-offering the old co-scrubbed
+///   record cannot silently re-add the role).
+/// - Claim present, scrub set meets the live-roster strict majority
+///   ([`verify_accord_family_coscrub`], the ONE shared quorum core) → `Ok(())`.
+/// - Otherwise → [`Error::RoleNotAccordConferred`] (fail-closed; the caller
+///   must NOT store the row).
+pub async fn check_accord_role_admission_over_roster(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+    role: &str,
+    roster_key_ids: &[String],
+) -> Result<(), Error> {
+    // (1) Fast path: no claim on either role surface → nothing to gate.
+    if !row.claims_role(role) {
+        return Ok(());
+    }
+
+    // (2) Revocation-wins (#377/#424): a quorum-withdrawn (role, key_id) stays
+    // refused EVEN with a valid co-scrub set; a SUPERSEDE successor whose
+    // tombstone names THIS key_id is exempt (rotate-in).
+    if let Some(w) = directory.lookup_role_withdrawal(role, &row.key_id).await? {
+        if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
+            return Err(Error::RoleWithdrawn {
+                role: role.to_owned(),
+                key_id: row.key_id.clone(),
+                superseded_by: w.superseded_by.clone(),
+            });
+        }
+    }
+
+    // (3) The shared accord-family m-of-n co-scrub quorum core.
+    verify_accord_family_coscrub(directory, row, roster_key_ids)
+        .await
+        .map_err(|reason| Error::RoleNotAccordConferred {
+            role: role.to_owned(),
+            key_id: row.key_id.clone(),
+            scrub_key_id: row.scrub_key_id.clone(),
+            reason,
+        })
+}
+
+/// v17.0.0 (CIRISPersist#440) — the **self-authenticating effective-role
+/// read** a consumer resolves trust from: `key_id`'s stored row claims `role`
+/// (either role surface), the row's scrub set STILL VERIFIES to the accord
+/// family m-of-n ([`verify_accord_family_coscrub`], re-run against the live
+/// roster), and no un-superseded V104 tombstone names `(role, key_id)`.
+///
+/// The co-scrub is re-verified rather than trusted from claim-presence
+/// because the `roles` vector accepted arbitrary self-asserted tokens before
+/// v17.0.0 gated these roles — a row stored under ≤16.1.1 may carry a
+/// decorative self-claimed `registry`/`verify` that the write gate never saw.
+/// Re-deriving conferral from the row's own cryptography (never from write-
+/// gate history) means such a legacy row reads `false` here, by construction.
+///
+/// CIRISServer's CC 3.4.9 `licensure_cap` resolves "which co-steward is this
+/// attesting key" through this (dropping its by-pin fallback):
+/// `has_effective_role(dir, kid, identity_type::REGISTRY)` /
+/// `identity_type::VERIFY`. Role-generic on purpose; the `canonical` /
+/// `infra:attest` dedicated effective-reads stay as-is.
+pub async fn has_effective_role(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+    role: &str,
+) -> Result<bool, Error> {
+    has_effective_role_over_roster(directory, key_id, role, &accord_holder_roster_key_ids()).await
+}
+
+/// [`has_effective_role`] with an explicit accord-holder roster (tests inject
+/// their own signable holders).
+pub async fn has_effective_role_over_roster(
+    directory: &dyn super::FederationDirectory,
+    key_id: &str,
+    role: &str,
+    roster_key_ids: &[String],
+) -> Result<bool, Error> {
+    let Some(row) = directory.lookup_public_key(key_id).await? else {
+        return Ok(false);
+    };
+    if !row.claims_role(role) {
+        return Ok(false);
+    }
+    if verify_accord_family_coscrub(directory, &row, roster_key_ids)
+        .await
+        .is_err()
+    {
+        return Ok(false);
+    }
+    Ok(
+        match directory.lookup_role_withdrawal(role, key_id).await? {
+            // A supersede tombstone naming THIS key as its own successor is a
+            // rotate-in; anything else withdrawn ⇒ not effective.
+            Some(w) => w.superseded_by.as_deref() == Some(key_id),
+            None => true,
+        },
+    )
 }
 
 /// **CIRISPersist#422 — is `key_id` an accord-blessed build-signing pipeline?**
@@ -3895,6 +4214,78 @@ pub async fn withdraw_infra_attest_role_over_roster(
             None,
             &authority_digest,
         )
+        .await
+}
+
+/// v17.0.0 (CIRISPersist#440) — the canonical `op` token a role-generic
+/// WITHDRAW authority payload commits to: `withdraw_role:{role}`. The role
+/// token is INSIDE the op string (and therefore inside the JCS payload
+/// digest), so a decision authorizing withdrawal of one role can never be
+/// replayed to withdraw a different role from the same key. `canonical` and
+/// `infra:attest` keep their frozen dedicated tokens
+/// ([`OP_WITHDRAW_CANONICAL`] / [`OP_WITHDRAW_INFRA_ATTEST`]).
+pub fn op_withdraw_role(role: &str) -> String {
+    format!("withdraw_role:{role}")
+}
+
+/// v17.0.0 (CIRISPersist#440) — **withdraw** an accord-conferred role (the
+/// CC 3.4.9 co-stewards `registry`/`verify`, and every future
+/// [`check_accord_role_admission_over_roster`]-gated role) from `key_id`.
+/// The #377 op-parameterized authority core, role-generically: the stored
+/// accord proposal's payload must commit to
+/// `(`[`op_withdraw_role`]`(role), key_id)`; persist re-tallies its OWN
+/// cryptographically-verified participations against the accord-holder
+/// roster at the strict-majority destructive threshold (never a caller
+/// `AccordDecision.authorized` bool), then records the durable V104
+/// tombstone. Reverse-quorum per the accord-ops invariant; idempotent.
+///
+/// Refuses `canonical` and `infra:attest` — those roles have dedicated
+/// withdraw ops with frozen tokens and (for `canonical`) a dedicated V095
+/// tombstone table; routing them here would fork their audit surface.
+pub async fn withdraw_accord_role(
+    directory: &dyn super::FederationDirectory,
+    role: &str,
+    key_id: &str,
+    proposal_digest: &str,
+) -> Result<(), Error> {
+    withdraw_accord_role_over_roster(
+        directory,
+        role,
+        key_id,
+        proposal_digest,
+        &accord_holder_roster_key_ids(),
+    )
+    .await
+}
+
+/// [`withdraw_accord_role`] with an explicit accord-holder roster keyset
+/// (tests). Shares [`verify_canonical_authority_over_roster`] — the
+/// op-parameterized #377 authority core — so the quorum math lives in ONE
+/// place.
+pub async fn withdraw_accord_role_over_roster(
+    directory: &dyn super::FederationDirectory,
+    role: &str,
+    key_id: &str,
+    proposal_digest: &str,
+    roster_key_ids: &[String],
+) -> Result<(), Error> {
+    if role == identity_type::CANONICAL || role == crate::federation::types::roles::INFRA_ATTEST {
+        return Err(Error::InvalidArgument(format!(
+            "withdraw_accord_role: role {role:?} has a dedicated withdraw op \
+             (withdraw_canonical_role / withdraw_infra_attest_role) — use it"
+        )));
+    }
+    let authority_digest = verify_canonical_authority_over_roster(
+        directory,
+        proposal_digest,
+        &op_withdraw_role(role),
+        key_id,
+        None,
+        roster_key_ids,
+    )
+    .await?;
+    directory
+        .record_role_withdrawal(role, key_id, None, &authority_digest)
         .await
 }
 
@@ -7212,6 +7603,255 @@ mod canonical_gate_tests {
         let backend = MemoryBackend::new();
         run_infra_gate_matrix(&backend, "mem").await;
         run_infra_endtoend(&backend, "e2e-mem").await;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // CIRISPersist#441 — the `roles=[...]` set path runs the SAME
+    // accord-conferral admission gates as the scalar `identity_type`
+    // path (CC 4.5.8.1: cohabitation must not become a self-claim
+    // backdoor). Before #441 `roles=["agent","canonical"]` was ADMITTED
+    // where `identity_type="canonical"` was refused.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// End-to-end via `put_public_key` (production wrappers, isolated
+    /// backend): every constitutional role self-claim is refused with the
+    /// SAME error kind regardless of which role surface carries it.
+    async fn run_set_path_parity(dir: &dyn FederationDirectory, tag: &str) {
+        // (a) `canonical` in the roles VECTOR — the #441 probe case.
+        let kid = format!("sp-canon-roles-{tag}");
+        let mut rec = record(&kid, identity_type::NODE, &kid);
+        rec.roles = vec!["agent".to_owned(), identity_type::CANONICAL.to_owned()];
+        let err = put(dir, rec)
+            .await
+            .expect_err("(a) roles=[..,canonical] self-claim must be REFUSED");
+        assert_eq!(
+            err.kind(),
+            "canonical_role_not_accord_conferred",
+            "(a) set path must fire the SAME kind as the scalar path"
+        );
+        assert!(dir.lookup_public_key(&kid).await.unwrap().is_none());
+
+        // (b) `infra:attest` smuggled through the identity_type SET — the
+        // mirror-direction hole closed by the same claims_role predicate.
+        let kid = format!("sp-infra-set-{tag}");
+        let rec = record(&kid, "infra:attest,node", &kid);
+        let err = put(dir, rec)
+            .await
+            .expect_err("(b) identity_type set infra:attest self-claim must be REFUSED");
+        assert_eq!(err.kind(), "infra_attest_role_not_accord_conferred");
+
+        // (c) A plain self-assertable scope in `roles` stays admissible —
+        // the gate touches ONLY the accord-conferred tokens.
+        let kid = format!("sp-plain-{tag}");
+        let mut rec = record(&kid, identity_type::NODE, &kid);
+        rec.roles = vec!["cirislens_pipeline_writer".to_owned()];
+        put(dir, rec)
+            .await
+            .expect("(c) plain authorization scopes must remain self-assertable");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn set_path_parity_sqlite() {
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        run_set_path_parity(&backend, "sq").await;
+
+        // (d) `accord_holder` — hardware-attestation gate parity across all
+        // three claim shapes (scalar was already gated; set + vector are the
+        // #441 closures). Backend-specific: the HW policy lives on the SQL
+        // backends.
+        for (kid, ident, roles) in [
+            ("sp-ah-set-sq", "agent,accord_holder".to_owned(), Vec::new()),
+            (
+                "sp-ah-roles-sq",
+                identity_type::NODE.to_owned(),
+                vec![identity_type::ACCORD_HOLDER.to_owned()],
+            ),
+        ] {
+            let mut rec = record(kid, &ident, kid);
+            rec.roles = roles;
+            let err = backend
+                .put_public_key(SignedKeyRecord { record: rec })
+                .await
+                .expect_err("(d) accord_holder claim without evidence must be REFUSED");
+            assert_eq!(
+                err.kind(),
+                "federation_accord_holder_requires_attestation_evidence",
+                "(d) {kid}: every claim shape hits the HW gate"
+            );
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn set_path_parity_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping set_path_parity_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        super::run_in_isolated_pg_db(&dsn, |backend| async move {
+            run_set_path_parity(&backend, "pg").await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn set_path_parity_memory() {
+        use crate::store::memory::MemoryBackend;
+        let backend = MemoryBackend::new();
+        run_set_path_parity(&backend, "mem").await;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // CIRISPersist#440 — the CC 3.4.9 co-steward roles (`registry` /
+    // `verify`). Same accord m-of-n co-scrub ceremony as `canonical` /
+    // `infra:attest`, via the role-generic gate; withdrawal rides the
+    // V104 generic tombstone; `has_effective_role` is the consumer read.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// The co-steward decision table, end-to-end through the PRODUCTION
+    /// wrappers (real A1/B1/C1 roster key_ids seeded with test-signable
+    /// identities, the [`run_infra_endtoend`] pattern) — so it must run only
+    /// on ISOLATED backends.
+    async fn run_costeward_gate_matrix(dir: &dyn FederationDirectory, tag: &str) {
+        let accord: Vec<Identity> = accord_holder_roster_key_ids()
+            .iter()
+            .map(|k| Identity::new(k))
+            .collect();
+        for a in &accord {
+            register_founder(dir, a).await;
+        }
+        let env = |kid: &str| serde_json::json!({ "key_id": kid });
+
+        // (1) ADMITTED: 2-of-3 co-scrub carrying `registry` in the
+        // identity_type set (the CC 3.4.9 shape — a key may be {node,registry});
+        // stored through the production put_public_key gate, then resolvable
+        // from the key record alone via the effective read.
+        let reg_kid = format!("cs1-{tag}");
+        let reg = signed_canonical_record(
+            &reg_kid,
+            "node,registry",
+            env(&reg_kid),
+            &[&accord[0], &accord[1]],
+        );
+        dir.put_public_key(SignedKeyRecord { record: reg })
+            .await
+            .expect("(1) a 2-of-3 co-scrubbed registry co-steward admits");
+        assert!(
+            super::has_effective_role(dir, &reg_kid, identity_type::REGISTRY)
+                .await
+                .unwrap(),
+            "(1) the stored co-scrubbed row reads effective"
+        );
+        assert!(
+            !super::has_effective_role(dir, &reg_kid, identity_type::VERIFY)
+                .await
+                .unwrap(),
+            "(1) registry is NOT the verify co-steward"
+        );
+
+        // (2) REFUSED end-to-end: self-signed `verify` claim, on EITHER
+        // surface; nothing stored.
+        let kid = format!("cs2-{tag}");
+        let err = put(dir, record(&kid, "node,verify", &kid))
+            .await
+            .expect_err("(2) a self-signed verify claim must be REFUSED");
+        assert_eq!(err.kind(), "role_not_accord_conferred");
+        assert!(dir.lookup_public_key(&kid).await.unwrap().is_none());
+        let kid = format!("cs2b-{tag}");
+        let mut vec_claim = record(&kid, identity_type::NODE, &kid);
+        vec_claim.roles = vec![identity_type::VERIFY.to_owned()];
+        let err = put(dir, vec_claim)
+            .await
+            .expect_err("(2) a roles-vector verify claim must be REFUSED");
+        assert_eq!(err.kind(), "role_not_accord_conferred");
+
+        // (3) REFUSED: single scrub (sub-quorum).
+        let kid = format!("cs3-{tag}");
+        let err = put(
+            dir,
+            signed_canonical_record(&kid, "node,registry", env(&kid), &[&accord[0]]),
+        )
+        .await
+        .expect_err("(3) a single-scrub registry claim must be REFUSED");
+        assert_eq!(err.kind(), "role_not_accord_conferred");
+
+        // (4) Revocation-wins: after a V104 tombstone for (registry, cs1),
+        // the SAME valid co-scrubbed record is refused re-admission and the
+        // effective read flips false.
+        dir.record_role_withdrawal(identity_type::REGISTRY, &reg_kid, None, "digest-cs1")
+            .await
+            .expect("(4) record the registry withdrawal tombstone");
+        let re_offer = signed_canonical_record(
+            &reg_kid,
+            "node,registry",
+            env(&reg_kid),
+            &[&accord[0], &accord[1]],
+        );
+        let err = put(dir, re_offer)
+            .await
+            .expect_err("(4) a withdrawn co-steward cannot be re-conferred");
+        assert_eq!(err.kind(), "role_withdrawn");
+        assert!(
+            !super::has_effective_role(dir, &reg_kid, identity_type::REGISTRY)
+                .await
+                .unwrap(),
+            "(4) a withdrawn co-steward is not effective"
+        );
+
+        // (5) The effective read is self-authenticating: a row with NO claim
+        // reads false by claim-absence (and the ≤16.1.1 legacy-row shapes —
+        // self-claimed / sub-quorum — are exactly the rows (2)/(3) prove the
+        // co-scrub re-verification refuses).
+        assert!(
+            !super::has_effective_role(dir, &accord[0].key_id, identity_type::REGISTRY)
+                .await
+                .unwrap()
+        );
+
+        // (6) The generic withdraw op refuses the dedicated-op roles.
+        for role in [identity_type::CANONICAL, "infra:attest"] {
+            let err = super::withdraw_accord_role(dir, role, "whoever", "digest")
+                .await
+                .expect_err("(6) canonical/infra:attest must use their dedicated ops");
+            assert!(
+                format!("{err}").contains("dedicated withdraw op"),
+                "(6) got: {err}"
+            );
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn costeward_gate_sqlite() {
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        run_costeward_gate_matrix(&backend, "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn costeward_gate_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping costeward_gate_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        super::run_in_isolated_pg_db(&dsn, |backend| async move {
+            run_costeward_gate_matrix(&backend, "pg").await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn costeward_gate_memory() {
+        use crate::store::memory::MemoryBackend;
+        let backend = MemoryBackend::new();
+        run_costeward_gate_matrix(&backend, "mem").await;
     }
 }
 

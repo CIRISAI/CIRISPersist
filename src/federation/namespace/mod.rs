@@ -226,7 +226,10 @@ pub enum ReplicatedKind {
     /// The subject's identity occurrences (`SignedIdentityOccurrence`; the
     /// detached signature container reconstructed per #418).
     IdentityOccurrence,
-    /// The subject's authenticated transport bindings (`TransportDestination`).
+    /// The subject's authenticated transport routes (`SignedTransportDestination`
+    /// since #443 — the detached signature container reconstructed like the
+    /// occurrence plane; a bare unsigned `TransportDestination` no longer
+    /// rides replication).
     TransportDestination,
     /// Attestations **about** the subject (`SignedAttestation`; envelope sig).
     Attestation,

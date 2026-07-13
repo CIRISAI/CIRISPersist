@@ -3383,10 +3383,22 @@ impl Engine {
         let delegation_promoted = self.attestation_promote(&delegation_id).await?;
 
         // (6) Reachability: a transport_destination per occurrence that
-        // supplied one (§5.6.8.8.1).
+        // supplied one (§5.6.8.8.1). #443 (route table): epoch-aware — a
+        // re-login asserting the SAME destination refreshes in place at the
+        // stored epoch (asserted_at=now supersedes at equal epoch); a CHANGED
+        // destination bumps the epoch so the new route monotonically
+        // supersedes the old one across the mesh.
         let mut transport_rows = 0usize;
         for occ in [&input.app, &input.agent] {
+            let existing = directory
+                .list_transport_destinations_for(&occ.occurrence_key_id)
+                .await?;
             for td in &occ.transport_destinations {
+                let epoch = match existing.iter().find(|e| e.transport_kind == td.0) {
+                    Some(prior) if prior.destination == td.1 => prior.epoch,
+                    Some(prior) => prior.epoch + 1,
+                    None => 0,
+                };
                 directory
                     .put_transport_destination(&TransportDestination {
                         occurrence_key_id: occ.occurrence_key_id.clone(),
@@ -3402,6 +3414,8 @@ impl Engine {
                         // The node registering its OWN occurrence → authoritative.
                         binding_provenance:
                             crate::federation::self_at_login::BindingProvenance::Rooted,
+                        epoch,
+                        retired_at: None,
                     })
                     .await?;
                 transport_rows += 1;
@@ -12604,8 +12618,9 @@ mod tests {
         assert_ne!(gb.1, gd.1, "distinct pubkey ⇒ distinct wrap");
     }
 
-    /// transport_destination is idempotent on the composite PK + a
-    /// removed row is gone (drop+re-register reachability model).
+    /// #443 route-table semantics: one live route per (occ, kind) — a newer
+    /// assertion for the SAME kind supersedes in place (no stale-route
+    /// accumulation) — plus a removed row is gone (local hygiene DELETE).
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn transport_destination_upsert_and_remove() {
@@ -12631,12 +12646,15 @@ mod tests {
             transport_ed25519_pubkey_base64: None,
             transport_x25519_pubkey_base64: None,
             binding_provenance: crate::federation::self_at_login::BindingProvenance::Rooted,
+            epoch: 0,
+            retired_at: None,
         };
 
         dir.put_transport_destination(&mk("reticulum", "d1"))
             .await
             .expect("put 1");
-        // Re-assert same PK → idempotent (still one row).
+        // Re-assert same (occ, kind) at the same (epoch, asserted_at) →
+        // guarded no-op (still one row, content unchanged).
         dir.put_transport_destination(&mk("reticulum", "d1"))
             .await
             .expect("put 1 again");
@@ -12650,6 +12668,30 @@ mod tests {
                 .len(),
             2
         );
+
+        // #443 — a dest-hash ROTATION (same kind, new destination, newer
+        // assertion) SUPERSEDES in place: still one reticulum row, and it
+        // carries the new destination (the old route does not linger).
+        let mut rotated = mk("reticulum", "d2");
+        rotated.asserted_at = now + chrono::Duration::seconds(1);
+        dir.put_transport_destination(&rotated)
+            .await
+            .expect("rotate");
+        let rows = dir.list_transport_destinations_for(&occ).await.unwrap();
+        assert_eq!(rows.len(), 2, "rotation must not add a row");
+        let ret = rows
+            .iter()
+            .find(|r| r.transport_kind == "reticulum")
+            .expect("reticulum route");
+        assert_eq!(ret.destination, "d2", "newest assertion wins");
+        // ... and it can be removed under its CURRENT destination.
+        assert!(dir
+            .remove_transport_destination(&occ, "reticulum", "d2")
+            .await
+            .unwrap());
+        dir.put_transport_destination(&mk("reticulum", "d1"))
+            .await
+            .expect("re-put d1 for the removal checks");
 
         // Remove one → true; remove again → false (idempotent).
         assert!(dir
