@@ -1701,6 +1701,11 @@ pub struct OccurrenceTransportBinding {
 }
 
 impl OccurrenceTransportBinding {
+    /// The `transport_destinations.transport_kind` an occurrence-embedded
+    /// binding projects to — this struct is RNS-specific by shape
+    /// (`reticulum_*` pubkeys, RNS dest hash), so the kind is fixed.
+    pub const TRANSPORT_KIND: &str = "reticulum";
+
     /// Convert to the verify-core `TransportDestination` for
     /// `verify_transport_binding`.
     pub fn to_verify(&self) -> ciris_verify_core::transport_binding::TransportDestination {
@@ -1710,6 +1715,42 @@ impl OccurrenceTransportBinding {
             destination_hash_base64: self.destination_hash_base64.clone(),
             app_name: self.app_name.clone(),
             aspects: self.aspects.clone(),
+        }
+    }
+
+    /// v17.0.1 (CIRISPersist#446) — project this binding into the
+    /// `transport_destinations` read model (the #336 last mile). The
+    /// occurrence plane is the replication authority; the route table is a
+    /// LOCAL MATERIALIZED VIEW of it, so the projected row:
+    /// - inherits the occurrence's authenticated authority (the caller runs
+    ///   it only inside an ACCEPTED occurrence write — after
+    ///   `verify_signed_identity_occurrence`, or on the trusted-local path);
+    /// - is a **local derived row** (the signed-column-free local put), so
+    ///   `list_signed_transport_destinations_for` excludes it and the route
+    ///   never double-replicates under two supersession clocks;
+    /// - rides the occurrence's own last-signed-wins clock
+    ///   (`asserted_at = occurrence.asserted_at`, `epoch = 0` — a LIVE
+    ///   announced route at `epoch >= 1` always outranks the boot-time
+    ///   projection, and a newer occurrence's projection supersedes an older
+    ///   one, in lockstep with the occurrence UPSERT guard);
+    /// - carries `Rooted` provenance from the authenticated CONTEXT (the
+    ///   occurrence passed `signer_acts_for`), never from a wire field.
+    pub fn project_route(
+        &self,
+        occurrence_key_id: &str,
+        asserted_at: chrono::DateTime<chrono::Utc>,
+    ) -> super::self_at_login::TransportDestination {
+        super::self_at_login::TransportDestination {
+            occurrence_key_id: occurrence_key_id.to_owned(),
+            transport_kind: Self::TRANSPORT_KIND.to_owned(),
+            destination: self.destination_hash_base64.clone(),
+            asserted_at,
+            last_seen_at: None,
+            transport_ed25519_pubkey_base64: Some(self.reticulum_ed25519_pubkey_base64.clone()),
+            transport_x25519_pubkey_base64: Some(self.reticulum_x25519_pubkey_base64.clone()),
+            binding_provenance: super::self_at_login::BindingProvenance::Rooted,
+            epoch: 0,
+            retired_at: None,
         }
     }
 }

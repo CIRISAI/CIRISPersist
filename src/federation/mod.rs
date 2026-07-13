@@ -779,6 +779,23 @@ pub trait FederationDirectory: Send + Sync {
     /// ("`attesting_key_id == identity_key_id` OR
     /// `attesting_key_id ∈ current occurrences of identity_key_id`")
     /// is the v3.13+ admission gate that needs the trust-graph walk.
+    ///
+    /// # The composite-projection class invariant (v17.0.1, CIRISPersist#446)
+    ///
+    /// **An embedded member of a signed composite that also has a dedicated
+    /// consumer-read table MUST be materialized into that table at
+    /// acceptance — as a LOCAL derived row inheriting the composite's
+    /// authority and supersession clock — and de-materialized when the
+    /// composite is revoked.** Otherwise the object is durably stored and
+    /// verified yet invisible in the representation consumers actually query
+    /// ("accepted but not projected" — the CIRISEdge#336 failure class).
+    /// Instances on this struct: `encryption_pubkeys` → flattened occurrence
+    /// columns ✓; `transport_binding` → projected into
+    /// `transport_destinations` via
+    /// [`types::OccurrenceTransportBinding::project_route`] on every accepted
+    /// put (signed + trusted-local, all backends), retired on occurrence
+    /// revocation ✓. Any future embedded member with a standalone table must
+    /// follow the same shape.
     async fn put_identity_occurrence(
         &self,
         occurrence: SignedIdentityOccurrence,

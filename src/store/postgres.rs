@@ -3952,7 +3952,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         // Last-signed-wins: UPSERT only when strictly newer asserted_at; a
         // stale/equal replay is a safe no-op (poisoned/older row can't win).
-        client
+        let occurrence_applied = client
             .execute(
                 "INSERT INTO cirislens.federation_identity_occurrences (\
                     identity_key_id, occurrence_key_id, device_class, \
@@ -4000,6 +4000,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     crate::federation::Error::Backend(format!("insert identity_occurrence: {msg}"))
                 }
             })?;
+        // #446 — materialize the embedded binding into the
+        // `transport_destinations` read model (local derived row on the
+        // occurrence's own (epoch=0, asserted_at) clock — see project_route).
+        // ONLY when the occurrence write actually applied: projecting on a
+        // stale no-op could seed the read model with a binding older than
+        // the stored occurrence.
+        if occurrence_applied > 0 {
+            if let Some(tb) = &row.transport_binding {
+                let route = tb.project_route(&row.occurrence_key_id, row.asserted_at);
+                crate::federation::FederationDirectory::put_transport_destination(self, &route)
+                    .await?;
+            }
+        }
         Ok(())
     }
 
@@ -4062,6 +4075,13 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("put_identity_occurrence_local: {e}"))
             })?;
+        // #446 — the trusted-local path projects too (accepted write; the
+        // invariant is "every stored occurrence carrying a binding has its
+        // route materialized").
+        if let Some(tb) = &row.transport_binding {
+            let route = tb.project_route(&row.occurrence_key_id, row.asserted_at);
+            crate::federation::FederationDirectory::put_transport_destination(self, &route).await?;
+        }
         Ok(())
     }
 
@@ -5150,6 +5170,24 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             )
             .await
             .map_err(map_revocation_pg_err("identity_occurrence_revocation"))?;
+        // #446 de-projection (the projection's inverse): retire the LOCAL
+        // derived route materialized from this occurrence's binding — else a
+        // revoked occurrence leaves a live routable peer. Narrow on purpose:
+        // only the signed-column-free projected/local row; a live SIGNED
+        // route retires via its own #443 signed-tombstone plane.
+        client
+            .execute(
+                "UPDATE cirislens.transport_destinations SET retired_at = $1 \
+                 WHERE occurrence_key_id = $2 AND transport_kind = $3 \
+                   AND signature IS NULL AND retired_at IS NULL",
+                &[
+                    &row.revoked_at,
+                    &row.occurrence_key_id,
+                    &crate::federation::types::OccurrenceTransportBinding::TRANSPORT_KIND,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("identity_occurrence_revocation"))?;
         Ok(())
     }
 
@@ -5180,6 +5218,20 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.reason,
                     &witness,
                     &row.persist_row_hash,
+                ],
+            )
+            .await
+            .map_err(map_revocation_pg_err("identity_occurrence_revocation"))?;
+        // #446 de-projection — mirrors the signed revocation path.
+        client
+            .execute(
+                "UPDATE cirislens.transport_destinations SET retired_at = $1 \
+                 WHERE occurrence_key_id = $2 AND transport_kind = $3 \
+                   AND signature IS NULL AND retired_at IS NULL",
+                &[
+                    &row.revoked_at,
+                    &row.occurrence_key_id,
+                    &crate::federation::types::OccurrenceTransportBinding::TRANSPORT_KIND,
                 ],
             )
             .await
@@ -16616,6 +16668,24 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         let suffix = uuid_like();
         crate::federation::self_at_login::test_support::run_signed_transport_route_matrix(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
+    /// #446 — the occurrence→route composite-projection matrix on postgres.
+    /// Shares the assertion body with the memory + sqlite parity tests.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn binding_projection_matrix_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::self_at_login::test_support::run_binding_projection_matrix(
             &backend, &suffix,
         )
         .await;
