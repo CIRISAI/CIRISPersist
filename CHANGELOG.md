@@ -5,6 +5,58 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.0.1] — 2026-07-13 — occurrence `transport_binding` → route-table projection (#446; the #336 last mile)
+
+Publishing note: v17.0.0 was tagged but its publish run was superseded by
+this cut minutes later — downstream pins land directly on 17.0.1.
+
+### Fixed — "accepted but not projected": the occurrence-embedded binding now materializes into `transport_destinations` (#446)
+
+`IdentityOccurrence.transport_binding` was stored as an opaque JSON blob and
+never projected into `transport_destinations` — the one table consumers
+(CIRISEdge's boot-load resolver) actually read. CIRISServer's signed
+self-route (the #227 arc) therefore replicated byte-exactly on the
+occurrence plane and then dead-ended: the receiving edge never learned the
+route. Within one struct the asymmetry was the tell: `encryption_pubkeys`
+was flattened into queryable columns; `transport_binding` was not.
+
+The projection (`OccurrenceTransportBinding::project_route`, applied inside
+every ACCEPTED occurrence write — signed + trusted-local, all three
+backends; no schema change, V105 already carries every column):
+
+- **Authority inherited, never independent** — runs only after
+  `verify_signed_identity_occurrence` (or on the trusted-local plane), and
+  ONLY when the occurrence write actually applied (projecting on a stale
+  no-op could seed the read model with a binding older than the stored
+  occurrence).
+- **Local derived row, no double-carriage** — written via the
+  signature-free local put, so `list_signed_transport_destinations_for`
+  excludes it: the occurrence plane stays the single replication authority
+  for this route; `transport_destinations` is its read model.
+- **Supersession in lockstep** — the projected row rides the occurrence's
+  own clock (`epoch = 0`, `asserted_at = occurrence.asserted_at`); a LIVE
+  announced route at `epoch >= 1` always outranks the boot-time projection.
+- **Rooted provenance from the authenticated context**, never a wire field.
+- **De-projection on revocation** — `put_identity_occurrence_revocation`
+  (+ local) retires the projected row (`retired_at`), narrowly (only the
+  signature-free local/projected row; a live SIGNED route retires via its
+  own #443 tombstone plane). A newer occurrence revives the route through
+  the ordinary guard.
+
+The composite-projection **class invariant** is documented on
+`FederationDirectory::put_identity_occurrence`: an embedded member of a
+signed composite that also has a dedicated consumer-read table MUST be
+materialized at acceptance as a local derived row inheriting the
+composite's authority + supersession, and de-materialized on the
+composite's revocation.
+
+### Tests
+
+Shared projection matrix on all three backends (materialize → no
+double-carriage → supersede-in-place → retire-on-revocation → revive) +
+projection assertions added to the #418 signed-gate test. Full gate:
+`cargo nextest --all-targets` pg+sqlite **1534/1534**.
+
 ## [17.0.0] — 2026-07-13 — the mesh-unblocking cut: transport route table rebuilt (#443) + role-surface unification (#441) + CC 3.4.9 co-stewards (#440) + pg roles readback (#442)
 
 ### BREAKING — `transport_destinations` is now a well-formed superseding route table (#443; the persist root of CIRISEdge#336)

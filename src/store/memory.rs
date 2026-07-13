@@ -1865,38 +1865,54 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut row = occurrence.identity_occurrence;
         crate::federation::check_device_class(&row.device_class)?;
         crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        if !state.federation_keys.contains_key(&row.identity_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "identity_key_id {} does not exist in federation_keys",
-                row.identity_key_id
-            )));
-        }
-        if !state.federation_keys.contains_key(&row.occurrence_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "occurrence_key_id {} does not exist in federation_keys",
-                row.occurrence_key_id
-            )));
-        }
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        // Last-signed-wins: only a strictly-newer asserted_at supersedes.
-        let key = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
-        let newer = state
-            .federation_identity_occurrences
-            .get(&key)
-            .is_none_or(|ex| row.asserted_at > ex.asserted_at);
-        if newer {
-            // #418 — store the signature container in lockstep so the
-            // replication read reconstructs the tuple that was put.
-            state.federation_identity_occurrence_sigs.insert(
-                key.clone(),
-                (
-                    occurrence.attesting_key_id,
-                    occurrence.signed_envelope,
-                    occurrence.signature,
-                ),
-            );
-            state.federation_identity_occurrences.insert(key, row);
+        // #446 — the projection is computed inside the lock scope but applied
+        // after it (put_transport_destination takes the lock itself), ONLY
+        // when the occurrence write applied.
+        let projected_route = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            if !state.federation_keys.contains_key(&row.identity_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "identity_key_id {} does not exist in federation_keys",
+                    row.identity_key_id
+                )));
+            }
+            if !state.federation_keys.contains_key(&row.occurrence_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "occurrence_key_id {} does not exist in federation_keys",
+                    row.occurrence_key_id
+                )));
+            }
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            // Last-signed-wins: only a strictly-newer asserted_at supersedes.
+            let key = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
+            let newer = state
+                .federation_identity_occurrences
+                .get(&key)
+                .is_none_or(|ex| row.asserted_at > ex.asserted_at);
+            let projected_route = if newer {
+                row.transport_binding
+                    .as_ref()
+                    .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at))
+            } else {
+                None
+            };
+            if newer {
+                // #418 — store the signature container in lockstep so the
+                // replication read reconstructs the tuple that was put.
+                state.federation_identity_occurrence_sigs.insert(
+                    key.clone(),
+                    (
+                        occurrence.attesting_key_id,
+                        occurrence.signed_envelope,
+                        occurrence.signature,
+                    ),
+                );
+                state.federation_identity_occurrences.insert(key, row);
+            }
+            projected_route
+        };
+        if let Some(route) = &projected_route {
+            crate::federation::FederationDirectory::put_transport_destination(self, route).await?;
         }
         Ok(())
     }
@@ -1909,24 +1925,36 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut row = occurrence;
         crate::federation::check_device_class(&row.device_class)?;
         crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
-        let mut state = self.state.lock().expect("memory backend lock");
-        if !state.federation_keys.contains_key(&row.identity_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "identity_key_id {} does not exist in federation_keys",
-                row.identity_key_id
-            )));
+        // #446 — the trusted-local path projects too (accepted write);
+        // applied after the lock scope.
+        let projected_route = {
+            let mut state = self.state.lock().expect("memory backend lock");
+            if !state.federation_keys.contains_key(&row.identity_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "identity_key_id {} does not exist in federation_keys",
+                    row.identity_key_id
+                )));
+            }
+            if !state.federation_keys.contains_key(&row.occurrence_key_id) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "occurrence_key_id {} does not exist in federation_keys",
+                    row.occurrence_key_id
+                )));
+            }
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            let projected_route = row
+                .transport_binding
+                .as_ref()
+                .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at));
+            state.federation_identity_occurrences.insert(
+                (row.identity_key_id.clone(), row.occurrence_key_id.clone()),
+                row,
+            );
+            projected_route
+        };
+        if let Some(route) = &projected_route {
+            crate::federation::FederationDirectory::put_transport_destination(self, route).await?;
         }
-        if !state.federation_keys.contains_key(&row.occurrence_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "occurrence_key_id {} does not exist in federation_keys",
-                row.occurrence_key_id
-            )));
-        }
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        state.federation_identity_occurrences.insert(
-            (row.identity_key_id.clone(), row.occurrence_key_id.clone()),
-            row,
-        );
         Ok(())
     }
 
@@ -2804,9 +2832,26 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         state
             .federation_identity_occurrence_revocation_sigs
             .insert(key.clone(), (attesting_key_id, signed_envelope, signature));
+        let revoked_at = row.revoked_at;
+        let occurrence_key_id = row.occurrence_key_id.clone();
         state
             .federation_identity_occurrence_revocations
             .insert(key, row);
+        // #446 de-projection (the projection's inverse): retire the LOCAL
+        // derived route materialized from this occurrence's binding. Narrow
+        // on purpose: only the signature-free projected/local row; a live
+        // SIGNED route retires via its own #443 signed-tombstone plane.
+        let route_key = (
+            occurrence_key_id,
+            crate::federation::types::OccurrenceTransportBinding::TRANSPORT_KIND.to_owned(),
+        );
+        if !state.transport_destination_sigs.contains_key(&route_key) {
+            if let Some(route) = state.transport_destinations.get_mut(&route_key) {
+                if route.retired_at.is_none() {
+                    route.retired_at = Some(revoked_at);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2826,10 +2871,24 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             }
         }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        let revoked_at = row.revoked_at;
+        let occurrence_key_id = row.occurrence_key_id.clone();
         state.federation_identity_occurrence_revocations.insert(
             (row.identity_key_id.clone(), row.occurrence_key_id.clone()),
             row,
         );
+        // #446 de-projection — mirrors the signed revocation path.
+        let route_key = (
+            occurrence_key_id,
+            crate::federation::types::OccurrenceTransportBinding::TRANSPORT_KIND.to_owned(),
+        );
+        if !state.transport_destination_sigs.contains_key(&route_key) {
+            if let Some(route) = state.transport_destinations.get_mut(&route_key) {
+                if route.retired_at.is_none() {
+                    route.retired_at = Some(revoked_at);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -5200,6 +5259,17 @@ mod accord_tests {
     async fn signed_transport_route_matrix_memory() {
         let backend = MemoryBackend::new();
         crate::federation::self_at_login::test_support::run_signed_transport_route_matrix(
+            &backend, "mem",
+        )
+        .await;
+    }
+
+    /// #446 — the occurrence→route composite-projection matrix on the memory
+    /// backend. Shares the assertion body with the sqlite + pg parity tests.
+    #[tokio::test]
+    async fn binding_projection_matrix_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::self_at_login::test_support::run_binding_projection_matrix(
             &backend, "mem",
         )
         .await;

@@ -1037,4 +1037,123 @@ pub(crate) mod test_support {
             "a local supersede must drop the stale signature container"
         );
     }
+
+    /// **The #446 composite-projection matrix** (trusted-local occurrence
+    /// plane; the signed plane is covered by the sqlite gate test, which
+    /// shares the same projection code path). Invariant: every ACCEPTED
+    /// occurrence carrying a `transport_binding` has its route materialized
+    /// in `transport_destinations` as a LOCAL derived row — visible to the
+    /// plain reads, invisible to the signed replication read (no
+    /// double-carriage) — superseding on the occurrence's own asserted_at
+    /// clock, retired by the occurrence's revocation, and revived by a newer
+    /// occurrence.
+    pub(crate) async fn run_binding_projection_matrix(dir: &dyn FederationDirectory, suffix: &str) {
+        use crate::federation::types::{
+            device_class, IdentityOccurrence, IdentityOccurrenceRevocation,
+            OccurrenceTransportBinding,
+        };
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        let identity = format!("proj-id-{suffix}");
+        let occ = format!("proj-occ-{suffix}");
+        for k in [&identity, &occ] {
+            let ed = B64.encode([0x22u8; 32]);
+            dir.put_public_key(SignedKeyRecord {
+                record: fixture_key(k, ed, None),
+            })
+            .await
+            .expect("register projection fixture key");
+        }
+
+        let binding = |tag: u8| OccurrenceTransportBinding {
+            reticulum_x25519_pubkey_base64: B64.encode([tag; 32]),
+            reticulum_ed25519_pubkey_base64: B64.encode([tag.wrapping_add(1); 32]),
+            destination_hash_base64: B64.encode([tag; 16]),
+            app_name: "ciris.federation".into(),
+            aspects: vec!["announce".into()],
+        };
+        let occ_row = |asserted: &str, tag: u8| IdentityOccurrence {
+            identity_key_id: identity.clone(),
+            occurrence_key_id: occ.clone(),
+            device_class: device_class::AGENT.into(),
+            hardware_attestation: None,
+            asserted_at: ts(asserted),
+            valid_until: None,
+            encryption_pubkeys: None,
+            transport_binding: Some(binding(tag)),
+            persist_row_hash: String::new(),
+        };
+
+        // (1) Accepted local put with a binding → the route is MATERIALIZED:
+        // reticulum kind, dest + both transport pubkeys from the binding,
+        // Rooted from context, (epoch=0, asserted_at=occurrence clock).
+        dir.put_identity_occurrence_local(occ_row("2026-07-01T00:00:00Z", 0x10))
+            .await
+            .expect("(1) local occurrence put");
+        let rows = dir.list_transport_destinations_for(&occ).await.unwrap();
+        assert_eq!(rows.len(), 1, "(1) exactly one projected route");
+        let r = &rows[0];
+        assert_eq!(r.transport_kind, OccurrenceTransportBinding::TRANSPORT_KIND);
+        assert_eq!(r.destination, B64.encode([0x10u8; 16]));
+        assert_eq!(
+            r.transport_x25519_pubkey_base64.as_deref(),
+            Some(B64.encode([0x10u8; 32]).as_str())
+        );
+        assert_eq!(
+            r.transport_ed25519_pubkey_base64.as_deref(),
+            Some(B64.encode([0x11u8; 32]).as_str())
+        );
+        assert_eq!(r.binding_provenance, BindingProvenance::Rooted);
+        assert_eq!(r.epoch, 0);
+        assert_eq!(r.asserted_at, ts("2026-07-01T00:00:00Z"));
+        // No double-carriage: the projected row is LOCAL-derived, so the
+        // signed replication read must not emit it (the occurrence plane is
+        // the single replication authority for this route).
+        assert!(
+            dir.list_signed_transport_destinations_for(&occ)
+                .await
+                .unwrap()
+                .is_empty(),
+            "(1) a projected route must not replicate on the route plane"
+        );
+
+        // (2) A newer occurrence supersedes the projection in lockstep.
+        dir.put_identity_occurrence_local(occ_row("2026-07-02T00:00:00Z", 0x20))
+            .await
+            .expect("(2) newer local occurrence put");
+        let rows = dir.list_transport_destinations_for(&occ).await.unwrap();
+        assert_eq!(rows.len(), 1, "(2) superseded in place, never a 2nd row");
+        assert_eq!(rows[0].destination, B64.encode([0x20u8; 16]));
+
+        // (3) De-projection: revoking the occurrence retires the projected
+        // route — a revoked occurrence must not leave a live routable peer.
+        dir.put_identity_occurrence_revocation_local(IdentityOccurrenceRevocation {
+            identity_key_id: identity.clone(),
+            occurrence_key_id: occ.clone(),
+            revoked_at: ts("2026-07-03T00:00:00Z"),
+            effective_at: ts("2026-07-03T00:00:00Z"),
+            reason: None,
+            witness_set: vec![identity.clone()],
+            persist_row_hash: String::new(),
+        })
+        .await
+        .expect("(3) local occurrence revocation");
+        assert!(
+            dir.list_transport_destinations_for(&occ)
+                .await
+                .unwrap()
+                .is_empty(),
+            "(3) the projected route must be retired with its occurrence"
+        );
+
+        // (4) A NEWER occurrence re-materializes (revives) the route — the
+        // (epoch, asserted_at) guard supersedes the retired row and clears
+        // retired_at.
+        dir.put_identity_occurrence_local(occ_row("2026-07-04T00:00:00Z", 0x30))
+            .await
+            .expect("(4) re-established occurrence put");
+        let rows = dir.list_transport_destinations_for(&occ).await.unwrap();
+        assert_eq!(rows.len(), 1, "(4) a newer occurrence revives the route");
+        assert_eq!(rows[0].destination, B64.encode([0x30u8; 16]));
+    }
 }

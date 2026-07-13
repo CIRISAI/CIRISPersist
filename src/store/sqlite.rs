@@ -3615,8 +3615,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             })?),
             None => None,
         };
+        // #446 — materialize the embedded binding into the
+        // `transport_destinations` read model (computed before `row` moves
+        // into the write closure; applied AFTER the write, and ONLY when the
+        // occurrence write actually applied — projecting on a stale no-op
+        // could seed the read model with a binding older than the stored
+        // occurrence).
+        let projected_route = row
+            .transport_binding
+            .as_ref()
+            .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at));
         let conn = self.conn.clone();
-        (move || -> Result<(), rusqlite::Error> {
+        let occurrence_applied = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
             // Last-signed-wins: UPSERT only when the incoming `asserted_at` is
             // strictly newer (RFC-3339 UTC sorts lexically == chronologically).
@@ -3657,8 +3667,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     signature_json,
                     transport_binding_json,
                 ],
-            )?;
-            Ok(())
+            )
         })()
         .map_err(|e| {
             let msg = e.to_string();
@@ -3670,6 +3679,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::federation::Error::Backend(format!("insert identity_occurrence: {msg}"))
             }
         })?;
+        if occurrence_applied > 0 {
+            if let Some(route) = &projected_route {
+                crate::federation::FederationDirectory::put_transport_destination(self, route)
+                    .await?;
+            }
+        }
         Ok(())
     }
 
@@ -3697,6 +3712,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             })?),
             None => None,
         };
+        // #446 — the trusted-local path projects too: it is an ACCEPTED write
+        // (engine-internal self-write), and the invariant is "every stored
+        // occurrence carrying a binding has its route materialized".
+        let projected_route = row
+            .transport_binding
+            .as_ref()
+            .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at));
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -3733,6 +3755,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| {
             crate::federation::Error::Backend(format!("put_identity_occurrence_local: {e}"))
         })?;
+        if let Some(route) = &projected_route {
+            crate::federation::FederationDirectory::put_transport_destination(self, route).await?;
+        }
         Ok(())
     }
 
@@ -4844,6 +4869,21 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     signature_json,
                 ],
             )?;
+            // #446 de-projection (the projection's inverse): retire the LOCAL
+            // derived route materialized from this occurrence's binding — else
+            // a revoked occurrence leaves a live routable peer. Narrow on
+            // purpose: only the signed-column-free projected/local row; a live
+            // SIGNED route retires via its own #443 signed-tombstone plane.
+            conn.execute(
+                "UPDATE transport_destinations SET retired_at = ?1 \
+                 WHERE occurrence_key_id = ?2 AND transport_kind = ?3 \
+                   AND signature IS NULL AND retired_at IS NULL",
+                rusqlite::params![
+                    row.revoked_at.to_rfc3339(),
+                    row.occurrence_key_id,
+                    crate::federation::types::OccurrenceTransportBinding::TRANSPORT_KIND,
+                ],
+            )?;
             Ok(())
         })()
         .map_err(map_revocation_sqlite_err("identity_occurrence_revocation"))?;
@@ -4878,6 +4918,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.reason,
                     witness,
                     row.persist_row_hash,
+                ],
+            )?;
+            // #446 de-projection — mirrors the signed revocation path.
+            conn.execute(
+                "UPDATE transport_destinations SET retired_at = ?1 \
+                 WHERE occurrence_key_id = ?2 AND transport_kind = ?3 \
+                   AND signature IS NULL AND retired_at IS NULL",
+                rusqlite::params![
+                    row.revoked_at.to_rfc3339(),
+                    row.occurrence_key_id,
+                    crate::federation::types::OccurrenceTransportBinding::TRANSPORT_KIND,
                 ],
             )?;
             Ok(())
@@ -20966,6 +21017,28 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+        // #446 — the ACCEPTED signed occurrence's binding is PROJECTED into
+        // the transport_destinations read model (local derived row: visible
+        // to the plain read, absent from the signed replication read).
+        let routes = backend
+            .list_transport_destinations_for("alice-phone")
+            .await
+            .unwrap();
+        assert_eq!(routes.len(), 1, "#446: binding must be materialized");
+        assert_eq!(routes[0].destination, B64.encode(dest_hash));
+        assert_eq!(
+            routes[0].binding_provenance,
+            crate::federation::self_at_login::BindingProvenance::Rooted
+        );
+        assert_eq!(routes[0].epoch, 0);
+        assert!(
+            backend
+                .list_signed_transport_destinations_for("alice-phone")
+                .await
+                .unwrap()
+                .is_empty(),
+            "#446: the projected route must not replicate on the route plane"
+        );
 
         // (2) DIVERGENT typed projection (envelope says content_x, typed claims
         // attacker_x) → REJECTED (the MITM: sig covers only the envelope).
@@ -33415,6 +33488,18 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         crate::federation::self_at_login::test_support::run_signed_transport_route_matrix(
+            &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// #446 — the occurrence→route composite-projection matrix on sqlite.
+    /// Shares the assertion body with the memory + pg parity tests.
+    #[tokio::test]
+    async fn binding_projection_matrix_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::self_at_login::test_support::run_binding_projection_matrix(
             &backend, "sqlite",
         )
         .await;
