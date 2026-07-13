@@ -2210,6 +2210,9 @@ impl SqliteBackend {
         // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
         // co-scrub gate as `canonical`. Fail-closed before any write.
         crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
+        // #440 — the CC 3.4.9 co-steward roles (`registry`/`verify`) are
+        // accord-conferred, same ceremony. Fail-closed before any write.
+        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         // Resolve the existing row + classify the transition.
@@ -2600,7 +2603,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation
         // admission gate for accord_holder rows. Runs BEFORE
         // persist_row_hash + INSERT so rejected rows leave no trace.
-        if row.identity_type == crate::federation::types::identity_type::ACCORD_HOLDER {
+        // #441: evaluated over identity_type ∪ roles (claims_role) — an
+        // `accord_holder` claim in the set form ("agent,accord_holder")
+        // or in the roles vector hits the same gate as the scalar.
+        if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
             self.hardware_attestation_policy().check(
                 &row.key_id,
                 row.attestation_evidence.as_ref(),
@@ -2622,6 +2628,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
         // co-scrub gate as `canonical`. Fail-closed before any write.
         crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
+        // #440 — the CC 3.4.9 co-steward roles (`registry`/`verify`) are
+        // accord-conferred, same ceremony. Fail-closed before any write.
+        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
 
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
@@ -26277,10 +26286,12 @@ mod tests {
     async fn re_federation_lists() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
+        // #442: populate the roles set on one key so the list projection
+        // is asserted on both backends (the pg SELECT once dropped it).
+        let mut key_a = fed_key("k-a", "agent-a", "k-a");
+        key_a.roles = vec!["agent".into(), "substrate_persist".into()];
         backend
-            .put_public_key(SignedKeyRecord {
-                record: fed_key("k-a", "agent-a", "k-a"),
-            })
+            .put_public_key(SignedKeyRecord { record: key_a })
             .await
             .unwrap();
         backend
@@ -26312,6 +26323,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(keys.items.len(), 2);
+        let k_a = keys.items.iter().find(|k| k.key_id == "k-a").unwrap();
+        assert_eq!(
+            k_a.roles,
+            vec!["agent".to_string(), "substrate_persist".to_string()],
+            "#442: list_federation_keys must project the stored roles set"
+        );
 
         // revoked filter: k-b appears in federation_revocations.
         let revoked = backend

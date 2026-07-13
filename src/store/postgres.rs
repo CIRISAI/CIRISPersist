@@ -2510,6 +2510,9 @@ impl PostgresBackend {
         // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
         // co-scrub gate as `canonical`. Fail-closed before any write.
         crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
+        // #440 — the CC 3.4.9 co-steward roles (`registry`/`verify`) are
+        // accord-conferred, same ceremony. Fail-closed before any write.
+        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let existing = crate::federation::FederationDirectory::lookup_public_key(self, &row.key_id)
@@ -2871,8 +2874,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // admission gate for accord_holder rows. Runs BEFORE
         // persist_row_hash + INSERT so rejected rows leave no trace.
         // Non-accord-holder rows skip the gate (the column is
-        // informational for them).
-        if row.identity_type == crate::federation::types::identity_type::ACCORD_HOLDER {
+        // informational for them). #441: evaluated over identity_type ∪
+        // roles (claims_role) — an `accord_holder` claim in the set form
+        // ("agent,accord_holder") or in the roles vector hits the same
+        // gate as the scalar.
+        if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
             self.hardware_attestation_policy().check(
                 &row.key_id,
                 row.attestation_evidence.as_ref(),
@@ -2892,6 +2898,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // #422 — `infra:attest` in `roles` is accord-conferred, same m-of-n
         // co-scrub gate as `canonical`. Fail-closed before any write.
         crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
+        // #440 — the CC 3.4.9 co-steward roles (`registry`/`verify`) are
+        // accord-conferred, same ceremony. Fail-closed before any write.
+        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
 
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
@@ -13795,7 +13804,7 @@ impl crate::read::ReadEngine for PostgresBackend {
                     identity_type, identity_ref, valid_from, valid_until, registration_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    attestation_evidence, consent_role, additional_scrubs \
+                    attestation_evidence, consent_role, additional_scrubs, roles \
              FROM cirislens.federation_keys \
              {where_sql} \
              ORDER BY valid_from DESC, key_id DESC \
@@ -20215,12 +20224,16 @@ mod tests {
         let mut key_ids: Vec<String> = Vec::new();
         for i in 0..4 {
             let kid = format!("k-§i-{}-{i}", uuid_like());
-            let key = fix_section_i_key(
+            let mut key = fix_section_i_key(
                 &kid,
                 &identity,
                 base + chrono::Duration::minutes(i64::from(i)),
                 i % 2 == 0, // alternate pqc_completed
             );
+            // #442: the pg SELECT once omitted `roles` and the tolerant
+            // decoder silently returned [] — populate the set so the
+            // page assertions below catch a dropped column.
+            key.roles = vec!["agent".into(), "substrate_persist".into()];
             backend
                 .put_public_key(crate::federation::SignedKeyRecord { record: key })
                 .await
@@ -20247,6 +20260,13 @@ mod tests {
         assert_eq!(p1.items.len(), 2);
         assert_eq!(p1.items[0].key_id, key_ids[0]);
         assert_eq!(p1.items[1].key_id, key_ids[1]);
+        for k in &p1.items {
+            assert_eq!(
+                k.roles,
+                vec!["agent".to_string(), "substrate_persist".to_string()],
+                "#442: list_federation_keys must project the stored roles set"
+            );
+        }
         let c1 = p1.next_cursor.expect("page 2 cursor");
 
         // Page 2 — exact-fill (2 remaining items, limit=2). The

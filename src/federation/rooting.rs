@@ -1113,11 +1113,24 @@ mod sqlite_conformance {
         let backend = fresh().await;
         let holder_k = TestKey::new("A1", 0x41);
         let agent_k = TestKey::new("node-under-a1", 0x42);
-        put(
-            &backend,
-            signed_record(&holder_k, &holder_k, "steward,accord_holder"),
-        )
-        .await;
+        // #441: the accord_holder claim is gated on EVERY claim shape
+        // (claims_role over identity_type ∪ roles), so this set-form
+        // terminus row now needs hardware-attestation evidence to admit —
+        // exactly like a scalar-form registration. (The real A1/B1/C1 rows
+        // enter via the genesis seed path, which is the pinned ceremony
+        // bake and legitimately bypasses the per-registration gate.)
+        let mut holder_rec = signed_record(&holder_k, &holder_k, "steward,accord_holder");
+        holder_rec.attestation_evidence = Some(serde_json::json!({
+            "platform_attestation": {
+                "Ios": {
+                    "secure_enclave": true,
+                    "app_attest": [171, 205, 239],
+                    "device_check_token": [18, 52, 86]
+                }
+            },
+            "nonce_captured_at": chrono::Utc::now().to_rfc3339(),
+        }));
+        put(&backend, holder_rec).await;
         put(&backend, signed_record(&agent_k, &holder_k, agent())).await;
 
         let verdict = root_binding_anchored(

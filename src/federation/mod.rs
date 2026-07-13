@@ -129,16 +129,20 @@ pub(crate) mod serde_bytes_b64 {
 }
 
 pub use admission::{
-    canonical_withdrawal_payload_sha256, check_canonical_role_admission,
-    check_canonical_role_admission_over_roster, check_cohort_scope, check_consensus_protocol_form,
-    check_device_class, check_encryption_pubkeys, check_infra_attest_role_admission,
-    check_infra_attest_role_admission_over_roster, check_observed_region, is_canonical,
-    is_canonical_effective, is_infra_attest, is_infra_attest_effective, supersede_canonical,
+    canonical_withdrawal_payload_sha256, check_accord_role_admission_over_roster,
+    check_canonical_role_admission, check_canonical_role_admission_over_roster,
+    check_co_steward_role_admission, check_co_steward_role_admission_over_roster,
+    check_cohort_scope, check_consensus_protocol_form, check_device_class,
+    check_encryption_pubkeys, check_infra_attest_role_admission,
+    check_infra_attest_role_admission_over_roster, check_observed_region, has_effective_role,
+    has_effective_role_over_roster, is_canonical, is_canonical_effective, is_infra_attest,
+    is_infra_attest_effective, op_withdraw_role, supersede_canonical,
     verify_canonical_supersede_authority, verify_canonical_withdraw_authority,
-    verify_signed_identity_occurrence_revocation, withdraw_canonical_role,
-    withdraw_infra_attest_role, AttestationLadderTransitionPolicy, CanonicalWithdrawal,
-    DimensionAdmissionPolicy, DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule,
-    RoleWithdrawal, ATTESTATION_LADDER_MECHANISMS,
+    verify_signed_identity_occurrence_revocation, withdraw_accord_role,
+    withdraw_accord_role_over_roster, withdraw_canonical_role, withdraw_infra_attest_role,
+    AttestationLadderTransitionPolicy, CanonicalWithdrawal, DimensionAdmissionPolicy,
+    DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule, RoleWithdrawal,
+    ATTESTATION_LADDER_MECHANISMS,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
@@ -4354,6 +4358,58 @@ pub enum Error {
         superseded_by: Option<String>,
     },
 
+    /// v16.2.0 (CIRISPersist#440/#441) — a `federation_keys` write was REFUSED
+    /// because it claims an accord-conferred `role` (on EITHER role surface —
+    /// the `identity_type` set or the `roles` vector,
+    /// [`types::KeyRecord::claims_role`]) without the accord family m-of-n
+    /// co-scrub. The role-generic mirror of
+    /// [`Self::CanonicalRoleNotAccordConferred`] /
+    /// [`Self::InfraAttestRoleNotAccordConferred`], carried by the CC 3.4.9
+    /// co-steward roles (`registry`/`verify`) and every future
+    /// accord-conferred role. Fail-closed (verify-before-mutation, AV-9 — the
+    /// row is NOT stored). Stable `kind()` token `role_not_accord_conferred`.
+    /// See [`admission::check_accord_role_admission_over_roster`].
+    #[error(
+        "federation_keys row {key_id:?} claims the accord-conferred role {role:?} but is not \
+         accord-conferred (scrub_key_id={scrub_key_id:?}, reason: {reason}); accord-conferred \
+         roles are conferred by the accord family m-of-n co-scrub, never self-claimed — on \
+         either role surface (identity_type set or roles vector)"
+    )]
+    RoleNotAccordConferred {
+        /// The accord-conferred role token the row claimed.
+        role: String,
+        /// The `key_id` of the row that attempted to carry the role.
+        key_id: String,
+        /// The row's `scrub_key_id` (the claimed scrubber).
+        scrub_key_id: String,
+        /// Why the record failed the accord-conferred test (self-signed /
+        /// sub-quorum scrub set / non-anchor scrubbers).
+        reason: String,
+    },
+
+    /// v16.2.0 (CIRISPersist#440) — a `federation_keys` write was REFUSED
+    /// because it would confer `role` on a `key_id` the accord quorum has
+    /// WITHDRAWN (a durable V104 tombstone whose `superseded_by` does not name
+    /// this key). The role-generic revocation-wins consult — the #377 rule
+    /// carried by [`admission::check_accord_role_admission_over_roster`].
+    /// Stable `kind()` token `role_withdrawn`. See
+    /// [`admission::withdraw_accord_role`].
+    #[error(
+        "federation_keys row {key_id:?} was refused the accord-conferred role {role:?}: the \
+         accord quorum withdrew it (V104 tombstone; superseded_by={superseded_by:?}) — a \
+         withdrawn key cannot be re-conferred the role, even by a valid co-scrub \
+         (revocation-wins)"
+    )]
+    RoleWithdrawn {
+        /// The withdrawn role token.
+        role: String,
+        /// The `key_id` that carries a withdrawal tombstone.
+        key_id: String,
+        /// The successor `key_id` the withdrawal points to (a supersede), or
+        /// `None` for a plain withdraw.
+        superseded_by: Option<String>,
+    },
+
     /// v13.1.0 (CIRISPersist#377, FSD Trust Root m-of-n) — a canonical
     /// withdraw/supersede was REFUSED because its accord live-quorum authority
     /// [`AccordDecision`](ciris_verify_core::accord_live_quorum::AccordDecision)
@@ -4634,6 +4690,8 @@ impl Error {
             }
             Error::InfraAttestRoleWithdrawn { .. } => "infra_attest_role_withdrawn",
             Error::CanonicalRoleWithdrawn { .. } => "canonical_role_withdrawn",
+            Error::RoleNotAccordConferred { .. } => "role_not_accord_conferred",
+            Error::RoleWithdrawn { .. } => "role_withdrawn",
             Error::CanonicalWithdrawalAuthorityInvalid { .. } => {
                 "canonical_withdrawal_authority_invalid"
             }
