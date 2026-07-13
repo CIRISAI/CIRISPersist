@@ -11550,7 +11550,7 @@ fn sqlite_row_to_transport_destination(
     })
 }
 
-/// v16.2.0 (#443 replication read) — SQLite row →
+/// v17.0.0 (#443 replication read) — SQLite row →
 /// [`crate::federation::SignedTransportDestination`]. Reconstructs the
 /// signature container byte-exact from the stored `{attesting_key_id,
 /// signed_envelope, signature}` columns (V105) so a transport replicator

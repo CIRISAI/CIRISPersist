@@ -3982,11 +3982,11 @@ impl PyEngine {
         })
     }
 
-    /// v16.2.0 (CIRISPersist#440, CC 3.4.9) — does `key_id` hold `role`
+    /// v17.0.0 (CIRISPersist#440, CC 3.4.9) — does `key_id` hold `role`
     /// **effectively**? `True` iff the stored `federation_keys` row claims
     /// `role` on either role surface (the `identity_type` set or the `roles`
     /// vector), its scrub set re-verifies to the accord family m-of-n (the
-    /// read is self-authenticating — a decorative pre-16.2.0 self-claimed
+    /// read is self-authenticating — a decorative pre-17.0.0 self-claimed
     /// token reads `False`), and no un-superseded V104 withdrawal tombstone
     /// names `(role, key_id)`. The consumer resolver for the CC 3.4.9
     /// co-steward roles (`registry` / `verify`): a consumer applying the
@@ -25678,7 +25678,7 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // #424 — re-conferring a quorum-withdrawn `infra:attest` key: the same
         // revocation-wins refusal class as CanonicalRoleWithdrawn; ValueError.
         crate::federation::Error::InfraAttestRoleWithdrawn { .. } => PyValueError::new_err(kind),
-        // v16.2.0 (#440/#441) — the role-generic mirrors of the two refusal
+        // v17.0.0 (#440/#441) — the role-generic mirrors of the two refusal
         // classes above (carried by the CC 3.4.9 co-steward roles); ValueError.
         crate::federation::Error::RoleNotAccordConferred { .. }
         | crate::federation::Error::RoleWithdrawn { .. } => PyValueError::new_err(kind),

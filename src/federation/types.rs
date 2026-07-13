@@ -193,7 +193,7 @@ pub mod identity_type {
     /// The admission gate is
     /// [`super::super::admission::check_canonical_role_admission`].
     pub const CANONICAL: &str = "canonical";
-    /// v16.2.0 (CIRISPersist#440, CC 3.4.9) — the **CIRISRegistry
+    /// v17.0.0 (CIRISPersist#440, CC 3.4.9) — the **CIRISRegistry
     /// co-steward** of the co-stewarded `licensure:{authority_id}`
     /// dimension. CC 3.4.9 caps single-source licensure attestations at
     /// `confidence <= 0.5` until BOTH co-stewards have emitted; to apply
@@ -211,11 +211,11 @@ pub mod identity_type {
     /// [`super::super::admission::check_co_steward_role_admission`].
     /// Withdrawal rides the V104 generic role tombstone.
     pub const REGISTRY: &str = "registry";
-    /// v16.2.0 (CIRISPersist#440, CC 3.4.9) — the **CIRISVerify
+    /// v17.0.0 (CIRISPersist#440, CC 3.4.9) — the **CIRISVerify
     /// co-steward** of `licensure:{authority_id}`. Exact mirror of
     /// [`REGISTRY`]; see it for the conferral/withdrawal story.
     pub const VERIFY: &str = "verify";
-    /// v16.2.0 (CIRISPersist#440) — the two CC 3.4.9 co-steward roles,
+    /// v17.0.0 (CIRISPersist#440) — the two CC 3.4.9 co-steward roles,
     /// in canonical order. Every member is accord-conferred.
     pub const CO_STEWARD_ROLES: [&str; 2] = [REGISTRY, VERIFY];
 
@@ -881,7 +881,7 @@ impl KeyRecord {
         ids.len()
     }
 
-    /// v16.2.0 (CIRISPersist#441, CC 3.4.7.1 / CC 4.5.8.1) — does this record
+    /// v17.0.0 (CIRISPersist#441, CC 3.4.7.1 / CC 4.5.8.1) — does this record
     /// claim `role` on EITHER role surface: the `identity_type` **set**
     /// ([`identity_type::set_contains`]) OR the V020 `roles` vector? This is
     /// the predicate every role admission gate evaluates, so the two surfaces
@@ -2493,7 +2493,7 @@ mod tests {
         r.registration_envelope = serde_json::json!({ "transport_hints": "not-a-list" });
         assert!(r.transport_hints().is_empty());
 
-        // v16.2.0 (#441) — `claims_role` evaluates BOTH role surfaces: the
+        // v17.0.0 (#441) — `claims_role` evaluates BOTH role surfaces: the
         // identity_type set (scalar or comma-joined) and the roles vector.
         r.identity_type = "node".into();
         r.roles = Vec::new();

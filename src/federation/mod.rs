@@ -1534,7 +1534,7 @@ pub trait FederationDirectory: Send + Sync {
                 self.list_signed_identity_occurrences_for(subject_key_id)
                     .await?,
             ),
-            // v16.2.0 (#443): the route arm returns the SIGNED container
+            // v17.0.0 (#443): the route arm returns the SIGNED container
             // (byte-exact re-publish; signed-put rows only — a bare local
             // route is not replicable) INCLUDING retired tombstones, which
             // must gossip so the mesh converges on the retirement.
@@ -2892,7 +2892,7 @@ pub trait FederationDirectory: Send + Sync {
     /// put** (self-at-login, the node's own engine); the replication plane
     /// goes through [`Self::put_signed_transport_destination`] instead.
     ///
-    /// v16.2.0 (CIRISPersist#443) — route-table semantics: keyed on the
+    /// v17.0.0 (CIRISPersist#443) — route-table semantics: keyed on the
     /// `(occurrence_key_id, transport_kind)` PK (`destination` is payload —
     /// one live route per peer per transport), and **guarded monotonic**: the
     /// write applies iff no row exists or the incoming `(epoch, asserted_at)`
@@ -2912,7 +2912,7 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
-    /// v16.2.0 (CIRISPersist#443) — the **authenticated replication apply**
+    /// v17.0.0 (CIRISPersist#443) — the **authenticated replication apply**
     /// for the route plane: verify the
     /// [`verify_signed_transport_destination`](admission::verify_signed_transport_destination)
     /// gate (hybrid 1-of-1 over `JCS(signed_envelope)` against the PINNED
@@ -2939,7 +2939,7 @@ pub trait FederationDirectory: Send + Sync {
         ))
     }
 
-    /// v16.2.0 (CIRISPersist#443) — the route-plane **signed replication
+    /// v17.0.0 (CIRISPersist#443) — the route-plane **signed replication
     /// read**: every SIGNED-put route row of `occurrence_key_id` with its
     /// original `{attesting_key_id, signed_envelope, signature}` container,
     /// byte-exact (the mirror of
@@ -4428,7 +4428,7 @@ pub enum Error {
         superseded_by: Option<String>,
     },
 
-    /// v16.2.0 (CIRISPersist#440/#441) — a `federation_keys` write was REFUSED
+    /// v17.0.0 (CIRISPersist#440/#441) — a `federation_keys` write was REFUSED
     /// because it claims an accord-conferred `role` (on EITHER role surface —
     /// the `identity_type` set or the `roles` vector,
     /// [`types::KeyRecord::claims_role`]) without the accord family m-of-n
@@ -4457,7 +4457,7 @@ pub enum Error {
         reason: String,
     },
 
-    /// v16.2.0 (CIRISPersist#440) — a `federation_keys` write was REFUSED
+    /// v17.0.0 (CIRISPersist#440) — a `federation_keys` write was REFUSED
     /// because it would confer `role` on a `key_id` the accord quorum has
     /// WITHDRAWN (a durable V104 tombstone whose `superseded_by` does not name
     /// this key). The role-generic revocation-wins consult — the #377 rule

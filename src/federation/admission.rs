@@ -1617,7 +1617,7 @@ pub async fn verify_signed_identity_occurrence_revocation(
     .await
 }
 
-/// v16.2.0 (CIRISPersist#443) — the SIGNED transport-destination admission
+/// v17.0.0 (CIRISPersist#443) — the SIGNED transport-destination admission
 /// gate: the route-plane mirror of
 /// [`verify_signed_identity_occurrence_revocation`], closing the
 /// **route-hijack confused deputy** (CIRISEdge#336): before this the
@@ -3617,7 +3617,7 @@ pub async fn check_infra_attest_role_admission_over_roster(
         })
 }
 
-/// v16.2.0 (CIRISPersist#440, CC 3.4.9) — the **CC 3.4.9 co-steward role
+/// v17.0.0 (CIRISPersist#440, CC 3.4.9) — the **CC 3.4.9 co-steward role
 /// admission gate**: a `federation_keys` row may claim
 /// [`identity_type::REGISTRY`] or [`identity_type::VERIFY`] (on either role
 /// surface, [`super::KeyRecord::claims_role`]) IFF the record carries the
@@ -3654,7 +3654,7 @@ pub async fn check_co_steward_role_admission_over_roster(
     Ok(())
 }
 
-/// v16.2.0 (CIRISPersist#440/#441) — the **role-generic accord-conferral
+/// v17.0.0 (CIRISPersist#440/#441) — the **role-generic accord-conferral
 /// admission gate**: `role` may be claimed (on either role surface,
 /// [`super::KeyRecord::claims_role`]) only by a record carrying the accord
 /// family m-of-n co-scrub, and only while no un-superseded V104 withdrawal
@@ -3708,7 +3708,7 @@ pub async fn check_accord_role_admission_over_roster(
         })
 }
 
-/// v16.2.0 (CIRISPersist#440) — the **self-authenticating effective-role
+/// v17.0.0 (CIRISPersist#440) — the **self-authenticating effective-role
 /// read** a consumer resolves trust from: `key_id`'s stored row claims `role`
 /// (either role surface), the row's scrub set STILL VERIFIES to the accord
 /// family m-of-n ([`verify_accord_family_coscrub`], re-run against the live
@@ -3716,7 +3716,7 @@ pub async fn check_accord_role_admission_over_roster(
 ///
 /// The co-scrub is re-verified rather than trusted from claim-presence
 /// because the `roles` vector accepted arbitrary self-asserted tokens before
-/// v16.2.0 gated these roles — a row stored under ≤16.1.1 may carry a
+/// v17.0.0 gated these roles — a row stored under ≤16.1.1 may carry a
 /// decorative self-claimed `registry`/`verify` that the write gate never saw.
 /// Re-deriving conferral from the row's own cryptography (never from write-
 /// gate history) means such a legacy row reads `false` here, by construction.
@@ -4217,7 +4217,7 @@ pub async fn withdraw_infra_attest_role_over_roster(
         .await
 }
 
-/// v16.2.0 (CIRISPersist#440) — the canonical `op` token a role-generic
+/// v17.0.0 (CIRISPersist#440) — the canonical `op` token a role-generic
 /// WITHDRAW authority payload commits to: `withdraw_role:{role}`. The role
 /// token is INSIDE the op string (and therefore inside the JCS payload
 /// digest), so a decision authorizing withdrawal of one role can never be
@@ -4228,7 +4228,7 @@ pub fn op_withdraw_role(role: &str) -> String {
     format!("withdraw_role:{role}")
 }
 
-/// v16.2.0 (CIRISPersist#440) — **withdraw** an accord-conferred role (the
+/// v17.0.0 (CIRISPersist#440) — **withdraw** an accord-conferred role (the
 /// CC 3.4.9 co-stewards `registry`/`verify`, and every future
 /// [`check_accord_role_admission_over_roster`]-gated role) from `key_id`.
 /// The #377 op-parameterized authority core, role-generically: the stored

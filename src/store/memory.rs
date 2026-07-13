@@ -163,13 +163,13 @@ struct State {
     federation_partner_record_sigs:
         HashMap<String, (Vec<ciris_verify_core::threshold::ThresholdSignature>, usize)>,
     /// v6.5.0 (CIRISPersist#183, CEG §5.6.8.8.1) — per-occurrence
-    /// reachability rows. v16.2.0 (#443): keyed by the ROUTE-TABLE PK
+    /// reachability rows. v17.0.0 (#443): keyed by the ROUTE-TABLE PK
     /// `(occurrence_key_id, transport_kind)` (`destination` is payload — one
     /// live route per peer per transport), superseded under the
     /// `(epoch, asserted_at)` monotonic guard. Parity with the
     /// postgres/sqlite `transport_destinations` table (V105).
     transport_destinations: HashMap<(String, String), crate::federation::TransportDestination>,
-    /// v16.2.0 (CIRISPersist#443, replication read) — signature container for
+    /// v17.0.0 (CIRISPersist#443, replication read) — signature container for
     /// SIGNED-put routes, keyed like `transport_destinations`
     /// (`(attesting_key_id, signed_envelope, signature)`). Absent for
     /// trusted-local rows (and REMOVED when a local put supersedes a signed
@@ -1944,7 +1944,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // the consumer (prefer `Rooted`; content gate CC 6 N1), never a substrate
         // reject. Kept backend-symmetric with the FK-less sqlite/postgres tables.
         //
-        // v16.2.0 (#443) — route-table PK (occ, kind) + the (epoch,
+        // v17.0.0 (#443) — route-table PK (occ, kind) + the (epoch,
         // asserted_at) monotonic guard: a stale assertion is a silent no-op.
         // A local put that supersedes a SIGNED row drops the signature
         // container (it attested the old content) — parity with the

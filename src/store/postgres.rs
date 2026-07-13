@@ -2080,7 +2080,7 @@ fn pg_row_to_transport_destination(
     })
 }
 
-/// v16.2.0 (#443 replication read) — Postgres row →
+/// v17.0.0 (#443 replication read) — Postgres row →
 /// [`crate::federation::SignedTransportDestination`]. Columns 0..=9 are the
 /// shared typed decode; 10..=12 the byte-exact signature container (TEXT —
 /// JSONB would not preserve the producer's serialization). Callers gate on

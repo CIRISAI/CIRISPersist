@@ -266,7 +266,7 @@ impl BindingProvenance {
 /// reachability row). Backed by the `transport_destinations` table
 /// (V078; route-table shape since V105).
 ///
-/// v16.2.0 (CIRISPersist#443) — this is now a **superseding route table**:
+/// v17.0.0 (CIRISPersist#443) — this is now a **superseding route table**:
 /// the authoritative key is `(occurrence_key_id, transport_kind)` (one live
 /// route per peer per transport), `destination` is payload, and supersession
 /// is `(epoch, asserted_at)`-lexicographic (never last-physical-writer-wins).
@@ -325,7 +325,7 @@ pub struct TransportDestination {
     /// `Rooted` (their authoritative-by-assumption intent).
     #[serde(default)]
     pub binding_provenance: BindingProvenance,
-    /// v16.2.0 (CIRISPersist#443) — the **durable monotonic supersession
+    /// v17.0.0 (CIRISPersist#443) — the **durable monotonic supersession
     /// counter** (the edge-side `RootedPeer.epoch` finally has a durable
     /// home). Supersession is `(epoch, asserted_at)`-lexicographic: a put
     /// applies iff its `epoch` is strictly greater, or equal with a strictly
@@ -335,7 +335,7 @@ pub struct TransportDestination {
     /// (and capsule peers built against an older wheel) read as epoch 0.
     #[serde(default)]
     pub epoch: u64,
-    /// v16.2.0 (CIRISPersist#443) — the **replicated tombstone**: when set,
+    /// v17.0.0 (CIRISPersist#443) — the **replicated tombstone**: when set,
     /// the route is RETIRED. Retirement travels as a signed put with a higher
     /// `(epoch, asserted_at)`, so the monotonic guard keeps older gossip from
     /// resurrecting the route. Retired rows are EXCLUDED from the three
@@ -345,7 +345,7 @@ pub struct TransportDestination {
     pub retired_at: Option<DateTime<Utc>>,
 }
 
-/// v16.2.0 (CIRISPersist#443) — a **signed** transport-destination submission:
+/// v17.0.0 (CIRISPersist#443) — a **signed** transport-destination submission:
 /// the route-plane mirror of
 /// [`SignedIdentityOccurrence`](crate::federation::types::SignedIdentityOccurrence) /
 /// [`SignedIdentityOccurrenceRevocation`](crate::federation::types::SignedIdentityOccurrenceRevocation).
@@ -388,7 +388,7 @@ pub struct SignedTransportDestination {
     pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
 }
 
-/// v16.2.0 (CIRISPersist#443) — outcome of a
+/// v17.0.0 (CIRISPersist#443) — outcome of a
 /// [`put_signed_transport_destination`](crate::federation::FederationDirectory::put_signed_transport_destination)
 /// monotonic apply. Modeled on
 /// [`ReplicatedKeyOutcome`](crate::federation::register::ReplicatedKeyOutcome)
@@ -515,7 +515,7 @@ mod tests {
         assert_eq!(a["dimension"], DIMENSION_PARTNERSHIP_ACCEPT);
     }
 
-    /// v16.2.0 (#443) — a BARE unsigned `TransportDestination` payload does
+    /// v17.0.0 (#443) — a BARE unsigned `TransportDestination` payload does
     /// NOT deserialize as a `SignedTransportDestination`: the replication
     /// path's structural refusal of the pre-#443 confused-deputy wire shape
     /// (a peer can no longer push an unauthenticated route). Also: the #443
@@ -542,7 +542,7 @@ mod tests {
     }
 }
 
-/// v16.2.0 (CIRISPersist#443) — shared, backend-agnostic conformance matrices
+/// v17.0.0 (CIRISPersist#443) — shared, backend-agnostic conformance matrices
 /// for the transport route table, run by the sqlite / postgres / memory test
 /// suites against `&dyn FederationDirectory` so the three backends cannot
 /// drift (the CIRISConformance parity rule). `suffix` scopes every fixture id
