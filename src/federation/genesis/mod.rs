@@ -50,6 +50,105 @@ pub fn accord_holder_genesis_records() -> &'static [SignedKeyRecord] {
     })
 }
 
+/// v17.1.0 (CIRISPersist#449, CIRISVerify#202) — the SYNTHESIZED test-anchor
+/// holder rows: one deterministic self-signed `accord_holder` record per
+/// `CIRIS_TEST_TRUST_ROOT` pubkey (`test-accord-holder-{i}`), so the genesis
+/// seed is self-consistent with verify's SWAPPED live anchor under
+/// [`test_anchor_active`](ciris_verify_core::test_anchor::test_anchor_active).
+/// `None` whenever the mode is off (the shared runtime AND-gate + anti-prod
+/// tripwire live in verify's `test_trust_root_override`; persist consults it
+/// rather than re-parsing the env, so the two crates cannot diverge on what
+/// "test mode" means).
+///
+/// NOT baked artifacts — synthesized per call from the env-supplied PUBKEYS.
+/// persist never sees the test root's private key, so the self-scrub fields
+/// are non-verifying placeholders: sufficient for the seed + fail-secure
+/// presence checks and for the anchor-membership rooting verify does under
+/// the override; a harness needing a scrub-VERIFYING terminus row registers
+/// its own properly-signed record (it holds the key).
+#[cfg(feature = "test-anchor")]
+pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let keys = ciris_verify_core::test_anchor::test_trust_root_override()?;
+    let ts: chrono::DateTime<chrono::Utc> = ACCORD_FAMILY_FOUNDED_AT
+        .parse()
+        .expect("ACCORD_FAMILY_FOUNDED_AT is a valid RFC-3339 constant");
+    let mut out = Vec::with_capacity(keys.len());
+    for (i, ed) in keys.iter().enumerate() {
+        let key_id = format!("test-accord-holder-{i}");
+        let envelope = serde_json::json!({ "key_id": key_id, "test_anchor": true });
+        let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
+            .expect("canonicalize test-anchor envelope");
+        out.push(SignedKeyRecord {
+            record: crate::federation::KeyRecord {
+                key_id: key_id.clone(),
+                pubkey_ed25519_base64: B64.encode(ed),
+                pubkey_ml_dsa_65_base64: None,
+                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                identity_type: crate::federation::types::identity_type::ACCORD_HOLDER.to_owned(),
+                identity_ref: key_id.clone(),
+                valid_from: ts,
+                valid_until: None,
+                registration_envelope: envelope,
+                original_content_hash: hex::encode(Sha256::digest(&canonical)),
+                scrub_signature_classical: B64.encode(b"test-anchor-placeholder"),
+                scrub_signature_pqc: None,
+                scrub_key_id: key_id.clone(),
+                scrub_timestamp: ts,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                roles: Vec::new(),
+                // The V-schema requires accord_holder rows to CARRY evidence;
+                // this is the SoftwareOnly_TEST custody marker (the tier
+                // verify's accord_custody_attestation admits under the same
+                // gate, CIRISVerify#202) — honest about what it is, never a
+                // fabricated hardware claim.
+                attestation_evidence: Some(serde_json::json!({
+                    "tier": "SoftwareOnly_TEST",
+                    "test_anchor": true,
+                })),
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            },
+        });
+    }
+    Some(out)
+}
+
+/// v17.1.0 (CIRISPersist#449) — is the test-anchor override LIVE (feature
+/// compiled in AND runtime-armed AND a decodable `CIRIS_TEST_TRUST_ROOT`)?
+/// Const-`false` on a prod build — every test-mode branch below is dead code
+/// the optimizer removes, exactly like verify's inert twins.
+fn test_anchor_override_active() -> bool {
+    #[cfg(feature = "test-anchor")]
+    {
+        ciris_verify_core::test_anchor::test_trust_root_override().is_some()
+    }
+    #[cfg(not(feature = "test-anchor"))]
+    {
+        false
+    }
+}
+
+/// v17.1.0 (CIRISPersist#449) — the EFFECTIVE accord-holder genesis roster:
+/// the synthesized [`test_anchor_genesis_records`] under a live test-anchor
+/// override, the baked A1/B1/C1 [`accord_holder_genesis_records`] otherwise
+/// (and ALWAYS on a prod build — the test branch is compiled out). This is
+/// the ONE selector every roster consumer rides — the backend genesis seeds,
+/// [`verify_anchor_seeded`], the family bake, and the admission quorum roster
+/// (`accord_holder_roster_key_ids`) — so the whole accord machinery follows
+/// the same anchor verify roots against, by construction.
+pub fn effective_accord_holder_records() -> std::borrow::Cow<'static, [SignedKeyRecord]> {
+    #[cfg(feature = "test-anchor")]
+    if let Some(test) = test_anchor_genesis_records() {
+        return std::borrow::Cow::Owned(test);
+    }
+    std::borrow::Cow::Borrowed(accord_holder_genesis_records())
+}
+
 /// Fail-secure presence check (CIRISPersist#347 req 3): confirm every pinned
 /// [`accord_holder_bootstrap_anchor`](ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor)
 /// pubkey is live as a seeded self-signed `accord_holder` row, and that the
@@ -65,13 +164,20 @@ where
     use base64::Engine as _;
     use std::collections::HashSet;
 
+    // #449 — `accord_holder_bootstrap_anchor()` is the LIVE anchor (verify
+    // swaps it for the SW test root under `test_anchor_active()`), so the
+    // record set checked against it must be the matching EFFECTIVE roster:
+    // the same fail-secure present==anchor invariant, enforced against
+    // whichever anchor is actually live. On a prod build both selectors are
+    // the baked constants and this is byte-identical to pre-#449.
     let anchor: HashSet<[u8; 32]> =
         ciris_verify_core::accord_genesis::accord_holder_bootstrap_anchor()
             .into_iter()
             .collect();
     let mut present: HashSet<[u8; 32]> = HashSet::new();
 
-    for sr in accord_holder_genesis_records() {
+    let records = effective_accord_holder_records();
+    for sr in records.iter() {
         let r = &sr.record;
         let row = dir
             .lookup_public_key(&r.key_id)
@@ -129,7 +235,9 @@ pub fn accord_family_genesis_record() -> crate::federation::types::Family {
     let founded_at = ACCORD_FAMILY_FOUNDED_AT
         .parse()
         .expect("ACCORD_FAMILY_FOUNDED_AT is a valid RFC-3339 constant");
-    let members = accord_holder_genesis_records()
+    // #449 — founder seats follow the EFFECTIVE roster so the family stays
+    // coherent with the seeded holders (test or baked) by construction.
+    let members = effective_accord_holder_records()
         .iter()
         .map(|sr| FamilyMember {
             key_id: sr.record.key_id.clone(),
@@ -361,6 +469,21 @@ where
     verify_anchor_seeded(dir).await?;
     seed_accord_family(dir).await?;
     verify_family_seeded(dir).await?;
+    // #449 — under a live test-anchor override the baked 2-of-3 canonical
+    // record is NOT seedable by construction: its A1/B1 scrubs cannot verify
+    // against the swapped SW roster (the m-of-n gate would fail-secure
+    // refuse it, correctly). The local mesh harness mints its own software
+    // canonical under the test anchor instead (CIRISVerify#202 /
+    // CIRISServer#258), so skip the bake rather than brick the boot. Dead
+    // code on a prod build (the fence compiles the branch out).
+    if test_anchor_override_active() {
+        tracing::warn!(
+            "CIRIS_TESTING_MODE: test trust root active — skipping the baked \
+             2-of-3 canonical genesis seed (the harness mints its own canonical \
+             under the SW test anchor). This MUST NOT appear in production."
+        );
+        return Ok(());
+    }
     seed_canonical_servers(dir).await?;
     verify_canonical_seeded(dir).await?;
     Ok(())
@@ -781,5 +904,113 @@ mod tests {
             verdict.is_confirmed(),
             "pg seeded real A1 must root, got {verdict:?}"
         );
+    }
+}
+
+/// v17.1.0 (CIRISPersist#449) — the test-anchor genesis relaxation, exercised
+/// ONLY on a `test-anchor` build (`cargo nextest run --features
+/// sqlite,test-anchor`). Env mutation is safe under nextest's
+/// process-per-test isolation; each test still cleans up after itself for the
+/// in-process `cargo test` runner.
+#[cfg(all(test, feature = "test-anchor", feature = "sqlite"))]
+mod test_anchor_tests {
+    use super::*;
+    use crate::store::backend::Backend as _;
+    use crate::store::sqlite::SqliteBackend;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+
+    /// Arm the override with a fresh SW test root; returns its pubkey b64.
+    fn arm_test_anchor() -> String {
+        let ed = ed25519_dalek::SigningKey::from_bytes(&[0x5Au8; 32]);
+        let pk_b64 = B64.encode(ed.verifying_key().to_bytes());
+        std::env::set_var("CIRIS_TESTING_MODE", "true");
+        std::env::set_var("CIRIS_TEST_TRUST_ROOT", &pk_b64);
+        std::env::remove_var("ENVIRONMENT");
+        std::env::remove_var("CIRIS_ENV");
+        std::env::remove_var("CIRIS_ENVIRONMENT");
+        pk_b64
+    }
+
+    fn disarm_test_anchor() {
+        std::env::remove_var("CIRIS_TESTING_MODE");
+        std::env::remove_var("CIRIS_TEST_TRUST_ROOT");
+        std::env::remove_var("ENVIRONMENT");
+    }
+
+    /// The #449 repro, fixed: under the armed override the full genesis-seed
+    /// boot path succeeds against the SWAPPED anchor — the SW holder row is
+    /// seeded and verified (present == live anchor at n=1), the family's
+    /// founder seats follow the test roster, and the unseedable baked 2-of-3
+    /// canonical is skipped instead of bricking the boot.
+    #[serial_test::serial(test_anchor_env)]
+    #[tokio::test]
+    async fn test_anchor_boot_seeds_swapped_roster_sqlite() {
+        let pk_b64 = arm_test_anchor();
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .seed_genesis_accord_holders(&effective_accord_holder_records())
+            .await
+            .expect("seed the SW test-root holder");
+        seed_family_and_canonical(&backend)
+            .await
+            .expect("#449: the genesis-seed boot path must succeed in test mode");
+
+        let dir: &dyn crate::federation::FederationDirectory = &backend;
+        // The SW holder row is live with the override pubkey.
+        let row = dir
+            .lookup_public_key("test-accord-holder-0")
+            .await
+            .unwrap()
+            .expect("the synthesized test holder is seeded");
+        assert_eq!(row.pubkey_ed25519_base64, pk_b64);
+        assert_eq!(
+            row.identity_type,
+            crate::federation::types::identity_type::ACCORD_HOLDER
+        );
+        // The baked A1/B1/C1 are NOT seeded (the roster is swapped, not merged).
+        let baked_a1 = &accord_holder_genesis_records()[0].record.key_id;
+        assert!(dir.lookup_public_key(baked_a1).await.unwrap().is_none());
+        // Family seats follow the test roster.
+        let fam = dir
+            .lookup_family(ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID)
+            .await
+            .unwrap()
+            .expect("family seeded");
+        assert_eq!(fam.members.len(), 1);
+        assert_eq!(fam.members[0].key_id, "test-accord-holder-0");
+        // The baked canonical bake was skipped, not force-inserted.
+        assert!(backend.list_canonical_servers().await.unwrap().is_empty());
+
+        disarm_test_anchor();
+    }
+
+    /// Without the runtime flag the feature is inert: the effective roster is
+    /// the baked trio, byte-identical to a prod build.
+    #[serial_test::serial(test_anchor_env)]
+    #[tokio::test]
+    async fn test_anchor_inert_without_runtime_flag() {
+        disarm_test_anchor();
+        let recs = effective_accord_holder_records();
+        assert_eq!(recs.len(), 3, "baked A1/B1/C1 when the mode is unarmed");
+        assert_eq!(
+            recs[0].record.key_id,
+            accord_holder_genesis_records()[0].record.key_id
+        );
+    }
+
+    /// The anti-production tripwire (re-checked through verify's shared gate):
+    /// an explicit prod signal defeats the override even with the test flag +
+    /// root set — the effective roster stays baked.
+    #[serial_test::serial(test_anchor_env)]
+    #[tokio::test]
+    async fn test_anchor_prod_tripwire_defeats_override() {
+        let _ = arm_test_anchor();
+        std::env::set_var("ENVIRONMENT", "production");
+        let recs = effective_accord_holder_records();
+        assert_eq!(recs.len(), 3, "prod signal must defeat the test override");
+        disarm_test_anchor();
     }
 }

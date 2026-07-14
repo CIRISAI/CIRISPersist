@@ -3937,9 +3937,12 @@ pub fn canonical_withdrawal_payload_sha256(
 
 /// The accord-holder standing-roster `key_id`s (A1/B1/C1) — the FIXED identities
 /// whose PINNED directory pubkeys form the canonical-withdraw quorum roster.
-/// Sourced from the baked genesis records, never caller input.
+/// Sourced from the EFFECTIVE genesis records, never caller input: the baked
+/// trio in production, and — only on a `test-anchor` build with the runtime
+/// gate armed (#449) — the synthesized SW test-root holders, so the whole
+/// accord quorum machinery follows the same anchor verify roots against.
 fn accord_holder_roster_key_ids() -> Vec<String> {
-    super::genesis::accord_holder_genesis_records()
+    super::genesis::effective_accord_holder_records()
         .iter()
         .map(|r| r.record.key_id.clone())
         .collect()

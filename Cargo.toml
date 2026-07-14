@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "17.0.2"
+version = "17.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -16,6 +16,16 @@ publish = false
 
 [features]
 default = []
+
+# v17.1.0 (CIRISPersist#449, CIRISVerify#202) — compile-time-fenced TEST-ONLY
+# genesis relaxation for the local mesh harness (CIRISServer#258). Forwards to
+# verify-core's fence so persist and verify share ONE definition of "test
+# mode" (`ciris_verify_core::test_anchor::test_anchor_active()`), while
+# persist enforces the gate independently at its own genesis-seed chokepoints
+# (defense in depth). A prod build (feature off) compiles the relaxation out
+# entirely — the genesis path is byte-identical to pre-#449. NEVER enable in
+# a published wheel/release lane.
+test-anchor = ["ciris-verify-core/test-anchor"]
 
 # Phase 1 features.
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:postgres-types", "dep:refinery", "refinery/tokio-postgres"]
