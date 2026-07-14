@@ -5,6 +5,44 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.2.0] — 2026-07-14 — test-anchor node-bless unblock (#451): PQC-complete seeded holder + verifiable self-scrub via env + the persist-tier e2e
+
+### Added — the #449 "flag if this bites" follow-up (all inside the `test-anchor` fence + `test_anchor_active()` gate; prod byte-identical)
+
+v17.1.0's seeded test holder carried no ML-DSA pubkey, so a node record
+hybrid-scrubbed by the SW test root could never verify under the always-on
+`HybridPolicy::Strict` registration gate — the harness (CIRISServer#258)
+was dead-ended at node-bless, with every workaround correctly refused by a
+production gate. Fixed by letting the harness supply what persist cannot
+synthesize (it never sees the test root's private key), index-aligned with
+`CIRIS_TEST_TRUST_ROOT`, all optional:
+
+- **`CIRIS_TEST_TRUST_ROOT_PQC`** — base64 ML-DSA-65 pubkeys; the seeded
+  row becomes PQC-complete (`pubkey_ml_dsa_65_base64` + `pqc_completed_at`),
+  so a full hybrid scrub by the SW root verifies under Strict with ZERO
+  relaxation of the verification itself (#451 ask 1).
+- **`CIRIS_TEST_TRUST_ROOT_SCRUB`** (+ **`_SCRUB_PQC`**) — base64 self-scrub
+  signatures over persist's pinned synthesized envelope
+  (`JCS({"key_id":"test-accord-holder-{i}","test_anchor":true})`; classical
+  = Ed25519 over the canonical bytes, PQC = the bound `sign_bound` form).
+  With these the seeded terminus is fully scrub-VERIFYING and persist's own
+  `root_binding` Confirms chains terminating at it. Without them: the
+  v17.1.0 placeholder (seed + presence checks + verify-side
+  anchor-membership rooting work; persist-side rooting through the
+  placeholder terminus does not confirm) — the rooting contract is now
+  PINNED, not theoretical.
+
+### Tests — the persist-tier e2e (#451 ask 2)
+
+`test_anchor_e2e_sw_root_blesses_node_and_roots`: real SW hybrid root (test
+holds the private halves) → env armed with pubkeys + self-scrubs → a full
+`Engine` builds in test mode → `produce_scrubbed_key_record` (the exact
+server-tier bless path) → `register_federation_key` ADMITS under the
+always-on Strict hybrid gate → `root_binding` CONFIRMS with the chain
+terminating at `test-accord-holder-0`. Real crypto end-to-end, zero
+verification relaxation. Gates: default pg+sqlite `--all-targets`
+1534/1534 (unchanged); fenced sqlite suite 1232/1232.
+
 ## [17.1.0] — 2026-07-14 — test-anchor-aware genesis seed (#449; unblocks the local mesh harness)
 
 ### Added — compile-time-fenced TEST-ONLY genesis relaxation (`test-anchor` feature)
