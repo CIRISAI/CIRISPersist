@@ -5,6 +5,20 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.0.2] — 2026-07-14 — verify 10.2.0 re-pin (mesh coherence)
+
+### Changed
+- **`ciris-verify` 10.1.1 → 10.2.0** (all six Rust git-tag pins flipped
+  together; `Cargo.lock` coherent at 10.2.0 across
+  ciris-verify-core/keyring/crypto). verify 10.2.0 adds the
+  compile-time-fenced TEST-ONLY trust-root / custody relaxation for the
+  local mesh harness (CIRISVerify#202/#203) — a dev-harness affordance
+  behind a feature fence persist does not enable, so persist's production
+  verification surface is byte-identical; the re-pin keeps the mesh's
+  bundled-verify versions coherent for the CIRISEdge/Server adoption wave
+  pinning `>=17,<18`. Wheel `Requires-Dist: ciris-verify>=10.0.0,<11`
+  unchanged (same major — the cohab firewall doesn't move).
+
 ## [17.0.1] — 2026-07-13 — occurrence `transport_binding` → route-table projection (#446; the #336 last mile)
 
 Publishing note: v17.0.0 was tagged but its publish run was superseded by
