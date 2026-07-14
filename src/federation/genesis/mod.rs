@@ -60,17 +60,45 @@ pub fn accord_holder_genesis_records() -> &'static [SignedKeyRecord] {
 /// rather than re-parsing the env, so the two crates cannot diverge on what
 /// "test mode" means).
 ///
-/// NOT baked artifacts — synthesized per call from the env-supplied PUBKEYS.
-/// persist never sees the test root's private key, so the self-scrub fields
-/// are non-verifying placeholders: sufficient for the seed + fail-secure
-/// presence checks and for the anchor-membership rooting verify does under
-/// the override; a harness needing a scrub-VERIFYING terminus row registers
-/// its own properly-signed record (it holds the key).
+/// NOT baked artifacts — synthesized per call from env-supplied material.
+/// persist never sees the test root's PRIVATE key, so what the row can carry
+/// is exactly what the harness supplies (v17.2.0, CIRISPersist#451; all
+/// index-aligned with `CIRIS_TEST_TRUST_ROOT`, all optional):
+///
+/// - **`CIRIS_TEST_TRUST_ROOT_PQC`** — comma-separated base64 ML-DSA-65
+///   PUBKEYS. When present the seeded row is PQC-complete
+///   (`pubkey_ml_dsa_65_base64 = Some`, `pqc_completed_at` set), so a full
+///   hybrid scrub signed by the SW root verifies under the always-on
+///   `HybridPolicy::Strict` registration gate with ZERO relaxation of the
+///   verification itself — the #451 node-bless unblock.
+/// - **`CIRIS_TEST_TRUST_ROOT_SCRUB`** (+ optional
+///   **`CIRIS_TEST_TRUST_ROOT_SCRUB_PQC`**) — comma-separated base64
+///   self-scrub SIGNATURES over this row's canonical envelope, produced by
+///   the harness (it holds the private halves). The signing contract is
+///   pinned: classical = Ed25519 over
+///   `JCS({"key_id":"test-accord-holder-{i}","test_anchor":true})` (the
+///   exact envelope synthesized here); PQC = the bound hybrid form
+///   (`SelfSigner::sign_bound` over the same canonical bytes). When present
+///   the seeded terminus is a fully scrub-VERIFYING rooting root — persist's
+///   own `root_binding` Confirms a chain terminating here (its
+///   `Ed25519Fallback` link policy verifies classical-only or full-hybrid).
+///   When absent: a non-verifying placeholder — the seed + presence checks +
+///   verify-side anchor-membership rooting still work, but persist-side
+///   `root_binding` will NOT confirm through this terminus (the pinned
+///   contract the #451 e2e documents).
 #[cfg(feature = "test-anchor")]
 pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
+
+    /// The i-th comma-separated slot of `var`, trimmed; `None` when the var
+    /// is unset or the slot is missing/empty.
+    fn env_slot(var: &str, i: usize) -> Option<String> {
+        let raw = std::env::var(var).ok()?;
+        let slot = raw.split(',').nth(i)?.trim().to_owned();
+        (!slot.is_empty()).then_some(slot)
+    }
 
     let keys = ciris_verify_core::test_anchor::test_trust_root_override()?;
     let ts: chrono::DateTime<chrono::Utc> = ACCORD_FAMILY_FOUNDED_AT
@@ -82,11 +110,20 @@ pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
         let envelope = serde_json::json!({ "key_id": key_id, "test_anchor": true });
         let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope)
             .expect("canonicalize test-anchor envelope");
+        // #451 — optional PQC pubkey + real self-scrub signatures (see the
+        // doc contract above). The PQC scrub only rides alongside a
+        // classical one (it is the BOUND half of a hybrid pair).
+        let pqc_pubkey = env_slot("CIRIS_TEST_TRUST_ROOT_PQC", i);
+        let scrub_ed = env_slot("CIRIS_TEST_TRUST_ROOT_SCRUB", i);
+        let scrub_pqc = scrub_ed
+            .as_ref()
+            .and_then(|_| env_slot("CIRIS_TEST_TRUST_ROOT_SCRUB_PQC", i));
         out.push(SignedKeyRecord {
             record: crate::federation::KeyRecord {
                 key_id: key_id.clone(),
                 pubkey_ed25519_base64: B64.encode(ed),
-                pubkey_ml_dsa_65_base64: None,
+                pqc_completed_at: pqc_pubkey.as_ref().map(|_| ts),
+                pubkey_ml_dsa_65_base64: pqc_pubkey,
                 algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
                 identity_type: crate::federation::types::identity_type::ACCORD_HOLDER.to_owned(),
                 identity_ref: key_id.clone(),
@@ -94,11 +131,11 @@ pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
                 valid_until: None,
                 registration_envelope: envelope,
                 original_content_hash: hex::encode(Sha256::digest(&canonical)),
-                scrub_signature_classical: B64.encode(b"test-anchor-placeholder"),
-                scrub_signature_pqc: None,
+                scrub_signature_classical: scrub_ed
+                    .unwrap_or_else(|| B64.encode(b"test-anchor-placeholder")),
+                scrub_signature_pqc: scrub_pqc,
                 scrub_key_id: key_id.clone(),
                 scrub_timestamp: ts,
-                pqc_completed_at: None,
                 persist_row_hash: String::new(),
                 roles: Vec::new(),
                 // The V-schema requires accord_holder rows to CARRY evidence;
@@ -935,6 +972,9 @@ mod test_anchor_tests {
     fn disarm_test_anchor() {
         std::env::remove_var("CIRIS_TESTING_MODE");
         std::env::remove_var("CIRIS_TEST_TRUST_ROOT");
+        std::env::remove_var("CIRIS_TEST_TRUST_ROOT_PQC");
+        std::env::remove_var("CIRIS_TEST_TRUST_ROOT_SCRUB");
+        std::env::remove_var("CIRIS_TEST_TRUST_ROOT_SCRUB_PQC");
         std::env::remove_var("ENVIRONMENT");
     }
 
@@ -1011,6 +1051,153 @@ mod test_anchor_tests {
         std::env::set_var("ENVIRONMENT", "production");
         let recs = effective_accord_holder_records();
         assert_eq!(recs.len(), 3, "prod signal must defeat the test override");
+        disarm_test_anchor();
+    }
+
+    /// v17.2.0 (CIRISPersist#451) — the persist-tier END-TO-END proving the
+    /// full harness test model with REAL crypto and ZERO verification
+    /// relaxation (per the harness owner's directive):
+    ///
+    /// 1. arm the override with a SW hybrid root the test holds the private
+    ///    halves of, including the #451 PQC pubkey + self-scrub env halves;
+    /// 2. a full `Engine` BUILDS in test mode (the #449 repro at Engine
+    ///    tier), seeding a PQC-COMPLETE `test-accord-holder-0` carrying the
+    ///    harness-supplied REAL self-scrub;
+    /// 3. a node record hybrid-scrubbed by the SW root
+    ///    (`produce_scrubbed_key_record`, the exact server-tier bless path)
+    ///    ADMITS through `register_federation_key` — the always-on
+    ///    `HybridPolicy::Strict` verifies both halves against the seeded row;
+    /// 4. persist's own `root_binding` CONFIRMS the blessed node, chain
+    ///    terminating at `test-accord-holder-0` — pinning the #451 rooting
+    ///    contract: WITH the env-supplied self-scrub the terminus verifies
+    ///    (without it, persist-side rooting through the placeholder terminus
+    ///    does not confirm; verify-side anchor-membership rooting is
+    ///    unaffected either way).
+    #[serial_test::serial(test_anchor_env)]
+    #[tokio::test]
+    async fn test_anchor_e2e_sw_root_blesses_node_and_roots() {
+        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
+        use ciris_verify_core::federation_self_record::{produce_scrubbed_key_record, ScrubTarget};
+        use ciris_verify_core::self_at_login::{HybridSigningIdentity, SelfSigner};
+
+        // SW root + node hybrid identities — Boxed and built BEFORE any
+        // await (multi-KiB ML-DSA signers on 2 MB test stacks).
+        let root = Box::new(HybridSigningIdentity::new(
+            "test-accord-holder-0",
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let node = Box::new(HybridSigningIdentity::new(
+            "test-node-1",
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let root_member = root.directory_member().unwrap();
+        let node_member = node.directory_member().unwrap();
+
+        // The HARNESS half of the #451 contract: self-scrub over persist's
+        // pinned synthesized envelope (classical + bound PQC, sign_bound).
+        let envelope = serde_json::json!({ "key_id": "test-accord-holder-0", "test_anchor": true });
+        let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope).unwrap();
+        let (scrub_ed, scrub_pqc) = root.sign_bound(&canonical).await.unwrap();
+
+        std::env::set_var("CIRIS_TESTING_MODE", "true");
+        std::env::set_var(
+            "CIRIS_TEST_TRUST_ROOT",
+            &root_member.ed25519_public_key_base64,
+        );
+        std::env::set_var(
+            "CIRIS_TEST_TRUST_ROOT_PQC",
+            root_member
+                .mldsa65_public_key_base64
+                .as_deref()
+                .expect("hybrid root has an ML-DSA pubkey"),
+        );
+        std::env::set_var("CIRIS_TEST_TRUST_ROOT_SCRUB", &scrub_ed);
+        std::env::set_var("CIRIS_TEST_TRUST_ROOT_SCRUB_PQC", &scrub_pqc);
+        std::env::remove_var("ENVIRONMENT");
+        std::env::remove_var("CIRIS_ENV");
+        std::env::remove_var("CIRIS_ENVIRONMENT");
+
+        // (2) A full Engine builds in test mode.
+        let signer = std::sync::Arc::new(crate::signing::LocalSigner::from_parts(
+            ed25519_dalek::SigningKey::from_bytes(&[0x6Cu8; 32]),
+            "test-anchor-e2e-steward".to_string(),
+            None,
+            None,
+        ));
+        let engine = crate::engine::Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("#451: a test-mode Engine must build");
+
+        // The seeded holder is PQC-complete and carries the REAL self-scrub.
+        let dir = engine.federation_directory();
+        let row = dir
+            .lookup_public_key("test-accord-holder-0")
+            .await
+            .unwrap()
+            .expect("test holder seeded");
+        assert_eq!(
+            row.pubkey_ml_dsa_65_base64.as_deref(),
+            root_member.mldsa65_public_key_base64.as_deref(),
+            "#451: seeded row must carry the env-supplied ML-DSA pubkey"
+        );
+        assert!(row.pqc_completed_at.is_some());
+        assert_eq!(row.scrub_signature_classical, scrub_ed);
+        assert_eq!(row.scrub_signature_pqc.as_deref(), Some(scrub_pqc.as_str()));
+
+        // (3) Node bless: the SW root hybrid-scrubs a node registration —
+        // the exact server-tier path (CIRISServer harness test_bless).
+        let verify_rec = produce_scrubbed_key_record(
+            root.as_ref(),
+            ScrubTarget {
+                key_id: "test-node-1".into(),
+                pubkey_ed25519_base64: node_member.ed25519_public_key_base64.clone(),
+                pubkey_ml_dsa_65_base64: node_member
+                    .mldsa65_public_key_base64
+                    .clone()
+                    .expect("hybrid node has an ML-DSA pubkey"),
+                identity_type: crate::federation::types::identity_type::NODE.to_owned(),
+                roles: Vec::new(),
+            },
+            "2026-07-14T00:00:00Z",
+            &[],
+        )
+        .await
+        .expect("produce the SW-scrubbed node record");
+        // Wire-identical shapes: verify's SignedKeyRecord → persist's.
+        let persist_rec: crate::federation::SignedKeyRecord =
+            serde_json::from_value(serde_json::to_value(&verify_rec).unwrap())
+                .expect("verify→persist SignedKeyRecord wire round-trip");
+
+        // (4) Admitted under the always-on Strict hybrid gate.
+        engine
+            .register_federation_key(persist_rec)
+            .await
+            .expect("#451: the SW-root hybrid scrub must admit under Strict");
+
+        // (5) persist-side rooting CONFIRMS through the verifying terminus.
+        let crate::engine::BackendDispatch::Sqlite(sq) = engine.backend() else {
+            panic!("sqlite engine expected");
+        };
+        let verdict = crate::federation::rooting::root_binding(
+            &**sq,
+            "test-node-1",
+            &node_member.ed25519_public_key_base64,
+        )
+        .await;
+        assert!(
+            verdict.is_confirmed(),
+            "#451: the blessed node must root via persist's own root_binding, got {verdict:?}"
+        );
+        let chain = verdict.chain().unwrap();
+        assert!(chain.terminates_at_steward_bootstrap);
+        assert_eq!(
+            chain.chain.last().unwrap().key_id,
+            "test-accord-holder-0",
+            "#451: the chain terminates at the SW test root"
+        );
+
         disarm_test_anchor();
     }
 }
