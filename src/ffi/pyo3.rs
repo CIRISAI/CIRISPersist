@@ -1261,7 +1261,7 @@ impl PyEngine {
                         // HUMANITY_ACCORD holder rooting-anchor rows, then
                         // fail-secure verify.
                         pg.seed_genesis_accord_holders(
-                            crate::federation::genesis::accord_holder_genesis_records(),
+                            &crate::federation::genesis::effective_accord_holder_records(),
                         )
                         .await
                         .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;
@@ -1330,7 +1330,7 @@ impl PyEngine {
                         // HUMANITY_ACCORD holder rooting-anchor rows, then
                         // fail-secure verify.
                         sq.seed_genesis_accord_holders(
-                            crate::federation::genesis::accord_holder_genesis_records(),
+                            &crate::federation::genesis::effective_accord_holder_records(),
                         )
                         .await
                         .map_err(|e| PyRuntimeError::new_err(format!("genesis seed: {e}")))?;

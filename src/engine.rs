@@ -5087,7 +5087,7 @@ async fn build_backend(dsn: &str, seed_genesis: bool) -> Result<BackendDispatch,
                 // v12.0.2 (#347) — first-boot-seed the HUMANITY_ACCORD holder
                 // rooting-anchor rows (idempotent), then fail-secure verify.
                 pg.seed_genesis_accord_holders(
-                    crate::federation::genesis::accord_holder_genesis_records(),
+                    &crate::federation::genesis::effective_accord_holder_records(),
                 )
                 .await
                 .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;
@@ -5141,7 +5141,7 @@ async fn build_backend(dsn: &str, seed_genesis: bool) -> Result<BackendDispatch,
             if seed_genesis {
                 // v12.0.2 (#347) — HUMANITY_ACCORD holder anchor rows, then verify.
                 sq.seed_genesis_accord_holders(
-                    crate::federation::genesis::accord_holder_genesis_records(),
+                    &crate::federation::genesis::effective_accord_holder_records(),
                 )
                 .await
                 .map_err(|e| EngineError::GenesisSeed(e.to_string()))?;

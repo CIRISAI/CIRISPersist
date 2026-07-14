@@ -5,6 +5,44 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.1.0] — 2026-07-14 — test-anchor-aware genesis seed (#449; unblocks the local mesh harness)
+
+### Added — compile-time-fenced TEST-ONLY genesis relaxation (`test-anchor` feature)
+
+Under verify 10.2.0's test-anchor override (CIRISVerify#202), verify swaps
+the rooting anchor to a SW test root — but persist's fail-secure genesis
+verifiers kept enforcing the baked A1/B1/C1 roster against it, so a
+`CIRIS_TESTING_MODE` Engine was unbootable (`EngineError::GenesisSeed`),
+blocking the local mesh QA harness (CIRISServer#258). persist now mirrors
+verify's fence, independently enforced (defense in depth):
+
+- New cargo feature **`test-anchor`** forwarding to
+  `ciris-verify-core/test-anchor`. A prod build (feature off) compiles every
+  relaxation out — the genesis path is byte-identical to 17.0.x (inert-twin
+  pattern). Runtime activation additionally requires verify's SHARED gate
+  (`test_anchor_active()`: `CIRIS_TESTING_MODE=true` AND the anti-production
+  tripwire), so persist and verify can never diverge on what "test mode"
+  means.
+- **`effective_accord_holder_records()`** — the ONE roster selector: the
+  synthesized SW test-root holder rows under a live override
+  (`test-accord-holder-{i}`, self-signed `accord_holder`,
+  `SoftwareOnly_TEST` custody marker — honest, never a fabricated hardware
+  claim), the baked A1/B1/C1 otherwise. Every consumer rides it: the
+  backend genesis seeds (engine + pyo3 ctors), `verify_anchor_seeded` (the
+  same fail-secure present == LIVE-anchor invariant, now against whichever
+  anchor is actually live), the HUMANITY_ACCORD family bake (founder seats
+  follow the roster), and the admission quorum roster
+  (`accord_holder_roster_key_ids`) — so canonical/infra:attest/co-steward
+  conferral follows the same anchor verify roots against.
+- The baked 2-of-3 canonical bake is **skipped** under the override (its
+  A1/B1 scrubs cannot verify against the swapped roster — the m-of-n gate
+  would correctly refuse it); the harness mints its own software canonical.
+- Tests (run via `--features sqlite,test-anchor`; env mutation safe under
+  nextest process-per-test): the #449 repro fixed end-to-end (boot seeds the
+  swapped roster, family seats follow it, canonical skipped), inert without
+  the runtime flag, prod-tripwire defeats the override. Default gate
+  unchanged: 1534/1534.
+
 ## [17.0.2] — 2026-07-14 — verify 10.2.0 re-pin (mesh coherence)
 
 ### Changed
