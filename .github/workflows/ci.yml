@@ -211,19 +211,20 @@ jobs:
       # Save the warmed cache (main only; PRs restore but never save). Only the
       # `core` leg saves — all 6 legs share the one per-platform key, so saving
       # from each would be a 6-way write of the same registry blob.
+      #
+      # CIRISPersist#458 — ONE save (tar+gzip+push of target/), then `alias-keys`
+      # RETAGS the same pushed manifest as the rolling `phead` blob server-side
+      # (no second ~9-min tar+push of byte-identical content). The versioned key
+      # is the primary (edge's cross-repo exact-pin restores it); `phead` is a
+      # registry alias for cross-version incremental restore (see the ciriscache
+      # composite). Was two full saves back-to-back (~18.5 min on the v17.5.0 tag
+      # run); now push-once + ~1s retag.
       - uses: CIRISAI/CIRISCache/save@v1
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core'
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-      # …and the rolling `phead` blob (most-recent persist build) for
-      # cross-version incremental restore (see the ciriscache composite).
-      - uses: CIRISAI/CIRISCache/save@v1
-        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core'
-        continue-on-error: true
-        with:
-          key: ${{ env.CIRISCACHE_KEY_HEAD }}
+          alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # NOTE: the prior `linux-aarch64-build` cross-compile job was removed
@@ -285,20 +286,17 @@ jobs:
         run: cargo test --features server
 
       # Save the warmed cache (main only; PRs restore but never save).
-      - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-        continue-on-error: true
-        with:
-          key: ${{ env.CIRISCACHE_KEY }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-      # …and the rolling `phead` blob (most-recent persist build) so the NEXT
-      # version's build restores this warm target/ and recompiles only changed
+      # CIRISPersist#458 — push once (tar+gzip+push of target/), then `alias-keys`
+      # retags the rolling `phead` blob onto the SAME manifest server-side (no
+      # second ~9-min tar+push of byte-identical content). `phead` lets the NEXT
+      # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
       - uses: CIRISAI/CIRISCache/save@v1
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true
         with:
-          key: ${{ env.CIRISCACHE_KEY_HEAD }}
+          key: ${{ env.CIRISCACHE_KEY }}
+          alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # Mission category §4 + PLATFORM_ARCHITECTURE.md §3.1: iOS device +
@@ -453,20 +451,17 @@ jobs:
           path: dist/${{ matrix.dir }}/ciris_persist.abi3.so
 
       # Save the warmed cache (main only; PRs restore but never save).
-      - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-        continue-on-error: true
-        with:
-          key: ${{ env.CIRISCACHE_KEY }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-      # …and the rolling `phead` blob (most-recent persist build) so the NEXT
-      # version's build restores this warm target/ and recompiles only changed
+      # CIRISPersist#458 — push once (tar+gzip+push of target/), then `alias-keys`
+      # retags the rolling `phead` blob onto the SAME manifest server-side (no
+      # second ~9-min tar+push of byte-identical content). `phead` lets the NEXT
+      # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
       - uses: CIRISAI/CIRISCache/save@v1
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true
         with:
-          key: ${{ env.CIRISCACHE_KEY_HEAD }}
+          key: ${{ env.CIRISCACHE_KEY }}
+          alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ci-perf — recombine the two parallel iOS target builds into the single
@@ -687,20 +682,17 @@ jobs:
           path: dist/${{ matrix.abi }}/
 
       # Save the warmed cache (main only; PRs restore but never save).
-      - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-        continue-on-error: true
-        with:
-          key: ${{ env.CIRISCACHE_KEY }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-      # …and the rolling `phead` blob (most-recent persist build) so the NEXT
-      # version's build restores this warm target/ and recompiles only changed
+      # CIRISPersist#458 — push once (tar+gzip+push of target/), then `alias-keys`
+      # retags the rolling `phead` blob onto the SAME manifest server-side (no
+      # second ~9-min tar+push of byte-identical content). `phead` lets the NEXT
+      # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
       - uses: CIRISAI/CIRISCache/save@v1
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true
         with:
-          key: ${{ env.CIRISCACHE_KEY_HEAD }}
+          key: ${{ env.CIRISCACHE_KEY }}
+          alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # Downstream job: collect per-ABI artifacts into tarballs + wheels.
@@ -1223,21 +1215,17 @@ jobs:
       # + darwin-aarch64 wheel entries are saved by the test/darwin jobs.) The
       # CIRISCACHE_KEY was already computed by the composite restore near the top
       # of this job (same PLAT, same toolchain), so reuse it.
-      - name: Save CIRISCache (linux-aarch64 + windows-x64 — #314)
+      # CIRISPersist#458 — one save (tar+gzip+push of the wheel target/), then
+      # `alias-keys` retags the rolling `phead` blob onto the same manifest
+      # server-side (no second tar+push). Windows was the worst offender here:
+      # the wheel target/ is large and a second full push serialized ~9 min.
+      - name: Save CIRISCache (linux-aarch64 + windows-x64 — #314, push-once+alias)
         if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
         uses: CIRISAI/CIRISCache/save@v1
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-      # …and the rolling `phead` blob (most-recent persist build) for
-      # cross-version incremental restore (see the ciriscache composite).
-      - name: Save CIRISCache phead blob
-        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
-        uses: CIRISAI/CIRISCache/save@v1
-        continue-on-error: true
-        with:
-          key: ${{ env.CIRISCACHE_KEY_HEAD }}
+          alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # v0.1.12 — publish abi3 wheel to PyPI on every tag push.
@@ -1374,6 +1362,44 @@ jobs:
           # also verify the PyPI artifact ties to this exact GH
           # workflow identity.
           attestations: true
+
+  # CIRISPersist#458 (ask #3) — release tripwire. The v17.5.0 tag existed while
+  # PyPI still served 17.4.0: a CIRISCache restore hang killed the wheel + lint
+  # jobs, so `publish-pypi`'s `needs:` never satisfied and the job was SILENTLY
+  # SKIPPED — a tagged release that never shipped, with nothing paging. This job
+  # runs on EVERY tag regardless of upstream outcome (`always()` overrides a
+  # skipped/failed `publish-pypi`), and FAILS LOUDLY if the tagged version isn't
+  # on PyPI. A red X on the release run is the page. Extends the dedup-orphans
+  # lesson (assert the artifact EXISTS after a release) to the publish side.
+  assert-published:
+    name: Assert tag reached PyPI (release tripwire)
+    runs-on: ubuntu-latest
+    needs: [publish-pypi]
+    # always() so a SKIPPED/FAILED publish-pypi (the exact #458 failure) still
+    # triggers the check instead of skipping the tripwire along with it.
+    if: ${{ always() && startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - name: Assert PyPI serves this tag's version
+        run: |
+          set -uo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          URL="https://pypi.org/pypi/ciris-persist/${VERSION}/json"
+          echo "Tripwire: does PyPI serve ciris-persist ${VERSION} for tag ${GITHUB_REF_NAME}?"
+          echo "  ${URL}"
+          # Poll — PyPI index propagation after a fresh upload is usually seconds,
+          # occasionally ~a minute. Up to ~3 min before we call it a real miss.
+          CODE=000
+          for attempt in 1 2 3 4 5 6; do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "$URL" || echo 000)
+            if [ "$CODE" = "200" ]; then
+              echo "✅ PyPI serves ciris-persist ${VERSION} — tag ${GITHUB_REF_NAME} shipped."
+              exit 0
+            fi
+            echo "::warning::attempt ${attempt}/6: PyPI has no ${VERSION} yet (HTTP ${CODE}); retrying in 30s"
+            sleep 30
+          done
+          echo "::error title=Release orphaned::Tag ${GITHUB_REF_NAME} exists but PyPI has NO ciris-persist ${VERSION} (last HTTP ${CODE}). publish-pypi failed or was skipped by an upstream failure — the release did NOT ship. Re-run the publish path or investigate the blocking job."
+          exit 1
 
   # Build manifest registration (v0.9.2+, CIRISPersist#42 closed).
   # Signs FOUR per-target BuildManifests covering:
