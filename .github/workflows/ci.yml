@@ -898,6 +898,24 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
+      # Reclaim runner disk BEFORE the ciriscache restore extracts the ~3.7 GB
+      # substrate blob (→ a much larger uncompressed target/) and maturin builds
+      # the release wheel + auditwheel repairs it. Linux only (ubuntu ships ~25
+      # GB of preinstalled toolchains a Rust wheel build never touches). The
+      # linux-x86_64 wheel leg has no dedicated free-space headroom, and a
+      # release-tag run lost the runner mid-extract (job `failure`, restore step
+      # stuck `in_progress`, log blob never uploaded = the ENOSPC-kills-the-agent
+      # signature) — orphaning the v17.5.0 AND v17.5.1 publishes until a rerun.
+      # Mirrors the linux-x86_64-test reclaim (inline rm, no third-party action).
+      - name: Free runner disk (reclaim unused preinstalled toolchains)
+        if: runner.os == 'Linux'
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "after:"; df -h / | tail -1
       # v3.5.3 (CIRISPersist#133) — libsqlite3-dev for the dynamic
       # libsqlite3 link. v3.5.2 narrowed the `bundled` rusqlite feature
       # to Android-only, but the Linux wheel-build runner had no
