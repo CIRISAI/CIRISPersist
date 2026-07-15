@@ -5,6 +5,62 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.5.0] — 2026-07-15 — owner-scope replication log (#455) + resolve_scores boundedness/executor posture (#456)
+
+### Added — `list_attestation_log`: the owner-scope replication read beside the caller-gated consumer read (#455)
+
+v17.4.0's `list_scores` is caller-visibility-gated — correct for an
+authenticated consumer, structurally **wrong for a replication relay**
+enumerating its own store to decide what to gossip (a Cohort hold-and-forward
+relay must see rows attested *between other parties*; wiring edge's advertise
+sweep through `list_scores` would silently narrow — the CIRISEdge#336 failure
+shape). New `list_attestation_log(subject_key_id: Option, cursor, limit)` on
+`FederationDirectory` (+ append-only capsule op + ops-proxy route) with three
+load-bearing invariants: (1) **no caller gate** — gossip policy lives at the
+consumer tier; (2) **lifecycle-blind** — anti-entropy converges the append-only
+LOG not the live view, so superseded/withdrawn/recanted rows are returned (and
+the expensive retraction subquery is skipped); (3) **byte-faithful** —
+`persist_row_hash` intact for re-publish. Federation-tier only (the replicable
+set; local drafts are pre-promotion producer state). `None` subject = full-log
+anti-entropy walk; `Some` seeks one subject over the V106 index. Two entry
+points per replicated kind — owner log walk vs gated consumer view — never one
+doing both jobs.
+
+### Changed — `resolve_scores` boundedness + executor posture (#456)
+
+`resolve_scores` sits on CIRISServer's per-session admission path (AV
+stream-join); a join-storm made it O(history) and serialized behind the sqlite
+conn mutex on the async executor.
+- **Bounded fold input.** Candidates are capped at the newest
+  `RESOLVE_CANDIDATE_CAP` (4096) rows (all backends). Per-attester latest-wins
+  means ancient superseded rows can't change a live verdict; a set that hits
+  the cap surfaces `"candidates_truncated": true` in the trace (audit walks use
+  the unbounded list handles). 
+- **`spawn_blocking`** for the sqlite query + fold + composer fetch, so the
+  admission path never holds the conn mutex on the executor thread (the data
+  plane's KEX/route reads no longer serialize behind a verdict). Postgres pools
+  + queries async, so it takes only the bound.
+- **V107** expression index `(attesting_key_id, attestation_type,
+  references_attestation_id)` on both backends — the composer/retraction
+  lookups (`resolve_scores` composer fetch + `list_scores` lifecycle
+  `NOT EXISTS`) were an unindexed correlated scan per candidate row.
+
+### Fixed — two latent breaks the v17.4.0 bench-attribution hardening surfaced
+
+Building the `secrets_crypto` bench under `--features secrets` (its isolated
+feature set — a config nothing else `-D warnings`-checked, and which the old
+`| tee` bench mask hid): (a) `secrets/{hardware,key_cache}` + `REENCRYPT_
+CHUNK_SIZE` are consumed only by the backend secrets stores → dead under
+`secrets`-alone; now `#[cfg_attr(not(any(postgres, sqlite)), allow(dead_code))]`
+(genuine dead code under a full build still errors); (b) v17.4.0's
+`compose_verdict` was pub-but-undocumented → `missing_docs`; documented.
+
+### Tests
+Owner-log invariants (no-gate / lifecycle-blind / federation-only / subject-vs-
+full walk) on sqlite + memory; the candidate-truncation flag as a fold unit
+test; pg parity retained. Full gate `cargo nextest --all-targets` pg+sqlite:
+**1556/1556**.
+
 ## [17.4.0] — 2026-07-15 — the durable `scores` read surface (FSD-005 Appendix C): V106 subject projection + `list_scores`/`resolve_scores`
 
 ### Added — pin-once read contract for the `scores` workhorse

@@ -1943,7 +1943,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let (data, composers) = {
             let state = self.state.lock().expect("memory backend lock");
             let all = &state.federation_attestations;
-            let data: Vec<crate::federation::Attestation> = all
+            let mut data: Vec<crate::federation::Attestation> = all
                 .iter()
                 .filter(|r| {
                     r.attestation_type == crate::federation::types::attestation_type::SCORES
@@ -1951,6 +1951,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 })
                 .cloned()
                 .collect();
+            // #456 — bound the fold input at the newest RESOLVE_CANDIDATE_CAP
+            // rows (parity with the sqlite/postgres LIMIT): sort DESC, truncate.
+            data.sort_by(|a, b| {
+                b.asserted_at
+                    .cmp(&a.asserted_at)
+                    .then_with(|| b.attestation_id.cmp(&a.attestation_id))
+            });
+            data.truncate(crate::federation::scores::RESOLVE_CANDIDATE_CAP as usize);
             let attesters: std::collections::HashSet<&str> =
                 data.iter().map(|a| a.attesting_key_id.as_str()).collect();
             let composers: Vec<crate::federation::Attestation> = all
@@ -1970,6 +1978,67 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             trace,
             chrono::Utc::now(),
         ))
+    }
+
+    async fn list_attestation_log(
+        &self,
+        subject_key_id: Option<&str>,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
+        use crate::federation::Error;
+        if !(1..=10_000).contains(&limit) {
+            return Err(Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+        if let Some(c) = &cursor {
+            if c.version != "v1" {
+                return Err(Error::InvalidArgument(format!(
+                    "AttestationCursor version {} unsupported; v1 only",
+                    c.version
+                )));
+            }
+        }
+        // #455 — owner-scope LOG walk: NO caller gate, NO lifecycle folding,
+        // federation-tier (the replicable set) only, byte-faithful rows.
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<crate::federation::Attestation> = state
+            .federation_attestations
+            .iter()
+            .filter(|r| {
+                r.tier == crate::federation::types::attestation_tier::FEDERATION
+                    && subject_key_id.is_none_or(|subj| r.subject_key_ids.iter().any(|s| s == subj))
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            b.asserted_at
+                .cmp(&a.asserted_at)
+                .then_with(|| b.attestation_id.cmp(&a.attestation_id))
+        });
+        if let Some(c) = &cursor {
+            rows.retain(|r| {
+                (r.asserted_at, r.attestation_id.as_str())
+                    < (c.last_asserted_at, c.last_attestation_id.as_str())
+            });
+        }
+        let limit_usize = limit as usize;
+        rows.truncate(limit_usize);
+        let next_cursor = if rows.len() == limit_usize {
+            rows.last().map(|last| {
+                crate::read::AttestationCursor::from_trailing(
+                    last.asserted_at,
+                    last.attestation_id.clone(),
+                )
+            })
+        } else {
+            None
+        };
+        Ok(crate::read::ScoresPage {
+            items: rows,
+            next_cursor,
+        })
     }
 
     async fn attestation_upsert_local(
@@ -5999,6 +6068,58 @@ mod tests {
         be.put_attestation(SignedAttestation { attestation: a })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_list_attestation_log_owner_scope() {
+        // #455 — backend parity for the owner LOG walk: lifecycle-blind (a
+        // withdrawn score stays) + composers visible in the full walk;
+        // subject seek returns subject-bearing rows only.
+        use crate::federation::FederationDirectory;
+        let be = MemoryBackend::new();
+        mem_put_score(&be, "live", "k1", "subj", "trust:demo:v1", 0.5, 1.0, 10).await;
+        mem_put_score(&be, "gone", "k2", "subj", "trust:demo:v1", 0.5, 1.0, 20).await;
+        mem_put_composer(&be, "wd", "k2", "withdraws", "gone", 30).await;
+        // gated Live read hides the withdrawn "gone".
+        let gated: Vec<String> = be
+            .list_scores(
+                "",
+                crate::read::AttestationFilter {
+                    subject_key_id: Some("subj".into()),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|a| a.attestation_id)
+            .collect();
+        assert_eq!(gated, vec!["live"]);
+        // subject log: gone + live (lifecycle-blind; subjectless wd excluded).
+        let mut sids: Vec<String> = be
+            .list_attestation_log(Some("subj"), None, 100)
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|a| a.attestation_id)
+            .collect();
+        sids.sort();
+        assert_eq!(sids, vec!["gone", "live"]);
+        // full log: every federation row incl. the composer.
+        let mut fids: Vec<String> = be
+            .list_attestation_log(None, None, 100)
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|a| a.attestation_id)
+            .collect();
+        fids.sort();
+        assert_eq!(fids, vec!["gone", "live", "wd"]);
     }
 
     #[tokio::test]

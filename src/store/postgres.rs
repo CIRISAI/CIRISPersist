@@ -7058,15 +7058,21 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .get()
             .await
             .map_err(|e| Error::Backend(format!("pool: {e}")))?;
-        let (mut where_parts, params) = pg_scores_shared_predicates(&filter, &scope);
+        let (mut where_parts, mut params) = pg_scores_shared_predicates(&filter, &scope);
         where_parts.push("fa.attestation_type = 'scores'".to_string());
         let where_sql = format!("WHERE {}", where_parts.join(" AND "));
+        // #456 — BOUNDED candidate fetch (see sqlite): cap at the newest
+        // RESOLVE_CANDIDATE_CAP rows; ancient superseded rows can't change a
+        // live verdict, and the admission path must not be O(history).
+        params.push(Box::new(crate::federation::scores::RESOLVE_CANDIDATE_CAP));
+        let p_cap = params.len();
         let sql = format!(
             "SELECT DISTINCT {PG_SCORES_FA_COLS} \
              FROM cirislens.attestation_subjects s \
              JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id \
              {where_sql} \
-             ORDER BY asserted_at DESC, attestation_id DESC"
+             ORDER BY asserted_at DESC, attestation_id DESC \
+             LIMIT ${p_cap}"
         );
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref() as _).collect();
@@ -7107,6 +7113,86 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             trace,
             chrono::Utc::now(),
         ))
+    }
+
+    async fn list_attestation_log(
+        &self,
+        subject_key_id: Option<&str>,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
+        use crate::federation::Error;
+        if !(1..=10_000).contains(&limit) {
+            return Err(Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        // #455 — owner-scope LOG walk: NO caller gate, NO lifecycle folding,
+        // federation-tier (the replicable set) only, byte-faithful rows.
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let mut where_parts: Vec<String> = vec!["fa.tier = 'federation'".to_string()];
+        let from = if let Some(subj) = subject_key_id {
+            params.push(Box::new(subj.to_string()));
+            where_parts.push(format!("s.subject_key_id = ${}", params.len()));
+            "cirislens.attestation_subjects s \
+             JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id"
+        } else {
+            "cirislens.federation_attestations fa"
+        };
+        if let Some(c) = &cursor {
+            if c.version != "v1" {
+                return Err(Error::InvalidArgument(format!(
+                    "AttestationCursor version {} unsupported; v1 only",
+                    c.version
+                )));
+            }
+            params.push(Box::new(c.last_asserted_at));
+            let p_at = params.len();
+            params.push(Box::new(c.last_attestation_id.clone()));
+            let p_id = params.len();
+            where_parts.push(format!(
+                "(fa.asserted_at, fa.attestation_id::text) < (${p_at}, ${p_id})"
+            ));
+        }
+        params.push(Box::new(limit));
+        let p_limit = params.len();
+        let distinct = if subject_key_id.is_some() {
+            "DISTINCT "
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT {distinct}{PG_SCORES_FA_COLS} FROM {from} \
+             WHERE {} \
+             ORDER BY asserted_at DESC, attestation_id DESC \
+             LIMIT ${p_limit}",
+            where_parts.join(" AND ")
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(&sql, &params_ref[..])
+            .await
+            .map_err(|e| Error::Backend(format!("list_attestation_log: {e}")))?;
+        let items: Vec<crate::federation::Attestation> = rows
+            .into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = if items.len() == limit as usize {
+            let last = &items[items.len() - 1];
+            Some(crate::read::AttestationCursor::from_trailing(
+                last.asserted_at,
+                last.attestation_id.clone(),
+            ))
+        } else {
+            None
+        };
+        Ok(crate::read::ScoresPage { items, next_cursor })
     }
 
     async fn attach_revocation_pqc_signature(

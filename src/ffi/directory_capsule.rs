@@ -593,6 +593,21 @@ pub enum DirectoryOp {
         /// When true, populate the verdict's derivation trace.
         trace: bool,
     },
+    /// [`FederationDirectory::list_attestation_log`] (v17.5.0, CIRISPersist#455)
+    /// — the OWNER-scope replication log walk beside the caller-gated
+    /// `ListScores` consumer read. NO caller gate, NO lifecycle folding,
+    /// federation-tier, byte-faithful rows — the relay enumerates its own
+    /// store to decide what to gossip (edge's advertise sweep). `None`
+    /// subject = full-log anti-entropy walk. Result rides `Scores`.
+    /// APPEND-ONLY.
+    ListAttestationLog {
+        /// Subject `key_id` to seek, or `None` for the full-log walk.
+        subject_key_id: Option<String>,
+        /// Opaque `(asserted_at, attestation_id)` page cursor.
+        cursor: Option<crate::read::AttestationCursor>,
+        /// Page size (1..=10_000).
+        limit: i64,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -887,6 +902,17 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
+        DirectoryOp::ListAttestationLog {
+            subject_key_id,
+            cursor,
+            limit,
+        } => match dir
+            .list_attestation_log(subject_key_id.as_deref(), cursor, limit)
+            .await
+        {
+            Ok(v) => DirectoryOpResult::Scores(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
         DirectoryOp::PutLocationProof { proof } => match dir.put_location_proof(proof).await {
             Ok(()) => DirectoryOpResult::Unit,
             Err(e) => DirectoryOpResult::Err(e.to_string()),
@@ -2382,6 +2408,31 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::ComposedVerdict(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v17.5.0 (#455) — route the owner-scope replication LOG walk through the
+    /// capsule so edge's advertise sweep reaches the real (un-gated,
+    /// lifecycle-blind, byte-faithful) enumeration inside persist's `.so`.
+    async fn list_attestation_log(
+        &self,
+        subject_key_id: Option<&str>,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, Error> {
+        match self
+            .run_op(&DirectoryOp::ListAttestationLog {
+                subject_key_id: subject_key_id.map(str::to_string),
+                cursor,
+                limit,
+            })
+            .await?
+        {
+            DirectoryOpResult::Scores(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),

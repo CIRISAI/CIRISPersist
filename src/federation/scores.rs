@@ -111,17 +111,33 @@ impl RowState {
     }
 }
 
-/// Compose the [`ComposedVerdict`] from scope-gated candidate rows.
+/// v17.5.0 (CIRISPersist#456) the `resolve_scores` fold-input bound.
 ///
-/// - `scores_rows` — the subject-gated candidate rows (any type; only
-///   `attestation_type == "scores"` data rows contribute to the aggregate).
+/// The admission-path fold fetches at most this many candidate rows
+/// (newest-first), so the bound keeps exactly the rows per-attester
+/// latest-wins needs; ancient superseded rows beyond it cannot change a live
+/// verdict. A candidate set that hits the cap surfaces
+/// `"candidates_truncated": true` in the trace. An unbounded audit walk uses
+/// `list_scores` or `list_attestation_log` with a client fold, never this
+/// admission-path handle.
+pub const RESOLVE_CANDIDATE_CAP: i64 = 4096;
+
+/// Compose the [`ComposedVerdict`] from scope-gated candidate rows — the
+/// backend-agnostic `resolve_scores` fold, kept in ONE place so the composite
+/// substrate op (the #329 pattern) folds identically across sqlite / postgres
+/// / memory (backend parity is a conformance HARD requirement).
+///
+/// - `scores_rows` — the subject-gated, `RESOLVE_CANDIDATE_CAP`-bounded
+///   candidate rows (any type; only `attestation_type == "scores"` data rows
+///   contribute to the aggregate).
 /// - `composers` — the `supersedes` / `withdraws` / `recants` rows (from the
 ///   same attesters) that MAY retract a candidate; fetched separately by the
 ///   backend because a composer need not name the subject itself.
-/// - `policy` — the requested composition policy id.
+/// - `policy` — the requested composition policy id (CC 4.4.3).
 /// - `trace` — when true, populate [`ComposedVerdict::trace`] with the full
-///   derivation (the OPEN escape hatch).
-/// - `now` — the wall clock for `age_of_head`.
+///   derivation incl. `candidates_truncated` (the OPEN escape hatch).
+/// - `now` — the wall clock for `age_of_head` (a parameter for deterministic
+///   tests).
 pub fn compose_verdict(
     scores_rows: Vec<Attestation>,
     composers: Vec<Attestation>,
@@ -130,6 +146,9 @@ pub fn compose_verdict(
     now: DateTime<Utc>,
 ) -> ComposedVerdict {
     let (polarity, policy_id) = resolve_policy(policy);
+    // #456 — the backends LIMIT the fetch at RESOLVE_CANDIDATE_CAP; a full
+    // batch therefore MEANS possible truncation, surfaced in the trace.
+    let candidates_truncated = scores_rows.len() as i64 >= RESOLVE_CANDIDATE_CAP;
 
     // Only genuine `scores` data rows aggregate.
     let data: Vec<Attestation> = scores_rows
@@ -254,7 +273,13 @@ pub fn compose_verdict(
 
     let trace_val = if trace {
         Some(build_trace(
-            policy_id, polarity, aggregate, &data, &state_of, &heads,
+            policy_id,
+            polarity,
+            aggregate,
+            &data,
+            &state_of,
+            &heads,
+            candidates_truncated,
         ))
     } else {
         None
@@ -313,6 +338,7 @@ fn classify(
 
 /// Build the derivation trace (the OPEN escape hatch). Every future fold input
 /// appears as a NEW field here — never a signature change.
+#[allow(clippy::too_many_arguments)]
 fn build_trace(
     policy_id: &str,
     polarity: Polarity,
@@ -320,6 +346,7 @@ fn build_trace(
     data: &[Attestation],
     state_of: &dyn Fn(&Attestation) -> RowState,
     heads: &std::collections::HashMap<String, &Attestation>,
+    candidates_truncated: bool,
 ) -> serde_json::Value {
     let head_ids: std::collections::HashSet<&String> =
         heads.values().map(|h| &h.attestation_id).collect();
@@ -346,6 +373,10 @@ fn build_trace(
         },
         "aggregate": aggregate,
         "contributor_count": heads.len(),
+        // #456 — true ⇒ the candidate fetch hit RESOLVE_CANDIDATE_CAP; the
+        // verdict is over the newest cap rows (audit reads use the unbounded
+        // list handles, not this).
+        "candidates_truncated": candidates_truncated,
         "inputs": inputs,
     })
 }
@@ -478,5 +509,27 @@ mod tests {
         assert_eq!(tr["policy"], "cc-4.4.2-signed-mean");
         assert_eq!(tr["inputs"][0]["attester"], "k1");
         assert_eq!(tr["inputs"][0]["lifecycle_state"], "live");
+        // #456 — a below-cap candidate set is NOT truncated.
+        assert_eq!(tr["candidates_truncated"], false);
+    }
+
+    #[test]
+    fn candidates_truncated_flag_at_cap() {
+        // #456 — the backends LIMIT the fetch at RESOLVE_CANDIDATE_CAP; a full
+        // batch (>= cap rows reaching the fold) sets the trace flag. One
+        // attester's newest score is the live head regardless, so the verdict
+        // is still well-formed over the (bounded) newest window.
+        let cap = RESOLVE_CANDIDATE_CAP as usize;
+        let rows: Vec<Attestation> = (0..cap)
+            .map(|i| scores_row(&format!("r{i}"), "k1", 0.5, 1.0, i as i64))
+            .collect();
+        let v = compose_verdict(rows, vec![], "cc-4.4.2-signed-mean", true, t(1_000_000));
+        assert_eq!(v.trace.unwrap()["candidates_truncated"], true);
+        // below cap → false.
+        let rows: Vec<Attestation> = (0..cap - 1)
+            .map(|i| scores_row(&format!("r{i}"), "k1", 0.5, 1.0, i as i64))
+            .collect();
+        let v = compose_verdict(rows, vec![], "cc-4.4.2-signed-mean", true, t(1_000_000));
+        assert_eq!(v.trace.unwrap()["candidates_truncated"], false);
     }
 }

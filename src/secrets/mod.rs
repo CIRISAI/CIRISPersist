@@ -53,10 +53,20 @@
 #[cfg(feature = "secrets")]
 pub mod crypto;
 
+// The hardware master-key derivation + software key cache are consumed ONLY
+// by the backend secrets STORES (`secrets/postgres.rs`, `secrets/sqlite.rs`,
+// gated `secrets + {postgres|sqlite}`). A `--features secrets`-only build
+// (e.g. the `secrets_crypto` bench) compiles these modules but not their
+// consumers → legitimately dead. Allow dead code ONLY in that backend-less
+// config; a genuine unused symbol under a full build still errors under
+// `-D warnings`. (Surfaced by the v17.4.0 bench-attribution hardening — the
+// `| tee` mask had hidden this compile break.)
 #[cfg(feature = "secrets")]
+#[cfg_attr(not(any(feature = "postgres", feature = "sqlite")), allow(dead_code))]
 pub(crate) mod hardware;
 
 #[cfg(feature = "secrets")]
+#[cfg_attr(not(any(feature = "postgres", feature = "sqlite")), allow(dead_code))]
 pub(crate) mod key_cache;
 
 #[cfg(all(feature = "secrets", feature = "postgres"))]
@@ -88,6 +98,7 @@ pub use service::SecretsService;
 /// 64 keeps each locked window short while amortizing transaction
 /// overhead.
 #[cfg(feature = "secrets")]
+#[cfg_attr(not(any(feature = "postgres", feature = "sqlite")), allow(dead_code))]
 pub(crate) const REENCRYPT_CHUNK_SIZE: usize = 64;
 
 #[cfg(feature = "secrets-client")]
