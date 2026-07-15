@@ -983,6 +983,47 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v17.5.0 (CIRISPersist#455) — the **owner-scope attestation-LOG
+    /// enumeration**: the replication/relay read beside the caller-gated
+    /// consumer read. A caller-visibility-gated read can never serve a
+    /// relay enumerating ITS OWN STORE to decide what to gossip (a Cohort
+    /// hold-and-forward relay must see rows attested *between other
+    /// parties*; wiring the sweep through [`Self::list_scores`] silently
+    /// narrows — the CIRISEdge#336 failure shape). Three contract
+    /// invariants, each load-bearing:
+    ///
+    /// 1. **No caller gate.** The caller is the substrate owner enumerating
+    ///    its own store; gossip policy (what to actually advertise) lives at
+    ///    the consumer tier (edge `projection_for`), never here.
+    /// 2. **Lifecycle-blind.** Anti-entropy converges the append-only LOG,
+    ///    not the live view — superseded/withdrawn/recanted rows are
+    ///    returned (also skipping the correlated retraction subquery, the
+    ///    most expensive predicate at sweep cardinalities).
+    /// 3. **Byte-faithful.** Full rows with `persist_row_hash` intact, fit
+    ///    for re-publish.
+    ///
+    /// The log is the **replicable set**: federation-tier rows only. Local
+    /// (`tier='local'`) drafts are pre-promotion producer state, not part of
+    /// the shared log by definition (AV-60: nothing crosses to federation
+    /// visibility unsigned). `subject_key_id = None` walks the full log
+    /// (anti-entropy); `Some` seeks one subject over V106. Ordered
+    /// `(asserted_at DESC, attestation_id DESC)`, cursor-paged.
+    ///
+    /// Two entry points per replicated kind — the owner log walk (this) and
+    /// the gated consumer view ([`Self::list_scores`]) — never one doing
+    /// both jobs.
+    async fn list_attestation_log(
+        &self,
+        subject_key_id: Option<&str>,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, Error> {
+        let _ = (subject_key_id, cursor, limit);
+        Err(Error::Unsupported {
+            method: "list_attestation_log",
+        })
+    }
+
     /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — admit a
     /// `family` row.
     ///
