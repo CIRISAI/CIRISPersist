@@ -66,7 +66,7 @@ fn storage_floor(c: &mut Criterion) {
     // Dedicated single-row table for the raw-SQL storage-floor probe —
     // its own table so it never drifts against a substrate's schema.
     {
-        let guard = conn.blocking_lock();
+        let guard = conn.lock();
         guard
             .execute(
                 "CREATE TABLE bench_floor (k TEXT PRIMARY KEY, v INTEGER NOT NULL)",
@@ -99,7 +99,7 @@ fn storage_floor(c: &mut Criterion) {
     // tokio in the path at all.
     group.bench_function("raw_sqlite_write", |b| {
         b.iter(|| {
-            let guard = conn.blocking_lock();
+            let guard = conn.lock();
             guard
                 .execute(
                     "INSERT INTO bench_floor (k, v) VALUES ('probe', 1) \
