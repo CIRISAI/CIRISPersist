@@ -66,6 +66,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Reclaim ~21 GB of unused preinstalled toolchains before the 11-bench
+      # release-mode build (same rationale + safety as the ci.yml test job).
+      - name: Free runner disk (reclaim unused preinstalled toolchains)
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "after:"; df -h / | tail -1
+
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
