@@ -24373,6 +24373,173 @@ mod tests {
         assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
     }
 
+    // ── v17.4.0 scores read surface: postgres runtime parity (the pg SQL
+    //    JOIN + `= ANY($n)` + `->>'references_attestation_id'` anti-join
+    //    differ from sqlite, so they need a live-pg run — mirror of the
+    //    sqlite `list_scores`/`resolve_scores` tests). ──
+
+    /// Build + sign + put a federation `scores` row with an explicit
+    /// attestation_id, attester, subject, dimension, score, and asserted_at
+    /// offset (minutes). Composers (supersedes/withdraws) reference a prior
+    /// id via the envelope. Returns the (uuid) attestation_id.
+    #[cfg(test)]
+    async fn pg_put_score(
+        be: &PostgresBackend,
+        attester: &str,
+        subject: &str,
+        dimension: &str,
+        score: f64,
+        base: chrono::DateTime<chrono::Utc>,
+        mins: i64,
+    ) -> String {
+        use crate::federation::FederationDirectory;
+        // Idempotent: seed the (self-attesting) key so the FK holds.
+        let _ = be
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(attester, "a", chrono::Utc::now(), true),
+            })
+            .await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut row = pg_scores_attestation(attester, attester, attester, dimension);
+        row.attestation_id = id.clone();
+        // `weight` is the confidence column the fold uses (score × confidence);
+        // full confidence, the varying signal is `score` in the envelope.
+        row.weight = Some(1.0);
+        row.asserted_at = base + chrono::Duration::minutes(mins);
+        row.subject_key_ids = vec![subject.to_string()];
+        row.attestation_envelope = serde_json::json!({
+            "dimension": dimension, "score": score, "confidence": 1.0,
+        });
+        pg_resign(&mut row);
+        be.put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .expect("pg put_score");
+        id
+    }
+
+    #[cfg(test)]
+    async fn pg_put_composer(
+        be: &PostgresBackend,
+        attester: &str,
+        atype: &str,
+        references: &str,
+        base: chrono::DateTime<chrono::Utc>,
+        mins: i64,
+    ) {
+        use crate::federation::FederationDirectory;
+        let _ = be
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(attester, "a", chrono::Utc::now(), true),
+            })
+            .await;
+        let mut row = pg_scores_attestation(attester, attester, attester, "x");
+        row.attestation_id = uuid::Uuid::new_v4().to_string();
+        row.attestation_type = atype.to_string();
+        row.weight = None;
+        row.asserted_at = base + chrono::Duration::minutes(mins);
+        row.attestation_envelope = serde_json::json!({ "references_attestation_id": references });
+        pg_resign(&mut row);
+        be.put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .expect("pg put_composer");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_list_scores_subject_dimension_seek_newest_first() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let be = PostgresBackend::connect(&dsn).await.expect("connect");
+        be.run_migrations().await.expect("migrations");
+        let base = chrono::Utc::now() - chrono::Duration::hours(2);
+        let subj = format!("subj-{}", uuid_like());
+        let dim = "trust:demo:v1";
+        let s1 = pg_put_score(&be, "k1", &subj, dim, 0.5, base, 10).await;
+        let s2 = pg_put_score(&be, "k2", &subj, dim, 0.6, base, 20).await;
+        let _s3 = pg_put_score(&be, "k3", &subj, "other:demo:v1", 0.6, base, 30).await;
+        // exact-dimension seek, newest-first
+        let f = crate::read::AttestationFilter {
+            subject_key_id: Some(subj.clone()),
+            dimension_exact: Some(dim.into()),
+            ..Default::default()
+        };
+        let page = be.list_scores("", f, None, 100).await.unwrap();
+        let ids: Vec<_> = page
+            .items
+            .iter()
+            .map(|a| a.attestation_id.clone())
+            .collect();
+        assert_eq!(ids, vec![s2.clone(), s1.clone()], "newest-first exact-dim");
+        // attester_filter Explicit set membership (`= ANY($n)`)
+        let f = crate::read::AttestationFilter {
+            subject_key_id: Some(subj.clone()),
+            dimension_exact: Some(dim.into()),
+            attester_filter: Some(crate::read::AttesterSet::Explicit(vec!["k1".into()])),
+            ..Default::default()
+        };
+        let page = be.list_scores("", f, None, 100).await.unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|a| a.attestation_id.clone())
+                .collect::<Vec<_>>(),
+            vec![s1],
+            "attester_filter set membership"
+        );
+        let _ = s2;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_resolve_scores_latest_wins_withdraw_and_band() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let be = PostgresBackend::connect(&dsn).await.expect("connect");
+        be.run_migrations().await.expect("migrations");
+        let base = chrono::Utc::now() - chrono::Duration::hours(2);
+        let subj = format!("subj-{}", uuid_like());
+        let dim = "trust:demo:v1";
+        // k1: 0.9 superseded by 0.4 head; k2: 0.5; k3: withdrawn.
+        let k1old = pg_put_score(&be, "k1", &subj, dim, 0.9, base, 10).await;
+        pg_put_score(&be, "k1", &subj, dim, 0.4, base, 20).await;
+        pg_put_composer(&be, "k1", "supersedes", &k1old, base, 20).await;
+        pg_put_score(&be, "k2", &subj, dim, 0.5, base, 15).await;
+        let k3 = pg_put_score(&be, "k3", &subj, dim, 0.5, base, 15).await;
+        pg_put_composer(
+            &be,
+            "k3",
+            crate::federation::types::attestation_type::WITHDRAWS,
+            &k3,
+            base,
+            25,
+        )
+        .await;
+        let f = crate::read::AttestationFilter {
+            subject_key_id: Some(subj),
+            dimension_exact: Some(dim.into()),
+            ..Default::default()
+        };
+        let v = be
+            .resolve_scores("", f, "cc-4.4.2-signed-mean".into(), true)
+            .await
+            .unwrap();
+        // live heads k1new(0.4), k2(0.5); k1old superseded, k3 withdrawn.
+        assert_eq!(v.contributor_count, 2, "distinct live attesters");
+        assert_eq!(
+            v.band,
+            crate::read::ConfidenceBand::Supported,
+            "mean(0.4,0.5)=0.45"
+        );
+        assert_eq!(v.open_contradictions, 0);
+        assert!(v.trace.is_some() && v.age_of_head.is_some());
+    }
+
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn pg_put_attestation_rejects_accord_dimension_from_steward() {
