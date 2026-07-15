@@ -14578,6 +14578,18 @@ impl crate::read::ReadEngine for PostgresBackend {
             }
             where_parts.push(format!("({})", ors.join(" OR ")));
         }
+        // v17.5.2 (#461) — EXACT dimension match. Was silently a no-op in
+        // list_attestations (only `dimension_prefixes` was ever applied; a
+        // caller-supplied `dimension_exact` — or a mistaken `{"dimension":…}`
+        // key — filtered nothing), forcing a fetch-then-fold-in-Python. Mirrors
+        // `list_scores`' `dimension_exact`; AND-composed with any prefix set.
+        if let Some(d) = &filter.dimension_exact {
+            params.push(Box::new(d.clone()));
+            where_parts.push(format!(
+                "attestation_envelope->>'dimension' = ${}",
+                params.len()
+            ));
+        }
         // v4.5 — point-in-time validity.
         if let Some(va) = filter.valid_at {
             params.push(Box::new(va));
@@ -30723,6 +30735,17 @@ mod tests {
             })
             .await,
             want_valid
+        );
+        // v17.5.2 (#461) — EXACT dimension match parity (was a silent no-op:
+        // pre-fix returned all 4). `config:filter:v1` matches only `a`, not `b`
+        // (`config:other:v1`).
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_exact: Some("config:filter:v1".into()),
+                ..Default::default()
+            })
+            .await,
+            vec![a.to_string()]
         );
     }
 

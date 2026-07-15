@@ -14539,6 +14539,18 @@ impl crate::read::ReadEngine for SqliteBackend {
             }
             parts.push(format!("({})", ors.join(" OR ")));
         }
+        // v17.5.2 (#461) — EXACT dimension match. Was silently a no-op in
+        // list_attestations (only `dimension_prefixes` was ever applied; a
+        // caller-supplied `dimension_exact` — or a mistaken `{"dimension":…}`
+        // key — filtered nothing), forcing a fetch-then-fold-in-Python. Mirrors
+        // `list_scores`' `dimension_exact`; AND-composed with any prefix set.
+        if let Some(d) = &filter.dimension_exact {
+            binds.push(SqlValue::Text(d.clone()));
+            parts.push(format!(
+                "json_extract(attestation_envelope, '$.dimension') = ?{}",
+                binds.len()
+            ));
+        }
         // v4.5 — point-in-time validity.
         if let Some(va) = filter.valid_at {
             binds.push(SqlValue::Text(va.to_rfc3339()));
@@ -24097,6 +24109,29 @@ mod tests {
             })
             .await,
             vec!["a", "b", "c"]
+        );
+        // v17.5.2 (#461) — EXACT dimension match. Pre-fix `dimension_exact` was
+        // silently ignored in list_attestations (would return all 4); now
+        // `config:filter:v1` matches only `a`, NOT `b` (`config:other:v1`) —
+        // proving exact, not prefix.
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_exact: Some("config:filter:v1".into()),
+                ..Default::default()
+            })
+            .await,
+            vec!["a"]
+        );
+        // AND-composed with a prefix set (prefixes OR among themselves, then
+        // AND the exact): `config:filter:v1` AND `goal:%` matches nothing.
+        assert_eq!(
+            q(AttestationFilter {
+                dimension_exact: Some("config:filter:v1".into()),
+                dimension_prefixes: vec!["goal:".into()],
+                ..Default::default()
+            })
+            .await,
+            Vec::<String>::new()
         );
     }
 

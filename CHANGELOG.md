@@ -5,6 +5,42 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.5.2] — 2026-07-15 — CIRISVerify 10.3.0 re-pin (mobile fold-boot panic) + `list_attestations` `dimension_exact` fix (#461) + wheel disk-reclaim
+
+### Changed — CIRISVerify re-pin 10.2.0 → 10.3.0 (the driver)
+
+Drop-in — all 6 Cargo pins in lockstep, no persist call-site change. 10.3.0 makes
+`ciris-keyring`'s sync→async bridge **reentrancy-safe**, fixing the mobile fold-boot
+`block_on`-under-ambient-runtime panic (CIRISVerify#204/#205) an agent hit on mobile.
+The fix is internal to keyring (a `keyring_block_on` bridge routing every prior raw
+`Runtime::block_on` site); persist embeds keyring in its `.so`, so edge/agent mobile
+consumers get it via the persist wheel. pyproject `ciris-verify` floor stays
+`>=10.0.0,<11` (major-coherent — the fix is Rust-side, not the Python CLI package).
+
+### Fixed — `list_attestations` `dimension_exact` was a silent no-op (#461)
+
+`list_attestations` applied only `dimension_prefixes`; a caller-supplied
+`dimension_exact` filtered **nothing** (and a mistaken `{"dimension":…}` key —
+the fields are `dimension_exact`/`dimension_prefixes`, and the filter isn't
+`deny_unknown_fields` — was silently dropped), forcing a fetch-100-then-fold-in-Python.
+Both backends now apply an exact `dimension` match, AND-composed with any prefix set;
+sqlite + postgres parity tests.
+
+**Note on #461's *feature* ask:** the tier/local-tier selector on the
+newest-per-dimension read **already shipped in v17.4.0** — `list_scores` +
+`AttestationFilter.tier: {Local|Federation|Any}` (default federation-only). Passing
+`{"dimension_exact": D, "tier": "Local"}` (or `"Any"`) returns unpromoted local-tier
+rows today, on all three backends — so the agent's consent-withdrawal lookup needs no
+new substrate. This cut is the separate `list_attestations` correctness gap.
+
+### Changed — CI: wheel-job disk-reclaim (release-infra)
+
+The `linux-x86_64` wheel leg lost its runner mid ciriscache-extract (ENOSPC signature)
+on the v17.5.0 **and** v17.5.1 tag runs — the #458 `assert-published` tripwire caught
+each, but a manual rerun was needed. Added the Linux-only `Free runner disk` step to
+the `pyo3-wheel` job before the restore (mirrors the `linux-x86_64-test` legs), so the
+wheel leg stops losing the runner on release tags.
+
 ## [17.5.1] — 2026-07-15 — CI wall-time (restore dedup + release-path save-skip); republish the 17.5.0 substrate (#458 followup)
 
 Patch release — **no crate code change from 17.5.0**. Ships a CI/release-infra
