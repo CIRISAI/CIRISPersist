@@ -3353,6 +3353,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.cohort_scope,
                 ],
             )?;
+            // v17.4.0 (V106) — maintain the subject projection (federation
+            // tier: put_attestation writes federation-visible rows).
+            sqlite_project_attestation_subjects(
+                &conn,
+                &row,
+                crate::federation::types::attestation_tier::FEDERATION,
+            )?;
             Ok(())
         })()
         .map_err(|e| {
@@ -6529,7 +6536,194 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "federation_attestations row {attestation_id} was concurrently promoted"
             )));
         }
+        // v17.4.0 (V106) — projection: the promoted row is now federation-tier.
+        {
+            let conn = self.conn.clone();
+            let id = attestation_id.to_owned();
+            (move || -> Result<(), rusqlite::Error> {
+                let conn = conn.lock();
+                conn.execute(
+                    "UPDATE attestation_subjects SET tier = 'federation' WHERE attestation_id = ?1",
+                    rusqlite::params![id],
+                )?;
+                Ok(())
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("promote_attestation projection: {e}"))
+            })?;
+        }
         Ok(true)
+    }
+
+    async fn list_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: crate::read::AttestationFilter,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
+        use crate::federation::Error;
+        use crate::read::LifecycleView;
+        if !(1..=10_000).contains(&limit) {
+            return Err(Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+        let scope = crate::scope::caller_scope_from_directory(self, caller_occurrence_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("list_scores admission: {e}")))?;
+        let (mut parts, mut binds) = sqlite_scores_shared_predicates(&filter, &scope);
+        // lifecycle: exclude rows retracted by a still-hiding composer.
+        let hide: &[&str] = match filter.lifecycle {
+            LifecycleView::Live => &["supersedes", "withdraws", "recants"],
+            LifecycleView::IncludeSuperseded => &["withdraws", "recants"],
+            LifecycleView::IncludeWithdrawn => &["supersedes", "recants"],
+            LifecycleView::IncludeRecanted => &["supersedes", "withdraws"],
+            LifecycleView::All => &[],
+        };
+        if !hide.is_empty() {
+            let mut ph: Vec<String> = Vec::new();
+            for ty in hide {
+                binds.push(SqlValue::Text((*ty).to_string()));
+                ph.push(format!("?{}", binds.len()));
+            }
+            parts.push(format!(
+                "NOT EXISTS (SELECT 1 FROM federation_attestations c \
+                   WHERE c.attesting_key_id = fa.attesting_key_id \
+                     AND c.attestation_type IN ({}) \
+                     AND json_extract(c.attestation_envelope, '$.references_attestation_id') = fa.attestation_id)",
+                ph.join(",")
+            ));
+        }
+        if let Some(c) = &cursor {
+            if c.version != "v1" {
+                return Err(Error::InvalidArgument(format!(
+                    "AttestationCursor version {} unsupported; v1 only",
+                    c.version
+                )));
+            }
+            binds.push(SqlValue::Text(c.last_asserted_at.to_rfc3339()));
+            let p_at = binds.len();
+            binds.push(SqlValue::Text(c.last_attestation_id.clone()));
+            let p_id = binds.len();
+            parts.push(format!(
+                "(fa.asserted_at, fa.attestation_id) < (?{p_at}, ?{p_id})"
+            ));
+        }
+        let where_sql = format!("WHERE {}", parts.join(" AND "));
+        binds.push(SqlValue::Integer(limit));
+        let p_limit = binds.len();
+        let sql = format!(
+            "SELECT DISTINCT {SCORES_FA_COLS} \
+             FROM attestation_subjects s \
+             JOIN federation_attestations fa ON fa.attestation_id = s.attestation_id \
+             {where_sql} \
+             ORDER BY fa.asserted_at DESC, fa.attestation_id DESC LIMIT ?{p_limit}"
+        );
+        let conn = self.conn.clone();
+        let limit_usize = limit as usize;
+        (move || -> Result<crate::read::ScoresPage, crate::federation::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| Error::Backend(format!("list_scores prepare: {e}")))?;
+            let items: Vec<crate::federation::Attestation> = stmt
+                .query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)
+                .map_err(|e| Error::Backend(format!("list_scores query: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Error::Backend(format!("list_scores row: {e}")))?;
+            let next_cursor = if items.len() == limit_usize {
+                let last = &items[items.len() - 1];
+                Some(crate::read::AttestationCursor::from_trailing(
+                    last.asserted_at,
+                    last.attestation_id.clone(),
+                ))
+            } else {
+                None
+            };
+            Ok(crate::read::ScoresPage { items, next_cursor })
+        })()
+    }
+
+    async fn resolve_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: crate::read::AttestationFilter,
+        policy: String,
+        trace: bool,
+    ) -> Result<crate::read::ComposedVerdict, crate::federation::Error> {
+        use crate::federation::Error;
+        let scope = crate::scope::caller_scope_from_directory(self, caller_occurrence_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("resolve_scores admission: {e}")))?;
+        let (mut parts, binds) = sqlite_scores_shared_predicates(&filter, &scope);
+        // The fold aggregates `scores` data rows only; classify lifecycle in
+        // the fold (fetch every scores row, retracted or not).
+        parts.push("fa.attestation_type = 'scores'".to_string());
+        let where_sql = format!("WHERE {}", parts.join(" AND "));
+        let sql = format!(
+            "SELECT DISTINCT {SCORES_FA_COLS} \
+             FROM attestation_subjects s \
+             JOIN federation_attestations fa ON fa.attestation_id = s.attestation_id \
+             {where_sql} \
+             ORDER BY fa.asserted_at DESC, fa.attestation_id DESC"
+        );
+        let conn = self.conn.clone();
+        let data: Vec<crate::federation::Attestation> = {
+            (move || -> Result<Vec<crate::federation::Attestation>, Error> {
+                let conn = conn.lock();
+                let mut stmt = conn
+                    .prepare(&sql)
+                    .map_err(|e| Error::Backend(format!("resolve_scores prepare: {e}")))?;
+                let rows: Vec<crate::federation::Attestation> = stmt
+                    .query_map(params_from_iter(binds.iter()), sqlite_row_to_attestation)
+                    .map_err(|e| Error::Backend(format!("resolve_scores query: {e}")))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| Error::Backend(format!("resolve_scores row: {e}")))?;
+                Ok(rows)
+            })()?
+        };
+        // Composers (retractions) from the same attesters, regardless of their
+        // own subject/scope — a retraction applies for everyone.
+        let mut attesters: Vec<String> = data.iter().map(|a| a.attesting_key_id.clone()).collect();
+        attesters.sort();
+        attesters.dedup();
+        let composers: Vec<crate::federation::Attestation> = if attesters.is_empty() {
+            Vec::new()
+        } else {
+            let mut cbinds: Vec<SqlValue> = Vec::new();
+            let mut ph: Vec<String> = Vec::new();
+            for a in &attesters {
+                cbinds.push(SqlValue::Text(a.clone()));
+                ph.push(format!("?{}", cbinds.len()));
+            }
+            let csql = format!(
+                "SELECT {SCORES_FA_COLS} FROM federation_attestations fa \
+                 WHERE fa.attestation_type IN ('supersedes','withdraws','recants') \
+                   AND fa.attesting_key_id IN ({})",
+                ph.join(",")
+            );
+            let conn = self.conn.clone();
+            (move || -> Result<Vec<crate::federation::Attestation>, Error> {
+                let conn = conn.lock();
+                let mut stmt = conn
+                    .prepare(&csql)
+                    .map_err(|e| Error::Backend(format!("resolve_scores composer prepare: {e}")))?;
+                let rows: Vec<crate::federation::Attestation> = stmt
+                    .query_map(params_from_iter(cbinds.iter()), sqlite_row_to_attestation)
+                    .map_err(|e| Error::Backend(format!("resolve_scores composer query: {e}")))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| Error::Backend(format!("resolve_scores composer row: {e}")))?;
+                Ok(rows)
+            })()?
+        };
+        Ok(crate::federation::scores::compose_verdict(
+            data,
+            composers,
+            &policy,
+            trace,
+            chrono::Utc::now(),
+        ))
     }
 
     async fn attach_revocation_pqc_signature(
@@ -11428,6 +11622,15 @@ impl SqliteBackend {
                     row.cohort_scope,
                 ],
             )?;
+            // v17.4.0 (V106) — maintain the subject projection at `local` tier.
+            // On the upsert-replace path the prior row's projection entries were
+            // already dropped by the DELETE above (FK ON DELETE CASCADE), so no
+            // stale rows survive.
+            sqlite_project_attestation_subjects(
+                &tx,
+                &row,
+                crate::federation::types::attestation_tier::LOCAL,
+            )?;
             tx.commit()?;
             Ok(())
         })()
@@ -11444,6 +11647,155 @@ impl SqliteBackend {
         })?;
         Ok(attestation_id)
     }
+}
+
+/// v17.4.0 — the `fa.`-aliased `federation_attestations` column list for the
+/// `scores` read handles (JOINed to `attestation_subjects s`). Column NAMES
+/// are unprefixed, so [`sqlite_row_to_attestation`] (which reads by name)
+/// resolves them unchanged.
+const SCORES_FA_COLS: &str = "fa.attestation_id, fa.attesting_key_id, fa.attested_key_id, \
+     fa.attestation_type, fa.weight, fa.asserted_at, fa.expires_at, \
+     fa.attestation_envelope, fa.original_content_hash, fa.scrub_signature_classical, \
+     fa.scrub_signature_pqc, fa.scrub_key_id, fa.scrub_timestamp, fa.pqc_completed_at, \
+     fa.persist_row_hash, fa.subject_key_ids, fa.withdraws_admission_rule, fa.cohort_scope, \
+     fa.tier, fa.promoted_at";
+
+/// v17.4.0 — shared WHERE predicate builder for the sqlite `scores` read
+/// handles. Emits the subject / dimension(exact+prefix) / type / attester /
+/// pqc / confidence / valid_at / window / tier / attester_filter axes plus the
+/// §4.3 scope gate, over aliases `s` (`attestation_subjects`) and `fa`
+/// (`federation_attestations`). Lifecycle, cursor, and the resolve-only
+/// `attestation_type='scores'` clause are added by the callers. The returned
+/// `parts` is always non-empty (tier + scope always emit), so the caller can
+/// unconditionally `WHERE parts.join(" AND ")`.
+fn sqlite_scores_shared_predicates(
+    filter: &crate::read::AttestationFilter,
+    scope: &crate::scope::CallerScope,
+) -> (Vec<String>, Vec<SqlValue>) {
+    use crate::read::{AttesterSet, Tier};
+    let mut parts: Vec<String> = Vec::new();
+    let mut binds: Vec<SqlValue> = Vec::new();
+    if let Some(subj) = &filter.subject_key_id {
+        binds.push(SqlValue::Text(subj.clone()));
+        parts.push(format!("s.subject_key_id = ?{}", binds.len()));
+    }
+    if let Some(dx) = &filter.dimension_exact {
+        binds.push(SqlValue::Text(dx.clone()));
+        parts.push(format!("s.dimension = ?{}", binds.len()));
+    }
+    if !filter.dimension_prefixes.is_empty() {
+        let mut ors: Vec<String> = Vec::new();
+        for p in &filter.dimension_prefixes {
+            let esc = p
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            binds.push(SqlValue::Text(format!("{esc}%")));
+            ors.push(format!("s.dimension LIKE ?{} ESCAPE '\\'", binds.len()));
+        }
+        parts.push(format!("({})", ors.join(" OR ")));
+    }
+    if let Some(t) = &filter.attestation_type {
+        binds.push(SqlValue::Text(t.clone()));
+        parts.push(format!("fa.attestation_type = ?{}", binds.len()));
+    }
+    if let Some(k) = &filter.attesting_key_id {
+        binds.push(SqlValue::Text(k.clone()));
+        parts.push(format!("fa.attesting_key_id = ?{}", binds.len()));
+    }
+    if let Some(k) = &filter.attested_key_id {
+        binds.push(SqlValue::Text(k.clone()));
+        parts.push(format!("fa.attested_key_id = ?{}", binds.len()));
+    }
+    if let Some(pqc) = filter.pqc_completed {
+        parts.push(if pqc {
+            "fa.pqc_completed_at IS NOT NULL".to_owned()
+        } else {
+            "fa.pqc_completed_at IS NULL".to_owned()
+        });
+    }
+    if let Some(floor) = filter.confidence_floor {
+        binds.push(SqlValue::Real(floor));
+        parts.push(format!(
+            "(fa.weight IS NOT NULL AND fa.weight >= ?{})",
+            binds.len()
+        ));
+    }
+    if let Some(va) = filter.valid_at {
+        binds.push(SqlValue::Text(va.to_rfc3339()));
+        let p = binds.len();
+        parts.push(format!(
+            "(fa.asserted_at <= ?{p} AND (fa.expires_at IS NULL OR fa.expires_at > ?{p}))"
+        ));
+    }
+    if let Some((start, end)) = filter.window {
+        binds.push(SqlValue::Text(start.to_rfc3339()));
+        let ps = binds.len();
+        binds.push(SqlValue::Text(end.to_rfc3339()));
+        let pe = binds.len();
+        parts.push(format!(
+            "(fa.asserted_at >= ?{ps} AND fa.asserted_at < ?{pe})"
+        ));
+    }
+    // tier: default (None) = federation-only (matches list_attestations).
+    match filter.tier {
+        None | Some(Tier::Federation) => parts.push("fa.tier = 'federation'".to_owned()),
+        Some(Tier::Local) => parts.push("fa.tier = 'local'".to_owned()),
+        Some(Tier::Any) => {}
+    }
+    // attester_filter: Explicit set membership (All / None = no restriction).
+    if let Some(AttesterSet::Explicit(keys)) = &filter.attester_filter {
+        if keys.is_empty() {
+            parts.push("0 = 1".to_owned());
+        } else {
+            let mut ph: Vec<String> = Vec::new();
+            for k in keys {
+                binds.push(SqlValue::Text(k.clone()));
+                ph.push(format!("?{}", binds.len()));
+            }
+            parts.push(format!("fa.attesting_key_id IN ({})", ph.join(",")));
+        }
+    }
+    // §4.3 scope gate on fa.cohort_scope / fa.attested_key_id.
+    {
+        let (frag, sbinds) = crate::store::scope_bind::scope_predicate_sqlite(
+            scope,
+            "fa.cohort_scope",
+            "fa.attested_key_id",
+            binds.len(),
+        );
+        parts.push(frag);
+        binds.extend(sbinds);
+    }
+    (parts, binds)
+}
+
+/// v17.4.0 (V106) — maintain the `attestation_subjects` projection for a row
+/// on the given (already-locked) connection/transaction. Expands
+/// `subject_key_ids[]` into one projection row per element, at `tier`.
+/// `INSERT OR REPLACE` keeps it idempotent on the (subject, attestation) PK.
+fn sqlite_project_attestation_subjects(
+    conn: &rusqlite::Connection,
+    row: &crate::federation::Attestation,
+    tier: &str,
+) -> rusqlite::Result<()> {
+    let dimension = crate::federation::admission::envelope_dimension(&row.attestation_envelope);
+    for subj in &row.subject_key_ids {
+        conn.execute(
+            "INSERT OR REPLACE INTO attestation_subjects \
+                (subject_key_id, dimension, asserted_at, attestation_id, tier, cohort_scope) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                subj,
+                dimension,
+                row.asserted_at.to_rfc3339(),
+                row.attestation_id,
+                tier,
+                row.cohort_scope,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn sqlite_row_to_attestation(
@@ -23635,6 +23987,420 @@ mod tests {
             .await,
             vec!["a", "b", "c"]
         );
+    }
+
+    // ── v17.4.0 (FSD-005 Appendix C) — scores read surface ──────────
+
+    fn scores_base_ts() -> chrono::DateTime<chrono::Utc> {
+        chrono::TimeZone::timestamp_opt(&chrono::Utc, 1_700_000_000, 0).unwrap()
+    }
+
+    /// Seed the attester key + put a federation `scores` row with full
+    /// control over subject / dimension / score / weight / asserted_at.
+    #[allow(clippy::too_many_arguments)]
+    async fn put_score(
+        be: &SqliteBackend,
+        id: &str,
+        attester: &str,
+        subject: &str,
+        dimension: &str,
+        score: f64,
+        weight: f64,
+        secs: i64,
+    ) {
+        // Idempotent-ish: seed the attester key if absent (self-attested).
+        let _ = be
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    attester,
+                    attester,
+                    attester,
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await;
+        let mut a = signed_attestation_fixture(attester, attester, attester, SCORES);
+        a.attestation_id = id.into();
+        a.weight = Some(weight);
+        a.asserted_at = scores_base_ts() + chrono::Duration::seconds(secs);
+        a.attestation_envelope = serde_json::json!({
+            "dimension": dimension, "score": score, "confidence": weight,
+            "epistemic_mode": "observed",
+        });
+        a.subject_key_ids = vec![subject.into()];
+        a.cohort_scope = "federation".into();
+        resign_fed(&mut a); // sign the as-built envelope for the ingest gate
+        be.put_attestation(SignedAttestation { attestation: a })
+            .await
+            .unwrap();
+    }
+
+    async fn put_composer(
+        be: &SqliteBackend,
+        id: &str,
+        attester: &str,
+        ty: &str,
+        references: &str,
+        secs: i64,
+    ) {
+        let _ = be
+            .put_public_key(SignedKeyRecord {
+                record: fed_key_with_identity_type(
+                    attester,
+                    attester,
+                    attester,
+                    crate::federation::types::identity_type::AGENT,
+                ),
+            })
+            .await;
+        let mut a = signed_attestation_fixture(attester, attester, attester, ty);
+        a.attestation_id = id.into();
+        a.asserted_at = scores_base_ts() + chrono::Duration::seconds(secs);
+        a.attestation_envelope = serde_json::json!({
+            "references_attestation_id": references, "reason": "t",
+        });
+        a.subject_key_ids = vec![];
+        a.cohort_scope = "federation".into();
+        resign_fed(&mut a);
+        be.put_attestation(SignedAttestation { attestation: a })
+            .await
+            .unwrap();
+    }
+
+    fn scores_filter(subject: &str) -> AttestationFilter {
+        AttestationFilter {
+            subject_key_id: Some(subject.into()),
+            ..Default::default()
+        }
+    }
+
+    async fn list_ids(be: &SqliteBackend, f: AttestationFilter) -> Vec<String> {
+        use crate::federation::FederationDirectory;
+        be.list_scores("", f, None, 100)
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|a| a.attestation_id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sqlite_list_scores_subject_dimension_seek_newest_first() {
+        use crate::federation::FederationDirectory;
+        let be = SqliteBackend::open_in_memory().await.unwrap();
+        be.run_migrations().await.unwrap();
+        put_score(&be, "s1", "k1", "subj", "trust:demo:v1", 0.5, 1.0, 10).await;
+        put_score(&be, "s2", "k2", "subj", "trust:demo:v1", 0.6, 1.0, 20).await;
+        put_score(&be, "s3", "k3", "subj", "other:demo:v1", 0.6, 1.0, 30).await;
+        // exact dimension seek, newest-first
+        let f = AttestationFilter {
+            subject_key_id: Some("subj".into()),
+            dimension_exact: Some("trust:demo:v1".into()),
+            ..Default::default()
+        };
+        let page = be.list_scores("", f, None, 100).await.unwrap();
+        let ids: Vec<_> = page
+            .items
+            .iter()
+            .map(|a| a.attestation_id.clone())
+            .collect();
+        assert_eq!(ids, vec!["s2", "s1"], "newest-first, dimension-exact");
+        // prefix filter picks all trust:* + other:*
+        let f = AttestationFilter {
+            subject_key_id: Some("subj".into()),
+            dimension_prefixes: vec!["trust:".into()],
+            ..Default::default()
+        };
+        let mut ids = list_ids(&be, f).await;
+        ids.sort();
+        assert_eq!(ids, vec!["s1", "s2"]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_list_scores_attester_filter_and_cursor() {
+        use crate::federation::FederationDirectory;
+        let be = SqliteBackend::open_in_memory().await.unwrap();
+        be.run_migrations().await.unwrap();
+        put_score(&be, "a", "k1", "subj", "trust:demo:v1", 0.5, 1.0, 10).await;
+        put_score(&be, "b", "k2", "subj", "trust:demo:v1", 0.5, 1.0, 20).await;
+        put_score(&be, "c", "k3", "subj", "trust:demo:v1", 0.5, 1.0, 30).await;
+        // attester_filter Explicit set membership
+        let f = AttestationFilter {
+            subject_key_id: Some("subj".into()),
+            attester_filter: Some(crate::read::AttesterSet::Explicit(vec![
+                "k1".into(),
+                "k3".into(),
+            ])),
+            ..Default::default()
+        };
+        let mut ids = list_ids(&be, f).await;
+        ids.sort();
+        assert_eq!(ids, vec!["a", "c"]);
+        // cursor pagination stable
+        let page1 = be
+            .list_scores("", scores_filter("subj"), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            page1
+                .items
+                .iter()
+                .map(|a| a.attestation_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["c", "b"]
+        );
+        let cur = page1.next_cursor.expect("full page → cursor");
+        let page2 = be
+            .list_scores("", scores_filter("subj"), Some(cur), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            page2
+                .items
+                .iter()
+                .map(|a| a.attestation_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert!(page2.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_list_scores_lifecycle_hides_withdrawn_by_default() {
+        let be = SqliteBackend::open_in_memory().await.unwrap();
+        be.run_migrations().await.unwrap();
+        put_score(&be, "live", "k1", "subj", "trust:demo:v1", 0.5, 1.0, 10).await;
+        put_score(&be, "gone", "k2", "subj", "trust:demo:v1", 0.5, 1.0, 20).await;
+        put_composer(&be, "w", "k2", WITHDRAWS, "gone", 30).await;
+        // default Live → withdrawn "gone" hidden
+        let ids = list_ids(&be, scores_filter("subj")).await;
+        assert_eq!(ids, vec!["live"], "withdrawn row hidden by default");
+        // IncludeWithdrawn → shows it again
+        let f = AttestationFilter {
+            subject_key_id: Some("subj".into()),
+            lifecycle: crate::read::LifecycleView::IncludeWithdrawn,
+            ..Default::default()
+        };
+        let mut ids = list_ids(&be, f).await;
+        ids.sort();
+        assert_eq!(ids, vec!["gone", "live"]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_scores_tier_local_hidden_then_shown_and_promote() {
+        use crate::federation::FederationDirectory;
+        let be = fresh_backend_with_occurrence("occ").await;
+        // a local self-scores row (producer authority, tier=local)
+        let input = local_input("occ", SCORES, "trust:demo:v1", vec!["subj".into()]);
+        let local_id = be.attestation_upsert_local(input).await.unwrap();
+        // helper: list as the producing occurrence (local rows are cohort
+        // 'self', visible only to their producer).
+        let occ_ids = |f: AttestationFilter| {
+            let be = &be;
+            async move {
+                be.list_scores("occ", f, None, 100)
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|a| a.attestation_id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        // default tier (federation) hides the local row
+        assert!(
+            occ_ids(scores_filter("subj")).await.is_empty(),
+            "local hidden at default federation tier"
+        );
+        // Tier::Any shows it
+        let f = AttestationFilter {
+            subject_key_id: Some("subj".into()),
+            tier: Some(crate::read::Tier::Any),
+            ..Default::default()
+        };
+        assert_eq!(
+            occ_ids(f).await,
+            vec![local_id.clone()],
+            "Tier::Any reveals local draft"
+        );
+        // projection row exists at local tier
+        let (proj_tier, dim): (String, Option<String>) = {
+            let conn = be.conn_handle();
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT tier, dimension FROM attestation_subjects WHERE attestation_id = ?1",
+                [&local_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(proj_tier, "local");
+        assert_eq!(dim.as_deref(), Some("trust:demo:v1"));
+        // promote → projection flips to federation, now visible at default tier
+        be.promote_attestation(
+            &local_id,
+            "c2ln",
+            None,
+            "abcdef01",
+            "occ",
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            occ_ids(scores_filter("subj")).await,
+            vec![local_id],
+            "promoted row now federation-visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_resolve_scores_latest_wins_withdraw_and_band() {
+        use crate::federation::FederationDirectory;
+        let be = SqliteBackend::open_in_memory().await.unwrap();
+        be.run_migrations().await.unwrap();
+        // k1: old 0.9 superseded by new 0.4 head; k2: 0.5; k3: withdrawn
+        put_score(&be, "k1old", "k1", "subj", "trust:demo:v1", 0.9, 1.0, 10).await;
+        put_score(&be, "k1new", "k1", "subj", "trust:demo:v1", 0.4, 1.0, 20).await;
+        put_composer(&be, "sup", "k1", "supersedes", "k1old", 20).await;
+        put_score(&be, "k2", "k2", "subj", "trust:demo:v1", 0.5, 1.0, 15).await;
+        put_score(&be, "k3", "k3", "subj", "trust:demo:v1", 0.5, 1.0, 15).await;
+        put_composer(&be, "wd", "k3", WITHDRAWS, "k3", 25).await;
+        let v = be
+            .resolve_scores(
+                "",
+                scores_filter("subj"),
+                "cc-4.4.2-signed-mean".into(),
+                true,
+            )
+            .await
+            .unwrap();
+        // live heads: k1new(0.4), k2(0.5) → k3 withdrawn, k1old superseded
+        assert_eq!(v.contributor_count, 2);
+        // mean(0.4, 0.5) = 0.45 → Supported
+        assert_eq!(v.band, crate::read::ConfidenceBand::Supported);
+        assert_eq!(v.open_contradictions, 0);
+        assert!(v.trace.is_some(), "trace requested");
+        assert!(v.age_of_head.is_some());
+    }
+
+    #[tokio::test]
+    async fn sqlite_resolve_scores_gated_row_excluded() {
+        use crate::federation::FederationDirectory;
+        let be = SqliteBackend::open_in_memory().await.unwrap();
+        be.run_migrations().await.unwrap();
+        // one federation row (visible) + one 'self'-scoped row (hidden to
+        // an unauthenticated caller) — the hidden one must not enter the fold.
+        put_score(&be, "vis", "k1", "subj", "trust:demo:v1", 0.5, 1.0, 10).await;
+        // self-scoped row via raw insert + projection (bypasses the local-tier
+        // write path; it is a federation-tier 'self' cohort row for the gate).
+        be.put_public_key(SignedKeyRecord {
+            record: fed_key_with_identity_type(
+                "k9",
+                "k9",
+                "k9",
+                crate::federation::types::identity_type::AGENT,
+            ),
+        })
+        .await
+        .unwrap();
+        {
+            let conn = be.conn_handle();
+            let conn = conn.lock();
+            let env =
+                serde_json::json!({"dimension":"trust:demo:v1","score":-0.9,"confidence":1.0})
+                    .to_string();
+            conn.execute(
+                "INSERT INTO federation_attestations (attestation_id, attesting_key_id, \
+                   attested_key_id, attestation_type, weight, asserted_at, expires_at, \
+                   attestation_envelope, original_content_hash, scrub_signature_classical, \
+                   scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
+                   persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, \
+                   tier, promoted_at) VALUES ('hid','k9','k9','scores',1.0,\
+                   '2026-01-01T00:00:00Z',NULL,?1,x'','s',NULL,'k9','2026-01-01T00:00:00Z',\
+                   NULL,'0','[\"subj\"]',NULL,'self','federation',NULL)",
+                rusqlite::params![env],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO attestation_subjects (subject_key_id, dimension, asserted_at, \
+                   attestation_id, tier, cohort_scope) VALUES ('subj','trust:demo:v1',\
+                   '2026-01-01T00:00:00Z','hid','federation','self')",
+                [],
+            )
+            .unwrap();
+        }
+        let v = be
+            .resolve_scores(
+                "",
+                scores_filter("subj"),
+                "cc-4.4.2-signed-mean".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        // only the visible k1 row counts (the self-scoped -0.9 is gated out).
+        assert_eq!(v.contributor_count, 1);
+        assert_eq!(v.band, crate::read::ConfidenceBand::Supported);
+    }
+
+    #[tokio::test]
+    async fn sqlite_v106_backfill_projects_existing_rows() {
+        let be = SqliteBackend::open_in_memory().await.unwrap();
+        be.run_migrations().await.unwrap();
+        // Raw-insert a federation row with two subjects WITHOUT touching the
+        // projection, then simulate the backfill on a cleared projection.
+        be.put_public_key(SignedKeyRecord {
+            record: fed_key_with_identity_type(
+                "k1",
+                "k1",
+                "k1",
+                crate::federation::types::identity_type::AGENT,
+            ),
+        })
+        .await
+        .unwrap();
+        {
+            let conn = be.conn_handle();
+            let conn = conn.lock();
+            let env = serde_json::json!({"dimension":"trust:demo:v1","score":1.0}).to_string();
+            conn.execute(
+                "INSERT INTO federation_attestations (attestation_id, attesting_key_id, \
+                   attested_key_id, attestation_type, weight, asserted_at, expires_at, \
+                   attestation_envelope, original_content_hash, scrub_signature_classical, \
+                   scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
+                   persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, \
+                   tier, promoted_at) VALUES ('bf','k1','k1','scores',1.0,\
+                   '2026-01-01T00:00:00Z',NULL,?1,x'','s',NULL,'k1','2026-01-01T00:00:00Z',\
+                   NULL,'0','[\"p\",\"q\"]',NULL,'federation','federation',NULL)",
+                rusqlite::params![env],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM attestation_subjects", [])
+                .unwrap();
+            // the V106 backfill statement (verbatim shape).
+            conn.execute(
+                "INSERT INTO attestation_subjects (subject_key_id, dimension, asserted_at, \
+                    attestation_id, tier, cohort_scope) \
+                 SELECT je.value, json_extract(fa.attestation_envelope,'$.dimension'), \
+                    fa.asserted_at, fa.attestation_id, fa.tier, fa.cohort_scope \
+                 FROM federation_attestations fa, json_each(fa.subject_key_ids) je",
+                [],
+            )
+            .unwrap();
+            let mut subs: Vec<String> = {
+                let mut stmt = conn
+                    .prepare("SELECT subject_key_id FROM attestation_subjects WHERE attestation_id='bf' ORDER BY subject_key_id")
+                    .unwrap();
+                stmt.query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap()
+            };
+            subs.sort();
+            assert_eq!(subs, vec!["p".to_string(), "q".to_string()]);
+        }
     }
 
     #[tokio::test]

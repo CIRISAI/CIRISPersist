@@ -59,4 +59,28 @@ impl CallerScope {
             CallerScope::Unauthenticated => None,
         }
     }
+
+    /// v17.4.0 — the Rust-side twin of
+    /// [`cohort_scope_sql_predicate`](super::cohort_scope_sql_predicate)
+    /// (FSD §4.3), for the memory backend's `scores` reads (which have no SQL
+    /// to push the gate into). Returns `true` iff a row tagged `cohort_scope`
+    /// with membership `target` (the row's `attested_key_id`) is admitted for
+    /// this caller. Byte-for-byte the same semantics: broad tiers always
+    /// admit; `self`/`family`/`community` admit only on target-membership;
+    /// the unauthenticated reader sees only the broad tiers.
+    pub fn admits(&self, cohort_scope: &str, target: &str) -> bool {
+        const BROAD: &[&str] = &["affiliations", "species", "biosphere", "federation"];
+        if BROAD.contains(&cohort_scope) {
+            return true;
+        }
+        match self {
+            CallerScope::Unauthenticated => false,
+            CallerScope::Authenticated { admission } => match cohort_scope {
+                "self" => target == admission.identity_key_id,
+                "family" => admission.family_key_ids.contains(target),
+                "community" => admission.community_key_ids.contains(target),
+                _ => false,
+            },
+        }
+    }
 }

@@ -124,6 +124,25 @@ pub async fn build_caller_admission(
     occurrence_key_id: &KeyId,
 ) -> Result<CallerAdmission, AdmissionError> {
     let directory = engine.federation_directory();
+    Ok(build_caller_admission_from_directory(directory.as_ref(), occurrence_key_id).await?)
+}
+
+/// v17.4.0 — the directory-only admission builder. Identical resolution to
+/// [`build_caller_admission`], but takes a `&dyn FederationDirectory` instead
+/// of an `Engine`, so a backend that is ITSELF a `FederationDirectory` (the
+/// `scores` read handles run their §4.3 gate inside the backend, so the whole
+/// composite op executes in persist's `.so` — the #329 pattern) can resolve
+/// its own caller admission without an `Engine`. Errors are `federation::Error`
+/// (the only failure surface); the `Engine` wrapper re-wraps into
+/// [`AdmissionError`] for its callers.
+///
+/// Not backend-gated: it takes a `&dyn FederationDirectory` directly, so it
+/// is available even in a no-SQL-backend build (the memory backend is a
+/// `FederationDirectory`).
+pub async fn build_caller_admission_from_directory(
+    directory: &dyn crate::federation::FederationDirectory,
+    occurrence_key_id: &KeyId,
+) -> Result<CallerAdmission, crate::federation::Error> {
     let now = chrono::Utc::now();
 
     // Step 1 — occurrence → identity. §4.4 singleton fallback when the
@@ -177,6 +196,24 @@ pub async fn build_caller_admission(
         community_key_ids,
         _seal: AdmissionSeal,
     })
+}
+
+/// v17.4.0 — resolve a caller occurrence key to its [`CallerScope`] via a
+/// directory. An empty `caller_occurrence_key_id` is an UNAUTHENTICATED read
+/// (broad-tier rows only, per §8.1.13.3); a non-empty one resolves the
+/// substrate-built admission (never caller-asserted — AV-44). Used by the
+/// `scores` read handles so the §4.3 gate runs inside the backend's `.so`.
+pub async fn caller_scope_from_directory(
+    directory: &dyn crate::federation::FederationDirectory,
+    caller_occurrence_key_id: &str,
+) -> Result<super::CallerScope, crate::federation::Error> {
+    if caller_occurrence_key_id.is_empty() {
+        return Ok(super::CallerScope::Unauthenticated);
+    }
+    let admission =
+        build_caller_admission_from_directory(directory, &caller_occurrence_key_id.to_string())
+            .await?;
+    Ok(super::CallerScope::Authenticated { admission })
 }
 
 impl CallerAdmission {

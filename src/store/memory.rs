@@ -61,6 +61,13 @@ struct State {
     /// v0.2.0 — Federation `federation_attestations` rows,
     /// append-only.
     federation_attestations: Vec<crate::federation::Attestation>,
+    /// v17.4.0 (V106) — the in-memory mirror of the `attestation_subjects`
+    /// projection: `subject_key_id → [attestation_id, …]`. Maintained on every
+    /// attestation write (put + local upsert/insert). Advisory: reads still
+    /// scan `federation_attestations` (the authoritative store) so a stale
+    /// entry can never yield a wrong row — it exists to make the projection
+    /// backend-symmetric and inspectable.
+    subject_index: HashMap<String, Vec<String>>,
     /// v0.2.0 — Federation `federation_revocations` rows,
     /// append-only.
     federation_revocations: Vec<crate::federation::Revocation>,
@@ -271,6 +278,7 @@ impl Default for MemoryBackend {
                 keys: HashMap::new(),
                 federation_keys: HashMap::new(),
                 federation_attestations: Vec::new(),
+                subject_index: HashMap::new(),
                 federation_revocations: Vec::new(),
                 federation_trust: HashMap::new(),
                 outbound_queue: HashMap::new(),
@@ -545,6 +553,14 @@ impl MemoryBackend {
                         .and_then(|v| v.as_str())
                         == Some(dimension.as_str()))
             });
+        }
+        // v17.4.0 (V106) — maintain the subject-index mirror at local tier.
+        for subj in &row.subject_key_ids {
+            state
+                .subject_index
+                .entry(subj.clone())
+                .or_default()
+                .push(row.attestation_id.clone());
         }
         state.federation_attestations.push(row);
         Ok(attestation_id)
@@ -1349,6 +1365,92 @@ pub(crate) fn assemble_fountain_content(
 // architectural contract — consumers see the canonical hash even
 // against the in-memory backend.
 
+/// v17.4.0 — the Rust-side twin of the sqlite/postgres `scores` WHERE
+/// predicate for the memory backend: does `r` match the filter's shared axes
+/// (subject / dimension exact+prefix / type / attester / pqc / confidence /
+/// valid_at / window / tier / attester_filter) AND the §4.3 scope gate?
+/// Lifecycle + cursor are applied by the caller.
+fn mem_scores_row_matches(
+    r: &crate::federation::Attestation,
+    filter: &crate::read::AttestationFilter,
+    scope: &crate::scope::CallerScope,
+) -> bool {
+    use crate::read::{AttesterSet, Tier};
+    let dimension = crate::federation::admission::envelope_dimension(&r.attestation_envelope);
+    if let Some(subj) = &filter.subject_key_id {
+        if !r.subject_key_ids.iter().any(|s| s == subj) {
+            return false;
+        }
+    }
+    if let Some(dx) = &filter.dimension_exact {
+        if dimension != Some(dx.as_str()) {
+            return false;
+        }
+    }
+    if !filter.dimension_prefixes.is_empty() {
+        let d = dimension.unwrap_or("");
+        if !filter.dimension_prefixes.iter().any(|p| d.starts_with(p)) {
+            return false;
+        }
+    }
+    if let Some(t) = &filter.attestation_type {
+        if &r.attestation_type != t {
+            return false;
+        }
+    }
+    if let Some(k) = &filter.attesting_key_id {
+        if &r.attesting_key_id != k {
+            return false;
+        }
+    }
+    if let Some(k) = &filter.attested_key_id {
+        if &r.attested_key_id != k {
+            return false;
+        }
+    }
+    if let Some(pqc) = filter.pqc_completed {
+        if r.pqc_completed_at.is_some() != pqc {
+            return false;
+        }
+    }
+    if let Some(floor) = filter.confidence_floor {
+        match r.weight {
+            Some(w) if w >= floor => {}
+            _ => return false,
+        }
+    }
+    if let Some(va) = filter.valid_at {
+        if !(r.asserted_at <= va && r.expires_at.is_none_or(|e| e > va)) {
+            return false;
+        }
+    }
+    if let Some((start, end)) = filter.window {
+        if !(r.asserted_at >= start && r.asserted_at < end) {
+            return false;
+        }
+    }
+    match filter.tier {
+        None | Some(Tier::Federation) => {
+            if r.tier != crate::federation::types::attestation_tier::FEDERATION {
+                return false;
+            }
+        }
+        Some(Tier::Local) => {
+            if r.tier != crate::federation::types::attestation_tier::LOCAL {
+                return false;
+            }
+        }
+        Some(Tier::Any) => {}
+    }
+    if let Some(AttesterSet::Explicit(keys)) = &filter.attester_filter {
+        if !keys.iter().any(|k| k == &r.attesting_key_id) {
+            return false;
+        }
+    }
+    // §4.3 scope gate (target = attested_key_id, mirroring the SQL).
+    scope.admits(&r.cohort_scope, &r.attested_key_id)
+}
+
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for MemoryBackend {
     async fn put_public_key(
@@ -1732,8 +1834,142 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         }
 
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // v17.4.0 (V106) — maintain the subject-index mirror.
+        for subj in &row.subject_key_ids {
+            state
+                .subject_index
+                .entry(subj.clone())
+                .or_default()
+                .push(row.attestation_id.clone());
+        }
         state.federation_attestations.push(row);
         Ok(())
+    }
+
+    async fn list_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: crate::read::AttestationFilter,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
+        use crate::federation::Error;
+        use crate::read::LifecycleView;
+        if !(1..=10_000).contains(&limit) {
+            return Err(Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+        if let Some(c) = &cursor {
+            if c.version != "v1" {
+                return Err(Error::InvalidArgument(format!(
+                    "AttestationCursor version {} unsupported; v1 only",
+                    c.version
+                )));
+            }
+        }
+        let scope = crate::scope::caller_scope_from_directory(self, caller_occurrence_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("list_scores admission: {e}")))?;
+        let hide: &[&str] = match filter.lifecycle {
+            LifecycleView::Live => &["supersedes", "withdraws", "recants"],
+            LifecycleView::IncludeSuperseded => &["withdraws", "recants"],
+            LifecycleView::IncludeWithdrawn => &["supersedes", "recants"],
+            LifecycleView::IncludeRecanted => &["supersedes", "withdraws"],
+            LifecycleView::All => &[],
+        };
+        let state = self.state.lock().expect("memory backend lock");
+        let all = &state.federation_attestations;
+        let mut rows: Vec<crate::federation::Attestation> = all
+            .iter()
+            .filter(|r| mem_scores_row_matches(r, &filter, &scope))
+            .filter(|r| {
+                if hide.is_empty() {
+                    return true;
+                }
+                // Exclude rows retracted by a still-hiding composer from the
+                // same attester.
+                !all.iter().any(|c| {
+                    hide.contains(&c.attestation_type.as_str())
+                        && c.attesting_key_id == r.attesting_key_id
+                        && crate::federation::precedence::references_attestation_id_from_envelope(
+                            &c.attestation_envelope,
+                        ) == Some(r.attestation_id.as_str())
+                })
+            })
+            .cloned()
+            .collect();
+        // (asserted_at DESC, attestation_id DESC).
+        rows.sort_by(|a, b| {
+            b.asserted_at
+                .cmp(&a.asserted_at)
+                .then_with(|| b.attestation_id.cmp(&a.attestation_id))
+        });
+        if let Some(c) = &cursor {
+            rows.retain(|r| {
+                (r.asserted_at, r.attestation_id.as_str())
+                    < (c.last_asserted_at, c.last_attestation_id.as_str())
+            });
+        }
+        let limit_usize = limit as usize;
+        rows.truncate(limit_usize);
+        let next_cursor = if rows.len() == limit_usize {
+            rows.last().map(|last| {
+                crate::read::AttestationCursor::from_trailing(
+                    last.asserted_at,
+                    last.attestation_id.clone(),
+                )
+            })
+        } else {
+            None
+        };
+        Ok(crate::read::ScoresPage {
+            items: rows,
+            next_cursor,
+        })
+    }
+
+    async fn resolve_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: crate::read::AttestationFilter,
+        policy: String,
+        trace: bool,
+    ) -> Result<crate::read::ComposedVerdict, crate::federation::Error> {
+        use crate::federation::Error;
+        let scope = crate::scope::caller_scope_from_directory(self, caller_occurrence_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("resolve_scores admission: {e}")))?;
+        let (data, composers) = {
+            let state = self.state.lock().expect("memory backend lock");
+            let all = &state.federation_attestations;
+            let data: Vec<crate::federation::Attestation> = all
+                .iter()
+                .filter(|r| {
+                    r.attestation_type == crate::federation::types::attestation_type::SCORES
+                        && mem_scores_row_matches(r, &filter, &scope)
+                })
+                .cloned()
+                .collect();
+            let attesters: std::collections::HashSet<&str> =
+                data.iter().map(|a| a.attesting_key_id.as_str()).collect();
+            let composers: Vec<crate::federation::Attestation> = all
+                .iter()
+                .filter(|c| {
+                    crate::federation::precedence::is_structural_composer(&c.attestation_type)
+                        && attesters.contains(c.attesting_key_id.as_str())
+                })
+                .cloned()
+                .collect();
+            (data, composers)
+        };
+        Ok(crate::federation::scores::compose_verdict(
+            data,
+            composers,
+            &policy,
+            trace,
+            chrono::Utc::now(),
+        ))
     }
 
     async fn attestation_upsert_local(
@@ -5703,6 +5939,127 @@ mod tests {
         // v9.0.0 — sign the as-built envelope (CC 5.3.2.4.3.1).
         resign_fix(&mut row);
         row
+    }
+
+    // ── v17.4.0 (FSD-005 Appendix C) — scores read surface parity ──
+
+    fn scores_base() -> chrono::DateTime<chrono::Utc> {
+        chrono::TimeZone::timestamp_opt(&chrono::Utc, 1_700_000_000, 0).unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn mem_put_score(
+        be: &MemoryBackend,
+        id: &str,
+        attester: &str,
+        subject: &str,
+        dimension: &str,
+        score: f64,
+        weight: f64,
+        secs: i64,
+    ) {
+        let _ = be
+            .put_public_key(SignedKeyRecord {
+                record: fix_key(attester, attester, attester),
+            })
+            .await;
+        let mut a = fix_attestation(id, attester, attester, attester);
+        a.weight = Some(weight);
+        a.asserted_at = scores_base() + chrono::Duration::seconds(secs);
+        a.attestation_envelope = serde_json::json!({
+            "dimension": dimension, "score": score, "confidence": weight,
+        });
+        a.subject_key_ids = vec![subject.into()];
+        resign_fix(&mut a);
+        be.put_attestation(SignedAttestation { attestation: a })
+            .await
+            .unwrap();
+    }
+
+    async fn mem_put_composer(
+        be: &MemoryBackend,
+        id: &str,
+        attester: &str,
+        ty: &str,
+        references: &str,
+        secs: i64,
+    ) {
+        let _ = be
+            .put_public_key(SignedKeyRecord {
+                record: fix_key(attester, attester, attester),
+            })
+            .await;
+        let mut a = fix_attestation(id, attester, attester, attester);
+        a.attestation_type = ty.into();
+        a.asserted_at = scores_base() + chrono::Duration::seconds(secs);
+        a.attestation_envelope =
+            serde_json::json!({ "references_attestation_id": references, "reason": "t" });
+        a.subject_key_ids = vec![];
+        resign_fix(&mut a);
+        be.put_attestation(SignedAttestation { attestation: a })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_scores_read_resolve_and_mirror() {
+        use crate::federation::FederationDirectory;
+        let be = MemoryBackend::new();
+        mem_put_score(&be, "a", "k1", "subj", "trust:demo:v1", 0.5, 1.0, 10).await;
+        mem_put_score(&be, "b", "k2", "subj", "trust:demo:v1", 0.5, 1.0, 20).await;
+        mem_put_score(&be, "c", "k3", "subj", "trust:demo:v1", 0.5, 1.0, 30).await;
+        let filter = crate::read::AttestationFilter {
+            subject_key_id: Some("subj".into()),
+            ..Default::default()
+        };
+        // newest-first
+        let ids: Vec<String> = be
+            .list_scores("", filter.clone(), None, 100)
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|a| a.attestation_id)
+            .collect();
+        assert_eq!(ids, vec!["c", "b", "a"]);
+        // cursor pagination
+        let p1 = be.list_scores("", filter.clone(), None, 2).await.unwrap();
+        assert_eq!(p1.items.len(), 2);
+        let cur = p1.next_cursor.expect("full page");
+        let p2 = be
+            .list_scores("", filter.clone(), Some(cur), 2)
+            .await
+            .unwrap();
+        assert_eq!(p2.items.len(), 1);
+        assert_eq!(p2.items[0].attestation_id, "a");
+        // resolve: 3 contributors, mean 0.5 → Supported
+        let v = be
+            .resolve_scores("", filter.clone(), "cc-4.4.2-signed-mean".into(), false)
+            .await
+            .unwrap();
+        assert_eq!(v.contributor_count, 3);
+        assert_eq!(v.band, crate::read::ConfidenceBand::Supported);
+        // withdraw k3 → drops from both list (default Live) and fold
+        mem_put_composer(&be, "w", "k3", "withdraws", "c", 40).await;
+        let ids: Vec<String> = be
+            .list_scores("", filter.clone(), None, 100)
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|a| a.attestation_id)
+            .collect();
+        assert_eq!(ids, vec!["b", "a"], "withdrawn hidden by default");
+        let v = be
+            .resolve_scores("", filter, "cc-4.4.2-signed-mean".into(), false)
+            .await
+            .unwrap();
+        assert_eq!(v.contributor_count, 2, "k3 withdrawn → out of fold");
+        // the in-memory subject-index mirror was maintained on every write.
+        let idx = be.state.lock().unwrap();
+        let mut ids = idx.subject_index.get("subj").cloned().unwrap_or_default();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
     }
 
     fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {

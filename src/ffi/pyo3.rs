@@ -13415,6 +13415,118 @@ impl PyEngine {
         })
     }
 
+    /// v17.4.0 (FSD-005 Appendix C) — the durable `scores` LIST read. Ordered
+    /// subject+dimension seek over the V106 projection; the §4.3 gate is built
+    /// from `caller_occurrence_key_id` INSIDE the backend (None → empty →
+    /// unauthenticated, broad tiers only). Returns JSON-encoded `ScoresPage`.
+    #[pyo3(signature = (filter_json, cursor_json=None, limit=100, caller_occurrence_key_id=None))]
+    fn list_scores(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        cursor_json: Option<&str>,
+        limit: i64,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::read::AttestationFilter = serde_json::from_str(filter_json)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("AttestationFilter JSON decode: {e}"))
+                })?;
+            let cursor: Option<crate::read::AttestationCursor> = match cursor_json {
+                None => None,
+                Some(s) => Some(serde_json::from_str(s).map_err(|e| {
+                    PyValueError::new_err(format!("AttestationCursor JSON decode: {e}"))
+                })?),
+            };
+            let caller = caller_occurrence_key_id.unwrap_or_default();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let page = backend
+                            .list_scores(&caller, filter, cursor, limit)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&page)
+                            .map_err(|e| PyRuntimeError::new_err(format!("ScoresPage encode: {e}")))
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let page = backend
+                            .list_scores(&caller, filter, cursor, limit)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&page)
+                            .map_err(|e| PyRuntimeError::new_err(format!("ScoresPage encode: {e}")))
+                    })
+                }
+            })
+        })
+    }
+
+    /// v17.4.0 (FSD-005 Appendix C) — the durable `scores` RESOLVE read: the
+    /// composed verdict (band + n's + open trace). Runs the precedence + CC
+    /// 4.4.2 polarity fold as a composite substrate op. Returns JSON-encoded
+    /// `ComposedVerdict`.
+    #[pyo3(signature = (filter_json, policy, trace=false, caller_occurrence_key_id=None))]
+    fn resolve_scores(
+        &self,
+        py: Python<'_>,
+        filter_json: &str,
+        policy: String,
+        trace: bool,
+        caller_occurrence_key_id: Option<String>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let filter: crate::read::AttestationFilter = serde_json::from_str(filter_json)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("AttestationFilter JSON decode: {e}"))
+                })?;
+            let caller = caller_occurrence_key_id.unwrap_or_default();
+            py.detach(move || match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let verdict = backend
+                            .resolve_scores(&caller, filter, policy, trace)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&verdict).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ComposedVerdict encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let verdict = backend
+                            .resolve_scores(&caller, filter, policy, trace)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&verdict).map_err(|e| {
+                            PyRuntimeError::new_err(format!("ComposedVerdict encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
     /// #135 + part of #150 — list every attestation whose subject is
     /// `target_key_id` (`attested_key_id = target_key_id`), newest-first,
     /// cursor-paged. Scope is built from `caller_occurrence_key_id`

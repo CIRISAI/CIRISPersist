@@ -125,9 +125,9 @@ pub use aggregates::scoring::{
 };
 pub use aggregates::scrub::ScrubAggregate;
 pub use list::federation::{
-    AttestationCursor, AttestationFilter, AttestationListPage, FederationKeyCursor,
-    FederationKeyFilter, FederationKeyListPage, RevocationCursor, RevocationFilter,
-    RevocationListPage,
+    AttestationCursor, AttestationFilter, AttestationListPage, AttesterSet, ComposedVerdict,
+    ConfidenceBand, FederationKeyCursor, FederationKeyFilter, FederationKeyListPage, LifecycleView,
+    RevocationCursor, RevocationFilter, RevocationListPage, ScoresPage, Tier,
 };
 pub use list::llm::{LlmCallCursor, LlmCallFilter, LlmCallListPage};
 pub use list::tasks::{TaskClass, TaskCursor, TaskFilter, TaskGroup, TaskListPage};

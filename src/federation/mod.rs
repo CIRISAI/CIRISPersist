@@ -71,6 +71,7 @@ pub mod register;
 pub mod replication;
 pub mod rooting;
 pub mod schema_resolver;
+pub mod scores;
 // CIRISPersist#210 — cross-process leader election (RNS shared-instance
 // owner; CIRISEdge#100). Backend-agnostic types + staleness helper; the
 // atomic acquire/heartbeat/release live in the backends.
@@ -927,6 +928,59 @@ pub trait FederationDirectory: Send + Sync {
             return Ok(None);
         }
         Ok(occ.encryption_pubkeys)
+    }
+
+    /// v17.4.0 (FSD-005 Appendix C) — the durable `scores` LIST read: an
+    /// ordered subject+dimension seek over the V106 `attestation_subjects`
+    /// projection, JOINed to `federation_attestations`, honoring the full
+    /// [`AttestationFilter`](crate::read::AttestationFilter) axis set
+    /// (subject / dimension exact+prefix / tier / lifecycle / attester_filter
+    /// / window / confidence) and the §4.3 caller-visibility gate resolved
+    /// from `caller_occurrence_key_id` (empty ⇒ unauthenticated, broad tiers
+    /// only). Cursor-paged `(asserted_at, attestation_id)` newest-first.
+    ///
+    /// Declared on `FederationDirectory` (not `ReadEngine`) so the composite
+    /// substrate op can route it (the #329 capsule dispatches `dyn
+    /// FederationDirectory`): the whole gate + seek runs inside persist's
+    /// `.so`. Default = `Unsupported`; the sqlite/postgres/memory backends
+    /// override.
+    async fn list_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: crate::read::AttestationFilter,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, Error> {
+        let _ = (caller_occurrence_key_id, filter, cursor, limit);
+        Err(Error::Unsupported {
+            method: "list_scores",
+        })
+    }
+
+    /// v17.4.0 (FSD-005 Appendix C) — the durable `scores` RESOLVE read: the
+    /// composed verdict. Fetches the same candidate set as
+    /// [`Self::list_scores`] (no pagination), runs the CEG §6.1 per-attester
+    /// precedence latest-wins fold + the CC 4.4.2 polarity aggregation
+    /// ([`super::scores::compose_verdict`]), and maps the result to a
+    /// qualitative [`ConfidenceBand`](crate::read::ConfidenceBand). Scope-gated
+    /// rows are excluded from BOTH the fold and the result (no verdict-
+    /// differencing).
+    ///
+    /// Runs as a composite substrate op (the #329 pattern): the whole
+    /// gate + fetch + fold executes inside persist's `.so`, so a cohabiting
+    /// consumer can never run a STALE composer against newer data. Default =
+    /// `Unsupported`; the backends override.
+    async fn resolve_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: crate::read::AttestationFilter,
+        policy: String,
+        trace: bool,
+    ) -> Result<crate::read::ComposedVerdict, Error> {
+        let _ = (caller_occurrence_key_id, filter, policy, trace);
+        Err(Error::Unsupported {
+            method: "resolve_scores",
+        })
     }
 
     /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — admit a

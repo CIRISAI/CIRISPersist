@@ -49,6 +49,7 @@ pub type KeyId = String;
 pub use admission::CallerAdmission;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub use admission::{build_caller_admission, AdmissionError};
+pub use admission::{build_caller_admission_from_directory, caller_scope_from_directory};
 pub use caller::CallerScope;
 pub use sql::{cohort_scope_sql_predicate, BackendKind, ScopeParam};
 
