@@ -5,6 +5,43 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.3.0] — 2026-07-14 — the trace-delivery unblock (#329 field hit): `ResolveEncryptionKeys` + `ListIdentityOccurrenceRevocationsFor` capsule ops
+
+### Fixed — sealed-envelope trace delivery shipped 0 envelopes fleet-wide on the embedded/pyo3 path (CIRISServer#260)
+
+`resolve_encryption_keys` (the v14 revocation-aware seal lookup) is a
+DEFAULT trait method whose fold decomposes into
+`lookup_identity_for_occurrence` + `list_identity_occurrence_revocations_for`.
+Through `build_ops_directory` the second call had no `DirectoryOp` →
+`Error::Unsupported` — so the moment a peer's occurrence row replicated in,
+`resolve_peer_kex_pubkeys` flipped from `None` to a hard error and every
+embedded consumer sealed nothing, forever. Two APPEND-ONLY capsule ops:
+
+- **`ResolveEncryptionKeys { occurrence_key_id }`** — the WHOLE fold
+  (occurrence lookup → §10.1.4 validity window → the v16 `revokes()`
+  re-establishment comparator) as ONE composite executing inside persist's
+  `.so`, and the ops proxy now OVERRIDES the trait default to route it.
+  Routing the composite rather than only the raw read matters: the default
+  fold would run the comparator in the CONSUMER'S binary — the #320
+  cross-cdylib skew class, on the seal-safety path (a consumer pinned to an
+  older persist crate would run a stale comparator against newer data).
+  Result variant `EncryptionKeys(Option<EncryptionPubkeys>)`; `None` stays
+  the fail-secure exclusion.
+- **`ListIdentityOccurrenceRevocationsFor { identity_key_id }`** — the raw
+  revocation-plane read (was an `Unsupported` stub), for enumeration /
+  observability and trait-default folds generally; result variant
+  `IdentityOccurrenceRevocations(Vec<..>)`.
+
+Test: `ops_directory_resolve_encryption_keys_is_revocation_aware` — the
+exact field scenario through the proxy: resolves `Some` pre-revocation
+(previously the hard error), `None` post-revocation (revocation-aware
+through the ABI), raw read round-trips byte-equal to a direct backend
+call. Full gate pg+sqlite `--all-targets` **1535/1535**.
+
+Downstream: CIRISServer#260 / the mesh-repro KEX gate — one re-pin
+(`>=17.3.0,<18`) and `resolve_peer_kex_pubkeys(canonical)` returns `Some`
+on the embedded path; end-to-end trace delivery unblocks.
+
 ## [17.2.0] — 2026-07-14 — test-anchor node-bless unblock (#451): PQC-complete seeded holder + verifiable self-scrub via env + the persist-tier e2e
 
 ### Added — the #449 "flag if this bites" follow-up (all inside the `test-anchor` fence + `test_anchor_active()` gate; prod byte-identical)

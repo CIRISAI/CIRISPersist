@@ -537,6 +537,32 @@ pub enum DirectoryOp {
         /// The occurrence `key_id` whose signed routes to enumerate.
         occurrence_key_id: String,
     },
+    /// [`FederationDirectory::resolve_encryption_keys`] (#329 field hit,
+    /// CIRISServer#260) — the v14 REVOCATION-AWARE seal lookup as ONE
+    /// composite op. The whole fold (occurrence lookup → validity window →
+    /// the v16 `revokes()` re-establishment comparator over the identity's
+    /// revocations) executes INSIDE persist's `.so` at dispatch: routing the
+    /// composite — rather than only the raw revocations read — means a
+    /// cohabiting consumer pinned to an older persist crate can never run a
+    /// STALE comparator against newer data (the #320 skew class, on the
+    /// seal-safety path). `None` ⇒ recipient excluded from v2 grants
+    /// (fail-secure; never a plaintext fallback). Result rides the new
+    /// `EncryptionKeys` variant. APPEND-ONLY.
+    ResolveEncryptionKeys {
+        /// The occurrence `key_id` whose CURRENT v2 KEX pubkeys to resolve.
+        occurrence_key_id: String,
+    },
+    /// [`FederationDirectory::list_identity_occurrence_revocations_for`]
+    /// (#329 field hit) — the raw revocation-plane read, routed so
+    /// revocation-aware consumer logic (and the trait's default folds) can
+    /// run against the ops proxy at all. Prefer the `ResolveEncryptionKeys`
+    /// composite for SEALING decisions (comparator stays in the `.so`); this
+    /// raw read is for enumeration/observability. Result rides the new
+    /// `IdentityOccurrenceRevocations` variant. APPEND-ONLY.
+    ListIdentityOccurrenceRevocationsFor {
+        /// The identity `key_id` whose occurrence revocations to enumerate.
+        identity_key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -624,6 +650,12 @@ pub enum DirectoryOpResult {
     /// routes with their signature container, for transport replication.
     /// APPEND-ONLY.
     SignedTransportDestinations(Vec<self_at_login::SignedTransportDestination>),
+    /// `resolve_encryption_keys` (#329) — the revocation-aware current KEX
+    /// pubkeys (`None` ⇒ fail-secure exclusion from v2 grants). APPEND-ONLY.
+    EncryptionKeys(Option<crate::federation::EncryptionPubkeys>),
+    /// `list_identity_occurrence_revocations_for` (#329) — the raw
+    /// revocation-plane rows for an identity. APPEND-ONLY.
+    IdentityOccurrenceRevocations(Vec<IdentityOccurrenceRevocation>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -771,6 +803,23 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::SignedTransportDestinations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ResolveEncryptionKeys { occurrence_key_id } => {
+            // #329 — the WHOLE revocation-aware fold runs here, inside
+            // persist's `.so`, against persist's own comparator + clock.
+            match dir.resolve_encryption_keys(&occurrence_key_id).await {
+                Ok(v) => DirectoryOpResult::EncryptionKeys(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListIdentityOccurrenceRevocationsFor { identity_key_id } => {
+            match dir
+                .list_identity_occurrence_revocations_for(&identity_key_id)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::IdentityOccurrenceRevocations(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -2178,9 +2227,49 @@ impl FederationDirectory for OpsDirectory {
         &self,
         identity_key_id: &str,
     ) -> Result<Vec<IdentityOccurrenceRevocation>, Error> {
-        Err(Error::Unsupported {
-            method: "list_identity_occurrence_revocations_for",
-        })
+        // #329 — routed (was Error::Unsupported). The raw revocation-plane
+        // read; SEALING decisions should go through the trait's
+        // `resolve_encryption_keys` (overridden below to route the composite
+        // op) so the revocation comparator runs inside persist's `.so`.
+        match self
+            .run_op(&DirectoryOp::ListIdentityOccurrenceRevocationsFor {
+                identity_key_id: identity_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::IdentityOccurrenceRevocations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// #329 (CIRISServer#260 field hit) — OVERRIDE of the trait's default
+    /// fold. The default decomposes into `lookup_identity_for_occurrence` +
+    /// `list_identity_occurrence_revocations_for` and runs the validity
+    /// window + the v16 `revokes()` re-establishment comparator IN THE
+    /// CONSUMER'S BINARY — the #320 cross-cdylib skew class, on the
+    /// seal-safety path (a cohabiting consumer pinned to an older persist
+    /// crate would run a stale comparator against newer data). Routing the
+    /// ONE composite op executes the whole fold inside persist's `.so`
+    /// against persist's own comparator and clock.
+    async fn resolve_encryption_keys(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<crate::federation::EncryptionPubkeys>, Error> {
+        match self
+            .run_op(&DirectoryOp::ResolveEncryptionKeys {
+                occurrence_key_id: occurrence_key_id.to_string(),
+            })
+            .await?
+        {
+            DirectoryOpResult::EncryptionKeys(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
     }
     async fn list_family_membership_revocations_for(
         &self,
@@ -3180,6 +3269,100 @@ mod tests {
             "proxy result must equal a direct backend call"
         );
         assert_eq!(via_proxy.expect("some").key_id, "primitive-ops");
+    }
+
+    #[test]
+    fn ops_directory_resolve_encryption_keys_is_revocation_aware() {
+        // #329 (CIRISServer#260 field hit) — the exact fleet-breaking
+        // scenario, through the proxy: resolve_encryption_keys previously
+        // decomposed to the uncovered raw revocations read and surfaced
+        // Error::Unsupported the moment the occurrence row existed, so the
+        // embedded/pyo3 path could never resolve a peer's KEX pubkeys. Now
+        // the composite op routes the WHOLE fold into persist's `.so`:
+        // resolves Some before revocation, None after (revocation-aware
+        // through the ABI), and the raw revocations read round-trips too.
+        let rt = test_runtime();
+        let backend: Arc<MemoryBackend> = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> = backend;
+        let directory = build_persist_directory(dir.clone());
+        let executor = Arc::new(crate::ffi::executor_capsule::build_persist_executor(
+            rt.clone(),
+        ));
+        let proxy = build_ops_directory(directory, executor).expect("abi ok");
+
+        let now = chrono::Utc::now();
+        for k in ["kex-identity", "kex-phone"] {
+            rt.block_on(dir.put_public_key(SignedKeyRecord {
+                record: sample_key_record(k),
+            }))
+            .expect("register fixture key");
+        }
+        rt.block_on(
+            dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+                identity_key_id: "kex-identity".into(),
+                occurrence_key_id: "kex-phone".into(),
+                device_class: crate::federation::types::device_class::AGENT.into(),
+                hardware_attestation: None,
+                asserted_at: now - chrono::Duration::hours(1),
+                valid_until: None,
+                encryption_pubkeys: Some({
+                    use base64::engine::general_purpose::STANDARD as B64;
+                    use base64::Engine as _;
+                    crate::federation::EncryptionPubkeys {
+                        x25519_base64: B64.encode([0x11u8; 32]),
+                        ml_kem_768_base64: B64.encode(vec![0x22u8; 1184]),
+                    }
+                }),
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            }),
+        )
+        .expect("seed occurrence");
+
+        // Pre-revocation: the proxy resolves the KEX keys (was: hard error).
+        let resolved = rt
+            .block_on(proxy.resolve_encryption_keys("kex-phone"))
+            .expect("#329: proxy resolve must not be Unsupported");
+        {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine as _;
+            assert_eq!(
+                resolved.as_ref().map(|k| k.x25519_base64.clone()),
+                Some(B64.encode([0x11u8; 32])),
+                "proxy must resolve the occurrence's KEX pubkeys"
+            );
+        }
+
+        // Revoke → the SAME proxy call fail-secure excludes the occurrence.
+        rt.block_on(dir.put_identity_occurrence_revocation_local(
+            crate::federation::IdentityOccurrenceRevocation {
+                identity_key_id: "kex-identity".into(),
+                occurrence_key_id: "kex-phone".into(),
+                revoked_at: now,
+                effective_at: now,
+                reason: None,
+                witness_set: vec!["kex-identity".into()],
+                persist_row_hash: String::new(),
+            },
+        ))
+        .expect("seed revocation");
+        let resolved = rt
+            .block_on(proxy.resolve_encryption_keys("kex-phone"))
+            .expect("proxy resolve after revocation");
+        assert!(
+            resolved.is_none(),
+            "a revoked occurrence must resolve to None through the ABI"
+        );
+
+        // The raw revocation-plane read routes too, equal to a direct call.
+        let via_proxy = rt
+            .block_on(proxy.list_identity_occurrence_revocations_for("kex-identity"))
+            .expect("#329: raw revocations read must not be Unsupported");
+        let via_direct = rt
+            .block_on(dir.list_identity_occurrence_revocations_for("kex-identity"))
+            .expect("direct revocations read");
+        assert_eq!(via_proxy.len(), 1);
+        assert_eq!(via_proxy, via_direct, "proxy == direct backend call");
     }
 
     #[test]
