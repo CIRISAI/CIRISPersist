@@ -47,16 +47,21 @@ runs:
         echo "CIRISCache: persist=${BASE}-p${P:-none}-enone-v${V:-none}"
         echo "CIRISCache: head   =${BASE}-phead-enone-v${V:-none}"
         echo "CIRISCache: verify =${BASE}-pnone-enone-v${V:-none}"
-    # Widest → narrowest; each overlays the previous (later wins on overlap).
-    - uses: CIRISAI/CIRISCache/restore@v1   # layer 1 (widest): verify upstream (first-ever-build fallback)
+    # Single first-hit-wins restore (restore@v2). CIRISPersist#458-followup: the
+    # old 3-step layered restore extracted the phead blob AND the versioned blob
+    # (byte-IDENTICAL 3.7 GB supersets) back-to-back — ~200-240s of redundant
+    # extraction on EVERY leg (measured on the v17.5.0-era main run). Each blob
+    # is a complete superset of the shallower layers (save uploads the full
+    # `~/.cargo/registry + target`), so the DEEPEST hit alone suffices — no
+    # cumulative overlay. Order = most-specific → widest; restore@v2 restores the
+    # first key that hits and SKIPS the rest (one extraction, not three):
+    #   1. this exact version   (same-version re-run)
+    #   2. rolling phead        (cross-version warm target/ — the common case)
+    #   3. verify upstream leaf (first-ever build after a verify pin bump)
+    - uses: CIRISAI/CIRISCache/restore@v2
       continue-on-error: true
       with:
-        key: ${{ env.CIRISCACHE_KEY_VERIFY }}
-    - uses: CIRISAI/CIRISCache/restore@v1   # layer 2: most-recent persist build (the cross-version warm target/)
-      continue-on-error: true
-      with:
-        key: ${{ env.CIRISCACHE_KEY_HEAD }}
-    - uses: CIRISAI/CIRISCache/restore@v1   # layer 3 (narrowest, wins): this exact version (same-version re-run)
-      continue-on-error: true
-      with:
-        key: ${{ env.CIRISCACHE_KEY }}
+        keys: |
+          ${{ env.CIRISCACHE_KEY }}
+          ${{ env.CIRISCACHE_KEY_HEAD }}
+          ${{ env.CIRISCACHE_KEY_VERIFY }}

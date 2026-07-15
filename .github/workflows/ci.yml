@@ -220,7 +220,7 @@ jobs:
       # composite). Was two full saves back-to-back (~18.5 min on the v17.5.0 tag
       # run); now push-once + ~1s retag.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && matrix.substrate.name == 'core'
+        if: github.ref == 'refs/heads/main' && matrix.substrate.name == 'core'   # main-only: tag runs skip the ~10min save (#458 followup)
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -292,7 +292,7 @@ jobs:
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        if: github.ref == 'refs/heads/main'   # save warms the NEXT build; tag/release runs skip the ~10min save (off the publish critical path — #458 followup)
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -457,7 +457,7 @@ jobs:
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        if: github.ref == 'refs/heads/main'   # save warms the NEXT build; tag/release runs skip the ~10min save (off the publish critical path — #458 followup)
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -688,7 +688,7 @@ jobs:
       # version's build restore this warm target/ and recompile only changed
       # files instead of rebuilding persist's deps from the verify baseline.
       - uses: CIRISAI/CIRISCache/save@v1
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        if: github.ref == 'refs/heads/main'   # save warms the NEXT build; tag/release runs skip the ~10min save (off the publish critical path — #458 followup)
         continue-on-error: true
         with:
           key: ${{ env.CIRISCACHE_KEY }}
@@ -1220,7 +1220,7 @@ jobs:
       # server-side (no second tar+push). Windows was the worst offender here:
       # the wheel target/ is large and a second full push serialized ~9 min.
       - name: Save CIRISCache (linux-aarch64 + windows-x64 — #314, push-once+alias)
-        if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')
+        if: github.ref == 'refs/heads/main' && (matrix.label == 'linux-aarch64' || matrix.label == 'windows-x86_64')   # main-only: tag runs skip the ~10min save (#458 followup)
         uses: CIRISAI/CIRISCache/save@v1
         continue-on-error: true
         with:
