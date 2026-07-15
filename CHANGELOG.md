@@ -5,6 +5,35 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.5.1] — 2026-07-15 — CI wall-time (restore dedup + release-path save-skip); republish the 17.5.0 substrate (#458 followup)
+
+Patch release — **no crate code change from 17.5.0**. Ships a CI/release-infra
+optimization, and because the 17.5.0 tag's PyPI publish was orphaned (a
+CIRISCache restore hang killed the wheel/lint jobs → `publish-pypi` silently
+skipped → PyPI never advanced past 17.4.0), 17.5.1 becomes the first
+actually-published tag of the 17.5.x substrate. CIRISEdge v13.1.0's
+`ciris-persist>=17.5.0,<18` floor is satisfied by 17.5.1.
+
+### Changed — CI wall-time (#458 followup)
+
+- **Restore dedup.** The `ciriscache` composite ran a 3-step layered restore
+  that extracted the rolling `phead` blob **and** the versioned blob
+  (byte-identical ~3.7 GB supersets) back-to-back — ~200–240 s of redundant
+  extraction on **every** leg (measured on the 17.5.0-era main run). Collapsed
+  to a single `restore@v2` first-hit-wins keys-list: the deepest hit is a
+  complete superset, so one extraction suffices, not three. ~3–4 min off every
+  linux / darwin / iOS / android / wheel leg.
+- **Save off the release critical path.** After the #458 double→single save
+  collapse, the remaining ~10-min CIRISCache save (one 3.7 GB tar+gzip+push)
+  still gated `publish` via the core test leg — yet it produces nothing publish
+  needs; it only warms the *next* build. Saves now run on `main` pushes only;
+  tag/release runs skip them (the merge's main run already warmed the cache).
+  ~10 min off the release critical path.
+- Net: the tag/publish path sheds the ~10-min save and ~3–4 min of per-leg
+  re-extraction — the substrate reaches PyPI materially faster, and (with the
+  #458 fail-open restore + `assert-published` tripwire, shipped in the same
+  arc) a cache-layer flake can no longer silently orphan a release.
+
 ## [17.5.0] — 2026-07-15 — owner-scope replication log (#455) + resolve_scores boundedness/executor posture (#456)
 
 ### Added — `list_attestation_log`: the owner-scope replication read beside the caller-gated consumer read (#455)
