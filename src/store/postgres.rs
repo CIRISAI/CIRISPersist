@@ -3691,6 +3691,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     crate::federation::Error::Backend(format!("insert attestation: {msg}"))
                 }
             })?;
+        // v17.4.0 (V106) — maintain the subject projection (federation tier).
+        pg_project_attestation_subjects(
+            &**client,
+            &row,
+            &attestation_uuid,
+            crate::federation::types::attestation_tier::FEDERATION,
+        )
+        .await
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("put_attestation projection: {e}"))
+        })?;
         Ok(())
     }
 
@@ -6925,7 +6936,177 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "federation_attestations row {attestation_id} was concurrently promoted"
             )));
         }
+        // v17.4.0 (V106) — projection: the promoted row is now federation-tier.
+        client
+            .execute(
+                "UPDATE cirislens.attestation_subjects SET tier = 'federation' \
+                 WHERE attestation_id = $1",
+                &[&att_uuid],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("promote_attestation projection: {e}"))
+            })?;
         Ok(true)
+    }
+
+    async fn list_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: crate::read::AttestationFilter,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, crate::federation::Error> {
+        use crate::federation::Error;
+        use crate::read::LifecycleView;
+        if !(1..=10_000).contains(&limit) {
+            return Err(Error::InvalidArgument(format!(
+                "limit must be in [1, 10000], got {limit}"
+            )));
+        }
+        let scope = crate::scope::caller_scope_from_directory(self, caller_occurrence_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("list_scores admission: {e}")))?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let (mut where_parts, mut params) = pg_scores_shared_predicates(&filter, &scope);
+        // lifecycle: exclude rows retracted by a still-hiding composer.
+        let hide: &[&str] = match filter.lifecycle {
+            LifecycleView::Live => &["supersedes", "withdraws", "recants"],
+            LifecycleView::IncludeSuperseded => &["withdraws", "recants"],
+            LifecycleView::IncludeWithdrawn => &["supersedes", "recants"],
+            LifecycleView::IncludeRecanted => &["supersedes", "withdraws"],
+            LifecycleView::All => &[],
+        };
+        if !hide.is_empty() {
+            let mut ph: Vec<String> = Vec::new();
+            for ty in hide {
+                params.push(Box::new((*ty).to_string()));
+                ph.push(format!("${}", params.len()));
+            }
+            where_parts.push(format!(
+                "NOT EXISTS (SELECT 1 FROM cirislens.federation_attestations c \
+                   WHERE c.attesting_key_id = fa.attesting_key_id \
+                     AND c.attestation_type IN ({}) \
+                     AND c.attestation_envelope->>'references_attestation_id' = fa.attestation_id::text)",
+                ph.join(",")
+            ));
+        }
+        if let Some(c) = &cursor {
+            if c.version != "v1" {
+                return Err(Error::InvalidArgument(format!(
+                    "AttestationCursor version {} unsupported; v1 only",
+                    c.version
+                )));
+            }
+            params.push(Box::new(c.last_asserted_at));
+            let p_at = params.len();
+            params.push(Box::new(c.last_attestation_id.clone()));
+            let p_id = params.len();
+            where_parts.push(format!(
+                "(fa.asserted_at, fa.attestation_id::text) < (${p_at}, ${p_id})"
+            ));
+        }
+        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
+        params.push(Box::new(limit));
+        let p_limit = params.len();
+        let sql = format!(
+            "SELECT DISTINCT {PG_SCORES_FA_COLS} \
+             FROM cirislens.attestation_subjects s \
+             JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id \
+             {where_sql} \
+             ORDER BY asserted_at DESC, attestation_id DESC \
+             LIMIT ${p_limit}"
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(&sql, &params_ref[..])
+            .await
+            .map_err(|e| Error::Backend(format!("list_scores: {e}")))?;
+        let items: Result<Vec<crate::federation::Attestation>, crate::federation::Error> =
+            rows.into_iter().map(pg_row_to_attestation).collect();
+        let items = items?;
+        let next_cursor = if items.len() == limit as usize {
+            let last = &items[items.len() - 1];
+            Some(crate::read::AttestationCursor::from_trailing(
+                last.asserted_at,
+                last.attestation_id.clone(),
+            ))
+        } else {
+            None
+        };
+        Ok(crate::read::ScoresPage { items, next_cursor })
+    }
+
+    async fn resolve_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: crate::read::AttestationFilter,
+        policy: String,
+        trace: bool,
+    ) -> Result<crate::read::ComposedVerdict, crate::federation::Error> {
+        use crate::federation::Error;
+        let scope = crate::scope::caller_scope_from_directory(self, caller_occurrence_key_id)
+            .await
+            .map_err(|e| Error::Backend(format!("resolve_scores admission: {e}")))?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        let (mut where_parts, params) = pg_scores_shared_predicates(&filter, &scope);
+        where_parts.push("fa.attestation_type = 'scores'".to_string());
+        let where_sql = format!("WHERE {}", where_parts.join(" AND "));
+        let sql = format!(
+            "SELECT DISTINCT {PG_SCORES_FA_COLS} \
+             FROM cirislens.attestation_subjects s \
+             JOIN cirislens.federation_attestations fa ON fa.attestation_id = s.attestation_id \
+             {where_sql} \
+             ORDER BY asserted_at DESC, attestation_id DESC"
+        );
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(&sql, &params_ref[..])
+            .await
+            .map_err(|e| Error::Backend(format!("resolve_scores: {e}")))?;
+        let data: Vec<crate::federation::Attestation> = rows
+            .into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<Vec<_>, _>>()?;
+        // Composers (retractions) from the same attesters, regardless of their
+        // own subject/scope — a retraction applies for everyone.
+        let mut attesters: Vec<String> = data.iter().map(|a| a.attesting_key_id.clone()).collect();
+        attesters.sort();
+        attesters.dedup();
+        let composers: Vec<crate::federation::Attestation> = if attesters.is_empty() {
+            Vec::new()
+        } else {
+            let csql = format!(
+                "SELECT {PG_SCORES_FA_COLS} FROM cirislens.federation_attestations fa \
+                 WHERE fa.attestation_type IN ('supersedes','withdraws','recants') \
+                   AND fa.attesting_key_id = ANY($1)"
+            );
+            let crows = client
+                .query(&csql, &[&attesters])
+                .await
+                .map_err(|e| Error::Backend(format!("resolve_scores composers: {e}")))?;
+            crows
+                .into_iter()
+                .map(pg_row_to_attestation)
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(crate::federation::scores::compose_verdict(
+            data,
+            composers,
+            &policy,
+            trace,
+            chrono::Utc::now(),
+        ))
     }
 
     async fn attach_revocation_pqc_signature(
@@ -11593,11 +11774,178 @@ impl PostgresBackend {
                 Error::Backend(format!("insert local attestation: {msg}"))
             }
         })?;
+        // v17.4.0 (V106) — subject projection at `local` tier. On the
+        // upsert-replace path the prior projection rows were dropped by the
+        // DELETE above (FK ON DELETE CASCADE), so no stale rows survive.
+        pg_project_attestation_subjects(
+            &*tx,
+            &row,
+            &attestation_uuid,
+            crate::federation::types::attestation_tier::LOCAL,
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("local attestation projection: {e}")))?;
         tx.commit()
             .await
             .map_err(|e| Error::Backend(format!("local attestation commit: {e}")))?;
         Ok(attestation_id)
     }
+}
+
+/// v17.4.0 — the `fa.`-aliased `federation_attestations` column list for the
+/// postgres `scores` read handles (JOINed to `cirislens.attestation_subjects
+/// s`). Casts match [`pg_row_to_attestation`]'s by-name reads
+/// (`attestation_id::text`, `weight::float8`). Output column names are
+/// unprefixed so ORDER BY / DISTINCT reference them directly.
+const PG_SCORES_FA_COLS: &str = "fa.attestation_id::text AS attestation_id, fa.attesting_key_id, \
+     fa.attested_key_id, fa.attestation_type, fa.weight::float8 AS weight, fa.asserted_at, \
+     fa.expires_at, fa.attestation_envelope, fa.original_content_hash, \
+     fa.scrub_signature_classical, fa.scrub_signature_pqc, fa.scrub_key_id, fa.scrub_timestamp, \
+     fa.pqc_completed_at, fa.persist_row_hash, fa.subject_key_ids, fa.withdraws_admission_rule, \
+     fa.cohort_scope, fa.tier, fa.promoted_at";
+
+/// v17.4.0 — shared WHERE predicate builder for the postgres `scores` read
+/// handles. Emits the subject / dimension(exact+prefix) / type / attester /
+/// pqc / confidence / valid_at / window / tier / attester_filter axes plus the
+/// §4.3 scope gate, over aliases `s` (`attestation_subjects`) and `fa`
+/// (`federation_attestations`). The returned `where_parts` is always non-empty
+/// (tier + scope always emit).
+fn pg_scores_shared_predicates(
+    filter: &crate::read::AttestationFilter,
+    scope: &crate::scope::CallerScope,
+) -> (
+    Vec<String>,
+    Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) {
+    use crate::read::{AttesterSet, Tier};
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+    if let Some(subj) = &filter.subject_key_id {
+        params.push(Box::new(subj.clone()));
+        where_parts.push(format!("s.subject_key_id = ${}", params.len()));
+    }
+    if let Some(dx) = &filter.dimension_exact {
+        params.push(Box::new(dx.clone()));
+        where_parts.push(format!("s.dimension = ${}", params.len()));
+    }
+    if !filter.dimension_prefixes.is_empty() {
+        let mut ors: Vec<String> = Vec::new();
+        for p in &filter.dimension_prefixes {
+            let esc = p
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            params.push(Box::new(format!("{esc}%")));
+            ors.push(format!("s.dimension LIKE ${}", params.len()));
+        }
+        where_parts.push(format!("({})", ors.join(" OR ")));
+    }
+    if let Some(t) = &filter.attestation_type {
+        params.push(Box::new(t.clone()));
+        where_parts.push(format!("fa.attestation_type = ${}", params.len()));
+    }
+    if let Some(k) = &filter.attesting_key_id {
+        params.push(Box::new(k.clone()));
+        where_parts.push(format!("fa.attesting_key_id = ${}", params.len()));
+    }
+    if let Some(k) = &filter.attested_key_id {
+        params.push(Box::new(k.clone()));
+        where_parts.push(format!("fa.attested_key_id = ${}", params.len()));
+    }
+    if let Some(pqc) = filter.pqc_completed {
+        where_parts.push(if pqc {
+            "fa.pqc_completed_at IS NOT NULL".to_owned()
+        } else {
+            "fa.pqc_completed_at IS NULL".to_owned()
+        });
+    }
+    if let Some(floor) = filter.confidence_floor {
+        params.push(Box::new(floor));
+        where_parts.push(format!(
+            "(fa.weight IS NOT NULL AND fa.weight::float8 >= ${})",
+            params.len()
+        ));
+    }
+    if let Some(va) = filter.valid_at {
+        params.push(Box::new(va));
+        let p = params.len();
+        where_parts.push(format!(
+            "(fa.asserted_at <= ${p} AND (fa.expires_at IS NULL OR fa.expires_at > ${p}))"
+        ));
+    }
+    if let Some((start, end)) = filter.window {
+        params.push(Box::new(start));
+        let ps = params.len();
+        params.push(Box::new(end));
+        let pe = params.len();
+        where_parts.push(format!(
+            "(fa.asserted_at >= ${ps} AND fa.asserted_at < ${pe})"
+        ));
+    }
+    // tier: default (None) = federation-only.
+    match filter.tier {
+        None | Some(Tier::Federation) => where_parts.push("fa.tier = 'federation'".to_owned()),
+        Some(Tier::Local) => where_parts.push("fa.tier = 'local'".to_owned()),
+        Some(Tier::Any) => {}
+    }
+    // attester_filter: Explicit set membership (All / None = no restriction).
+    if let Some(AttesterSet::Explicit(keys)) = &filter.attester_filter {
+        if keys.is_empty() {
+            where_parts.push("FALSE".to_owned());
+        } else {
+            params.push(Box::new(keys.clone()));
+            where_parts.push(format!("fa.attesting_key_id = ANY(${})", params.len()));
+        }
+    }
+    // §4.3 scope gate on fa.cohort_scope / fa.attested_key_id.
+    {
+        let (frag, sparams) = crate::store::scope_bind::scope_predicate_pg(
+            scope,
+            "fa.cohort_scope",
+            "fa.attested_key_id",
+            params.len(),
+        );
+        where_parts.push(frag);
+        params.extend(sparams);
+    }
+    (where_parts, params)
+}
+
+/// v17.4.0 (V106) — maintain the `cirislens.attestation_subjects` projection
+/// for `row` on the given client/transaction. Expands `subject_key_ids[]` into
+/// one projection row per element at `tier`; upsert on the (subject,
+/// attestation) PK keeps it idempotent.
+async fn pg_project_attestation_subjects<C>(
+    client: &C,
+    row: &crate::federation::Attestation,
+    attestation_uuid: &uuid::Uuid,
+    tier: &str,
+) -> Result<(), tokio_postgres::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    let dimension = crate::federation::admission::envelope_dimension(&row.attestation_envelope);
+    for subj in &row.subject_key_ids {
+        client
+            .execute(
+                "INSERT INTO cirislens.attestation_subjects \
+                    (subject_key_id, dimension, asserted_at, attestation_id, tier, cohort_scope) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (subject_key_id, attestation_id) DO UPDATE SET \
+                    dimension = EXCLUDED.dimension, asserted_at = EXCLUDED.asserted_at, \
+                    tier = EXCLUDED.tier, cohort_scope = EXCLUDED.cohort_scope",
+                &[
+                    subj,
+                    &dimension,
+                    &row.asserted_at,
+                    attestation_uuid,
+                    &tier,
+                    &row.cohort_scope,
+                ],
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 fn pg_row_to_attestation(
@@ -24023,6 +24371,173 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
+    }
+
+    // ── v17.4.0 scores read surface: postgres runtime parity (the pg SQL
+    //    JOIN + `= ANY($n)` + `->>'references_attestation_id'` anti-join
+    //    differ from sqlite, so they need a live-pg run — mirror of the
+    //    sqlite `list_scores`/`resolve_scores` tests). ──
+
+    /// Build + sign + put a federation `scores` row with an explicit
+    /// attestation_id, attester, subject, dimension, score, and asserted_at
+    /// offset (minutes). Composers (supersedes/withdraws) reference a prior
+    /// id via the envelope. Returns the (uuid) attestation_id.
+    #[cfg(test)]
+    async fn pg_put_score(
+        be: &PostgresBackend,
+        attester: &str,
+        subject: &str,
+        dimension: &str,
+        score: f64,
+        base: chrono::DateTime<chrono::Utc>,
+        mins: i64,
+    ) -> String {
+        use crate::federation::FederationDirectory;
+        // Idempotent: seed the (self-attesting) key so the FK holds.
+        let _ = be
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(attester, "a", chrono::Utc::now(), true),
+            })
+            .await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut row = pg_scores_attestation(attester, attester, attester, dimension);
+        row.attestation_id = id.clone();
+        // `weight` is the confidence column the fold uses (score × confidence);
+        // full confidence, the varying signal is `score` in the envelope.
+        row.weight = Some(1.0);
+        row.asserted_at = base + chrono::Duration::minutes(mins);
+        row.subject_key_ids = vec![subject.to_string()];
+        row.attestation_envelope = serde_json::json!({
+            "dimension": dimension, "score": score, "confidence": 1.0,
+        });
+        pg_resign(&mut row);
+        be.put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .expect("pg put_score");
+        id
+    }
+
+    #[cfg(test)]
+    async fn pg_put_composer(
+        be: &PostgresBackend,
+        attester: &str,
+        atype: &str,
+        references: &str,
+        base: chrono::DateTime<chrono::Utc>,
+        mins: i64,
+    ) {
+        use crate::federation::FederationDirectory;
+        let _ = be
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(attester, "a", chrono::Utc::now(), true),
+            })
+            .await;
+        let mut row = pg_scores_attestation(attester, attester, attester, "x");
+        row.attestation_id = uuid::Uuid::new_v4().to_string();
+        row.attestation_type = atype.to_string();
+        row.weight = None;
+        row.asserted_at = base + chrono::Duration::minutes(mins);
+        row.attestation_envelope = serde_json::json!({ "references_attestation_id": references });
+        pg_resign(&mut row);
+        be.put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .expect("pg put_composer");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_list_scores_subject_dimension_seek_newest_first() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let be = PostgresBackend::connect(&dsn).await.expect("connect");
+        be.run_migrations().await.expect("migrations");
+        let base = chrono::Utc::now() - chrono::Duration::hours(2);
+        let subj = format!("subj-{}", uuid_like());
+        let dim = "trust:demo:v1";
+        let s1 = pg_put_score(&be, "k1", &subj, dim, 0.5, base, 10).await;
+        let s2 = pg_put_score(&be, "k2", &subj, dim, 0.6, base, 20).await;
+        let _s3 = pg_put_score(&be, "k3", &subj, "other:demo:v1", 0.6, base, 30).await;
+        // exact-dimension seek, newest-first
+        let f = crate::read::AttestationFilter {
+            subject_key_id: Some(subj.clone()),
+            dimension_exact: Some(dim.into()),
+            ..Default::default()
+        };
+        let page = be.list_scores("", f, None, 100).await.unwrap();
+        let ids: Vec<_> = page
+            .items
+            .iter()
+            .map(|a| a.attestation_id.clone())
+            .collect();
+        assert_eq!(ids, vec![s2.clone(), s1.clone()], "newest-first exact-dim");
+        // attester_filter Explicit set membership (`= ANY($n)`)
+        let f = crate::read::AttestationFilter {
+            subject_key_id: Some(subj.clone()),
+            dimension_exact: Some(dim.into()),
+            attester_filter: Some(crate::read::AttesterSet::Explicit(vec!["k1".into()])),
+            ..Default::default()
+        };
+        let page = be.list_scores("", f, None, 100).await.unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|a| a.attestation_id.clone())
+                .collect::<Vec<_>>(),
+            vec![s1],
+            "attester_filter set membership"
+        );
+        let _ = s2;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn pg_resolve_scores_latest_wins_withdraw_and_band() {
+        use crate::federation::FederationDirectory;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let be = PostgresBackend::connect(&dsn).await.expect("connect");
+        be.run_migrations().await.expect("migrations");
+        let base = chrono::Utc::now() - chrono::Duration::hours(2);
+        let subj = format!("subj-{}", uuid_like());
+        let dim = "trust:demo:v1";
+        // k1: 0.9 superseded by 0.4 head; k2: 0.5; k3: withdrawn.
+        let k1old = pg_put_score(&be, "k1", &subj, dim, 0.9, base, 10).await;
+        pg_put_score(&be, "k1", &subj, dim, 0.4, base, 20).await;
+        pg_put_composer(&be, "k1", "supersedes", &k1old, base, 20).await;
+        pg_put_score(&be, "k2", &subj, dim, 0.5, base, 15).await;
+        let k3 = pg_put_score(&be, "k3", &subj, dim, 0.5, base, 15).await;
+        pg_put_composer(
+            &be,
+            "k3",
+            crate::federation::types::attestation_type::WITHDRAWS,
+            &k3,
+            base,
+            25,
+        )
+        .await;
+        let f = crate::read::AttestationFilter {
+            subject_key_id: Some(subj),
+            dimension_exact: Some(dim.into()),
+            ..Default::default()
+        };
+        let v = be
+            .resolve_scores("", f, "cc-4.4.2-signed-mean".into(), true)
+            .await
+            .unwrap();
+        // live heads k1new(0.4), k2(0.5); k1old superseded, k3 withdrawn.
+        assert_eq!(v.contributor_count, 2, "distinct live attesters");
+        assert_eq!(
+            v.band,
+            crate::read::ConfidenceBand::Supported,
+            "mean(0.4,0.5)=0.45"
+        );
+        assert_eq!(v.open_contradictions, 0);
+        assert!(v.trace.is_some() && v.age_of_head.is_some());
     }
 
     #[tokio::test]

@@ -5,6 +5,58 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.4.0] — 2026-07-15 — the durable `scores` read surface (FSD-005 Appendix C): V106 subject projection + `list_scores`/`resolve_scores`
+
+### Added — pin-once read contract for the `scores` workhorse
+
+The 2026-07-14 consumer-demand survey showed every `scores` consumer refetches
+a key's whole history and folds client-side (CIRISServer's Composer + its two
+N+1s, edge's advertise sweep, agent's fetch-100-then-fold), because the
+demanded query shape — `(subject, dimension exact-or-prefix, trust, time,
+state) → composed verdict` — was not pushable. This ships that shape as a
+**pin-once contract** (logical axes, additive-only, verdict-as-band with an
+open trace — so it need not break again; the design + forward-compat rules are
+FSD-005 Appendix C).
+
+- **V106 migration (both backends, lockstep).** A normalized
+  `attestation_subjects(subject_key_id, dimension, asserted_at, attestation_id,
+  tier, cohort_scope)` projection with the ordered seek index `(subject_key_id,
+  dimension, asserted_at DESC, attestation_id)` — chosen over a Postgres
+  GIN-on-expression precisely because it is **backend-symmetric** (the #442
+  divergence class); GIN is postgres-only and unordered. Plus a `dimension`
+  generated column (Postgres STORED / SQLite VIRTUAL) and a GIN on
+  `evidence_refs` (pg). Backfilled from existing rows by expanding
+  `subject_key_ids`. Maintained on every attestation write (put / emit /
+  local-upsert / promote); memory keeps an in-memory subject-index mirror.
+- **`AttestationFilter` extended** (`#[non_exhaustive]`, every field additive):
+  `dimension_exact` (the exact-match axis the API lacked — `attestation_type`
+  was exact but `dimension` prefix-only), `window`, `tier` (Local/Federation/Any,
+  default Federation), `lifecycle` (Live default; opt into Superseded/Withdrawn/
+  Recanted/All), `attester_filter` (`AttesterSet::{All, Explicit}` — derived
+  predicates resolve to `Explicit` server-side). New return types
+  `ConfidenceBand` / `ComposedVerdict` / `ScoresPage`, all `#[non_exhaustive]`;
+  the verdict is a **qualitative band + n's (contributor_count,
+  witness_diversity, open_contradictions, age_of_head), never a bare float**,
+  with an OPEN `trace` (serde_json::Value at the FFI seam) as the
+  extensibility escape hatch.
+- **`list_scores` + `resolve_scores`** on `FederationDirectory` (so the whole
+  §4.3 caller-gate + fold runs inside persist's `.so` as a composite op — the
+  #329 pattern — not a per-handle N+1). `resolve_scores` runs the
+  `precedence.rs` per-attester latest-wins fold (supersedes/withdraws/recants),
+  the CC 4.4.2 polarity-column aggregation (signed→mean, boolean-via-score→min),
+  and excludes caller-gated rows from BOTH the returned rows AND the aggregate
+  (no verdict-differencing). Shared `compose_verdict` core in
+  `src/federation/scores.rs`. Both handles take a mandatory
+  `caller_occurrence_key_id`. PyO3 + directory-capsule surface (append-only ops).
+
+### Tests
+All three backends: the fold unit suite + list_scores (subject/dimension seek,
+prefix, tier, lifecycle, attester-set, cursor), resolve_scores (latest-wins,
+withdraw, band, gated-row-excluded), V106 backfill + projection maintenance +
+promote. Postgres runtime parity added for the new handles (the pg JOIN /
+`= ANY($n)` / `->>'references_attestation_id'` anti-join differ from sqlite).
+Full gate `cargo nextest --all-targets` pg+sqlite: **1553/1553**.
+
 ## [17.3.0] — 2026-07-14 — the trace-delivery unblock (#329 field hit): `ResolveEncryptionKeys` + `ListIdentityOccurrenceRevocationsFor` capsule ops
 
 ### Fixed — sealed-envelope trace delivery shipped 0 envelopes fleet-wide on the embedded/pyo3 path (CIRISServer#260)

@@ -66,6 +66,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Reclaim ~21 GB of unused preinstalled toolchains before the 11-bench
+      # release-mode build (same rationale + safety as the ci.yml test job).
+      - name: Free runner disk (reclaim unused preinstalled toolchains)
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "after:"; df -h / | tail -1
+
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -147,7 +158,13 @@ jobs:
         env:
           MALLOC_ARENA_MAX: "4"
         run: |
+          # pipefail from the top so even the calibration bench's build/run
+          # failure is the step's status (not `tee`'s) — see the attribution
+          # note on the bench loop below.
+          set -o pipefail
+          echo "::group::bench calibration"
           cargo bench --bench calibration -- --output-format bencher | tee calibration-output.txt
+          echo "::endgroup::"
           # v3.3.1 (CIRISPersist#122) — TWO calibration anchors now:
           # `splitmix64_10m` (CPU-bound) + `dram_random_walk_500k`
           # (memory/cache-bound). The normalization step applies
@@ -189,19 +206,55 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           # Now run the rest into bench-output-raw.txt; the next step
-          # normalizes raw→bench-output.txt which benchmark-action
-          # consumes.
-          cargo bench --features postgres --bench ingest_pipeline -- --output-format bencher | tee bench-output-raw.txt
-          cargo bench --bench canonicalize -- --output-format bencher | tee -a bench-output-raw.txt
-          cargo bench --bench sign -- --output-format bencher | tee -a bench-output-raw.txt
-          cargo bench --bench dedup_key -- --output-format bencher | tee -a bench-output-raw.txt
-          cargo bench --features postgres --bench queue -- --output-format bencher | tee -a bench-output-raw.txt
-          cargo bench --features sqlite,cirislens_sequence --bench sequence_contention -- --output-format bencher | tee -a bench-output-raw.txt
-          cargo bench --features sqlite --bench engine_cold_start -- --output-format bencher | tee -a bench-output-raw.txt
-          cargo bench --features sqlite --bench read_engine_analytics -- --output-format bencher | tee -a bench-output-raw.txt
-          cargo bench --features secrets --bench secrets_crypto -- --output-format bencher | tee -a bench-output-raw.txt
-          cargo bench --features sqlite,cirislens_occurrence --bench occurrence_registry -- --output-format bencher | tee -a bench-output-raw.txt
-          cargo bench --features sqlite,cirislens_sequence --bench storage_floor -- --output-format bencher | tee -a bench-output-raw.txt
+          # normalizes raw→bench-output.txt which benchmark-action consumes.
+          #
+          # ATTRIBUTION HARDENING (CIRISPersist bench-hardening cut): the
+          # historic `cargo bench … | tee -a` pattern MASKED cargo's exit
+          # code — a pipeline's status is `tee`'s, so a compile error or a
+          # bench panic was silently swallowed and the job stayed green over
+          # a broken bench (this is exactly how `storage_floor`'s
+          # `blocking_lock` compile break hid on main). Now:
+          #   - `set -o pipefail` so a piped cargo failure IS the step's status;
+          #   - each bench runs inside `run_bench` which ::group::s its output
+          #     and emits a `::error title=…::` naming the EXACT bench + feature
+          #     set on failure — GitHub's log + the job annotation point
+          #     straight at the culprit;
+          #   - ALL benches run (collect-all), then the step fails ONCE at the
+          #     end listing every broken bench, so one run surfaces every break
+          #     rather than stopping at the first.
+          set -o pipefail
+          : > bench-output-raw.txt
+          failed_benches=""
+          run_bench() {
+            local features="$1" bench="$2"
+            echo "::group::bench ${bench} (features: ${features:-default})"
+            local rc=0
+            if [ -n "$features" ]; then
+              cargo bench --features "$features" --bench "$bench" -- --output-format bencher | tee -a bench-output-raw.txt || rc=$?
+            else
+              cargo bench --bench "$bench" -- --output-format bencher | tee -a bench-output-raw.txt || rc=$?
+            fi
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error title=bench failed::${bench} (features: ${features:-default}) failed to build or run (exit ${rc}) — see the '::group:: bench ${bench}' log above"
+              failed_benches="${failed_benches} ${bench}"
+            fi
+          }
+          run_bench "postgres" ingest_pipeline
+          run_bench "" canonicalize
+          run_bench "" sign
+          run_bench "" dedup_key
+          run_bench "postgres" queue
+          run_bench "sqlite,cirislens_sequence" sequence_contention
+          run_bench "sqlite" engine_cold_start
+          run_bench "sqlite" read_engine_analytics
+          run_bench "secrets" secrets_crypto
+          run_bench "sqlite,cirislens_occurrence" occurrence_registry
+          run_bench "sqlite,cirislens_sequence" storage_floor
+          if [ -n "${failed_benches}" ]; then
+            echo "::error title=bench job failed::broken benches:${failed_benches}"
+            exit 1
+          fi
 
       # v2.12.0 (CIRISPersist#116) — normalize every ns/iter against
       # the calibration anchor. Output value is scaled so 1

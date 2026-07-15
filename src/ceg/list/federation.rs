@@ -105,10 +105,67 @@ pub struct FederationKeyListPage {
 
 // ─── Attestations ──────────────────────────────────────────────────
 
-/// Filter for [`crate::ceg::ReadEngine::list_attestations`]. Composes
-/// AND-style.
+/// v17.4.0 (FSD-005 Appendix C.2) — the row-tier axis of a `scores`
+/// query. `None` on [`AttestationFilter::tier`] preserves the pre-v17.4.0
+/// `list_attestations` behavior (federation-tier-only). Made a first-class
+/// axis (C.4 rule 5) so drafts (`Local`) never need a second handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tier {
+    /// Producer-only-authority, signature-deferred, self-visible-only rows.
+    Local,
+    /// Hybrid-signed, federation-visible rows (the default read tier).
+    Federation,
+    /// Both tiers (the caller opts into seeing its own drafts alongside
+    /// federation rows).
+    Any,
+}
+
+/// v17.4.0 (FSD-005 Appendix C.2) — lifecycle visibility. `Live` (the
+/// serde default) hides rows retracted by a `supersedes` / `withdraws` /
+/// `recants` composer; the `Include*` variants opt specific retracted
+/// classes back in; `All` shows everything. Made a first-class axis (C.4
+/// rule 5) so "I need retracted history" never forces a new API.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LifecycleView {
+    /// Only the precedence-live head per attester chain (default).
+    #[default]
+    Live,
+    /// Live rows plus rows retracted by a `supersedes`.
+    IncludeSuperseded,
+    /// Live rows plus rows retracted by a `withdraws`.
+    IncludeWithdrawn,
+    /// Live rows plus rows retracted by a `recants`.
+    IncludeRecanted,
+    /// Every row, retracted or not.
+    All,
+}
+
+/// v17.4.0 (FSD-005 Appendix C.2) — trust-perspective attester filter.
+/// The v17.4.0 substrate honors ONLY set membership (`All` / `Explicit`);
+/// the DERIVED predicates (`holders_of` / `reachable_from` / `licensed_by`)
+/// resolve to an `Explicit` set SERVER-SIDE and are intentionally absent
+/// here. `#[non_exhaustive]` keeps adding them later additive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum AttesterSet {
+    /// No attester restriction.
+    All,
+    /// Keep only rows whose `attesting_key_id` is in this set.
+    Explicit(Vec<String>),
+}
+
+/// Filter for [`crate::ceg::ReadEngine::list_attestations`] and the
+/// v17.4.0 `scores` read handles. Composes AND-style.
+///
+/// v17.4.0 (FSD-005 Appendix C.2): this is the ONE `ScoresQuery` — extended
+/// in place (never forked) so `list_scores` and `resolve_scores` share it
+/// and a consumer builds a filter once for both the timeline and the verdict.
+/// Every field is `Option`/additive and the struct is `#[non_exhaustive]`, so
+/// a new query axis is a new optional field defaulting to today's behavior —
+/// old consumers keep compiling and deserializing (C.4 rule 2).
 // `Eq` dropped in v4.5 — `confidence_floor: Option<f64>` is not `Eq`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AttestationFilter {
     /// Filter by the key id that DID the attesting.
     pub attesting_key_id: Option<String>,
@@ -147,6 +204,39 @@ pub struct AttestationFilter {
     /// a member of `subject_key_ids`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_key_id: Option<String>,
+
+    /// v17.4.0 (Appendix C.2) — EXACT dimension match (the axis today's
+    /// prefix-only `dimension_prefixes` lacks; `attestation_type` is exact
+    /// but `dimension` was prefix-only). AND-composed with any prefix set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension_exact: Option<String>,
+
+    /// v17.4.0 (Appendix C.2) — half-open time window `[start, end)` on
+    /// `asserted_at`, for the timeline read. Distinct from `valid_at`
+    /// (point-in-time validity incl. expiry); this is a range on when the
+    /// attestation was asserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+
+    /// v17.4.0 (Appendix C.2) — row-tier axis. `None` = federation-only
+    /// (preserves `list_attestations`' pre-v17.4.0 behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<Tier>,
+
+    /// v17.4.0 (Appendix C.2) — lifecycle visibility. Default `Live`.
+    #[serde(default, skip_serializing_if = "is_default_lifecycle")]
+    pub lifecycle: LifecycleView,
+
+    /// v17.4.0 (Appendix C.2) — trust-perspective attester filter. `None`
+    /// = no restriction (equivalent to `AttesterSet::All`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attester_filter: Option<AttesterSet>,
+}
+
+/// serde `skip_serializing_if` for the default `LifecycleView::Live` — keeps
+/// pre-v17.4.0 filter JSON byte-stable across the schema extension.
+fn is_default_lifecycle(v: &LifecycleView) -> bool {
+    matches!(v, LifecycleView::Live)
 }
 
 /// Opaque cursor for [`crate::ceg::ReadEngine::list_attestations`].
@@ -180,6 +270,70 @@ pub struct AttestationListPage {
     pub items: Vec<Attestation>,
     /// Cursor for the next page.
     pub next_cursor: Option<AttestationCursor>,
+}
+
+// ─── v17.4.0 scores read surface (FSD-005 Appendix C) ──────────────
+
+/// One page of `list_scores` rows. Mirrors [`AttestationListPage`]; reuses
+/// the [`AttestationCursor`] `(asserted_at, attestation_id)` shape. Each item
+/// is a full [`Attestation`] (the `ScoredRow`) so the timeline consumer has
+/// the raw signed row, not a lossy projection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScoresPage {
+    /// Scored rows in `(asserted_at DESC, attestation_id DESC)` order.
+    pub items: Vec<Attestation>,
+    /// Cursor for the next page; `None` at end of stream.
+    pub next_cursor: Option<AttestationCursor>,
+}
+
+/// v17.4.0 (FSD-005 Appendix C.3) — the composed verdict as a QUALITATIVE
+/// band, never a bare float. `#[non_exhaustive]` so a future band does not
+/// break a consumer `match`. Keeping the float scale out of the wire lets the
+/// composition math evolve forever without a break (C.4 rule 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ConfidenceBand {
+    /// The live head is a negative-polarity claim (refuted).
+    Refuted,
+    /// Live rows disagree in sign (open contradiction dominates).
+    Contested,
+    /// Supported by few / low-confidence contributors.
+    Weak,
+    /// Supported by a healthy set of contributors.
+    Supported,
+    /// Strongly supported (high aggregate + contributor count).
+    WellEstablished,
+    /// Not enough distinct witnesses to render a verdict.
+    InsufficientWitnesses,
+}
+
+/// v17.4.0 (FSD-005 Appendix C.3) — the `resolve_scores` fold result.
+/// `#[non_exhaustive]`; the `trace` is the OPEN extensibility escape hatch
+/// (`serde_json::Value` at the FFI seam) — any future fold input (a
+/// witness-diversity discount, a bond weighting, a new gate) appears as a new
+/// trace field, reflected in `band`, invisible to consumers that ignore it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ComposedVerdict {
+    /// The qualitative confidence band.
+    pub band: ConfidenceBand,
+    /// Distinct attesting keys among the live (post-precedence) rows.
+    pub contributor_count: u32,
+    /// The anti-collusion witness-diversity n (NOT n_eff). `None` until the
+    /// server-tier diversity policy lands (Appendix C.5 out-of-scope).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness_diversity: Option<f64>,
+    /// Count of live rows whose sign opposes the head (open contradictions).
+    pub open_contradictions: u32,
+    /// Age of the precedence head (`now − head.asserted_at`). `None` when
+    /// there is no live head (empty fold).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_of_head: Option<std::time::Duration>,
+    /// Which composition policy produced this verdict (the `PolicyId`).
+    pub policy_applied: String,
+    /// The derivation trace, populated only when the caller asks for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<serde_json::Value>,
 }
 
 // ─── Revocations ───────────────────────────────────────────────────

@@ -86,7 +86,12 @@ jobs:
           # "no matching package named … found" incomplete-index variant
           # is deliberately NOT matched — it is indistinguishable from a
           # genuine typo'd dependency, so it stays red for a human.)
-          transient='Docker pull failed|Initialize containers|toomanyrequests|429 Too Many Requests|TLS handshake timeout|i/o timeout|[Cc]onnection reset|503 Service|502 Bad Gateway|504 Gateway|[Ss]ervice [Uu]navailable|unexpected EOF|net/http: (request canceled|TLS handshake)|failed to (pull|fetch|resolve)|temporary failure in name resolution|HTTP2 framing layer|download of .* failed|unable to update registry|curl failed|spurious network error'
+          # `No space left on device` / ENOSPC: runner disk-pressure variance.
+          # The ci.yml + bench.yml jobs now proactively reclaim ~21 GB, so a
+          # residual ENOSPC is runner-variance (not our build genuinely needing
+          # more than a reclaimed runner has) — safely self-healing on one
+          # rerun, exactly the transient-infra class this workflow exists for.
+          transient='Docker pull failed|Initialize containers|toomanyrequests|429 Too Many Requests|TLS handshake timeout|i/o timeout|[Cc]onnection reset|503 Service|502 Bad Gateway|504 Gateway|[Ss]ervice [Uu]navailable|unexpected EOF|net/http: (request canceled|TLS handshake)|failed to (pull|fetch|resolve)|temporary failure in name resolution|HTTP2 framing layer|download of .* failed|unable to update registry|curl failed|spurious network error|No space left on device|ENOSPC'
           # Genuine failures we must NEVER auto-rerun (would mask a real red).
           genuine='error\[E[0-9]|error: could not compile|test result: FAILED|panicked at|assertion .*failed|thread .* panicked|cargo (test|clippy|fmt).*error'
 

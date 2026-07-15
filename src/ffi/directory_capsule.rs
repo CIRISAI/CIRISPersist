@@ -563,6 +563,36 @@ pub enum DirectoryOp {
         /// The identity `key_id` whose occurrence revocations to enumerate.
         identity_key_id: String,
     },
+    /// [`FederationDirectory::list_scores`] (v17.4.0, FSD-005 Appendix C) —
+    /// the durable `scores` LIST read routed as a composite op: the §4.3
+    /// caller gate + the ordered subject+dimension seek run INSIDE persist's
+    /// `.so` at dispatch. Result rides the new `Scores` variant. APPEND-ONLY.
+    ListScores {
+        /// The reading occurrence's `key_id` (empty ⇒ unauthenticated).
+        caller_occurrence_key_id: String,
+        /// The `ScoresQuery` filter (extended `AttestationFilter`).
+        filter: crate::read::AttestationFilter,
+        /// Opaque `(asserted_at, attestation_id)` page cursor.
+        cursor: Option<crate::read::AttestationCursor>,
+        /// Page size (1..=10_000).
+        limit: i64,
+    },
+    /// [`FederationDirectory::resolve_scores`] (v17.4.0, FSD-005 Appendix C) —
+    /// the composed-verdict fold routed as a composite op (the #329 pattern):
+    /// the WHOLE gate + precedence latest-wins fold + polarity aggregation
+    /// runs inside persist's `.so`, so a cohabiting consumer can never run a
+    /// STALE composer against newer data. Result rides the new
+    /// `ComposedVerdict` variant. APPEND-ONLY.
+    ResolveScores {
+        /// The reading occurrence's `key_id` (empty ⇒ unauthenticated).
+        caller_occurrence_key_id: String,
+        /// The `ScoresQuery` filter (extended `AttestationFilter`).
+        filter: crate::read::AttestationFilter,
+        /// The composition policy id (CC 4.4.3).
+        policy: String,
+        /// When true, populate the verdict's derivation trace.
+        trace: bool,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -656,6 +686,12 @@ pub enum DirectoryOpResult {
     /// `list_identity_occurrence_revocations_for` (#329) — the raw
     /// revocation-plane rows for an identity. APPEND-ONLY.
     IdentityOccurrenceRevocations(Vec<IdentityOccurrenceRevocation>),
+    /// `list_scores` (v17.4.0) — one page of scored rows + next cursor.
+    /// APPEND-ONLY.
+    Scores(crate::read::ScoresPage),
+    /// `resolve_scores` (v17.4.0) — the composed verdict (band + n's + open
+    /// trace). APPEND-ONLY.
+    ComposedVerdict(crate::read::ComposedVerdict),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -820,6 +856,34 @@ pub async fn dispatch_directory_op(
                 .await
             {
                 Ok(v) => DirectoryOpResult::IdentityOccurrenceRevocations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListScores {
+            caller_occurrence_key_id,
+            filter,
+            cursor,
+            limit,
+        } => match dir
+            .list_scores(&caller_occurrence_key_id, filter, cursor, limit)
+            .await
+        {
+            Ok(v) => DirectoryOpResult::Scores(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::ResolveScores {
+            caller_occurrence_key_id,
+            filter,
+            policy,
+            trace,
+        } => {
+            // v17.4.0 — the WHOLE precedence + polarity fold runs here, inside
+            // persist's `.so`, against persist's own comparator + clock.
+            match dir
+                .resolve_scores(&caller_occurrence_key_id, filter, policy, trace)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::ComposedVerdict(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -2271,6 +2335,59 @@ impl FederationDirectory for OpsDirectory {
             )),
         }
     }
+
+    /// v17.4.0 — route the `scores` LIST read through the composite op so the
+    /// §4.3 gate + ordered seek run in persist's `.so`.
+    async fn list_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: crate::read::AttestationFilter,
+        cursor: Option<crate::read::AttestationCursor>,
+        limit: i64,
+    ) -> Result<crate::read::ScoresPage, Error> {
+        match self
+            .run_op(&DirectoryOp::ListScores {
+                caller_occurrence_key_id: caller_occurrence_key_id.to_string(),
+                filter,
+                cursor,
+                limit,
+            })
+            .await?
+        {
+            DirectoryOpResult::Scores(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v17.4.0 — route the `scores` RESOLVE fold through the composite op (the
+    /// #329 pattern): the whole gate + precedence + aggregation runs in
+    /// persist's `.so`, never a stale comparator in the consumer's binary.
+    async fn resolve_scores(
+        &self,
+        caller_occurrence_key_id: &str,
+        filter: crate::read::AttestationFilter,
+        policy: String,
+        trace: bool,
+    ) -> Result<crate::read::ComposedVerdict, Error> {
+        match self
+            .run_op(&DirectoryOp::ResolveScores {
+                caller_occurrence_key_id: caller_occurrence_key_id.to_string(),
+                filter,
+                policy,
+                trace,
+            })
+            .await?
+        {
+            DirectoryOpResult::ComposedVerdict(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
     async fn list_family_membership_revocations_for(
         &self,
         family_key_id: &str,
@@ -2641,6 +2758,56 @@ mod tests {
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
+        }
+    }
+
+    /// v17.4.0 — the `scores` read ops (ListScores + ResolveScores) round-trip
+    /// through the full C-ABI: serialize op → dispatch inside the `.so` →
+    /// result variant back across the seam. Proves the composite-op wiring
+    /// (op variant, dispatch arm, result variant) end-to-end; the fold logic
+    /// itself is covered by the backend + `federation::scores` unit tests.
+    #[test]
+    fn scores_ops_round_trip_through_capsule() {
+        let rt = test_runtime();
+        let (_dir, directory) = memory_directory();
+        let filter = crate::read::AttestationFilter {
+            subject_key_id: Some("subj".into()),
+            ..Default::default()
+        };
+        // ListScores → empty page (no rows seeded), correct variant.
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ListScores {
+                caller_occurrence_key_id: String::new(),
+                filter: filter.clone(),
+                cursor: None,
+                limit: 100,
+            },
+        ) {
+            DirectoryOpResult::Scores(page) => {
+                assert!(page.items.is_empty());
+                assert!(page.next_cursor.is_none());
+            }
+            other => panic!("expected Scores, got {other:?}"),
+        }
+        // ResolveScores → InsufficientWitnesses verdict, correct variant.
+        match run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ResolveScores {
+                caller_occurrence_key_id: String::new(),
+                filter,
+                policy: "cc-4.4.2-signed-mean".into(),
+                trace: true,
+            },
+        ) {
+            DirectoryOpResult::ComposedVerdict(v) => {
+                assert_eq!(v.contributor_count, 0);
+                assert_eq!(v.band, crate::read::ConfidenceBand::InsufficientWitnesses);
+                assert_eq!(v.policy_applied, "cc-4.4.2-signed-mean");
+            }
+            other => panic!("expected ComposedVerdict, got {other:?}"),
         }
     }
 

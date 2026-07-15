@@ -90,6 +90,27 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v6
+      # Reclaim runner disk BEFORE the cache restore + full-feature build.
+      # ubuntu-latest ships ~25 GB of preinstalled toolchains a Rust
+      # substrate build never touches (android SDK ~9 GB, .NET ~2 GB,
+      # Haskell/ghc ~5 GB, CodeQL ~5 GB, boost). The 6-leg matrix ×
+      # target/ + the CIRISCache restore + the postgres service image
+      # intermittently filled the ~14 GB default free space → a
+      # non-deterministic ENOSPC on whichever leg lost the race (e.g.
+      # `linux-x86_64 (cirisaudit)`, 2026-07-15). Inline `rm` (no
+      # third-party action → no supply-chain surface on the substrate
+      # repo); `df -h` before/after so any future disk pressure is
+      # attributable in the log, not a silent build write-error.
+      - name: Free runner disk (reclaim unused preinstalled toolchains)
+        run: |
+          echo "before:"; df -h / | tail -1
+          # Named, unambiguously-unused dirs only (~21 GB) — NOT the whole
+          # hostedtoolcache, which later steps' tool caches live in.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "after:"; df -h / | tail -1
       # v10.7.0 (CIRISVerify v8.0.0) — no libtss2-dev: ciris-keyring deleted
       # the link-time tss-esapi backend (#141); the TPM plugin is dlopen'd at
       # runtime and the keyring link-binds no libtss2 on any target.
