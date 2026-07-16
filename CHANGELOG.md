@@ -5,6 +5,45 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.6.0] — 2026-07-16 — delete the forked provenance verifier; delegate trust-root chain-crypto to CIRISVerify + RequireHybrid tightening (#465)
+
+### Changed — CIRISVerify re-pin 10.3.0 → 10.5.0 (lockstep)
+
+Drop-in — 6 Cargo pins in lockstep, no persist call-site regression; pyproject
+`ciris-verify` floor stays `>=10.0.0,<11` (minor within major). Two releases
+closed the fork-collapse blockers: **10.4.0** fixed the JCS-envelope preimage
+(verify was checking the 32-byte hash; the producer signs the envelope), and
+**10.5.0** (CIRISVerify#208) parameterized the provenance terminus role set.
+
+### Changed — `root_binding` delegates chain-crypto to CIRISVerify (#465)
+
+`root_binding_anchored` step 4 stops re-implementing the provenance chain-walk:
+deleted the ~77-line forked `verify_chain_signatures` and now calls
+`ciris_verify_core::provenance::verify_provenance_chain_with_policy_and_terminus(
+&chain, &anchor, RequireHybrid, &[steward, accord_holder])`. The two
+`ProvenanceChain`/`ProvenanceLink` types are field-identical → serde round-trip
+map; anchor `[u8;32] → Vec<u8>`. persist keeps its own terminus-role + #344
+anchor pins (the CIRISPersist#94 edge-contract tokens `NotRootedAtSteward` /
+`TerminusNotInAnchor`), so verify's only live failure here is crypto → mapped to
+`UnsignedProvenanceLink` (same `.kind()`). Closes crypto-DRY assessment item #1.
+
+### Security — trust-root binding gate now requires hybrid
+
+The delegation replaces the former `HybridPolicy::Ed25519Fallback`: a federation
+binding gate now **rejects a classical-only provenance link** (F-AV-14 / AV-8),
+and persist + verify stop disagreeing on PQC-mandatoriness. **Production-safe** —
+genesis is full-hybrid (every seed row carries both scrub-signatures), so only
+the rooting test fixtures needed a hybrid upgrade (bound ML-DSA-65 scrub-sig). No
+public API change.
+
+### Tests
+
+Rooting conformance fixtures upgraded to bound-hybrid (ML-DSA-65 over
+`canonical ‖ classical_sig`). Full federation suite **352/352** (sqlite + local
+Postgres, serial). Not implicated in the CIRISVerify#210 dual-registry /
+`verify_unknown_key` skew (that is a CIRISServer in-wheel-identity /
+Python-verify-API concern, filed server-side).
+
 ## [17.5.2] — 2026-07-15 — CIRISVerify 10.3.0 re-pin (mobile fold-boot panic) + `list_attestations` `dimension_exact` fix (#461) + wheel disk-reclaim
 
 ### Changed — CIRISVerify re-pin 10.2.0 → 10.3.0 (the driver)

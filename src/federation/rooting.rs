@@ -82,7 +82,9 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use super::{FederationDirectory, KeyRecord};
-use crate::verify::hybrid::{verify_hybrid, HybridPolicy};
+// #465: the scrub-signature crypto now routes through verify's provenance walk
+// (verify_provenance_chain_with_policy_and_terminus), so rooting no longer uses
+// persist's verify_hybrid / HybridPolicy directly.
 
 /// Maximum provenance-chain depth before the walk gives up and
 /// rejects with [`RootingRejection::OverDepth`].
@@ -717,105 +719,77 @@ where
         }
     }
 
-    // Step 4: verify every link's scrub-signature. Each row was
-    // signed by its parent (`scrub_key_id`); the self-signed
-    // bootstrap signed itself. We need the parent's pubkey to verify,
-    // so build a quick index of the links we already hold.
-    if let Err(rejection) = verify_chain_signatures(&chain) {
-        return RootingVerdict::Rejected { rejection };
+    // Step 4: verify every link's scrub-signature by DELEGATING to CIRISVerify's
+    // provenance walk (CIRISPersist#465 — deletes persist's forked crypto
+    // re-implementation, crypto-DRY assessment #1). v10.4.0 fixed the JCS-envelope
+    // preimage and v10.5.0 (CIRISVerify#208) parameterized the terminus role set,
+    // so persist finally roots THROUGH verify instead of re-implementing the walk.
+    // We pass persist's own accepted-terminus roles ({steward, accord_holder},
+    // matching `is_trusted_root_identity`) and `RequireHybrid` — TIGHTENING the
+    // former `Ed25519Fallback`: a federation binding gate MUST reject a
+    // classical-only link (F-AV-14 / AV-8), and the two trust-root verifiers now
+    // agree on PQC-mandatoriness. Production genesis is full-hybrid, so nothing
+    // real breaks. Steps 3 + 3b already pinned the terminus ROLE and ANCHOR with
+    // persist's exact rejection tokens (the #94 edge contract), so verify's
+    // redundant re-checks pass here and its only live failure mode is crypto →
+    // mapped to `UnsignedProvenanceLink` (same `.kind()` token as the old fork).
+    // The two `ProvenanceChain`/`ProvenanceLink` types are field-identical, so
+    // the map is a serde round-trip; the anchor is `[u8;32]` → `Vec<u8>`.
+    let verify_chain: ciris_verify_core::provenance::ProvenanceChain =
+        match serde_json::to_value(&chain).and_then(serde_json::from_value) {
+            Ok(vc) => vc,
+            Err(e) => {
+                return RootingVerdict::Rejected {
+                    rejection: RootingRejection::UnsignedProvenanceLink {
+                        key_id: chain.key_id.clone(),
+                        signed_by_key_id: chain.key_id.clone(),
+                        detail: format!("map provenance chain to verify type: {e}"),
+                    },
+                };
+            }
+        };
+    let verify_anchor: Vec<Vec<u8>> = trusted_anchor.iter().map(|k| k.to_vec()).collect();
+    if let Err(e) = ciris_verify_core::provenance::verify_provenance_chain_with_policy_and_terminus(
+        &verify_chain,
+        &verify_anchor,
+        ciris_verify_core::threshold::HybridPolicy::RequireHybrid,
+        &[STEWARD_IDENTITY_TYPE, ACCORD_HOLDER_IDENTITY_TYPE],
+    ) {
+        let failing = verify_provenance_error_key_id(&e).unwrap_or_else(|| chain.key_id.clone());
+        return RootingVerdict::Rejected {
+            rejection: RootingRejection::UnsignedProvenanceLink {
+                key_id: failing.clone(),
+                signed_by_key_id: failing,
+                detail: format!("verify provenance: {e}"),
+            },
+        };
     }
 
     RootingVerdict::Confirmed { chain }
 }
 
-/// Verify every link's scrub-signature against the pubkey of the row
-/// that signed it. Returns the first [`RootingRejection`] on failure;
-/// `Ok(())` when every link verifies.
-///
-/// The signature input is the **`original_content_hash` bytes** — per
-/// `docs/FEDERATION_DIRECTORY.md` §"Schema sketch", the scrub-signature
-/// is "Ed25519 over `original_content_hash`" (`original_content_hash`
-/// is itself `sha256(canonical(registration_envelope))`). The hybrid
-/// PQC component, when present, signs the bound input
-/// `original_content_hash || classical_sig`; [`verify_hybrid`] applies
-/// the bound-signature rule internally.
-fn verify_chain_signatures(chain: &ProvenanceChain) -> Result<(), RootingRejection> {
-    use std::collections::HashMap;
-
-    // Index links by key_id so each link can find its parent's pubkey.
-    let by_key: HashMap<&str, &ProvenanceLink> =
-        chain.chain.iter().map(|l| (l.key_id.as_str(), l)).collect();
-
-    for link in &chain.chain {
-        // The signer of `link` is `link.scrub_key_id` — equal to
-        // `link.key_id` for the self-signed bootstrap.
-        let signer = by_key.get(link.scrub_key_id.as_str()).ok_or_else(|| {
-            // Should be unreachable: provenance_chain only terminates
-            // on a self-signed row or a structural error, so every
-            // non-terminal link's parent is the next link in `chain`.
-            // Belt-and-braces: a missing signer is a broken link.
-            RootingRejection::BrokenProvenanceLink {
-                key_id: link.key_id.clone(),
-                missing_parent_key_id: link.scrub_key_id.clone(),
-            }
-        })?;
-
-        // The bytes the scrub-signature covers: the JCS-canonicalized
-        // `registration_envelope` — the SAME bytes the producer signed
-        // (`ciris_verify_core::produce_self_key_record` → `sign_bound(&canonical)`)
-        // and the write-path `verify_key_registration` verifies. This was
-        // empirically confirmed against the real A1 accord-holder record:
-        // its Ed25519 scrub-signature verifies over `canonical(envelope)`,
-        // NOT over the hash bytes (CIRISPersist#344). Verifying over the
-        // hash — as this did before — rejected every real record.
-        let signed_bytes =
-            crate::verify::canonical::ceg_produce_canonicalize(&link.registration_envelope)
-                .map_err(|e| RootingRejection::UnsignedProvenanceLink {
-                    key_id: link.key_id.clone(),
-                    signed_by_key_id: link.scrub_key_id.clone(),
-                    detail: format!("registration_envelope canonicalize: {e}"),
-                })?;
-
-        // Integrity: the declared `original_content_hash` MUST equal the
-        // recomputed canonical hash, or the envelope was tampered relative
-        // to the row's hash (a canonicalizer disagreement or a swapped
-        // envelope). Fail-secure — same discipline as `verify_key_registration`.
-        let computed_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&signed_bytes));
-        if computed_hash != link.original_content_hash {
-            return Err(RootingRejection::UnsignedProvenanceLink {
-                key_id: link.key_id.clone(),
-                signed_by_key_id: link.scrub_key_id.clone(),
-                detail: format!(
-                    "original_content_hash mismatch: envelope canonicalizes to {computed_hash}, \
-                     row declares {}",
-                    link.original_content_hash
-                ),
-            });
-        }
-
-        // Crypto through the CIRISVerify path. Ed25519Fallback: a
-        // hybrid-pending link verifies on Ed25519 alone; a link that
-        // carries a PQC signature is verified hybrid (both required).
-        let outcome = verify_hybrid(
-            &signed_bytes,
-            &link.scrub_signature_classical,
-            link.scrub_signature_pqc.as_deref(),
-            &signer.pubkey_ed25519_base64,
-            signer.pubkey_ml_dsa_65_base64.as_deref(),
-            HybridPolicy::Ed25519Fallback,
-            None,
-        );
-
-        if let Err(e) = outcome {
-            return Err(RootingRejection::UnsignedProvenanceLink {
-                key_id: link.key_id.clone(),
-                signed_by_key_id: link.scrub_key_id.clone(),
-                detail: e.kind().to_owned(),
-            });
-        }
+/// Extract the failing link's `key_id` from a verify [`ProvenanceError`] for the
+/// [`RootingRejection::UnsignedProvenanceLink`] mapping (CIRISPersist#465).
+/// Variants that name no specific link (empty chain, queried-key mismatch,
+/// terminus shape/role, over-depth) return `None` → caller falls back to the
+/// queried `key_id`.
+fn verify_provenance_error_key_id(
+    e: &ciris_verify_core::provenance::ProvenanceError,
+) -> Option<String> {
+    use ciris_verify_core::provenance::ProvenanceError as E;
+    match e {
+        E::BrokenLink { key_id, .. }
+        | E::SelfSignedMidChain { key_id, .. }
+        | E::BadContentHash { key_id, .. }
+        | E::ContentHashMismatch { key_id, .. }
+        | E::BadSignatureEncoding { key_id, .. }
+        | E::BadKeyEncoding { key_id, .. }
+        | E::ParentMissingPqcKey { key_id, .. }
+        | E::ScrubSignatureInvalid { key_id, .. }
+        | E::UntrustedAnchor { key_id, .. }
+        | E::LinkNotHybrid { key_id, .. } => Some(key_id.clone()),
+        _ => None,
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -901,14 +875,22 @@ mod conformance_helpers {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     use chrono::{DateTime, Utc};
+    use ciris_crypto::{MlDsa65Signer, PqcSigner as _};
     use ed25519_dalek::{Signer as _, SigningKey};
     use sha2::{Digest, Sha256};
 
-    /// A test identity — a deterministic Ed25519 keypair plus the
-    /// `key_id` it is registered under.
+    /// A test identity — a deterministic hybrid (Ed25519 + ML-DSA-65)
+    /// keypair plus the `key_id` it is registered under.
+    ///
+    /// Both halves are seeded from the same `[seed; 32]` so a `TestKey`
+    /// is fully deterministic. The ML-DSA-65 half is required now that
+    /// rooting delegates chain-crypto to CIRISVerify under
+    /// [`HybridPolicy::RequireHybrid`] (CIRISPersist#465): every
+    /// provenance link MUST carry a valid bound ML-DSA-65 scrub-signature.
     pub struct TestKey {
         pub key_id: String,
         pub signing_key: SigningKey,
+        pub mldsa: MlDsa65Signer,
     }
 
     impl TestKey {
@@ -916,11 +898,21 @@ mod conformance_helpers {
             TestKey {
                 key_id: key_id.to_owned(),
                 signing_key: SigningKey::from_bytes(&[seed; 32]),
+                mldsa: MlDsa65Signer::from_seed(&[seed; 32])
+                    .expect("deterministic ML-DSA-65 keypair from seed"),
             }
         }
 
         pub fn pubkey_b64(&self) -> String {
             B64.encode(self.signing_key.verifying_key().to_bytes())
+        }
+
+        /// The subject's ML-DSA-65 public key, base64 STANDARD — the
+        /// value that lands in `pubkey_ml_dsa_65_base64` and, when this
+        /// key is a scrub *signer* (a chain parent), the pubkey the child
+        /// link's bound PQC scrub-signature verifies against.
+        pub fn pubkey_ml_dsa_b64(&self) -> String {
+            B64.encode(self.mldsa.public_key().expect("ML-DSA-65 public key"))
         }
 
         /// The raw 32-byte Ed25519 pubkey — for use as a test rooting
@@ -951,13 +943,25 @@ mod conformance_helpers {
         let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope).unwrap();
         let original_content_hash = hex::encode(Sha256::digest(&canonical));
 
-        // scrub-signature: Ed25519 over the canonical envelope bytes.
-        let sig = signer.signing_key.sign(&canonical);
+        // Bound hybrid scrub-signature — byte-identical to the
+        // `SelfSigner::sign_bound` construction the real producer uses
+        // (CIRISVerify `self_at_login::sign_bytes`): Ed25519 over the
+        // canonical envelope bytes, then ML-DSA-65 over `canonical ‖
+        // classical_sig`. Both halves are the SIGNER's keys — under
+        // `RequireHybrid` the verifier binds each link's PQC signature to
+        // the PARENT (signer) row's `pubkey_ml_dsa_65_base64`.
+        let classical_sig = signer.signing_key.sign(&canonical).to_bytes();
+        let mut bound = canonical.clone();
+        bound.extend_from_slice(&classical_sig);
+        let pqc_sig = signer
+            .mldsa
+            .sign(&bound)
+            .expect("ML-DSA-65 scrub-signature");
 
         KeyRecord {
             key_id: subject.key_id.clone(),
             pubkey_ed25519_base64: subject.pubkey_b64(),
-            pubkey_ml_dsa_65_base64: None,
+            pubkey_ml_dsa_65_base64: Some(subject.pubkey_ml_dsa_b64()),
             algorithm: algorithm::HYBRID.to_owned(),
             identity_type: identity_type.to_owned(),
             identity_ref: subject.key_id.clone(),
@@ -965,8 +969,8 @@ mod conformance_helpers {
             valid_until: None,
             registration_envelope: envelope,
             original_content_hash,
-            scrub_signature_classical: B64.encode(sig.to_bytes()),
-            scrub_signature_pqc: None,
+            scrub_signature_classical: B64.encode(classical_sig),
+            scrub_signature_pqc: Some(B64.encode(pqc_sig)),
             scrub_key_id: signer.key_id.clone(),
             scrub_timestamp: ts(),
             pqc_completed_at: None,
