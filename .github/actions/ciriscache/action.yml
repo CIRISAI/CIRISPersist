@@ -37,16 +37,26 @@ runs:
         # p11.6.1 never existed), so before this only the verify layer restored
         # and persist's OWN deps (pyo3/rusqlite/tokio-postgres/candle…) — which
         # the verify blob does NOT hold — recompiled from scratch every release.
-        # `phead` is version-INDEPENDENT (still pinned on plat+rustc+verify so
-        # it's ABI-compatible) and overwritten each build, so a version bump
-        # restores the last persist `target/` (verify + all persist deps +
-        # persist crate) and cargo recompiles only CHANGED files. The versioned
+        # `phead` is persist-version-INDEPENDENT (overwritten each build), so a
+        # PERSIST version bump restores the last persist `target/` (verify + all
+        # persist deps + persist crate) and cargo recompiles only CHANGED files.
+        # BUT the key still embeds the VERIFY version, so a VERIFY bump rotates
+        # it → miss → every leg cold-compiles persist's heavy deps (pyo3 /
+        # rusqlite / tokio / candle / ort / tokenizers…). `HEAD_ANYV` is the
+        # verify-AGNOSTIC fallback: restore@v2 treats a trailing `*` as a prefix
+        # and restores the most-recent (version-sorted) match, so on a verify
+        # bump it pulls the last phead of ANY verify version — cargo then
+        # recompiles only the changed verify crates + persist, reusing the heavy
+        # verify-INDEPENDENT deps. Incremental, not cold (follow-up to #458; the
+        # 10s "restore" on a verify-bump leg was this exact miss). The versioned
         # blob still exists for edge's cross-repo exact-pin.
         echo "CIRISCACHE_KEY_HEAD=${BASE}-phead-enone-v${V:-none}" >> "$GITHUB_ENV"
+        echo "CIRISCACHE_KEY_HEAD_ANYV=${BASE}-phead-enone-v*" >> "$GITHUB_ENV"
         echo "CIRISCACHE_KEY_VERIFY=${BASE}-pnone-enone-v${V:-none}" >> "$GITHUB_ENV"
-        echo "CIRISCache: persist=${BASE}-p${P:-none}-enone-v${V:-none}"
-        echo "CIRISCache: head   =${BASE}-phead-enone-v${V:-none}"
-        echo "CIRISCache: verify =${BASE}-pnone-enone-v${V:-none}"
+        echo "CIRISCache: persist =${BASE}-p${P:-none}-enone-v${V:-none}"
+        echo "CIRISCache: head    =${BASE}-phead-enone-v${V:-none}"
+        echo "CIRISCache: head*   =${BASE}-phead-enone-v* (verify-agnostic fallback)"
+        echo "CIRISCache: verify  =${BASE}-pnone-enone-v${V:-none}"
     # Single first-hit-wins restore (restore@v2). CIRISPersist#458-followup: the
     # old 3-step layered restore extracted the phead blob AND the versioned blob
     # (byte-IDENTICAL 3.7 GB supersets) back-to-back — ~200-240s of redundant
@@ -54,14 +64,18 @@ runs:
     # is a complete superset of the shallower layers (save uploads the full
     # `~/.cargo/registry + target`), so the DEEPEST hit alone suffices — no
     # cumulative overlay. Order = most-specific → widest; restore@v2 restores the
-    # first key that hits and SKIPS the rest (one extraction, not three):
-    #   1. this exact version   (same-version re-run)
-    #   2. rolling phead        (cross-version warm target/ — the common case)
-    #   3. verify upstream leaf (first-ever build after a verify pin bump)
+    # first key that hits and SKIPS the rest (one extraction, not four):
+    #   1. this exact version    (same-version re-run)
+    #   2. rolling phead         (persist-version bump, SAME verify — common case)
+    #   3. phead any-verify (*)  (VERIFY bump — restore last phead of any verify
+    #                             version → recompile only verify + persist,
+    #                             reuse the heavy verify-independent deps)
+    #   4. verify upstream leaf  (first-ever build; nothing persist cached yet)
     - uses: CIRISAI/CIRISCache/restore@v2
       continue-on-error: true
       with:
         keys: |
           ${{ env.CIRISCACHE_KEY }}
           ${{ env.CIRISCACHE_KEY_HEAD }}
+          ${{ env.CIRISCACHE_KEY_HEAD_ANYV }}
           ${{ env.CIRISCACHE_KEY_VERIFY }}
