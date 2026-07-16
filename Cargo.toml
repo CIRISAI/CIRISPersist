@@ -910,6 +910,15 @@ name = "read_engine_analytics"
 harness = false
 required-features = ["sqlite"]
 
+# v17.4.0/v17.5.0 scores read surface (list_scores / resolve_scores /
+# list_attestation_log) — corpus sweep for the V106 ordered seek plus the
+# RESOLVE_CANDIDATE_CAP plateau. The hard shape invariants are GATED in
+# tests/scores_shape_witness.rs; this bench charts the magnitudes.
+[[bench]]
+name = "scores_read"
+harness = false
+required-features = ["sqlite"]
+
 # Secrets crypto facade (AES-256-GCM) single-call latency. No DB.
 [[bench]]
 name = "secrets_crypto"
