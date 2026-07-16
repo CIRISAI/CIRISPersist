@@ -299,6 +299,71 @@ jobs:
           alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # CIRISPersist#463 — publish a macos-x86_64 CIRISCache substrate blob.
+  # persist's wheel matrix intentionally OMITS darwin-x86_64 (macos-13 Intel
+  # runner capacity — FSD §3.5 "sunset target, keep CI green only"), so NO job
+  # produced a macos-x86_64 blob. Consequence: CIRISServer's macos-x86_64
+  # release wheel restored only the verify leaf and COLD-COMPILED persist+edge
+  # every release (~19-min leg). This is a SAVE-ONLY warm job — no wheel, no
+  # artifact, not in publish-pypi's needs graph — so the Intel-runner capacity
+  # objection doesn't bind: main-only + continue-on-error means a queued/failed
+  # Intel runner never blocks a release; worst case is a stale blob (strictly
+  # better than today's total absence). NATIVE x86_64 (macos-13), NOT
+  # cross-compiled on arm64 — a `--target x86_64-apple-darwin` build writes a
+  # different target/ subtree + fingerprints that would NOT overlay onto server's
+  # native build. --release so target/release/ warms server's release wheel
+  # (server pins the same dtolnay 1.97.0 → the rustc<X> key matches).
+  darwin-x86_64-cachewarm:
+    name: darwin-x86_64 (CIRISCache warm only — #463)
+    # main-only: off the publish critical path; PRs never save. Same posture as
+    # the other savers (#458 followup — tag/release runs skip the save too).
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-13
+    # Bound a hung Intel build (the runner-capacity caveat is about QUEUE time,
+    # which GitHub caps on its own; this caps a stuck build so it can't leave the
+    # main run pending). Nothing depends on this job, so a timeout is harmless.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.97.0
+      # CIRISCache (#316/#463) — macos-13 (Intel) ⇒ PLAT=macos-x86_64, the token
+      # CIRISServer's macos-x86_64 wheel restores. Restore-then-save keeps the
+      # blob incremental across main pushes.
+      - uses: ./.github/actions/ciriscache
+        with:
+          plat: macos-x86_64
+      - name: Repair toolchain if rustup-init shadow (cache-poison heal)
+        # Same macOS rustup-init-shim heal as darwin-aarch64-test: a restored
+        # ~/.cargo/bin/cargo can be the rustup-init shim, which passes --version
+        # but fails `cargo build`. Probe + reinstall. Load-bearing here — if the
+        # build fails, the save is skipped and no blob is produced.
+        shell: bash
+        run: |
+          if cargo build --help 2>&1 | grep -q "rustup-init"; then
+            echo "::warning::Detected rustup-init shadow in ~/.cargo/bin; reinstalling toolchain"
+            rm -rf "$HOME/.cargo/bin"
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+              sh -s -- -y --default-toolchain 1.97.0 --profile minimal --no-modify-path
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup default 1.97.0
+          cargo --version
+      # Warm the release substrate the server wheel builds against. `server`
+      # features mirror the deepest common substrate compile (verify + persist
+      # deps + persist crate) without pulling PyO3/postgres the server wheel
+      # doesn't share on this leg.
+      - name: cargo build (warm release substrate)
+        run: cargo build --release --features server
+      # Save under the macos-x86_64 key + alias the rolling phead (push-once +
+      # retag, #458). continue-on-error: a flaky/queued Intel runner is non-fatal.
+      - uses: CIRISAI/CIRISCache/save@v1
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        with:
+          key: ${{ env.CIRISCACHE_KEY }}
+          alias-keys: ${{ env.CIRISCACHE_KEY_HEAD }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   # Mission category §4 + PLATFORM_ARCHITECTURE.md §3.1: iOS device +
   # simulator build path. Runs on macOS with the iOS targets.
   #
