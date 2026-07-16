@@ -248,6 +248,7 @@ jobs:
           run_bench "sqlite,cirislens_sequence" sequence_contention
           run_bench "sqlite" engine_cold_start
           run_bench "sqlite" read_engine_analytics
+          run_bench "sqlite" scores_read
           run_bench "secrets" secrets_crypto
           run_bench "sqlite,cirislens_occurrence" occurrence_registry
           run_bench "sqlite,cirislens_sequence" storage_floor
