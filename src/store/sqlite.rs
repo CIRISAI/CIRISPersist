@@ -6736,6 +6736,141 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| Error::Backend(format!("list_attestation_log join: {e}")))?
     }
 
+    async fn record_announced_peer(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        pubkey_ml_dsa_65_base64: Option<&str>,
+        claimed_identity_type: Option<&str>,
+        last_seen: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        if key_id.is_empty() || pubkey_ed25519_base64.is_empty() {
+            return Err(Error::InvalidArgument(
+                "record_announced_peer: key_id and pubkey_ed25519_base64 must be non-empty".into(),
+            ));
+        }
+        let conn = self.conn.clone();
+        let key_id = key_id.to_owned();
+        let pubkey = pubkey_ed25519_base64.to_owned();
+        let pqc = pubkey_ml_dsa_65_base64.map(str::to_owned);
+        let claimed = claimed_identity_type.map(str::to_owned);
+        let seen = last_seen.to_rfc3339();
+        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            let conn = conn.lock();
+            // #469 invariant 3 — idempotent refresh, Conflict on pubkey change.
+            // The caller (edge) verified announce self-consistency, so a repeat
+            // announce with a DIFFERENT pubkey for the same key_id is a genuine
+            // identity conflict (LAN key substitution), not a refresh.
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT pubkey_ed25519_base64 FROM announced_peers WHERE key_id = ?1",
+                    rusqlite::params![key_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| Error::Backend(format!("record_announced_peer lookup: {e}")))?;
+            match existing {
+                Some(prior) if prior != pubkey => Err(Error::Conflict(format!(
+                    "announced peer {key_id}: pubkey differs from the recorded announce \
+                     (identity conflict, not a refresh)"
+                ))),
+                Some(_) => {
+                    // Refresh liveness; enrich the PQC half / claimed type when
+                    // the new announce carries them (never blank an old value).
+                    conn.execute(
+                        "UPDATE announced_peers SET \
+                             last_seen_at = ?2, \
+                             announce_count = announce_count + 1, \
+                             pubkey_ml_dsa_65_base64 = COALESCE(?3, pubkey_ml_dsa_65_base64), \
+                             claimed_identity_type = COALESCE(?4, claimed_identity_type) \
+                         WHERE key_id = ?1",
+                        rusqlite::params![key_id, seen, pqc, claimed],
+                    )
+                    .map_err(|e| Error::Backend(format!("record_announced_peer refresh: {e}")))?;
+                    Ok(())
+                }
+                None => {
+                    conn.execute(
+                        "INSERT INTO announced_peers (\
+                             key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, \
+                             claimed_identity_type, first_seen_at, last_seen_at, announce_count\
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)",
+                        rusqlite::params![key_id, pubkey, pqc, claimed, seen],
+                    )
+                    .map_err(|e| Error::Backend(format!("record_announced_peer insert: {e}")))?;
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("record_announced_peer join: {e}")))?
+    }
+
+    async fn list_announced_peers(
+        &self,
+    ) -> Result<Vec<crate::federation::types::AnnouncedPeer>, crate::federation::Error> {
+        use crate::federation::Error;
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<crate::federation::types::AnnouncedPeer>, Error> {
+                let conn = conn.lock();
+                // #469 invariant 4 — anti-join federation_keys: a bookmark whose
+                // key_id has since been ADMITTED for real is superseded by the
+                // rooted row (read-side; no hook in the admission gate).
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT ap.key_id, ap.pubkey_ed25519_base64, \
+                                ap.pubkey_ml_dsa_65_base64, ap.claimed_identity_type, \
+                                ap.first_seen_at, ap.last_seen_at, ap.announce_count \
+                         FROM announced_peers ap \
+                         WHERE NOT EXISTS (\
+                             SELECT 1 FROM federation_keys fk WHERE fk.key_id = ap.key_id\
+                         ) \
+                         ORDER BY ap.last_seen_at DESC",
+                    )
+                    .map_err(|e| Error::Backend(format!("list_announced_peers prepare: {e}")))?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, i64>(6)?,
+                        ))
+                    })
+                    .map_err(|e| Error::Backend(format!("list_announced_peers query: {e}")))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    let (key_id, pubkey, pqc, claimed, first, last, count) =
+                        row.map_err(|e| Error::Backend(format!("list_announced_peers row: {e}")))?;
+                    let parse_ts = |s: &str, field: &str| {
+                        chrono::DateTime::parse_from_rfc3339(s)
+                            .map(|t| t.with_timezone(&chrono::Utc))
+                            .map_err(|e| {
+                                Error::Backend(format!("list_announced_peers {field}: {e}"))
+                            })
+                    };
+                    out.push(crate::federation::types::AnnouncedPeer {
+                        key_id,
+                        pubkey_ed25519_base64: pubkey,
+                        pubkey_ml_dsa_65_base64: pqc,
+                        claimed_identity_type: claimed,
+                        first_seen_at: parse_ts(&first, "first_seen_at")?,
+                        last_seen_at: parse_ts(&last, "last_seen_at")?,
+                        announce_count: count,
+                    });
+                }
+                Ok(out)
+            },
+        )
+        .await
+        .map_err(|e| Error::Backend(format!("list_announced_peers join: {e}")))?
+    }
+
     async fn resolve_scores(
         &self,
         caller_occurrence_key_id: &str,

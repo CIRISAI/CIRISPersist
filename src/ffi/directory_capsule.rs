@@ -608,6 +608,28 @@ pub enum DirectoryOp {
         /// Page size (1..=10_000).
         limit: i64,
     },
+    /// [`FederationDirectory::record_announced_peer`] (v17.8.0,
+    /// CIRISPersist#469) — the seeder bridge: record a self-consistent but
+    /// UNROOTED LAN announce as a non-canonical, untrusted discovery
+    /// bookmark. NOT an admission; never an authority. Edge calls this from
+    /// `resolve_announce_cold_start`'s Advisory admit path, beside the
+    /// transport-binding write. Result rides `Unit`. APPEND-ONLY.
+    RecordAnnouncedPeer {
+        /// The announced occurrence `key_id` (NOT in `federation_keys`).
+        key_id: String,
+        /// Ed25519 pubkey from the announce, base64 standard.
+        pubkey_ed25519_base64: String,
+        /// ML-DSA-65 pubkey when the announce carried it.
+        pubkey_ml_dsa_65_base64: Option<String>,
+        /// The identity_type the announce CLAIMED (advisory only).
+        claimed_identity_type: Option<String>,
+        /// Announce receipt time (RFC 3339 → DateTime).
+        last_seen: chrono::DateTime<chrono::Utc>,
+    },
+    /// [`FederationDirectory::list_announced_peers`] (v17.8.0,
+    /// CIRISPersist#469) — the live (not-yet-admitted) bookmarks, newest
+    /// `last_seen_at` first. Result rides `AnnouncedPeers`. APPEND-ONLY.
+    ListAnnouncedPeers,
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -707,6 +729,9 @@ pub enum DirectoryOpResult {
     /// `resolve_scores` (v17.4.0) — the composed verdict (band + n's + open
     /// trace). APPEND-ONLY.
     ComposedVerdict(crate::read::ComposedVerdict),
+    /// `list_announced_peers` (v17.8.0, #469) — the live advisory-peer
+    /// bookmarks (non-canonical, untrusted, never an authority). APPEND-ONLY.
+    AnnouncedPeers(Vec<crate::federation::types::AnnouncedPeer>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -911,6 +936,29 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(v) => DirectoryOpResult::Scores(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::RecordAnnouncedPeer {
+            key_id,
+            pubkey_ed25519_base64,
+            pubkey_ml_dsa_65_base64,
+            claimed_identity_type,
+            last_seen,
+        } => match dir
+            .record_announced_peer(
+                &key_id,
+                &pubkey_ed25519_base64,
+                pubkey_ml_dsa_65_base64.as_deref(),
+                claimed_identity_type.as_deref(),
+                last_seen,
+            )
+            .await
+        {
+            Ok(()) => DirectoryOpResult::Unit,
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::ListAnnouncedPeers => match dir.list_announced_peers().await {
+            Ok(v) => DirectoryOpResult::AnnouncedPeers(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
         DirectoryOp::PutLocationProof { proof } => match dir.put_location_proof(proof).await {
@@ -2433,6 +2481,48 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::Scores(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v17.8.0 (#469) — route the seeder-bridge bookmark write through the
+    /// capsule so edge's `resolve_announce_cold_start` Advisory admit path can
+    /// record LAN-announced peers without an admission.
+    async fn record_announced_peer(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        pubkey_ml_dsa_65_base64: Option<&str>,
+        claimed_identity_type: Option<&str>,
+        last_seen: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        match self
+            .run_op(&DirectoryOp::RecordAnnouncedPeer {
+                key_id: key_id.to_owned(),
+                pubkey_ed25519_base64: pubkey_ed25519_base64.to_owned(),
+                pubkey_ml_dsa_65_base64: pubkey_ml_dsa_65_base64.map(str::to_owned),
+                claimed_identity_type: claimed_identity_type.map(str::to_owned),
+                last_seen,
+            })
+            .await?
+        {
+            DirectoryOpResult::Unit => Ok(()),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v17.8.0 (#469) — the live advisory-peer bookmarks via the capsule.
+    async fn list_announced_peers(
+        &self,
+    ) -> Result<Vec<crate::federation::types::AnnouncedPeer>, Error> {
+        match self.run_op(&DirectoryOp::ListAnnouncedPeers).await? {
+            DirectoryOpResult::AnnouncedPeers(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),

@@ -1024,6 +1024,71 @@ pub trait FederationDirectory: Send + Sync {
         })
     }
 
+    /// v17.8.0 (CIRISPersist#469) — the **seeder bridge**: record a peer
+    /// learned from a self-consistent (but not directory-rooted) LAN announce
+    /// as a **non-canonical, untrusted discovery bookmark**.
+    ///
+    /// This is deliberately **NOT an admission**. An advisory peer is unrooted
+    /// by definition; `put_public_key`'s gate must keep rejecting it. Four
+    /// invariants (the #469 contract):
+    /// 1. **Non-canonical, untrusted** — rows live in the separate
+    ///    `announced_peers` table and project server-side to
+    ///    `canonical=false, trust="unknown"`.
+    /// 2. **Never an authority** — enforced by construction: no admission /
+    ///    quorum / rooting / `list_keys_by_identity_type` path reads this
+    ///    table. A bookmark can never satisfy an accord seat, WA, or steward
+    ///    count.
+    /// 3. **Idempotent + liveness-refreshing** — repeated announces for the
+    ///    same `key_id` + same pubkey refresh `last_seen_at` and bump
+    ///    `announce_count`; they never duplicate. A repeat announce whose
+    ///    **pubkey differs** is rejected `Error::Conflict` (fail-honest: the
+    ///    caller verified announce self-consistency, so a changed pubkey for
+    ///    one key_id is a genuine identity conflict, not a refresh).
+    /// 4. **Promotable** — when the same `key_id` later roots for real
+    ///    (admitted `put_public_key`), the real row wins:
+    ///    [`Self::list_announced_peers`] anti-joins `federation_keys`, so the
+    ///    bookmark is superseded on the read side with **no hook in the
+    ///    admission gate**.
+    ///
+    /// `claimed_identity_type` is what the announce asserted — advisory
+    /// display data only, never an authority input.
+    async fn record_announced_peer(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        pubkey_ml_dsa_65_base64: Option<&str>,
+        claimed_identity_type: Option<&str>,
+        last_seen: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Error> {
+        let _ = (
+            key_id,
+            pubkey_ed25519_base64,
+            pubkey_ml_dsa_65_base64,
+            claimed_identity_type,
+            last_seen,
+        );
+        Err(Error::Unsupported {
+            method: "record_announced_peer",
+        })
+    }
+
+    /// v17.8.0 (CIRISPersist#469) — list the live announced-peer bookmarks
+    /// (see [`Self::record_announced_peer`]).
+    ///
+    /// **Anti-joins `federation_keys`**: a bookmark whose `key_id` has since
+    /// been admitted for real is excluded — the rooted row supersedes it
+    /// (invariant 4) — so the server's `collect_peers` union never shows the
+    /// same peer twice at two trust levels. Ordered newest-`last_seen_at`
+    /// first. This read is the server-side feed for
+    /// `GET /v1/federation/peers`' `canonical=false / trust="unknown"`
+    /// projection; it is NOT a key read — rows here carry no provenance and
+    /// must never be fed into verification paths.
+    async fn list_announced_peers(&self) -> Result<Vec<types::AnnouncedPeer>, Error> {
+        Err(Error::Unsupported {
+            method: "list_announced_peers",
+        })
+    }
+
     /// v3.12.0 (CIRISPersist#153 Ask 2, CEG 0.7 §5.6.8.9) — admit a
     /// `family` row.
     ///

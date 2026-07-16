@@ -7709,6 +7709,122 @@ mod canonical_gate_tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
+    // CIRISPersist#469 — the seeder bridge: announced/advisory LAN-peer
+    // bookmarks. Backend-parity harness over the #469 contract:
+    // record→list roundtrip, idempotent liveness refresh + enrichment,
+    // Conflict on pubkey change, and promotion supersede (an ADMITTED
+    // key_id's bookmark disappears from the read — invariant 4).
+    // ─────────────────────────────────────────────────────────────────
+    async fn run_announced_peer_parity(dir: &dyn FederationDirectory, tag: &str) {
+        // Whole-second timestamps: pg TIMESTAMPTZ truncates to MICROseconds,
+        // so nanosecond-carrying `Utc::now()` round-trips unequal on pg only.
+        let t0 = chrono::DateTime::from_timestamp(1_752_600_000, 0).expect("fixture ts");
+        let t1 = t0 + chrono::Duration::seconds(60);
+
+        // (a) record → list roundtrip, fields intact.
+        let kid = format!("ap-roundtrip-{tag}");
+        dir.record_announced_peer(&kid, "ed-pub-a", None, Some("node"), t0)
+            .await
+            .expect("(a) first announce records");
+        let peers = dir.list_announced_peers().await.expect("(a) list");
+        let p = peers
+            .iter()
+            .find(|p| p.key_id == kid)
+            .expect("(a) bookmark visible");
+        assert_eq!(p.pubkey_ed25519_base64, "ed-pub-a");
+        assert_eq!(p.claimed_identity_type.as_deref(), Some("node"));
+        assert_eq!(p.announce_count, 1);
+        assert_eq!(p.first_seen_at, p.last_seen_at);
+
+        // (b) idempotent refresh: same key+pubkey → one row, count bumps,
+        // last_seen advances, PQC half ENRICHES (never blanks).
+        dir.record_announced_peer(&kid, "ed-pub-a", Some("pqc-pub-a"), None, t1)
+            .await
+            .expect("(b) repeat announce refreshes");
+        let peers = dir.list_announced_peers().await.expect("(b) list");
+        let matches: Vec<_> = peers.iter().filter(|p| p.key_id == kid).collect();
+        assert_eq!(matches.len(), 1, "(b) no duplicate bookmark");
+        let p = matches[0];
+        assert_eq!(p.announce_count, 2);
+        assert_eq!(p.last_seen_at, t1, "(b) liveness refreshed");
+        assert_eq!(p.first_seen_at, t0, "(b) first_seen preserved");
+        assert_eq!(
+            p.pubkey_ml_dsa_65_base64.as_deref(),
+            Some("pqc-pub-a"),
+            "(b) PQC half enriched"
+        );
+        assert_eq!(
+            p.claimed_identity_type.as_deref(),
+            Some("node"),
+            "(b) claimed type not blanked by a None refresh"
+        );
+
+        // (c) pubkey change for the same key_id → Conflict (identity
+        // conflict, not a refresh), and the stored row is untouched.
+        let err = dir
+            .record_announced_peer(&kid, "ed-pub-DIFFERENT", None, None, t1)
+            .await
+            .expect_err("(c) pubkey change must be refused");
+        assert_eq!(err.kind(), "federation_conflict", "(c) typed Conflict");
+        let peers = dir.list_announced_peers().await.expect("(c) list");
+        let p = peers.iter().find(|p| p.key_id == kid).expect("(c) intact");
+        assert_eq!(p.pubkey_ed25519_base64, "ed-pub-a", "(c) row untouched");
+
+        // (d) promotion supersede (invariant 4): once the same key_id is
+        // ADMITTED for real (put_public_key through the actual gate), the
+        // bookmark vanishes from the read — the rooted row wins, with no
+        // hook in the admission gate.
+        let kid_promoted = format!("ap-promoted-{tag}");
+        dir.record_announced_peer(&kid_promoted, "ed-pub-b", None, None, t0)
+            .await
+            .expect("(d) bookmark records");
+        let rec = record(&kid_promoted, identity_type::NODE, &kid_promoted);
+        put(dir, rec).await.expect("(d) real admission succeeds");
+        let peers = dir.list_announced_peers().await.expect("(d) list");
+        assert!(
+            !peers.iter().any(|p| p.key_id == kid_promoted),
+            "(d) admitted key_id's bookmark must be superseded by the rooted row"
+        );
+
+        // (e) empty args → typed InvalidArgument, fail-honest.
+        let err = dir
+            .record_announced_peer("", "ed", None, None, t0)
+            .await
+            .expect_err("(e) empty key_id refused");
+        assert_eq!(err.kind(), "federation_invalid_argument");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn announced_peer_parity_sqlite() {
+        use crate::store::backend::Backend as _;
+        use crate::store::sqlite::SqliteBackend;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        run_announced_peer_parity(&backend, "sq").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn announced_peer_parity_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping announced_peer_parity_postgres: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        super::run_in_isolated_pg_db(&dsn, |backend| async move {
+            run_announced_peer_parity(&backend, "pg").await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn announced_peer_parity_memory() {
+        use crate::store::memory::MemoryBackend;
+        let backend = MemoryBackend::new();
+        run_announced_peer_parity(&backend, "mem").await;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
     // CIRISPersist#440 — the CC 3.4.9 co-steward roles (`registry` /
     // `verify`). Same accord m-of-n co-scrub ceremony as `canonical` /
     // `infra:attest`, via the role-generic gate; withdrawal rides the

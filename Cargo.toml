@@ -1,6 +1,6 @@
 [package]
 name = "ciris-persist"
-version = "17.7.0"
+version = "17.8.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Unified Rust persistence for the CIRIS federation — signed events, time-series, runtime state."
@@ -907,6 +907,15 @@ required-features = ["sqlite"]
 # ReadEngine analytical-query scaling over a seeded trace corpus.
 [[bench]]
 name = "read_engine_analytics"
+harness = false
+required-features = ["sqlite"]
+
+# v17.4.0/v17.5.0 scores read surface (list_scores / resolve_scores /
+# list_attestation_log) — corpus sweep for the V106 ordered seek plus the
+# RESOLVE_CANDIDATE_CAP plateau. The hard shape invariants are GATED in
+# tests/scores_shape_witness.rs; this bench charts the magnitudes.
+[[bench]]
+name = "scores_read"
 harness = false
 required-features = ["sqlite"]
 

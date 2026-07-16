@@ -7195,6 +7195,120 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         Ok(crate::read::ScoresPage { items, next_cursor })
     }
 
+    async fn record_announced_peer(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        pubkey_ml_dsa_65_base64: Option<&str>,
+        claimed_identity_type: Option<&str>,
+        last_seen: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        if key_id.is_empty() || pubkey_ed25519_base64.is_empty() {
+            return Err(Error::InvalidArgument(
+                "record_announced_peer: key_id and pubkey_ed25519_base64 must be non-empty".into(),
+            ));
+        }
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        // #469 invariant 3 — idempotent refresh, Conflict on pubkey change.
+        // Same-pubkey repeat announces refresh liveness (and enrich the PQC
+        // half / claimed type via COALESCE); a DIFFERENT pubkey for the same
+        // key_id is a genuine identity conflict. Single-statement upsert with a
+        // conditional DO UPDATE keeps it atomic; the WHERE guard makes the
+        // conflicting-pubkey case update 0 rows, which we then classify.
+        let n = client
+            .execute(
+                "INSERT INTO cirislens.announced_peers (\
+                     key_id, pubkey_ed25519_base64, pubkey_ml_dsa_65_base64, \
+                     claimed_identity_type, first_seen_at, last_seen_at, announce_count\
+                 ) VALUES ($1, $2, $3, $4, $5, $5, 1) \
+                 ON CONFLICT (key_id) DO UPDATE SET \
+                     last_seen_at = EXCLUDED.last_seen_at, \
+                     announce_count = cirislens.announced_peers.announce_count + 1, \
+                     pubkey_ml_dsa_65_base64 = COALESCE(\
+                         EXCLUDED.pubkey_ml_dsa_65_base64, \
+                         cirislens.announced_peers.pubkey_ml_dsa_65_base64), \
+                     claimed_identity_type = COALESCE(\
+                         EXCLUDED.claimed_identity_type, \
+                         cirislens.announced_peers.claimed_identity_type) \
+                 WHERE cirislens.announced_peers.pubkey_ed25519_base64 = \
+                       EXCLUDED.pubkey_ed25519_base64",
+                &[
+                    &key_id,
+                    &pubkey_ed25519_base64,
+                    &pubkey_ml_dsa_65_base64,
+                    &claimed_identity_type,
+                    &last_seen,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("record_announced_peer upsert: {e}")))?;
+        if n == 0 {
+            return Err(Error::Conflict(format!(
+                "announced peer {key_id}: pubkey differs from the recorded announce \
+                 (identity conflict, not a refresh)"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn list_announced_peers(
+        &self,
+    ) -> Result<Vec<crate::federation::types::AnnouncedPeer>, crate::federation::Error> {
+        use crate::federation::Error;
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(format!("pool: {e}")))?;
+        // #469 invariant 4 — anti-join federation_keys: a bookmark whose key_id
+        // has since been ADMITTED for real is superseded by the rooted row.
+        let rows = client
+            .query(
+                "SELECT ap.key_id, ap.pubkey_ed25519_base64, \
+                        ap.pubkey_ml_dsa_65_base64, ap.claimed_identity_type, \
+                        ap.first_seen_at, ap.last_seen_at, ap.announce_count \
+                 FROM cirislens.announced_peers ap \
+                 WHERE NOT EXISTS (\
+                     SELECT 1 FROM cirislens.federation_keys fk \
+                     WHERE fk.key_id = ap.key_id\
+                 ) \
+                 ORDER BY ap.last_seen_at DESC",
+                &[],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("list_announced_peers query: {e}")))?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(crate::federation::types::AnnouncedPeer {
+                    key_id: r
+                        .try_get("key_id")
+                        .map_err(|e| Error::Backend(format!("announced_peers key_id: {e}")))?,
+                    pubkey_ed25519_base64: r.try_get("pubkey_ed25519_base64").map_err(|e| {
+                        Error::Backend(format!("announced_peers pubkey_ed25519: {e}"))
+                    })?,
+                    pubkey_ml_dsa_65_base64: r.try_get("pubkey_ml_dsa_65_base64").map_err(|e| {
+                        Error::Backend(format!("announced_peers pubkey_ml_dsa: {e}"))
+                    })?,
+                    claimed_identity_type: r.try_get("claimed_identity_type").map_err(|e| {
+                        Error::Backend(format!("announced_peers claimed_identity_type: {e}"))
+                    })?,
+                    first_seen_at: r
+                        .try_get("first_seen_at")
+                        .map_err(|e| Error::Backend(format!("announced_peers first_seen: {e}")))?,
+                    last_seen_at: r
+                        .try_get("last_seen_at")
+                        .map_err(|e| Error::Backend(format!("announced_peers last_seen: {e}")))?,
+                    announce_count: r
+                        .try_get("announce_count")
+                        .map_err(|e| Error::Backend(format!("announced_peers count: {e}")))?,
+                })
+            })
+            .collect()
+    }
+
     async fn attach_revocation_pqc_signature(
         &self,
         revocation_id: &str,
