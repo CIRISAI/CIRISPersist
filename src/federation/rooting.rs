@@ -875,14 +875,22 @@ mod conformance_helpers {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     use chrono::{DateTime, Utc};
+    use ciris_crypto::{MlDsa65Signer, PqcSigner as _};
     use ed25519_dalek::{Signer as _, SigningKey};
     use sha2::{Digest, Sha256};
 
-    /// A test identity — a deterministic Ed25519 keypair plus the
-    /// `key_id` it is registered under.
+    /// A test identity — a deterministic hybrid (Ed25519 + ML-DSA-65)
+    /// keypair plus the `key_id` it is registered under.
+    ///
+    /// Both halves are seeded from the same `[seed; 32]` so a `TestKey`
+    /// is fully deterministic. The ML-DSA-65 half is required now that
+    /// rooting delegates chain-crypto to CIRISVerify under
+    /// [`HybridPolicy::RequireHybrid`] (CIRISPersist#465): every
+    /// provenance link MUST carry a valid bound ML-DSA-65 scrub-signature.
     pub struct TestKey {
         pub key_id: String,
         pub signing_key: SigningKey,
+        pub mldsa: MlDsa65Signer,
     }
 
     impl TestKey {
@@ -890,11 +898,21 @@ mod conformance_helpers {
             TestKey {
                 key_id: key_id.to_owned(),
                 signing_key: SigningKey::from_bytes(&[seed; 32]),
+                mldsa: MlDsa65Signer::from_seed(&[seed; 32])
+                    .expect("deterministic ML-DSA-65 keypair from seed"),
             }
         }
 
         pub fn pubkey_b64(&self) -> String {
             B64.encode(self.signing_key.verifying_key().to_bytes())
+        }
+
+        /// The subject's ML-DSA-65 public key, base64 STANDARD — the
+        /// value that lands in `pubkey_ml_dsa_65_base64` and, when this
+        /// key is a scrub *signer* (a chain parent), the pubkey the child
+        /// link's bound PQC scrub-signature verifies against.
+        pub fn pubkey_ml_dsa_b64(&self) -> String {
+            B64.encode(self.mldsa.public_key().expect("ML-DSA-65 public key"))
         }
 
         /// The raw 32-byte Ed25519 pubkey — for use as a test rooting
@@ -925,13 +943,25 @@ mod conformance_helpers {
         let canonical = crate::verify::canonical::ceg_produce_canonicalize(&envelope).unwrap();
         let original_content_hash = hex::encode(Sha256::digest(&canonical));
 
-        // scrub-signature: Ed25519 over the canonical envelope bytes.
-        let sig = signer.signing_key.sign(&canonical);
+        // Bound hybrid scrub-signature — byte-identical to the
+        // `SelfSigner::sign_bound` construction the real producer uses
+        // (CIRISVerify `self_at_login::sign_bytes`): Ed25519 over the
+        // canonical envelope bytes, then ML-DSA-65 over `canonical ‖
+        // classical_sig`. Both halves are the SIGNER's keys — under
+        // `RequireHybrid` the verifier binds each link's PQC signature to
+        // the PARENT (signer) row's `pubkey_ml_dsa_65_base64`.
+        let classical_sig = signer.signing_key.sign(&canonical).to_bytes();
+        let mut bound = canonical.clone();
+        bound.extend_from_slice(&classical_sig);
+        let pqc_sig = signer
+            .mldsa
+            .sign(&bound)
+            .expect("ML-DSA-65 scrub-signature");
 
         KeyRecord {
             key_id: subject.key_id.clone(),
             pubkey_ed25519_base64: subject.pubkey_b64(),
-            pubkey_ml_dsa_65_base64: None,
+            pubkey_ml_dsa_65_base64: Some(subject.pubkey_ml_dsa_b64()),
             algorithm: algorithm::HYBRID.to_owned(),
             identity_type: identity_type.to_owned(),
             identity_ref: subject.key_id.clone(),
@@ -939,8 +969,8 @@ mod conformance_helpers {
             valid_until: None,
             registration_envelope: envelope,
             original_content_hash,
-            scrub_signature_classical: B64.encode(sig.to_bytes()),
-            scrub_signature_pqc: None,
+            scrub_signature_classical: B64.encode(classical_sig),
+            scrub_signature_pqc: Some(B64.encode(pqc_sig)),
             scrub_key_id: signer.key_id.clone(),
             scrub_timestamp: ts(),
             pqc_completed_at: None,
