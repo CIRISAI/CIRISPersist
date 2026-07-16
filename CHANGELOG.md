@@ -5,6 +5,59 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.8.0] — 2026-07-16 — the seeder bridge (#469): announced/advisory LAN peers + the scores read surface's shape-witness gate and bench
+
+### Added — `record_announced_peer` / `list_announced_peers`: the seeder bridge (#469, CIRISEdge#362)
+
+A self-consistent LAN announce that does NOT root (`root_binding` →
+`UnknownKeyId`) is edge-admitted as an Advisory routing hint only — before this
+it left no directory-visible trace, so the server's `GET /v1/federation/peers`
+never surfaced a LAN peer with an ESTABLISHED link. New V108 `announced_peers`
+table + two `FederationDirectory` methods (+ append-only capsule ops), honoring
+the four #469 invariants:
+1. **Non-canonical, untrusted** — a SEPARATE table, deliberately NOT a
+   `federation_keys` row/identity_type; the server projects
+   `canonical=false, trust="unknown"`.
+2. **Never an authority** — enforced BY CONSTRUCTION: no admission / quorum /
+   rooting / `list_keys_by_identity_type` path can see the table. Not a key
+   admission; `put_public_key`'s gate is untouched.
+3. **Idempotent + liveness-refreshing** — repeat announces refresh
+   `last_seen_at` + bump `announce_count` (COALESCE-enrich the PQC half /
+   claimed type); a pubkey CHANGE for the same key_id is `Error::Conflict`
+   (identity conflict, not a refresh — fail-honest).
+4. **Promotable** — `list_announced_peers` anti-joins `federation_keys`, so an
+   ADMITTED key_id's bookmark is superseded by the rooted row with no hook in
+   the admission gate.
+Three-backend parity harness (roundtrip / refresh / conflict / promotion via
+the REAL admission gate / typed args), sqlite+postgres+memory.
+
+### Added — scores read surface: gating shape-witness tests + criterion bench
+
+The v17.4.0/17.5.0 read handles (`list_scores`, `resolve_scores`,
+`list_attestation_log`) had ZERO bench coverage and no executable proof of
+their two design invariants. Now (the proof-centipede pattern: the invariant
+carries a test that can FAIL, not a chart someone must read):
+- **`tests/scores_shape_witness.rs`** (gating, ~1.1s): `resolve_scores`' fold
+  input **plateaus at exactly `RESOLVE_CANDIDATE_CAP` (4096)** — trace
+  `candidates_truncated` flips, `inputs.len()==4096` at 6k AND 12k corpus
+  (removing the backend LIMIT fails the test); `list_scores` page + cursor are
+  **byte-identical at 1k vs 16k corpus** (bounded by page, not corpus), with an
+  `EXPLAIN QUERY PLAN` witness that the V106 `attestation_subjects_seek` index
+  drives the read (dropping the index fails the test).
+- **`benches/scores_read.rs`** (criterion, observational): 13 points — seek
+  sweep 1k→16k, fold sweep 256→8192 (crossing the cap), log walks — wired into
+  the bench workflow for the gh-pages trend.
+
+### On-device validation (Android x86_64 emulator, this cut's artifacts)
+
+Not a code change — recorded for the release evidence trail: ciris-keyring
+v10.5.0's full suite **74/74 on-device** (incl. all 4 `rt::` reentrancy tests —
+the CIRISVerify#204 mobile fold-boot panic conditions, now safe on real
+bionic); persist's CI-built android .so loads clean under `RTLD_NOW`
+(`JNI_OnLoad` resolved); the Chaquopy pyo3 .so fully loads + resolves
+`PyInit_ciris_persist` once libpython's 104 demanded `Py*` symbols are present
+(the documented #98 DT_NEEDED contract, now enumerated).
+
 ## [17.7.0] — 2026-07-16 — crypto-DRY closure set: the single hybrid-sign verb (#470) + merkle leaf-hash single-sourcing + strict-verify hygiene, each with a differential authority-equivalence guard
 
 The persist mirror of CIRISVerify's v10.4.0 assessment cut: close our remaining
