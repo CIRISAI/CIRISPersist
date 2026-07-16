@@ -5,6 +5,62 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.7.0] — 2026-07-16 — crypto-DRY closure set: the single hybrid-sign verb (#470) + merkle leaf-hash single-sourcing + strict-verify hygiene, each with a differential authority-equivalence guard
+
+The persist mirror of CIRISVerify's v10.4.0 assessment cut: close our remaining
+crypto-DRY findings against the APIs verify now exposes, and ship the verb
+downstream needs to close theirs. Every closure lands WITH a differential
+authority-equivalence test — the pilot of the proof-centipede format
+(CIRISConstitution#36): single-source the authority, then pin both sides so
+neither can drift silently.
+
+### Added — `Engine.local_sign_hybrid`: the single hybrid-sign verb across the PyO3 boundary (#470)
+
+The Engine PyO3 surface exposed only the raw halves (`local_sign` /
+`local_pqc_sign`), so every PyO3 consumer hand-composed the canonical bound
+rule `pqc = Sign_PQC(message ‖ ed25519_sig)` — ~7 sites ecosystem-wide, one of
+them (the KMP fabric-client signer) originally WRONG in a way
+`HybridPolicy::Strict` rejects. New `Engine.local_sign_hybrid(message) ->
+{"classical_sig": bytes, "pqc_sig": bytes}` delegates to
+`LocalSigner::sign_hybrid`, so the rule lives in exactly ONE place.
+Retires the last hand-composed hybrid site in CIRISServer's lens-core PyO3
+fold (CIRISServer#283 finding 3; pairs with CIRISVerify#207 item 4).
+
+**Differential guards (both directions):**
+- Rust: `sign_hybrid_round_trips_verify_hybrid_strict` — the producing
+  authority round-trips the INDEPENDENT checking authority
+  (`verify_hybrid`, `Strict`), and the exact drift shape (PQC over the RAW
+  message — the original KMP bug) is asserted REJECTED.
+- Python: `test_local_sign_hybrid_matches_hand_composition_470` — the verb is
+  pinned byte-identical (classical; deterministic Ed25519) / shape-identical
+  (PQC; FIPS 204 hedged signing is randomized) to the hand-composition it
+  replaces, from the consumer's side of the boundary.
+
+### Changed — `audit/merkle_store::hash_leaf` single-sourced on verify (crypto-DRY)
+
+Was a hand-maintained byte-parity COPY of verify's RFC 6962 §2.1 leaf hash
+(kept only because verify's was `pub(crate)`; its own comment demanded
+lockstep updates). CIRISVerify v10.4.0 made `transparency::hash_leaf` /
+`hash_node` `pub` — persist now delegates. The two existing guards remain and
+are re-pointed as the authority-equivalence tests: byte-equal to verify's own
+`TransparencyStore::leaf_hash`, and anchored to the RFC 6962 construction
+directly.
+
+### Changed — strict-verify hygiene: one Ed25519 acceptance rule
+
+The remaining direct `ed25519_dalek::verify_strict` reach-around (test-side)
+now routes through the canonical `ciris_crypto::Ed25519Verifier::verify_strict`
+(v10.4.0) — one acceptance rule in the repo, not two.
+
+### Deferred (tracked, deliberately not in this cut)
+
+- §10.5.2 stream-nonce prefix derivation — encoding unratified; persist-local
+  until the CEG variant is ratified (CIRISVerify#207).
+- `key_grant` v2 algorithm-string ratification (hyphen vs underscore — two
+  "pinned" wire identifiers for one construction) — needs CEG cross-confirm.
+- Python `json.dumps` legacy canonicalizer — migration-gated, retires on the
+  2.7.x trace sunset.
+
 ## [17.6.0] — 2026-07-16 — delete the forked provenance verifier; delegate trust-root chain-crypto to CIRISVerify + RequireHybrid tightening (#465)
 
 ### Changed — CIRISVerify re-pin 10.3.0 → 10.5.0 (lockstep)

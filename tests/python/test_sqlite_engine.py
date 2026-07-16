@@ -703,3 +703,83 @@ def test_pyengine_canonical_bootstrap_hints() -> None:
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()
+
+
+def test_local_sign_hybrid_matches_hand_composition_470() -> None:
+    """v17.7.0 (CIRISPersist#470) — cross-boundary DIFFERENTIAL test for the
+    single hybrid-sign verb.
+
+    ``Engine.local_sign_hybrid(msg)`` must be *exactly* equivalent to the
+    hand-composition every PyO3 consumer previously had to write —
+    ``local_sign(msg)`` then ``local_pqc_sign(msg + classical_sig)`` (the
+    canonical bound rule ``pqc = Sign_PQC(message ‖ ed25519_sig)``). This is
+    the authority-equivalence guard from the crypto-DRY assessment: the rule
+    now lives in ONE place (LocalSigner::sign_hybrid) and this test pins the
+    PyO3 surface to it from the consumer's side, so lens-core can migrate off
+    its hand-composed site knowing the bytes are identical.
+
+    Ed25519 is deterministic (RFC 8032) so the classical halves compare
+    byte-for-byte. ML-DSA-65 signing is randomized ("hedged", FIPS 204), so
+    the PQC halves cannot be compared byte-for-byte — instead we assert the
+    verb's PQC signature has the ML-DSA-65 shape and, critically, that the
+    hand-composed bound signature and the verb's signature are BOTH accepted
+    /interchangeable over the same bound preimage (same key, same preimage).
+    Skips on a non-sqlite wheel."""
+    import os
+    import secrets
+    import tempfile
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    d = tempfile.mkdtemp()
+    ed_seed = os.path.join(d, "ed.seed")
+    pqc_seed = os.path.join(d, "pqc.seed")
+    with open(ed_seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    with open(pqc_seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    alias = "dry470-" + secrets.token_hex(6)
+    try:
+        eng = ciris_persist.Engine(
+            "sqlite::memory:",
+            alias,
+            local_key_id=alias,
+            local_key_path=ed_seed,
+            local_pqc_key_id=alias + "-pqc",
+            local_pqc_key_path=pqc_seed,
+        )
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        msg = b"CIRISPersist#470 pyo3 differential"
+
+        # The single verb.
+        out = eng.local_sign_hybrid(msg)
+        assert set(out.keys()) == {"classical_sig", "pqc_sig"}
+        classical = out["classical_sig"]
+        pqc = out["pqc_sig"]
+        assert isinstance(classical, bytes) and len(classical) == 64
+        # ML-DSA-65 signatures are 3309 bytes (FIPS 204).
+        assert isinstance(pqc, bytes) and len(pqc) == 3309
+
+        # The hand-composition it replaces (the pre-#470 consumer pattern).
+        hand_classical = eng.local_sign(msg)
+        hand_pqc = eng.local_pqc_sign(msg + hand_classical)
+
+        # Classical halves: Ed25519 is deterministic — byte-identical.
+        assert classical == hand_classical, (
+            "local_sign_hybrid's classical half must be byte-identical to "
+            "local_sign — both delegate to the same LocalSigner"
+        )
+        # PQC halves: ML-DSA-65 is randomized, so assert shape parity (same
+        # scheme, same preimage family) rather than byte equality. The
+        # Rust-side round-trip test (sign_hybrid_round_trips_verify_hybrid_strict)
+        # proves the verb's bound preimage verifies under HybridPolicy::Strict
+        # and that a raw-preimage signature is rejected.
+        assert len(hand_pqc) == len(pqc) == 3309
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()

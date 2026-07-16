@@ -862,4 +862,90 @@ mod tests {
             Err(KeyringError::NotSupported { .. })
         ));
     }
+
+    /// v17.7.0 (CIRISPersist#470) — DIFFERENTIAL AUTHORITY-EQUIVALENCE test:
+    /// the producing authority ([`LocalSigner::sign_hybrid`], which
+    /// `Engine.sign_hybrid` and the PyO3 `Engine.local_sign_hybrid` verb both
+    /// delegate to) round-trips through the INDEPENDENT checking authority
+    /// (`crate::verify::hybrid::verify_hybrid` under `HybridPolicy::Strict`).
+    ///
+    /// This is the guard the crypto-DRY assessment showed was missing at every
+    /// hand-composed hybrid site: it pins the bound rule
+    /// `pqc = Sign_PQC(message ‖ ed25519_sig)` from BOTH sides, so neither the
+    /// signer nor the verifier can drift without this failing. (The KMP signer
+    /// bug — ML-DSA over the raw body instead of the bound input — would fail
+    /// exactly here.) Also asserts the exact drift shape: a PQC signature over
+    /// the RAW message must be REJECTED by Strict.
+    #[tokio::test]
+    async fn sign_hybrid_round_trips_verify_hybrid_strict() {
+        use crate::verify::hybrid::{verify_hybrid, HybridPolicy};
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        use ciris_keyring::MlDsa65SoftwareSigner;
+        use ed25519_dalek::SigningKey;
+
+        // Deterministic hybrid identity — same recipe as engine.rs's
+        // promote-path `pqc_signer` fixture.
+        let signing_key = SigningKey::from_bytes(&[0x21u8; 32]);
+        let pqc = MlDsa65SoftwareSigner::from_seed_bytes(&[0x21u8 ^ 0x55; 32], "dry-470-pqc")
+            .expect("pqc seed");
+        let pqc_arc: std::sync::Arc<dyn ciris_keyring::PqcSigner> = std::sync::Arc::new(pqc);
+        let signer = LocalSigner::from_parts(
+            signing_key,
+            "dry-470".to_owned(),
+            Some(pqc_arc),
+            Some("dry-470-pqc".to_owned()),
+        );
+
+        let message = b"CIRISPersist#470 differential authority-equivalence";
+
+        // Produce through the single signing authority.
+        let sig = signer.sign_hybrid(message).await.expect("sign_hybrid");
+
+        // Verify through the independent checking authority, Strict (both
+        // halves REQUIRED — the federation binding-gate policy).
+        let ed_pub_b64 = B64.encode(signer.ed25519_public_key_bytes());
+        let pqc_pub_b64 = signer
+            .pqc_public_key_b64()
+            .await
+            .expect("pqc pubkey")
+            .expect("pqc configured");
+        let ed_sig_b64 = B64.encode(&sig.classical.signature);
+        let pqc_sig_b64 = B64.encode(&sig.pqc.signature);
+
+        verify_hybrid(
+            message,
+            &ed_sig_b64,
+            Some(&pqc_sig_b64),
+            &ed_pub_b64,
+            Some(&pqc_pub_b64),
+            HybridPolicy::Strict,
+            None,
+        )
+        .expect("sign_hybrid output MUST verify under Strict — the bound rule is single-sourced");
+
+        // Drift shape: a PQC signature over the RAW message (the KMP bug — the
+        // exact hand-composition mistake the #470 verb exists to prevent) must
+        // be REJECTED. Re-sign the raw message with the same PQC key and swap
+        // it in; Strict must fail.
+        let raw_pqc = signer
+            .sign_ml_dsa_65(message)
+            .await
+            .expect("raw pqc sign (deliberately wrong preimage)");
+        let raw_pqc_b64 = B64.encode(&raw_pqc);
+        assert!(
+            verify_hybrid(
+                message,
+                &ed_sig_b64,
+                Some(&raw_pqc_b64),
+                &ed_pub_b64,
+                Some(&pqc_pub_b64),
+                HybridPolicy::Strict,
+                None,
+            )
+            .is_err(),
+            "a PQC signature over the raw message (unbound) must FAIL Strict — \
+             if this passes, the bound rule has silently weakened"
+        );
+    }
 }

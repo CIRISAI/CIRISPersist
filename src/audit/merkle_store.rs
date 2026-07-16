@@ -46,7 +46,8 @@ use chrono::{DateTime, Utc};
 use ciris_verify_core::transparency::{
     SignedTreeHead, TransparencyError, TransparencyStore, WitnessSignature,
 };
-use sha2::{Digest, Sha256};
+// #470 arc — `hash_leaf` now delegates to verify's `transparency::hash_leaf`;
+// the RFC-6962-spec-anchor unit test imports sha2 inside its own module.
 use tokio::runtime::Handle;
 
 use super::merkle_leaf::AuditLeaf;
@@ -57,15 +58,17 @@ use super::merkle_leaf::AuditLeaf;
 
 /// RFC 6962 §2.1 leaf hash: `sha256(0x00 || canonical)`.
 ///
-/// Byte-for-byte parity with Verify v2.3.0's `pub(crate) hash_leaf`
-/// (see `ciris-verify-core/src/transparency.rs`). Locked by the unit
-/// tests in this module — any divergence in Verify means tests fail
-/// and we must update the prefix here in lockstep.
+/// v17.7.0 (CIRISPersist#470 arc, crypto-DRY closure) — **DELEGATES to
+/// CIRISVerify's canonical `transparency::hash_leaf`**, now `pub` as of
+/// CIRISVerify v10.4.0. This was a hand-maintained byte-parity *copy* (kept
+/// only because verify's was `pub(crate)`), which the crypto-DRY assessment
+/// flagged: two implementations of the same RFC 6962 leaf construction that had
+/// to be updated "in lockstep." Now single-sourced on the authority. The two
+/// tests below remain as the authority-equivalence guards: one cross-checks the
+/// exposed fn against verify's own `TransparencyStore::leaf_hash`, the other
+/// anchors it to the RFC 6962 spec construction directly.
 pub(crate) fn hash_leaf(canonical: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update([0x00]);
-    hasher.update(canonical);
-    hasher.finalize().into()
+    ciris_verify_core::transparency::hash_leaf(canonical)
 }
 
 // ────────────────────────────────────────────────────────────────────
