@@ -68,6 +68,10 @@ struct State {
     /// entry can never yield a wrong row — it exists to make the projection
     /// backend-symmetric and inspectable.
     subject_index: HashMap<String, Vec<String>>,
+    /// v17.8.0 (CIRISPersist#469) — announced/advisory LAN-peer bookmarks,
+    /// keyed by `key_id`. Deliberately SEPARATE from `federation_keys`
+    /// (never an authority; see the trait docs on `record_announced_peer`).
+    announced_peers: HashMap<String, crate::federation::types::AnnouncedPeer>,
     /// v0.2.0 — Federation `federation_revocations` rows,
     /// append-only.
     federation_revocations: Vec<crate::federation::Revocation>,
@@ -279,6 +283,7 @@ impl Default for MemoryBackend {
                 federation_keys: HashMap::new(),
                 federation_attestations: Vec::new(),
                 subject_index: HashMap::new(),
+                announced_peers: HashMap::new(),
                 federation_revocations: Vec::new(),
                 federation_trust: HashMap::new(),
                 outbound_queue: HashMap::new(),
@@ -2039,6 +2044,75 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             items: rows,
             next_cursor,
         })
+    }
+
+    async fn record_announced_peer(
+        &self,
+        key_id: &str,
+        pubkey_ed25519_base64: &str,
+        pubkey_ml_dsa_65_base64: Option<&str>,
+        claimed_identity_type: Option<&str>,
+        last_seen: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        if key_id.is_empty() || pubkey_ed25519_base64.is_empty() {
+            return Err(Error::InvalidArgument(
+                "record_announced_peer: key_id and pubkey_ed25519_base64 must be non-empty".into(),
+            ));
+        }
+        let mut state = self.state.lock().expect("memory backend lock");
+        match state.announced_peers.get_mut(key_id) {
+            // #469 invariant 3 — Conflict on pubkey change (identity conflict,
+            // not a refresh).
+            Some(existing) if existing.pubkey_ed25519_base64 != pubkey_ed25519_base64 => {
+                Err(Error::Conflict(format!(
+                    "announced peer {key_id}: pubkey differs from the recorded announce \
+                     (identity conflict, not a refresh)"
+                )))
+            }
+            Some(existing) => {
+                existing.last_seen_at = last_seen;
+                existing.announce_count += 1;
+                if let Some(pqc) = pubkey_ml_dsa_65_base64 {
+                    existing.pubkey_ml_dsa_65_base64 = Some(pqc.to_owned());
+                }
+                if let Some(claimed) = claimed_identity_type {
+                    existing.claimed_identity_type = Some(claimed.to_owned());
+                }
+                Ok(())
+            }
+            None => {
+                state.announced_peers.insert(
+                    key_id.to_owned(),
+                    crate::federation::types::AnnouncedPeer {
+                        key_id: key_id.to_owned(),
+                        pubkey_ed25519_base64: pubkey_ed25519_base64.to_owned(),
+                        pubkey_ml_dsa_65_base64: pubkey_ml_dsa_65_base64.map(str::to_owned),
+                        claimed_identity_type: claimed_identity_type.map(str::to_owned),
+                        first_seen_at: last_seen,
+                        last_seen_at: last_seen,
+                        announce_count: 1,
+                    },
+                );
+                Ok(())
+            }
+        }
+    }
+
+    async fn list_announced_peers(
+        &self,
+    ) -> Result<Vec<crate::federation::types::AnnouncedPeer>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        // #469 invariant 4 — anti-join federation_keys: an admitted key_id
+        // supersedes its bookmark.
+        let mut out: Vec<_> = state
+            .announced_peers
+            .values()
+            .filter(|p| !state.federation_keys.contains_key(&p.key_id))
+            .cloned()
+            .collect();
+        out.sort_by_key(|p| std::cmp::Reverse(p.last_seen_at));
+        Ok(out)
     }
 
     async fn attestation_upsert_local(

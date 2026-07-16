@@ -2443,6 +2443,38 @@ pub struct PeerMetadataRow {
     pub persist_row_hash: String,
 }
 
+/// `announced_peers` row — the seeder-bridge read shape (v17.8.0,
+/// CIRISPersist#469).
+///
+/// A **non-canonical, untrusted discovery bookmark** for a peer learned from a
+/// self-consistent (but not directory-rooted) LAN announce. NOT a
+/// `federation_keys` identity: it lives in its own table precisely so it is
+/// invisible to every admission / quorum / rooting / authority path by
+/// construction. The server projects it to
+/// `LocalPeerState { canonical: false, trust: "unknown", last_seen, … }` for
+/// `GET /v1/federation/peers` (CIRISEdge#362).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnouncedPeer {
+    /// The announced occurrence `key_id`. NOT an FK — the whole point is
+    /// this key is not (yet) in the directory.
+    pub key_id: String,
+    /// Ed25519 pubkey from the announce, base64 standard.
+    pub pubkey_ed25519_base64: String,
+    /// ML-DSA-65 pubkey when the announce carried the PQC half.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pubkey_ml_dsa_65_base64: Option<String>,
+    /// The identity_type the announce CLAIMED (`node` / `steward` / …).
+    /// Advisory display data only — unverified, never an authority input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_identity_type: Option<String>,
+    /// First time this key_id was announced.
+    pub first_seen_at: DateTime<Utc>,
+    /// Most recent announce (refreshed by every `record_announced_peer`).
+    pub last_seen_at: DateTime<Utc>,
+    /// How many announces have been recorded (liveness signal).
+    pub announce_count: i64,
+}
+
 /// Compute the canonical-bytes hash for a row used for
 /// `persist_row_hash`. Persist calls this server-side on every write
 /// path so consumers don't have to.
