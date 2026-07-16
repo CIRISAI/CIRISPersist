@@ -1346,13 +1346,12 @@ mod tests {
         // and the canonical(post-scrub) bytes — proves a peer with
         // the published public key can verify the deployment's
         // attestation.
+        //
+        // v17.7.0 (#470 arc, crypto-DRY closure) — strict-verify through the
+        // canonical `ciris_crypto::Ed25519Verifier::verify_strict` (v10.4.0)
+        // instead of reaching for `ed25519_dalek` directly: ONE Ed25519
+        // acceptance rule in the repo, not two.
         let pubkey_bytes = signer.public_key().await.expect("signer.public_key");
-        let pubkey_arr: [u8; 32] = pubkey_bytes
-            .as_slice()
-            .try_into()
-            .expect("ed25519 public key is 32 bytes");
-        let pubkey =
-            ed25519_dalek::VerifyingKey::from_bytes(&pubkey_arr).expect("verifying key parse");
 
         let row0 = &snap[0];
         let payload_value = serde_json::Value::Object(row0.payload.clone());
@@ -1361,14 +1360,13 @@ mod tests {
             .unwrap();
         let sig_b64 = row0.scrub_signature.as_ref().unwrap();
         let sig_bytes = BASE64.decode(sig_b64).expect("base64 decode");
-        let sig_arr: [u8; 64] = sig_bytes
-            .as_slice()
-            .try_into()
-            .expect("ed25519 signature is 64 bytes");
-        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
-        pubkey
-            .verify_strict(&canonical, &sig)
-            .expect("scrub_signature verifies against canonical(post-scrub)");
+        let verified = ciris_crypto::Ed25519Verifier
+            .verify_strict(&pubkey_bytes, &canonical, &sig_bytes)
+            .expect("verify_strict parse");
+        assert!(
+            verified,
+            "scrub_signature verifies against canonical(post-scrub)"
+        );
     }
 
     #[tokio::test]

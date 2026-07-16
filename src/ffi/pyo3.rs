@@ -3240,6 +3240,46 @@ impl PyEngine {
         })
     }
 
+    /// v17.7.0 (CIRISPersist#470) — the SINGLE hybrid-sign verb across the
+    /// Engine PyO3 boundary. Delegates to [`LocalSigner::sign_hybrid`] so the
+    /// canonical bound-signature rule — `pqc = Sign_PQC(message ‖ ed25519_sig)`
+    /// — lives in exactly ONE place. The crypto-DRY assessment found that rule
+    /// hand-recomposed across ~7 sites (one of them, the KMP signer, WRONG:
+    /// ML-DSA over the raw body → signatures persist's `HybridPolicy::Strict`
+    /// rejects). PyO3 consumers (e.g. lens-core's agent-embedded fold) call this
+    /// instead of pairing [`Self::local_sign`] + [`Self::local_pqc_sign`] and
+    /// re-deriving `message ‖ ed25519_sig` themselves.
+    ///
+    /// Returns `{"classical_sig": bytes, "pqc_sig": bytes}` — the Ed25519 half
+    /// over `message`, the ML-DSA-65 half over the bound input. Byte-identical to
+    /// the RLib `LocalSigner::sign_hybrid`; a differential test
+    /// (`local_sign_hybrid_matches_rlib_sign_hybrid`) locks the two surfaces.
+    fn local_sign_hybrid<'py>(
+        &self,
+        py: Python<'py>,
+        message: &Bound<'py, PyBytes>,
+    ) -> PyResult<Py<PyDict>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let signer = self.local_signer.clone().ok_or_else(|| {
+                PyValueError::new_err(
+                    "no local signer configured (Engine needs local_key_id + \
+                 local_key_path; for the PQC half also local_pqc_key_id + \
+                 local_pqc_key_path)",
+                )
+            })?;
+            let runtime = self.runtime.clone();
+            let msg = message.as_bytes().to_vec();
+            let sig = py
+                .detach(|| runtime.block_on(async move { signer.sign_hybrid(&msg).await }))
+                .map_err(local_signer_err_to_py)?;
+            let out = PyDict::new(py);
+            out.set_item("classical_sig", PyBytes::new(py, &sig.classical.signature))?;
+            out.set_item("pqc_sig", PyBytes::new(py, &sig.pqc.signature))?;
+            Ok(out.unbind())
+        })
+    }
+
     /// v0.1.18 — debug helper for canonical-byte drift diagnosis
     /// (CIRISPersist#6 follow-up). Pipes a raw HTTP body through
     /// persist's schema parse + canonicalizer and returns BOTH
