@@ -5,6 +5,32 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [18.1.0] — 2026-07-20 — the `trace:*` Information-Type validator (dimension-as-type-registry; CIRISConstitution#39 interim)
+
+### Added — `check_trace_dimension_admission` at every attestation write chokepoint
+
+The dimension is the CEG's **Information-Type parameter**, and the doctrine
+requires the type parameter be machine-checkably validated — v18.0.0 shipped
+`trace:complete:v1` as an unregistered free string. Now (same interim posture
+as the CC#38 size cap; ratification filed as CIRISConstitution#39):
+
+- **Self-emission rule**: `trace:*` requires `attesting_key_id ∈
+  subject_key_ids` — a trace records its own producer's reasoning;
+  third-party emission on the namespace refuses. (Inverse polarity of
+  `capacity:*`'s anti-self rule.)
+- **Shape validation**: non-empty `trace_id` + `agent_id_hash`, and EXACTLY
+  ONE of inline `trace` (object) / `manifest` (`trace_manifest:v1`,
+  `sha256:`-prefixed `content_hash`, positive `byte_len`,
+  `component_count`). An admitted `trace:*` row is guaranteed parseable.
+- **Provenance boundary**: admission validates SHAPE; the in-envelope
+  producer signature carries provenance (verified at promotion/read).
+- Typed `Error::TraceDimensionInvalid`, kind
+  `federation_trace_dimension_invalid` (PyO3 `ValueError`).
+- Runs beside the size cap at all six chokepoints (3× `put_attestation` +
+  3× local funnels), no-op for non-`trace:` dimensions.
+- Witnesses: 4 tests incl. a 9-case shape-violation matrix (each refusing
+  with the typed kind) — the freeze-gate vector source for CC#39.
+
 ## [18.0.0] — 2026-07-20 — ENVELOPE-NATIVE traces (#473): a trace IS a `scores` attestation, saved as such
 
 The owner doctrine, made structural: **"everything persist saves is a CEG-native

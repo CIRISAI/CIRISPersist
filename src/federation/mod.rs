@@ -3939,6 +3939,20 @@ pub enum Error {
         cap: usize,
     },
 
+    /// v18.1.0 (CIRISPersist#473 followup) — a `trace:*`-dimension
+    /// attestation failed the Information-Type validator: the dimension is
+    /// the CEG's machine-checkable type parameter, so a `trace:*` row that
+    /// admits MUST be self-emitted (attester ∈ subjects — a trace records
+    /// its own producer's reasoning) and MUST parse as exactly one of the
+    /// ratification-tracked shapes (inline trace / `trace_manifest:v1`).
+    /// Admission validates SHAPE; the in-envelope producer signature
+    /// carries provenance (verified at promotion/read).
+    #[error("trace:* dimension admission refused: {detail}")]
+    TraceDimensionInvalid {
+        /// What failed (self-emission / missing field / bad manifest …).
+        detail: String,
+    },
+
     /// v2.4.0 (CIRISPersist#102 Ask 3a). The submitted `scores`
     /// attestation's `dimension` begins with `accord:` but the
     /// `attesting_key_id`'s `identity_type` is not `accord_holder`.
@@ -4905,6 +4919,7 @@ impl Error {
             Error::RateLimited { .. } => "federation_rate_limited",
             Error::Conflict(_) => "federation_conflict",
             Error::EnvelopeTooLarge { .. } => "federation_envelope_too_large",
+            Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"
             }
