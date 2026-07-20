@@ -5611,6 +5611,40 @@ pub async fn check_adult_incapacity_binding(
     Ok(())
 }
 
+/// v17.9.0 (CIRISConstitution#38 interim) — the attestation-plane envelope
+/// size cap, in **canonical (JCS) bytes**. 1 MiB, deliberately aligned with
+/// the blob plane's [`crate::federation::blobs::DEFAULT_INLINE_BYTES_CAP`]:
+/// the substrate-wide discipline is *inline below 1 MiB; above it, the
+/// envelope carries a manifest (content hash + degradable-plane reference)
+/// and the payload rides the fountain-content primitive*. Until this cut the
+/// CEG had NO size bound at any layer — the 8 MiB HTTP ingest body cap
+/// (AV-7) never covered capsule/FFI writes, so an unchecked write could park
+/// a multi-hundred-MB row on the anti-entropy plane. Interim persist value;
+/// re-pin to the ratified number when CC#38 lands.
+pub const MAX_ATTESTATION_ENVELOPE_BYTES: usize = 1024 * 1024;
+
+/// v17.9.0 (CIRISConstitution#38 interim) — refuse an attestation whose
+/// envelope's canonical bytes exceed [`MAX_ATTESTATION_ENVELOPE_BYTES`].
+///
+/// Runs FIRST at every attestation write chokepoint (all three backends'
+/// `put_attestation` + the three local-tier write funnels) — the
+/// cheapest-most-specific-rejection-first discipline: no signature
+/// verification or directory lookups are spent on an envelope that can never
+/// be admitted. Measures the REAL canonical bytes (the same JCS the producer
+/// signed, via [`crate::verify::canonical::ceg_produce_canonicalize`]) — the
+/// signed thing is the sized thing (CC#38's proposed rule).
+pub fn check_envelope_size_admission(envelope: &serde_json::Value) -> Result<(), Error> {
+    let canonical = crate::verify::canonical::ceg_produce_canonicalize(envelope)
+        .map_err(|e| Error::InvalidArgument(format!("envelope canonicalize: {e}")))?;
+    if canonical.len() > MAX_ATTESTATION_ENVELOPE_BYTES {
+        return Err(Error::EnvelopeTooLarge {
+            bytes: canonical.len(),
+            cap: MAX_ATTESTATION_ENVELOPE_BYTES,
+        });
+    }
+    Ok(())
+}
+
 /// v10.3.0 (CIRISPersist#288, CC 3.4.1 / 3.4.3 / 3.4.5) — reserved-prefix
 /// admission on the **`attestation_type`** namespace, keyed on the attesting
 /// key's `identity_type`.
@@ -8706,5 +8740,60 @@ mod canonical_withdrawal_tests {
         use crate::store::memory::MemoryBackend;
         let backend = MemoryBackend::new();
         run_infra_withdrawal_matrix(&backend, "mem").await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// v17.9.0 (CIRISConstitution#38 interim) — envelope size cap witnesses.
+// The check is SINGLE-SOURCED (`check_envelope_size_admission`) and called
+// identically at all six write chokepoints, so the boundary is unit-pinned
+// here and one backend integration (memory, below in store tests) proves the
+// wiring; per-backend duplication would re-test the same fn.
+// ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod envelope_size_tests {
+    use super::{check_envelope_size_admission, MAX_ATTESTATION_ENVELOPE_BYTES};
+
+    /// Build an envelope whose CANONICAL bytes are exactly `n` long:
+    /// `{"d":"<pad>"}` canonicalizes to 8 framing bytes + pad.
+    fn envelope_of_canonical_len(n: usize) -> serde_json::Value {
+        assert!(n > 8);
+        serde_json::json!({ "d": "x".repeat(n - 8) })
+    }
+
+    #[test]
+    fn at_cap_admits_over_cap_refuses_exact_boundary() {
+        // Exactly AT the cap — admitted.
+        let at = envelope_of_canonical_len(MAX_ATTESTATION_ENVELOPE_BYTES);
+        let canonical = crate::verify::canonical::ceg_produce_canonicalize(&at).unwrap();
+        assert_eq!(
+            canonical.len(),
+            MAX_ATTESTATION_ENVELOPE_BYTES,
+            "fixture sanity"
+        );
+        check_envelope_size_admission(&at).expect("exactly-at-cap envelope must admit");
+
+        // One byte OVER — refused with the typed kind.
+        let over = envelope_of_canonical_len(MAX_ATTESTATION_ENVELOPE_BYTES + 1);
+        let err = check_envelope_size_admission(&over).expect_err("cap+1 envelope must be refused");
+        assert_eq!(err.kind(), "federation_envelope_too_large");
+        match err {
+            crate::federation::Error::EnvelopeTooLarge { bytes, cap } => {
+                assert_eq!(bytes, MAX_ATTESTATION_ENVELOPE_BYTES + 1);
+                assert_eq!(cap, MAX_ATTESTATION_ENVELOPE_BYTES);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cap_is_canonical_bytes_not_pretty_bytes() {
+        // The measured thing is the JCS canonical form — whitespace in any
+        // non-canonical serialization is irrelevant. A value whose PRETTY
+        // form exceeds the cap but whose canonical form fits must admit.
+        let v = envelope_of_canonical_len(MAX_ATTESTATION_ENVELOPE_BYTES);
+        let pretty = serde_json::to_string_pretty(&v).unwrap();
+        assert!(pretty.len() > MAX_ATTESTATION_ENVELOPE_BYTES - 8);
+        check_envelope_size_admission(&v).expect("canonical-bytes rule");
     }
 }

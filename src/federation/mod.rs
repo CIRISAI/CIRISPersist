@@ -3923,6 +3923,22 @@ pub enum Error {
     #[error("conflicts with existing row: {0}")]
     Conflict(String),
 
+    /// v17.9.0 (CIRISConstitution#38 interim) — the attestation envelope's
+    /// canonical (JCS) bytes exceed
+    /// [`admission::MAX_ATTESTATION_ENVELOPE_BYTES`]. The CEG had NO size
+    /// bound at any layer (the 8 MiB HTTP body cap doesn't cover capsule/FFI
+    /// writes), so an unchecked write could park a multi-hundred-MB row on
+    /// the replication plane. Payloads above the cap belong on the degradable
+    /// plane (fountain-content, envelope-carries-manifest). The cap value is
+    /// persist's conservative interim; re-pinned when CC#38 ratifies.
+    #[error("attestation envelope too large: {bytes} bytes > {cap} cap")]
+    EnvelopeTooLarge {
+        /// Canonical-bytes size of the submitted envelope.
+        bytes: usize,
+        /// The admission cap it exceeded.
+        cap: usize,
+    },
+
     /// v2.4.0 (CIRISPersist#102 Ask 3a). The submitted `scores`
     /// attestation's `dimension` begins with `accord:` but the
     /// `attesting_key_id`'s `identity_type` is not `accord_holder`.
@@ -4888,6 +4904,7 @@ impl Error {
             Error::SignatureInvalid(_) => "federation_signature_invalid",
             Error::RateLimited { .. } => "federation_rate_limited",
             Error::Conflict(_) => "federation_conflict",
+            Error::EnvelopeTooLarge { .. } => "federation_envelope_too_large",
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"
             }
