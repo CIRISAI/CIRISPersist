@@ -3279,6 +3279,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // substrate_persist; capacity:* → no self-emission), keyed on the
         // attesting key's identity_type. Runs BEFORE persist_row_hash + INSERT
         // so a rejected emission leaves no trace.
+        crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
         // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11; keying broadened by
@@ -11733,6 +11734,10 @@ impl SqliteBackend {
         replace: bool,
     ) -> Result<String, crate::federation::Error> {
         use crate::federation::Error;
+
+        // v17.9.0 (CC#38 interim) — envelope size cap FIRST, before any
+        // parsing/lookups (cheapest-most-specific-rejection-first).
+        crate::federation::admission::check_envelope_size_admission(&input.attestation_envelope)?;
 
         // The (occurrence, dimension) key + the gate axis. Required.
         let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {

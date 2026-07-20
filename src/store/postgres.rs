@@ -3587,6 +3587,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // system:*/audit_chain:*/… → substrate-self-report; hard_case:* →
         // substrate_persist; capacity:* → no self-emission), keyed on the
         // attesting key's identity_type. Backend-symmetric with SQLite + memory.
+        crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
         // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11; keying broadened by
@@ -11838,6 +11839,10 @@ impl PostgresBackend {
         replace: bool,
     ) -> Result<String, crate::federation::Error> {
         use crate::federation::Error;
+
+        // v17.9.0 (CC#38 interim) — envelope size cap FIRST, before any
+        // parsing/lookups (cheapest-most-specific-rejection-first).
+        crate::federation::admission::check_envelope_size_admission(&input.attestation_envelope)?;
 
         let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
             Error::InvalidArgument(

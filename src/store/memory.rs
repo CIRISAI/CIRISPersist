@@ -481,6 +481,10 @@ impl MemoryBackend {
         replace: bool,
     ) -> Result<String, crate::federation::Error> {
         use crate::federation::Error;
+
+        // v17.9.0 (CC#38 interim) — envelope size cap FIRST, before any
+        // parsing/lookups (cheapest-most-specific-rejection-first).
+        crate::federation::admission::check_envelope_size_admission(&input.attestation_envelope)?;
         let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
             Error::InvalidArgument(
                 "local attestation envelope must carry a \"dimension\" string".into(),
@@ -1754,6 +1758,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v10.3.0 (CIRISPersist#288, CC 3.4.1/3.4.3/3.4.5) — reserved-prefix
         // admission on the attestation_TYPE namespace, keyed on the attesting
         // key's identity_type. Backend-symmetric with SQLite + Postgres.
+        crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
         // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
@@ -11696,6 +11701,50 @@ mod tests {
         )
         .await
         .expect("age_self_declared:band:* is admitted (subject-signed self rung)");
+    }
+
+    /// v17.9.0 (CC#38 interim) — the envelope size cap fires FIRST at both
+    /// write chokepoint families: the federation put and the local-tier
+    /// funnel. One backend suffices — the check is the single-sourced
+    /// `check_envelope_size_admission` at every site (unit-pinned boundary
+    /// in `federation::admission::envelope_size_tests`).
+    #[tokio::test]
+    async fn envelope_size_cap_refuses_oversize_at_both_write_paths() {
+        use crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES;
+        let backend = MemoryBackend::new();
+        let oversize = serde_json::json!({
+            "d": "x".repeat(MAX_ATTESTATION_ENVELOPE_BYTES),
+            "dimension": "test:oversize:v1",
+        });
+
+        // Federation put: refused before signature/directory work.
+        let mut row = fix_attestation("cap-fed", "cap-k", "cap-k", "cap-k");
+        row.attestation_envelope = oversize.clone();
+        let err = backend
+            .put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+            .expect_err("oversize federation put must refuse");
+        assert_eq!(err.kind(), "federation_envelope_too_large");
+
+        // Local-tier funnel: refused at entry (no key seeding needed —
+        // the cap fires before any lookup).
+        let input = crate::federation::types::LocalAttestationInput {
+            attesting_key_id: "cap-k".into(),
+            attested_key_id: None,
+            attestation_type: "scores".into(),
+            attestation_envelope: oversize,
+            subject_key_ids: Vec::new(),
+            expires_at: None,
+            weight: None,
+            cohort_scope: "self".into(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        };
+        let err = backend
+            .attestation_upsert_local(input)
+            .await
+            .expect_err("oversize local upsert must refuse");
+        assert_eq!(err.kind(), "federation_envelope_too_large");
     }
 
     // ── v11.5.0 (CIRISPersist#306, CC 3.2 / CC 3.3.12 / CC 1.15.6) ──────────

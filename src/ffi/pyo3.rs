@@ -25885,6 +25885,9 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // for a method with no DirectoryOp. This is a persist-side contract
         // gap (add the op), not caller-fault; RuntimeError (5xx).
         crate::federation::Error::Unsupported { .. } => PyRuntimeError::new_err(kind),
+        // v17.9.0 (CC#38 interim) — caller-fixable: shrink the envelope or move
+        // the payload to the degradable plane (manifest-in-envelope).
+        crate::federation::Error::EnvelopeTooLarge { .. } => PyValueError::new_err(kind),
     }
 }
 

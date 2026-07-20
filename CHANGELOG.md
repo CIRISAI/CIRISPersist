@@ -5,6 +5,37 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [17.9.0] — 2026-07-16 — envelope size cap at admission (CIRISConstitution#38 interim): the CEG had NO size bound at any layer
+
+### Added — `MAX_ATTESTATION_ENVELOPE_BYTES` (1 MiB, canonical bytes) enforced at every attestation write chokepoint
+
+Verified across the stack before this cut: **no envelope size bound existed
+anywhere** — CC part 2 is silent, persist admission had no check, storage is
+physically bounded only (~1 GB TEXT / ~255 MB JSONB), and the 8 MiB HTTP body
+cap (AV-7) never covered capsule/FFI writes. An unchecked write could park a
+multi-hundred-MB row on the anti-entropy plane. This matters NOW because the
+envelope-native inversion (#473: traces ARE scores attestations) puts ~3 MB
+`full_traces` objects in scope of the attestation plane.
+
+- Single-sourced `check_envelope_size_admission` (canonical **JCS** bytes via
+  the real producer canonicalizer — the signed thing is the sized thing),
+  called FIRST at all six chokepoints: 3× `put_attestation` + 3× local-tier
+  write funnels (cheapest-most-specific-rejection-first; no signature or
+  directory work spent on an inadmissible envelope).
+- 1 MiB, deliberately aligned with the blob plane's `DEFAULT_INLINE_BYTES_CAP`:
+  the substrate-wide discipline is *inline below 1 MiB; above it the envelope
+  carries a manifest (hash + degradable-plane reference) and the payload rides
+  the fountain-content primitive*. Heavy trace-attestations take the manifest
+  path by design.
+- Typed `Error::EnvelopeTooLarge { bytes, cap }`, kind
+  `federation_envelope_too_large` (PyO3: `ValueError` — caller-fixable).
+- Witnesses: exact-boundary unit tests (at-cap admits, cap+1 refuses,
+  canonical-not-pretty bytes measured) + a backend integration proving both
+  write-path families refuse.
+- **Interim value**: CIRISConstitution#38 asks to ratify the discipline (cap +
+  manifest rule + freeze-gate vector) as wire contract; persist re-pins the
+  const if ratification lands on a different number.
+
 ## [17.8.0] — 2026-07-16 — the seeder bridge (#469): announced/advisory LAN peers + the scores read surface's shape-witness gate and bench
 
 ### Added — `record_announced_peer` / `list_announced_peers`: the seeder bridge (#469, CIRISEdge#362)
