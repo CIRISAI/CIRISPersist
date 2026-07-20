@@ -164,7 +164,10 @@ fn envelope_bytes(trace: &CompleteTrace, schema_version: &str) -> Vec<u8> {
 
 /// The shared body: runs assertions (a)-(e) against a migrated backend.
 /// `suffix` keeps PG ids self-isolating across concurrent runs.
-async fn run_hard_cut_assertions<B: Backend>(backend: &B, suffix: &str) {
+async fn run_hard_cut_assertions<B: Backend + ciris_persist::federation::FederationDirectory>(
+    backend: &B,
+    suffix: &str,
+) {
     let (ed_sk, key_id, ed_pk_b64) = producer_key(suffix);
     // Per-run agent_id_hash so PG read-backs (filtered on agent_id_hash)
     // never see another concurrent run's rows.

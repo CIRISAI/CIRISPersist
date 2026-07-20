@@ -538,7 +538,12 @@ impl MemoryBackend {
             )));
         }
 
-        let attestation_id = uuid::Uuid::new_v4().to_string();
+        // v18.0.0 (#473) — caller-supplied deterministic id (replay-idempotent
+        // trace ingest) or the classic fresh v4.
+        let attestation_id = input
+            .attestation_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let attesting_key_id = input.attesting_key_id.clone();
         let now = chrono::Utc::now();
         let mut row = match transit {
@@ -552,6 +557,18 @@ impl MemoryBackend {
             None => input.into_local_row(attestation_id.clone(), now),
         };
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        // v18.0.0 (#473) — replay idempotence for caller-supplied DETERMINISTIC
+        // ids (the trace-ingest mint): an existing attestation_id is a no-op
+        // success, mirroring sqlite's INSERT OR IGNORE / pg's ON CONFLICT DO
+        // NOTHING.
+        if state
+            .federation_attestations
+            .iter()
+            .any(|a| a.attestation_id == row.attestation_id)
+        {
+            return Ok(attestation_id);
+        }
 
         if replace {
             state.federation_attestations.retain(|a| {
@@ -10565,6 +10582,7 @@ mod tests {
         // TRANSIT write because the bound-hybrid signature verifies (§10.1.3).
         let att_id = backend
             .attestation_upsert_local(LocalAttestationInput {
+                attestation_id: None,
                 attesting_key_id: "subject-c".into(),
                 attested_key_id: Some("target-c".into()),
                 attestation_type: attestation_type::SCORES.into(),
@@ -10657,6 +10675,7 @@ mod tests {
         // A crypto-INVALID revocation is REJECTED at admission (never transits).
         let bad = backend
             .attestation_insert_local(LocalAttestationInput {
+                attestation_id: None,
                 attesting_key_id: "subject-c".into(),
                 attested_key_id: Some("target-c".into()),
                 attestation_type: attestation_type::SCORES.into(),
@@ -10684,6 +10703,7 @@ mod tests {
         // An UNSIGNED revocation (no signature material) is likewise rejected.
         let unsigned = backend
             .attestation_insert_local(LocalAttestationInput {
+                attestation_id: None,
                 attesting_key_id: "subject-c".into(),
                 attested_key_id: Some("target-c".into()),
                 attestation_type: attestation_type::SCORES.into(),
@@ -10738,6 +10758,7 @@ mod tests {
         let (_hash, sig_classical, sig_pqc) = sign_envelope("subject-r", &env);
         let att_id = backend
             .attestation_upsert_local(LocalAttestationInput {
+                attestation_id: None,
                 attesting_key_id: "subject-r".into(),
                 attested_key_id: Some("target-r".into()),
                 attestation_type: attestation_type::SCORES.into(),
@@ -11729,6 +11750,7 @@ mod tests {
         // Local-tier funnel: refused at entry (no key seeding needed —
         // the cap fires before any lookup).
         let input = crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
             attesting_key_id: "cap-k".into(),
             attested_key_id: None,
             attestation_type: "scores".into(),

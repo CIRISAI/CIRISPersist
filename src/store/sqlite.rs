@@ -11804,7 +11804,12 @@ impl SqliteBackend {
         // Build the local row + its persist_row_hash. A durable row defers
         // its signature (empty-sentinel scrub envelope); a TRANSIT revocation
         // carries the caller's verified bound-hybrid signature + computed hash.
-        let attestation_id = uuid::Uuid::new_v4().to_string();
+        // v18.0.0 (#473) — caller-supplied deterministic id (replay-idempotent
+        // trace ingest) or the classic fresh v4.
+        let attestation_id = input
+            .attestation_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = chrono::Utc::now();
         let attesting_key_id = input.attesting_key_id.clone();
         let mut row = match transit {
@@ -11843,8 +11848,12 @@ impl SqliteBackend {
                     rusqlite::params![attesting_key_id, dimension],
                 )?;
             }
+            // v18.0.0 (#473) — INSERT OR IGNORE: a caller-supplied DETERMINISTIC
+            // attestation_id (the trace-ingest mint) makes a replayed batch
+            // re-derive the same id and land 0 rows instead of duplicating.
+            // Inert for classic v4 ids.
             tx.execute(
-                "INSERT INTO federation_attestations (\
+                "INSERT OR IGNORE INTO federation_attestations (\
                     attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
@@ -23864,6 +23873,7 @@ mod tests {
         subjects: Vec<String>,
     ) -> crate::federation::types::LocalAttestationInput {
         crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
             attesting_key_id: attesting.into(),
             attested_key_id: None,
             attestation_type: attestation_type.into(),
@@ -24078,6 +24088,7 @@ mod tests {
 
         backend
             .attestation_upsert_local(LocalAttestationInput {
+                attestation_id: None,
                 attesting_key_id: "subject-c".into(),
                 attested_key_id: Some("target-c".into()),
                 attestation_type: attestation_type::SCORES.into(),
@@ -24126,6 +24137,7 @@ mod tests {
         // crypto-INVALID revocation → rejected at admission.
         let bad = backend
             .attestation_insert_local(LocalAttestationInput {
+                attestation_id: None,
                 attesting_key_id: "subject-c".into(),
                 attested_key_id: Some("target-c".into()),
                 attestation_type: attestation_type::SCORES.into(),

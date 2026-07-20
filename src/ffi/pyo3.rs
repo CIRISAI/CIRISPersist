@@ -27716,6 +27716,7 @@ mod tests {
             .unwrap();
             let att_id = sq
                 .attestation_upsert_local(crate::federation::types::LocalAttestationInput {
+                    attestation_id: None,
                     attesting_key_id: derived.clone(),
                     attested_key_id: None,
                     attestation_type: crate::federation::types::attestation_type::SCORES.into(),

@@ -5,6 +5,69 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [18.0.0] — 2026-07-20 — ENVELOPE-NATIVE traces (#473): a trace IS a `scores` attestation, saved as such
+
+The owner doctrine, made structural: **"everything persist saves is a CEG-native
+object put in an envelope."** The live-mesh failure behind #473 — 28 signed
+traces stranded local, 0 replicated, 0 at the canonical — was the `trace_events`
+silo: an object off the substrate can never replicate by CEG state, and every
+bridge/outbox that copies it there is the anti-pattern (the deleted lens-core
+fan-out). This cut inverts the model.
+
+### Changed (MAJOR) — the ingest pipeline mints each verified trace as its canonical CEG object
+
+- `receive_and_persist` now mints **one local-tier `scores` attestation per
+  verified trace** — the trace's canonical home on `federation_attestations` —
+  BEFORE the `trace_events` projection rows land. Dimension
+  `trace:complete:v1` (namespace flagged for CC ratification);
+  `attesting_key_id` = the trace's verified producer key; `subject_key_ids` =
+  [attester] (self-subject — the #461 lesson: subjectless rows are invisible
+  to every V106 seek); `cohort_scope = self`. **Consent promotes
+  `self → community` via the existing `attestation_promote`; replication is
+  pure CEG state** — no push, no outbox.
+- **Replay-idempotent by construction**: the `attestation_id` is DETERMINISTIC
+  (sha256 of the trace_id folded to a UUID) and the local-write funnels now
+  honor a caller-supplied id with conflict-ignore (`INSERT OR IGNORE` /
+  `ON CONFLICT DO NOTHING` / memory existence check) — a replayed batch
+  re-derives the same id and lands zero duplicates.
+- **Size discipline (CC#38)**: an envelope whose canonical bytes fit
+  `MAX_ATTESTATION_ENVELOPE_BYTES` rides WHOLE (the scrubbed trace inline); an
+  oversize trace gets a **manifest envelope** (content hash + byte length +
+  component count) — payload stays queryable in the projection; degradable-
+  plane (fountain) retrieval is the tracked follow-up.
+- **Honest skip accounting**: a relay (`TrustPreVerified`) ingest whose
+  producer key is not yet in this node's directory SKIPS the mint with a
+  warning + `BatchSummary.trace_attestations_skipped` — projection rows still
+  land; the mint self-heals on replay once the key federates.
+- `BatchSummary` gains `trace_attestations_minted` / `trace_attestations_skipped`.
+- `LocalAttestationInput` gains OPTIONAL `attestation_id` (serde-default —
+  additive; every existing caller/wire shape untouched).
+
+### Why MAJOR
+
+`IngestPipeline<B>` (and the ingest queue) now bound `B: Backend +
+FederationDirectory` — a compile-break for any custom backend implementing
+only `Backend`. The storage MODEL also changes: the attestation row is the
+trace's canonical home and `trace_events` is its projection (existing read
+surfaces unchanged in this cut; corpus unification is the tracked long arc).
+
+### Witnesses
+
+- `envelope_native_trace_mints_scores_attestation_and_replays_idempotently` —
+  ingest → the attestation is visible through the REALIZED consumer read
+  (`list_scores`, tier=Local, `dimension_exact`), self-subject, inline
+  envelope; replay lands zero duplicates with the same deterministic id.
+- `envelope_native_mint_skips_honestly_when_producer_unregistered` — the relay
+  shape: projection lands, mint skips with honest accounting.
+- Existing ingest suite green (24/24) with the mint live inside it.
+
+### Not in this cut (tracked)
+
+- Backfill of pre-18.0 `trace_events` rows (they never replicated; a
+  best-effort re-mint tool is a follow-up).
+- Fountain-plane payload retrieval for manifest envelopes.
+- `trace_events` corpus retirement + the wider `cirislens_*` silo arc.
+
 ## [17.9.0] — 2026-07-16 — envelope size cap at admission (CIRISConstitution#38 interim): the CEG had NO size bound at any layer
 
 ### Added — `MAX_ATTESTATION_ENVELOPE_BYTES` (1 MiB, canonical bytes) enforced at every attestation write chokepoint

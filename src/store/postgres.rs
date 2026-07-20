@@ -11898,7 +11898,12 @@ impl PostgresBackend {
             &identity_type,
         )?;
 
-        let attestation_id = uuid::Uuid::new_v4().to_string();
+        // v18.0.0 (#473) — caller-supplied deterministic id (replay-idempotent
+        // trace ingest) or the classic fresh v4.
+        let attestation_id = input
+            .attestation_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = chrono::Utc::now();
         let attesting_key_id = input.attesting_key_id.clone();
         // A durable row defers its signature (empty-sentinel scrub envelope);
@@ -11945,7 +11950,7 @@ impl PostgresBackend {
                 scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
                 subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at\
              ) VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9, $10, $11, $12, \
-                       $13, $14, $15, $16, $17, $18, 'local', NULL)",
+                       $13, $14, $15, $16, $17, $18, 'local', NULL) ON CONFLICT (attestation_id) DO NOTHING",
             &[
                 &attestation_uuid,
                 &row.attesting_key_id,
@@ -17388,6 +17393,7 @@ mod tests {
 
         backend
             .attestation_upsert_local(LocalAttestationInput {
+                attestation_id: None,
                 attesting_key_id: subject.clone(),
                 attested_key_id: Some(target.clone()),
                 attestation_type: attestation_type::SCORES.into(),
@@ -17462,6 +17468,7 @@ mod tests {
         // crypto-INVALID revocation → rejected at admission (never transits).
         let bad = backend
             .attestation_insert_local(LocalAttestationInput {
+                attestation_id: None,
                 attesting_key_id: subject.clone(),
                 attested_key_id: Some(target.clone()),
                 attestation_type: attestation_type::SCORES.into(),
@@ -17528,6 +17535,7 @@ mod tests {
             crate::federation::tier_ingest::test_support::sign_envelope(&subject, &env);
         let att_id = backend
             .attestation_upsert_local(LocalAttestationInput {
+                attestation_id: None,
                 attesting_key_id: subject.clone(),
                 attested_key_id: Some(target.clone()),
                 attestation_type: attestation_type::SCORES.into(),
@@ -30604,6 +30612,7 @@ mod tests {
         subjects: Vec<String>,
     ) -> crate::federation::types::LocalAttestationInput {
         crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
             attesting_key_id: attesting.into(),
             attested_key_id: None,
             attestation_type: attestation_type.into(),

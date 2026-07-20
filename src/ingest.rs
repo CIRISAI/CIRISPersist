@@ -29,6 +29,13 @@ use crate::scrub::{ScrubError, Scrubber};
 use crate::store::{Backend, Error as StoreError, InsertReport};
 use crate::verify::{canonical::Canonicalizer, Error as VerifyError};
 
+/// v18.0.0 (CIRISPersist#473) — the dimension every envelope-native trace
+/// attestation carries. A trace is not a new object kind: it is a `scores`
+/// attestation on this dimension (owner doctrine: "everything persist saves
+/// is a CEG-native object put in an envelope"). Namespace flagged for CC
+/// ratification alongside the CC#38 size discipline.
+pub const TRACE_ATTESTATION_DIMENSION: &str = "trace:complete:v1";
+
 /// What the ingest pipeline did with one `events[]` body.
 ///
 /// Mission constraint (MISSION.md §3 anti-pattern #7): a successful
@@ -43,6 +50,17 @@ pub struct BatchSummary {
     /// Count of `trace_events` rows that landed (excluding ON
     /// CONFLICT skips).
     pub trace_events_inserted: usize,
+    /// v18.0.0 (#473) — envelope-native trace attestations minted this
+    /// batch (one local-tier `scores` attestation per verified trace; a
+    /// replayed trace re-derives the same deterministic id and counts here
+    /// as minted-idempotent).
+    pub trace_attestations_minted: usize,
+    /// v18.0.0 (#473) — traces whose attestation mint was SKIPPED (warn
+    /// logged): typically the attesting key is not in this node's directory
+    /// (relay `TrustPreVerified` ingest of a not-yet-federated producer).
+    /// The projection rows still land; the mint self-heals on replay once
+    /// the key federates.
+    pub trace_attestations_skipped: usize,
     /// Count of `trace_events` ON CONFLICT skips.
     pub trace_events_conflicted: usize,
     /// Count of `trace_llm_calls` rows that landed.
@@ -281,7 +299,13 @@ where
 
 impl<'a, B, C, S> IngestPipeline<'a, B, C, S>
 where
-    B: Backend + ?Sized,
+    // v18.0.0 (CIRISPersist#473) — `FederationDirectory` joined the bound:
+    // the ENVELOPE-NATIVE doctrine ("everything persist saves is a CEG
+    // object in an envelope") makes the ingest pipeline mint each verified
+    // trace as a local-tier `scores` attestation — the trace's canonical
+    // home — via `attestation_insert_local`; `trace_events` rows are the
+    // read-optimized projection.
+    B: Backend + crate::federation::FederationDirectory + ?Sized,
     C: Canonicalizer + ?Sized,
     S: Scrubber + ?Sized,
 {
@@ -396,6 +420,9 @@ where
         //    Envelope columns get attached to each row by index.
         let mut events_to_insert = Vec::new();
         let mut llm_calls_to_insert = Vec::new();
+        // v18.0.0 (#473) — one envelope-native attestation mint per trace.
+        let mut trace_attestation_inputs: Vec<crate::federation::types::LocalAttestationInput> =
+            Vec::new();
         let mut env_idx = 0usize;
         // v4.0 (FSD §4.6) — write-path cohort_scope gate: resolved
         // writer admission, keyed on the signer (`scrub_key_id`). Built
@@ -529,12 +556,47 @@ where
 
                         env_idx += 1;
                     }
+                    // v18.0.0 (#473) — ENVELOPE-NATIVE: collect the trace's
+                    // attestation mint (its canonical CEG home). Runs
+                    // post-scrub (the envelope carries the scrubbed trace,
+                    // consistent with what the projection rows store).
+                    trace_attestation_inputs.push(self.build_trace_attestation_input(trace)?);
                     events_to_insert.extend(d.events);
                     llm_calls_to_insert.extend(d.llm_calls);
                 }
             }
         }
         debug_assert_eq!(env_idx, envelopes.len(), "envelope index drift");
+
+        // 4.9 (v18.0.0, #473) — mint the ENVELOPE-NATIVE trace attestations
+        //    FIRST: the attestation is the trace's canonical home; the
+        //    trace_events rows below are its projection. Deterministic ids +
+        //    the funnels' conflict-ignore make replays idempotent. A mint
+        //    failure (typically: attesting key not in this directory on a
+        //    relay ingest) SKIPS with a warning — the projection still
+        //    lands, and the mint self-heals on replay once the key exists.
+        let mut trace_attestations_minted = 0usize;
+        let mut trace_attestations_skipped = 0usize;
+        for input in trace_attestation_inputs {
+            let tid = input
+                .attestation_envelope
+                .get("trace_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_owned();
+            match self.backend.attestation_insert_local(input).await {
+                Ok(_) => trace_attestations_minted += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        write_path = "trace_ingest",
+                        trace_id = %tid,
+                        reason = %e.kind(),
+                        "ciris-persist: trace attestation mint skipped (#473)"
+                    );
+                    trace_attestations_skipped += 1;
+                }
+            }
+        }
 
         // 5. Insert. Postgres ON CONFLICT DO NOTHING handles
         //    idempotency at the dedup index (FSD §3.4 #4).
@@ -610,6 +672,8 @@ where
         Ok(BatchSummary {
             envelopes_processed: env.events.len(),
             trace_events_inserted: event_report.inserted,
+            trace_attestations_minted,
+            trace_attestations_skipped,
             trace_events_conflicted: event_report.conflicted,
             trace_llm_calls_inserted: llm_inserted,
             scrubbed_fields,
@@ -646,6 +710,86 @@ where
             }
         }
         Ok(hashes)
+    }
+
+    /// v18.0.0 (CIRISPersist#473) — build the ENVELOPE-NATIVE attestation
+    /// mint for one verified, post-scrub trace.
+    ///
+    /// The trace's canonical CEG home is a local-tier `scores` attestation:
+    /// `attesting_key_id` = the trace's verified producer key
+    /// (`signature_key_id`), `subject_key_ids` = [attester] (self-subject —
+    /// a subjectless row is invisible to every V106 seek, the #461 lesson),
+    /// `cohort_scope` = `self` (consent promotes `self → community` via
+    /// `attestation_promote`; replication is pure CEG state). The
+    /// `attestation_id` is DETERMINISTIC (sha256 of the trace_id, folded to
+    /// a UUID) so a replayed batch re-mints the same id and the funnels'
+    /// conflict-ignore deduplicates.
+    ///
+    /// Size discipline (CC#38 / `MAX_ATTESTATION_ENVELOPE_BYTES`): an
+    /// envelope whose canonical bytes fit rides WHOLE (the scrubbed trace
+    /// inline); an oversize trace gets a MANIFEST envelope (content hash +
+    /// byte length + component count) — the payload stays queryable in the
+    /// `trace_events` projection, and degradable-plane (fountain) retrieval
+    /// is the tracked follow-up. Either way the attestation admits.
+    fn build_trace_attestation_input(
+        &self,
+        trace: &crate::schema::CompleteTrace,
+    ) -> Result<crate::federation::types::LocalAttestationInput, IngestError> {
+        use crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES;
+
+        // Deterministic id: sha256("ciris:trace-attestation:v1:" ‖ trace_id)
+        // folded into a UUID (pg's attestation_id column is ::uuid-cast).
+        let mut h = Sha256::new();
+        h.update(b"ciris:trace-attestation:v1:");
+        h.update(trace.trace_id.as_bytes());
+        let digest = h.finalize();
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&digest[..16]);
+        let attestation_id = uuid::Uuid::from_bytes(b).to_string();
+
+        let attesting = trace.signature_key_id.clone();
+        let trace_value = serde_json::to_value(trace)
+            .map_err(|e| IngestError::Sign(format!("trace attestation serialize: {e}")))?;
+        let mut envelope = serde_json::json!({
+            "dimension": TRACE_ATTESTATION_DIMENSION,
+            "trace_id": trace.trace_id,
+            "agent_id_hash": trace.agent_id_hash,
+            "trace": trace_value,
+        });
+
+        let canonical = self
+            .canonicalizer
+            .canonicalize_value(&envelope)
+            .map_err(IngestError::Verify)?;
+        if canonical.len() > MAX_ATTESTATION_ENVELOPE_BYTES {
+            let mut mh = Sha256::new();
+            mh.update(&canonical);
+            envelope = serde_json::json!({
+                "dimension": TRACE_ATTESTATION_DIMENSION,
+                "trace_id": trace.trace_id,
+                "agent_id_hash": trace.agent_id_hash,
+                "manifest": {
+                    "schema": "trace_manifest:v1",
+                    "content_hash": format!("sha256:{}", hex::encode(mh.finalize())),
+                    "byte_len": canonical.len(),
+                    "component_count": trace.components.len(),
+                },
+            });
+        }
+
+        Ok(crate::federation::types::LocalAttestationInput {
+            attestation_id: Some(attestation_id),
+            attesting_key_id: attesting.clone(),
+            attested_key_id: None,
+            attestation_type: "scores".to_owned(),
+            weight: None,
+            expires_at: None,
+            attestation_envelope: envelope,
+            subject_key_ids: vec![attesting],
+            cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        })
     }
 
     /// Sign post-scrub canonical bytes per component. Returns one
@@ -747,9 +891,11 @@ where
         body_sha256: &str,
     ) -> Result<(), IngestError> {
         let key_id = &trace.signature_key_id;
-        let lookup = self
-            .backend
-            .lookup_public_key(key_id)
+        // v18.0.0 (#473) — fully-qualified: the pipeline's B is now bound by
+        // BOTH `Backend` and `FederationDirectory`, which each expose a
+        // `lookup_public_key`. The verify path wants the store-trait one
+        // (unchanged pre-18.0 semantics).
+        let lookup = Backend::lookup_public_key(self.backend, key_id)
             .await
             .map_err(IngestError::Store)?;
 
@@ -1391,6 +1537,110 @@ mod tests {
         let s2 = pipeline.receive_and_persist(&bytes).await.unwrap();
         assert_eq!(s2.trace_events_inserted, 0);
         assert_eq!(s2.trace_events_conflicted, 2);
+    }
+
+    /// v18.0.0 (CIRISPersist#473) — ENVELOPE-NATIVE witness: an ingested
+    /// trace's canonical home is a local-tier `scores` attestation, visible
+    /// through the REALIZED consumer read (`list_scores`, tier=Local), with
+    /// a deterministic id making replays idempotent.
+    #[tokio::test]
+    async fn envelope_native_trace_mints_scores_attestation_and_replays_idempotently() {
+        use crate::federation::FederationDirectory as _;
+        let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
+        let backend = MemoryBackend::new();
+        backend.add_public_key(&key_id, vkey);
+
+        // NOTE: memory's `add_public_key` seeds BOTH the legacy verify
+        // store AND a minimal federation_keys row — the mint's FK holds.
+
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+
+        // First ingest: events land AND the attestation mints.
+        let s1 = pipeline.receive_and_persist(&bytes).await.unwrap();
+        assert_eq!(s1.trace_attestations_minted, 1, "one trace, one mint");
+        assert_eq!(s1.trace_attestations_skipped, 0);
+
+        // The realized consumer read: list_scores, tier=Local, exact dimension.
+        let filter: crate::read::AttestationFilter = serde_json::from_value(serde_json::json!({
+            "dimension_exact": TRACE_ATTESTATION_DIMENSION,
+            "tier": "Local",
+        }))
+        .unwrap();
+        let page = backend
+            .list_scores(&key_id, filter.clone(), None, 10)
+            .await
+            .expect("list_scores");
+        assert_eq!(page.items.len(), 1, "the trace IS a scores attestation");
+        let att = &page.items[0];
+        assert_eq!(att.attesting_key_id, key_id);
+        assert_eq!(
+            att.subject_key_ids,
+            vec![key_id.clone()],
+            "self-subject (#461)"
+        );
+        assert_eq!(
+            att.attestation_envelope
+                .get("dimension")
+                .and_then(|v| v.as_str()),
+            Some(TRACE_ATTESTATION_DIMENSION)
+        );
+        assert!(
+            att.attestation_envelope.get("trace").is_some(),
+            "small trace rides WHOLE (inline envelope, no manifest)"
+        );
+        let minted_id = att.attestation_id.clone();
+
+        // Replay: same bytes → same deterministic id → still exactly ONE row.
+        let s2 = pipeline.receive_and_persist(&bytes).await.unwrap();
+        assert_eq!(
+            s2.trace_events_inserted, 0,
+            "events dedup (pre-18 behavior)"
+        );
+        assert_eq!(s2.trace_attestations_minted, 1, "mint is replay-idempotent");
+        let page2 = backend
+            .list_scores(&key_id, filter, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page2.items.len(), 1, "NO duplicate attestation on replay");
+        assert_eq!(
+            page2.items[0].attestation_id, minted_id,
+            "same deterministic id"
+        );
+    }
+
+    /// v18.0.0 (#473) — an UNREGISTERED producer (the relay
+    /// `TrustPreVerified` shape) skips the mint with honest accounting;
+    /// the projection rows still land.
+    #[tokio::test]
+    async fn envelope_native_mint_skips_honestly_when_producer_unregistered() {
+        let (bytes, _key_id, _vkey) = make_signed_batch_bytes().await;
+        let backend = MemoryBackend::new();
+        // NO key registered anywhere — the true relay shape: authenticity was
+        // established upstream (TrustPreVerified skips the lookup), and the
+        // producer has not yet federated to THIS node's directory.
+
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &backend,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+        let s = pipeline
+            .receive_and_persist_with(&bytes, VerifyMode::TrustPreVerified)
+            .await
+            .unwrap();
+        assert!(s.trace_events_inserted > 0, "projection rows still land");
+        assert_eq!(s.trace_attestations_minted, 0);
+        assert_eq!(s.trace_attestations_skipped, 1, "honest skip accounting");
     }
 
     #[tokio::test]

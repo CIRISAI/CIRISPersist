@@ -3319,6 +3319,7 @@ impl Engine {
         // one bilateral_pair_id. Local-tier, self-cohort.
         let grant_id = directory
             .attestation_upsert_local(LocalAttestationInput {
+                attestation_id: None,
                 attesting_key_id: input.identity_key_id.clone(),
                 attested_key_id: Some(input.agent.occurrence_key_id.clone()),
                 attestation_type: attestation_type::SCORES.to_owned(),
@@ -3336,6 +3337,7 @@ impl Engine {
             .await?;
         let accept_id = directory
             .attestation_upsert_local(LocalAttestationInput {
+                attestation_id: None,
                 attesting_key_id: input.agent.occurrence_key_id.clone(),
                 attested_key_id: Some(input.identity_key_id.clone()),
                 attestation_type: attestation_type::SCORES.to_owned(),
@@ -3361,6 +3363,7 @@ impl Engine {
             .unwrap_or_else(|| crate::federation::SELF_AT_LOGIN_DELEGATION_SCOPE.to_vec());
         let delegation_id = directory
             .attestation_upsert_local(LocalAttestationInput {
+                attestation_id: None,
                 attesting_key_id: input.identity_key_id.clone(),
                 attested_key_id: Some(input.agent.occurrence_key_id.clone()),
                 attestation_type: attestation_type::DELEGATES_TO.to_owned(),
@@ -8891,6 +8894,7 @@ mod tests {
 
         // Write a local-tier self-attestation (signature deferred).
         let input = crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
             attesting_key_id: derived.clone(),
             attested_key_id: None,
             attestation_type: SCORES.into(),
@@ -9035,6 +9039,7 @@ mod tests {
         pg.put_public_key(SignedKeyRecord { record }).await.unwrap();
 
         let input = crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
             attesting_key_id: occ.clone(),
             attested_key_id: None,
             attestation_type: SCORES.into(),
