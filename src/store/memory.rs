@@ -485,6 +485,12 @@ impl MemoryBackend {
         // v17.9.0 (CC#38 interim) — envelope size cap FIRST, before any
         // parsing/lookups (cheapest-most-specific-rejection-first).
         crate::federation::admission::check_envelope_size_admission(&input.attestation_envelope)?;
+        crate::federation::admission::check_trace_dimension_admission(
+            input.dimension(),
+            &input.attesting_key_id,
+            &input.subject_key_ids,
+            &input.attestation_envelope,
+        )?;
         let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
             Error::InvalidArgument(
                 "local attestation envelope must carry a \"dimension\" string".into(),
@@ -1776,6 +1782,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // admission on the attestation_TYPE namespace, keyed on the attesting
         // key's identity_type. Backend-symmetric with SQLite + Postgres.
         crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
+        crate::federation::admission::check_trace_dimension_admission(
+            crate::federation::admission::envelope_dimension(&row.attestation_envelope),
+            &row.attesting_key_id,
+            &row.subject_key_ids,
+            &row.attestation_envelope,
+        )?;
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
         // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-

@@ -1249,6 +1249,124 @@ pub fn check_local_tier_eligibility(
     Ok(LocalTierDisposition::Durable)
 }
 
+/// v18.1.0 (CIRISPersist#473 followup) — the `trace:` namespace prefix. The
+/// dimension is the CEG's Information-Type parameter; `trace:*` is the
+/// envelope-native trace family (`trace:complete:v1` = the v18.0.0 ingest
+/// mint's member). Registry entry + validator pending CC ratification
+/// (namespace catalog + `trace_manifest:v1` schema + the self-emission rule);
+/// this const + [`check_trace_dimension_admission`] are persist's
+/// machine-checkable interim, the same posture as the CC#38 size cap.
+pub const TRACE_DIMENSION_PREFIX: &str = "trace:";
+
+/// v18.1.0 (CIRISPersist#473 followup) — the `trace:*` Information-Type
+/// validator. No-op for non-`trace:` dimensions. For `trace:*`:
+///
+/// 1. **Self-emission** (the inverse polarity of `capacity:*`'s anti-self
+///    rule): a trace records its own producer's reasoning, so
+///    `attesting_key_id` MUST appear in `subject_key_ids`. Third-party
+///    emission on the namespace is refused.
+/// 2. **Shape**: the envelope MUST carry `trace_id` + `agent_id_hash`
+///    (strings) and EXACTLY ONE of:
+///    - `trace` (object) — the inline post-scrub CompleteTrace, or
+///    - `manifest` (object) — `schema == "trace_manifest:v1"`,
+///      `content_hash` a `"sha256:"`-prefixed string, positive integer
+///      `byte_len`, integer `component_count` (the CC#38 oversize form).
+///
+/// Admission validates SHAPE, machine-checkably — a `trace:*` row that
+/// admits is guaranteed parseable by every consumer. PROVENANCE rides the
+/// producer signature inside the envelope (verified at promotion/read);
+/// neither half substitutes for the other.
+pub fn check_trace_dimension_admission(
+    dimension: Option<&str>,
+    attesting_key_id: &str,
+    subject_key_ids: &[String],
+    envelope: &serde_json::Value,
+) -> Result<(), Error> {
+    let Some(dim) = dimension else {
+        return Ok(());
+    };
+    if !dim.starts_with(TRACE_DIMENSION_PREFIX) {
+        return Ok(());
+    }
+    let refuse = |detail: String| Err(Error::TraceDimensionInvalid { detail });
+
+    // 1. Self-emission.
+    if !subject_key_ids.iter().any(|s| s == attesting_key_id) {
+        return refuse(format!(
+            "trace:* is self-emitted: attesting_key_id {attesting_key_id} must appear in \
+             subject_key_ids (a trace records its own producer's reasoning)"
+        ));
+    }
+
+    // 2. Required identity fields.
+    for field in ["trace_id", "agent_id_hash"] {
+        match envelope.get(field) {
+            Some(serde_json::Value::String(v)) if !v.is_empty() => {}
+            _ => {
+                return refuse(format!(
+                    "trace:* envelope must carry non-empty string \"{field}\""
+                ))
+            }
+        }
+    }
+
+    // 3. Exactly one of inline `trace` / `manifest`.
+    let inline = envelope.get("trace");
+    let manifest = envelope.get("manifest");
+    match (inline, manifest) {
+        (Some(t), None) => {
+            if !t.is_object() {
+                return refuse("trace:* inline form: \"trace\" must be an object".into());
+            }
+        }
+        (None, Some(m)) => {
+            let Some(m) = m.as_object() else {
+                return refuse("trace:* manifest form: \"manifest\" must be an object".into());
+            };
+            if m.get("schema").and_then(|v| v.as_str()) != Some("trace_manifest:v1") {
+                return refuse(
+                    "trace:* manifest form: \"schema\" must be \"trace_manifest:v1\"".into(),
+                );
+            }
+            match m.get("content_hash").and_then(|v| v.as_str()) {
+                Some(h) if h.starts_with("sha256:") && h.len() > "sha256:".len() => {}
+                _ => {
+                    return refuse(
+                        "trace:* manifest form: \"content_hash\" must be a \
+                         \"sha256:\"-prefixed string"
+                            .into(),
+                    )
+                }
+            }
+            match m.get("byte_len").and_then(|v| v.as_u64()) {
+                Some(n) if n > 0 => {}
+                _ => {
+                    return refuse(
+                        "trace:* manifest form: \"byte_len\" must be a positive integer".into(),
+                    )
+                }
+            }
+            if m.get("component_count").and_then(|v| v.as_u64()).is_none() {
+                return refuse(
+                    "trace:* manifest form: \"component_count\" must be an integer".into(),
+                );
+            }
+        }
+        (Some(_), Some(_)) => {
+            return refuse(
+                "trace:* envelope must carry EXACTLY ONE of \"trace\" / \"manifest\", not both"
+                    .into(),
+            )
+        }
+        (None, None) => {
+            return refuse(
+                "trace:* envelope must carry one of \"trace\" (inline) / \"manifest\"".into(),
+            )
+        }
+    }
+    Ok(())
+}
+
 /// v4.4.0 (CIRISPersist#171, CEG §7.5 / AV-62) — the federation-path
 /// mirror of the `capacity:*` anti-Goodhart rule: a `capacity:*` row
 /// MUST have `attesting_key_id != attested_key_id` (no self-scoring).
@@ -8795,5 +8913,121 @@ mod envelope_size_tests {
         let pretty = serde_json::to_string_pretty(&v).unwrap();
         assert!(pretty.len() > MAX_ATTESTATION_ENVELOPE_BYTES - 8);
         check_envelope_size_admission(&v).expect("canonical-bytes rule");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// v18.1.0 — trace:* Information-Type validator witnesses.
+// ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod trace_dimension_tests {
+    use super::check_trace_dimension_admission;
+
+    fn subjects(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn inline_env() -> serde_json::Value {
+        serde_json::json!({
+            "dimension": "trace:complete:v1",
+            "trace_id": "t-1", "agent_id_hash": "ah-1",
+            "trace": {"components": []}
+        })
+    }
+
+    fn manifest_env() -> serde_json::Value {
+        serde_json::json!({
+            "dimension": "trace:complete:v1",
+            "trace_id": "t-1", "agent_id_hash": "ah-1",
+            "manifest": {"schema": "trace_manifest:v1",
+                          "content_hash": "sha256:abc123",
+                          "byte_len": 2_000_000, "component_count": 16}
+        })
+    }
+
+    #[test]
+    fn non_trace_dimension_is_a_no_op() {
+        check_trace_dimension_admission(
+            Some("consent:community_trust:v1"),
+            "k",
+            &[],
+            &serde_json::json!({}),
+        )
+        .expect("non-trace dimensions bypass");
+        check_trace_dimension_admission(None, "k", &[], &serde_json::json!({})).expect("no dim");
+    }
+
+    #[test]
+    fn valid_inline_and_manifest_forms_admit() {
+        check_trace_dimension_admission(
+            Some("trace:complete:v1"),
+            "prod",
+            &subjects(&["prod"]),
+            &inline_env(),
+        )
+        .expect("inline form");
+        check_trace_dimension_admission(
+            Some("trace:complete:v1"),
+            "prod",
+            &subjects(&["prod", "other"]),
+            &manifest_env(),
+        )
+        .expect("manifest form");
+    }
+
+    #[test]
+    fn third_party_emission_refused_self_rule() {
+        let err = check_trace_dimension_admission(
+            Some("trace:complete:v1"),
+            "third-party",
+            &subjects(&["prod"]),
+            &inline_env(),
+        )
+        .expect_err("attester not in subjects must refuse");
+        assert_eq!(err.kind(), "federation_trace_dimension_invalid");
+    }
+
+    #[test]
+    fn shape_violations_each_refuse_with_the_typed_kind() {
+        let cases: Vec<serde_json::Value> = vec![
+            // missing trace_id
+            serde_json::json!({"dimension":"trace:x:v1","agent_id_hash":"a","trace":{}}),
+            // empty agent_id_hash
+            serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"","trace":{}}),
+            // neither form
+            serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"a"}),
+            // both forms
+            serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"a",
+                               "trace":{}, "manifest":{"schema":"trace_manifest:v1",
+                               "content_hash":"sha256:x","byte_len":1,"component_count":1}}),
+            // inline not an object
+            serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"a","trace":"str"}),
+            // manifest wrong schema
+            serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"a",
+                               "manifest":{"schema":"nope","content_hash":"sha256:x","byte_len":1,"component_count":1}}),
+            // manifest un-prefixed hash
+            serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"a",
+                               "manifest":{"schema":"trace_manifest:v1","content_hash":"abc","byte_len":1,"component_count":1}}),
+            // manifest zero byte_len
+            serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"a",
+                               "manifest":{"schema":"trace_manifest:v1","content_hash":"sha256:x","byte_len":0,"component_count":1}}),
+            // manifest missing component_count
+            serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"a",
+                               "manifest":{"schema":"trace_manifest:v1","content_hash":"sha256:x","byte_len":1}}),
+        ];
+        for (i, env) in cases.iter().enumerate() {
+            let err = check_trace_dimension_admission(
+                Some("trace:x:v1"),
+                "prod",
+                &subjects(&["prod"]),
+                env,
+            )
+            .expect_err("shape case must refuse");
+            assert_eq!(
+                err.kind(),
+                "federation_trace_dimension_invalid",
+                "case {i} typed kind"
+            );
+        }
     }
 }
