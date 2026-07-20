@@ -1043,6 +1043,16 @@ fn is_default_tier(tier: &str) -> bool {
 /// signature is deferred to `attestation_promote` (no hybrid sig here).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalAttestationInput {
+    /// v18.0.0 (CIRISPersist#473) — OPTIONAL caller-supplied
+    /// `attestation_id`. `None` (the default; pre-18.0 wire shape) mints a
+    /// fresh UUIDv4 exactly as before. `Some` lets an idempotent producer —
+    /// the envelope-native trace ingest — derive a DETERMINISTIC id (e.g.
+    /// from `trace_id`) so a replayed batch re-mints the SAME id and the
+    /// insert path's conflict-ignore makes the mint replay-safe instead of
+    /// duplicating. Additive + serde-default: every existing caller/wire
+    /// shape is untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_id: Option<String>,
     /// The producing occurrence's `federation_keys.key_id` (the
     /// `witness_relation: self` producer). Must exist in federation_keys.
     pub attesting_key_id: String,

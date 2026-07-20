@@ -255,7 +255,7 @@ pub fn spawn_persister<B, C, S>(
     signer_key_id: String,
 ) -> (IngestHandle, PersisterHandle)
 where
-    B: Backend + 'static,
+    B: Backend + crate::federation::FederationDirectory + 'static,
     C: Canonicalizer + 'static,
     S: Scrubber + 'static,
 {
