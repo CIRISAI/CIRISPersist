@@ -630,6 +630,17 @@ pub enum DirectoryOp {
     /// CIRISPersist#469) — the live (not-yet-admitted) bookmarks, newest
     /// `last_seen_at` first. Result rides `AnnouncedPeers`. APPEND-ONLY.
     ListAnnouncedPeers,
+    /// [`crate::federation::trust_root::trust_root_valid`] (v18.2.0,
+    /// CIRISPersist#481) — the pluggable-trust-root graph predicate
+    /// (edge + self-declaration + lifecycle + halt latch), served from
+    /// persist so server/edge/agent share ONE implementation. Result rides
+    /// `TrustRootVerdict`. APPEND-ONLY.
+    TrustRootValid {
+        /// The trusting user/node occurrence key.
+        user_key_id: String,
+        /// The candidate external root key.
+        root_key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -732,6 +743,9 @@ pub enum DirectoryOpResult {
     /// `list_announced_peers` (v17.8.0, #469) — the live advisory-peer
     /// bookmarks (non-canonical, untrusted, never an authority). APPEND-ONLY.
     AnnouncedPeers(Vec<crate::federation::types::AnnouncedPeer>),
+    /// `trust_root_valid` (v18.2.0, #481) — the per-check trust-root
+    /// verdict. APPEND-ONLY.
+    TrustRootVerdict(crate::federation::trust_root::TrustRootVerdict),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -959,6 +973,15 @@ pub async fn dispatch_directory_op(
         },
         DirectoryOp::ListAnnouncedPeers => match dir.list_announced_peers().await {
             Ok(v) => DirectoryOpResult::AnnouncedPeers(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::TrustRootValid {
+            user_key_id,
+            root_key_id,
+        } => match crate::federation::trust_root::trust_root_valid(dir, &user_key_id, &root_key_id)
+            .await
+        {
+            Ok(v) => DirectoryOpResult::TrustRootVerdict(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
         DirectoryOp::PutLocationProof { proof } => match dir.put_location_proof(proof).await {
