@@ -641,6 +641,18 @@ pub enum DirectoryOp {
         /// The candidate external root key.
         root_key_id: String,
     },
+    /// [`crate::federation::trust_root::capability_roots_to_trusted_root`]
+    /// (v18.3.0, CIRISPersist#483) — the composed capability walk: does
+    /// `subject_key_id` hold `scope`, granted by a root `user_key_id`
+    /// trusts? CIRISEdge#386 leg B (the trace serve gate). APPEND-ONLY.
+    CapabilityRootsToTrustedRoot {
+        /// The local node asking.
+        user_key_id: String,
+        /// The peer whose capability is in question.
+        subject_key_id: String,
+        /// The delegation scope token (e.g. `infra:serve`).
+        scope: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -746,6 +758,10 @@ pub enum DirectoryOpResult {
     /// `trust_root_valid` (v18.2.0, #481) — the per-check trust-root
     /// verdict. APPEND-ONLY.
     TrustRootVerdict(crate::federation::trust_root::TrustRootVerdict),
+    /// `capability_roots_to_trusted_root` (v18.3.0, #483) — the winning
+    /// grant, or `None` if the subject holds the scope from no trusted
+    /// root. APPEND-ONLY.
+    TrustedGrant(Option<crate::federation::trust_root::TrustedGrant>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -982,6 +998,21 @@ pub async fn dispatch_directory_op(
             .await
         {
             Ok(v) => DirectoryOpResult::TrustRootVerdict(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        DirectoryOp::CapabilityRootsToTrustedRoot {
+            user_key_id,
+            subject_key_id,
+            scope,
+        } => match crate::federation::trust_root::capability_roots_to_trusted_root(
+            dir,
+            &user_key_id,
+            &subject_key_id,
+            &scope,
+        )
+        .await
+        {
+            Ok(g) => DirectoryOpResult::TrustedGrant(g),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
         DirectoryOp::PutLocationProof { proof } => match dir.put_location_proof(proof).await {

@@ -7838,6 +7838,269 @@ mod tests {
         );
     }
 
+    /// v18.3.0 (CIRISPersist#483) — the composed capability walk: a
+    /// subject's `infra:serve`, granted by a root the asking user trusts,
+    /// resolves to that root; when the user un-trusts the root (edge
+    /// tombstone), the SAME subject grant no longer roots → `None`. This is
+    /// edge#386's trace-serve gate: serve only under a COMMON valid root.
+    #[tokio::test]
+    async fn capability_roots_to_trusted_root_483() {
+        use crate::federation::trust_root::{capability_roots_to_trusted_root, trust_root_valid};
+        let backend = MemoryBackend::new();
+        for (k, it) in [
+            ("cr-user", "user"),
+            ("cr-root", "node"),
+            ("cr-peer", "node"),
+            ("cr-la", "accord_holder"),
+        ] {
+            let mut rec = fix_key(k, "ref", k);
+            rec.identity_type = it.to_owned();
+            backend
+                .put_public_key(SignedKeyRecord { record: rec })
+                .await
+                .unwrap();
+        }
+        let infra = || serde_json::json!(["infra:attest", "infra:serve"]);
+
+        // Root self-declares + user trusts it + fresh lifecycle (the full
+        // valid-root fixture, mirroring the 481 witness).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to("cr-rootdecl", "cr-root", "cr-root", infra()),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to("cr-edge", "cr-user", "cr-root", infra()),
+            })
+            .await
+            .unwrap();
+        let mut lc = fix_attestation("cr-lc", "cr-la", "cr-root", "cr-la");
+        lc.attestation_envelope = serde_json::json!({
+            "id": "cr-lc", "dimension": "accord:lifecycle:v1", "score": 1.0, "confidence": 0.9,
+        });
+        lc.asserted_at = chrono::Utc::now();
+        resign_fix(&mut lc);
+        backend
+            .put_attestation(SignedAttestation { attestation: lc })
+            .await
+            .unwrap();
+        assert!(
+            trust_root_valid(&backend, "cr-user", "cr-root")
+                .await
+                .unwrap()
+                .valid,
+            "fixture: root is valid for the user"
+        );
+
+        // The root grants the PEER infra:serve.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "cr-grant",
+                    "cr-root",
+                    "cr-peer",
+                    serde_json::json!(["infra:serve"]),
+                ),
+            })
+            .await
+            .unwrap();
+
+        // #483 — the peer's infra:serve roots to a root the user trusts.
+        let grant = capability_roots_to_trusted_root(&backend, "cr-user", "cr-peer", "infra:serve")
+            .await
+            .expect("walk")
+            .expect("peer serves under a root the user trusts");
+        assert_eq!(grant.root_key_id, "cr-root");
+        assert_eq!(grant.grant_attestation_id, "cr-grant");
+        assert!(grant.verdict.valid);
+
+        // A scope the peer was NOT granted → None.
+        assert!(
+            capability_roots_to_trusted_root(&backend, "cr-user", "cr-peer", "infra:store")
+                .await
+                .unwrap()
+                .is_none(),
+            "ungranted scope roots nowhere"
+        );
+
+        // Un-trust the root: the peer's grant now roots to nothing.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_withdraws("cr-w", "cr-user", "cr-edge"),
+            })
+            .await
+            .unwrap();
+        assert!(
+            capability_roots_to_trusted_root(&backend, "cr-user", "cr-peer", "infra:serve")
+                .await
+                .unwrap()
+                .is_none(),
+            "un-trusting the root stops the peer serving immediately (edge#386)"
+        );
+    }
+
+    /// v18.3.0 (CIRISPersist#484) — the exported co-scrub minting helpers
+    /// let a consumer test the `has_effective_role` ALLOW path, not just the
+    /// deny path (the CIRISEdge#379 fail-closed-blindness fix). Same crate,
+    /// so `#[cfg(test)]` reaches them; downstream reaches them via the
+    /// `test-anchor` feature (`ciris_persist::federation::accord_test_support`).
+    #[tokio::test]
+    async fn exported_coscrub_helpers_prove_has_effective_role_allow_and_deny_484() {
+        use crate::federation::admission::has_effective_role_over_roster;
+        use crate::federation::operational::test_support::{
+            register_accord_holder, signed_canonical_record, signed_canonical_record_with_roles,
+            Identity,
+        };
+        let backend = MemoryBackend::new();
+
+        // A 2-of-3 accord family (register the pinned pubkeys the co-scrub
+        // verifies against).
+        let holders = [
+            Identity::new("h0-484"),
+            Identity::new("h1-484"),
+            Identity::new("h2-484"),
+        ];
+        for h in &holders {
+            register_accord_holder(&backend, h)
+                .await
+                .expect("register holder");
+        }
+        let roster: Vec<String> = holders.iter().map(|h| h.key_id.clone()).collect();
+        let env = serde_json::json!({ "key_id": "canon-484", "purpose": "test" });
+
+        // ALLOW: a genuinely co-scrubbed record claiming infra:serve, signed
+        // by 2 distinct holders → has_effective_role == true.
+        let allow = signed_canonical_record_with_roles(
+            "canon-484",
+            "node",
+            vec!["infra:serve".to_owned()],
+            env.clone(),
+            &[&holders[0], &holders[1]],
+        );
+        backend
+            .put_public_key(SignedKeyRecord { record: allow })
+            .await
+            .expect("co-scrubbed record admits");
+        assert!(
+            has_effective_role_over_roster(&backend, "canon-484", "infra:serve", &roster)
+                .await
+                .unwrap(),
+            "(484) genuinely co-scrubbed record → has_effective_role ALLOW"
+        );
+
+        // DENY: a record with the SAME role claim but NO co-scrub (only a
+        // self-scrub) → false. This is what edge could test before; now both
+        // arms are provable.
+        let self_only = signed_canonical_record_with_roles(
+            "canon-484-self",
+            "node",
+            vec!["infra:serve".to_owned()],
+            serde_json::json!({ "key_id": "canon-484-self" }),
+            &[&Identity::new("self-484")], // not in the roster → does not count
+        );
+        backend
+            .put_public_key(SignedKeyRecord { record: self_only })
+            .await
+            .expect("self-scrubbed record still stores");
+        assert!(
+            !has_effective_role_over_roster(&backend, "canon-484-self", "infra:serve", &roster)
+                .await
+                .unwrap(),
+            "(484) self-asserted role with no accord co-scrub → DENY"
+        );
+
+        // And the plain (rolesless) builder is unaffected — sanity that the
+        // export didn't change existing behavior.
+        let _plain = signed_canonical_record("x-484", "node", env, &[&holders[0]]);
+    }
+
+    /// v18.3.0 (CIRISPersist#480, persist-side compat confirmation) — a
+    /// `canonical,node` record that ALSO carries `roles:["infra:serve"]`
+    /// still (a) passes the 2-of-3 `check_canonical_role_admission` core
+    /// gate — the co-scrub is over `registration_envelope`, and `roles` is a
+    /// separate column, so the added role does not perturb admission — and
+    /// (b) preserves the `canonical` identity_type the genesis seed
+    /// re-verify (`verify_canonical_seeded`) asserts. So when server hands us
+    /// the re-blessed `SignedKeyRecord` for `canonical_seed.json`, the seed
+    /// swap is a drop-in: both gates already accept it, and BOTH effective
+    /// roles read true. (The seed JSON change itself waits on that
+    /// accord-holder-signed record — this proves persist is ready for it.)
+    #[tokio::test]
+    async fn canonical_record_with_infra_serve_role_admits_and_reads_both_480() {
+        use crate::federation::admission::{
+            check_canonical_role_admission_over_roster, has_effective_role_over_roster,
+        };
+        use crate::federation::operational::test_support::{
+            register_accord_holder, signed_canonical_record_with_roles, Identity,
+        };
+        use crate::federation::types::identity_type;
+        let backend = MemoryBackend::new();
+        let holders = [
+            Identity::new("h0-480"),
+            Identity::new("h1-480"),
+            Identity::new("h2-480"),
+        ];
+        for h in &holders {
+            register_accord_holder(&backend, h).await.unwrap();
+        }
+        let roster: Vec<String> = holders.iter().map(|h| h.key_id.clone()).collect();
+
+        // canonical,node + infra:serve, genuinely 2-of-3 co-scrubbed.
+        let rec = signed_canonical_record_with_roles(
+            "ciris-canonical-test-480",
+            "canonical,node",
+            vec!["infra:serve".to_owned()],
+            serde_json::json!({ "key_id": "ciris-canonical-test-480" }),
+            &[&holders[0], &holders[1]],
+        );
+
+        // (a) the canonical admission gate accepts the added role.
+        check_canonical_role_admission_over_roster(&backend, &rec, &roster)
+            .await
+            .expect("(480a) canonical admission accepts a record carrying infra:serve");
+
+        // (b) the seed re-verify invariant: canonical role preserved.
+        assert!(
+            identity_type::set_contains(&rec.identity_type, identity_type::CANONICAL),
+            "(480b) verify_canonical_seeded's `canonical` invariant holds"
+        );
+
+        // Store + read both effective roles (put_public_key here would fire
+        // the PRODUCTION-roster canonical gate, so seed the row directly via
+        // the state — the read path is what #480 cares about).
+        {
+            let mut st = backend.state.lock().expect("lock");
+            let mut stored = rec.clone();
+            stored.persist_row_hash =
+                crate::federation::types::compute_persist_row_hash(&stored).unwrap();
+            st.federation_keys.insert(stored.key_id.clone(), stored);
+        }
+        assert!(
+            has_effective_role_over_roster(
+                &backend,
+                "ciris-canonical-test-480",
+                identity_type::CANONICAL,
+                &roster
+            )
+            .await
+            .unwrap(),
+            "(480) canonical role reads effective"
+        );
+        assert!(
+            has_effective_role_over_roster(
+                &backend,
+                "ciris-canonical-test-480",
+                "infra:serve",
+                &roster
+            )
+            .await
+            .unwrap(),
+            "(480) infra:serve role ALSO reads effective — the trace-serve gate opens"
+        );
+    }
+
     #[tokio::test]
     async fn memory_withdraws_admission_rules_2_3_and_refusal() {
         let backend = MemoryBackend::new();

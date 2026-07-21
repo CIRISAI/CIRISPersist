@@ -678,9 +678,19 @@ fn partner_wins(a: &PartnerRecord, b: &PartnerRecord) -> bool {
 /// the builders are legitimately unused there; without this, `-D warnings`
 /// fails the job on dead_code. The operational unit tests in this file
 /// exercise the pure resolvers and don't need the signed-envelope helpers.
-#[cfg(test)]
+// v18.3.0 (CIRISPersist#484) — the gate widened from `#[cfg(test)]` to
+// `#[cfg(any(test, feature = "test-anchor"))]` so DOWNSTREAM test builds can
+// mint a genuinely accord-co-scrubbed record and test the `has_effective_role`
+// ALLOW path. Under `#[cfg(test)]` alone these were unreachable to a consumer
+// (a dependency's test items never compile into the dependent), so consumers
+// gating real planes on `has_effective_role` (edge trace-serve) could only
+// test the DENY path — the exact blindness that shipped CIRISEdge#379's gate
+// fail-closed-dead in the field. `test-anchor` is persist's established
+// "test-only, NEVER in a published wheel" fence (see Cargo.toml), so the
+// signing helpers stay out of release builds.
+#[cfg(any(test, feature = "test-anchor"))]
 #[allow(dead_code)]
-pub(crate) mod test_support {
+pub mod test_support {
     use super::*;
     use base64::Engine as _;
     use ciris_crypto::{ClassicalSigner, Ed25519Signer, MlDsa65Signer, PqcSigner};
@@ -950,6 +960,72 @@ pub(crate) mod test_support {
             consent_role: None,
             additional_scrubs: scrub_sigs[1..].to_vec(),
         }
+    }
+
+    /// v18.3.0 (CIRISPersist#484) — a co-scrubbed record that carries
+    /// `roles`, so a consumer can test the `has_effective_role` **ALLOW**
+    /// path (not just the deny path).
+    ///
+    /// Identical to [`signed_canonical_record`] but stamps `roles` onto the
+    /// row. The co-scrub is over `JCS(registration_envelope)` (the roles
+    /// column is not part of the signed bytes — matching the production
+    /// admission model: role CLAIM is the column, role CONFERRAL is the
+    /// re-verified co-scrub against the accord roster). Pass 2 distinct
+    /// accord-holder `Identity`s (a 2-of-3 admit) as `scrubbers`, register
+    /// them with [`register_accord_holder`], then read back with
+    /// [`crate::federation::admission::has_effective_role_over_roster`] over
+    /// their key_ids.
+    pub fn signed_canonical_record_with_roles(
+        key_id: &str,
+        identity_type: &str,
+        roles: Vec<String>,
+        envelope: serde_json::Value,
+        scrubbers: &[&Identity],
+    ) -> crate::federation::types::KeyRecord {
+        let mut rec = signed_canonical_record(key_id, identity_type, envelope, scrubbers);
+        rec.roles = roles;
+        rec
+    }
+
+    /// v18.3.0 (CIRISPersist#484) — register `holder`'s PINNED hybrid
+    /// pubkeys as a directory row so the accord roster resolves to keys the
+    /// co-scrub can be verified against. `node` identity_type (not
+    /// `accord_holder`) so it skips the hardware-signer gate — the roster
+    /// resolution in `verify_accord_family_coscrub` only needs the pubkeys,
+    /// not the HW attestation. The exported analogue of admission's
+    /// previously-private `register_founder`.
+    pub async fn register_accord_holder(
+        directory: &dyn crate::federation::FederationDirectory,
+        holder: &Identity,
+    ) -> Result<(), crate::federation::Error> {
+        let m = holder.member();
+        let rec = crate::federation::types::KeyRecord {
+            key_id: holder.key_id.clone(),
+            pubkey_ed25519_base64: m.ed25519_public_key_base64,
+            pubkey_ml_dsa_65_base64: m.mldsa65_public_key_base64,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: crate::federation::types::identity_type::NODE.to_owned(),
+            identity_ref: holder.key_id.clone(),
+            valid_from: chrono::Utc::now(),
+            valid_until: None,
+            registration_envelope: json!({ "key_id": holder.key_id }),
+            original_content_hash: "test-anchor".to_owned(),
+            scrub_signature_classical: "AA".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: holder.key_id.clone(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        // persist_row_hash is (re)computed by the backend on write (parity
+        // with admission's private `register_founder`, which left it empty).
+        directory
+            .put_public_key(crate::federation::types::SignedKeyRecord { record: rec })
+            .await
     }
 }
 
