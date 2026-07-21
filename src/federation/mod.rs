@@ -72,6 +72,7 @@ pub mod replication;
 pub mod rooting;
 pub mod schema_resolver;
 pub mod scores;
+pub mod trust_root;
 // CIRISPersist#210 — cross-process leader election (RNS shared-instance
 // owner; CIRISEdge#100). Backend-agnostic types + staleness helper; the
 // atomic acquire/heartbeat/release live in the backends.

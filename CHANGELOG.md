@@ -5,6 +5,44 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [18.2.0] — 2026-07-20 — pluggable-trust-root substrate (#481): the `trust_root_valid` walk + the four admission/tombstone confirmations
+
+Substrate half of CIRISServer `FSD/TRUST_ROOT_CAPABILITY_GATE.md`
+(CC ratification: CIRISConstitution#40). Trust is a layered graph of plain
+`attestation` / `delegates_to` objects — **no new object kind**.
+
+### Added — `federation::trust_root::trust_root_valid` (+ capsule op)
+
+The FSD's pure graph predicate, served from persist so server / edge / agent
+share ONE implementation ("never a client assertion, never a cached flag"):
+1. a live `delegates_to(user → root)` edge exists, `root != user` (the base
+   self-root NEVER satisfies the external-root gate);
+2. `root` self-declares — live `delegates_to(root → root)` whose envelope
+   `scope` includes `infra:attest` / `infra:serve`;
+3. a live `accord:lifecycle:v1` attestation about the root is within the
+   90-day freshness window (`ACCORD_LIFECYCLE_FRESHNESS_DAYS`,
+   CC#40-tracked);
+4. no accord halt is latched for the root (`get_active_halt`;
+   backends that cannot answer report `halt_latched: None` honestly).
+Returns a typed per-check [`TrustRootVerdict`] (open accounting — consumers
+gate on `valid` but SEE which leg failed). Tombstones fold via the CEG
+composers: a `withdraws`/`recants` referencing an edge makes it ABSENT.
+Capsule: `DirectoryOp::TrustRootValid` (append-only) for edge.
+
+### Confirmed (witnessed, no behavior change)
+
+- self-root `attestation(user → user)` admits (the immutable identity floor);
+- self-referential `delegates_to(root → root, scope:[infra:*])` admits — a
+  root roots to itself. **Two-planes rule documented**: these are delegation
+  SCOPE tokens (the user's consensual choice), NOT the accord-conferred
+  `infra:attest` key ROLE, which remains co-scrub gated;
+- the `withdraws` tombstone on a trust edge is nuclear un-trust: the walk
+  treats the edge as absent while the root's own declarations and the base
+  self-root stand (the app never bricks).
+
+Witness: `trust_root_walk_and_tombstone_481` — all four asks through the
+real write + walk surfaces. federation+memory families 496/496 (pg serial).
+
 ## [18.1.0] — 2026-07-20 — the `trace:*` Information-Type validator (dimension-as-type-registry; CIRISConstitution#39 interim)
 
 ### Added — `check_trace_dimension_admission` at every attestation write chokepoint

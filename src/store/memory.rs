@@ -7718,6 +7718,126 @@ mod tests {
         d
     }
 
+    /// v18.2.0 (CIRISPersist#481) — the pluggable-trust-root witnesses, all
+    /// four asks through the REAL write + walk surfaces:
+    /// 1. self-root `attestation(user → user)` ADMITS;
+    /// 2. self-referential `delegates_to(root → root, scope:[infra:*])`
+    ///    ADMITS (a root roots to itself) — and note the TWO-PLANES rule:
+    ///    these are delegation SCOPE tokens in an envelope, not the
+    ///    accord-conferred `infra:attest` key ROLE (which stays co-scrub
+    ///    gated; see admission set-path tests);
+    /// 3. `trust_root_valid` evaluates the full predicate (edge +
+    ///    self-declaration + fresh `accord:lifecycle` + halt latch);
+    /// 4. the `withdraws` tombstone on the trust edge makes the walk treat
+    ///    it as ABSENT (nuclear un-trust; base self-root untouched).
+    #[tokio::test]
+    async fn trust_root_walk_and_tombstone_481() {
+        use crate::federation::trust_root::{trust_root_valid, TrustRootVerdict};
+        let backend = MemoryBackend::new();
+        for (k, it) in [
+            ("tr-user", "user"),
+            ("tr-root", "node"),
+            ("tr-la", "accord_holder"),
+        ] {
+            let mut rec = fix_key(k, "ref", k);
+            rec.identity_type = it.to_owned();
+            backend
+                .put_public_key(SignedKeyRecord { record: rec })
+                .await
+                .unwrap();
+        }
+
+        // Ask 1 — the self-root base admits (attesting == attested == self).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_attestation("tr-self", "tr-user", "tr-user", "tr-user"),
+            })
+            .await
+            .expect("(1) self-root attestation(user→user) must admit");
+
+        // Ask 2 — the self-referential root declaration admits.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "tr-rootdecl",
+                    "tr-root",
+                    "tr-root",
+                    serde_json::json!(["infra:attest", "infra:serve"]),
+                ),
+            })
+            .await
+            .expect("(2) delegates_to(root→root, infra:*) must admit");
+
+        // The user's trust edge.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "tr-edge",
+                    "tr-user",
+                    "tr-root",
+                    serde_json::json!(["infra:attest", "infra:serve"]),
+                ),
+            })
+            .await
+            .expect("delegates_to(user→root) must admit");
+
+        // Fresh accord:lifecycle about the root (accord:* attester must be
+        // an accord_holder — the constitutional asymmetry holds here too).
+        let mut lc = fix_attestation("tr-lc", "tr-la", "tr-root", "tr-la");
+        lc.attestation_envelope = serde_json::json!({
+            "id": "tr-lc",
+            "dimension": "accord:lifecycle:v1",
+            "score": 1.0,
+            "confidence": 0.9,
+        });
+        lc.asserted_at = chrono::Utc::now();
+        resign_fix(&mut lc);
+        backend
+            .put_attestation(SignedAttestation { attestation: lc })
+            .await
+            .expect("accord:lifecycle from an accord_holder must admit");
+
+        // Ask 3 — the walk: every leg green.
+        let v: TrustRootVerdict = trust_root_valid(&backend, "tr-user", "tr-root")
+            .await
+            .expect("walk");
+        assert!(v.edge_exists, "(3) live user→root edge");
+        assert!(
+            v.root_self_declares,
+            "(3) root self-declares w/ infra scope"
+        );
+        assert!(v.lifecycle_active, "(3) fresh accord:lifecycle");
+        assert_ne!(v.halt_latched, Some(true), "(3) no halt latched");
+        assert!(v.valid, "(3) all legs ⇒ valid");
+
+        // A self-root is the immutable BASE, never a valid EXTERNAL root.
+        let v0 = trust_root_valid(&backend, "tr-user", "tr-user")
+            .await
+            .expect("walk self");
+        assert!(
+            !v0.valid && !v0.edge_exists,
+            "base self-root ≠ external root"
+        );
+
+        // Ask 4 — nuclear un-trust: withdraw the edge; the walk folds it
+        // ABSENT. The base self-root is untouched (the app never bricks).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_withdraws("tr-w", "tr-user", "tr-edge"),
+            })
+            .await
+            .expect("(4) withdraws on own edge must admit");
+        let v2 = trust_root_valid(&backend, "tr-user", "tr-root")
+            .await
+            .expect("walk post-tombstone");
+        assert!(!v2.edge_exists, "(4) tombstoned edge is ABSENT to the walk");
+        assert!(!v2.valid, "(4) un-trust revokes validity");
+        assert!(
+            v2.root_self_declares && v2.lifecycle_active,
+            "(4) only the EDGE died — the root's own declarations stand"
+        );
+    }
+
     #[tokio::test]
     async fn memory_withdraws_admission_rules_2_3_and_refusal() {
         let backend = MemoryBackend::new();
