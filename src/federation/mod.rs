@@ -57,6 +57,15 @@ pub mod namespace;
 // partner_record). Row shapes, the four admission checks, and the two
 // CEG-declared merge dispatchers; the backends do the storage I/O.
 pub mod operational;
+
+/// v18.3.0 (CIRISPersist#484) — the exported accord co-scrub test-minting
+/// surface: `Identity`, `signed_canonical_record[_with_roles]`, and
+/// `register_accord_holder`. Behind `test-anchor` (persist's test-only,
+/// never-in-a-published-wheel fence) so a DOWNSTREAM consumer gating a real
+/// plane on `has_effective_role` can mint a genuinely co-scrubbed record and
+/// test the ALLOW path — not just the deny path.
+#[cfg(any(test, feature = "test-anchor"))]
+pub use operational::test_support as accord_test_support;
 pub mod perceptual_hash;
 pub mod precedence;
 #[cfg(feature = "cirisaudit")]

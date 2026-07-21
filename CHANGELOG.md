@@ -5,6 +5,54 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [18.3.0] — 2026-07-21 — trust-serve composition (#483) + exported accord co-scrub test helpers (#484) + canonical-role compat (#480)
+
+Completes the #481 pluggable-trust-root arc into edge's trace-serve gate
+(CIRISEdge#386), and closes the fail-closed-blindness class that shipped
+CIRISEdge#379 dead in the field.
+
+### Added — `capability_roots_to_trusted_root` (#483)
+
+The composed capability walk: *does `subject` hold delegation `scope`,
+granted by a root that `user` trusts?* Enumerates live (non-tombstoned)
+`delegates_to(root → subject)` edges carrying the scope and evaluates
+[`trust_root_valid`] for each candidate root, returning the winning root as
+a `TrustedGrant` (root + grant id + its `TrustRootVerdict` — the
+derivation-trace discipline, not a bare bool). Edge#386 leg B: two nodes
+serve each other only under a COMMON valid root, and un-trust stops serving
+immediately. Kept in persist so the ONE scope-parse + ONE CEG-tombstone fold
+are never forked into a consumer. Capsule op `CapabilityRootsToTrustedRoot`
+(append-only) for edge.
+
+### Added — exported accord co-scrub test-minting helpers (#484)
+
+`federation::accord_test_support` (re-export of `operational::test_support`,
+gated behind the existing `test-anchor` fence) now exposes `Identity`,
+`signed_canonical_record[_with_roles]`, and `register_accord_holder` — the
+pieces a downstream consumer needs to mint a genuinely 2-of-3
+accord-co-scrubbed record and test the `has_effective_role` **ALLOW** path.
+Previously `#[cfg(test)]`-private, so a consumer gating a real plane on
+`has_effective_role` (edge trace-serve) could only test the DENY path — the
+exact blindness that shipped CIRISEdge#379's gate fail-closed-dead while a
+green test said nothing. `test-anchor` keeps the signing helpers out of
+published wheels.
+
+### Confirmed — canonical record carrying `infra:serve` (#480, persist side)
+
+Witnessed that a `canonical,node` record ALSO carrying `roles:["infra:serve"]`
+(a) passes the 2-of-3 `check_canonical_role_admission` core gate (the
+co-scrub is over `registration_envelope`; `roles` is a separate column) and
+(b) preserves the `canonical` identity_type the genesis seed re-verify
+asserts — and reads BOTH effective roles true. So the `canonical_seed.json`
+swap is a drop-in when server hands over the accord-holder-re-blessed
+`SignedKeyRecord` (the seed JSON change itself waits on that record).
+
+### Witnesses
+`capability_roots_to_trusted_root_483` (grant roots to trusted root; un-trust
+→ `None`), `exported_coscrub_helpers_prove_has_effective_role_allow_and_deny_484`
+(both arms), `canonical_record_with_infra_serve_role_admits_and_reads_both_480`.
+federation+memory 500/500 (pg serial).
+
 ## [18.2.0] — 2026-07-20 — pluggable-trust-root substrate (#481): the `trust_root_valid` walk + the four admission/tombstone confirmations
 
 Substrate half of CIRISServer `FSD/TRUST_ROOT_CAPABILITY_GATE.md`

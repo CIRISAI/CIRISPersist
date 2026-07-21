@@ -76,8 +76,9 @@ pub struct TrustRootVerdict {
 
 /// Does `token` appear in the envelope's `scope` field? Accepts the two
 /// established wire shapes (`topology.rs` convention): a bare string or an
-/// array of tokens.
-fn scope_contains(envelope: &serde_json::Value, token: &str) -> bool {
+/// array of tokens. `pub(crate)` so the composed [`capability_roots_to_trusted_root`]
+/// walk shares the ONE scope-parse (never forked).
+pub(crate) fn scope_contains(envelope: &serde_json::Value, token: &str) -> bool {
     match envelope.get("scope") {
         Some(serde_json::Value::String(s)) => s == token,
         Some(serde_json::Value::Array(items)) => items.iter().any(|v| v.as_str() == Some(token)),
@@ -88,8 +89,10 @@ fn scope_contains(envelope: &serde_json::Value, token: &str) -> bool {
 /// Fold the CEG tombstones over `rows`: an attestation is DEAD when a
 /// `withdraws` / `recants` composer (precedence-winning, same-attester
 /// authority is enforced at composer admission) references its id.
-/// Returns the set of dead `attestation_id`s.
-fn tombstoned_ids(rows: &[&Attestation]) -> std::collections::HashSet<String> {
+/// Returns the set of dead `attestation_id`s. `pub(crate)` so the composed
+/// [`capability_roots_to_trusted_root`] walk shares the ONE tombstone fold
+/// (the module's single-authority discipline — never forked, per #483).
+pub(crate) fn tombstoned_ids(rows: &[&Attestation]) -> std::collections::HashSet<String> {
     use std::collections::HashMap;
     let mut by_target: HashMap<&str, Vec<&Attestation>> = HashMap::new();
     for row in rows {
@@ -210,4 +213,88 @@ where
         halt_latched,
         valid,
     })
+}
+
+/// The winning grant returned by [`capability_roots_to_trusted_root`]: the
+/// root that confers the scope AND that the asking user trusts, plus that
+/// root's full [`TrustRootVerdict`] (the derivation-trace discipline — the
+/// consumer sees WHICH root and WHY it counted, never a bare bool).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrustedGrant {
+    /// The root that both (a) grants `scope` to the subject via a live
+    /// `delegates_to(root → subject)` and (b) passes `trust_root_valid`
+    /// from the asking user's records.
+    pub root_key_id: String,
+    /// The `delegates_to(root → subject)` grant's `attestation_id` (the
+    /// specific live edge that conferred the scope).
+    pub grant_attestation_id: String,
+    /// The winning root's trust verdict (all legs green — it is the reason
+    /// `valid` held).
+    pub verdict: TrustRootVerdict,
+}
+
+/// v18.3.0 (CIRISPersist#483) — the composed capability walk: does
+/// `subject_key_id` hold delegation `scope`, granted by a root that
+/// `user_key_id` trusts?
+///
+/// CIRISEdge#386 leg B: a trace serve gate must confirm the recipient's
+/// `infra:serve` roots to a root **the sending node itself trusts** — so
+/// two nodes serve each other only under a COMMON valid root, and un-trust
+/// stops serving immediately. Kept in persist (not re-derived in edge)
+/// because it reuses the module's ONE scope-parse + ONE CEG-tombstone fold;
+/// forking those into a consumer would double the policy the FSD demands
+/// live in a single authority.
+///
+/// Walk: enumerate live (non-tombstoned) `delegates_to(candidate_root →
+/// subject)` edges carrying `scope`, and for each candidate evaluate
+/// [`trust_root_valid`] from the user's records. Returns the FIRST valid
+/// root as a [`TrustedGrant`] (`None` if the subject holds the scope from
+/// no root the user trusts — or from no root at all). Self-granted scope
+/// (`root == subject`) is skipped: a subject cannot confer capability on
+/// itself here, mirroring the self-root-is-not-an-external-root rule.
+pub async fn capability_roots_to_trusted_root<F>(
+    directory: &F,
+    user_key_id: &str,
+    subject_key_id: &str,
+    scope: &str,
+) -> Result<Option<TrustedGrant>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    // Every grant ABOUT the subject (delegates_to(* → subject)) plus its
+    // tombstones — a withdraws/recants on a grant is attested about the
+    // same subject, so the one about-read carries both.
+    let about_subject = directory.list_attestations_for(subject_key_id).await?;
+    let about_refs: Vec<&Attestation> = about_subject.iter().collect();
+    let dead = tombstoned_ids(&about_refs);
+
+    // Candidate roots: distinct granters of a live scoped delegates_to edge
+    // to the subject (excluding a self-grant). Dedup so a root that granted
+    // twice is walked once.
+    let mut seen = std::collections::HashSet::new();
+    let candidates: Vec<(&str, &str)> = about_subject
+        .iter()
+        .filter(|a| {
+            a.attestation_type == attestation_type::DELEGATES_TO
+                && a.attested_key_id == subject_key_id
+                && a.attesting_key_id != subject_key_id
+                && !dead.contains(&a.attestation_id)
+                && scope_contains(&a.attestation_envelope, scope)
+        })
+        .filter(|a| seen.insert(a.attesting_key_id.clone()))
+        .map(|a| (a.attesting_key_id.as_str(), a.attestation_id.as_str()))
+        .collect();
+
+    // First candidate root the user actually trusts wins.
+    for (root_key_id, grant_id) in candidates {
+        let verdict = trust_root_valid(directory, user_key_id, root_key_id).await?;
+        if verdict.valid {
+            return Ok(Some(TrustedGrant {
+                root_key_id: root_key_id.to_owned(),
+                grant_attestation_id: grant_id.to_owned(),
+                verdict,
+            }));
+        }
+    }
+    Ok(None)
 }
