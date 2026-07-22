@@ -2185,6 +2185,11 @@ impl SqliteBackend {
     ) -> Result<crate::federation::register::AdoptScrubOutcome, crate::federation::Error> {
         use crate::federation::register::AdoptScrubOutcome;
         let mut row = record.record;
+        // v19.0.0 (#486) — lift envelope-attested roles (upgrade path parity
+        // with put_public_key: the re-blessed canonical seed arrives HERE on
+        // an upgrading node; without the lift its conferred roles would stay
+        // invisible on exactly the nodes #480 cares about).
+        crate::federation::admission::lift_envelope_attested_roles(&mut row);
 
         if row.scrub_key_id == row.key_id {
             return Err(crate::federation::Error::InvalidArgument(
@@ -2592,6 +2597,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         record: crate::federation::SignedKeyRecord,
     ) -> Result<(), crate::federation::Error> {
         let mut row = record.record;
+        // v19.0.0 (#486) — lift envelope-attested roles into the claim
+        // surface BEFORE the role write-gates (lift-then-gate).
+        crate::federation::admission::lift_envelope_attested_roles(&mut row);
 
         // v10.1.0 (CIRISPersist#275 hardening) — universal write-path
         // invariant: pubkey_ed25519_base64 MUST decode to a 32-byte Ed25519
@@ -3286,6 +3294,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &row.subject_key_ids,
             &row.attestation_envelope,
         )?;
+        crate::federation::trust_root::check_trust_charter_admission(
+            self,
+            &row.attestation_type,
+            &row.attesting_key_id,
+            &row.attested_key_id,
+            &row.attestation_envelope,
+        )
+        .await?;
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
         // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11; keying broadened by
@@ -11750,6 +11766,17 @@ impl SqliteBackend {
             &input.subject_key_ids,
             &input.attestation_envelope,
         )?;
+        crate::federation::trust_root::check_trust_charter_admission(
+            self,
+            &input.attestation_type,
+            &input.attesting_key_id,
+            input
+                .attested_key_id
+                .as_deref()
+                .unwrap_or(&input.attesting_key_id),
+            &input.attestation_envelope,
+        )
+        .await?;
 
         // The (occurrence, dimension) key + the gate axis. Required.
         let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {

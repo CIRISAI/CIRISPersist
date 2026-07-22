@@ -5,6 +5,84 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [19.0.0] — 2026-07-22 — RC3 charter alignment: roles lift (#486) + charter recovery/AND-minimum/edge-expiry (#488) + crystal scope vocabulary (#487) + verify 10.6.0
+
+The whole centipede run against the finalized RC3 charter model (CIRISServer
+`FSD/TRUST_ROOT_CAPABILITY_GATE.md` 2026-07-22 + `FSD/PRIOR_ART.md`;
+ratification CIRISConstitution#40).
+
+### Changed (MAJOR) — #486: envelope-attested roles LIFT into `KeyRecord.roles`
+
+Verify's ceremony attests roles inside the scrub-signed
+`registration_envelope` (`roles_in_envelope()`), but persist never read that
+surface — an accord co-scrub could attest `infra:serve` and every
+`claims_role` / `has_effective_role` consumer still saw `[]`. The attestation
+was made and dropped on the floor (the actual root cause behind #480's dark
+trace plane). Now `lift_envelope_attested_roles` runs at `put_public_key` (3
+backends) AND `adopt_scrub_upgrade` (the seed-upgrade path — exactly where a
+re-blessed canonical lands on an existing node): **union, then gate** — the
+envelope set (verify's exact codec) unions into the claim surface BEFORE the
+role write-gates, so a lifted gated role (`canonical`/`infra:attest`/co-
+steward) still faces its co-scrub gate. Lifting creates VISIBILITY, never
+conferral; effectiveness is always re-derived.
+
+### Changed (MAJOR) — #488: the RC3 charter deltas
+
+1. **CRITICAL (the KERI lesson)**: a root charter (`delegates_to(root →
+   root, infra:*)`) MUST carry a `pre_rotation_commitment` (64-hex sha256 of
+   the pre-committed successor key set — published BEFORE ever needed), and
+   a recovery declaration (`recovers` + `successor_keys`) must BIND: the
+   successor set hashes (via the ONE pinned `pre_rotation_commitment()`
+   construction) to the predecessor's live commitment, and the attesting new
+   root must be a member. Enforced fail-closed at all six attestation write
+   chokepoints (`check_trust_charter_admission`, typed
+   `federation_charter_invalid`). Without this, compromise of a charter key
+   is unrecoverable by construction — the attacker owns the tombstoning pen.
+   (Holder-quorum co-signature half rides the server propose+cosign
+   ceremony; record shape CC#40-tracked.)
+2. **serve∧attest AND-minimum**: `root_self_declares` requires BOTH
+   `infra:serve` AND `infra:attest` (was OR) — a root serves and vouches, or
+   it is inert. Extra charter scopes tolerated.
+3. **Edge expiry (the OCSP/CRLite lesson)**: every liveness test in the walk
+   (`trust_root_valid` legs, `capability_roots_to_trusted_root` candidates)
+   now treats an EXPIRED `delegates_to` as dead — stale grants die of age.
+
+`TrustRootVerdict` gains `charter_has_recovery` (BREAKING shape); `valid`
+requires it.
+
+### Changed (MAJOR) — #487: RC3 crystal scope vocabulary (hard cut, no aliases)
+
+`INFRA_JOIN_COMMUNITIES` (`infra:join_communities`) is REMOVED — it never
+matched server's legacy `infra:membership` on the wire (exact-string
+matching; same intended capability, two tokens, silent mutual miss). Replaced
+by the two crystal tokens: `INFRA_HOLD_COMMUNITY_MEMBERSHIP`
+(`infra:hold_community_membership`) + `INFRA_HOLD_FAMILY_MEMBERSHIP`
+(`infra:hold_family_membership`) — act/standing + object on their face;
+community/family split because they are distinct CEG objects in different
+sensitivity classes. Pre-fleet: verifiers simply do not know the retired
+tokens.
+
+### Changed — verify re-pin 10.5.0 → 10.6.0
+
+CC 2.3.2.1 canonical-hash subject codec (`canonical:sha256:<hex>`; bare hex
+no longer silently admitted). No persist call-site changes; wheel
+Requires-Dist (`>=10,<11`) unchanged.
+
+### #480 status
+
+Persist is now fully ready on BOTH seed paths (fresh `put_public_key` +
+upgrade `adopt_scrub_upgrade` — both lift). The `canonical_seed.json` swap
+remains gated on the accord-holder re-bless ceremony JSON (its envelope must
+carry `roles:["infra:serve"]`; the current baked envelope has no roles
+field).
+
+### Witnesses
+
+`rc3_charter_deltas_488` (commitment-less charter refuses; serve-only ≠
+root; expired edge dead; recovery binds/refuses),
+`envelope_attested_roles_lift_then_gate_486` (lift visible; lifted gated
+role still refused), fixtures upgraded to committed charters.
+
 ## [18.3.0] — 2026-07-21 — trust-serve composition (#483) + exported accord co-scrub test helpers (#484) + canonical-role compat (#480)
 
 Completes the #481 pluggable-trust-root arc into edge's trace-serve gate

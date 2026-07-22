@@ -25890,6 +25890,8 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::EnvelopeTooLarge { .. } => PyValueError::new_err(kind),
         // v18.1.0 — caller-fixable: fix the trace envelope shape / subjects.
         crate::federation::Error::TraceDimensionInvalid { .. } => PyValueError::new_err(kind),
+        // v19.0.0 — caller-fixable: add the pre-rotation commitment / fix binding.
+        crate::federation::Error::CharterInvalid { .. } => PyValueError::new_err(kind),
     }
 }
 

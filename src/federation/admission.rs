@@ -1249,6 +1249,42 @@ pub fn check_local_tier_eligibility(
     Ok(LocalTierDisposition::Durable)
 }
 
+/// v19.0.0 (CIRISPersist#486) — lift the **envelope-attested** roles into
+/// `KeyRecord.roles` at admission.
+///
+/// Verify's ceremony DOES attest roles: `produce_scrubbed_key_record`
+/// materializes `ScrubTarget.roles` into the scrub-signed
+/// `registration_envelope` (`"roles"`), and `roles_in_envelope()` exposes
+/// them — but persist never read that surface, so an accord co-scrub could
+/// attest `infra:serve` and every `claims_role` / `has_effective_role`
+/// consumer still saw `[]`. The attestation was made and dropped on the
+/// floor (the actual root cause behind #480's dark trace plane).
+///
+/// Semantics — **union, then gate**:
+/// - The envelope set (mirroring verify's `roles_in_envelope()` codec
+///   byte-for-byte: `envelope["roles"]` as `Vec<String>`, absent → empty) is
+///   unioned into the top-level `roles` claim surface.
+/// - Runs BEFORE the role write-gates in `put_public_key`, so a lifted
+///   gated role (`canonical` / `infra:attest` / co-steward) still faces its
+///   co-scrub admission gate — lifting creates VISIBILITY, never conferral.
+///   Tampering the envelope's `roles` breaks the scrub signatures (the
+///   envelope is the signed bytes), and effectiveness is ALWAYS re-derived
+///   (`has_effective_role` re-verifies the co-scrub against the live
+///   roster) — so wire-supplied top-level roles stay exactly as untrusted
+///   as before: a claim, not a capability.
+pub fn lift_envelope_attested_roles(row: &mut super::KeyRecord) {
+    let envelope_roles: Vec<String> = row
+        .registration_envelope
+        .get("roles")
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+        .unwrap_or_default();
+    for role in envelope_roles {
+        if !row.roles.contains(&role) {
+            row.roles.push(role);
+        }
+    }
+}
+
 /// v18.1.0 (CIRISPersist#473 followup) — the `trace:` namespace prefix. The
 /// dimension is the CEG's Information-Type parameter; `trace:*` is the
 /// envelope-native trace family (`trace:complete:v1` = the v18.0.0 ingest
@@ -6908,7 +6944,8 @@ mod tests {
         assert!(scopes_are_infra_only(&scope_set(&[ds::INFRA_SERVE])));
         assert!(scopes_are_infra_only(&scope_set(&[
             ds::INFRA_NETWORK_PRESENCE,
-            ds::INFRA_JOIN_COMMUNITIES,
+            ds::INFRA_HOLD_COMMUNITY_MEMBERSHIP,
+            ds::INFRA_HOLD_FAMILY_MEMBERSHIP,
             ds::INFRA_SERVE,
             ds::INFRA_STORE,
             ds::INFRA_TRANSPORT,

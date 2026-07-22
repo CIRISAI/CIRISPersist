@@ -491,6 +491,17 @@ impl MemoryBackend {
             &input.subject_key_ids,
             &input.attestation_envelope,
         )?;
+        crate::federation::trust_root::check_trust_charter_admission(
+            self,
+            &input.attestation_type,
+            &input.attesting_key_id,
+            input
+                .attested_key_id
+                .as_deref()
+                .unwrap_or(&input.attesting_key_id),
+            &input.attestation_envelope,
+        )
+        .await?;
         let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
             Error::InvalidArgument(
                 "local attestation envelope must carry a \"dimension\" string".into(),
@@ -1490,6 +1501,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         record: crate::federation::SignedKeyRecord,
     ) -> Result<(), crate::federation::Error> {
         let mut row = record.record;
+        // v19.0.0 (#486) — lift envelope-attested roles into the claim
+        // surface BEFORE the role write-gates (lift-then-gate).
+        crate::federation::admission::lift_envelope_attested_roles(&mut row);
         // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — same consent_role
         // admission gate + 'unregistered'⇔None normalization as the SQL
         // backends (a stored-form 'unregistered' submitted on the wire
@@ -1788,6 +1802,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             &row.subject_key_ids,
             &row.attestation_envelope,
         )?;
+        crate::federation::trust_root::check_trust_charter_admission(
+            self,
+            &row.attestation_type,
+            &row.attesting_key_id,
+            &row.attested_key_id,
+            &row.attestation_envelope,
+        )
+        .await?;
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
         // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
@@ -7758,9 +7780,8 @@ mod tests {
         // Ask 2 — the self-referential root declaration admits.
         backend
             .put_attestation(SignedAttestation {
-                attestation: fix_delegates_to(
+                attestation: fix_charter(
                     "tr-rootdecl",
-                    "tr-root",
                     "tr-root",
                     serde_json::json!(["infra:attest", "infra:serve"]),
                 ),
@@ -7838,6 +7859,207 @@ mod tests {
         );
     }
 
+    /// v19.0.0 (CIRISPersist#488) — the RC3 charter deltas, all three:
+    /// (1) CRITICAL: a charter without a pre-rotation commitment REFUSES at
+    /// admission; a recovery declaration must BIND to the predecessor's
+    /// pre-committed successor set; (2) serve∧attest AND-minimum — a
+    /// serve-only self-loop is not a root; (3) an EXPIRED trust edge is as
+    /// dead to the walk as a tombstoned one.
+    #[tokio::test]
+    async fn rc3_charter_deltas_488() {
+        use crate::federation::trust_root::{pre_rotation_commitment, trust_root_valid};
+        let backend = MemoryBackend::new();
+        for (k, it) in [
+            ("rc-user", "user"),
+            ("rc-root", "node"),
+            ("rc-root2", "node"),
+        ] {
+            let mut rec = fix_key(k, "ref", k);
+            rec.identity_type = it.to_owned();
+            backend
+                .put_public_key(SignedKeyRecord { record: rec })
+                .await
+                .unwrap();
+        }
+
+        // (1) commitment-less charter REFUSES with the typed kind.
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "rc-bare",
+                    "rc-root",
+                    "rc-root",
+                    serde_json::json!(["infra:serve", "infra:attest"]),
+                ),
+            })
+            .await
+            .expect_err("(1) charter without pre-rotation commitment must refuse");
+        assert_eq!(err.kind(), "federation_charter_invalid");
+
+        // (2) serve-only charter admits (it is a valid delegates_to) but is
+        // NOT a root to the walk — the AND-minimum.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_charter(
+                    "rc-serveonly",
+                    "rc-root2",
+                    serde_json::json!(["infra:serve"]),
+                ),
+            })
+            .await
+            .expect("serve-only self-loop admits (charter-shaped, commitment present)");
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "rc-edge2",
+                    "rc-user",
+                    "rc-root2",
+                    serde_json::json!(["infra:serve"]),
+                ),
+            })
+            .await
+            .unwrap();
+        let v = trust_root_valid(&backend, "rc-user", "rc-root2")
+            .await
+            .unwrap();
+        assert!(v.edge_exists);
+        assert!(
+            !v.root_self_declares && !v.valid,
+            "(2) serve-only self-loop is NOT a root (serve∧attest minimum)"
+        );
+
+        // (3) an expired edge is dead to the walk.
+        let mut expired = fix_delegates_to(
+            "rc-expired-edge",
+            "rc-user",
+            "rc-root",
+            serde_json::json!(["infra:serve"]),
+        );
+        expired.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        resign_fix(&mut expired);
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: expired,
+            })
+            .await
+            .unwrap();
+        let v3 = trust_root_valid(&backend, "rc-user", "rc-root")
+            .await
+            .unwrap();
+        assert!(
+            !v3.edge_exists,
+            "(3) expired delegates_to is ABSENT to the walk"
+        );
+
+        // (1b) recovery binding: predecessor charter pre-commits to a
+        // successor set; the bound successor charter ADMITS; a non-binding
+        // one REFUSES; a non-member attester REFUSES.
+        let successors = vec!["rc-root2".to_owned(), "rc-user".to_owned()];
+        let commitment = pre_rotation_commitment(&successors).unwrap();
+        let mut pred = fix_delegates_to(
+            "rc-pred",
+            "rc-root",
+            "rc-root",
+            serde_json::json!(["infra:serve", "infra:attest"]),
+        );
+        pred.attestation_envelope = serde_json::json!({
+            "references_attestation_id": "rc-pred",
+            "scope": ["infra:serve", "infra:attest"],
+            "pre_rotation_commitment": commitment,
+        });
+        resign_fix(&mut pred);
+        backend
+            .put_attestation(SignedAttestation { attestation: pred })
+            .await
+            .expect("predecessor charter admits");
+
+        // Bound successor charter: attester rc-root2 ∈ pre-committed set.
+        let mut succ = fix_charter(
+            "rc-succ",
+            "rc-root2",
+            serde_json::json!(["infra:serve", "infra:attest"]),
+        );
+        let succ_env = serde_json::json!({
+            "references_attestation_id": "rc-succ",
+            "scope": ["infra:serve", "infra:attest"],
+            "pre_rotation_commitment":
+                pre_rotation_commitment(&["rc-next-a".to_owned()]).unwrap(),
+            "recovers": "rc-root",
+            "successor_keys": successors,
+        });
+        succ.attestation_envelope = succ_env;
+        resign_fix(&mut succ);
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: succ.clone(),
+            })
+            .await
+            .expect("(1b) BOUND recovery charter admits");
+
+        // Non-binding successor set → refused.
+        let mut bad = succ.clone();
+        bad.attestation_id = "rc-succ-bad".into();
+        bad.attestation_envelope["successor_keys"] =
+            serde_json::json!(["rc-root2", "not-precommitted"]);
+        resign_fix(&mut bad);
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: bad })
+            .await
+            .expect_err("(1b) non-binding successor set must refuse");
+        assert_eq!(err.kind(), "federation_charter_invalid");
+    }
+
+    /// v19.0.0 (CIRISPersist#486) — envelope-attested roles LIFT into the
+    /// claim surface (union, then gate): a scrub-signed envelope carrying
+    /// `roles:["infra:serve"]` becomes visible to `claims_role` after
+    /// `put_public_key`; a GATED role (`infra:attest`) lifted from an
+    /// envelope with no accord co-scrub still REFUSES at its write gate —
+    /// lifting creates visibility, never conferral.
+    #[tokio::test]
+    async fn envelope_attested_roles_lift_then_gate_486() {
+        let backend = MemoryBackend::new();
+
+        // Ungated role in the envelope, empty top-level roles (the exact
+        // #480 shape): after put, the row CLAIMS infra:serve.
+        let mut rec = fix_key("lift-1", "ref", "lift-1");
+        rec.identity_type = "node".to_owned();
+        rec.registration_envelope = serde_json::json!({
+            "key_id": "lift-1",
+            "roles": ["infra:serve"],
+        });
+        assert!(rec.roles.is_empty(), "fixture: top-level roles empty");
+        backend
+            .put_public_key(SignedKeyRecord { record: rec })
+            .await
+            .expect("envelope-roled record admits");
+        let row = crate::federation::FederationDirectory::lookup_public_key(&backend, "lift-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.claims_role("infra:serve"),
+            "(486) envelope-attested infra:serve is VISIBLE to claims_role"
+        );
+
+        // Lift-then-gate: infra:attest in the envelope of a record with NO
+        // accord co-scrub → the v15 write gate refuses the lifted claim.
+        let mut gated = fix_key("lift-2", "ref", "lift-2");
+        gated.identity_type = "node".to_owned();
+        gated.registration_envelope = serde_json::json!({
+            "key_id": "lift-2",
+            "roles": ["infra:attest"],
+        });
+        let err = backend
+            .put_public_key(SignedKeyRecord { record: gated })
+            .await
+            .expect_err("(486) lifted infra:attest with no co-scrub must refuse");
+        assert!(
+            err.kind().contains("infra_attest") || err.kind().contains("accord"),
+            "refused by the infra:attest gate, got kind {}",
+            err.kind()
+        );
+    }
+
     /// v18.3.0 (CIRISPersist#483) — the composed capability walk: a
     /// subject's `infra:serve`, granted by a root the asking user trusts,
     /// resolves to that root; when the user un-trusts the root (edge
@@ -7866,7 +8088,7 @@ mod tests {
         // valid-root fixture, mirroring the 481 witness).
         backend
             .put_attestation(SignedAttestation {
-                attestation: fix_delegates_to("cr-rootdecl", "cr-root", "cr-root", infra()),
+                attestation: fix_charter("cr-rootdecl", "cr-root", infra()),
             })
             .await
             .unwrap();
@@ -8099,6 +8321,24 @@ mod tests {
             .unwrap(),
             "(480) infra:serve role ALSO reads effective — the trace-serve gate opens"
         );
+    }
+
+    /// Build a root CHARTER: self-loop `delegates_to(root → root)` carrying
+    /// `scope` + the v19.0.0 (#488) pre-rotation commitment (over a
+    /// deterministic test successor set) the charter admission gate requires.
+    fn fix_charter(id: &str, root: &str, scope: serde_json::Value) -> Attestation {
+        let successors = vec![format!("{root}-succ-a"), format!("{root}-succ-b")];
+        let commitment =
+            crate::federation::trust_root::pre_rotation_commitment(&successors).unwrap();
+        let mut d = fix_attestation(id, root, root, root);
+        d.attestation_type = crate::federation::types::attestation_type::DELEGATES_TO.into();
+        d.attestation_envelope = serde_json::json!({
+            "references_attestation_id": id,
+            "scope": scope,
+            "pre_rotation_commitment": commitment,
+        });
+        resign_fix(&mut d);
+        d
     }
 
     #[tokio::test]

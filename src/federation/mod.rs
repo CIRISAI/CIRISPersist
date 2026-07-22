@@ -3963,6 +3963,18 @@ pub enum Error {
         detail: String,
     },
 
+    /// v19.0.0 (CIRISPersist#488, CRITICAL — the KERI lesson) — a root
+    /// charter (`delegates_to(root → root, infra:*)`) failed the recovery
+    /// admission gate: missing/malformed pre-rotation commitment, or a
+    /// recovery declaration that does not bind to the predecessor's
+    /// pre-committed successor key set. A charter without pre-committed
+    /// recovery makes root-key compromise unrecoverable by construction.
+    #[error("root charter admission refused: {detail}")]
+    CharterInvalid {
+        /// What failed (commitment shape / membership / binding).
+        detail: String,
+    },
+
     /// v2.4.0 (CIRISPersist#102 Ask 3a). The submitted `scores`
     /// attestation's `dimension` begins with `accord:` but the
     /// `attesting_key_id`'s `identity_type` is not `accord_holder`.
@@ -4930,6 +4942,7 @@ impl Error {
             Error::Conflict(_) => "federation_conflict",
             Error::EnvelopeTooLarge { .. } => "federation_envelope_too_large",
             Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
+            Error::CharterInvalid { .. } => "federation_charter_invalid",
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"
             }
