@@ -510,7 +510,8 @@ pub mod owner_binding {
 /// - [`INFRA_PREFIX`] (`infra:*`) — **server-class** authority, the only
 ///   class a pure `node`-role delegate ([`super::types::identity_type::NODE`])
 ///   may carry. Canonical infra scopes: [`INFRA_NETWORK_PRESENCE`],
-///   [`INFRA_JOIN_COMMUNITIES`], [`INFRA_SERVE`], [`INFRA_STORE`],
+///   [`INFRA_HOLD_COMMUNITY_MEMBERSHIP`], [`INFRA_HOLD_FAMILY_MEMBERSHIP`],
+///   [`INFRA_SERVE`], [`INFRA_STORE`],
 ///   [`INFRA_TRANSPORT`], [`INFRA_ATTEST`].
 /// - [`AGENCY_PREFIX`] (`agency:*`) — **brain-only** authority, FORBIDDEN
 ///   for a `node`-role delegate (CC 1.13.5). Canonical agency scopes:
@@ -539,8 +540,23 @@ pub mod delegation_scope {
     /// as the node (the infra realization of presence; cf. the legacy
     /// unprefixed `network_presence`).
     pub const INFRA_NETWORK_PRESENCE: &str = "infra:network_presence";
-    /// `infra:join_communities` — participate in federation membership.
-    pub const INFRA_JOIN_COMMUNITIES: &str = "infra:join_communities";
+    /// `infra:hold_community_membership` — occupy a member seat on
+    /// **community** rosters under the delegator's standing (RC3 crystal
+    /// vocabulary, CIRISPersist#487; CIRISServer `TRUST_ROOT_CAPABILITY_GATE`
+    /// / CC 4.4.3.4.3). `hold_` names the persistent STANDING — not the join
+    /// ceremony, not grant/manage authority (steward/moderator are judgment
+    /// roles bestowed on the MEMBER, never node-holdable per CC 1.13.5).
+    /// Owner-granted (the node's standing), NEVER charter-granted — see the
+    /// two-granter split in `TRUST_ROOT_CAPABILITY_GATE`. Replaced the vague
+    /// `infra:join_communities` (hard cut, no alias — pre-fleet).
+    pub const INFRA_HOLD_COMMUNITY_MEMBERSHIP: &str = "infra:hold_community_membership";
+    /// `infra:hold_family_membership` — occupy a member seat on **family**
+    /// rosters under the delegator's standing (RC3, #487). The community /
+    /// family split exists because they are distinct CEG objects
+    /// (`put_community` / `put_family`) in different sensitivity classes: an
+    /// owner can give a node community standing while keeping it out of the
+    /// family. See [`INFRA_HOLD_COMMUNITY_MEMBERSHIP`].
+    pub const INFRA_HOLD_FAMILY_MEMBERSHIP: &str = "infra:hold_family_membership";
     /// `infra:serve` — serve content / requests as infrastructure.
     pub const INFRA_SERVE: &str = "infra:serve";
     /// `infra:store` — persist / store data as infrastructure.
