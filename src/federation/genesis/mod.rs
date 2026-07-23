@@ -25,6 +25,12 @@
 //! anyway; the custody proof is the separate #268 CEG artifact). See
 //! `SqliteBackend::seed_genesis_accord_holders` / the Postgres twin.
 
+pub mod bundle;
+pub use bundle::{
+    bake_assembled_genesis, verify_bundle_quorum, BakeItemOutcome, GenesisAuthorization,
+    GenesisBakeReport, GenesisBundle,
+};
+
 use super::SignedKeyRecord;
 
 /// The baked HUMANITY_ACCORD holder records (A1/B1/C1) — the #268 ceremony's

@@ -2585,6 +2585,126 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         SqliteBackend::adopt_scrub_upgrade(self, record).await
     }
 
+    // v19.1.0 (#490) — the authenticated re-anchor. Re-verifies the bundle
+    // quorum INTERNALLY (own roster + pinned keys) before any write; the
+    // record must be one the bundle carries; identity + anti-rollback
+    // guards re-asserted here AND in the UPDATE's WHERE.
+    async fn adopt_genesis_reanchor(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+        bundle: &crate::federation::genesis::GenesisBundle,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        crate::federation::genesis::verify_bundle_quorum(self, bundle).await?;
+        let mut row = record.record;
+        if !bundle.serve_nodes.iter().any(|sn| {
+            sn.record.persist_row_hash == row.persist_row_hash
+                && sn.record.key_id == row.key_id
+                && sn.record.registration_envelope == row.registration_envelope
+        }) {
+            return Err(Error::GenesisBundleInvalid {
+                detail: format!(
+                    "re-anchor record {} is not carried by the verified bundle",
+                    row.key_id
+                ),
+            });
+        }
+        // v19.0.0 (#486) — adopt-path parity: lift envelope-attested roles.
+        crate::federation::admission::lift_envelope_attested_roles(&mut row);
+        crate::federation::register::validate_registration_pubkey(&row)?;
+        // The accord-conferred role write gates, same as every adopt path.
+        crate::federation::admission::check_canonical_role_admission(self, &row).await?;
+        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
+        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        let existing = crate::federation::FederationDirectory::lookup_public_key(self, &row.key_id)
+            .await?
+            .ok_or_else(|| Error::GenesisBundleInvalid {
+                detail: format!("re-anchor target {} has no existing row", row.key_id),
+            })?;
+        if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64 {
+            return Err(Error::GenesisBundleInvalid {
+                detail: format!("re-anchor {}: pubkey change refused", row.key_id),
+            });
+        }
+        if row.valid_from <= existing.valid_from {
+            return Err(Error::GenesisBundleInvalid {
+                detail: format!(
+                    "re-anchor {}: valid_from not newer than anchored — rollback refused",
+                    row.key_id
+                ),
+            });
+        }
+
+        let envelope_text = serde_json::to_string(&row.registration_envelope)
+            .map_err(|e| Error::Backend(format!("envelope: {e}")))?;
+        let attestation_text = match &row.attestation_evidence {
+            Some(v) => Some(
+                serde_json::to_string(v).map_err(|e| Error::Backend(format!("evidence: {e}")))?,
+            ),
+            None => None,
+        };
+        let roles_text: Option<String> = if row.roles.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&row.roles)
+                    .map_err(|e| Error::Backend(format!("roles: {e}")))?,
+            )
+        };
+        let original_content_hash = hex::decode(&row.original_content_hash)
+            .map_err(|e| Error::InvalidArgument(format!("original_content_hash hex: {e}")))?;
+        let conn = self.conn.clone();
+        let kid = row.key_id.clone();
+        let n = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
+            // WHERE re-asserts the identity guard atomically. Unlike
+            // adopt_scrub_upgrade there is NO `scrub_key_id = key_id`
+            // condition — this path replaces an ANCHORED row, under the
+            // bundle-quorum authority verified above.
+            conn.execute(
+                "UPDATE federation_keys SET \
+                    pubkey_ml_dsa_65_base64 = ?2, algorithm = ?3, identity_type = ?4, \
+                    identity_ref = ?5, valid_from = ?6, valid_until = ?7, \
+                    registration_envelope = ?8, original_content_hash = ?9, \
+                    scrub_signature_classical = ?10, scrub_signature_pqc = ?11, \
+                    scrub_key_id = ?12, scrub_timestamp = ?13, pqc_completed_at = ?14, \
+                    persist_row_hash = ?15, roles = ?16, attestation_evidence = ?17 \
+                 WHERE key_id = ?1 AND pubkey_ed25519_base64 = ?18",
+                rusqlite::params![
+                    row.key_id,
+                    row.pubkey_ml_dsa_65_base64,
+                    row.algorithm,
+                    row.identity_type,
+                    row.identity_ref,
+                    row.valid_from.to_rfc3339(),
+                    row.valid_until.map(|t| t.to_rfc3339()),
+                    envelope_text,
+                    original_content_hash,
+                    row.scrub_signature_classical,
+                    row.scrub_signature_pqc,
+                    row.scrub_key_id,
+                    row.scrub_timestamp.to_rfc3339(),
+                    row.pqc_completed_at.map(|t| t.to_rfc3339()),
+                    row.persist_row_hash,
+                    roles_text,
+                    attestation_text,
+                    row.pubkey_ed25519_base64,
+                ],
+            )
+        })
+        .await
+        .map_err(|e| Error::Backend(format!("join: {e}")))?
+        .map_err(|e| Error::Backend(format!("reanchor {kid}: {e}")))?;
+        if n != 1 {
+            return Err(Error::Backend(format!(
+                "reanchor {kid}: expected 1 row updated, got {n}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn apply_replicated_key_record(
         &self,
         record: crate::federation::SignedKeyRecord,

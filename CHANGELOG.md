@@ -5,6 +5,59 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [19.1.0] — 2026-07-23 — bake the assembled genesis (#490) + the mesh goes bright (#480 finisher)
+
+The 2026-07-23 `humanity-accord` genesis ceremony produced a valid artifact
+that persist could not land: the anti-downgrade gate refused the re-blessed
+canonical ("already anchored to a different record") with no authenticated
+path around it. This cut adds that path — and bakes the ceremony's own
+record into the seed.
+
+### Added — `bake_assembled_genesis` (#490)
+
+`federation::genesis::{GenesisBundle, bake_assembled_genesis,
+verify_bundle_quorum, GenesisBakeReport}` + `Engine::bake_assembled_genesis`
++ the PyO3 verb:
+
+- **Quorum verified against persist's OWN state**: each authorization's
+  holder must be seated on THIS node's roster and resolve in THIS node's
+  directory; hybrid (Ed25519 + bound ML-DSA-65, Strict) over the
+  `authorization_digest` — byte-identical to CIRISServer `mesh_genesis`'s
+  construction; threshold floored at strict-majority of the OWN roster (a
+  tampered policy string cannot talk it down). Bundle-carried holder
+  records are never the authority (the #377 lesson).
+- **Authenticated re-anchor** (`adopt_genesis_reanchor`, new
+  FederationDirectory method, default `Unsupported`): the ONLY path that
+  replaces an anchored canonical. Every backend impl re-verifies the
+  quorum INTERNALLY before writing; identity guard (pubkey-identical) +
+  anti-rollback (`valid_from` strictly newer) re-asserted at the write.
+- **Idempotent** (re-bake = no-op report) + **after-the-fact import** (the
+  operator's saved artifact JSON completes a ceremony whose durable write
+  failed — CIRISServer#309/#310) + typed per-item `GenesisBakeReport`
+  ("what anchored, what was skipped and why").
+- Typed `Error::GenesisBundleInvalid`, kind
+  `federation_genesis_bundle_invalid`; fail-closed — an unverifiable
+  bundle writes NOTHING.
+
+### Changed — `canonical_seed.json` is the re-blessed record (#480 finisher)
+
+The baked canonical genesis record is now the ceremony's serve node:
+2-of-3 co-scrubbed (A1+B1), envelope-attested `roles:["infra:serve"]`
+(the v19.0.0 #486 lift makes it claim-visible at seeding). **A fresh
+canonical now receives traces** — the #480 darkness is closed for new
+nodes; existing nodes bake the bundle (this cut's verb) to re-anchor.
+The pre-ceremony record is preserved as a test fixture.
+
+### The acceptance witness (production cryptography, end to end)
+
+`bake_real_genesis_v2_artifact_490` bakes the REAL ceremony artifact
+(`tests/fixtures/genesis_v2.json`, sha256 `44be2cf8…`, 106,979 bytes)
+against the real baked genesis state: A1+B1's actual YubiKey hybrid
+authorizations verify; the anchored-but-different canonical re-anchors;
+`infra:serve` lifts; the charter passes the pre-rotation gate; the serve
+grant lands; re-bake is a no-op; a tampered authorization refuses with
+nothing written.
+
 ## [19.0.0] — 2026-07-22 — RC3 charter alignment: roles lift (#486) + charter recovery/AND-minimum/edge-expiry (#488) + crystal scope vocabulary (#487) + verify 10.6.0
 
 The whole centipede run against the finalized RC3 charter model (CIRISServer
