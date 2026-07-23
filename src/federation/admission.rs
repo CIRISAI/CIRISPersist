@@ -6936,6 +6936,52 @@ mod tests {
         items.iter().map(|s| (*s).to_owned()).collect()
     }
 
+    /// v19.1.1 (verify 10.6.1 re-pin) — the DIFFERENTIAL VOCABULARY GUARD:
+    /// persist's `delegation_scope` infra tokens and verify-core's
+    /// `INFRA_SCOPES` must be the SAME SET, and every persist token must
+    /// pass verify's exact-membership fail-closed gate
+    /// (`verify_delegation_scope_split`). This pins the drift class 10.6.1
+    /// fixed: the RC3 vocab cut (#487) landed in server+persist while
+    /// verify still enumerated the retired `infra:join_communities` — one
+    /// fact, two gate verdicts (delegations passed persist's prefix
+    /// admission but read UnknownScope on the verify/FFI surface). Any
+    /// future one-sided vocabulary change now fails THIS test instead of
+    /// fail-closing real delegations in the field.
+    #[test]
+    fn persist_and_verify_infra_scope_vocabularies_are_identical() {
+        use super::super::types::delegation_scope as ds;
+        let persist_infra = [
+            ds::INFRA_NETWORK_PRESENCE,
+            ds::INFRA_HOLD_COMMUNITY_MEMBERSHIP,
+            ds::INFRA_HOLD_FAMILY_MEMBERSHIP,
+            ds::INFRA_SERVE,
+            ds::INFRA_STORE,
+            ds::INFRA_TRANSPORT,
+            ds::INFRA_ATTEST,
+        ];
+        // Same SET (order-independent), both directions.
+        let mut ours: Vec<&str> = persist_infra.to_vec();
+        let mut theirs: Vec<&str> = ciris_verify_core::operational_admit::INFRA_SCOPES.to_vec();
+        ours.sort_unstable();
+        theirs.sort_unstable();
+        assert_eq!(
+            ours, theirs,
+            "persist delegation_scope infra set != verify INFRA_SCOPES — \
+             a one-sided vocabulary change (the 10.6.1 drift class)"
+        );
+        // And every token passes verify's fail-closed gate on a node.
+        let scopes: Vec<String> = persist_infra.iter().map(|s| s.to_string()).collect();
+        ciris_verify_core::operational_admit::verify_delegation_scope_split("node", &scopes)
+            .expect("every persist infra token must be verify-admissible on a node");
+        // The retired token stays dead on BOTH sides.
+        let retired = vec!["infra:join_communities".to_owned()];
+        assert!(
+            ciris_verify_core::operational_admit::verify_delegation_scope_split("node", &retired)
+                .is_err(),
+            "retired infra:join_communities must fail-close on the verify gate"
+        );
+    }
+
     #[test]
     fn scopes_are_infra_only_table() {
         use super::super::types::delegation_scope as ds;
