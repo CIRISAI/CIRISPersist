@@ -5,6 +5,35 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [19.1.1] — 2026-07-23 — verify 10.6.1 re-pin (RC3 vocab interop fix) + differential vocabulary guard + #445 android CI hardening
+
+### Changed — verify 10.6.0 → 10.6.1 (the fix we needed)
+
+Verify's `INFRA_SCOPES` never got the #487 RC3 vocab cut — it still
+enumerated the retired `infra:join_communities` and had NEITHER
+`hold_*_membership` token, so an RC3 delegation passed persist's admission
+but read `UnknownScope` on the verify/FFI surface: one fact, two gate
+verdicts, the exact interop-hole class RC3 closed. 10.6.1 hard-cuts
+verify's set into sync. 6 pins + lockfile; Requires-Dist range unchanged.
+
+### Added — the differential vocabulary guard
+
+`persist_and_verify_infra_scope_vocabularies_are_identical`: persist's
+`delegation_scope` infra set and verify-core's `INFRA_SCOPES` must be the
+SAME SET (order-independent, both directions), every persist token must
+pass `verify_delegation_scope_split` on a node, and the retired token must
+fail-close. **A one-sided vocabulary change now fails persist CI instead
+of fail-closing real delegations in the field.**
+
+### Fixed — #445: android NDK provisioning hardening (bundled CI config)
+
+- `nttld/setup-ndk` gains `local-cache: true` — the NDK serves from
+  actions/cache after the first run instead of dl.google.com every run.
+- `auto-retry.yml` learns the download-retry-exhaustion CO-OCCURRENCE
+  signature (`Error: aborted` + `Waiting N seconds before trying again`);
+  bare "aborted" deliberately stays out (real SIGABRT prints "Aborted
+  (core dumped)" and must stay red).
+
 ## [19.1.0] — 2026-07-23 — bake the assembled genesis (#490) + the mesh goes bright (#480 finisher)
 
 The 2026-07-23 `humanity-accord` genesis ceremony produced a valid artifact

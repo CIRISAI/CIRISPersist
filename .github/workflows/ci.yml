@@ -612,6 +612,12 @@ jobs:
         with:
           ndk-version: r26b
           add-to-path: true
+          # #445 — serve the NDK from actions/cache after the first run
+          # instead of dl.google.com every run (the r26b download aborted
+          # mid-stream on the v17.0.0 cut and the action's internal 2×
+          # retry gave up). First-run misses remain network-exposed; the
+          # auto-retry co-occurrence signature covers that residual.
+          local-cache: true
       - name: install cargo-ndk
         run: cargo install cargo-ndk
       - name: extract version from Cargo.toml

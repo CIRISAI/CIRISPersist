@@ -98,6 +98,16 @@ jobs:
           transient_hit=false
           genuine_hit=false
           if echo "$logs" | grep -qiE "$transient"; then transient_hit=true; fi
+          # #445 — setup-action download-retry exhaustion (the nttld/setup-ndk
+          # dl.google.com abort): Node's bare `Error: aborted` CO-OCCURRING
+          # with the action's own `Waiting N seconds before trying again`.
+          # No genuine compile/test failure prints that pair. The bare word
+          # "aborted" is deliberately NOT in the main regex — a real SIGABRT
+          # prints "Aborted (core dumped)" and must stay red.
+          if echo "$logs" | grep -q 'Error: aborted' \
+            && echo "$logs" | grep -qE 'Waiting [0-9]+ seconds before trying again'; then
+            transient_hit=true
+          fi
           if echo "$logs" | grep -qE "$genuine"; then genuine_hit=true; fi
           echo "infra_only=$infra_only transient_hit=$transient_hit genuine_hit=$genuine_hit"
 
