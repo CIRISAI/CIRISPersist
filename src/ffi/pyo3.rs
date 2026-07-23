@@ -3280,6 +3280,43 @@ impl PyEngine {
         })
     }
 
+    /// v19.1.0 (CIRISPersist#490) — bake an assembled genesis trust-root
+    /// bundle (the ceremony artifact JSON, the operator-saved
+    /// `genesis_v2.json`). Verifies the holder quorum against THIS node's
+    /// own roster + directory-pinned keys, then lands serve nodes
+    /// (insert / idempotent no-op / authenticated re-anchor) and the
+    /// delegation plane. Returns the bake report as a JSON string
+    /// (`quorum_verified`, per serve-node and per-attestation outcomes) —
+    /// what anchored, what was skipped and why. Raises `ValueError`
+    /// (`federation_genesis_bundle_invalid`) on an unverifiable bundle;
+    /// NOTHING is written in that case.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    fn bake_assembled_genesis(&self, py: Python<'_>, bundle_json: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let json = bundle_json.to_owned();
+            let backend = self.backend.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    let report = match &backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(b) => {
+                            crate::federation::genesis::bake_assembled_genesis(&**b, &json).await
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(b) => {
+                            crate::federation::genesis::bake_assembled_genesis(&**b, &json).await
+                        }
+                    }
+                    .map_err(federation_err_to_py)?;
+                    serde_json::to_string(&report)
+                        .map_err(|e| PyRuntimeError::new_err(format!("bake report serialize: {e}")))
+                })
+            })
+        })
+    }
+
     /// v0.1.18 — debug helper for canonical-byte drift diagnosis
     /// (CIRISPersist#6 follow-up). Pipes a raw HTTP body through
     /// persist's schema parse + canonicalizer and returns BOTH
@@ -25892,6 +25929,8 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::TraceDimensionInvalid { .. } => PyValueError::new_err(kind),
         // v19.0.0 — caller-fixable: add the pre-rotation commitment / fix binding.
         crate::federation::Error::CharterInvalid { .. } => PyValueError::new_err(kind),
+        // v19.1.0 — caller-fixable: supply a valid quorum-signed bundle.
+        crate::federation::Error::GenesisBundleInvalid { .. } => PyValueError::new_err(kind),
     }
 }
 

@@ -1543,6 +1543,60 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(())
     }
 
+    // v19.1.0 (#490) — the authenticated re-anchor (memory parity; see the
+    // sqlite impl for the full invariants).
+    async fn adopt_genesis_reanchor(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+        bundle: &crate::federation::genesis::GenesisBundle,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        crate::federation::genesis::verify_bundle_quorum(self, bundle).await?;
+        let mut row = record.record;
+        if !bundle.serve_nodes.iter().any(|sn| {
+            sn.record.persist_row_hash == row.persist_row_hash
+                && sn.record.key_id == row.key_id
+                && sn.record.registration_envelope == row.registration_envelope
+        }) {
+            return Err(Error::GenesisBundleInvalid {
+                detail: format!(
+                    "re-anchor record {} is not carried by the verified bundle",
+                    row.key_id
+                ),
+            });
+        }
+        crate::federation::admission::lift_envelope_attested_roles(&mut row);
+        crate::federation::register::validate_registration_pubkey(&row)?;
+        crate::federation::admission::check_canonical_role_admission(self, &row).await?;
+        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
+        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        let mut state = self.state.lock().expect("memory backend lock");
+        let existing =
+            state
+                .federation_keys
+                .get(&row.key_id)
+                .ok_or_else(|| Error::GenesisBundleInvalid {
+                    detail: format!("re-anchor target {} has no existing row", row.key_id),
+                })?;
+        if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64 {
+            return Err(Error::GenesisBundleInvalid {
+                detail: format!("re-anchor {}: pubkey change refused", row.key_id),
+            });
+        }
+        if row.valid_from <= existing.valid_from {
+            return Err(Error::GenesisBundleInvalid {
+                detail: format!(
+                    "re-anchor {}: valid_from not newer than anchored — rollback refused",
+                    row.key_id
+                ),
+            });
+        }
+        state.federation_keys.insert(row.key_id.clone(), row);
+        Ok(())
+    }
+
     async fn lookup_public_key(
         &self,
         key_id: &str,
@@ -7857,6 +7911,120 @@ mod tests {
             v2.root_self_declares && v2.lifecycle_active,
             "(4) only the EDGE died — the root's own declarations stand"
         );
+    }
+
+    /// v19.1.0 (CIRISPersist#490) — THE acceptance witness: bake the REAL
+    /// 2026-07-23 humanity-accord ceremony artifact (`genesis_v2.json`,
+    /// byte-exact, sha256 44be2cf8…) against a node holding the REAL baked
+    /// genesis state (A1/B1/C1 roster + the prior roles-less canonical
+    /// anchor — the exact state that refused the adopt in the field).
+    ///
+    /// Proves end-to-end, with production cryptography:
+    /// 1. the bundle quorum (A1+B1 hybrid YubiKey authorizations) verifies
+    ///    against persist's OWN roster + directory-pinned keys;
+    /// 2. the anchored-but-different canonical is RE-ANCHORED (the exact
+    ///    "downgrade/replace refused" case, now authenticated);
+    /// 3. the #486 lift makes the re-blessed record claim `infra:serve`
+    ///    (envelope-attested, top-level `roles:[]` on the wire);
+    /// 4. the delegation plane admits (the charter passes the v19.0.0
+    ///    pre-rotation gate; the serve grant lands);
+    /// 5. re-baking the same artifact is a no-op (idempotent).
+    #[tokio::test]
+    async fn bake_real_genesis_v2_artifact_490() {
+        use crate::federation::genesis::{bake_assembled_genesis, BakeItemOutcome};
+        let backend = MemoryBackend::new();
+
+        // Seed the REAL baked genesis state: the A1/B1/C1 holder roster…
+        for rec in crate::federation::genesis::effective_accord_holder_records().iter() {
+            backend
+                .put_public_key(rec.clone())
+                .await
+                .expect("seed accord holder");
+        }
+        // …and the PRIOR canonical anchor — the PRE-CEREMONY roles-less
+        // record (kept as a fixture: the live baked seed is now the
+        // re-blessed one, so the field-refusal state must be seeded
+        // explicitly).
+        let prev: Vec<crate::federation::SignedKeyRecord> =
+            serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/canonical_seed_pre_ceremony.json"
+            )))
+            .expect("pre-ceremony seed fixture parses");
+        for rec in prev {
+            backend
+                .put_public_key(rec)
+                .await
+                .expect("seed prior canonical anchor");
+        }
+        let canon = "ciris-canonical-1-d7bdeu223k";
+        let before = crate::federation::FederationDirectory::lookup_public_key(&backend, canon)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !before.claims_role("infra:serve"),
+            "fixture: prior anchor is dark (no infra:serve) — the #480 state"
+        );
+
+        // Bake the REAL artifact.
+        let artifact = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/genesis_v2.json"
+        ));
+        let report = bake_assembled_genesis(&backend, artifact)
+            .await
+            .expect("the real ceremony artifact must verify and bake");
+        assert_eq!(
+            report.quorum_verified, 2,
+            "A1+B1 hybrid authorizations verified"
+        );
+        assert_eq!(
+            report.serve_nodes,
+            vec![(canon.to_owned(), BakeItemOutcome::ReAnchored)],
+            "the anchored-but-different canonical is re-anchored under quorum"
+        );
+        for (id, outcome) in &report.attestations {
+            assert!(
+                matches!(
+                    outcome,
+                    BakeItemOutcome::Anchored | BakeItemOutcome::AlreadyPresent
+                ),
+                "delegation-plane row {id} must land, got {outcome:?}"
+            );
+        }
+
+        // The mesh is bright: the re-blessed record claims infra:serve
+        // (the #486 lift over the envelope-attested set).
+        let after = crate::federation::FederationDirectory::lookup_public_key(&backend, canon)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.claims_role("infra:serve"), "the trace plane opens");
+        assert!(after.claims_role(crate::federation::types::identity_type::CANONICAL));
+        assert!(
+            after.valid_from > before.valid_from,
+            "anti-rollback ordering"
+        );
+
+        // Idempotent: same artifact again → nothing changes, no error.
+        let again = bake_assembled_genesis(&backend, artifact)
+            .await
+            .expect("re-bake is a no-op, not an error");
+        assert_eq!(
+            again.serve_nodes,
+            vec![(canon.to_owned(), BakeItemOutcome::AlreadyPresent)],
+            "idempotent re-bake"
+        );
+
+        // A tampered bundle (flipped byte in an authorization) refuses and
+        // writes NOTHING.
+        let mut tampered: serde_json::Value = serde_json::from_str(artifact).unwrap();
+        tampered["authorizations"][0]["signature_classical"] = serde_json::json!("QUFBQQ==");
+        let err = bake_assembled_genesis(&backend, &tampered.to_string())
+            .await
+            .expect_err("tampered authorization must refuse");
+        assert_eq!(err.kind(), "federation_genesis_bundle_invalid");
     }
 
     /// v19.0.0 (CIRISPersist#488) — the RC3 charter deltas, all three:

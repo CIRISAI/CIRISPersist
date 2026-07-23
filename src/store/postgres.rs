@@ -2893,6 +2893,110 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         PostgresBackend::adopt_scrub_upgrade(self, record).await
     }
 
+    // v19.1.0 (#490) — the authenticated re-anchor (see sqlite impl for the
+    // full invariants: internal quorum re-verify + bundle-carried check +
+    // lift + gates + identity/anti-rollback guards).
+    async fn adopt_genesis_reanchor(
+        &self,
+        record: crate::federation::SignedKeyRecord,
+        bundle: &crate::federation::genesis::GenesisBundle,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::Error;
+        crate::federation::genesis::verify_bundle_quorum(self, bundle).await?;
+        let mut row = record.record;
+        if !bundle.serve_nodes.iter().any(|sn| {
+            sn.record.persist_row_hash == row.persist_row_hash
+                && sn.record.key_id == row.key_id
+                && sn.record.registration_envelope == row.registration_envelope
+        }) {
+            return Err(Error::GenesisBundleInvalid {
+                detail: format!(
+                    "re-anchor record {} is not carried by the verified bundle",
+                    row.key_id
+                ),
+            });
+        }
+        crate::federation::admission::lift_envelope_attested_roles(&mut row);
+        crate::federation::register::validate_registration_pubkey(&row)?;
+        crate::federation::admission::check_canonical_role_admission(self, &row).await?;
+        crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
+        crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+
+        let existing = crate::federation::FederationDirectory::lookup_public_key(self, &row.key_id)
+            .await?
+            .ok_or_else(|| Error::GenesisBundleInvalid {
+                detail: format!("re-anchor target {} has no existing row", row.key_id),
+            })?;
+        if existing.pubkey_ed25519_base64 != row.pubkey_ed25519_base64 {
+            return Err(Error::GenesisBundleInvalid {
+                detail: format!("re-anchor {}: pubkey change refused", row.key_id),
+            });
+        }
+        if row.valid_from <= existing.valid_from {
+            return Err(Error::GenesisBundleInvalid {
+                detail: format!(
+                    "re-anchor {}: valid_from not newer than anchored — rollback refused",
+                    row.key_id
+                ),
+            });
+        }
+
+        let original_content_hash = hex::decode(&row.original_content_hash)
+            .map_err(|e| Error::InvalidArgument(format!("original_content_hash hex: {e}")))?;
+        let roles_param: Option<&Vec<String>> = if row.roles.is_empty() {
+            None
+        } else {
+            Some(&row.roles)
+        };
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        // No `scrub_key_id = key_id` WHERE condition — this path replaces an
+        // ANCHORED row under the bundle-quorum authority verified above.
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_keys SET \
+                    pubkey_ml_dsa_65_base64 = $2, algorithm = $3, identity_type = $4, \
+                    identity_ref = $5, valid_from = $6, valid_until = $7, \
+                    registration_envelope = $8, original_content_hash = $9, \
+                    scrub_signature_classical = $10, scrub_signature_pqc = $11, \
+                    scrub_key_id = $12, scrub_timestamp = $13, pqc_completed_at = $14, \
+                    persist_row_hash = $15, roles = $16, attestation_evidence = $17 \
+                 WHERE key_id = $1 AND pubkey_ed25519_base64 = $18",
+                &[
+                    &row.key_id,
+                    &row.pubkey_ml_dsa_65_base64,
+                    &row.algorithm,
+                    &row.identity_type,
+                    &row.identity_ref,
+                    &row.valid_from,
+                    &row.valid_until,
+                    &row.registration_envelope,
+                    &original_content_hash,
+                    &row.scrub_signature_classical,
+                    &row.scrub_signature_pqc,
+                    &row.scrub_key_id,
+                    &row.scrub_timestamp,
+                    &row.pqc_completed_at,
+                    &row.persist_row_hash,
+                    &roles_param,
+                    &row.attestation_evidence,
+                    &row.pubkey_ed25519_base64,
+                ],
+            )
+            .await
+            .map_err(|e| Error::Backend(format!("reanchor {}: {e}", row.key_id)))?;
+        if n != 1 {
+            return Err(Error::Backend(format!(
+                "reanchor {}: expected 1 row updated, got {n}",
+                row.key_id
+            )));
+        }
+        Ok(())
+    }
+
     async fn put_public_key(
         &self,
         record: crate::federation::SignedKeyRecord,

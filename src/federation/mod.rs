@@ -437,6 +437,26 @@ pub trait FederationDirectory: Send + Sync {
     /// Fetch a single pubkey row by `key_id`. Returns `None` if absent.
     async fn lookup_public_key(&self, key_id: &str) -> Result<Option<KeyRecord>, Error>;
 
+    /// v19.1.0 (CIRISPersist#490) — the **authenticated re-anchor**: replace
+    /// an ALREADY-ANCHORED key row with a re-blessed record carried by a
+    /// quorum-verified [`genesis::GenesisBundle`]. The ONLY path that may
+    /// replace an anchored canonical. Every impl MUST re-verify the bundle
+    /// quorum INTERNALLY against this node's own roster + pinned keys
+    /// (`genesis::verify_bundle_quorum`) before writing — authority is
+    /// re-derived from own verified state, never accepted from the caller
+    /// (the #377 lesson). Identity guard (pubkey-identical) + anti-rollback
+    /// (`valid_from` strictly newer) are re-asserted at the write.
+    async fn adopt_genesis_reanchor(
+        &self,
+        record: SignedKeyRecord,
+        bundle: &genesis::GenesisBundle,
+    ) -> Result<(), Error> {
+        let _ = (record, bundle);
+        Err(Error::Unsupported {
+            method: "adopt_genesis_reanchor",
+        })
+    }
+
     /// Fetch all pubkey rows for a given identity. Used by the
     /// "all keys for primitive X" lookup the v0.2.x verify subsumption
     /// proxy will call.
@@ -3975,6 +3995,18 @@ pub enum Error {
         detail: String,
     },
 
+    /// v19.1.0 (CIRISPersist#490) — an assembled genesis bundle failed
+    /// verification or bake admission: unparseable artifact, quorum not
+    /// met against THIS node's roster, a non-seated/unresolvable holder,
+    /// an authorization signature that does not verify against the
+    /// directory-pinned keys, an identity-changing re-anchor, or a
+    /// rollback (bundle record not newer than the anchored one).
+    #[error("genesis bundle refused: {detail}")]
+    GenesisBundleInvalid {
+        /// What failed.
+        detail: String,
+    },
+
     /// v2.4.0 (CIRISPersist#102 Ask 3a). The submitted `scores`
     /// attestation's `dimension` begins with `accord:` but the
     /// `attesting_key_id`'s `identity_type` is not `accord_holder`.
@@ -4943,6 +4975,7 @@ impl Error {
             Error::EnvelopeTooLarge { .. } => "federation_envelope_too_large",
             Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
             Error::CharterInvalid { .. } => "federation_charter_invalid",
+            Error::GenesisBundleInvalid { .. } => "federation_genesis_bundle_invalid",
             Error::AccordDimensionRequiresAccordHolder { .. } => {
                 "federation_accord_dimension_requires_accord_holder"
             }

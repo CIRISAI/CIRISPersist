@@ -2096,6 +2096,28 @@ impl Engine {
         Ok(key_id)
     }
 
+    /// v19.1.0 (CIRISPersist#490) — bake an assembled genesis trust-root
+    /// bundle (the ceremony artifact JSON): quorum-verify against THIS
+    /// node's roster, then land serve nodes (insert / idempotent /
+    /// authenticated re-anchor) + the delegation plane. See
+    /// [`crate::federation::genesis::bake_assembled_genesis`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn bake_assembled_genesis(
+        &self,
+        bundle_json: &str,
+    ) -> Result<crate::federation::genesis::GenesisBakeReport, crate::federation::Error> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::federation::genesis::bake_assembled_genesis(&**b, bundle_json).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::federation::genesis::bake_assembled_genesis(&**b, bundle_json).await
+            }
+        }
+    }
+
     /// v4.6 (CIRISPersist#171 phase 2, CEG §10.1.3/§10.1.5) — promote a
     /// **local**-tier self-attestation to **federation**: canonicalize the
     /// row's envelope through the produce-side gate (JCS post-cut, §0.9),
