@@ -93,6 +93,7 @@ pub struct TraceBackfillReport {
 
 pub mod register;
 pub mod replication;
+pub mod replication_policy;
 pub mod rooting;
 pub mod schema_resolver;
 pub mod scores;
