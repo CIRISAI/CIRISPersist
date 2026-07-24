@@ -1661,6 +1661,7 @@ mod tests {
     /// (`list_trace_summaries`) MUST see it. Before this cut node B's
     /// `put_attestation` wrote `federation_attestations` only — the corpus
     /// stayed empty forever (`n_summaries=0`, no error).
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn replicated_trace_attestation_materializes_scorer_corpus_501() {
         use crate::federation::FederationDirectory as _;
