@@ -2612,31 +2612,17 @@ impl FederationDirectory for OpsDirectory {
             method: "communities_containing",
         })
     }
-    async fn put_organization(
-        &self,
-        signed: SignedOrganization,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
-    ) -> Result<(), Error> {
+    async fn put_organization(&self, signed: SignedOrganization) -> Result<(), Error> {
         Err(Error::Unsupported {
             method: "put_organization",
         })
     }
-    async fn put_org_membership(
-        &self,
-        signed: SignedOrgMembership,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
-    ) -> Result<(), Error> {
+    async fn put_org_membership(&self, signed: SignedOrgMembership) -> Result<(), Error> {
         Err(Error::Unsupported {
             method: "put_org_membership",
         })
     }
-    async fn put_partner_record(
-        &self,
-        signed: SignedPartnerRecord,
-        steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
-    ) -> Result<(), Error> {
+    async fn put_partner_record(&self, signed: SignedPartnerRecord) -> Result<(), Error> {
         Err(Error::Unsupported {
             method: "put_partner_record",
         })

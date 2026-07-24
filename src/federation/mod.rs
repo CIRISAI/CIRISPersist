@@ -1371,12 +1371,7 @@ pub trait FederationDirectory: Send + Sync {
     /// Append-only on `attestation_id`; idempotent re-submit of identical
     /// content is `Ok(())`. Current-state is resolved at read time by
     /// [`operational::resolve_lww`] (stable-id grouping on `org_id`).
-    async fn put_organization(
-        &self,
-        signed: SignedOrganization,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
-    ) -> Result<(), Error>;
+    async fn put_organization(&self, signed: SignedOrganization) -> Result<(), Error>;
 
     /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — admit
     /// an `org_membership` envelope. Role-gated (`lww_skew_bounded`).
@@ -1392,12 +1387,7 @@ pub trait FederationDirectory: Send + Sync {
     /// Current-state is resolved at read time by
     /// [`operational::resolve_lww`] (stable-id grouping on
     /// `(user_id, org_id)`).
-    async fn put_org_membership(
-        &self,
-        signed: SignedOrgMembership,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
-    ) -> Result<(), Error>;
+    async fn put_org_membership(&self, signed: SignedOrgMembership) -> Result<(), Error>;
 
     /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — admit
     /// a `partner_record` envelope. M-of-N steward quorum
@@ -1421,11 +1411,7 @@ pub trait FederationDirectory: Send + Sync {
     /// Current-state is resolved at read time by
     /// [`operational::resolve_monotonic_quorum`] (stable-id grouping on
     /// `license_id`).
-    async fn put_partner_record(
-        &self,
-        signed: SignedPartnerRecord,
-        steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
-    ) -> Result<(), Error>;
+    async fn put_partner_record(&self, signed: SignedPartnerRecord) -> Result<(), Error>;
 
     /// v5.1.0 (CIRISPersist#65) — all stored `organization` rows for
     /// `org_id` (in-force and withdrawn — full history). Callers resolve

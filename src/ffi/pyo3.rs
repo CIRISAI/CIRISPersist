@@ -5598,21 +5598,13 @@ impl PyEngine {
     /// `key_directory_json` = `[ThresholdMember]`; `root_stewards_json` =
     /// `[String]`. Runs the four admission checks (skew-bound, no-payment-
     /// processor, role authority, fail-closed).
-    fn put_organization(
-        &self,
-        py: Python<'_>,
-        signed_json: &str,
-        key_directory_json: &str,
-        root_stewards_json: &str,
-    ) -> PyResult<()> {
+    fn put_organization(&self, py: Python<'_>, signed_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let signed: crate::federation::SignedOrganization = serde_json::from_str(signed_json)
                 .map_err(|e| {
                 PyValueError::new_err(format!("SignedOrganization JSON decode: {e}"))
             })?;
-            let (key_directory, root_stewards) =
-                decode_role_authority_inputs(key_directory_json, root_stewards_json)?;
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
@@ -5621,7 +5613,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_organization(signed, &key_directory, &root_stewards)
+                            .put_organization(signed)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -5632,7 +5624,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_organization(signed, &key_directory, &root_stewards)
+                            .put_organization(signed)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -5645,21 +5637,13 @@ impl PyEngine {
     /// gated; CEG 1.0-RC2 §5.6.8.13). Same arg shape as
     /// [`put_organization`](Self::put_organization); `signed_json` =
     /// `SignedOrgMembership`.
-    fn put_org_membership(
-        &self,
-        py: Python<'_>,
-        signed_json: &str,
-        key_directory_json: &str,
-        root_stewards_json: &str,
-    ) -> PyResult<()> {
+    fn put_org_membership(&self, py: Python<'_>, signed_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let signed: crate::federation::SignedOrgMembership = serde_json::from_str(signed_json)
                 .map_err(|e| {
                     PyValueError::new_err(format!("SignedOrgMembership JSON decode: {e}"))
                 })?;
-            let (key_directory, root_stewards) =
-                decode_role_authority_inputs(key_directory_json, root_stewards_json)?;
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
@@ -5668,7 +5652,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_org_membership(signed, &key_directory, &root_stewards)
+                            .put_org_membership(signed)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -5679,7 +5663,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_org_membership(signed, &key_directory, &root_stewards)
+                            .put_org_membership(signed)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -5694,21 +5678,12 @@ impl PyEngine {
     /// `steward_roster_json` = `[ThresholdMember]` (the pinned roster the
     /// quorum verifies against). Runs skew-bound, no-payment-processor,
     /// set-semantics-sorted, quorum, and revision anti-rollback.
-    fn put_partner_record(
-        &self,
-        py: Python<'_>,
-        signed_json: &str,
-        steward_roster_json: &str,
-    ) -> PyResult<()> {
+    fn put_partner_record(&self, py: Python<'_>, signed_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let signed: crate::federation::SignedPartnerRecord = serde_json::from_str(signed_json)
                 .map_err(|e| {
                     PyValueError::new_err(format!("SignedPartnerRecord JSON decode: {e}"))
-                })?;
-            let roster: Vec<ciris_verify_core::threshold::ThresholdMember> =
-                serde_json::from_str(steward_roster_json).map_err(|e| {
-                    PyValueError::new_err(format!("steward_roster JSON decode: {e}"))
                 })?;
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -5718,7 +5693,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_partner_record(signed, &roster)
+                            .put_partner_record(signed)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -5729,7 +5704,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_partner_record(signed, &roster)
+                            .put_partner_record(signed)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -24977,20 +24952,6 @@ enum OperationalKind {
 /// `put_organization` / `put_org_membership`: a JSON array of
 /// `ThresholdMember` (pinned hybrid pubkeys) + a JSON array of `String`
 /// root-steward key_ids.
-fn decode_role_authority_inputs(
-    key_directory_json: &str,
-    root_stewards_json: &str,
-) -> PyResult<(
-    Vec<ciris_verify_core::threshold::ThresholdMember>,
-    Vec<String>,
-)> {
-    let key_directory: Vec<ciris_verify_core::threshold::ThresholdMember> =
-        serde_json::from_str(key_directory_json)
-            .map_err(|e| PyValueError::new_err(format!("key_directory JSON decode: {e}")))?;
-    let root_stewards: Vec<String> = serde_json::from_str(root_stewards_json)
-        .map_err(|e| PyValueError::new_err(format!("root_stewards JSON decode: {e}")))?;
-    Ok((key_directory, root_stewards))
-}
 
 /// v5.1.0 (CIRISPersist#65) — FFI-internal operational-data list
 /// dispatchers (not exposed to Python; the `#[pyo3]` wrappers above call

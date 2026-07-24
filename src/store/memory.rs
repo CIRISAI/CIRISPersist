@@ -3833,13 +3833,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     async fn put_organization(
         &self,
         signed: crate::federation::SignedOrganization,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::operational;
         let mut row = signed.organization;
         let now = chrono::Utc::now();
         operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
+        // v21.0.0 (#502 E9) — resolve the steward roster from OUR directory
+        // BEFORE the state lock (the resolve locks the directory itself).
+        let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
         let mut state = self.state.lock().expect("memory backend lock");
         let current: Vec<_> = state
             .federation_org_memberships
@@ -3851,8 +3852,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             &row.attesting_key_id,
             &row.org_id,
             &current,
-            key_directory,
-            root_stewards,
+            &__stw_dir,
+            &__stw_roots,
         )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         memory_idempotent_insert(
@@ -3866,13 +3867,13 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     async fn put_org_membership(
         &self,
         signed: crate::federation::SignedOrgMembership,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::operational;
         let mut row = signed.org_membership;
         let now = chrono::Utc::now();
         operational::check_skew_and_payment(row.asserted_at, now, &row.signed_envelope)?;
+        // v21.0.0 (#502 E9) — roster from OUR directory, before the lock.
+        let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
         let mut state = self.state.lock().expect("memory backend lock");
         let current: Vec<_> = state
             .federation_org_memberships
@@ -3884,8 +3885,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             &row.attesting_key_id,
             &row.org_id,
             &current,
-            key_directory,
-            root_stewards,
+            &__stw_dir,
+            &__stw_roots,
         )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         memory_idempotent_insert(
@@ -3899,7 +3900,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     async fn put_partner_record(
         &self,
         signed: crate::federation::SignedPartnerRecord,
-        steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::operational;
         let now = chrono::Utc::now();
@@ -3908,7 +3908,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             now,
             &signed.partner_record.signed_envelope,
         )?;
-        operational::check_partner_set_and_quorum(&signed, steward_roster)?;
+        // v21.0.0 (#502 E9) — steward roster from OUR directory.
+        let (__stw_dir, _) = operational::resolve_steward_roster(self).await?;
+        operational::check_partner_set_and_quorum(&signed, &__stw_dir)?;
         let mut state = self.state.lock().expect("memory backend lock");
         let existing_max = state
             .federation_partner_records
@@ -8072,6 +8074,62 @@ mod tests {
             .await
             .expect_err("tampered authorization must refuse");
         assert_eq!(err.kind(), "federation_genesis_bundle_invalid");
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E9) — the operational role authority
+    /// resolves the steward roster from OUR OWN registered directory, not a
+    /// caller-passed slice. A grant rooted at a key that is NOT a registered
+    /// steward is REFUSED — a caller can no longer bless itself by handing
+    /// in a roster.
+    #[tokio::test]
+    async fn operational_roster_resolves_from_own_directory_502e9() {
+        use crate::federation::operational::test_support as op;
+        let backend = MemoryBackend::new();
+        let steward = op::Identity::new("e9-steward");
+        let admin = op::Identity::new("e9-admin");
+
+        // Grant BEFORE the steward is registered as a steward key → the
+        // resolved roster is empty → NoQualifyingGrant, refused.
+        let grant = op::signed_membership(
+            "e9-m1",
+            &steward,
+            "e9-admin",
+            "e9-org",
+            "org_admin",
+            "active",
+            chrono::Utc::now(),
+        );
+        let err = backend
+            .put_org_membership(grant)
+            .await
+            .expect_err("(E9) grant rooted at a non-registered steward is refused");
+        assert!(
+            err.kind().contains("operational_authority"),
+            "kind {}",
+            err.kind()
+        );
+
+        // Register the steward IN OUR DIRECTORY → now the same grant admits.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: steward.steward_key_record(),
+            })
+            .await
+            .expect("register steward");
+        let grant2 = op::signed_membership(
+            "e9-m2",
+            &steward,
+            "e9-admin",
+            "e9-org",
+            "org_admin",
+            "active",
+            chrono::Utc::now(),
+        );
+        backend
+            .put_org_membership(grant2)
+            .await
+            .expect("(E9) grant rooted at a REGISTERED steward admits");
+        let _ = &admin;
     }
 
     /// v21.0.0 (CIRISPersist#502 E1) — a forged revocation (scrub sig by a

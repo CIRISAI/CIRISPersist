@@ -952,7 +952,7 @@ mod tests {
         // the trust gate; scrub_key_id = the revoked key, self-revoke).
         let now = chrono::Utc::now();
         let rev_envelope = serde_json::json!({"revokes": dereg_id});
-        let rev_canonical = ceg_produce_canonicalize(&rev_envelope).expect("canonicalize");
+        let _rev_canonical = ceg_produce_canonicalize(&rev_envelope).expect("canonicalize");
         // v21.0.0 (#502 E1) — sign the revocation envelope with the
         // revoking key's registered hybrid key so admission verifies it.
         let (__rev_och, __rev_sc, __rev_sp) =

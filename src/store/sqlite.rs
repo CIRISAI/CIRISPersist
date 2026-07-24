@@ -6179,8 +6179,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn put_organization(
         &self,
         signed: crate::federation::SignedOrganization,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::operational;
         let mut row = signed.organization;
@@ -6189,13 +6187,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
+        let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
         let current = self.list_org_memberships_for(&row.org_id).await?;
         operational::check_role_authority(
             &row.attesting_key_id,
             &row.org_id,
             &current,
-            key_directory,
-            root_stewards,
+            &__stw_dir,
+            &__stw_roots,
         )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let env_text = serde_json::to_string(&row.signed_envelope)
@@ -6241,8 +6240,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn put_org_membership(
         &self,
         signed: crate::federation::SignedOrgMembership,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::operational;
         let mut row = signed.org_membership;
@@ -6251,13 +6248,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
+        let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
         let current = self.list_org_memberships_for(&row.org_id).await?;
         operational::check_role_authority(
             &row.attesting_key_id,
             &row.org_id,
             &current,
-            key_directory,
-            root_stewards,
+            &__stw_dir,
+            &__stw_roots,
         )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let env_text = serde_json::to_string(&row.signed_envelope)
@@ -6298,7 +6296,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn put_partner_record(
         &self,
         signed: crate::federation::SignedPartnerRecord,
-        steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::operational;
         operational::check_skew_and_payment(
@@ -6306,7 +6303,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
             &signed.partner_record.signed_envelope,
         )?;
-        operational::check_partner_set_and_quorum(&signed, steward_roster)?;
+        let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
+        let _ = &__stw_roots;
+        operational::check_partner_set_and_quorum(&signed, &__stw_dir)?;
         // Anti-rollback: revision MUST strictly exceed the existing max
         // for this license_id (enforced at admission, before any merge).
         let existing = self
@@ -19725,8 +19724,8 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
         let admin = op::Identity::new("admin-1");
-        let dir = vec![steward.member(), admin.member()];
-        let roots = vec!["steward-1".to_string()];
+        let _dir = vec![steward.member(), admin.member()];
+        let _roots = vec!["steward-1".to_string()];
 
         // steward (root) grants admin OrgAdmin — granter is the steward.
         let grant = op::signed_membership(
@@ -19739,14 +19738,26 @@ mod tests {
             op_now(),
         );
         backend
-            .put_org_membership(grant, &dir, &roots)
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: admin.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: steward.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_org_membership(grant)
             .await
             .expect("steward-rooted grant admits");
 
         // Now admin (OrgAdmin) writes an organization row — authorized.
         let org = op::signed_organization("o1", "org-x", &admin, "active", op_now());
         backend
-            .put_organization(org, &dir, &roots)
+            .put_organization(org)
             .await
             .expect("OrgAdmin actor admits organization");
 
@@ -19764,14 +19775,11 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let stranger = op::Identity::new("stranger");
-        let dir = vec![stranger.member()];
-        let roots = vec!["steward-1".to_string()]; // stranger is not rooted
+        let _dir = vec![stranger.member()];
+        let _roots = vec!["steward-1".to_string()]; // stranger is not rooted
 
         let org = op::signed_organization("o1", "org-x", &stranger, "active", op_now());
-        let err = backend
-            .put_organization(org, &dir, &roots)
-            .await
-            .unwrap_err();
+        let err = backend.put_organization(org).await.unwrap_err();
         assert_eq!(err.kind(), "federation_operational_authority");
         // nothing stored
         assert!(backend
@@ -19787,8 +19795,8 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
-        let dir = vec![steward.member()];
-        let roots = vec!["steward-1".to_string()];
+        let _dir = vec![steward.member()];
+        let _roots = vec!["steward-1".to_string()];
         let future = op_now() + chrono::Duration::minutes(10);
         let grant = op::signed_membership(
             "m1",
@@ -19799,10 +19807,7 @@ mod tests {
             "active",
             future,
         );
-        let err = backend
-            .put_org_membership(grant, &dir, &roots)
-            .await
-            .unwrap_err();
+        let err = backend.put_org_membership(grant).await.unwrap_err();
         assert_eq!(err.kind(), "federation_clock_skew_violation");
     }
 
@@ -19813,8 +19818,8 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
-        let dir = vec![steward.member()];
-        let roots = vec!["steward-1".to_string()];
+        let _dir = vec![steward.member()];
+        let _roots = vec!["steward-1".to_string()];
         let mut grant = op::signed_membership(
             "m1",
             &steward,
@@ -19826,10 +19831,7 @@ mod tests {
         );
         // Inject a payment-processor id into an open-vocab field.
         grant.org_membership.signed_envelope["billing"] = serde_json::json!("cus_ABC123");
-        let err = backend
-            .put_org_membership(grant, &dir, &roots)
-            .await
-            .unwrap_err();
+        let err = backend.put_org_membership(grant).await.unwrap_err();
         assert_eq!(err.kind(), "federation_payment_processor_identifier");
     }
 
@@ -19841,22 +19843,30 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
         let admin = op::Identity::new("admin-1");
-        let dir = vec![steward.member(), admin.member()];
-        let roots = vec!["steward-1".to_string()];
+        let _dir = vec![steward.member(), admin.member()];
+        let _roots = vec!["steward-1".to_string()];
         backend
-            .put_org_membership(
-                op::signed_membership(
-                    "m1",
-                    &steward,
-                    "admin-1",
-                    "org-x",
-                    "org_admin",
-                    "active",
-                    op_now(),
-                ),
-                &dir,
-                &roots,
-            )
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: admin.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: steward.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_org_membership(op::signed_membership(
+                "m1",
+                &steward,
+                "admin-1",
+                "org-x",
+                "org_admin",
+                "active",
+                op_now(),
+            ))
             .await
             .unwrap();
 
@@ -19875,7 +19885,7 @@ mod tests {
                 status,
                 base + chrono::Duration::seconds(secs),
             );
-            backend.put_organization(org, &dir, &roots).await.unwrap();
+            backend.put_organization(org).await.unwrap();
         }
         let rows = backend.list_organizations_for("org-x").await.unwrap();
         assert_eq!(rows.len(), 3, "all writes stored (append-only audit)");
@@ -19894,22 +19904,30 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
         let admin = op::Identity::new("admin-1");
-        let dir = vec![steward.member(), admin.member()];
-        let roots = vec!["steward-1".to_string()];
+        let _dir = vec![steward.member(), admin.member()];
+        let _roots = vec!["steward-1".to_string()];
         backend
-            .put_org_membership(
-                op::signed_membership(
-                    "m1",
-                    &steward,
-                    "admin-1",
-                    "org-x",
-                    "org_admin",
-                    "active",
-                    op_now(),
-                ),
-                &dir,
-                &roots,
-            )
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: admin.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: steward.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_org_membership(op::signed_membership(
+                "m1",
+                &steward,
+                "admin-1",
+                "org-x",
+                "org_admin",
+                "active",
+                op_now(),
+            ))
             .await
             .unwrap();
         let base = op_now();
@@ -19922,7 +19940,7 @@ mod tests {
                 "active",
                 base + chrono::Duration::seconds(secs),
             );
-            backend.put_organization(org, &dir, &roots).await.unwrap();
+            backend.put_organization(org).await.unwrap();
         }
         let rows = backend.list_organizations_for("org-x").await.unwrap();
         let current = crate::federation::operational::resolve_lww(&rows).unwrap();
@@ -19939,7 +19957,7 @@ mod tests {
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
         let s3 = op::Identity::new("s3");
-        let roster = vec![
+        let _roster = vec![
             s1.founder_member(),
             s2.founder_member(),
             s3.founder_member(),
@@ -19949,7 +19967,25 @@ mod tests {
         let pr1 =
             op::signed_partner_record("pr1", "lic-1", 1, "active", op_now(), &[&s1, &s2], 2, false);
         backend
-            .put_partner_record(pr1, &roster)
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s1.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s2.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s3.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_partner_record(pr1)
             .await
             .expect("2-of-3 admits");
 
@@ -19964,18 +20000,12 @@ mod tests {
             2,
             false,
         );
-        backend
-            .put_partner_record(pr2, &roster)
-            .await
-            .expect("rev 2 admits");
+        backend.put_partner_record(pr2).await.expect("rev 2 admits");
 
         // revision-decrease (back to 1) — REJECTED at admission.
         let pr_rollback =
             op::signed_partner_record("pr3", "lic-1", 1, "active", op_now(), &[&s1, &s2], 2, false);
-        let err = backend
-            .put_partner_record(pr_rollback, &roster)
-            .await
-            .unwrap_err();
+        let err = backend.put_partner_record(pr_rollback).await.unwrap_err();
         assert_eq!(err.kind(), "federation_partner_record_rollback");
 
         // Merge winner: revision 2 revoked beats revision 1 active.
@@ -19994,13 +20024,13 @@ mod tests {
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
         let s3 = op::Identity::new("s3");
-        let roster = vec![
+        let _roster = vec![
             s1.founder_member(),
             s2.founder_member(),
             s3.founder_member(),
         ];
         let pr = op::signed_partner_record("pr1", "lic-1", 1, "active", op_now(), &[&s1], 2, false);
-        let err = backend.put_partner_record(pr, &roster).await.unwrap_err();
+        let err = backend.put_partner_record(pr).await.unwrap_err();
         assert_eq!(err.kind(), "federation_operational_authority");
     }
 
@@ -20011,7 +20041,7 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
-        let roster = vec![s1.founder_member(), s2.founder_member()];
+        let _roster = vec![s1.founder_member(), s2.founder_member()];
         let pr = op::signed_partner_record(
             "pr1",
             "lic-1",
@@ -20022,7 +20052,7 @@ mod tests {
             2,
             true, // unsorted
         );
-        let err = backend.put_partner_record(pr, &roster).await.unwrap_err();
+        let err = backend.put_partner_record(pr).await.unwrap_err();
         assert_eq!(err.kind(), "federation_set_semantics_unsorted");
     }
 
@@ -20033,7 +20063,7 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
-        let roster = vec![s1.founder_member(), s2.founder_member()];
+        let _roster = vec![s1.founder_member(), s2.founder_member()];
         let base = op_now();
         for (id, lic, secs) in [("a", "l1", 0), ("b", "l2", 60), ("c", "l3", 120)] {
             let pr = op::signed_partner_record(
@@ -20046,7 +20076,19 @@ mod tests {
                 2,
                 false,
             );
-            backend.put_partner_record(pr, &roster).await.unwrap();
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: s1.steward_key_record(),
+                })
+                .await
+                .ok();
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: s2.steward_key_record(),
+                })
+                .await
+                .ok();
+            backend.put_partner_record(pr).await.unwrap();
         }
         // since = base + 30s → excludes "a", returns "b","c" ordered.
         let cursor = base + chrono::Duration::seconds(30);
@@ -20072,7 +20114,7 @@ mod tests {
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
         let s3 = op::Identity::new("s3");
-        let roster = vec![
+        let _roster = vec![
             s1.founder_member(),
             s2.founder_member(),
             s3.founder_member(),
@@ -20081,7 +20123,25 @@ mod tests {
         let sender =
             op::signed_partner_record("pr1", "lic-1", 1, "active", op_now(), &[&s1, &s2], 2, false);
         backend
-            .put_partner_record(sender.clone(), &roster)
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s1.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s2.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s3.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_partner_record(sender.clone())
             .await
             .expect("2-of-3 admits");
 

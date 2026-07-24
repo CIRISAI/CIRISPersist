@@ -6546,8 +6546,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn put_organization(
         &self,
         signed: crate::federation::SignedOrganization,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::operational;
         let mut row = signed.organization;
@@ -6556,13 +6554,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
+        let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
         let current = self.list_org_memberships_for(&row.org_id).await?;
         operational::check_role_authority(
             &row.attesting_key_id,
             &row.org_id,
             &current,
-            key_directory,
-            root_stewards,
+            &__stw_dir,
+            &__stw_roots,
         )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let client = self
@@ -6604,8 +6603,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn put_org_membership(
         &self,
         signed: crate::federation::SignedOrgMembership,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::operational;
         let mut row = signed.org_membership;
@@ -6614,13 +6611,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
+        let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
         let current = self.list_org_memberships_for(&row.org_id).await?;
         operational::check_role_authority(
             &row.attesting_key_id,
             &row.org_id,
             &current,
-            key_directory,
-            root_stewards,
+            &__stw_dir,
+            &__stw_roots,
         )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let client = self
@@ -6660,7 +6658,6 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn put_partner_record(
         &self,
         signed: crate::federation::SignedPartnerRecord,
-        steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::operational;
         operational::check_skew_and_payment(
@@ -6668,7 +6665,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             chrono::Utc::now(),
             &signed.partner_record.signed_envelope,
         )?;
-        operational::check_partner_set_and_quorum(&signed, steward_roster)?;
+        let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
+        let _ = &__stw_roots;
+        operational::check_partner_set_and_quorum(&signed, &__stw_dir)?;
         let existing = self
             .list_partner_records_for(&signed.partner_record.license_id)
             .await?;
@@ -31766,8 +31765,8 @@ mod tests {
         let org_id = format!("org-{}", uuid_like());
         let steward = op::Identity::new(&format!("steward-{}", uuid_like()));
         let admin = op::Identity::new(&format!("admin-{}", uuid_like()));
-        let dir = vec![steward.member(), admin.member()];
-        let roots = vec![steward.key_id.clone()];
+        let _dir = vec![steward.member(), admin.member()];
+        let _roots = vec![steward.key_id.clone()];
 
         // root steward grants admin OrgAdmin.
         let grant = op::signed_membership(
@@ -31780,52 +31779,49 @@ mod tests {
             now,
         );
         backend
-            .put_org_membership(grant, &dir, &roots)
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: admin.steward_key_record(),
+            })
             .await
-            .unwrap();
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: steward.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend.put_org_membership(grant).await.unwrap();
 
         // admin writes an organization — authorized.
         let o1 = format!("o1-{}", uuid_like());
         backend
-            .put_organization(
-                op::signed_organization(&o1, &org_id, &admin, "active", now),
-                &dir,
-                &roots,
-            )
+            .put_organization(op::signed_organization(&o1, &org_id, &admin, "active", now))
             .await
             .unwrap();
 
         // fail-closed: a stranger cannot write.
         let stranger = op::Identity::new(&format!("stranger-{}", uuid_like()));
         let err = backend
-            .put_organization(
-                op::signed_organization(
-                    &format!("ox-{}", uuid_like()),
-                    &org_id,
-                    &stranger,
-                    "active",
-                    now,
-                ),
-                &[stranger.member()],
-                &roots,
-            )
+            .put_organization(op::signed_organization(
+                &format!("ox-{}", uuid_like()),
+                &org_id,
+                &stranger,
+                "active",
+                now,
+            ))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_operational_authority");
 
         // skew-bound reject.
         let err = backend
-            .put_organization(
-                op::signed_organization(
-                    &format!("of-{}", uuid_like()),
-                    &org_id,
-                    &admin,
-                    "active",
-                    now + chrono::Duration::minutes(10),
-                ),
-                &dir,
-                &roots,
-            )
+            .put_organization(op::signed_organization(
+                &format!("of-{}", uuid_like()),
+                &org_id,
+                &admin,
+                "active",
+                now + chrono::Duration::minutes(10),
+            ))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_clock_skew_violation");
@@ -31839,26 +31835,19 @@ mod tests {
             now,
         );
         bad.organization.signed_envelope["billing"] = serde_json::json!("sub_9xKpQ");
-        let err = backend
-            .put_organization(bad, &dir, &roots)
-            .await
-            .unwrap_err();
+        let err = backend.put_organization(bad).await.unwrap_err();
         assert_eq!(err.kind(), "federation_payment_processor_identifier");
 
         // out-of-order arrival + withdrawal-forward-only.
         for (suffix, status, secs) in [("a", "active", 60), ("c", "deactivated", 180)] {
             backend
-                .put_organization(
-                    op::signed_organization(
-                        &format!("{suffix}-{}", uuid_like()),
-                        &org_id,
-                        &admin,
-                        status,
-                        now + chrono::Duration::seconds(secs),
-                    ),
-                    &dir,
-                    &roots,
-                )
+                .put_organization(op::signed_organization(
+                    &format!("{suffix}-{}", uuid_like()),
+                    &org_id,
+                    &admin,
+                    status,
+                    now + chrono::Duration::seconds(secs),
+                ))
                 .await
                 .unwrap();
         }
@@ -31886,90 +31875,105 @@ mod tests {
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
         let s3 = op::Identity::new("s3");
-        let roster = vec![
+        let _roster = vec![
             s1.founder_member(),
             s2.founder_member(),
             s3.founder_member(),
         ];
 
         backend
-            .put_partner_record(
-                op::signed_partner_record(
-                    &format!("pr1-{}", uuid_like()),
-                    &lic,
-                    1,
-                    "active",
-                    now,
-                    &[&s1, &s2],
-                    2,
-                    false,
-                ),
-                &roster,
-            )
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s1.steward_key_record(),
+            })
+            .await
+            .ok();
+
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s2.steward_key_record(),
+            })
+            .await
+            .ok();
+
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s3.steward_key_record(),
+            })
+            .await
+            .ok();
+
+        backend
+            .put_partner_record(op::signed_partner_record(
+                &format!("pr1-{}", uuid_like()),
+                &lic,
+                1,
+                "active",
+                now,
+                &[&s1, &s2],
+                2,
+                false,
+            ))
             .await
             .unwrap();
         let pr2_id = format!("pr2-{}", uuid_like());
         backend
-            .put_partner_record(
-                op::signed_partner_record(&pr2_id, &lic, 2, "revoked", now, &[&s1, &s2], 2, false),
-                &roster,
-            )
+            .put_partner_record(op::signed_partner_record(
+                &pr2_id,
+                &lic,
+                2,
+                "revoked",
+                now,
+                &[&s1, &s2],
+                2,
+                false,
+            ))
             .await
             .unwrap();
 
         // revision decrease rejected at admission.
         let err = backend
-            .put_partner_record(
-                op::signed_partner_record(
-                    &format!("pr3-{}", uuid_like()),
-                    &lic,
-                    1,
-                    "active",
-                    now,
-                    &[&s1, &s2],
-                    2,
-                    false,
-                ),
-                &roster,
-            )
+            .put_partner_record(op::signed_partner_record(
+                &format!("pr3-{}", uuid_like()),
+                &lic,
+                1,
+                "active",
+                now,
+                &[&s1, &s2],
+                2,
+                false,
+            ))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_partner_record_rollback");
 
         // insufficient quorum rejected.
         let err = backend
-            .put_partner_record(
-                op::signed_partner_record(
-                    &format!("prq-{}", uuid_like()),
-                    &lic,
-                    3,
-                    "active",
-                    now,
-                    &[&s1],
-                    2,
-                    false,
-                ),
-                &roster,
-            )
+            .put_partner_record(op::signed_partner_record(
+                &format!("prq-{}", uuid_like()),
+                &lic,
+                3,
+                "active",
+                now,
+                &[&s1],
+                2,
+                false,
+            ))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_operational_authority");
 
         // unsorted set-semantics rejected.
         let err = backend
-            .put_partner_record(
-                op::signed_partner_record(
-                    &format!("pru-{}", uuid_like()),
-                    &lic,
-                    3,
-                    "active",
-                    now,
-                    &[&s1, &s2],
-                    2,
-                    true,
-                ),
-                &roster,
-            )
+            .put_partner_record(op::signed_partner_record(
+                &format!("pru-{}", uuid_like()),
+                &lic,
+                3,
+                "active",
+                now,
+                &[&s1, &s2],
+                2,
+                true,
+            ))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), "federation_set_semantics_unsorted");
@@ -32009,7 +32013,7 @@ mod tests {
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
         let s3 = op::Identity::new("s3");
-        let roster = vec![
+        let _roster = vec![
             s1.founder_member(),
             s2.founder_member(),
             s3.founder_member(),
@@ -32018,9 +32022,24 @@ mod tests {
         let sender =
             op::signed_partner_record(&pr_id, &lic, 1, "active", now, &[&s1, &s2], 2, false);
         backend
-            .put_partner_record(sender.clone(), &roster)
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s1.steward_key_record(),
+            })
             .await
-            .unwrap();
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s2.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s3.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend.put_partner_record(sender.clone()).await.unwrap();
 
         let listed = backend
             .list_signed_partner_records_since(Some(now - chrono::Duration::seconds(1)), 200)

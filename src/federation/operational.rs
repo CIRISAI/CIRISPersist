@@ -746,12 +746,67 @@ pub mod test_support {
     }
 
     impl Identity {
-        /// New random hybrid identity under `id`.
+        /// v21.0.0 (#502 E9 test-isolation fix) — a DETERMINISTIC hybrid
+        /// identity seeded from `id` (the same `[0x11;32]`-overlay seed
+        /// `tier_ingest::test_support` uses), NOT a random keypair.
+        ///
+        /// The old random constructor meant a fixed key_id like `"s1"` had
+        /// DIFFERENT pubkeys on every construction — harmless while rosters
+        /// were passed in-memory per test, but once E9 resolves the roster
+        /// from the shared directory, two serial tests reusing `"s1"` on one
+        /// pg DB got mismatched pubkeys-vs-signatures (roster from run A,
+        /// signatures from run B → 0 valid). Deterministic seeding makes
+        /// `"s1"` stable across tests/runs AND byte-identical to
+        /// `hybrid_pubkeys("s1")`, so registration is idempotent and the
+        /// resolved roster always verifies the signatures.
         pub fn new(id: &str) -> Self {
+            let mut seed = [0x11u8; 32];
+            for (i, b) in id.bytes().take(32).enumerate() {
+                seed[i] = b;
+            }
             Self {
                 key_id: id.to_string(),
-                ed: Ed25519Signer::random().expect("test rng healthy"),
-                mldsa: MlDsa65Signer::new().unwrap(),
+                ed: Ed25519Signer::from_seed(&seed).expect("ed seed"),
+                mldsa: MlDsa65Signer::from_seed(&seed).expect("mldsa seed"),
+            }
+        }
+
+        /// v21.0.0 (#502 E9) — this identity as a REGISTERED `steward`
+        /// `KeyRecord` (identity_type = steward, carrying this identity's
+        /// pubkeys) so `resolve_steward_roster` finds it in the directory.
+        /// The E9 model: stewards are registered steward keys, not a
+        /// caller-passed roster.
+        pub fn steward_key_record(&self) -> crate::federation::types::KeyRecord {
+            let m = self.member();
+            crate::federation::types::KeyRecord {
+                key_id: self.key_id.clone(),
+                pubkey_ed25519_base64: m.ed25519_public_key_base64,
+                pubkey_ml_dsa_65_base64: m.mldsa65_public_key_base64,
+                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                identity_type: crate::federation::types::identity_type::STEWARD.to_owned(),
+                identity_ref: self.key_id.clone(),
+                // Fixed timestamp — deterministic content so the same key_id
+                // registers idempotently across serial tests on a shared DB.
+                valid_from: "2020-01-01T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                registration_envelope: json!({ "key_id": self.key_id }),
+                original_content_hash: {
+                    use sha2::Digest as _;
+                    let env = json!({ "key_id": self.key_id });
+                    let canonical =
+                        crate::verify::canonical::ceg_produce_canonicalize(&env).unwrap();
+                    hex::encode(sha2::Sha256::digest(&canonical))
+                },
+                scrub_signature_classical: "AA".to_owned(),
+                scrub_signature_pqc: None,
+                scrub_key_id: self.key_id.clone(),
+                scrub_timestamp: "2020-01-01T00:00:00Z".parse().unwrap(),
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
             }
         }
 
