@@ -257,6 +257,26 @@ struct State {
     /// v16.0.0 (CIRISPersist#424) — generic role-withdrawal tombstones (V104
     /// mirror), keyed `(role, key_id)`.
     role_withdrawals: HashMap<(String, String), crate::federation::admission::RoleWithdrawal>,
+    /// v21.0.0 (CIRISPersist#502 E7) — the in-memory mirror of the V109
+    /// `consent_peer_set` projection: the node's live `consent:replication:v1`
+    /// peer grants, revocation-folded. Maintained on every `put_attestation`
+    /// (grant upsert / withdraws-revocation fold), same as the SQL backends'
+    /// `consent_peer_set` table. See `crate::federation::consent_peer_set`.
+    consent_peer_set: Vec<ConsentPeerRow>,
+}
+
+/// v21.0.0 (CIRISPersist#502 E7) — one row of the in-memory
+/// `consent_peer_set` mirror. Mirrors the V109 table shape exactly.
+#[derive(Clone)]
+struct ConsentPeerRow {
+    node_key_id: String,
+    peer_key_id: String,
+    source_attestation_id: String,
+    /// Kept for V109 table-shape parity with the SQL backends;
+    /// `list_consent_peers` returns only the peer set (a name, not a
+    /// recency), so this is written but not read back.
+    #[allow(dead_code)]
+    asserted_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// v9.1.0 (CIRISPersist#243) — one in-memory scope-blob symbol + its LRU
@@ -323,6 +343,7 @@ impl Default for MemoryBackend {
                 accord_issued_nonces: std::collections::HashSet::new(),
                 canonical_withdrawals: HashMap::new(),
                 role_withdrawals: HashMap::new(),
+                consent_peer_set: Vec::new(),
             }),
         }
     }
@@ -1966,6 +1987,28 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .or_default()
                     .push(row.attestation_id.clone());
             }
+            // v21.0.0 (CIRISPersist#502 E7) — maintain the consent_peer_set
+            // mirror (grant upsert / withdraws-revocation fold) BEFORE `row`
+            // moves into `federation_attestations` below.
+            if let Some(target_id) =
+                crate::federation::consent_peer_set::revocation_fold_target(&row)
+            {
+                state
+                    .consent_peer_set
+                    .retain(|r| r.source_attestation_id != target_id);
+            } else if crate::federation::consent_peer_set::is_consent_replication_grant(&row) {
+                for peer in &row.subject_key_ids {
+                    state.consent_peer_set.retain(|r| {
+                        !(r.node_key_id == row.attesting_key_id && r.peer_key_id == *peer)
+                    });
+                    state.consent_peer_set.push(ConsentPeerRow {
+                        node_key_id: row.attesting_key_id.clone(),
+                        peer_key_id: peer.clone(),
+                        source_attestation_id: row.attestation_id.clone(),
+                        asserted_at: row.asserted_at,
+                    });
+                }
+            }
             state.federation_attestations.push(row);
             // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
             // `trace:complete:v1` attestation materializes its `trace_events`
@@ -2308,6 +2351,26 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .collect();
         rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
         Ok(rows)
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E7) — the revocation-folded
+    /// `consent_peer_set` read: `node_key_id`'s live peers, sorted +
+    /// deduped. The fold already happened at write time (see
+    /// `put_attestation`'s `consent_peer_set` mirror maintenance).
+    async fn list_consent_peers(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut peers: Vec<String> = state
+            .consent_peer_set
+            .iter()
+            .filter(|r| r.node_key_id == node_key_id)
+            .map(|r| r.peer_key_id.clone())
+            .collect();
+        peers.sort();
+        peers.dedup();
+        Ok(peers)
     }
 
     async fn attestations_binding_content(
@@ -7824,6 +7887,72 @@ mod tests {
         });
         resign_fix(&mut w); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         w
+    }
+
+    /// Build a `consent:replication:v1` grant from `node` naming `peer` as
+    /// the sole `subject_key_ids` entry.
+    fn fix_consent_grant(id: &str, node: &str, peer: &str) -> Attestation {
+        let mut g = fix_attestation(id, node, node, node);
+        g.attestation_envelope = serde_json::json!({
+            "dimension": crate::federation::consent_peer_set::DIMENSION,
+        });
+        g.subject_key_ids = vec![peer.to_string()];
+        resign_fix(&mut g); // envelope changed → re-sign (CC 5.3.2.4.3.1)
+        g
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E7) — THE witness: a `consent:replication:v1`
+    /// grant to peer P1 makes `list_consent_peers` include P1; a `withdraws`
+    /// referencing that grant's `attestation_id` REMOVES P1; a second,
+    /// untouched grant to peer P2 is unaffected. This is the mechanical
+    /// revocation fold CIRISServer's `replication_peers_from_consent` was
+    /// missing (the server read `list_attestations_by` + flat-mapped
+    /// `subject_key_ids` with no withdraws/recants fold at all).
+    #[tokio::test]
+    async fn consent_peer_set_folds_revocation_502e7() {
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("node-e7", "node", "node-e7"),
+            })
+            .await
+            .unwrap();
+
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_consent_grant("grant-e7-1", "node-e7", "peer-e7-1"),
+            })
+            .await
+            .expect("grant 1 admits");
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_consent_grant("grant-e7-2", "node-e7", "peer-e7-2"),
+            })
+            .await
+            .expect("grant 2 admits");
+
+        let peers = backend.list_consent_peers("node-e7").await.unwrap();
+        assert_eq!(
+            peers,
+            vec!["peer-e7-1".to_string(), "peer-e7-2".to_string()],
+            "both live grants must be visible, sorted"
+        );
+
+        // Revoke grant 1 — self-withdrawal (rule 1: issuer ==
+        // target.attesting_key_id).
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_withdraws("withdraw-e7-1", "node-e7", "grant-e7-1"),
+            })
+            .await
+            .expect("withdraws admits");
+
+        let peers_after = backend.list_consent_peers("node-e7").await.unwrap();
+        assert_eq!(
+            peers_after,
+            vec!["peer-e7-2".to_string()],
+            "peer-1's consent was withdrawn — it must disappear; peer-2 (untouched) survives"
+        );
     }
 
     /// Build a memory-backend `delegates_to` carrying `scope`.

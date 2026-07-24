@@ -44,6 +44,7 @@ pub mod capacity;
 pub mod cohort;
 pub mod community_dek;
 pub mod consent;
+pub mod consent_peer_set;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
 pub mod genesis;
@@ -685,6 +686,23 @@ pub trait FederationDirectory: Send + Sync {
     /// "which keys does K vouch for?"). Ordered by `asserted_at` DESC.
     async fn list_attestations_by(&self, attesting_key_id: &str)
         -> Result<Vec<Attestation>, Error>;
+
+    /// v21.0.0 (CIRISPersist#502 E7) — the revocation-folded
+    /// `consent_peer_set` projection (V109): `node_key_id`'s LIVE
+    /// `consent:replication:v1` peers, sorted + deduped, with any
+    /// `withdraws`/`recants`-revoked peer already excluded. Closes the
+    /// hole where CIRISServer's `replication_peers_from_consent` read
+    /// `list_attestations_by` + flat-mapped `subject_key_ids` without
+    /// folding revocation — a revoked peer kept receiving replication.
+    /// Maintained by [`consent_peer_set`](super::consent_peer_set) IN the
+    /// same transaction as `put_attestation`'s insert. Default
+    /// `Unsupported`; sqlite/postgres/memory override.
+    async fn list_consent_peers(&self, node_key_id: &str) -> Result<Vec<String>, Error> {
+        let _ = node_key_id;
+        Err(Error::Unsupported {
+            method: "list_consent_peers",
+        })
+    }
 
     /// v3.6.0 (CIRISPersist#134, CEG 0.3 §8.1.10 Policy J / §11.5.3)
     /// — return the chain of `content_rating:*` attestations rooted
