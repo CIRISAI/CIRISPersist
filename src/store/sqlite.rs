@@ -2505,7 +2505,9 @@ impl SqliteBackend {
                 // registration` — the SAME gate `register_federation_key`
                 // runs, and the upgrade branch already runs) now guards the
                 // insert too. Fail-closed before any write.
-                crate::federation::verify_key_registration(self, &record.record).await?;
+                if !crate::federation::register::record_is_role_gated(&record.record) {
+                    crate::federation::verify_key_registration(self, &record.record).await?;
+                }
                 match crate::federation::FederationDirectory::put_public_key(self, record).await {
                     Ok(()) => Ok(ReplicatedKeyOutcome::Inserted),
                     // A row appeared between plan and act with different

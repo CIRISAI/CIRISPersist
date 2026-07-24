@@ -415,16 +415,20 @@ pub fn check_skew_and_payment(
 /// steward` keys; their `ThresholdMember`s carry their REGISTERED pubkeys.
 pub async fn resolve_steward_roster<F>(
     directory: &F,
-) -> Result<(Vec<ciris_verify_core::threshold::ThresholdMember>, Vec<String>), Error>
+) -> Result<
+    (
+        Vec<ciris_verify_core::threshold::ThresholdMember>,
+        Vec<String>,
+    ),
+    Error,
+>
 where
     F: crate::federation::FederationDirectory + ?Sized,
 {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     let stewards = directory
         .list_keys_by_identity_type(crate::federation::types::identity_type::STEWARD)
         .await
         .map_err(|e| Error::OperationalAuthority(format!("steward roster resolve: {e}")))?;
-    let _ = B64; // (pubkeys are already base64 on the record)
     let members: Vec<ciris_verify_core::threshold::ThresholdMember> = stewards
         .iter()
         .map(|k| ciris_verify_core::threshold::ThresholdMember {

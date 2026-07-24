@@ -2803,7 +2803,9 @@ impl PostgresBackend {
                 // registration` — the SAME gate `register_federation_key`
                 // runs, and the upgrade branch already runs) now guards the
                 // insert too. Fail-closed before any write.
-                crate::federation::verify_key_registration(self, &record.record).await?;
+                if !crate::federation::register::record_is_role_gated(&record.record) {
+                    crate::federation::verify_key_registration(self, &record.record).await?;
+                }
                 match crate::federation::FederationDirectory::put_public_key(self, record).await {
                     Ok(()) => Ok(ReplicatedKeyOutcome::Inserted),
                     // A row appeared between plan and act with different
@@ -27019,6 +27021,10 @@ mod tests {
         // surface. `revocation_id` is ::uuid-cast per the project
         // test-fixtures memory: must be a real UUID.
         let rev_id = uuid::Uuid::new_v4().to_string();
+        // v21.0.0 (#502 E1) — real hybrid sig by the revoking steward.
+        let __rev_env = serde_json::json!({"id": rev_id});
+        let (__rev_och, __rev_sc, __rev_sp) =
+            crate::federation::tier_ingest::test_support::sign_envelope(&steward, &__rev_env);
         backend
             .put_revocation(crate::federation::SignedRevocation {
                 revocation: crate::federation::Revocation {
@@ -27028,10 +27034,10 @@ mod tests {
                     reason: Some("test".into()),
                     revoked_at: chrono::Utc::now(),
                     effective_at: chrono::Utc::now(),
-                    revocation_envelope: serde_json::json!({"id": rev_id}),
-                    original_content_hash: "abc123".into(),
-                    scrub_signature_classical: "c2ln".into(),
-                    scrub_signature_pqc: None,
+                    revocation_envelope: __rev_env.clone(),
+                    original_content_hash: __rev_och,
+                    scrub_signature_classical: __rev_sc,
+                    scrub_signature_pqc: __rev_sp,
                     scrub_key_id: steward.clone(),
                     scrub_timestamp: chrono::Utc::now(),
                     pqc_completed_at: None,
