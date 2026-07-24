@@ -2795,6 +2795,15 @@ impl PostgresBackend {
             ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
             ReplicatedKeyPlan::Refused => Ok(ReplicatedKeyOutcome::Refused),
             ReplicatedKeyPlan::Insert => {
+                // v21.0.0 (CIRISPersist#502 E2) — the fresh-key insert path
+                // ran NO proof-of-possession: a replicated first-sight
+                // `SignedKeyRecord{identity_ref: victim, pubkey: attacker}`
+                // was admitted TOFU, and later attestations by that key then
+                // verified. The Strict hybrid PoP gate (`verify_key_
+                // registration` — the SAME gate `register_federation_key`
+                // runs, and the upgrade branch already runs) now guards the
+                // insert too. Fail-closed before any write.
+                crate::federation::verify_key_registration(self, &record.record).await?;
                 match crate::federation::FederationDirectory::put_public_key(self, record).await {
                     Ok(()) => Ok(ReplicatedKeyOutcome::Inserted),
                     // A row appeared between plan and act with different

@@ -2497,6 +2497,15 @@ impl SqliteBackend {
             ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
             ReplicatedKeyPlan::Refused => Ok(ReplicatedKeyOutcome::Refused),
             ReplicatedKeyPlan::Insert => {
+                // v21.0.0 (CIRISPersist#502 E2) — the fresh-key insert path
+                // ran NO proof-of-possession: a replicated first-sight
+                // `SignedKeyRecord{identity_ref: victim, pubkey: attacker}`
+                // was admitted TOFU, and later attestations by that key then
+                // verified. The Strict hybrid PoP gate (`verify_key_
+                // registration` — the SAME gate `register_federation_key`
+                // runs, and the upgrade branch already runs) now guards the
+                // insert too. Fail-closed before any write.
+                crate::federation::verify_key_registration(self, &record.record).await?;
                 match crate::federation::FederationDirectory::put_public_key(self, record).await {
                     Ok(()) => Ok(ReplicatedKeyOutcome::Inserted),
                     // A row appeared between plan and act with different
@@ -17718,6 +17727,49 @@ mod tests {
     /// (The rest of the #371 decision table runs Engine-level on both
     /// backends in `federation::register::tests::run_apply_replicated_matrix`;
     /// postgres twin of THIS anomaly test lives in `store::postgres::tests`.)
+    /// v21.0.0 (CIRISPersist#502 E2) — a fresh replicated key with an
+    /// INVALID proof-of-possession is REJECTED (was TOFU: a self-consistent
+    /// fake `SignedKeyRecord` inserted, later attestations by it verified).
+    #[tokio::test]
+    async fn forged_fresh_replicated_key_tofu_rejected_502e2() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // A well-formed replicated key registration — valid PoP, admits.
+        let good = crate::federation::tier_ingest::test_support::replicated_key_record(
+            "e2-fresh", "node", "e2-fresh", "e2-fresh", "e2-nonce",
+        );
+        backend
+            .apply_replicated_key_record(crate::federation::SignedKeyRecord { record: good })
+            .await
+            .expect("(E2) valid-PoP fresh key admits");
+
+        // Forged: same self-consistent shape but the scrub signature is
+        // garbage → the Strict hybrid PoP gate rejects it before insert.
+        let mut forged = crate::federation::tier_ingest::test_support::replicated_key_record(
+            "e2-forged",
+            "node",
+            "e2-forged",
+            "e2-forged",
+            "e2-nonce2",
+        );
+        forged.scrub_signature_classical = "AAAA".into();
+        forged.scrub_signature_pqc = Some("AAAA".into());
+        let err = backend
+            .apply_replicated_key_record(crate::federation::SignedKeyRecord { record: forged })
+            .await
+            .expect_err("(E2) invalid-PoP fresh key must be rejected");
+        // Nothing was written.
+        assert!(
+            crate::federation::FederationDirectory::lookup_public_key(&backend, "e2-forged")
+                .await
+                .unwrap()
+                .is_none(),
+            "forged key left no trace, got err {}",
+            err.kind()
+        );
+    }
+
     #[tokio::test]
     async fn apply_replicated_key_record_ambiguous_owner_refused_sqlite() {
         use crate::federation::register::ReplicatedKeyOutcome;
