@@ -1806,7 +1806,8 @@ impl Engine {
         );
         let input = crate::federation::EmitAttestationInput::with_envelope(
             crate::federation::types::attestation_type::WITHDRAWS,
-            envelope,
+            crate::federation::envelope::EnvelopeCore::from_value(envelope)
+                .expect("engine-built envelope is a JSON object"),
         );
         self.emit_attestation(signer, input).await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("withdraws emit_attestation: {e}"))
@@ -2286,7 +2287,7 @@ impl Engine {
         // signed; hybrid-sign over the EXTERNAL signer. A non-PQC signer
         // cannot emit a conformant federation-tier attestation — surface
         // honestly with the same message the self-emit path uses.
-        let canonical = Self::emit_canonicalize(&input.attestation_envelope)?;
+        let canonical = Self::emit_canonicalize(&input.attestation_envelope.to_value())?;
         let sig = signer.sign_hybrid(&canonical).await.map_err(|e| {
             crate::federation::Error::Backend(format!(
                 "emit_attestation sign_hybrid: {e} — a conformant federation-tier emit requires a \
@@ -2331,7 +2332,7 @@ impl Engine {
             crate::federation::Error::Backend(format!("emit_attestation_self derive key_id: {e}"))
         })?;
 
-        let canonical = Self::emit_canonicalize(&input.attestation_envelope)?;
+        let canonical = Self::emit_canonicalize(&input.attestation_envelope.to_value())?;
         // Hybrid-sign over the COMPOSED signer. No `LocalSigner` is needed,
         // so a hardware-hybrid engine can emit here.
         let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
@@ -2408,7 +2409,7 @@ impl Engine {
             weight: input.weight,
             asserted_at: now,
             expires_at: input.expires_at,
-            attestation_envelope: input.attestation_envelope,
+            attestation_envelope: input.attestation_envelope.to_value(),
             original_content_hash,
             scrub_signature_classical: B64.encode(&sig.classical.signature),
             scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
@@ -2505,7 +2506,8 @@ impl Engine {
         };
         let mut input = crate::federation::EmitAttestationInput::with_envelope(
             crate::federation::types::attestation_type::DELEGATES_TO,
-            envelope,
+            crate::federation::envelope::EnvelopeCore::from_value(envelope)
+                .expect("engine-built envelope is a JSON object"),
         );
         // The edge is keyed by its RECIPIENT: the §11.10 duty walk + the
         // `is_steward_bound` retraction bucketing both match a delegation /
@@ -2618,7 +2620,8 @@ impl Engine {
         }
         let mut input = crate::federation::EmitAttestationInput::with_envelope(
             crate::federation::types::attestation_type::DELEGATES_TO,
-            envelope,
+            crate::federation::envelope::EnvelopeCore::from_value(envelope)
+                .expect("engine-built envelope is a JSON object"),
         );
         // Keyed by recipient, like every delegation edge (the §11.10 walk +
         // `steward_bindings_of` match by `attested_key_id`).
@@ -2692,7 +2695,8 @@ impl Engine {
         );
         let mut input = crate::federation::EmitAttestationInput::with_envelope(
             crate::federation::types::attestation_type::WITHDRAWS,
-            envelope,
+            crate::federation::envelope::EnvelopeCore::from_value(envelope)
+                .expect("engine-built envelope is a JSON object"),
         );
         // Key the retraction by the revoked edge's recipient so the duty
         // walk's `retracted` bucket (`attested_key_id`) invalidates it.
@@ -2788,7 +2792,8 @@ impl Engine {
         });
         let input = crate::federation::EmitAttestationInput::with_envelope(
             crate::federation::types::attestation_type::SCORES,
-            envelope,
+            crate::federation::envelope::EnvelopeCore::from_value(envelope)
+                .expect("engine-built envelope is a JSON object"),
         );
         self.emit_attestation(signer, input).await
     }
@@ -3366,10 +3371,12 @@ impl Engine {
                 attestation_type: attestation_type::SCORES.to_owned(),
                 weight: None,
                 expires_at: None,
-                attestation_envelope: partnership_grant_envelope(
-                    &input.agent.occurrence_key_id,
-                    &input.bilateral_pair_id,
-                ),
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    partnership_grant_envelope(
+                        &input.agent.occurrence_key_id,
+                        &input.bilateral_pair_id,
+                    ),
+                )?,
                 subject_key_ids: Vec::new(),
                 cohort_scope: cohort_scope::SELF.to_owned(),
                 scrub_signature_classical: None,
@@ -3384,10 +3391,9 @@ impl Engine {
                 attestation_type: attestation_type::SCORES.to_owned(),
                 weight: None,
                 expires_at: None,
-                attestation_envelope: partnership_accept_envelope(
-                    &input.identity_key_id,
-                    &input.bilateral_pair_id,
-                ),
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    partnership_accept_envelope(&input.identity_key_id, &input.bilateral_pair_id),
+                )?,
                 subject_key_ids: Vec::new(),
                 cohort_scope: cohort_scope::SELF.to_owned(),
                 scrub_signature_classical: None,
@@ -3410,11 +3416,13 @@ impl Engine {
                 attestation_type: attestation_type::DELEGATES_TO.to_owned(),
                 weight: None,
                 expires_at: None,
-                attestation_envelope: delegates_to_agent_envelope(
-                    &input.agent.occurrence_key_id,
-                    &input.bilateral_pair_id,
-                    &scope,
-                ),
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    delegates_to_agent_envelope(
+                        &input.agent.occurrence_key_id,
+                        &input.bilateral_pair_id,
+                        &scope,
+                    ),
+                )?,
                 subject_key_ids: Vec::new(),
                 cohort_scope: cohort_scope::SELF.to_owned(),
                 scrub_signature_classical: None,
@@ -8941,10 +8949,13 @@ mod tests {
             attestation_type: SCORES.into(),
             weight: Some(1.0),
             expires_at: None,
-            attestation_envelope: serde_json::json!({
-                "id": "att-1", "dimension": "identity_binding:v1",
-                "score": 1.0, "confidence": 0.9,
-            }),
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({
+                    "id": "att-1", "dimension": "identity_binding:v1",
+                    "score": 1.0, "confidence": 0.9,
+                }),
+            )
+            .unwrap(),
             subject_key_ids: vec![],
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
             scrub_signature_classical: None,
@@ -9086,10 +9097,13 @@ mod tests {
             attestation_type: SCORES.into(),
             weight: Some(1.0),
             expires_at: None,
-            attestation_envelope: serde_json::json!({
-                "id": "att-pg-1", "dimension": "identity_binding:v1",
-                "score": 1.0, "confidence": 0.9,
-            }),
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({
+                    "id": "att-pg-1", "dimension": "identity_binding:v1",
+                    "score": 1.0, "confidence": 0.9,
+                }),
+            )
+            .unwrap(),
             subject_key_ids: vec![],
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
             scrub_signature_classical: None,
@@ -9187,10 +9201,11 @@ mod tests {
 
         let input = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
-            serde_json::json!({
+            crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                 "id": "emit-1", "dimension": "identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
-            }),
+            }))
+            .unwrap(),
         );
         let att_id = engine
             .emit_attestation(&signer, input)
@@ -9264,10 +9279,11 @@ mod tests {
 
         let input = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
-            serde_json::json!({
+            crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                 "id": "emit-pg-1", "dimension": "identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
-            }),
+            }))
+            .unwrap(),
         );
         let att_id = engine
             .emit_attestation(&signer, input)
@@ -9321,10 +9337,11 @@ mod tests {
 
         let input = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
-            serde_json::json!({
+            crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                 "id": "emit-self-1", "dimension": "identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
-            }),
+            }))
+            .unwrap(),
         );
         let att_id = engine
             .emit_attestation_self(input)
@@ -9378,10 +9395,11 @@ mod tests {
         let upper = "FF7C5632DAE6EF3AE7F6283BD35268BC7910332414AA8A1C35A1645CA0295F61";
         let mut bad = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
-            serde_json::json!({
+            crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                 "id": "emit-self-293", "dimension": "identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
-            }),
+            }))
+            .unwrap(),
         );
         bad.subject_key_ids = vec![upper.to_owned()];
         let err = engine
@@ -9397,10 +9415,11 @@ mod tests {
         // rejects the encoding, not the subject.
         let mut ok = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
-            serde_json::json!({
+            crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                 "id": "emit-self-293-ok", "dimension": "identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
-            }),
+            }))
+            .unwrap(),
         );
         ok.subject_key_ids = vec![upper.to_lowercase()];
         engine
@@ -9435,10 +9454,11 @@ mod tests {
 
         let input = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
-            serde_json::json!({
+            crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                 "id": "emit-self-pg-1", "dimension": "identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
-            }),
+            }))
+            .unwrap(),
         );
         let att_id = engine
             .emit_attestation_self(input)
@@ -9523,10 +9543,11 @@ mod tests {
 
         let input = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
-            serde_json::json!({
+            crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                 "id": "emit-hw-1", "dimension": "identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
-            }),
+            }))
+            .unwrap(),
         );
         let att_id = engine
             .emit_attestation_self(input)
@@ -9572,10 +9593,11 @@ mod tests {
         // Weighted scores emit (the capacity-band case): weight survives.
         let weighted = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
-            serde_json::json!({
+            crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                 "id": "emit-w-1", "dimension": "capacity:sustained_coherence:v1",
                 "score": 0.42, "confidence": 0.9,
-            }),
+            }))
+            .unwrap(),
         )
         .with_weight(Some(0.42));
         let w_id = engine
@@ -9592,10 +9614,11 @@ mod tests {
         // Default (None) emit: weight stays None (pre-9.4.0 behavior).
         let plain = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
-            serde_json::json!({
+            crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                 "id": "emit-w-2", "dimension": "identity_binding:v1",
                 "score": 1.0, "confidence": 0.9,
-            }),
+            }))
+            .unwrap(),
         );
         let p_id = engine
             .emit_attestation(&signer, plain)
@@ -9824,7 +9847,10 @@ mod tests {
         let witness_emit = |subject: &str, token: &str, id: &str| {
             let mut input = crate::federation::EmitAttestationInput::with_envelope(
                 token,
-                serde_json::json!({ "id": id }),
+                crate::federation::envelope::EnvelopeCore::from_value(
+                    serde_json::json!({ "id": id }),
+                )
+                .unwrap(),
             );
             input.attested_key_id = Some(subject.to_owned());
             (input, w_signer.clone())
@@ -9980,7 +10006,10 @@ mod tests {
         // the emitter — subject-signed by design).
         let self_minor = crate::federation::EmitAttestationInput::with_envelope(
             "age_self_declared:minor:v1",
-            serde_json::json!({ "id": "wtse-self-minor" }),
+            crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({ "id": "wtse-self-minor" }),
+            )
+            .unwrap(),
         );
         engine
             .emit_attestation(&t_signer, self_minor)
@@ -9992,7 +10021,10 @@ mod tests {
         // the subject by carrying it in `attested_key_id` — the #368 surface.
         let mut cross = crate::federation::EmitAttestationInput::with_envelope(
             "age_assurance:government:adult:v1",
-            serde_json::json!({ "id": "wtse-w-adult" }),
+            crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({ "id": "wtse-w-adult" }),
+            )
+            .unwrap(),
         );
         cross.attested_key_id = Some(t.clone());
         let att_id = engine
@@ -10018,7 +10050,10 @@ mod tests {
         // witness emitting with the default (self) attested_key_id.
         let selfie = crate::federation::EmitAttestationInput::with_envelope(
             "age_assurance:provider:adult:v1",
-            serde_json::json!({ "id": "wtse-w-self" }),
+            crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({ "id": "wtse-w-self" }),
+            )
+            .unwrap(),
         );
         let e = engine
             .emit_attestation(&w_signer, selfie)
@@ -10035,7 +10070,10 @@ mod tests {
         // the witness's age is refused (reserved prefix needs a witness).
         let mut bad = crate::federation::EmitAttestationInput::with_envelope(
             "age_assurance:provider:adult:v1",
-            serde_json::json!({ "id": "wtse-t-cross" }),
+            crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({ "id": "wtse-t-cross" }),
+            )
+            .unwrap(),
         );
         bad.attested_key_id = Some(w.clone());
         let e = engine
@@ -10085,7 +10123,10 @@ mod tests {
                 &t_signer,
                 crate::federation::EmitAttestationInput::with_envelope(
                     "age_self_declared:minor:v1",
-                    serde_json::json!({ "id": format!("pgw-self-{run}") }),
+                    crate::federation::envelope::EnvelopeCore::from_value(
+                        serde_json::json!({ "id": format!("pgw-self-{run}") }),
+                    )
+                    .unwrap(),
                 ),
             )
             .await
@@ -10095,7 +10136,10 @@ mod tests {
         // Witness graduates the SUBJECT cross-subject.
         let mut cross = crate::federation::EmitAttestationInput::with_envelope(
             "age_assurance:government:adult:v1",
-            serde_json::json!({ "id": format!("pgw-adult-{run}") }),
+            crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({ "id": format!("pgw-adult-{run}") }),
+            )
+            .unwrap(),
         );
         cross.attested_key_id = Some(t.clone());
         engine
@@ -10110,7 +10154,10 @@ mod tests {
                 &w_signer,
                 crate::federation::EmitAttestationInput::with_envelope(
                     "age_assurance:provider:adult:v1",
-                    serde_json::json!({ "id": format!("pgw-self-adult-{run}") }),
+                    crate::federation::envelope::EnvelopeCore::from_value(
+                        serde_json::json!({ "id": format!("pgw-self-adult-{run}") }),
+                    )
+                    .unwrap(),
                 ),
             )
             .await
@@ -10162,7 +10209,10 @@ mod tests {
         // Witness attests T MINOR (the #368 cross-subject emit).
         let mut minor = crate::federation::EmitAttestationInput::with_envelope(
             "age_assurance:provider:minor:v1",
-            serde_json::json!({ "id": "mg-w-minor" }),
+            crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({ "id": "mg-w-minor" }),
+            )
+            .unwrap(),
         );
         minor.attested_key_id = Some("mg-ward".to_owned());
         engine
@@ -10201,7 +10251,10 @@ mod tests {
         // Witness attests S ADULT (cross-subject again).
         let mut adult = crate::federation::EmitAttestationInput::with_envelope(
             "age_assurance:government:adult:v1",
-            serde_json::json!({ "id": "mg-w-adult" }),
+            crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({ "id": "mg-w-adult" }),
+            )
+            .unwrap(),
         );
         adult.attested_key_id = Some(s.clone());
         engine
@@ -10310,7 +10363,10 @@ mod tests {
         // Witness attests T minor + S adult (cross-subject, #368).
         let mut minor = crate::federation::EmitAttestationInput::with_envelope(
             "age_assurance:provider:minor:v1",
-            serde_json::json!({ "id": format!("mgp-minor-{run}") }),
+            crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({ "id": format!("mgp-minor-{run}") }),
+            )
+            .unwrap(),
         );
         minor.attested_key_id = Some(ward.clone());
         engine
@@ -10319,7 +10375,10 @@ mod tests {
             .expect("witness attests ward minor");
         let mut adult = crate::federation::EmitAttestationInput::with_envelope(
             "age_assurance:government:adult:v1",
-            serde_json::json!({ "id": format!("mgp-adult-{run}") }),
+            crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({ "id": format!("mgp-adult-{run}") }),
+            )
+            .unwrap(),
         );
         adult.attested_key_id = Some(s.clone());
         engine

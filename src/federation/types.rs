@@ -1087,7 +1087,7 @@ pub struct LocalAttestationInput {
     /// The CEG attestation envelope. MUST carry a `"dimension"` string
     /// (the `(occurrence, dimension)` upsert key + the §7.5/§10.1.3
     /// local-tier gates read it).
-    pub attestation_envelope: serde_json::Value,
+    pub attestation_envelope: crate::federation::envelope::EnvelopeCore,
     /// §4.2.6 subjects this attestation names (producer-authority rows
     /// MAY name subjects; the local-tier gate refuses only a subject-side
     /// revocation, not subject-naming).
@@ -1127,9 +1127,7 @@ fn default_self_cohort_scope() -> String {
 impl LocalAttestationInput {
     /// The envelope `dimension` (the local-tier key + gate axis).
     pub fn dimension(&self) -> Option<&str> {
-        self.attestation_envelope
-            .get("dimension")
-            .and_then(|v| v.as_str())
+        self.attestation_envelope.dimension.as_deref()
     }
 
     /// Build the `local`-tier [`Attestation`] row: caller fields + the
@@ -1150,7 +1148,7 @@ impl LocalAttestationInput {
             weight: self.weight,
             asserted_at,
             expires_at: self.expires_at,
-            attestation_envelope: self.attestation_envelope,
+            attestation_envelope: self.attestation_envelope.to_value(),
             // Sentinel (empty) — local rows defer the scrub envelope.
             original_content_hash: String::new(),
             scrub_signature_classical: String::new(),
@@ -1197,7 +1195,7 @@ impl LocalAttestationInput {
             weight: self.weight,
             asserted_at,
             expires_at: self.expires_at,
-            attestation_envelope: self.attestation_envelope,
+            attestation_envelope: self.attestation_envelope.to_value(),
             original_content_hash,
             scrub_signature_classical,
             scrub_signature_pqc,
@@ -1239,7 +1237,7 @@ pub struct EmitAttestationInput {
     pub attested_key_id: Option<String>,
     /// The CEG attestation envelope (canonicalized via
     /// `ceg_produce_canonicalize`; never mutated).
-    pub attestation_envelope: serde_json::Value,
+    pub attestation_envelope: crate::federation::envelope::EnvelopeCore,
     /// §4.2.6 subjects this attestation names. May be empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subject_key_ids: Vec<String>,
@@ -1269,7 +1267,7 @@ impl EmitAttestationInput {
     /// write).
     pub fn with_envelope(
         attestation_type: impl Into<String>,
-        attestation_envelope: serde_json::Value,
+        attestation_envelope: crate::federation::envelope::EnvelopeCore,
     ) -> Self {
         Self {
             attestation_type: attestation_type.into(),

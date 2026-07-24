@@ -3587,11 +3587,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             {
                 let exists = client
                     .query_opt(
-                        "SELECT 1 AS one FROM cirislens.federation_attestations \
-                         WHERE attestation_type = $1 \
-                           AND attesting_key_id = $2 \
-                           AND attestation_envelope->>'references_attestation_id' = $3 \
-                         LIMIT 1",
+                        // v20.0.0 (#495 C2) — path from the ONE constant.
+                        &format!(
+                            "SELECT 1 AS one FROM cirislens.federation_attestations \
+                             WHERE attestation_type = $1 \
+                               AND attesting_key_id = $2 \
+                               AND attestation_envelope->>'{}' = $3 \
+                             LIMIT 1",
+                            crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
+                        ),
                         &[&row.attestation_type, &row.attesting_key_id, &ref_id],
                     )
                     .await
@@ -6423,8 +6427,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
             scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
             withdraws_admission_rule, cohort_scope, tier, promoted_at";
-        let pred = "((attestation_type = 'withdraws' AND withdraws_admission_rule IN (2, 3, 4)) \
-                    OR (attestation_envelope->>'dimension') LIKE 'consent:state:revoked%')";
+        // v20.0.0 (#495 C3) — dimension path + revoked prefix from the ONE
+        // constants (drift meant list_consent_revocations silently empty).
+        let pred = format!(
+            "((attestation_type = 'withdraws' AND withdraws_admission_rule IN (2, 3, 4)) \
+                    OR (attestation_envelope->>'{dim}') LIKE '{rev}%')",
+            dim = crate::federation::envelope::paths::DIMENSION,
+            rev = crate::federation::consent::consent_dimension::STATE_REVOKED_PREFIX,
+        );
         let rows = if let Some(s) = since {
             client
                 .query(
@@ -7114,12 +7124,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 params.push(Box::new((*ty).to_string()));
                 ph.push(format!("${}", params.len()));
             }
+            // v20.0.0 (#495 C2) — path from the ONE constant (see sqlite twin).
             where_parts.push(format!(
                 "NOT EXISTS (SELECT 1 FROM cirislens.federation_attestations c \
                    WHERE c.attesting_key_id = fa.attesting_key_id \
                      AND c.attestation_type IN ({}) \
-                     AND c.attestation_envelope->>'references_attestation_id' = fa.attestation_id::text)",
-                ph.join(",")
+                     AND c.attestation_envelope->>'{}' = fa.attestation_id::text)",
+                ph.join(","),
+                crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
             ));
         }
         if let Some(c) = &cursor {
@@ -11968,12 +11980,15 @@ impl PostgresBackend {
 
         // v17.9.0 (CC#38 interim) — envelope size cap FIRST, before any
         // parsing/lookups (cheapest-most-specific-rejection-first).
-        crate::federation::admission::check_envelope_size_admission(&input.attestation_envelope)?;
+        // v20.0.0 (#495): the input envelope is TYPED (EnvelopeCore);
+        // serialize once for the Value-based admission checks.
+        let envelope_value = input.attestation_envelope.to_value();
+        crate::federation::admission::check_envelope_size_admission(&envelope_value)?;
         crate::federation::admission::check_trace_dimension_admission(
             input.dimension(),
             &input.attesting_key_id,
             &input.subject_key_ids,
-            &input.attestation_envelope,
+            &envelope_value,
         )?;
         crate::federation::trust_root::check_trust_charter_admission(
             self,
@@ -11983,7 +11998,7 @@ impl PostgresBackend {
                 .attested_key_id
                 .as_deref()
                 .unwrap_or(&input.attesting_key_id),
-            &input.attestation_envelope,
+            &envelope_value,
         )
         .await?;
 
@@ -12034,7 +12049,7 @@ impl PostgresBackend {
                 ))
             })?
             .get(0);
-        let dim = crate::federation::admission::envelope_dimension(&input.attestation_envelope);
+        let dim = input.dimension();
         crate::federation::admission::DimensionAdmissionPolicy::default().check(
             &input.attestation_type,
             dim,
@@ -17533,7 +17548,10 @@ mod tests {
                 attestation_type: attestation_type::SCORES.into(),
                 weight: None,
                 expires_at: None,
-                attestation_envelope: env.clone(),
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    env.clone(),
+                )
+                .unwrap(),
                 subject_key_ids: vec![subject.clone()],
                 cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
                 scrub_signature_classical: Some(sig_classical),
@@ -17608,10 +17626,13 @@ mod tests {
                 attestation_type: attestation_type::SCORES.into(),
                 weight: None,
                 expires_at: None,
-                attestation_envelope: serde_json::json!({
-                    "id": format!("rev-bad-{suffix}"), "dimension": "consent:state:revoked:v1",
-                    "score": 1.0, "confidence": 0.9,
-                }),
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    serde_json::json!({
+                        "id": format!("rev-bad-{suffix}"), "dimension": "consent:state:revoked:v1",
+                        "score": 1.0, "confidence": 0.9,
+                    }),
+                )
+                .unwrap(),
                 subject_key_ids: vec![subject.clone()],
                 cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
                 scrub_signature_classical: Some("AAAA".into()),
@@ -17675,7 +17696,8 @@ mod tests {
                 attestation_type: attestation_type::SCORES.into(),
                 weight: None,
                 expires_at: None,
-                attestation_envelope: env,
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(env)
+                    .unwrap(),
                 subject_key_ids: vec![subject.clone()],
                 cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
                 scrub_signature_classical: Some(sig_classical),
@@ -30758,9 +30780,12 @@ mod tests {
             attestation_type: attestation_type.into(),
             weight: Some(1.0),
             expires_at: None,
-            attestation_envelope: serde_json::json!({
-                "id": "x", "dimension": dimension, "score": 1.0, "confidence": 0.9,
-            }),
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({
+                    "id": "x", "dimension": dimension, "score": 1.0, "confidence": 0.9,
+                }),
+            )
+            .unwrap(),
             subject_key_ids: subjects,
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
             scrub_signature_classical: None,
@@ -32599,6 +32624,164 @@ mod tests {
         assert_eq!(
             row.scrub_key_id, node,
             "ambiguous-owner refusal must leave the self-signed row untouched"
+        );
+    }
+
+    /// v20.0.0 (CIRISPersist#495 (b) + wall 1) — THE dual-backend parity +
+    /// typed-payload round-trip witness: rows whose payloads are the TYPED
+    /// structs (serde names = flat paths), inserted IDENTICALLY into
+    /// sqlite and postgres, must yield EQUAL scoring feature matrices —
+    /// the two hand-written aggregate shapes (sqlite two-level AVG(CASE)
+    /// vs pg SUM/COUNT-FILTER) can no longer drift apart silently, and a
+    /// typed-struct field rename breaks extraction on BOTH dialects
+    /// loudly.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    #[cfg(feature = "sqlite")]
+    async fn aggregate_feature_matrix_parity_sqlite_pg_495b() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let pg = PostgresBackend::connect(&dsn).await.expect("connect");
+        pg.run_migrations().await.expect("migrations run");
+        let sq = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        sq.run_migrations().await.unwrap();
+
+        let agent = format!("parity-495b-{}", uuid::Uuid::new_v4().simple());
+        let base = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 5, 1, 12, 0, 0).unwrap();
+        let mk = |trace: &str,
+                  et: crate::schema::ReasoningEventType,
+                  off: i64,
+                  payload: serde_json::Value| {
+            let payload = match payload {
+                serde_json::Value::Object(m) => m,
+                _ => serde_json::Map::new(),
+            };
+            crate::store::TraceEventRow {
+                trace_id: trace.to_owned(),
+                thought_id: format!("{trace}-th"),
+                task_id: Some(format!("{trace}-task")),
+                step_point: Some("x".into()),
+                event_type: et,
+                attempt_index: 0,
+                ts: base + chrono::Duration::minutes(off),
+                agent_id_hash: agent.clone(),
+                agent_name: Some("parity".into()),
+                deployment_domain: Some("test".into()),
+                deployment_region: None,
+                deployment_type: None,
+                deployment_trust_mode: None,
+                cohort_scope: "federation".to_string(),
+                cohort_target_id: None,
+                signature_ml_dsa_65: None,
+                pubkey_ml_dsa_65: None,
+                pqc_key_id: None,
+                agent_role: None,
+                agent_template: None,
+                cognitive_state: Some("WORK".into()),
+                trace_level: crate::schema::TraceLevel::Detailed,
+                payload,
+                cost_llm_calls: Some(1),
+                cost_tokens: Some(10),
+                cost_usd: Some(0.001),
+                signature: "sig".into(),
+                signing_key_id: "k".into(),
+                signature_verified: true,
+                verification_source: crate::store::VerificationSource::Persist,
+                schema_version: "2.7.0".into(),
+                pii_scrubbed: true,
+                original_content_hash: None,
+                scrub_signature: None,
+                scrub_key_id: None,
+                scrub_timestamp: None,
+            }
+        };
+
+        // TYPED payloads — the wall-1 structs serialize to the exact flat
+        // paths both aggregate dialects extract.
+        use crate::schema::ReasoningEventType as E;
+        use crate::trace_summary_contract as tsc;
+        let dma = serde_json::to_value(tsc::DmaResultsPayload {
+            csdma_plausibility_score: Some(0.8),
+            dsdma_domain_alignment: Some(0.6),
+            dsdma_domain: Some("test".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let idma = serde_json::to_value(tsc::IdmaResultPayload {
+            idma_k_eff: Some(3.0),
+            idma_correlation_risk: Some(0.2),
+            idma_fragility_flag: Some(false),
+            idma_phase: Some("stable".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let con = serde_json::to_value(tsc::ConscienceResultPayload {
+            conscience_passed: Some(true),
+            action_was_overridden: Some(false),
+            entropy_passed: Some(true),
+            coherence_passed: Some(true),
+            optimization_veto_passed: Some(true),
+            epistemic_humility_passed: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+        let act = serde_json::to_value(tsc::ActionResultPayload {
+            action_executed: Some("SPEAK".into()),
+            success: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut rows = Vec::new();
+        for t in ["p1", "p2", "p3"] {
+            rows.push(mk(t, E::DmaResults, 0, dma.clone()));
+            rows.push(mk(t, E::IdmaResult, 1, idma.clone()));
+            rows.push(mk(t, E::ConscienceResult, 2, con.clone()));
+            rows.push(mk(t, E::ActionResult, 3, act.clone()));
+        }
+
+        use crate::read::ReadEngine as _;
+        use crate::store::Backend as _;
+        pg.insert_trace_events_batch(&rows).await.unwrap();
+        sq.insert_trace_events_batch(&rows).await.unwrap();
+
+        let window = crate::read::TimeWindow::new(
+            base - chrono::Duration::hours(1),
+            base + chrono::Duration::hours(1),
+        )
+        .unwrap();
+        let a_pg = pg
+            .aggregate_scoring_factors(
+                &agent,
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        let a_sq = sq
+            .aggregate_scoring_factors(
+                &agent,
+                window,
+                None,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        // Normalize the evaluation wall-clock stamp (the only legitimately
+        // backend-varying field) before the content comparison.
+        let mut a_pg = a_pg;
+        let mut a_sq = a_sq;
+        a_pg.evaluated_at_unix_ms = 0;
+        a_sq.evaluated_at_unix_ms = 0;
+        assert_eq!(
+            a_pg, a_sq,
+            "(495b) sqlite and postgres MUST compute the identical scoring \
+             feature matrix from an identical corpus"
         );
     }
 }

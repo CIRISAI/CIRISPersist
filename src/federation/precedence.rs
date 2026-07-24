@@ -70,7 +70,7 @@ use super::types::{attestation_type, Attestation};
 /// with an envelope that fails its own schema).
 pub fn references_attestation_id_from_envelope(envelope: &serde_json::Value) -> Option<&str> {
     envelope
-        .get("references_attestation_id")
+        .get(crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID)
         .and_then(|v| v.as_str())
 }
 

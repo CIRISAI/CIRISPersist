@@ -64,7 +64,7 @@ pub const INFRA_SERVE_SCOPE: &str = "infra:serve";
 /// ceremony it enables), root-key compromise is unrecoverable BY
 /// CONSTRUCTION (Parity: powers not pre-committed don't exist when
 /// needed). Exact byte layout CC#40-ratification-tracked.
-pub const CHARTER_PRE_ROTATION_FIELD: &str = "pre_rotation_commitment";
+pub const CHARTER_PRE_ROTATION_FIELD: &str = super::envelope::paths::PRE_ROTATION_COMMITMENT;
 
 /// v19.0.0 (#488 delta 1) — the recovery-declaration envelope fields: a
 /// successor charter carries `recovers: <old_root_key_id>` plus
@@ -74,9 +74,9 @@ pub const CHARTER_PRE_ROTATION_FIELD: &str = "pre_rotation_commitment";
 /// co-signature half of the ceremony rides the server propose+cosign flow;
 /// its record shape is CC#40-tracked — persist verifies the pre-commitment
 /// binding, the ceremony supplies the quorum.)
-pub const CHARTER_RECOVERS_FIELD: &str = "recovers";
+pub const CHARTER_RECOVERS_FIELD: &str = super::envelope::paths::RECOVERS;
 /// See [`CHARTER_RECOVERS_FIELD`].
-pub const CHARTER_SUCCESSOR_KEYS_FIELD: &str = "successor_keys";
+pub const CHARTER_SUCCESSOR_KEYS_FIELD: &str = super::envelope::paths::SUCCESSOR_KEYS;
 
 /// Compute the pinned pre-rotation commitment over a successor key set:
 /// `lowercase_hex(sha256(JCS(sorted keys as JSON array)))`. The ONE
@@ -152,11 +152,11 @@ fn charter_commitment_well_formed(envelope: &serde_json::Value) -> bool {
 /// array of tokens. `pub(crate)` so the composed [`capability_roots_to_trusted_root`]
 /// walk shares the ONE scope-parse (never forked).
 pub(crate) fn scope_contains(envelope: &serde_json::Value, token: &str) -> bool {
-    match envelope.get("scope") {
-        Some(serde_json::Value::String(s)) => s == token,
-        Some(serde_json::Value::Array(items)) => items.iter().any(|v| v.as_str() == Some(token)),
-        _ => false,
-    }
+    envelope
+        .get(super::envelope::paths::SCOPE)
+        .cloned()
+        .and_then(|v| serde_json::from_value::<super::envelope::ScopeSet>(v).ok())
+        .is_some_and(|s| s.contains(token))
 }
 
 /// Fold the CEG tombstones over `rows`: an attestation is DEAD when a
@@ -437,7 +437,7 @@ where
     {
         return Ok(());
     }
-    let has_infra_scope = match envelope.get("scope") {
+    let has_infra_scope = match envelope.get(super::envelope::paths::SCOPE) {
         Some(serde_json::Value::String(s)) => s.starts_with("infra:"),
         Some(serde_json::Value::Array(items)) => items
             .iter()

@@ -5,6 +5,76 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [20.0.0] — 2026-07-24 — #495: the two `serde_json::Value` walls are gone; cross-boundary field drift is a build/test failure
+
+The umbrella cut. Every silent-drift incident this cycle (dark trace plane,
+withdrawn-stays-active hazard, revoked-consent-still-replicating hazard)
+traced to two opaque `Value` boundary payloads with hand-mirrored
+writer/reader key contracts. Both walls are replaced by TYPED contracts
+whose serde names ARE the projection paths, plus pinned vocabulary hashes.
+
+### Wall 2 — the attestation envelope (C2/C3, MAJOR)
+
+- **`federation::envelope::EnvelopeCore`**: the universal envelope keys
+  typed (`dimension`, `references_attestation_id`, `scope` [both wire
+  shapes], the charter fields, `withdrawal_reason`); dimension-specific
+  payload rides `#[serde(flatten)] extra` losslessly. The
+  `envelope_core_paths_bind_serde_names` witness binds the [`paths`]
+  constants to the serde names.
+- **THE FLIP (breaking)**: `EmitAttestationInput.attestation_envelope` and
+  `LocalAttestationInput.attestation_envelope` are now `EnvelopeCore` —
+  producers CONSTRUCT envelopes, they do not spell keys. Wire/FFI shape is
+  UNCHANGED (same JSON accepted/produced); stored rows keep `Value`
+  (byte-faithful storage; signatures ride JCS, order-free). Rust producers
+  (CIRISServer's five `json!{}` sites) get compile-checked on re-pin.
+- Every SQL read of a universal key interpolates the ONE `paths` constant
+  (the composer `NOT EXISTS` checks — the withdrawn-stays-active hazard is
+  dead); every Rust accessor (`envelope_dimension`,
+  `references_attestation_id_from_envelope`, `scope_contains`, the charter
+  consts) reads through the same source.
+- **C3**: the `consent:*` state dimension prefixes are single-sourced
+  (`federation::consent::consent_dimension`) and interpolated into the
+  revocation SQL — `list_consent_revocations` can no longer silently
+  empty on a token drift.
+- **`ENVELOPE_VOCABULARY_SHA256`** (pinned, gated) + the PyO3
+  `envelope_vocabulary` verb — `/v1/health`-servable beside the other
+  contract hashes.
+
+### Wall 1 — the trace payload (C1/M2/(b))
+
+- **Typed per-event payload structs** (`ThoughtStartPayload`,
+  `DmaResultsPayload`, `IdmaResultPayload`, `ConscienceResultPayload`,
+  `ActionResultPayload`) — serde names ARE the flat extraction paths;
+  `payload_structs_bind_extraction_manifest` asserts every #494 manifest
+  path is a serde field of its event's struct.
+- **M2**: `manifest_event_types_are_reasoning_event_tokens` binds the
+  event-type gate strings to `ReasoningEventType::as_str` — the
+  two-spelling class is witnessed.
+- **(b) THE PARITY WITNESS**:
+  `aggregate_feature_matrix_parity_sqlite_pg_495b` — typed payloads
+  inserted identically into sqlite AND postgres must yield EQUAL scoring
+  feature matrices (the two hand-written aggregate shapes can no longer
+  drift apart silently). Doubles as the dual-dialect typed-payload
+  round-trip proof.
+
+### Deliberately NOT typed (the disposition boundary)
+
+`PeerPolicyBlob` + the scope blobs (symbol-AEAD opaque holder — opacity is
+load-bearing, #243), `registration_envelope` (co-scrub canonical +
+existing typed accessors), operational `signed_envelope` (typed row
+shapes), `revocation_envelope`/`attestation_evidence` (small, typed-row
+adjacent). Posted as the disposition table on #495.
+
+### Consumer handoff
+
+- CIRISServer: on re-pin, the five `json!{}` emit sites become
+  `EnvelopeCore` construction (compile-guided); serve
+  `envelope_vocabulary().sha256` + `trace_summary_extraction().sha256` on
+  `/v1/health`.
+- CIRISAgent: emitter contract test asserts
+  `TRACE_SUMMARY_EXTRACTION_SHA256` (unchanged by this cut:
+  `f4dfea6e…`).
+
 ## [19.2.0] — 2026-07-24 — self-enc pubkeys accessor (#493) + the single-source trace-summary extraction contract (#494)
 
 The audit's two actionable slices: a live reverse-path KEX unblock, and the

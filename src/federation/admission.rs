@@ -837,7 +837,9 @@ fn contains_version_segment(dim: &str) -> bool {
 /// structural primitives have no `dimension` field — `None` is
 /// the expected shape for them.
 pub fn envelope_dimension(envelope: &serde_json::Value) -> Option<&str> {
-    envelope.get("dimension").and_then(|v| v.as_str())
+    envelope
+        .get(crate::federation::envelope::paths::DIMENSION)
+        .and_then(|v| v.as_str())
 }
 
 /// v13.2.1 (CIRISPersist#378) — is this `delegates_to` envelope an
@@ -1122,7 +1124,7 @@ where
             let hash = crate::federation::verify_envelope_hybrid_signature(
                 directory,
                 &input.attesting_key_id,
-                &input.attestation_envelope,
+                &input.attestation_envelope.to_value(),
                 sig_classical,
                 sig_pqc,
             )
@@ -1172,7 +1174,9 @@ pub fn is_subject_side_revocation(
     subject_key_ids: &[String],
 ) -> bool {
     let is_revocation = attestation_type == crate::federation::types::attestation_type::WITHDRAWS
-        || dimension.is_some_and(|d| d.starts_with("consent:state:revoked"));
+        || dimension.is_some_and(|d| {
+            d.starts_with(crate::federation::consent::consent_dimension::STATE_REVOKED_PREFIX)
+        });
     is_revocation && subject_key_ids.iter().any(|s| s == attesting_key_id)
 }
 

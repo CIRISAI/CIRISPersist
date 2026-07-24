@@ -40,6 +40,21 @@
 //! So this module is the STORE + EXPOSE + OQ-1 half; OQ-2 / OQ-3 are
 //! consumer-applied signals on the field persist now carries.
 
+/// v20.0.0 (CIRISPersist#495 C3) — the consent-state dimension PREFIX
+/// constants, single-sourced. Server-side consts (infohazard.rs / peer.rs)
+/// and every persist SQL literal must speak THESE strings; drift meant
+/// `list_consent_revocations` silently empty → revoked consent treated as
+/// active → replication kept flowing to a peer that revoked. Versioned
+/// dimensions extend the prefix (`consent:state:revoked:v1`).
+pub mod consent_dimension {
+    /// Prefix of every granted-state dimension.
+    pub const STATE_GRANTED_PREFIX: &str = "consent:state:granted";
+    /// Prefix of every revoked-state dimension.
+    pub const STATE_REVOKED_PREFIX: &str = "consent:state:revoked";
+    /// Prefix of every expired-state dimension.
+    pub const STATE_EXPIRED_PREFIX: &str = "consent:state:expired";
+}
+
 use super::{Error, FederationDirectory};
 
 /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — resolve the Counter-RII
@@ -84,9 +99,9 @@ pub fn envelope_dimension(a: &super::Attestation) -> Option<&str> {
 pub fn consent_state_of(dimension: Option<&str>) -> super::hard_case::ConsentState {
     use super::hard_case::ConsentState;
     match dimension {
-        Some(d) if d.starts_with("consent:state:granted") => ConsentState::Granted,
-        Some(d) if d.starts_with("consent:state:revoked") => ConsentState::Revoked,
-        Some(d) if d.starts_with("consent:state:expired") => ConsentState::Expired,
+        Some(d) if d.starts_with(consent_dimension::STATE_GRANTED_PREFIX) => ConsentState::Granted,
+        Some(d) if d.starts_with(consent_dimension::STATE_REVOKED_PREFIX) => ConsentState::Revoked,
+        Some(d) if d.starts_with(consent_dimension::STATE_EXPIRED_PREFIX) => ConsentState::Expired,
         _ => ConsentState::Unspecified,
     }
 }

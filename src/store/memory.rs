@@ -484,12 +484,15 @@ impl MemoryBackend {
 
         // v17.9.0 (CC#38 interim) — envelope size cap FIRST, before any
         // parsing/lookups (cheapest-most-specific-rejection-first).
-        crate::federation::admission::check_envelope_size_admission(&input.attestation_envelope)?;
+        // v20.0.0 (#495): the input envelope is TYPED (EnvelopeCore);
+        // serialize once for the Value-based admission checks.
+        let envelope_value = input.attestation_envelope.to_value();
+        crate::federation::admission::check_envelope_size_admission(&envelope_value)?;
         crate::federation::admission::check_trace_dimension_admission(
             input.dimension(),
             &input.attesting_key_id,
             &input.subject_key_ids,
-            &input.attestation_envelope,
+            &envelope_value,
         )?;
         crate::federation::trust_root::check_trust_charter_admission(
             self,
@@ -499,7 +502,7 @@ impl MemoryBackend {
                 .attested_key_id
                 .as_deref()
                 .unwrap_or(&input.attesting_key_id),
-            &input.attestation_envelope,
+            &envelope_value,
         )
         .await?;
         let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
@@ -538,7 +541,7 @@ impl MemoryBackend {
                 )))
             }
         };
-        let dim = crate::federation::admission::envelope_dimension(&input.attestation_envelope);
+        let dim = input.dimension();
         crate::federation::admission::DimensionAdmissionPolicy::default().check(
             &input.attestation_type,
             dim,
@@ -3633,7 +3636,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     .attestation_envelope
                     .get("dimension")
                     .and_then(|v| v.as_str())
-                    .is_some_and(|d| d.starts_with("consent:state:revoked"));
+                    .is_some_and(|d| {
+                        d.starts_with(
+                            crate::federation::consent::consent_dimension::STATE_REVOKED_PREFIX,
+                        )
+                    });
                 is_subject_withdraws || is_consent_revoked
             })
             .filter(|a| since.is_none_or(|s| a.asserted_at >= s))
@@ -11391,7 +11398,10 @@ mod tests {
                 attestation_type: attestation_type::SCORES.into(),
                 weight: None,
                 expires_at: None,
-                attestation_envelope: env.clone(),
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    env.clone(),
+                )
+                .unwrap(),
                 subject_key_ids: vec!["subject-c".into()],
                 cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
                 scrub_signature_classical: Some(sig_classical),
@@ -11484,10 +11494,13 @@ mod tests {
                 attestation_type: attestation_type::SCORES.into(),
                 weight: None,
                 expires_at: None,
-                attestation_envelope: serde_json::json!({
-                    "id": "rev-bad", "dimension": "consent:state:revoked:v1",
-                    "score": 1.0, "confidence": 0.9,
-                }),
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    serde_json::json!({
+                        "id": "rev-bad", "dimension": "consent:state:revoked:v1",
+                        "score": 1.0, "confidence": 0.9,
+                    }),
+                )
+                .unwrap(),
                 subject_key_ids: vec!["subject-c".into()],
                 cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
                 scrub_signature_classical: Some("AAAA".into()), // not a valid sig
@@ -11512,10 +11525,13 @@ mod tests {
                 attestation_type: attestation_type::SCORES.into(),
                 weight: None,
                 expires_at: None,
-                attestation_envelope: serde_json::json!({
-                    "id": "rev-unsigned", "dimension": "consent:state:revoked:v1",
-                    "score": 1.0, "confidence": 0.9,
-                }),
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    serde_json::json!({
+                        "id": "rev-unsigned", "dimension": "consent:state:revoked:v1",
+                        "score": 1.0, "confidence": 0.9,
+                    }),
+                )
+                .unwrap(),
                 subject_key_ids: vec!["subject-c".into()],
                 cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
                 scrub_signature_classical: None,
@@ -11567,7 +11583,8 @@ mod tests {
                 attestation_type: attestation_type::SCORES.into(),
                 weight: None,
                 expires_at: None,
-                attestation_envelope: env,
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(env)
+                    .unwrap(),
                 subject_key_ids: vec!["subject-r".into()],
                 cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
                 scrub_signature_classical: Some(sig_classical),
@@ -12557,7 +12574,8 @@ mod tests {
             attesting_key_id: "cap-k".into(),
             attested_key_id: None,
             attestation_type: "scores".into(),
-            attestation_envelope: oversize,
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(oversize)
+                .unwrap(),
             subject_key_ids: Vec::new(),
             expires_at: None,
             weight: None,

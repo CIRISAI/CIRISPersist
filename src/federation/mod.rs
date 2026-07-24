@@ -76,6 +76,7 @@ pub mod read;
 // DRYs the out-of-group peering gate that CIRISServer/CIRISStatus
 // previously re-derived; `consent:replication` stays CEG-side
 // governance.
+pub mod envelope;
 pub mod register;
 pub mod replication;
 pub mod rooting;

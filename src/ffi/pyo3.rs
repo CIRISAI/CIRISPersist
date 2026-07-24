@@ -3346,6 +3346,25 @@ impl PyEngine {
     /// the hash on `/v1/health` beside `wire_vocabulary_sha256`; the
     /// CIRISAgent emitter contract test asserts it — a contract change on
     /// either side fails loudly on both.
+    /// v20.0.0 (CIRISPersist#495) — the attestation-envelope vocabulary
+    /// contract: `{"manifest_json": …, "sha256": …}` (universal envelope
+    /// paths + consent-dimension prefixes). Served on `/v1/health` beside
+    /// the other contract hashes; consumer tests assert it.
+    fn envelope_vocabulary(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        catch_panic(|| {
+            let out = PyDict::new(py);
+            out.set_item(
+                "manifest_json",
+                crate::federation::envelope::envelope_vocabulary_json().to_string(),
+            )?;
+            out.set_item(
+                "sha256",
+                crate::federation::envelope::ENVELOPE_VOCABULARY_SHA256,
+            )?;
+            Ok(out.unbind())
+        })
+    }
+
     fn trace_summary_extraction(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         catch_panic(|| {
             let out = PyDict::new(py);
@@ -27811,10 +27830,13 @@ mod tests {
                     attestation_type: crate::federation::types::attestation_type::SCORES.into(),
                     weight: Some(1.0),
                     expires_at: None,
-                    attestation_envelope: serde_json::json!({
-                        "id": "att-1", "dimension": "identity_binding:v1",
-                        "score": 1.0, "confidence": 0.9,
-                    }),
+                    attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                        serde_json::json!({
+                            "id": "att-1", "dimension": "identity_binding:v1",
+                            "score": 1.0, "confidence": 0.9,
+                        }),
+                    )
+                    .unwrap(),
                     subject_key_ids: vec![],
                     cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
                     scrub_signature_classical: None,
