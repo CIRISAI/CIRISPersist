@@ -5,6 +5,40 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [20.1.0] — 2026-07-24 — the trace plane closes both directions: emitter identity on the summary (#498) + the P5 backfill (#478) + P4 projection-pinning (#477)
+
+### Added — `TraceSummary.agent_key_id` (#498, the last blocker before the first trace ships)
+
+The emitter's REGISTERED federation `key_id` now rides the trace summary
+(`MIN(signing_key_id)` — the key that SIGNED the trace, stamped on every
+row at decompose). **Registration is guaranteed by construction** for
+Full-verified traces: verify resolved that key FROM `federation_keys`
+before any row was admitted. The capacity scorer attests about the
+agent's real identity — FK-valid, anti-Goodhart-valid (subject ≠ scorer),
+CEG-correct. `None` only on `TrustPreVerified` relay corpora whose
+producer has not federated (honest). Additive serde field; both backends;
+witnessed on both.
+
+### Added — `Engine::backfill_trace_attestations` (#478, envelope-native P5)
+
+One-time idempotent backfill: every pre-18.0 trace with projection rows
+but no attestation gets its envelope-native `scores` attestation minted —
+best-effort reassembly from rows, provenance-marked
+(`reassembled_from_projection: true`), CC#38 manifest form above the size
+cap, and THE SAME deterministic id as the live mint
+(`trace_attestation_id`, now single-sourced) — backfill and replay
+CONVERGE on the funnels' conflict-ignore. Unregistered pre-18.0 producers
+skip with typed per-item accounting (`TraceBackfillReport`). Engine +
+PyO3 verb. Witness: mint + honest-skip + convergent re-run.
+
+### Documented — P4 projection-pinning (#477, recorded decision)
+
+`get_trace_detail`, `fetch_trace_events_page`, and the
+features/classifications enrichment are PROJECTION-PINNED permanently:
+the superset projection serves physical-row reads; mutable enrichment is
+projection-local (the signed envelope is never retro-mutated). Doc-pinned
+at the trait level; disposition posted on #477.
+
 ## [20.0.0] — 2026-07-24 — #495: the two `serde_json::Value` walls are gone; cross-boundary field drift is a build/test failure
 
 The umbrella cut. Every silent-drift incident this cycle (dark trace plane,

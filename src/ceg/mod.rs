@@ -196,6 +196,18 @@ pub trait ReadEngine: Send + Sync {
 
     // ── Section B — Trace detail (CIRISPersist#23 §B) ──────────────
 
+    /// ## Projection-pinned (v20.1.0, CIRISPersist#477 — recorded decision)
+    ///
+    /// This surface reads the `trace_events` PROJECTION by design, not the
+    /// envelope-native attestation (the canonical home since v18.0.0). The
+    /// #477 disposition: the projection is a SUPERSET projection (all
+    /// per-event scalars + payload + enrichment columns), maintained at
+    /// ingest in the same flow as the attestation mint — physical-row
+    /// reads stay HERE permanently; corpus unification would force
+    /// envelope reassembly on every hot read for no consumer benefit.
+    /// Mutable enrichment (`extracted_features`/`classifications`) is
+    /// projection-LOCAL by design: a projection column, not envelope
+    /// content — the signed envelope is never retro-mutated.
     /// Full trace reconstruction: summary + all per-component data
     /// (ordered by `ts`) + LLM call rows (chronological) + the
     /// envelope-level scrub + signature refs.

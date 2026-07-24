@@ -77,6 +77,20 @@ pub mod read;
 // previously re-derived; `consent:replication` stays CEG-side
 // governance.
 pub mod envelope;
+
+/// v20.1.0 (CIRISPersist#478) — the trace-attestation backfill report:
+/// what minted (incl. idempotent already-present no-ops — the funnels'
+/// conflict-ignore makes a re-run indistinguishable from a first run) and
+/// what SKIPPED with its typed reason (honest accounting, e.g. an
+/// unregistered pre-18.0 producer key).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TraceBackfillReport {
+    /// Traces whose attestation now exists (minted or already present).
+    pub minted: usize,
+    /// `(trace_id, error kind)` for traces the funnels refused.
+    pub skipped: Vec<(String, String)>,
+}
+
 pub mod register;
 pub mod replication;
 pub mod rooting;

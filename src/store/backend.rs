@@ -54,6 +54,18 @@ pub trait Backend: Send + Sync {
         rows: &[TraceLlmCallRow],
     ) -> impl Future<Output = Result<usize, Error>> + Send;
 
+    /// ## Projection-pinned (v20.1.0, CIRISPersist#477 — recorded decision)
+    ///
+    /// This surface reads the `trace_events` PROJECTION by design, not the
+    /// envelope-native attestation (the canonical home since v18.0.0). The
+    /// #477 disposition: the projection is a SUPERSET projection (all
+    /// per-event scalars + payload + enrichment columns), maintained at
+    /// ingest in the same flow as the attestation mint — physical-row
+    /// reads stay HERE permanently; corpus unification would force
+    /// envelope reassembly on every hot read for no consumer benefit.
+    /// Mutable enrichment (`extracted_features`/`classifications`) is
+    /// projection-LOCAL by design: a projection column, not envelope
+    /// content — the signed envelope is never retro-mutated.
     /// v0.7.4 (CIRISPersist#19) — batch-UPDATE the V009
     /// `extracted_features` column for `(trace_id, thought_id)` pairs.
     /// Called from `IngestPipeline::receive_and_persist` post-insert
@@ -205,6 +217,18 @@ pub trait Backend: Send + Sync {
         agent_id_hash: &str,
     ) -> impl Future<Output = Result<ErasureSummary, Error>> + Send;
 
+    /// ## Projection-pinned (v20.1.0, CIRISPersist#477 — recorded decision)
+    ///
+    /// This surface reads the `trace_events` PROJECTION by design, not the
+    /// envelope-native attestation (the canonical home since v18.0.0). The
+    /// #477 disposition: the projection is a SUPERSET projection (all
+    /// per-event scalars + payload + enrichment columns), maintained at
+    /// ingest in the same flow as the attestation mint — physical-row
+    /// reads stay HERE permanently; corpus unification would force
+    /// envelope reassembly on every hot read for no consumer benefit.
+    /// Mutable enrichment (`extracted_features`/`classifications`) is
+    /// projection-LOCAL by design: a projection column, not envelope
+    /// content — the signed envelope is never retro-mutated.
     /// v0.3.5 (CIRISLens#8 ASK 3) — Page-cursor read primitive for
     /// analytical streaming. Returns up to `limit` `trace_events` rows
     /// where `event_id > after_event_id`, ordered ascending by

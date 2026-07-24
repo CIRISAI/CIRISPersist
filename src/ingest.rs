@@ -36,6 +36,22 @@ use crate::verify::{canonical::Canonicalizer, Error as VerifyError};
 /// ratification alongside the CC#38 size discipline.
 pub const TRACE_ATTESTATION_DIMENSION: &str = "trace:complete:v1";
 
+/// v18.0.0/#473 (single-sourced v20.1.0 for the #478 backfill) — the
+/// DETERMINISTIC trace-attestation id: sha256("ciris:trace-attestation:v1:"
+/// ‖ trace_id) folded into a UUID (pg's attestation_id is ::uuid-cast). The
+/// live mint and the backfill derive the SAME id, so they converge: whichever
+/// runs second no-ops on the funnels' conflict-ignore.
+pub fn trace_attestation_id(trace_id: &str) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(b"ciris:trace-attestation:v1:");
+    h.update(trace_id.as_bytes());
+    let digest = h.finalize();
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&digest[..16]);
+    uuid::Uuid::from_bytes(b).to_string()
+}
+
 /// What the ingest pipeline did with one `events[]` body.
 ///
 /// Mission constraint (MISSION.md §3 anti-pattern #7): a successful
@@ -738,15 +754,7 @@ where
     ) -> Result<crate::federation::types::LocalAttestationInput, IngestError> {
         use crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES;
 
-        // Deterministic id: sha256("ciris:trace-attestation:v1:" ‖ trace_id)
-        // folded into a UUID (pg's attestation_id column is ::uuid-cast).
-        let mut h = Sha256::new();
-        h.update(b"ciris:trace-attestation:v1:");
-        h.update(trace.trace_id.as_bytes());
-        let digest = h.finalize();
-        let mut b = [0u8; 16];
-        b.copy_from_slice(&digest[..16]);
-        let attestation_id = uuid::Uuid::from_bytes(b).to_string();
+        let attestation_id = trace_attestation_id(&trace.trace_id);
 
         let attesting = trace.signature_key_id.clone();
         let trace_value = serde_json::to_value(trace)

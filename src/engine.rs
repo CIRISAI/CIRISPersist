@@ -2116,6 +2116,148 @@ impl Engine {
         signer.self_enc_pubkeys()
     }
 
+    /// v20.1.0 (CIRISPersist#478, envelope-native P5) — one-time idempotent
+    /// BACKFILL: mint the envelope-native `scores` attestation for every
+    /// pre-18.0 trace that has projection rows but no attestation.
+    ///
+    /// Reassembles each trace from its `trace_events` rows (best-effort —
+    /// the envelope carries `"reassembled_from_projection": true` so
+    /// consumers know the provenance; a byte-exact CompleteTrace is not
+    /// reconstructible from decomposed rows), derives the SAME
+    /// deterministic id as the live mint
+    /// ([`crate::ingest::trace_attestation_id`]), and mints via the
+    /// local funnel — whichever of backfill/replay runs second no-ops on
+    /// the conflict-ignore, so the two paths CONVERGE. Traces whose
+    /// producer key is not registered skip with honest per-item
+    /// accounting (same posture as the live mint's relay skip).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn backfill_trace_attestations(
+        &self,
+    ) -> Result<crate::federation::TraceBackfillReport, crate::federation::Error> {
+        use crate::federation::Error;
+        let mut report = crate::federation::TraceBackfillReport::default();
+        // Group rows per trace by paging the projection.
+        let mut after = 0i64;
+        let mut by_trace: std::collections::BTreeMap<String, Vec<crate::store::TraceEventRow>> =
+            std::collections::BTreeMap::new();
+        loop {
+            let page = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    crate::store::Backend::fetch_trace_events_page(&**b, after, 512, None).await
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    crate::store::Backend::fetch_trace_events_page(&**b, after, 512, None).await
+                }
+            }
+            .map_err(|e| Error::Backend(format!("backfill page: {e}")))?;
+            if page.is_empty() {
+                break;
+            }
+            for (eid, row) in page {
+                after = after.max(eid);
+                by_trace.entry(row.trace_id.clone()).or_default().push(row);
+            }
+        }
+
+        for (trace_id, mut rows) in by_trace {
+            rows.sort_by_key(|r| (r.ts, r.attempt_index));
+            let Some(first) = rows.first() else { continue };
+            let attesting = first.signing_key_id.clone();
+            let agent_id_hash = first.agent_id_hash.clone();
+            // Best-effort reassembly, provenance-marked.
+            let components: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "event_type": r.event_type.as_str(),
+                        "step_point": r.step_point,
+                        "attempt_index": r.attempt_index,
+                        "ts": r.ts.to_rfc3339(),
+                        "data": serde_json::Value::Object(r.payload.clone()),
+                    })
+                })
+                .collect();
+            let mut envelope = crate::federation::envelope::EnvelopeCore {
+                dimension: Some(crate::ingest::TRACE_ATTESTATION_DIMENSION.to_owned()),
+                ..Default::default()
+            };
+            envelope
+                .extra
+                .insert("trace_id".into(), serde_json::json!(trace_id));
+            envelope
+                .extra
+                .insert("agent_id_hash".into(), serde_json::json!(agent_id_hash));
+            envelope.extra.insert(
+                "reassembled_from_projection".into(),
+                serde_json::json!(true),
+            );
+            envelope.extra.insert(
+                "trace".into(),
+                serde_json::json!({
+                    "trace_id": trace_id,
+                    "thought_id": first.thought_id,
+                    "task_id": first.task_id,
+                    "agent_id_hash": agent_id_hash,
+                    "trace_level": first.trace_level,
+                    "schema_version": first.schema_version,
+                    "components": components,
+                }),
+            );
+            // CC#38 size discipline — oversize reassemblies take the
+            // manifest form, same as the live mint.
+            let value = envelope.to_value();
+            let canonical = crate::verify::canonical::ceg_produce_canonicalize(&value)
+                .map_err(|e| Error::InvalidArgument(format!("backfill canonicalize: {e}")))?;
+            if canonical.len() > crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES {
+                use sha2::Digest as _;
+                let hash = hex::encode(sha2::Sha256::digest(&canonical));
+                envelope.extra.remove("trace");
+                envelope.extra.insert(
+                    "manifest".into(),
+                    serde_json::json!({
+                        "schema": "trace_manifest:v1",
+                        "content_hash": format!("sha256:{hash}"),
+                        "byte_len": canonical.len(),
+                        "component_count": components.len(),
+                    }),
+                );
+            }
+
+            let input = crate::federation::types::LocalAttestationInput {
+                attestation_id: Some(crate::ingest::trace_attestation_id(&trace_id)),
+                attesting_key_id: attesting.clone(),
+                attested_key_id: None,
+                attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+                weight: None,
+                expires_at: None,
+                attestation_envelope: envelope,
+                subject_key_ids: vec![attesting],
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                scrub_signature_classical: None,
+                scrub_signature_pqc: None,
+            };
+            let outcome = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    crate::federation::FederationDirectory::attestation_insert_local(&**b, input)
+                        .await
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    crate::federation::FederationDirectory::attestation_insert_local(&**b, input)
+                        .await
+                }
+            };
+            match outcome {
+                Ok(_) => report.minted += 1,
+                Err(e) => report.skipped.push((trace_id, e.kind().to_owned())),
+            }
+        }
+        Ok(report)
+    }
+
     /// v19.1.0 (CIRISPersist#490) — bake an assembled genesis trust-root
     /// bundle (the ceremony artifact JSON): quorum-verify against THIS
     /// node's roster, then land serve nodes (insert / idempotent /
@@ -5311,6 +5453,157 @@ mod tests {
     /// v3.4.0 (CIRISPersist#123) — engine carries a replication
     /// config and `sweep_evictions_once` is a no-op when the sweeper
     /// is inactive (default).
+    /// v20.1.0 (CIRISPersist#478) — the P5 backfill witness: pre-18.0-style
+    /// projection rows (trace_events, NO attestation) get their
+    /// envelope-native attestation minted; re-running converges (same
+    /// deterministic ids → no duplicates); an unregistered producer skips
+    /// with honest accounting.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn backfill_trace_attestations_478() {
+        use crate::federation::FederationDirectory as _;
+        use crate::store::Backend as _;
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let backend = match &engine.backend {
+            BackendDispatch::Sqlite(b) => b.clone(),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
+        };
+
+        // Register the producer key (pre-18 traces from a REGISTERED agent)
+        // via the exported co-scrub-free node path.
+        let mut rec_env = serde_json::json!({ "key_id": "bf-agent" });
+        let canonical = crate::verify::canonical::ceg_produce_canonicalize(&rec_env).unwrap();
+        use sha2::Digest as _;
+        let rec = crate::federation::KeyRecord {
+            key_id: "bf-agent".into(),
+            pubkey_ed25519_base64: {
+                use base64::engine::general_purpose::STANDARD as B64;
+                use base64::Engine as _;
+                B64.encode([9u8; 32])
+            },
+            pubkey_ml_dsa_65_base64: None,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: crate::federation::types::identity_type::NODE.to_owned(),
+            identity_ref: "bf-agent".into(),
+            valid_from: chrono::Utc::now(),
+            valid_until: None,
+            registration_envelope: rec_env.take(),
+            original_content_hash: hex::encode(sha2::Sha256::digest(&canonical)),
+            scrub_signature_classical: "AA".into(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "bf-agent".into(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence: None,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord { record: rec })
+            .await
+            .expect("register producer");
+
+        // Pre-18-style projection rows: two traces, one with an
+        // UNREGISTERED signer (the honest-skip case).
+        let base = chrono::Utc::now();
+        let mk = |trace: &str, signer: &str| crate::store::TraceEventRow {
+            trace_id: trace.to_owned(),
+            thought_id: format!("{trace}-th"),
+            task_id: None,
+            step_point: Some("x".into()),
+            event_type: crate::schema::ReasoningEventType::ThoughtStart,
+            attempt_index: 0,
+            ts: base,
+            agent_id_hash: "bf-hash".into(),
+            agent_name: None,
+            deployment_domain: None,
+            deployment_type: None,
+            deployment_region: None,
+            deployment_trust_mode: None,
+            cohort_scope: "federation".to_string(),
+            cohort_target_id: None,
+            signature_ml_dsa_65: None,
+            pubkey_ml_dsa_65: None,
+            pqc_key_id: None,
+            agent_role: None,
+            agent_template: None,
+            cognitive_state: None,
+            trace_level: crate::schema::TraceLevel::Generic,
+            payload: serde_json::Map::new(),
+            cost_llm_calls: None,
+            cost_tokens: None,
+            cost_usd: None,
+            signature: "sig".into(),
+            signing_key_id: signer.to_owned(),
+            signature_verified: true,
+            verification_source: crate::store::VerificationSource::Persist,
+            schema_version: "2.7.0".into(),
+            pii_scrubbed: true,
+            original_content_hash: None,
+            scrub_signature: None,
+            scrub_key_id: None,
+            scrub_timestamp: None,
+        };
+        backend
+            .insert_trace_events_batch(&[mk("bf-t1", "bf-agent"), mk("bf-t2", "bf-ghost")])
+            .await
+            .unwrap();
+
+        // Backfill: registered trace mints; ghost-signed trace skips.
+        let r1 = engine
+            .backfill_trace_attestations()
+            .await
+            .expect("backfill");
+        assert_eq!(r1.minted, 1, "registered-producer trace minted");
+        assert_eq!(
+            r1.skipped.len(),
+            1,
+            "unregistered producer skipped honestly"
+        );
+        assert_eq!(r1.skipped[0].0, "bf-t2");
+
+        // The attestation is real + carries the deterministic id — read via
+        // the REALIZED consumer read (list_scores, tier Local: local rows
+        // are producer-scoped, invisible to the plain by-attester list).
+        let filter: crate::read::AttestationFilter = serde_json::from_value(serde_json::json!({
+            "dimension_exact": crate::ingest::TRACE_ATTESTATION_DIMENSION,
+            "tier": "Local",
+        }))
+        .unwrap();
+        let page = backend
+            .list_scores("bf-agent", filter.clone(), None, 10)
+            .await
+            .expect("list_scores");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.items[0].attestation_id,
+            crate::ingest::trace_attestation_id("bf-t1"),
+            "backfill id == the live-mint derivation (convergent)"
+        );
+        assert_eq!(
+            page.items[0]
+                .attestation_envelope
+                .get("reassembled_from_projection")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "provenance-marked"
+        );
+
+        // Idempotent: re-run converges, no duplicates.
+        let r2 = engine.backfill_trace_attestations().await.expect("re-run");
+        assert_eq!(r2.minted, 1, "conflict-ignore no-op still reports minted");
+        let page2 = backend
+            .list_scores("bf-agent", filter, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(page2.items.len(), 1, "no duplicates on re-run");
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn sweep_evictions_once_is_noop_without_budget() {
