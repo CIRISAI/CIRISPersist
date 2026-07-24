@@ -661,6 +661,56 @@ pub enum DirectoryOp {
         /// The granting node whose live peer set is asked for.
         node_key_id: String,
     },
+    /// [`FederationDirectory::list_signed_families_since`] (v21.0.0,
+    /// CIRISPersist#504 FLOOR) — bulk-list the full `SignedFamily` wrappers
+    /// (row + V110 authority signature) since a cursor, for the edge
+    /// advertise/serve responder. Result rides `SignedFamilies`. APPEND-ONLY.
+    ListSignedFamiliesSince {
+        /// Cursor: rows with `founded_at > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap.
+        limit: u32,
+    },
+    /// [`FederationDirectory::list_signed_communities_since`] (v21.0.0,
+    /// CIRISPersist#504 FLOOR). Structural mirror of
+    /// [`DirectoryOp::ListSignedFamiliesSince`]. Result rides `SignedCommunities`.
+    /// APPEND-ONLY.
+    ListSignedCommunitiesSince {
+        /// Cursor: rows with `founded_at > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap.
+        limit: u32,
+    },
+    /// [`FederationDirectory::list_signed_location_proofs_since`] (v21.0.0,
+    /// CIRISPersist#504 FLOOR). Structural mirror of
+    /// [`DirectoryOp::ListSignedFamiliesSince`]. Result rides `SignedLocationProofs`.
+    /// APPEND-ONLY.
+    ListSignedLocationProofsSince {
+        /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap.
+        limit: u32,
+    },
+    /// [`FederationDirectory::list_signed_family_membership_revocations_since`]
+    /// (v21.0.0, CIRISPersist#504 FLOOR). Structural mirror of
+    /// [`DirectoryOp::ListSignedFamiliesSince`]. Result rides
+    /// `SignedFamilyMembershipRevocations`. APPEND-ONLY.
+    ListSignedFamilyMembershipRevocationsSince {
+        /// Cursor: rows with `removed_at > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap.
+        limit: u32,
+    },
+    /// [`FederationDirectory::list_signed_community_membership_revocations_since`]
+    /// (v21.0.0, CIRISPersist#504 FLOOR). Structural mirror of
+    /// [`DirectoryOp::ListSignedFamiliesSince`]. Result rides
+    /// `SignedCommunityMembershipRevocations`. APPEND-ONLY.
+    ListSignedCommunityMembershipRevocationsSince {
+        /// Cursor: rows with `removed_at > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap.
+        limit: u32,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -773,6 +823,22 @@ pub enum DirectoryOpResult {
     /// `list_consent_peers` (v21.0.0, #502 E7) — the revocation-folded
     /// `consent_peer_set` peer list, sorted + deduped. APPEND-ONLY.
     ConsentPeers(Vec<String>),
+    /// `list_signed_families_since` (v21.0.0, CIRISPersist#504 FLOOR) — the
+    /// full signed-family wrappers (row + V110 authority signature) for the
+    /// edge advertise/serve responder. APPEND-ONLY.
+    SignedFamilies(Vec<SignedFamily>),
+    /// `list_signed_communities_since` (v21.0.0, CIRISPersist#504 FLOOR).
+    /// APPEND-ONLY.
+    SignedCommunities(Vec<SignedCommunity>),
+    /// `list_signed_location_proofs_since` (v21.0.0, CIRISPersist#504 FLOOR).
+    /// APPEND-ONLY.
+    SignedLocationProofs(Vec<SignedLocationProof>),
+    /// `list_signed_family_membership_revocations_since` (v21.0.0,
+    /// CIRISPersist#504 FLOOR). APPEND-ONLY.
+    SignedFamilyMembershipRevocations(Vec<SignedFamilyMembershipRevocation>),
+    /// `list_signed_community_membership_revocations_since` (v21.0.0,
+    /// CIRISPersist#504 FLOOR). APPEND-ONLY.
+    SignedCommunityMembershipRevocations(Vec<SignedCommunityMembershipRevocation>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1198,6 +1264,42 @@ pub async fn dispatch_directory_op(
         DirectoryOp::ListConsentPeers { node_key_id } => {
             match dir.list_consent_peers(&node_key_id).await {
                 Ok(v) => DirectoryOpResult::ConsentPeers(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedFamiliesSince { since, limit } => {
+            match dir.list_signed_families_since(since, limit).await {
+                Ok(v) => DirectoryOpResult::SignedFamilies(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedCommunitiesSince { since, limit } => {
+            match dir.list_signed_communities_since(since, limit).await {
+                Ok(v) => DirectoryOpResult::SignedCommunities(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedLocationProofsSince { since, limit } => {
+            match dir.list_signed_location_proofs_since(since, limit).await {
+                Ok(v) => DirectoryOpResult::SignedLocationProofs(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedFamilyMembershipRevocationsSince { since, limit } => {
+            match dir
+                .list_signed_family_membership_revocations_since(since, limit)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SignedFamilyMembershipRevocations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedCommunityMembershipRevocationsSince { since, limit } => {
+            match dir
+                .list_signed_community_membership_revocations_since(since, limit)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SignedCommunityMembershipRevocations(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -2611,6 +2713,101 @@ impl FederationDirectory for OpsDirectory {
             .await?
         {
             DirectoryOpResult::ConsentPeers(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — the signed-only family bulk read
+    /// via the capsule, for the edge advertise/serve responder.
+    async fn list_signed_families_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedFamily>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedFamiliesSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedFamilies(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — structural mirror of
+    /// [`Self::list_signed_families_since`].
+    async fn list_signed_communities_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedCommunity>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedCommunitiesSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedCommunities(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — structural mirror of
+    /// [`Self::list_signed_families_since`].
+    async fn list_signed_location_proofs_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedLocationProof>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedLocationProofsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedLocationProofs(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — structural mirror of
+    /// [`Self::list_signed_families_since`].
+    async fn list_signed_family_membership_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedFamilyMembershipRevocation>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedFamilyMembershipRevocationsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedFamilyMembershipRevocations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — structural mirror of
+    /// [`Self::list_signed_families_since`].
+    async fn list_signed_community_membership_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedCommunityMembershipRevocation>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedCommunityMembershipRevocationsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedCommunityMembershipRevocations(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),

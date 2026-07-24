@@ -7030,6 +7030,152 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
+    // ─── v21.0.0 (CIRISPersist#504 FLOOR) — bulk signed-since reads for the
+    //     5 E4 keyless-declaration planes (edge advertise/serve bridge).
+    //     Signed-only: `authority_key_id IS NOT NULL AND authority_key_id <>
+    //     ''` excludes `put_family_local` genesis-bake (and any other
+    //     legitimately-unsigned) rows — serving one would hand the edge
+    //     responder empty signature bytes.
+
+    async fn list_signed_families_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedFamily>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_families \
+                 WHERE ($1::timestamptz IS NULL OR founded_at > $1) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY founded_at ASC, family_key_id ASC LIMIT $2",
+                &[&since, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_signed_families_since: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_signed_family).collect()
+    }
+
+    async fn list_signed_communities_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedCommunity>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_communities \
+                 WHERE ($1::timestamptz IS NULL OR founded_at > $1) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY founded_at ASC, community_key_id ASC LIMIT $2",
+                &[&since, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_signed_communities_since: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_signed_community).collect()
+    }
+
+    async fn list_signed_location_proofs_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedLocationProof>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_location_proofs \
+                 WHERE ($1::timestamptz IS NULL OR asserted_at > $1) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY asserted_at ASC, subject_key_id ASC LIMIT $2",
+                &[&since, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_signed_location_proofs_since: {e}"))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_signed_location_proof)
+            .collect()
+    }
+
+    async fn list_signed_family_membership_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedFamilyMembershipRevocation>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_family_membership_revocations \
+                 WHERE ($1::timestamptz IS NULL OR removed_at > $1) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY removed_at ASC, family_key_id ASC, removed_identity_key_id ASC \
+                 LIMIT $2",
+                &[&since, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_signed_family_membership_revocations_since: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_signed_family_membership_revocation)
+            .collect()
+    }
+
+    async fn list_signed_community_membership_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedCommunityMembershipRevocation>, crate::federation::Error>
+    {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT * FROM cirislens.federation_community_membership_revocations \
+                 WHERE ($1::timestamptz IS NULL OR removed_at > $1) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY removed_at ASC, community_key_id ASC, removed_identity_key_id ASC \
+                 LIMIT $2",
+                &[&since, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_signed_community_membership_revocations_since: {e}"
+                ))
+            })?;
+        rows.into_iter()
+            .map(pg_row_to_signed_community_membership_revocation)
+            .collect()
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -13015,6 +13161,105 @@ fn pg_row_to_signed_partner_record(
         partner_record,
         steward_signatures,
         threshold: threshold as usize,
+    })
+}
+
+/// v21.0.0 (CIRISPersist#504 FLOOR) — row → `SignedFamily`: the
+/// [`pg_row_to_family`] row plus the V110 authority-signature columns. The
+/// sig columns are read BEFORE `row` is consumed by [`pg_row_to_family`].
+/// Callers gate the query on non-NULL/non-empty `authority_key_id`, so this
+/// always sees a genuinely signed row.
+fn pg_row_to_signed_family(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::SignedFamily, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let authority_key_id: String = row.safe_get_with("authority_key_id", mk_err)?;
+    let scrub_signature_classical: String =
+        row.safe_get_with("scrub_signature_classical", mk_err)?;
+    let scrub_signature_pqc: Option<String> = row.safe_get_with("scrub_signature_pqc", mk_err)?;
+    let family = pg_row_to_family(row)?;
+    Ok(crate::federation::SignedFamily {
+        family,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    })
+}
+
+/// v21.0.0 (CIRISPersist#504 FLOOR) — row → `SignedCommunity`. Structural
+/// mirror of [`pg_row_to_signed_family`].
+fn pg_row_to_signed_community(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::SignedCommunity, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let authority_key_id: String = row.safe_get_with("authority_key_id", mk_err)?;
+    let scrub_signature_classical: String =
+        row.safe_get_with("scrub_signature_classical", mk_err)?;
+    let scrub_signature_pqc: Option<String> = row.safe_get_with("scrub_signature_pqc", mk_err)?;
+    let community = pg_row_to_community(row)?;
+    Ok(crate::federation::SignedCommunity {
+        community,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    })
+}
+
+/// v21.0.0 (CIRISPersist#504 FLOOR) — row → `SignedLocationProof`. Structural
+/// mirror of [`pg_row_to_signed_family`].
+fn pg_row_to_signed_location_proof(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::SignedLocationProof, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let authority_key_id: String = row.safe_get_with("authority_key_id", mk_err)?;
+    let scrub_signature_classical: String =
+        row.safe_get_with("scrub_signature_classical", mk_err)?;
+    let scrub_signature_pqc: Option<String> = row.safe_get_with("scrub_signature_pqc", mk_err)?;
+    let location_proof = pg_row_to_location_proof(row)?;
+    Ok(crate::federation::SignedLocationProof {
+        location_proof,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    })
+}
+
+/// v21.0.0 (CIRISPersist#504 FLOOR) — row → `SignedFamilyMembershipRevocation`.
+/// Structural mirror of [`pg_row_to_signed_family`].
+fn pg_row_to_signed_family_membership_revocation(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::SignedFamilyMembershipRevocation, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let authority_key_id: String = row.safe_get_with("authority_key_id", mk_err)?;
+    let scrub_signature_classical: String =
+        row.safe_get_with("scrub_signature_classical", mk_err)?;
+    let scrub_signature_pqc: Option<String> = row.safe_get_with("scrub_signature_pqc", mk_err)?;
+    let family_membership_revocation = pg_row_to_family_membership_revocation(row)?;
+    Ok(crate::federation::SignedFamilyMembershipRevocation {
+        family_membership_revocation,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    })
+}
+
+/// v21.0.0 (CIRISPersist#504 FLOOR) — row →
+/// `SignedCommunityMembershipRevocation`. Structural mirror of
+/// [`pg_row_to_signed_family`].
+fn pg_row_to_signed_community_membership_revocation(
+    row: tokio_postgres::Row,
+) -> Result<crate::federation::SignedCommunityMembershipRevocation, crate::federation::Error> {
+    let mk_err = crate::federation::Error::Backend;
+    let authority_key_id: String = row.safe_get_with("authority_key_id", mk_err)?;
+    let scrub_signature_classical: String =
+        row.safe_get_with("scrub_signature_classical", mk_err)?;
+    let scrub_signature_pqc: Option<String> = row.safe_get_with("scrub_signature_pqc", mk_err)?;
+    let community_membership_revocation = pg_row_to_community_membership_revocation(row)?;
+    Ok(crate::federation::SignedCommunityMembershipRevocation {
+        community_membership_revocation,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
     })
 }
 
@@ -33106,6 +33351,457 @@ mod tests {
             a_pg, a_sq,
             "(495b) sqlite and postgres MUST compute the identical scoring \
              feature matrix from an identical corpus"
+        );
+    }
+
+    // ─── v21.0.0 (CIRISPersist#504 FLOOR) — the 5 signed-since-cursor bulk
+    //     read witnesses, postgres leg. Same shape as the sqlite witnesses
+    //     (`sqlite::tests::list_signed_*_since_signed_only_504`): signed-put
+    //     one record, assert `list_signed_*_since(None, 100)` returns
+    //     exactly that one byte-identical (INCLUDING the 3 V110 signature
+    //     fields) among only-this-run's rows, then assert an unsigned row is
+    //     excluded. Skips when `CIRIS_PERSIST_TEST_PG_URL` is unset;
+    //     uuid-suffixed keys keep runs self-isolating in the shared test DB.
+
+    /// `list_signed_families_since` on postgres: signed-only, byte-identical
+    /// round-trip; a `put_family_local` genesis-bake row is excluded.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_signed_families_since_signed_only_504_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let s = uuid_like();
+        let auth = format!("f504pg-auth-{s}");
+        let member = format!("f504pg-member-{s}");
+        let fam = format!("f504pg-family-{s}");
+        let fam_local = format!("f504pg-family-local-{s}");
+        for k in [&auth, &member] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: pg_admission_key(
+                        k,
+                        "primitive-504",
+                        crate::federation::types::identity_type::PRIMITIVE,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        // Whole-second, zero-subsecond timestamp — postgres TIMESTAMPTZ is
+        // microsecond-precision, so a `chrono::Utc::now()` nanosecond value
+        // would round-trip truncated and break the byte-exact comparison
+        // below (`serde_json::to_vec` renders full sub-second precision).
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 4, 0, 0, 0).unwrap();
+        let family_row = |key: &str| crate::federation::Family {
+            family_key_id: key.into(),
+            family_name: "504 PG Household".into(),
+            members: vec![crate::federation::FamilyMember {
+                key_id: member.clone(),
+                joined_at: now,
+                role: None,
+            }],
+            founded_at: now,
+            consensus_protocol: "founder_only".into(),
+            consensus_protocol_entrenched: false,
+            persist_row_hash: String::new(),
+        };
+        let signed =
+            crate::federation::tier_ingest::test_support::sign_family(&auth, family_row(&fam));
+        backend.put_family(signed.clone()).await.unwrap();
+        // Genesis-bake: legitimately unsigned, must never be served.
+        backend
+            .put_family_local(family_row(&fam_local))
+            .await
+            .unwrap();
+
+        let rows = backend
+            .list_signed_families_since(None, 10_000)
+            .await
+            .unwrap();
+        let mine: Vec<_> = rows
+            .into_iter()
+            .filter(|r| r.family.family_key_id == fam || r.family.family_key_id == fam_local)
+            .collect();
+        assert_eq!(mine.len(), 1, "unsigned genesis-bake row must be excluded");
+
+        let mut expect = signed;
+        expect.family.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(&expect.family).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&expect).unwrap(),
+            serde_json::to_vec(&mine[0]).unwrap(),
+            "returned SignedFamily must be byte-identical to what was put"
+        );
+    }
+
+    /// `list_signed_communities_since` on postgres: signed-only,
+    /// byte-identical round-trip; an unsigned legacy row (direct INSERT — no
+    /// `put_community_local` bypass exists) is excluded.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_signed_communities_since_signed_only_504_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let s = uuid_like();
+        let auth = format!("c504pg-auth-{s}");
+        let member = format!("c504pg-member-{s}");
+        let comm = format!("c504pg-community-{s}");
+        let comm_unsigned = format!("c504pg-community-unsigned-{s}");
+        for k in [&auth, &member] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: pg_admission_key(
+                        k,
+                        "primitive-504",
+                        crate::federation::types::identity_type::PRIMITIVE,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        // Whole-second timestamp — see the analogous comment in
+        // `list_signed_families_since_signed_only_504_pg`.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 6, 4, 0, 0, 0).unwrap();
+        let policy = serde_json::json!({ "cohort_scope": "community" });
+        let signed = crate::federation::tier_ingest::test_support::sign_community(
+            &auth,
+            crate::federation::Community {
+                community_key_id: comm.clone(),
+                community_name: "504 PG Co-op".into(),
+                members: vec![crate::federation::CommunityMember {
+                    key_id: member.clone(),
+                    joined_at: now,
+                    role: None,
+                }],
+                founded_at: now,
+                consensus_protocol: "majority".into(),
+                policy_blob: Some(policy),
+                persist_row_hash: String::new(),
+            },
+        );
+        backend.put_community(signed.clone()).await.unwrap();
+
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_communities (\
+                    community_key_id, community_name, members, founded_at, \
+                    consensus_protocol, policy_blob, persist_row_hash\
+                 ) VALUES ($1, $2, $3::jsonb, $4, $5, NULL, $6)",
+                &[
+                    &comm_unsigned,
+                    &"504 PG Unsigned Co-op".to_string(),
+                    &serde_json::json!([]),
+                    &now,
+                    &"founder_only".to_string(),
+                    &"deadbeef".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let rows = backend
+            .list_signed_communities_since(None, 10_000)
+            .await
+            .unwrap();
+        let mine: Vec<_> = rows
+            .into_iter()
+            .filter(|r| {
+                r.community.community_key_id == comm
+                    || r.community.community_key_id == comm_unsigned
+            })
+            .collect();
+        assert_eq!(mine.len(), 1, "unsigned legacy row must be excluded");
+
+        let mut expect = signed;
+        expect.community.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(&expect.community).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&expect).unwrap(),
+            serde_json::to_vec(&mine[0]).unwrap(),
+            "returned SignedCommunity must be byte-identical to what was put"
+        );
+    }
+
+    /// `list_signed_location_proofs_since` on postgres: signed-only,
+    /// byte-identical round-trip; an unsigned legacy row is excluded.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_signed_location_proofs_since_signed_only_504_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let s = uuid_like();
+        let subj = format!("lp504pg-subj-{s}");
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: pg_admission_key(
+                    &subj,
+                    "primitive-504",
+                    crate::federation::types::identity_type::PRIMITIVE,
+                ),
+            })
+            .await
+            .unwrap();
+
+        let ll = h3o::LatLng::new(37.0, -122.0).unwrap();
+        let cell7 = ll.to_cell(h3o::Resolution::Seven).to_string();
+        // Whole-second timestamp — see the analogous comment in
+        // `list_signed_families_since_signed_only_504_pg`.
+        let asserted_at = chrono::Utc.with_ymd_and_hms(2026, 6, 9, 0, 0, 0).unwrap();
+        let signed = crate::federation::tier_ingest::test_support::sign_location_proof(
+            &subj,
+            crate::federation::LocationProof {
+                subject_key_id: subj.clone(),
+                cell_id: cell7.clone(),
+                cell_resolution: 7,
+                asserted_at,
+                valid_until: None,
+                attestation_evidence: None,
+                withdrawn_at: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        backend.put_location_proof(signed.clone()).await.unwrap();
+
+        // Different asserted_at so the (subject_key_id, asserted_at) PK
+        // doesn't collide with the signed row above.
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_location_proofs (\
+                    subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
+                    attestation_evidence, withdrawn_at, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, NULL, NULL, NULL, $5)",
+                &[
+                    &subj,
+                    &cell7,
+                    &7i16,
+                    &(asserted_at + chrono::Duration::seconds(1)),
+                    &"deadbeef".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let rows = backend
+            .list_signed_location_proofs_since(None, 10_000)
+            .await
+            .unwrap();
+        let mine: Vec<_> = rows
+            .into_iter()
+            .filter(|r| r.location_proof.subject_key_id == subj)
+            .collect();
+        assert_eq!(mine.len(), 1, "unsigned legacy row must be excluded");
+
+        let mut expect = signed;
+        expect.location_proof.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(&expect.location_proof).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&expect).unwrap(),
+            serde_json::to_vec(&mine[0]).unwrap(),
+            "returned SignedLocationProof must be byte-identical to what was put"
+        );
+    }
+
+    /// `list_signed_family_membership_revocations_since` on postgres:
+    /// signed-only, byte-identical round-trip; an unsigned legacy row is
+    /// excluded.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_signed_family_membership_revocations_since_signed_only_504_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let s = uuid_like();
+        let fam = format!("fmr504pg-fam-{s}");
+        let removed = format!("fmr504pg-removed-{s}");
+        let removed2 = format!("fmr504pg-removed2-{s}");
+        for k in [&fam, &removed, &removed2] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: pg_admission_key(
+                        k,
+                        "primitive-504",
+                        crate::federation::types::identity_type::PRIMITIVE,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        let removed_at = chrono::Utc.with_ymd_and_hms(2026, 6, 11, 0, 0, 0).unwrap();
+        let signed =
+            crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+                &fam,
+                crate::federation::FamilyMembershipRevocation {
+                    family_key_id: fam.clone(),
+                    removed_identity_key_id: removed.clone(),
+                    removed_at,
+                    effective_at: removed_at,
+                    reason: Some("left the household (pg)".into()),
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            );
+        backend
+            .put_family_membership_revocation(signed.clone())
+            .await
+            .unwrap();
+
+        // Different removed_identity_key_id so the (family_key_id,
+        // removed_identity_key_id) PK doesn't collide.
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_family_membership_revocations (\
+                    family_key_id, removed_identity_key_id, removed_at, effective_at, \
+                    reason, witness_set, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $3, NULL, $4::jsonb, $5)",
+                &[
+                    &fam,
+                    &removed2,
+                    &removed_at,
+                    &serde_json::json!([]),
+                    &"deadbeef".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let rows = backend
+            .list_signed_family_membership_revocations_since(None, 10_000)
+            .await
+            .unwrap();
+        let mine: Vec<_> = rows
+            .into_iter()
+            .filter(|r| r.family_membership_revocation.family_key_id == fam)
+            .collect();
+        assert_eq!(mine.len(), 1, "unsigned legacy row must be excluded");
+
+        let mut expect = signed;
+        expect.family_membership_revocation.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(
+                &expect.family_membership_revocation,
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&expect).unwrap(),
+            serde_json::to_vec(&mine[0]).unwrap(),
+            "returned SignedFamilyMembershipRevocation must be byte-identical to what was put"
+        );
+    }
+
+    /// `list_signed_community_membership_revocations_since` on postgres:
+    /// signed-only, byte-identical round-trip; an unsigned legacy row is
+    /// excluded.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn list_signed_community_membership_revocations_since_signed_only_504_pg() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        use crate::federation::FederationDirectory;
+
+        let s = uuid_like();
+        let comm = format!("cmr504pg-comm-{s}");
+        let removed = format!("cmr504pg-removed-{s}");
+        let removed2 = format!("cmr504pg-removed2-{s}");
+        for k in [&comm, &removed, &removed2] {
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: pg_admission_key(
+                        k,
+                        "primitive-504",
+                        crate::federation::types::identity_type::PRIMITIVE,
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        let removed_at = chrono::Utc.with_ymd_and_hms(2026, 6, 11, 0, 0, 0).unwrap();
+        let signed =
+            crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
+                &comm,
+                crate::federation::CommunityMembershipRevocation {
+                    community_key_id: comm.clone(),
+                    removed_identity_key_id: removed.clone(),
+                    removed_at,
+                    effective_at: removed_at,
+                    reason: Some("left the co-op (pg)".into()),
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            );
+        backend
+            .put_community_membership_revocation(signed.clone())
+            .await
+            .unwrap();
+
+        // Different removed_identity_key_id so the (community_key_id,
+        // removed_identity_key_id) PK doesn't collide.
+        let client = backend.get_client().await.unwrap();
+        client
+            .execute(
+                "INSERT INTO cirislens.federation_community_membership_revocations (\
+                    community_key_id, removed_identity_key_id, removed_at, effective_at, \
+                    reason, witness_set, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $3, NULL, $4::jsonb, $5)",
+                &[
+                    &comm,
+                    &removed2,
+                    &removed_at,
+                    &serde_json::json!([]),
+                    &"deadbeef".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let rows = backend
+            .list_signed_community_membership_revocations_since(None, 10_000)
+            .await
+            .unwrap();
+        let mine: Vec<_> = rows
+            .into_iter()
+            .filter(|r| r.community_membership_revocation.community_key_id == comm)
+            .collect();
+        assert_eq!(mine.len(), 1, "unsigned legacy row must be excluded");
+
+        let mut expect = signed;
+        expect.community_membership_revocation.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(
+                &expect.community_membership_revocation,
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&expect).unwrap(),
+            serde_json::to_vec(&mine[0]).unwrap(),
+            "returned SignedCommunityMembershipRevocation must be byte-identical to what was put"
         );
     }
 }

@@ -1516,6 +1516,69 @@ pub trait FederationDirectory: Send + Sync {
         limit: u32,
     ) -> Result<Vec<SignedPartnerRecord>, Error>;
 
+    /// v21.0.0 (CIRISPersist#504 FLOOR, CIRISEdge advertise/serve bridge) —
+    /// bulk-list the full [`SignedFamily`] wrappers (row + the V110 authority
+    /// signature the CIRISPersist#502 E4 gate verified at admission) since a
+    /// cursor. `since` filters on `founded_at > since` (`None` = from the
+    /// start); rows are ordered by `(founded_at ASC, family_key_id ASC)` so
+    /// the cursor is a stable resumption point, mirroring
+    /// [`Self::list_organizations_since`]'s contract. `limit` caps the page.
+    ///
+    /// **Signed rows only.** A `put_family_local` genesis-bake row is
+    /// legitimately unsigned (`authority_key_id` NULL) and is never emitted
+    /// here — serving it would hand the edge advertise/serve responder empty
+    /// signature bytes, which fails hybrid-Strict verify downstream and
+    /// reopens the exact keyless-declaration forgery class E4 closed.
+    async fn list_signed_families_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedFamily>, Error>;
+
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
+    /// [`SignedCommunity`] wrappers since a cursor. Structural mirror of
+    /// [`Self::list_signed_families_since`]: cursor is `founded_at`
+    /// (`founded_at ASC, community_key_id ASC`), signed-rows-only contract
+    /// identical.
+    async fn list_signed_communities_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedCommunity>, Error>;
+
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
+    /// [`SignedLocationProof`] wrappers since a cursor. Structural mirror of
+    /// [`Self::list_signed_families_since`]: cursor is `asserted_at`
+    /// (`asserted_at ASC, subject_key_id ASC`), signed-rows-only contract
+    /// identical.
+    async fn list_signed_location_proofs_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedLocationProof>, Error>;
+
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
+    /// [`SignedFamilyMembershipRevocation`] wrappers since a cursor.
+    /// Structural mirror of [`Self::list_signed_families_since`]: cursor is
+    /// `removed_at` (`removed_at ASC, family_key_id ASC,
+    /// removed_identity_key_id ASC`), signed-rows-only contract identical.
+    async fn list_signed_family_membership_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedFamilyMembershipRevocation>, Error>;
+
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
+    /// [`SignedCommunityMembershipRevocation`] wrappers since a cursor.
+    /// Structural mirror of [`Self::list_signed_families_since`]: cursor is
+    /// `removed_at` (`removed_at ASC, community_key_id ASC,
+    /// removed_identity_key_id ASC`), signed-rows-only contract identical.
+    async fn list_signed_community_membership_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedCommunityMembershipRevocation>, Error>;
+
     /// v4.8.0 (#161 Ask 2) — occurrences of `identity_key_id` that are
     /// **currently active**: admitted AND with no revocation whose
     /// `effective_at <= now`. This is the honest view

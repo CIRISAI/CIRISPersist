@@ -6640,6 +6640,147 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    // ─── v21.0.0 (CIRISPersist#504 FLOOR) — bulk signed-since reads for the
+    //     5 E4 keyless-declaration planes (edge advertise/serve bridge).
+    //     Signed-only: `AND authority_key_id IS NOT NULL AND authority_key_id
+    //     <> ''` excludes `put_family_local` genesis-bake (and any other
+    //     legitimately-unsigned) rows — serving one would hand the edge
+    //     responder empty signature bytes.
+
+    async fn list_signed_families_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedFamily>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT * FROM federation_families \
+                 WHERE (?1 IS NULL OR founded_at > ?1) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY founded_at ASC, family_key_id ASC LIMIT ?2",
+            )?;
+            let rows =
+                stmt.query_map(rusqlite::params![since, limit], sqlite_row_to_signed_family)?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_signed_families_since: {e}")))
+    }
+
+    async fn list_signed_communities_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedCommunity>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT * FROM federation_communities \
+                 WHERE (?1 IS NULL OR founded_at > ?1) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY founded_at ASC, community_key_id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![since, limit],
+                sqlite_row_to_signed_community,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_signed_communities_since: {e}"))
+        })
+    }
+
+    async fn list_signed_location_proofs_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedLocationProof>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT * FROM federation_location_proofs \
+                 WHERE (?1 IS NULL OR asserted_at > ?1) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY asserted_at ASC, subject_key_id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![since, limit],
+                sqlite_row_to_signed_location_proof,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_signed_location_proofs_since: {e}"))
+        })
+    }
+
+    async fn list_signed_family_membership_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedFamilyMembershipRevocation>, crate::federation::Error>
+    {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT * FROM federation_family_membership_revocations \
+                 WHERE (?1 IS NULL OR removed_at > ?1) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY removed_at ASC, family_key_id ASC, removed_identity_key_id ASC \
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![since, limit],
+                sqlite_row_to_signed_family_membership_revocation,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_signed_family_membership_revocations_since: {e}"
+            ))
+        })
+    }
+
+    async fn list_signed_community_membership_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedCommunityMembershipRevocation>, crate::federation::Error>
+    {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT * FROM federation_community_membership_revocations \
+                 WHERE (?1 IS NULL OR removed_at > ?1) \
+                   AND authority_key_id IS NOT NULL AND authority_key_id <> '' \
+                 ORDER BY removed_at ASC, community_key_id ASC, removed_identity_key_id ASC \
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![since, limit],
+                sqlite_row_to_signed_community_membership_revocation,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_signed_community_membership_revocations_since: {e}"
+            ))
+        })
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -13122,6 +13263,94 @@ fn sqlite_row_to_signed_partner_record(
         partner_record,
         steward_signatures,
         threshold: threshold as usize,
+    })
+}
+
+/// v21.0.0 (CIRISPersist#504 FLOOR) — row → `SignedFamily`: the
+/// [`sqlite_row_to_family`] row plus the V110 authority-signature columns.
+/// Callers gate the SELECT on non-NULL/non-empty `authority_key_id`, so this
+/// always sees a genuinely signed row.
+fn sqlite_row_to_signed_family(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::SignedFamily> {
+    let authority_key_id: String = row.get("authority_key_id")?;
+    let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
+    let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
+    let family = sqlite_row_to_family(row)?;
+    Ok(crate::federation::SignedFamily {
+        family,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    })
+}
+
+/// v21.0.0 (CIRISPersist#504 FLOOR) — row → `SignedCommunity`. Structural
+/// mirror of [`sqlite_row_to_signed_family`].
+fn sqlite_row_to_signed_community(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::SignedCommunity> {
+    let authority_key_id: String = row.get("authority_key_id")?;
+    let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
+    let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
+    let community = sqlite_row_to_community(row)?;
+    Ok(crate::federation::SignedCommunity {
+        community,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    })
+}
+
+/// v21.0.0 (CIRISPersist#504 FLOOR) — row → `SignedLocationProof`. Structural
+/// mirror of [`sqlite_row_to_signed_family`].
+fn sqlite_row_to_signed_location_proof(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::SignedLocationProof> {
+    let authority_key_id: String = row.get("authority_key_id")?;
+    let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
+    let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
+    let location_proof = sqlite_row_to_location_proof(row)?;
+    Ok(crate::federation::SignedLocationProof {
+        location_proof,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    })
+}
+
+/// v21.0.0 (CIRISPersist#504 FLOOR) — row → `SignedFamilyMembershipRevocation`.
+/// Structural mirror of [`sqlite_row_to_signed_family`].
+fn sqlite_row_to_signed_family_membership_revocation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::SignedFamilyMembershipRevocation> {
+    let authority_key_id: String = row.get("authority_key_id")?;
+    let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
+    let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
+    let family_membership_revocation = sqlite_row_to_family_membership_revocation(row)?;
+    Ok(crate::federation::SignedFamilyMembershipRevocation {
+        family_membership_revocation,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    })
+}
+
+/// v21.0.0 (CIRISPersist#504 FLOOR) — row →
+/// `SignedCommunityMembershipRevocation`. Structural mirror of
+/// [`sqlite_row_to_signed_family`].
+fn sqlite_row_to_signed_community_membership_revocation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::SignedCommunityMembershipRevocation> {
+    let authority_key_id: String = row.get("authority_key_id")?;
+    let scrub_signature_classical: String = row.get("scrub_signature_classical")?;
+    let scrub_signature_pqc: Option<String> = row.get("scrub_signature_pqc")?;
+    let community_membership_revocation = sqlite_row_to_community_membership_revocation(row)?;
+    Ok(crate::federation::SignedCommunityMembershipRevocation {
+        community_membership_revocation,
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
     })
 }
 
@@ -24169,6 +24398,353 @@ mod tests {
 
         // Absent community returns None.
         assert!(backend.lookup_community("nope").await.unwrap().is_none());
+    }
+
+    // ─── v21.0.0 (CIRISPersist#504 FLOOR) — the 5 signed-since-cursor bulk
+    //     read witnesses. Each: signed-put one record, assert
+    //     `list_signed_*_since(None, 100)` returns exactly that one
+    //     byte-identical (INCLUDING the 3 V110 signature fields), then
+    //     assert an unsigned row is excluded.
+
+    /// `list_signed_families_since` returns exactly the one signed-put
+    /// family, byte-identical to what was submitted (including the 3 V110
+    /// signature fields), and excludes a `put_family_local` genesis-bake row
+    /// (legitimately unsigned — serving it would hand the edge advertise/
+    /// serve responder empty signature bytes).
+    #[tokio::test]
+    async fn list_signed_families_since_signed_only_504() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["f504-auth", "f504-member"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "acme", k),
+                })
+                .await
+                .unwrap();
+        }
+        let signed = crate::federation::tier_ingest::test_support::sign_family(
+            "f504-auth",
+            fed_family(
+                "f504-family",
+                "504 Signed Household",
+                vec!["f504-member"],
+                crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+            ),
+        );
+        backend.put_family(signed.clone()).await.unwrap();
+
+        // Genesis-bake: legitimately unsigned, must never be served.
+        backend
+            .put_family_local(fed_family(
+                "f504-family-local",
+                "504 Unsigned Household",
+                vec!["f504-member"],
+                crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+            ))
+            .await
+            .unwrap();
+
+        let rows = backend.list_signed_families_since(None, 100).await.unwrap();
+        assert_eq!(rows.len(), 1, "unsigned genesis-bake row must be excluded");
+
+        let mut expect = signed;
+        expect.family.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(&expect.family).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&expect).unwrap(),
+            serde_json::to_vec(&rows[0]).unwrap(),
+            "returned SignedFamily must be byte-identical to what was put"
+        );
+    }
+
+    /// `list_signed_communities_since` returns exactly the one signed-put
+    /// community, byte-identical (including the 3 V110 signature fields),
+    /// and excludes an unsigned legacy row. There is no `put_community_local`
+    /// bypass, so the unsigned row is written via a direct INSERT — the
+    /// pre-V110 shape `put_community` no longer writes (V110 migration note:
+    /// "nullable on all 3").
+    #[tokio::test]
+    async fn list_signed_communities_since_signed_only_504() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["c504-auth", "c504-member"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "acme", k),
+                })
+                .await
+                .unwrap();
+        }
+        let policy = serde_json::json!({ "cohort_scope": "community" });
+        let signed = crate::federation::tier_ingest::test_support::sign_community(
+            "c504-auth",
+            fed_community(
+                "c504-community",
+                "504 Signed Co-op",
+                vec!["c504-member"],
+                crate::federation::types::consensus_protocol::MAJORITY,
+                Some(policy),
+            ),
+        );
+        backend.put_community(signed.clone()).await.unwrap();
+
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "INSERT INTO federation_communities (\
+                    community_key_id, community_name, members, founded_at, \
+                    consensus_protocol, policy_blob, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "c504-community-unsigned",
+                    "504 Unsigned Co-op",
+                    "[]",
+                    "2026-06-04T00:00:00Z",
+                    "founder_only",
+                    Option::<String>::None,
+                    "deadbeef",
+                ],
+            )
+            .unwrap();
+        }
+
+        let rows = backend
+            .list_signed_communities_since(None, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "unsigned legacy row must be excluded");
+
+        let mut expect = signed;
+        expect.community.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(&expect.community).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&expect).unwrap(),
+            serde_json::to_vec(&rows[0]).unwrap(),
+            "returned SignedCommunity must be byte-identical to what was put"
+        );
+    }
+
+    /// `list_signed_location_proofs_since` returns exactly the one
+    /// signed-put proof, byte-identical (including the 3 V110 signature
+    /// fields), and excludes an unsigned legacy row (direct INSERT — no
+    /// `put_location_proof_local` bypass exists).
+    #[tokio::test]
+    async fn list_signed_location_proofs_since_signed_only_504() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("lp504-subj", "lp504", "lp504-subj"),
+            })
+            .await
+            .unwrap();
+
+        let ll = h3o::LatLng::new(37.0, -122.0).unwrap();
+        let cell7 = ll.to_cell(h3o::Resolution::Seven).to_string();
+        let signed = crate::federation::tier_ingest::test_support::sign_location_proof(
+            "lp504-subj",
+            crate::federation::LocationProof {
+                subject_key_id: "lp504-subj".into(),
+                cell_id: cell7.clone(),
+                cell_resolution: 7,
+                asserted_at: "2026-06-09T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                attestation_evidence: None,
+                withdrawn_at: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        backend.put_location_proof(signed.clone()).await.unwrap();
+
+        // Different asserted_at so the (subject_key_id, asserted_at) PK
+        // doesn't collide with the signed row above.
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "INSERT INTO federation_location_proofs (\
+                    subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
+                    attestation_evidence, withdrawn_at, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    "lp504-subj",
+                    cell7,
+                    7i64,
+                    "2026-06-09T01:00:00Z",
+                    Option::<String>::None,
+                    Option::<Vec<u8>>::None,
+                    Option::<String>::None,
+                    "deadbeef",
+                ],
+            )
+            .unwrap();
+        }
+
+        let rows = backend
+            .list_signed_location_proofs_since(None, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "unsigned legacy row must be excluded");
+
+        let mut expect = signed;
+        expect.location_proof.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(&expect.location_proof).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&expect).unwrap(),
+            serde_json::to_vec(&rows[0]).unwrap(),
+            "returned SignedLocationProof must be byte-identical to what was put"
+        );
+    }
+
+    /// `list_signed_family_membership_revocations_since` returns exactly the
+    /// one signed-put revocation, byte-identical (including the 3 V110
+    /// signature fields), and excludes an unsigned legacy row (direct
+    /// INSERT — no `put_family_membership_revocation_local` bypass exists).
+    #[tokio::test]
+    async fn list_signed_family_membership_revocations_since_signed_only_504() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["fmr504-fam", "fmr504-removed", "fmr504-removed2"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "acme", k),
+                })
+                .await
+                .unwrap();
+        }
+        let signed =
+            crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+                "fmr504-fam",
+                crate::federation::FamilyMembershipRevocation {
+                    family_key_id: "fmr504-fam".into(),
+                    removed_identity_key_id: "fmr504-removed".into(),
+                    removed_at: "2026-06-11T00:00:00Z".parse().unwrap(),
+                    effective_at: "2026-06-11T00:00:00Z".parse().unwrap(),
+                    reason: Some("left the household".into()),
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            );
+        backend
+            .put_family_membership_revocation(signed.clone())
+            .await
+            .unwrap();
+
+        // Different removed_identity_key_id so the (family_key_id,
+        // removed_identity_key_id) PK doesn't collide.
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "INSERT INTO federation_family_membership_revocations (\
+                    family_key_id, removed_identity_key_id, removed_at, effective_at, \
+                    reason, witness_set, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "fmr504-fam",
+                    "fmr504-removed2",
+                    "2026-06-11T01:00:00Z",
+                    "2026-06-11T01:00:00Z",
+                    Option::<String>::None,
+                    "[]",
+                    "deadbeef",
+                ],
+            )
+            .unwrap();
+        }
+
+        let rows = backend
+            .list_signed_family_membership_revocations_since(None, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "unsigned legacy row must be excluded");
+
+        let mut expect = signed;
+        expect.family_membership_revocation.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(
+                &expect.family_membership_revocation,
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&expect).unwrap(),
+            serde_json::to_vec(&rows[0]).unwrap(),
+            "returned SignedFamilyMembershipRevocation must be byte-identical to what was put"
+        );
+    }
+
+    /// `list_signed_community_membership_revocations_since` returns exactly
+    /// the one signed-put revocation, byte-identical (including the 3 V110
+    /// signature fields), and excludes an unsigned legacy row (direct
+    /// INSERT — no `put_community_membership_revocation_local` bypass
+    /// exists).
+    #[tokio::test]
+    async fn list_signed_community_membership_revocations_since_signed_only_504() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["cmr504-comm", "cmr504-removed", "cmr504-removed2"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "acme", k),
+                })
+                .await
+                .unwrap();
+        }
+        let signed =
+            crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
+                "cmr504-comm",
+                crate::federation::CommunityMembershipRevocation {
+                    community_key_id: "cmr504-comm".into(),
+                    removed_identity_key_id: "cmr504-removed".into(),
+                    removed_at: "2026-06-11T00:00:00Z".parse().unwrap(),
+                    effective_at: "2026-06-11T00:00:00Z".parse().unwrap(),
+                    reason: Some("left the co-op".into()),
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            );
+        backend
+            .put_community_membership_revocation(signed.clone())
+            .await
+            .unwrap();
+
+        // Different removed_identity_key_id so the (community_key_id,
+        // removed_identity_key_id) PK doesn't collide.
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "INSERT INTO federation_community_membership_revocations (\
+                    community_key_id, removed_identity_key_id, removed_at, effective_at, \
+                    reason, witness_set, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "cmr504-comm",
+                    "cmr504-removed2",
+                    "2026-06-11T01:00:00Z",
+                    "2026-06-11T01:00:00Z",
+                    Option::<String>::None,
+                    "[]",
+                    "deadbeef",
+                ],
+            )
+            .unwrap();
+        }
+
+        let rows = backend
+            .list_signed_community_membership_revocations_since(None, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "unsigned legacy row must be excluded");
+
+        let mut expect = signed;
+        expect.community_membership_revocation.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(
+                &expect.community_membership_revocation,
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&expect).unwrap(),
+            serde_json::to_vec(&rows[0]).unwrap(),
+            "returned SignedCommunityMembershipRevocation must be byte-identical to what was put"
+        );
     }
 
     /// consensus_protocol that doesn't parse into a canonical shape is

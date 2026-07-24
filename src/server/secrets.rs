@@ -21,8 +21,8 @@
 //! # Hybrid-verify on the wire
 //!
 //! Every mutating request body must be hybrid-signed by the
-//! steward (`X-Ciris-Signing-Key-Id` + `X-Ciris-Signature-Ed25519`
-//! + optional `X-Ciris-Signature-MlDsa-65` headers). Persist
+//! steward (`X-Ciris-Signing-Key-Id` + `X-Ciris-Signature-Ed25519` +
+//! optional `X-Ciris-Signature-MlDsa-65` headers). Persist
 //! verifies via the existing
 //! [`crate::verify::verify_hybrid_via_directory`] path — same
 //! directory the legacy trace-verify route consults. GET routes
@@ -263,6 +263,12 @@ struct SignedRequest {
     ml_dsa_65: Option<String>,
 }
 
+// clippy::result_large_err (new in 1.97, only trips under a wide
+// `--all-features` clippy pass — CI's narrower feature set never hit it):
+// the `Err` arm is an axum `Response`, which IS the intended short-circuit
+// return for an HTTP handler helper (an early `Response` back out through
+// `?`); boxing it would only add an indirection with no behavior change.
+#[allow(clippy::result_large_err)]
 fn extract_signatures(headers: &HeaderMap) -> Result<SignedRequest, Response> {
     let key_id = headers
         .get(HEADER_KEY_ID)
@@ -393,6 +399,9 @@ fn error_response(status: StatusCode, kind: &str, detail: String) -> Response {
         .into_response()
 }
 
+// clippy::result_large_err — see `extract_signatures`'s comment above; same
+// intended-early-Response shape.
+#[allow(clippy::result_large_err)]
 fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
     serde_json::from_slice(body).map_err(|e| {
         error_response(

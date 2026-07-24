@@ -5,6 +5,51 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.1.0] — 2026-07-24 — signed since-cursor reads for the 5 keyless planes (#504)
+
+The E4 admission work in v21.0.0 (#502) gave `Family` / `Community` /
+`LocationProof` / family- and community-membership-revocations a stored
+authority signature (`authority_key_id` + hybrid scrub sigs, V110), but left
+no way to READ the signed wrapper back — the existing `list_*_for` accessors
+return the bare inner record. That made the 5 planes serve-unshippable for
+the edge advertise/serve responder (CIRISEdge#504): it cannot reconstruct a
+valid signed record (it is not the authority), and fabricating empty
+signatures is exactly the advisory-spoofable class the Registry-of-Record
+model closes.
+
+### Added — signed, since-cursor bulk reads (#504)
+
+Five accessors on `FederationDirectory`, mirroring the org-trio
+(`list_organizations_since`) contract — signed wrapper, since-cursor, bulk,
+`ORDER BY <cursor> ASC, <id> ASC`:
+
+- `list_signed_families_since` (cursor `founded_at`)
+- `list_signed_communities_since` (cursor `founded_at`)
+- `list_signed_location_proofs_since` (cursor `asserted_at`)
+- `list_signed_family_membership_revocations_since` (cursor `removed_at`)
+- `list_signed_community_membership_revocations_since` (cursor `removed_at`)
+
+Each returns the `Signed*` wrapper reconstructed byte-exact from the stored
+record + its V110 authority signature, so edge serves what persist admitted.
+**Only signed rows are returned** — unsigned local/genesis-bake rows (no
+stored authority signature: sqlite/pg `authority_key_id IS NULL`, memory no
+side-map entry) are excluded, so the responder can never advertise
+empty-signature bytes. Exposed across the full surface: trait, all three
+backends (sqlite/postgres/memory), the ABI-stable directory capsule, and the
+PyO3 FFI. Since-cursor means the 30 s edge advertise pulls deltas, not a full
+per-member scan every round. 10 round-trip witnesses (5 sqlite + 5 postgres)
+assert byte-exactness including the 3 signature fields and the signed-only
+exclusion.
+
+### Deferred (tracked in #506 — hot-path fast-follow, not a v14 blocker)
+
+- A content-hash point-read (`lookup_signed_record_by_content_hash`) to retire
+  edge's full-scan-coupled fetch map. Edge v14 does not require it: the delta
+  reads return the full signed bytes, so edge populates its fetch cache
+  incrementally as deltas arrive.
+- Extending the since-cursor to the 5 primary signed planes (Key /
+  IdentityOccurrence / TransportDestination / Attestation / IdOcc-revocation).
+
 ## [21.0.0] — 2026-07-25 — the Registry-of-Record: replication admission is mechanistically CEG-driven (#501/#502)
 
 A full CEG→replication audit found the replication trust model was not
