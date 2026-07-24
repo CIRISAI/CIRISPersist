@@ -3317,6 +3317,50 @@ impl PyEngine {
         })
     }
 
+    /// v19.2.0 (CIRISPersist#493) — the node's own content-tier
+    /// self-encryption pubkeys, derived from the engine's local signing
+    /// seed (public halves only). Returns
+    /// `{"x25519_base64": …, "ml_kem_768_base64": …}` — the exact
+    /// `encryption_pubkeys` wire shape, so CIRISServer's
+    /// `publish_self_identity_occurrence` sources it directly and the
+    /// published keys are sealable-to by construction. Raises
+    /// `RuntimeError` on a hardware-custodied identity (no software seed).
+    fn self_enc_pubkeys(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let signer = self.local_signer.clone().ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "self_enc_pubkeys requires a local software signing identity",
+                )
+            })?;
+            let keys = signer.self_enc_pubkeys().map_err(local_signer_err_to_py)?;
+            let out = PyDict::new(py);
+            out.set_item("x25519_base64", keys.x25519_base64)?;
+            out.set_item("ml_kem_768_base64", keys.ml_kem_768_base64)?;
+            Ok(out.unbind())
+        })
+    }
+
+    /// v19.2.0 (CIRISPersist#494) — the trace-summary extraction-path
+    /// contract: `{"manifest_json": …, "sha256": …}`. CIRISServer serves
+    /// the hash on `/v1/health` beside `wire_vocabulary_sha256`; the
+    /// CIRISAgent emitter contract test asserts it — a contract change on
+    /// either side fails loudly on both.
+    fn trace_summary_extraction(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        catch_panic(|| {
+            let out = PyDict::new(py);
+            out.set_item(
+                "manifest_json",
+                crate::trace_summary_contract::extraction_manifest_json().to_string(),
+            )?;
+            out.set_item(
+                "sha256",
+                crate::trace_summary_contract::TRACE_SUMMARY_EXTRACTION_SHA256,
+            )?;
+            Ok(out.unbind())
+        })
+    }
+
     /// v0.1.18 — debug helper for canonical-byte drift diagnosis
     /// (CIRISPersist#6 follow-up). Pipes a raw HTTP body through
     /// persist's schema parse + canonicalizer and returns BOTH
@@ -25438,6 +25482,8 @@ fn local_signer_err_to_py(e: crate::signing::LocalSignerError) -> PyErr {
         LocalSignerError::PqcSign(_) | LocalSignerError::ClassicalSign(_) => {
             PyRuntimeError::new_err(format!("{e}"))
         }
+        // v19.2.0 (#493) — deployment-shape property, not caller-fixable.
+        LocalSignerError::SelfEncRequiresSoftwareSeed => PyRuntimeError::new_err(format!("{e}")),
     }
 }
 

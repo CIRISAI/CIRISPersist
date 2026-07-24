@@ -120,6 +120,7 @@ pub mod telemetry;
 pub mod thoughts;
 #[cfg(feature = "cirislens_tickets")]
 pub mod tickets;
+pub mod trace_summary_contract;
 pub mod verify;
 #[cfg(feature = "cirislens_wa_cert")]
 pub mod wa_cert;

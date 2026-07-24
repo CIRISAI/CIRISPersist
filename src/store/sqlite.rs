@@ -13071,63 +13071,37 @@ fn sqlite_row_to_goal(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::federa
 /// (`json_extract` on a JSON boolean returns integer 0/1). Postgres'
 /// `TRACE_SUMMARY_SELECT` is the reference; the column aliases match
 /// 1:1 so `sqlite_row_to_trace_summary` reads by name.
-const SQLITE_TRACE_SUMMARY_SELECT: &str = "\
-    MIN(trace_id) AS trace_id, \
-    MIN(thought_id) AS thought_id, \
-    MIN(task_id) AS task_id, \
-    MIN(agent_id_hash) AS agent_id_hash, \
-    MIN(agent_name) AS agent_name, \
-    MIN(agent_role) AS agent_role, \
-    MIN(deployment_domain) AS deployment_domain, \
-    MIN(deployment_type) AS deployment_type, \
-    MIN(ts) AS started_at, \
-    MAX(ts) AS completed_at, \
-    MIN(trace_level) AS trace_level, \
-    MIN(schema_version) AS schema_version, \
-    MIN(signature_verified) AS signature_verified, \
-    MIN(cognitive_state) AS cognitive_state, \
-    MAX(CASE WHEN event_type = 'THOUGHT_START' \
-        THEN json_extract(payload, '$.thought_type') END) AS thought_type, \
-    MAX(CASE WHEN event_type = 'THOUGHT_START' \
-        THEN json_extract(payload, '$.thought_depth') END) AS thought_depth, \
-    AVG(CASE WHEN event_type = 'DMA_RESULTS' \
-        THEN json_extract(payload, '$.csdma_plausibility_score') END) \
-        AS csdma_plausibility_score, \
-    AVG(CASE WHEN event_type = 'DMA_RESULTS' \
-        THEN json_extract(payload, '$.dsdma_domain_alignment') END) \
-        AS dsdma_domain_alignment, \
-    MAX(CASE WHEN event_type = 'DMA_RESULTS' \
-        THEN json_extract(payload, '$.dsdma_domain') END) AS dsdma_domain, \
-    AVG(CASE WHEN event_type = 'IDMA_RESULT' \
-        THEN json_extract(payload, '$.idma_k_eff') END) AS idma_k_eff, \
-    AVG(CASE WHEN event_type = 'IDMA_RESULT' \
-        THEN json_extract(payload, '$.idma_correlation_risk') END) \
-        AS idma_correlation_risk, \
-    MAX(CASE WHEN event_type = 'IDMA_RESULT' \
-        THEN json_extract(payload, '$.idma_fragility_flag') END) AS idma_fragility_flag, \
-    MAX(CASE WHEN event_type = 'IDMA_RESULT' \
-        THEN json_extract(payload, '$.idma_phase') END) AS idma_phase, \
-    MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
-        THEN json_extract(payload, '$.conscience_passed') END) AS conscience_passed, \
-    MAX(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
-        THEN json_extract(payload, '$.action_was_overridden') END) AS action_was_overridden, \
-    MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
-        THEN json_extract(payload, '$.entropy_passed') END) AS entropy_passed, \
-    MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
-        THEN json_extract(payload, '$.coherence_passed') END) AS coherence_passed, \
-    MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
-        THEN json_extract(payload, '$.optimization_veto_passed') END) \
-        AS optimization_veto_passed, \
-    MIN(CASE WHEN event_type = 'CONSCIENCE_RESULT' \
-        THEN json_extract(payload, '$.epistemic_humility_passed') END) \
-        AS epistemic_humility_passed, \
-    MAX(CASE WHEN event_type = 'ACTION_RESULT' \
-        THEN json_extract(payload, '$.action_executed') END) AS selected_action, \
-    MIN(CASE WHEN event_type = 'ACTION_RESULT' \
-        THEN json_extract(payload, '$.success') END) AS action_success, \
-    MAX(cost_llm_calls) AS llm_calls, \
-    MAX(cost_tokens) AS tokens_total, \
-    MAX(cost_usd) AS cost_usd";
+// v19.2.0 (#494) — the payload-extraction section is DERIVED from the
+// single-source contract (`trace_summary_contract`), not hand-written:
+// the sqlite and postgres projections and the emitter share ONE manifest,
+// so a path/gate/tier change is a contract change (hash-pinned), never a
+// silent NULL. Physical columns (ids, costs, timestamps) stay literal —
+// they are schema, not emitter contract.
+static SQLITE_TRACE_SUMMARY_SELECT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "MIN(trace_id) AS trace_id, \
+             MIN(thought_id) AS thought_id, \
+             MIN(task_id) AS task_id, \
+             MIN(agent_id_hash) AS agent_id_hash, \
+             MIN(agent_name) AS agent_name, \
+             MIN(agent_role) AS agent_role, \
+             MIN(deployment_domain) AS deployment_domain, \
+             MIN(deployment_type) AS deployment_type, \
+             MIN(ts) AS started_at, \
+             MAX(ts) AS completed_at, \
+             MIN(trace_level) AS trace_level, \
+             MIN(schema_version) AS schema_version, \
+             MIN(signature_verified) AS signature_verified, \
+             MIN(cognitive_state) AS cognitive_state, \
+             {payload}, \
+             MAX(cost_llm_calls) AS llm_calls, \
+             MAX(cost_tokens) AS tokens_total, \
+             MAX(cost_usd) AS cost_usd",
+        payload = crate::trace_summary_contract::sqlite_payload_select_fragment(
+            &crate::trace_summary_contract::summary_fields(),
+        )
+    )
+});
 
 /// Decode an integer-or-NULL column carrying a JSON boolean into
 /// `Option<bool>`. `json_extract` on a JSON `true`/`false` yields the
@@ -13591,7 +13565,7 @@ impl crate::read::ReadEngine for SqliteBackend {
             "SELECT {select} FROM trace_events \
              {where_sql} GROUP BY trace_id {having_sql} \
              ORDER BY started_at DESC, trace_id DESC LIMIT ?{p_limit}",
-            select = SQLITE_TRACE_SUMMARY_SELECT,
+            select = *SQLITE_TRACE_SUMMARY_SELECT,
         );
         let conn = self.conn.clone();
         let items = (move || -> Result<Vec<crate::read::TraceSummary>, crate::read::Error> {
@@ -13638,7 +13612,7 @@ impl crate::read::ReadEngine for SqliteBackend {
             let sql = format!(
                 "SELECT {select} FROM trace_events \
                      WHERE trace_id = ?1 AND {scope_frag} GROUP BY trace_id",
-                select = SQLITE_TRACE_SUMMARY_SELECT,
+                select = *SQLITE_TRACE_SUMMARY_SELECT,
             );
             let mut stmt = conn
                 .prepare(&sql)
@@ -13675,7 +13649,7 @@ impl crate::read::ReadEngine for SqliteBackend {
             let summary_sql = format!(
                 "SELECT {select} FROM trace_events \
                      WHERE trace_id = ?1 AND {scope_frag} GROUP BY trace_id",
-                select = SQLITE_TRACE_SUMMARY_SELECT,
+                select = *SQLITE_TRACE_SUMMARY_SELECT,
             );
             let summary = {
                 let mut stmt = conn
@@ -13849,14 +13823,20 @@ impl crate::read::ReadEngine for SqliteBackend {
         };
         binds.push(SqlValue::Integer(limit));
         let p_limit = binds.len();
+        // v19.2.0 (#494 ask 2) — the task_description extraction is DERIVED
+        // from the single-source contract, which gates it on trace_level
+        // (it is `detailed`-tier reasoning text; the emitter never
+        // populates it at generic — the ungated read was a wrong-tier read
+        // yielding a permanently-NULL column on generic corpora).
         let task_page_sql = format!(
             "SELECT task_id, MIN(ts) AS earliest_at, MAX(ts) AS latest_at, \
-                    MAX(CASE WHEN event_type = 'THOUGHT_START' \
-                        THEN json_extract(payload, '$.task_description') END) \
-                        AS initial_observation \
+                    {extract} \
              FROM trace_events {where_sql} \
              GROUP BY task_id {having_sql} \
-             ORDER BY earliest_at DESC, task_id DESC LIMIT ?{p_limit}"
+             ORDER BY earliest_at DESC, task_id DESC LIMIT ?{p_limit}",
+            extract = crate::trace_summary_contract::sqlite_payload_select_fragment(
+                &crate::trace_summary_contract::task_page_fields(),
+            )
         );
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
@@ -13910,7 +13890,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                      GROUP BY trace_id \
                      ORDER BY _tg_task_id ASC, \
                               _tg_depth IS NULL, _tg_depth ASC, started_at ASC",
-                select = SQLITE_TRACE_SUMMARY_SELECT,
+                select = *SQLITE_TRACE_SUMMARY_SELECT,
             );
             let trace_binds: Vec<SqlValue> =
                 task_ids.iter().map(|t| SqlValue::Text(t.clone())).collect();
@@ -17190,7 +17170,12 @@ mod tests {
             agent_name: Some("agent-test".to_owned()),
             agent_id_hash: "deadbeef".to_owned(),
             cognitive_state: Some("WORK".to_owned()),
-            trace_level: TraceLevel::Generic,
+            // v19.2.0 (#494 ask 2) — Detailed: these fixtures carry
+            // `task_description` (reasoning text), which the emitter only
+            // produces at detailed+; the tier-gated extraction correctly
+            // ignores it at generic (the old fixtures relied on the
+            // wrong-tier read this cut removed).
+            trace_level: TraceLevel::Detailed,
             payload: serde_json::Map::new(),
             cost_llm_calls: None,
             cost_tokens: None,
@@ -27344,7 +27329,12 @@ mod tests {
             agent_name: agent_name.map(str::to_owned),
             agent_id_hash: agent_id_hash.to_owned(),
             cognitive_state: Some("WORK".to_owned()),
-            trace_level: TraceLevel::Generic,
+            // v19.2.0 (#494 ask 2) — Detailed: these fixtures carry
+            // `task_description` (reasoning text), which the emitter only
+            // produces at detailed+; the tier-gated extraction correctly
+            // ignores it at generic (the old fixtures relied on the
+            // wrong-tier read this cut removed).
+            trace_level: TraceLevel::Detailed,
             payload,
             cost_llm_calls: Some(2),
             cost_tokens: Some(150),
@@ -27938,10 +27928,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(scrub.envelopes_scrubbed, 1);
+        // v19.2.0 (#494) — the shared re_event fixture now emits at
+        // Detailed (it carries task_description, detailed-tier reasoning
+        // text); the histogram bucket follows.
         assert_eq!(
             *scrub
                 .by_trace_level
-                .get(&crate::schema::TraceLevel::Generic)
+                .get(&crate::schema::TraceLevel::Detailed)
                 .unwrap(),
             1
         );

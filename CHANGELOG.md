@@ -5,6 +5,50 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [19.2.0] — 2026-07-24 — self-enc pubkeys accessor (#493) + the single-source trace-summary extraction contract (#494)
+
+The audit's two actionable slices: a live reverse-path KEX unblock, and the
+C1 fix for the silent-drift class that sat the trace plane dark.
+
+### Added — `Engine::self_enc_pubkeys()` (#493, unblocks CIRISServer#313)
+
+The node's content-tier self-encryption pubkeys (x25519 + ML-KEM-768),
+derived INTERNALLY from the engine's local signing seed via
+`ciris_crypto::self_enc` — public halves only; private halves derived,
+used, zeroized; the raw seed never crosses the API. Guarantees
+`published enc pubkey ⟷ decrypt privkey` BY CONSTRUCTION in standalone and
+fold — the #313 stall was the server publishing enc pubkeys minted from a
+DIFFERENT (freshly-minted keystore) seed than the engine decrypts with.
+Hardware-custodied identities refuse honestly
+(`SelfEncRequiresSoftwareSeed`). LocalSigner + Engine + PyO3 verb
+(returns the exact `encryption_pubkeys` wire shape). Confirmed to the
+metal: persist carries NO other self-enc derivation path; the one blessed
+derivation is `ciris_crypto::self_enc` over the local signing seed.
+
+### Changed — single-source trace-summary extraction contract (#494)
+
+`trace_summary_contract`: the manifest of
+`(event_type, flat_path, alias, agg, surface, min_tier)` tuples is now THE
+contract with the emitter. Both backends DERIVE their SELECT payload
+sections from it (sqlite `CASE WHEN`/`json_extract` dialect, postgres
+`FILTER`/`->>` dialect — dialect differs, the contract cannot), replacing
+the three hand-mirrored copies that let a path mismatch fail silently
+(NULL column → empty feature matrix → `envelopes_sent=0` — the
+CIRISServer#315 field RCA). Exposed as `extraction_manifest_json()` +
+pinned `TRACE_SUMMARY_EXTRACTION_SHA256` (+ the PyO3
+`trace_summary_extraction` verb): CIRISServer serves the hash on
+`/v1/health` beside `wire_vocabulary_sha256`; the agent's emitter test
+asserts it — drift on either side fails loudly on both. A gating witness
+pins computed == pinned.
+
+- **Ask-2 fix**: `task_description` (free reasoning text, `detailed`-tier
+  by the TraceLevel model) was extracted with NO tier gate — a wrong-tier
+  read yielding a permanently-NULL column on generic corpora. Now
+  tier-gated via the manifest; fixtures corrected to emit at `detailed`.
+- **Audit verification**: the suspected `DMA_RESULTS`/`IDMA_RESULT`
+  k_eff divergence is NOT present — both backends gate `idma_k_eff` on
+  `IDMA_RESULT`; only dialect differed.
+
 ## [19.1.1] — 2026-07-23 — verify 10.6.1 re-pin (RC3 vocab interop fix) + differential vocabulary guard + #445 android CI hardening
 
 ### Changed — verify 10.6.0 → 10.6.1 (the fix we needed)
