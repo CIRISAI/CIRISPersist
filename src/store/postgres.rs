@@ -13163,47 +13163,34 @@ impl PgRowExt for tokio_postgres::Row {
 /// JSONB-extraction SELECT clause shared by [`get_trace_summary`] and
 /// [`list_trace_summaries`]. The leading `MIN(trace_id)` produces the
 /// trace_id column for the GROUP BY result row.
-const TRACE_SUMMARY_SELECT: &str = "\
-    MIN(trace_id) AS trace_id, \
-    MIN(thought_id) AS thought_id, \
-    MIN(task_id) AS task_id, \
-    MIN(agent_id_hash) AS agent_id_hash, \
-    MIN(agent_name) AS agent_name, \
-    MIN(agent_role) AS agent_role, \
-    MIN(deployment_domain) AS deployment_domain, \
-    MIN(deployment_type) AS deployment_type, \
-    MIN(ts) AS started_at, \
-    MAX(ts) AS completed_at, \
-    MIN(trace_level) AS trace_level, \
-    MIN(schema_version) AS schema_version, \
-    BOOL_AND(signature_verified) AS signature_verified, \
-    MIN(cognitive_state) AS cognitive_state, \
-    \
-    MAX(payload->>'thought_type') FILTER (WHERE event_type = 'THOUGHT_START') AS thought_type, \
-    MAX((payload->>'thought_depth')::int) FILTER (WHERE event_type = 'THOUGHT_START') AS thought_depth, \
-    \
-    AVG((payload->>'csdma_plausibility_score')::float8) FILTER (WHERE event_type = 'DMA_RESULTS') AS csdma_plausibility_score, \
-    AVG((payload->>'dsdma_domain_alignment')::float8) FILTER (WHERE event_type = 'DMA_RESULTS') AS dsdma_domain_alignment, \
-    MAX(payload->>'dsdma_domain') FILTER (WHERE event_type = 'DMA_RESULTS') AS dsdma_domain, \
-    \
-    AVG((payload->>'idma_k_eff')::float8) FILTER (WHERE event_type = 'IDMA_RESULT') AS idma_k_eff, \
-    AVG((payload->>'idma_correlation_risk')::float8) FILTER (WHERE event_type = 'IDMA_RESULT') AS idma_correlation_risk, \
-    BOOL_OR((payload->>'idma_fragility_flag')::bool) FILTER (WHERE event_type = 'IDMA_RESULT') AS idma_fragility_flag, \
-    MAX(payload->>'idma_phase') FILTER (WHERE event_type = 'IDMA_RESULT') AS idma_phase, \
-    \
-    BOOL_AND((payload->>'conscience_passed')::bool) FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS conscience_passed, \
-    BOOL_OR((payload->>'action_was_overridden')::bool) FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS action_was_overridden, \
-    BOOL_AND((payload->>'entropy_passed')::bool) FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS entropy_passed, \
-    BOOL_AND((payload->>'coherence_passed')::bool) FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS coherence_passed, \
-    BOOL_AND((payload->>'optimization_veto_passed')::bool) FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS optimization_veto_passed, \
-    BOOL_AND((payload->>'epistemic_humility_passed')::bool) FILTER (WHERE event_type = 'CONSCIENCE_RESULT') AS epistemic_humility_passed, \
-    \
-    MAX(payload->>'action_executed') FILTER (WHERE event_type = 'ACTION_RESULT') AS selected_action, \
-    BOOL_AND((payload->>'success')::bool) FILTER (WHERE event_type = 'ACTION_RESULT') AS action_success, \
-    \
-    MAX(cost_llm_calls) AS llm_calls, \
-    MAX(cost_tokens) AS tokens_total, \
-    MAX(cost_usd) AS cost_usd";
+// v19.2.0 (#494) — payload extraction DERIVED from the single-source
+// contract (`trace_summary_contract`); see the sqlite twin for the full
+// rationale. Physical columns stay literal.
+static TRACE_SUMMARY_SELECT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "MIN(trace_id) AS trace_id, \
+         MIN(thought_id) AS thought_id, \
+         MIN(task_id) AS task_id, \
+         MIN(agent_id_hash) AS agent_id_hash, \
+         MIN(agent_name) AS agent_name, \
+         MIN(agent_role) AS agent_role, \
+         MIN(deployment_domain) AS deployment_domain, \
+         MIN(deployment_type) AS deployment_type, \
+         MIN(ts) AS started_at, \
+         MAX(ts) AS completed_at, \
+         MIN(trace_level) AS trace_level, \
+         MIN(schema_version) AS schema_version, \
+         BOOL_AND(signature_verified) AS signature_verified, \
+         MIN(cognitive_state) AS cognitive_state, \
+         {payload}, \
+         MAX(cost_llm_calls) AS llm_calls, \
+         MAX(cost_tokens) AS tokens_total, \
+         MAX(cost_usd) AS cost_usd",
+        payload = crate::trace_summary_contract::postgres_payload_select_fragment(
+            &crate::trace_summary_contract::summary_fields(),
+        )
+    )
+});
 
 /// Convert a row produced by `TRACE_SUMMARY_SELECT` into a
 /// [`crate::read::TraceSummary`]. Trace-level (`trace_level` column
@@ -13512,7 +13499,7 @@ impl crate::read::ReadEngine for PostgresBackend {
              {having_sql} \
              ORDER BY started_at DESC, trace_id DESC \
              LIMIT ${limit_p}",
-            select = TRACE_SUMMARY_SELECT,
+            select = *TRACE_SUMMARY_SELECT,
         );
 
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -13567,7 +13554,7 @@ impl crate::read::ReadEngine for PostgresBackend {
              FROM cirislens.trace_events \
              WHERE trace_id = $1 AND {scope_frag} \
              GROUP BY trace_id",
-            select = TRACE_SUMMARY_SELECT,
+            select = *TRACE_SUMMARY_SELECT,
         );
 
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -13842,19 +13829,23 @@ impl crate::read::ReadEngine for PostgresBackend {
         params.push(Box::new(limit));
         let p_limit = params.len();
 
+        // v19.2.0 (#494 ask 2) — extraction DERIVED from the single-source
+        // contract (tier-gated: `detailed`-tier reasoning text; the
+        // ungated read was a wrong-tier read on generic corpora).
         let task_page_sql = format!(
             "SELECT task_id, \
                     MIN(ts) AS earliest_at, \
                     MAX(ts) AS latest_at, \
-                    MAX(payload->>'task_description') \
-                        FILTER (WHERE event_type = 'THOUGHT_START') \
-                        AS initial_observation \
+                    {extract} \
              FROM cirislens.trace_events \
              {where_sql} \
              GROUP BY task_id \
              {having_sql} \
              ORDER BY earliest_at DESC, task_id DESC \
-             LIMIT ${p_limit}"
+             LIMIT ${p_limit}",
+            extract = crate::trace_summary_contract::postgres_payload_select_fragment(
+                &crate::trace_summary_contract::task_page_fields(),
+            )
         );
 
         let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -13904,7 +13895,7 @@ impl crate::read::ReadEngine for PostgresBackend {
              ORDER BY _tg_task_id ASC, \
                       _tg_depth ASC NULLS LAST, \
                       started_at ASC",
-            select = TRACE_SUMMARY_SELECT,
+            select = *TRACE_SUMMARY_SELECT,
         );
 
         let trace_rows = client
@@ -18254,7 +18245,9 @@ mod tests {
                 agent_name: agent_name.map(str::to_owned),
                 agent_id_hash: agent_id_hash.to_owned(),
                 cognitive_state: Some("work".into()),
-                trace_level: crate::schema::TraceLevel::Generic,
+                // v19.2.0 (#494 ask 2) — Detailed: carries task_description
+                // (reasoning text, detailed+ only); see the sqlite twin.
+                trace_level: crate::schema::TraceLevel::Detailed,
                 payload: base_payload(payload),
                 cost_llm_calls,
                 cost_tokens,
@@ -18884,7 +18877,9 @@ mod tests {
                 agent_name: agent_name.map(str::to_owned),
                 agent_id_hash: agent_id_hash.to_owned(),
                 cognitive_state: Some("work".into()),
-                trace_level: crate::schema::TraceLevel::Generic,
+                // v19.2.0 (#494 ask 2) — Detailed: carries task_description
+                // (reasoning text, detailed+ only); see the sqlite twin.
+                trace_level: crate::schema::TraceLevel::Detailed,
                 payload: payload_map,
                 cost_llm_calls: None,
                 cost_tokens: None,
@@ -30274,7 +30269,9 @@ mod tests {
                 agent_name: Some("agent-p".into()),
                 agent_id_hash: "agenthash-p".into(),
                 cognitive_state: Some("work".into()),
-                trace_level: crate::schema::TraceLevel::Generic,
+                // v19.2.0 (#494 ask 2) — Detailed: carries task_description
+                // (reasoning text, detailed+ only); see the sqlite twin.
+                trace_level: crate::schema::TraceLevel::Detailed,
                 payload,
                 cost_llm_calls: None,
                 cost_tokens: None,

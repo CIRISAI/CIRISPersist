@@ -149,6 +149,12 @@ pub enum LocalSignerError {
     /// [`LocalSigner::sign_hybrid`] instead.
     #[error("classical (Ed25519) sign: {0}")]
     ClassicalSign(String),
+    /// v19.2.0 (CIRISPersist#493) — self-enc derivation requires the raw
+    /// Ed25519 seed, which a HARDWARE-custodied identity (by design) never
+    /// exposes to this process. A hardware node publishes its content-tier
+    /// enc keys from its own keystore identity instead.
+    #[error("self-enc derivation requires a software (plaintext-seed) identity; this signer is hardware-custodied")]
+    SelfEncRequiresSoftwareSeed,
 }
 
 /// v7.1.0 (CIRISPersist#224) — the classical (Ed25519) half of a
@@ -471,6 +477,51 @@ impl LocalSigner {
                 public_key: pqc_pk,
             },
             mode: SignatureMode::HybridRequired,
+        })
+    }
+
+    /// v19.2.0 (CIRISPersist#493) — THIS node's content-tier
+    /// self-encryption PUBLIC keys (x25519 + ML-KEM-768), derived
+    /// internally from the signer's own Ed25519 seed via
+    /// `ciris_crypto::self_enc` (HKDF-SHA256, the same derivation the
+    /// KEM-open/decrypt side re-runs on the same seed) — so
+    /// `published enc pubkey ⟷ decrypt privkey` holds BY CONSTRUCTION,
+    /// exactly as `local_derived_key_id` + `sign_hybrid` already
+    /// guarantee for the signing identity. Public halves only; the
+    /// private halves are derived, dropped, and zeroized here — the raw
+    /// seed never crosses the API (CIRISServer#313: the reverse-path KEX
+    /// stall was the server publishing enc pubkeys from a DIFFERENT
+    /// freshly-minted seed than the engine decrypts with).
+    ///
+    /// Hardware-custodied identities refuse
+    /// ([`LocalSignerError::SelfEncRequiresSoftwareSeed`]) — their seed
+    /// never enters this process, honestly.
+    pub fn self_enc_pubkeys(
+        &self,
+    ) -> Result<crate::federation::types::EncryptionPubkeys, LocalSignerError> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let sk = match &self.classical {
+            ClassicalSigner::Plaintext(sk) => sk,
+            ClassicalSigner::Hardware { .. } => {
+                return Err(LocalSignerError::SelfEncRequiresSoftwareSeed)
+            }
+        };
+        let mut seed = sk.to_bytes();
+        let (mut x_secret, x_public) = ciris_crypto::self_enc::derive_self_enc_x25519(&seed);
+        let kem = ciris_crypto::self_enc::derive_self_enc_mlkem768(&seed);
+        // Zeroize every private-material copy before error handling can
+        // return early with them still resident.
+        seed.iter_mut().for_each(|b| *b = 0);
+        x_secret.iter_mut().for_each(|b| *b = 0);
+        let (mut kem_secret, kem_public) = kem.map_err(|e| LocalSignerError::PqcSeedLoad {
+            path: "<derived>".to_owned(),
+            detail: format!("ML-KEM-768 self-enc derivation: {e}"),
+        })?;
+        kem_secret.iter_mut().for_each(|b| *b = 0);
+        Ok(crate::federation::types::EncryptionPubkeys {
+            x25519_base64: B64.encode(x_public),
+            ml_kem_768_base64: B64.encode(&kem_public),
         })
     }
 
@@ -861,6 +912,42 @@ mod tests {
             adapter.attestation_with_nonce(Some(b"nonce")).await,
             Err(KeyringError::NotSupported { .. })
         ));
+    }
+
+    /// v19.2.0 (CIRISPersist#493) — published ⟷ decryptable BY
+    /// CONSTRUCTION: the pubkeys `self_enc_pubkeys` returns are exactly
+    /// the ones `ciris_crypto::self_enc` derives from the SAME seed the
+    /// KEM-open side holds — one seed, one derivation, both halves. (The
+    /// CIRISServer#313 stall was publishing keys minted from a DIFFERENT
+    /// seed.) Also pins the wire shape: base64, 32-byte x25519 +
+    /// 1184-byte ML-KEM-768, admissible by `check_encryption_pubkeys`.
+    #[test]
+    fn self_enc_pubkeys_match_seed_derivation_493() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let seed = [0x42u8; 32];
+        let signer = LocalSigner::from_parts(
+            SigningKey::from_bytes(&seed),
+            "enc-493".to_string(),
+            None,
+            None,
+        );
+        let keys = signer.self_enc_pubkeys().expect("software seed derives");
+
+        // The independent derivation from the same seed.
+        let (_, x_pub) = ciris_crypto::self_enc::derive_self_enc_x25519(&seed);
+        let (_, kem_pub) =
+            ciris_crypto::self_enc::derive_self_enc_mlkem768(&seed).expect("kem derive");
+        assert_eq!(keys.x25519_base64, B64.encode(x_pub), "x25519 half matches");
+        assert_eq!(
+            keys.ml_kem_768_base64,
+            B64.encode(&kem_pub),
+            "ML-KEM half matches"
+        );
+
+        // Wire-shape admissibility (the occurrence-publish gate).
+        crate::federation::admission::check_encryption_pubkeys(Some(&keys))
+            .expect("published shape admissible by check_encryption_pubkeys");
     }
 
     /// v17.7.0 (CIRISPersist#470) — DIFFERENTIAL AUTHORITY-EQUIVALENCE test:

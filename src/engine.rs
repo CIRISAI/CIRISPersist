@@ -2096,6 +2096,25 @@ impl Engine {
         Ok(key_id)
     }
 
+    /// v19.2.0 (CIRISPersist#493) — the node's own content-tier
+    /// self-encryption pubkeys (x25519 + ML-KEM-768), derived internally
+    /// from the engine's local signing seed via `ciris_crypto::self_enc`.
+    /// Public halves only — the private halves never leave (derived,
+    /// used, zeroized). Guarantees `published enc pubkey ⟷ decrypt
+    /// privkey` by construction in both standalone and fold, exactly as
+    /// `local_derived_key_id` + `sign_hybrid` do for the signing identity
+    /// (CIRISServer#313: the reverse-path KEX stall was publishing enc
+    /// pubkeys minted from a DIFFERENT seed than the engine decrypts with).
+    pub fn self_enc_pubkeys(
+        &self,
+    ) -> Result<crate::federation::types::EncryptionPubkeys, crate::signing::LocalSignerError> {
+        let signer = self
+            .local_signer
+            .as_ref()
+            .ok_or(crate::signing::LocalSignerError::SelfEncRequiresSoftwareSeed)?;
+        signer.self_enc_pubkeys()
+    }
+
     /// v19.1.0 (CIRISPersist#490) — bake an assembled genesis trust-root
     /// bundle (the ceremony artifact JSON): quorum-verify against THIS
     /// node's roster, then land serve nodes (insert / idempotent /
