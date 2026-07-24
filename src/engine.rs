@@ -5562,7 +5562,6 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn put_community_self_signed_admits_502e4_followup() {
-        use crate::federation::FederationDirectory as _;
         let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
             .await
             .expect("construct engine");
