@@ -405,6 +405,39 @@ pub fn check_skew_and_payment(
     Ok(())
 }
 
+/// v21.0.0 (CIRISPersist#502 E9) — resolve the operational steward roster
+/// from persist's OWN registered directory, NEVER a caller-passed slice.
+/// Before this, `check_role_authority` / `check_partner_set_and_quorum`
+/// trusted a `key_directory` / `root_stewards` / `steward_roster` handed in
+/// by the caller — genuine hybrid crypto verified against the WRONG root of
+/// trust (the gate collapses if any caller derives the roster from
+/// untrusted input). The stewards are the registered `identity_type =
+/// steward` keys; their `ThresholdMember`s carry their REGISTERED pubkeys.
+pub async fn resolve_steward_roster<F>(
+    directory: &F,
+) -> Result<(Vec<ciris_verify_core::threshold::ThresholdMember>, Vec<String>), Error>
+where
+    F: crate::federation::FederationDirectory + ?Sized,
+{
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let stewards = directory
+        .list_keys_by_identity_type(crate::federation::types::identity_type::STEWARD)
+        .await
+        .map_err(|e| Error::OperationalAuthority(format!("steward roster resolve: {e}")))?;
+    let _ = B64; // (pubkeys are already base64 on the record)
+    let members: Vec<ciris_verify_core::threshold::ThresholdMember> = stewards
+        .iter()
+        .map(|k| ciris_verify_core::threshold::ThresholdMember {
+            member_id: k.key_id.clone(),
+            ed25519_public_key_base64: k.pubkey_ed25519_base64.clone(),
+            mldsa65_public_key_base64: k.pubkey_ml_dsa_65_base64.clone(),
+            role: Some(ciris_verify_core::threshold::Role::Founder),
+        })
+        .collect();
+    let root_stewards: Vec<String> = stewards.iter().map(|k| k.key_id.clone()).collect();
+    Ok((members, root_stewards))
+}
+
 /// Run the `organization` / `org_membership` **authority** check
 /// (admission check 3): the operation's actor (`actor_key_id`) must hold
 /// `OrgAdmin` in `org_id`, established by a root-anchored grant in the
