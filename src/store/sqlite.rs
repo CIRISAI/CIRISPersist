@@ -3519,6 +3519,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 &row,
                 crate::federation::types::attestation_tier::FEDERATION,
             )?;
+            // v21.0.0 (CIRISPersist#502 E7) — maintain the consent_peer_set
+            // projection (grant upsert / withdraws-revocation fold) in the
+            // SAME locked scope as the insert above.
+            sqlite_project_consent_peer_set(&conn, &row)?;
             Ok(())
         })()
         .map_err(|e| {
@@ -3616,6 +3620,28 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 rows.collect()
             })()
         .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E7) — the revocation-folded
+    /// `consent_peer_set` read: `node_key_id`'s live peers, sorted +
+    /// deduped. The fold already happened at write time (see
+    /// `sqlite_project_consent_peer_set`), so this is a plain SELECT.
+    async fn list_consent_peers(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let node = node_key_id.to_owned();
+        (move || -> Result<Vec<String>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT peer_key_id FROM consent_peer_set \
+                 WHERE node_key_id = ?1 ORDER BY peer_key_id ASC",
+            )?;
+            let rows = stmt.query_map([&node], |r| r.get::<_, String>(0))?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_consent_peers: {e}")))
     }
 
     async fn attestations_binding_content(
@@ -12268,6 +12294,43 @@ fn sqlite_project_attestation_subjects(
     Ok(())
 }
 
+/// v21.0.0 (CIRISPersist#502 E7) — maintain the `consent_peer_set`
+/// projection for `row` on the given (already-locked) connection. A live
+/// `consent:replication:v1` grant upserts one row per `subject_key_ids[]`
+/// peer; a structural composer (`withdraws`/`recants`) whose
+/// `references_attestation_id` names a grant DELETEs every row this
+/// projection sourced from that grant. See
+/// `crate::federation::consent_peer_set` module docs.
+fn sqlite_project_consent_peer_set(
+    conn: &rusqlite::Connection,
+    row: &crate::federation::Attestation,
+) -> rusqlite::Result<()> {
+    if let Some(target_id) = crate::federation::consent_peer_set::revocation_fold_target(row) {
+        conn.execute(
+            "DELETE FROM consent_peer_set WHERE source_attestation_id = ?1",
+            rusqlite::params![target_id],
+        )?;
+        return Ok(());
+    }
+    if !crate::federation::consent_peer_set::is_consent_replication_grant(row) {
+        return Ok(());
+    }
+    for peer in &row.subject_key_ids {
+        conn.execute(
+            "INSERT OR REPLACE INTO consent_peer_set \
+                (node_key_id, peer_key_id, source_attestation_id, asserted_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                row.attesting_key_id,
+                peer,
+                row.attestation_id,
+                row.asserted_at.to_rfc3339(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn sqlite_row_to_attestation(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<crate::federation::Attestation> {
@@ -18029,6 +18092,87 @@ mod tests {
         w
     }
 
+    /// Build a `consent:replication:v1` grant from `node` naming `peer` as
+    /// the sole `subject_key_ids` entry.
+    fn consent_grant(id: &str, node: &str, peer: &str) -> Attestation {
+        let mut g = fed_attestation(id, node, node, node);
+        g.attestation_envelope = serde_json::json!({
+            "dimension": crate::federation::consent_peer_set::DIMENSION,
+        });
+        g.subject_key_ids = vec![peer.to_string()];
+        resign_fed(&mut g); // envelope changed → re-sign (CC 5.3.2.4.3.1)
+        g
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E7) — the sqlite-path assertion of the
+    /// `consent_peer_set` revocation fold (memory-backend witness:
+    /// `consent_peer_set_folds_revocation_502e7`). A grant to peer P1 makes
+    /// `list_consent_peers` include P1; a `withdraws` referencing that
+    /// grant's `attestation_id` REMOVES P1; an untouched second grant to P2
+    /// survives.
+    #[tokio::test]
+    async fn consent_peer_set_folds_revocation_502e7_sqlite() {
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("node-e7", "node-e7", "node-e7"),
+            })
+            .await
+            .unwrap();
+
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: consent_grant("grant-e7-1", "node-e7", "peer-e7-1"),
+            })
+            .await
+            .expect("grant 1 admits");
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: consent_grant("grant-e7-2", "node-e7", "peer-e7-2"),
+            })
+            .await
+            .expect("grant 2 admits");
+
+        let peers = backend.list_consent_peers("node-e7").await.unwrap();
+        assert_eq!(
+            peers,
+            vec!["peer-e7-1".to_string(), "peer-e7-2".to_string()],
+            "both live grants must be visible, sorted"
+        );
+
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against("withdraw-e7-1", "node-e7", "grant-e7-1"),
+            })
+            .await
+            .expect("withdraws admits");
+
+        let peers_after = backend.list_consent_peers("node-e7").await.unwrap();
+        assert_eq!(
+            peers_after,
+            vec!["peer-e7-2".to_string()],
+            "peer-1's consent was withdrawn — it must disappear; peer-2 (untouched) survives"
+        );
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E7) — the sqlite leg of the shared
+    /// backend-parity witness (see `postgres::tests::
+    /// consent_peer_set_parity_postgres_502e7`); both call the SAME
+    /// `consent_peer_set::test_support::exercise_consent_peer_set_fold`
+    /// body, so the two backends cannot silently diverge on the fold.
+    #[tokio::test]
+    async fn consent_peer_set_parity_sqlite_502e7() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::consent_peer_set::test_support::exercise_consent_peer_set_fold(
+            &backend,
+            "sqlite-parity",
+        )
+        .await;
+    }
+
     /// Build a `delegates_to` row from `granter` to `grantee` carrying
     /// the given `scope` (string or array Value).
     fn delegates_to(
@@ -19724,8 +19868,8 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
         let admin = op::Identity::new("admin-1");
-        let _dir = vec![steward.member(), admin.member()];
-        let _roots = vec!["steward-1".to_string()];
+        let _dir = [steward.member(), admin.member()];
+        let _roots = ["steward-1".to_string()];
 
         // steward (root) grants admin OrgAdmin — granter is the steward.
         let grant = op::signed_membership(
@@ -19775,8 +19919,8 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let stranger = op::Identity::new("stranger");
-        let _dir = vec![stranger.member()];
-        let _roots = vec!["steward-1".to_string()]; // stranger is not rooted
+        let _dir = [stranger.member()];
+        let _roots = ["steward-1".to_string()]; // stranger is not rooted
 
         let org = op::signed_organization("o1", "org-x", &stranger, "active", op_now());
         let err = backend.put_organization(org).await.unwrap_err();
@@ -19795,8 +19939,8 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
-        let _dir = vec![steward.member()];
-        let _roots = vec!["steward-1".to_string()];
+        let _dir = [steward.member()];
+        let _roots = ["steward-1".to_string()];
         let future = op_now() + chrono::Duration::minutes(10);
         let grant = op::signed_membership(
             "m1",
@@ -19818,8 +19962,8 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
-        let _dir = vec![steward.member()];
-        let _roots = vec!["steward-1".to_string()];
+        let _dir = [steward.member()];
+        let _roots = ["steward-1".to_string()];
         let mut grant = op::signed_membership(
             "m1",
             &steward,
@@ -19843,8 +19987,8 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
         let admin = op::Identity::new("admin-1");
-        let _dir = vec![steward.member(), admin.member()];
-        let _roots = vec!["steward-1".to_string()];
+        let _dir = [steward.member(), admin.member()];
+        let _roots = ["steward-1".to_string()];
         backend
             .put_public_key(crate::federation::SignedKeyRecord {
                 record: admin.steward_key_record(),
@@ -19904,8 +20048,8 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
         let admin = op::Identity::new("admin-1");
-        let _dir = vec![steward.member(), admin.member()];
-        let _roots = vec!["steward-1".to_string()];
+        let _dir = [steward.member(), admin.member()];
+        let _roots = ["steward-1".to_string()];
         backend
             .put_public_key(crate::federation::SignedKeyRecord {
                 record: admin.steward_key_record(),
@@ -19957,7 +20101,7 @@ mod tests {
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
         let s3 = op::Identity::new("s3");
-        let _roster = vec![
+        let _roster = [
             s1.founder_member(),
             s2.founder_member(),
             s3.founder_member(),
@@ -20024,7 +20168,7 @@ mod tests {
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
         let s3 = op::Identity::new("s3");
-        let _roster = vec![
+        let _roster = [
             s1.founder_member(),
             s2.founder_member(),
             s3.founder_member(),
@@ -20041,7 +20185,7 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
-        let _roster = vec![s1.founder_member(), s2.founder_member()];
+        let _roster = [s1.founder_member(), s2.founder_member()];
         let pr = op::signed_partner_record(
             "pr1",
             "lic-1",
@@ -20063,7 +20207,7 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
-        let _roster = vec![s1.founder_member(), s2.founder_member()];
+        let _roster = [s1.founder_member(), s2.founder_member()];
         let base = op_now();
         for (id, lic, secs) in [("a", "l1", 0), ("b", "l2", 60), ("c", "l3", 120)] {
             let pr = op::signed_partner_record(
@@ -20114,7 +20258,7 @@ mod tests {
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
         let s3 = op::Identity::new("s3");
-        let _roster = vec![
+        let _roster = [
             s1.founder_member(),
             s2.founder_member(),
             s3.founder_member(),

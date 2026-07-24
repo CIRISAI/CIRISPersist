@@ -653,6 +653,14 @@ pub enum DirectoryOp {
         /// The delegation scope token (e.g. `infra:serve`).
         scope: String,
     },
+    /// [`FederationDirectory::list_consent_peers`] (v21.0.0,
+    /// CIRISPersist#502 E7) — the revocation-folded `consent_peer_set`
+    /// read: `node_key_id`'s live `consent:replication:v1` peers. Result
+    /// rides `ConsentPeers`. APPEND-ONLY.
+    ListConsentPeers {
+        /// The granting node whose live peer set is asked for.
+        node_key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -762,6 +770,9 @@ pub enum DirectoryOpResult {
     /// grant, or `None` if the subject holds the scope from no trusted
     /// root. APPEND-ONLY.
     TrustedGrant(Option<crate::federation::trust_root::TrustedGrant>),
+    /// `list_consent_peers` (v21.0.0, #502 E7) — the revocation-folded
+    /// `consent_peer_set` peer list, sorted + deduped. APPEND-ONLY.
+    ConsentPeers(Vec<String>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1181,6 +1192,12 @@ pub async fn dispatch_directory_op(
         DirectoryOp::UpdatePeerPolicy { key_id, policy } => {
             match dir.update_peer_policy(&key_id, policy).await {
                 Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListConsentPeers { node_key_id } => {
+            match dir.list_consent_peers(&node_key_id).await {
+                Ok(v) => DirectoryOpResult::ConsentPeers(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -2577,6 +2594,23 @@ impl FederationDirectory for OpsDirectory {
     ) -> Result<Vec<crate::federation::types::AnnouncedPeer>, Error> {
         match self.run_op(&DirectoryOp::ListAnnouncedPeers).await? {
             DirectoryOpResult::AnnouncedPeers(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v21.0.0 (#502 E7) — the revocation-folded `consent_peer_set` read
+    /// via the capsule.
+    async fn list_consent_peers(&self, node_key_id: &str) -> Result<Vec<String>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListConsentPeers {
+                node_key_id: node_key_id.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::ConsentPeers(v) => Ok(v),
             DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
             _ => Err(Error::Backend(
                 "directory ops proxy: unexpected result variant".into(),

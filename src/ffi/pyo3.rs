@@ -5403,6 +5403,48 @@ impl PyEngine {
         })
     }
 
+    /// v21.0.0 (CIRISPersist#502 E7) — federation directory: the
+    /// revocation-folded `consent_peer_set` read. `node_key_id`'s live
+    /// `consent:replication:v1` peers, sorted + deduped, JSON array of
+    /// strings.
+    fn list_consent_peers(&self, py: Python<'_>, node_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let node_key_id = node_key_id.to_owned();
+            py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let peers = backend
+                            .list_consent_peers(&node_key_id)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&peers).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<String> JSON encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let peers = backend
+                            .list_consent_peers(&node_key_id)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&peers).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<String> JSON encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
     /// Federation directory: write a revocation.
     fn put_revocation(&self, py: Python<'_>, signed_revocation_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
@@ -24952,7 +24994,7 @@ enum OperationalKind {
 /// `put_organization` / `put_org_membership`: a JSON array of
 /// `ThresholdMember` (pinned hybrid pubkeys) + a JSON array of `String`
 /// root-steward key_ids.
-
+///
 /// v5.1.0 (CIRISPersist#65) — FFI-internal operational-data list
 /// dispatchers (not exposed to Python; the `#[pyo3]` wrappers above call
 /// them). Kept out of the `#[pymethods]` block because they take the

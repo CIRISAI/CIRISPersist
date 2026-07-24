@@ -3849,6 +3849,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         .map_err(|e| {
             crate::federation::Error::Backend(format!("put_attestation projection: {e}"))
         })?;
+        // v21.0.0 (CIRISPersist#502 E7) — maintain the consent_peer_set
+        // projection (grant upsert / withdraws-revocation fold), same
+        // client/transaction as the insert above.
+        pg_project_consent_peer_set(&**client, &row)
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("consent_peer_set projection: {e}"))
+            })?;
         // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
         // `trace:complete:v1` attestation materializes its `trace_events`
         // rows (via the SAME decompose the ingest path uses), so a
@@ -3942,6 +3950,34 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))?;
         rows.into_iter().map(pg_row_to_attestation).collect()
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E7) — the revocation-folded
+    /// `consent_peer_set` read: `node_key_id`'s live peers, sorted +
+    /// deduped. The fold already happened at write time (see
+    /// `pg_project_consent_peer_set`), so this is a plain SELECT.
+    async fn list_consent_peers(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT DISTINCT peer_key_id FROM cirislens.consent_peer_set \
+                 WHERE node_key_id = $1 ORDER BY peer_key_id ASC",
+                &[&node_key_id],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("list_consent_peers: {e}")))?;
+        rows.into_iter()
+            .map(|r| {
+                r.try_get::<_, String>("peer_key_id")
+                    .map_err(|e| crate::federation::Error::Backend(format!("peer_key_id: {e}")))
+            })
+            .collect()
     }
 
     async fn attestations_binding_content(
@@ -12359,6 +12395,53 @@ where
     Ok(())
 }
 
+/// v21.0.0 (CIRISPersist#502 E7) — maintain the
+/// `cirislens.consent_peer_set` projection for `row` on the given
+/// client/transaction. A live `consent:replication:v1` grant upserts one
+/// row per `subject_key_ids[]` peer; a structural composer
+/// (`withdraws`/`recants`) whose `references_attestation_id` names a grant
+/// DELETEs every row this projection sourced from that grant. See
+/// `crate::federation::consent_peer_set` module docs.
+async fn pg_project_consent_peer_set<C>(
+    client: &C,
+    row: &crate::federation::Attestation,
+) -> Result<(), tokio_postgres::Error>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    if let Some(target_id) = crate::federation::consent_peer_set::revocation_fold_target(row) {
+        client
+            .execute(
+                "DELETE FROM cirislens.consent_peer_set WHERE source_attestation_id = $1",
+                &[&target_id],
+            )
+            .await?;
+        return Ok(());
+    }
+    if !crate::federation::consent_peer_set::is_consent_replication_grant(row) {
+        return Ok(());
+    }
+    for peer in &row.subject_key_ids {
+        client
+            .execute(
+                "INSERT INTO cirislens.consent_peer_set \
+                    (node_key_id, peer_key_id, source_attestation_id, asserted_at) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (node_key_id, peer_key_id) DO UPDATE SET \
+                    source_attestation_id = EXCLUDED.source_attestation_id, \
+                    asserted_at = EXCLUDED.asserted_at",
+                &[
+                    &row.attesting_key_id,
+                    peer,
+                    &row.attestation_id,
+                    &row.asserted_at,
+                ],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 fn pg_row_to_attestation(
     row: tokio_postgres::Row,
 ) -> Result<crate::federation::Attestation, crate::federation::Error> {
@@ -17450,6 +17533,27 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         let suffix = uuid_like();
         crate::federation::self_at_login::test_support::run_binding_projection_matrix(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E7) — the postgres leg of the shared
+    /// `consent_peer_set` revocation-fold backend-parity witness (see
+    /// `sqlite::tests::consent_peer_set_parity_sqlite_502e7`); both call the
+    /// SAME `consent_peer_set::test_support::exercise_consent_peer_set_fold`
+    /// body, so sqlite and postgres cannot silently diverge on the fold.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn consent_peer_set_parity_postgres_502e7() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::consent_peer_set::test_support::exercise_consent_peer_set_fold(
             &backend, &suffix,
         )
         .await;
@@ -31765,8 +31869,8 @@ mod tests {
         let org_id = format!("org-{}", uuid_like());
         let steward = op::Identity::new(&format!("steward-{}", uuid_like()));
         let admin = op::Identity::new(&format!("admin-{}", uuid_like()));
-        let _dir = vec![steward.member(), admin.member()];
-        let _roots = vec![steward.key_id.clone()];
+        let _dir = [steward.member(), admin.member()];
+        let _roots = [steward.key_id.clone()];
 
         // root steward grants admin OrgAdmin.
         let grant = op::signed_membership(
@@ -31875,7 +31979,7 @@ mod tests {
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
         let s3 = op::Identity::new("s3");
-        let _roster = vec![
+        let _roster = [
             s1.founder_member(),
             s2.founder_member(),
             s3.founder_member(),
@@ -32013,7 +32117,7 @@ mod tests {
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
         let s3 = op::Identity::new("s3");
-        let _roster = vec![
+        let _roster = [
             s1.founder_member(),
             s2.founder_member(),
             s3.founder_member(),
