@@ -4401,7 +4401,43 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // other admission step. Hybrid-Strict vs the authority's registered
         // pubkeys — was FK-existence only, a forgeable keyless declaration.
         crate::federation::verify_family_admission(self, &family).await?;
-        self.put_family_local(family.family).await
+        let crate::federation::SignedFamily {
+            family: row,
+            authority_key_id,
+            scrub_signature_classical,
+            scrub_signature_pqc,
+        } = family;
+        let family_key_id = row.family_key_id.clone();
+        self.put_family_local(row).await?;
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded: the durable row had no home for it, so it couldn't
+        // prove its own authorship later). `put_family_local` (the
+        // genesis-bake bypass) is untouched — its INSERT leaves these
+        // columns NULL, correct for a legitimately-unsigned bake row; this
+        // UPDATE targets only the signed, gate-verified path.
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        client
+            .execute(
+                "UPDATE cirislens.federation_families \
+                    SET authority_key_id = $2, scrub_signature_classical = $3, \
+                        scrub_signature_pqc = $4 \
+                  WHERE family_key_id = $1",
+                &[
+                    &family_key_id,
+                    &authority_key_id,
+                    &scrub_signature_classical,
+                    &scrub_signature_pqc,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("store family authority signature: {e}"))
+            })?;
+        Ok(())
     }
 
     async fn put_family_local(
@@ -4901,6 +4937,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let members_value = serde_json::to_value(&row.members)
             .map_err(|e| crate::federation::Error::Backend(format!("members serialize: {e}")))?;
         let policy_blob_value = row.policy_blob.clone();
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        let authority_key_id = community.authority_key_id;
+        let scrub_signature_classical = community.scrub_signature_classical;
+        let scrub_signature_pqc = community.scrub_signature_pqc;
         let client = self
             .get_client()
             .await
@@ -4909,8 +4951,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "INSERT INTO cirislens.federation_communities (\
                     community_key_id, community_name, members, founded_at, \
-                    consensus_protocol, policy_blob, persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    consensus_protocol, policy_blob, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 &[
                     &row.community_key_id,
                     &row.community_name,
@@ -4919,6 +4962,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.consensus_protocol,
                     &policy_blob_value,
                     &row.persist_row_hash,
+                    &authority_key_id,
+                    &scrub_signature_classical,
+                    &scrub_signature_pqc,
                 ],
             )
             .await
@@ -5484,6 +5530,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let mut row = revocation.family_membership_revocation;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let witness = serde_json::json!(row.witness_set);
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        let authority_key_id = revocation.authority_key_id;
+        let scrub_signature_classical = revocation.scrub_signature_classical;
+        let scrub_signature_pqc = revocation.scrub_signature_pqc;
         let client = self
             .get_client()
             .await
@@ -5492,8 +5544,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "INSERT INTO cirislens.federation_family_membership_revocations (\
                     family_key_id, removed_identity_key_id, removed_at, effective_at, \
-                    reason, witness_set, persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    reason, witness_set, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 &[
                     &row.family_key_id,
                     &row.removed_identity_key_id,
@@ -5502,6 +5555,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.reason,
                     &witness,
                     &row.persist_row_hash,
+                    &authority_key_id,
+                    &scrub_signature_classical,
+                    &scrub_signature_pqc,
                 ],
             )
             .await
@@ -5545,6 +5601,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             &row.removed_identity_key_id,
             row.effective_at,
         );
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        let authority_key_id = revocation.authority_key_id;
+        let scrub_signature_classical = revocation.scrub_signature_classical;
+        let scrub_signature_pqc = revocation.scrub_signature_pqc;
         let mut client = self
             .get_client()
             .await
@@ -5559,8 +5621,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         tx.execute(
             "INSERT INTO cirislens.federation_community_membership_revocations (\
                 community_key_id, removed_identity_key_id, removed_at, effective_at, \
-                reason, witness_set, persist_row_hash\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                reason, witness_set, persist_row_hash, \
+                authority_key_id, scrub_signature_classical, scrub_signature_pqc\
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             &[
                 &row.community_key_id,
                 &row.removed_identity_key_id,
@@ -5569,6 +5632,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 &row.reason,
                 &witness,
                 &row.persist_row_hash,
+                &authority_key_id,
+                &scrub_signature_classical,
+                &scrub_signature_pqc,
             ],
         )
         .await
@@ -5745,6 +5811,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::federation::location::validate_location_cell(&row.cell_id, row.cell_resolution)?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let resolution = i16::from(row.cell_resolution);
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        let authority_key_id = proof.authority_key_id;
+        let scrub_signature_classical = proof.scrub_signature_classical;
+        let scrub_signature_pqc = proof.scrub_signature_pqc;
         let client = self
             .get_client()
             .await
@@ -5753,8 +5825,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .execute(
                 "INSERT INTO cirislens.federation_location_proofs (\
                     subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
-                    attestation_evidence, withdrawn_at, persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                    attestation_evidence, withdrawn_at, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                 &[
                     &row.subject_key_id,
                     &row.cell_id,
@@ -5764,6 +5837,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.attestation_evidence,
                     &row.withdrawn_at,
                     &row.persist_row_hash,
+                    &authority_key_id,
+                    &scrub_signature_classical,
+                    &scrub_signature_pqc,
                 ],
             )
             .await

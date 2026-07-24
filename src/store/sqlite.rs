@@ -4067,7 +4067,42 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // other admission step. Hybrid-Strict vs the authority's registered
         // pubkeys — was FK-existence only, a forgeable keyless declaration.
         crate::federation::verify_family_admission(self, &family).await?;
-        self.put_family_local(family.family).await
+        let crate::federation::SignedFamily {
+            family: row,
+            authority_key_id,
+            scrub_signature_classical,
+            scrub_signature_pqc,
+        } = family;
+        let family_key_id = row.family_key_id.clone();
+        self.put_family_local(row).await?;
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded: the durable row had no home for it, so it couldn't
+        // prove its own authorship later). `put_family_local` (the
+        // genesis-bake bypass) is untouched — its INSERT leaves these
+        // columns NULL, correct for a legitimately-unsigned bake row; this
+        // UPDATE targets only the signed, gate-verified path.
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "UPDATE federation_families \
+                    SET authority_key_id = ?2, scrub_signature_classical = ?3, \
+                        scrub_signature_pqc = ?4 \
+                  WHERE family_key_id = ?1",
+                rusqlite::params![
+                    family_key_id,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("store family authority signature: {e}"))
+        })?;
+        Ok(())
     }
 
     async fn put_family_local(
@@ -4563,14 +4598,21 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             })?),
             None => None,
         };
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        let authority_key_id = community.authority_key_id;
+        let scrub_signature_classical = community.scrub_signature_classical;
+        let scrub_signature_pqc = community.scrub_signature_pqc;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_communities (\
                     community_key_id, community_name, members, founded_at, \
-                    consensus_protocol, policy_blob, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    consensus_protocol, policy_blob, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     row.community_key_id,
                     row.community_name,
@@ -4579,6 +4621,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.consensus_protocol,
                     policy_blob_json,
                     row.persist_row_hash,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
                 ],
             )?;
             Ok(())
@@ -5191,14 +5236,21 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &row.removed_identity_key_id,
             row.effective_at,
         );
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        let authority_key_id = revocation.authority_key_id;
+        let scrub_signature_classical = revocation.scrub_signature_classical;
+        let scrub_signature_pqc = revocation.scrub_signature_pqc;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_family_membership_revocations (\
                     family_key_id, removed_identity_key_id, removed_at, effective_at, \
-                    reason, witness_set, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    reason, witness_set, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     row.family_key_id,
                     row.removed_identity_key_id,
@@ -5207,6 +5259,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.reason,
                     witness,
                     row.persist_row_hash,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
                 ],
             )?;
             Ok(())
@@ -5246,6 +5301,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let removal_detail = serde_json::to_string(&removal_event.detail).map_err(|e| {
             crate::federation::Error::Backend(format!("hard_case detail serialize: {e}"))
         })?;
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        let authority_key_id = revocation.authority_key_id;
+        let scrub_signature_classical = revocation.scrub_signature_classical;
+        let scrub_signature_pqc = revocation.scrub_signature_pqc;
         let conn = self.conn.clone();
         // SecReview F5 — INSERT + hard_case + epoch bump in ONE transaction
         // under a single lock acquisition: a bump failure after the INSERT
@@ -5258,8 +5319,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             tx.execute(
                 "INSERT INTO federation_community_membership_revocations (\
                     community_key_id, removed_identity_key_id, removed_at, effective_at, \
-                    reason, witness_set, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    reason, witness_set, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     row.community_key_id,
                     row.removed_identity_key_id,
@@ -5268,6 +5330,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.reason,
                     witness,
                     row.persist_row_hash,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
                 ],
             )?;
             // Idempotent on the deterministic event_id.
@@ -5422,14 +5487,21 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let mut row = proof.location_proof;
         crate::federation::location::validate_location_cell(&row.cell_id, row.cell_resolution)?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        let authority_key_id = proof.authority_key_id;
+        let scrub_signature_classical = proof.scrub_signature_classical;
+        let scrub_signature_pqc = proof.scrub_signature_pqc;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_location_proofs (\
                     subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
-                    attestation_evidence, withdrawn_at, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    attestation_evidence, withdrawn_at, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     row.subject_key_id,
                     row.cell_id,
@@ -5439,6 +5511,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.attestation_evidence,
                     row.withdrawn_at.map(|t| t.to_rfc3339()),
                     row.persist_row_hash,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
                 ],
             )?;
             Ok(())
@@ -23919,6 +23994,63 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E4 followup) — the authority signature
+    /// E4's admission gate verifies must be PERSISTED, not verified-then-
+    /// discarded: before this cut, `federation_families` (and its 4
+    /// siblings) had no column for `authority_key_id` /
+    /// `scrub_signature_{classical,pqc}`, so the durable row could never
+    /// prove its own authorship. Put an authority-signed family, then read
+    /// the stored row back via a direct SELECT on the V110 columns (there is
+    /// no public reconstruction of `SignedFamily` on the read side yet — see
+    /// the V110 migration note) and assert all 3 fields round-trip
+    /// byte-exact.
+    #[tokio::test]
+    async fn e4_authority_signature_persists_502_followup() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["e4sig-authority", "e4sig-member"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "acme", "e4sig-authority"),
+                })
+                .await
+                .unwrap();
+        }
+        let signed = crate::federation::tier_ingest::test_support::sign_family(
+            "e4sig-authority",
+            fed_family(
+                "e4sig-family",
+                "E4 Signature Household",
+                vec!["e4sig-member"],
+                crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+            ),
+        );
+        let expect_classical = signed.scrub_signature_classical.clone();
+        let expect_pqc = signed.scrub_signature_pqc.clone();
+        backend
+            .put_family(signed)
+            .await
+            .expect("(E4 followup) honestly-signed family admits");
+
+        let (authority_key_id, scrub_signature_classical, scrub_signature_pqc): (
+            String,
+            String,
+            Option<String>,
+        ) = {
+            let conn = backend.conn.lock();
+            conn.query_row(
+                "SELECT authority_key_id, scrub_signature_classical, scrub_signature_pqc \
+                     FROM federation_families WHERE family_key_id = ?1",
+                ["e4sig-family"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("(E4 followup) authority signature must be persisted, not discarded")
+        };
+        assert_eq!(authority_key_id, "e4sig-authority");
+        assert_eq!(scrub_signature_classical, expect_classical);
+        assert_eq!(scrub_signature_pqc, expect_pqc);
     }
 
     fn fed_community(

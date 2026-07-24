@@ -28,6 +28,17 @@ use crate::schema::ReasoningEventType;
 /// UNIQUE index `trace_events_dedup`. THREAT_MODEL.md AV-9.
 type DedupKey = (String, String, String, ReasoningEventType, u32);
 
+/// v21.0.0 (CIRISPersist#502 E4 followup) — one stored authority signature:
+/// `(authority_key_id, scrub_signature_classical, scrub_signature_pqc)`.
+/// Mirrors the V110 `authority_key_id` / `scrub_signature_{classical,pqc}`
+/// columns added to the 5 E4 keyless-declaration tables (`federation_families`
+/// / `federation_communities` / `federation_family_membership_revocations` /
+/// `federation_community_membership_revocations` /
+/// `federation_location_proofs`) — the fields `verify_family_admission` (and
+/// its 4 siblings) verify at `put_family` etc. before this cut were verified
+/// then discarded; now they're stored alongside the record.
+type AuthoritySig = (String, String, Option<String>);
+
 /// In-memory backend.
 ///
 /// Locks: a single `Mutex` guards all state. This is fine for tests
@@ -263,6 +274,27 @@ struct State {
     /// (grant upsert / withdraws-revocation fold), same as the SQL backends'
     /// `consent_peer_set` table. See `crate::federation::consent_peer_set`.
     consent_peer_set: Vec<ConsentPeerRow>,
+    /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — the authority
+    /// signature `put_family` verified at admission, keyed by
+    /// `family_key_id`. Absent for `put_family_local` genesis-bake rows
+    /// (legitimately unsigned — mirrors `federation_identity_occurrence_sigs`'s
+    /// "absent for trusted-local rows" convention).
+    federation_family_authority_sigs: HashMap<String, AuthoritySig>,
+    /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
+    /// mirror of `federation_family_authority_sigs`, keyed by
+    /// `community_key_id`.
+    federation_community_authority_sigs: HashMap<String, AuthoritySig>,
+    /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
+    /// mirror, keyed like `federation_family_membership_revocations`.
+    federation_family_membership_revocation_authority_sigs: HashMap<(String, String), AuthoritySig>,
+    /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
+    /// mirror, keyed like `federation_community_membership_revocations`.
+    federation_community_membership_revocation_authority_sigs:
+        HashMap<(String, String), AuthoritySig>,
+    /// v21.0.0 (CIRISPersist#502 E4 followup, V110 mirror) — structural
+    /// mirror, keyed like `federation_location_proofs`.
+    federation_location_proof_authority_sigs:
+        HashMap<(String, chrono::DateTime<chrono::Utc>), AuthoritySig>,
 }
 
 /// v21.0.0 (CIRISPersist#502 E7) — one row of the in-memory
@@ -344,6 +376,11 @@ impl Default for MemoryBackend {
                 canonical_withdrawals: HashMap::new(),
                 role_withdrawals: HashMap::new(),
                 consent_peer_set: Vec::new(),
+                federation_family_authority_sigs: HashMap::new(),
+                federation_community_authority_sigs: HashMap::new(),
+                federation_family_membership_revocation_authority_sigs: HashMap::new(),
+                federation_community_membership_revocation_authority_sigs: HashMap::new(),
+                federation_location_proof_authority_sigs: HashMap::new(),
             }),
         }
     }
@@ -2811,7 +2848,34 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // locks itself). Hybrid-Strict vs the authority's registered
         // pubkeys — was FK-existence only, a forgeable keyless declaration.
         crate::federation::verify_family_admission(self, &family).await?;
-        self.put_family_local(family.family).await
+        let crate::federation::SignedFamily {
+            family: row,
+            authority_key_id,
+            scrub_signature_classical,
+            scrub_signature_pqc,
+        } = family;
+        let family_key_id = row.family_key_id.clone();
+        self.put_family_local(row).await?;
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded: the durable row had no home for it, so it couldn't
+        // prove its own authorship later). `put_family_local` (the
+        // genesis-bake bypass) is untouched — its rows are legitimately
+        // unsigned; this side-map entry is written only on the signed,
+        // gate-verified path.
+        self.state
+            .lock()
+            .expect("memory backend lock")
+            .federation_family_authority_sigs
+            .insert(
+                family_key_id,
+                (
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                ),
+            );
+        Ok(())
     }
 
     async fn put_family_local(
@@ -3109,6 +3173,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             )));
         }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        state.federation_community_authority_sigs.insert(
+            row.community_key_id.clone(),
+            (
+                community.authority_key_id,
+                community.scrub_signature_classical,
+                community.scrub_signature_pqc,
+            ),
+        );
         state
             .federation_communities
             .insert(row.community_key_id.clone(), row);
@@ -3530,13 +3605,26 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .federation_hard_case_events
             .entry(event.event_id.clone())
             .or_insert(event);
-        state.federation_family_membership_revocations.insert(
-            (
-                row.family_key_id.clone(),
-                row.removed_identity_key_id.clone(),
-            ),
-            row,
+        let revocation_key = (
+            row.family_key_id.clone(),
+            row.removed_identity_key_id.clone(),
         );
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        state
+            .federation_family_membership_revocation_authority_sigs
+            .insert(
+                revocation_key.clone(),
+                (
+                    revocation.authority_key_id,
+                    revocation.scrub_signature_classical,
+                    revocation.scrub_signature_pqc,
+                ),
+            );
+        state
+            .federation_family_membership_revocations
+            .insert(revocation_key, row);
         Ok(())
     }
 
@@ -3609,6 +3697,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .federation_community_dek_epoch
             .entry(row.community_key_id.clone())
             .or_insert(0) += 1;
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        state
+            .federation_community_membership_revocation_authority_sigs
+            .insert(
+                revocation_key.clone(),
+                (
+                    revocation.authority_key_id,
+                    revocation.scrub_signature_classical,
+                    revocation.scrub_signature_pqc,
+                ),
+            );
         state
             .federation_community_membership_revocations
             .insert(revocation_key, row);
@@ -3879,9 +3980,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             )));
         }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        state
-            .federation_location_proofs
-            .insert((row.subject_key_id.clone(), row.asserted_at), row);
+        let proof_key = (row.subject_key_id.clone(), row.asserted_at);
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        state.federation_location_proof_authority_sigs.insert(
+            proof_key.clone(),
+            (
+                proof.authority_key_id,
+                proof.scrub_signature_classical,
+                proof.scrub_signature_pqc,
+            ),
+        );
+        state.federation_location_proofs.insert(proof_key, row);
         Ok(())
     }
 
@@ -14460,5 +14571,65 @@ mod tests {
                 .parse::<chrono::DateTime<chrono::Utc>>()
                 .unwrap()
         );
+    }
+
+    // ─── v21.0.0 (CIRISPersist#502 E4 followup) — the authority signature
+    //     E4's admission gate verifies must be PERSISTED, not verified-then-
+    //     discarded: before this cut, `Family`/`Community`/etc. had no home
+    //     for `authority_key_id` / `scrub_signature_{classical,pqc}`, so the
+    //     durable row could never prove its own authorship. Put an
+    //     authority-signed family, then read the stored side-map entry
+    //     directly (there is no public reconstruction of `SignedFamily` on
+    //     the read side yet — see the V110 migration note) and assert all 3
+    //     fields round-trip byte-exact.
+
+    /// A honestly-signed `Family` round-trips its authority signature: the
+    /// `federation_family_authority_sigs` side-map (V110 mirror) holds the
+    /// SAME `authority_key_id` + `scrub_signature_{classical,pqc}` the
+    /// caller submitted, not empty/discarded values.
+    #[tokio::test]
+    async fn e4_authority_signature_persists_502_followup() {
+        let backend = MemoryBackend::new();
+        for k in ["e4sig-authority", "e4sig-member", "e4sig-family"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "ref", k),
+                })
+                .await
+                .unwrap();
+        }
+        let fam = crate::federation::types::Family {
+            family_key_id: "e4sig-family".into(),
+            family_name: "E4 Signature Household".into(),
+            members: vec![crate::federation::types::FamilyMember {
+                key_id: "e4sig-member".into(),
+                joined_at: "2026-07-01T00:00:00Z".parse().unwrap(),
+                role: None,
+            }],
+            founded_at: "2026-07-01T00:00:00Z".parse().unwrap(),
+            consensus_protocol: "founder_only".into(),
+            consensus_protocol_entrenched: false,
+            persist_row_hash: String::new(),
+        };
+        let signed =
+            crate::federation::tier_ingest::test_support::sign_family("e4sig-authority", fam);
+        let expect_classical = signed.scrub_signature_classical.clone();
+        let expect_pqc = signed.scrub_signature_pqc.clone();
+        backend
+            .put_family(signed)
+            .await
+            .expect("(E4 followup) honestly-signed family admits");
+
+        let stored = backend
+            .state
+            .lock()
+            .expect("memory backend lock")
+            .federation_family_authority_sigs
+            .get("e4sig-family")
+            .cloned()
+            .expect("(E4 followup) authority signature must be persisted, not discarded");
+        assert_eq!(stored.0, "e4sig-authority");
+        assert_eq!(stored.1, expect_classical);
+        assert_eq!(stored.2, expect_pqc);
     }
 }
