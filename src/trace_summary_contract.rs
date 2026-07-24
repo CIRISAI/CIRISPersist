@@ -363,3 +363,220 @@ mod tests {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// v20.0.0 (#495, wall 1) — the TYPED per-event payload structs. The serde
+// field names ARE the flat extraction paths; the
+// `payload_structs_bind_extraction_manifest` witness asserts every
+// manifest `flat_path` is a serde field of its event's struct — so a
+// payload-field rename on either side fails the build's tests instead of
+// silently NULLing a projection column. The emitter (CIRISAgent, Python)
+// binds via TRACE_SUMMARY_EXTRACTION_SHA256; Rust producers/readers bind
+// via these structs.
+// ─────────────────────────────────────────────────────────────────────
+
+/// `THOUGHT_START` payload — the summary + task-page fields.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct ThoughtStartPayload {
+    /// Thought taxonomy token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_type: Option<String>,
+    /// Recursion depth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_depth: Option<i64>,
+    /// `detailed`-tier reasoning text (the task page's
+    /// `initial_observation`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_description: Option<String>,
+    /// Everything else the emitter ships, preserved.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `DMA_RESULTS` payload.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct DmaResultsPayload {
+    /// CSDMA plausibility (FLAT — the #315 fix; never nested).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csdma_plausibility_score: Option<f64>,
+    /// DSDMA domain alignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsdma_domain_alignment: Option<f64>,
+    /// DSDMA domain token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsdma_domain: Option<String>,
+    /// Preserved extras.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `IDMA_RESULT` payload.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct IdmaResultPayload {
+    /// Effective k (FLAT alias).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idma_k_eff: Option<f64>,
+    /// Correlation risk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idma_correlation_risk: Option<f64>,
+    /// Fragility flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idma_fragility_flag: Option<bool>,
+    /// Phase token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idma_phase: Option<String>,
+    /// Preserved extras.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `CONSCIENCE_RESULT` payload.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct ConscienceResultPayload {
+    /// Overall verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conscience_passed: Option<bool>,
+    /// Override marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_was_overridden: Option<bool>,
+    /// Entropy gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entropy_passed: Option<bool>,
+    /// Coherence gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coherence_passed: Option<bool>,
+    /// Optimization-veto gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimization_veto_passed: Option<bool>,
+    /// Epistemic-humility gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epistemic_humility_passed: Option<bool>,
+    /// Preserved extras.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `ACTION_RESULT` payload.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct ActionResultPayload {
+    /// The executed action token (projects as `selected_action`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_executed: Option<String>,
+    /// Success marker (projects as `action_success`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    /// Preserved extras.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[cfg(test)]
+mod payload_struct_tests {
+    use super::*;
+
+    fn serde_keys<T: serde::Serialize>(v: &T) -> Vec<String> {
+        match serde_json::to_value(v).unwrap() {
+            serde_json::Value::Object(m) => m.keys().cloned().collect(),
+            other => panic!("payload struct must serialize to an object, got {other:?}"),
+        }
+    }
+
+    /// THE wall-1 binding witness: every manifest `flat_path` is a serde
+    /// field of its event's typed struct. A rename on either side (struct
+    /// field OR manifest row) fails HERE — the class that sat the trace
+    /// plane dark can no longer ship.
+    #[test]
+    fn payload_structs_bind_extraction_manifest() {
+        fn full<T: Default + serde::Serialize>(fill: impl FnOnce(&mut T)) -> Vec<String> {
+            let mut v = T::default();
+            fill(&mut v);
+            serde_keys(&v)
+        }
+        let by_event: std::collections::HashMap<&str, Vec<String>> = [
+            (
+                "THOUGHT_START",
+                full::<ThoughtStartPayload>(|p| {
+                    p.thought_type = Some("t".into());
+                    p.thought_depth = Some(0);
+                    p.task_description = Some("d".into());
+                }),
+            ),
+            (
+                "DMA_RESULTS",
+                full::<DmaResultsPayload>(|p| {
+                    p.csdma_plausibility_score = Some(0.5);
+                    p.dsdma_domain_alignment = Some(0.5);
+                    p.dsdma_domain = Some("d".into());
+                }),
+            ),
+            (
+                "IDMA_RESULT",
+                full::<IdmaResultPayload>(|p| {
+                    p.idma_k_eff = Some(1.0);
+                    p.idma_correlation_risk = Some(0.1);
+                    p.idma_fragility_flag = Some(false);
+                    p.idma_phase = Some("p".into());
+                }),
+            ),
+            (
+                "CONSCIENCE_RESULT",
+                full::<ConscienceResultPayload>(|p| {
+                    p.conscience_passed = Some(true);
+                    p.action_was_overridden = Some(false);
+                    p.entropy_passed = Some(true);
+                    p.coherence_passed = Some(true);
+                    p.optimization_veto_passed = Some(true);
+                    p.epistemic_humility_passed = Some(true);
+                }),
+            ),
+            (
+                "ACTION_RESULT",
+                full::<ActionResultPayload>(|p| {
+                    p.action_executed = Some("SPEAK".into());
+                    p.success = Some(true);
+                }),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        for f in TRACE_SUMMARY_EXTRACTION {
+            let keys = by_event.get(f.event_type).unwrap_or_else(|| {
+                panic!("manifest event_type {} has no typed struct", f.event_type)
+            });
+            assert!(
+                keys.iter().any(|k| k == f.flat_path),
+                "manifest path {}::{} is not a serde field of its typed payload struct",
+                f.event_type,
+                f.flat_path
+            );
+        }
+    }
+
+    /// M2 — every manifest event_type is a real `ReasoningEventType` wire
+    /// token (the UPPERCASE stored-column form), single-sourcing the gate
+    /// strings against the enum.
+    #[test]
+    fn manifest_event_types_are_reasoning_event_tokens() {
+        use crate::schema::ReasoningEventType as E;
+        let tokens: Vec<&str> = [
+            E::ThoughtStart,
+            E::SnapshotAndContext,
+            E::DmaResults,
+            E::IdmaResult,
+            E::AspdmaResult,
+            E::ConscienceResult,
+            E::ActionResult,
+        ]
+        .iter()
+        .map(|e| e.as_str())
+        .collect();
+        for f in TRACE_SUMMARY_EXTRACTION {
+            assert!(
+                tokens.contains(&f.event_type),
+                "manifest event_type {} is not a ReasoningEventType token",
+                f.event_type
+            );
+        }
+    }
+}

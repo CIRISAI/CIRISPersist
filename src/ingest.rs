@@ -580,6 +580,7 @@ where
         for input in trace_attestation_inputs {
             let tid = input
                 .attestation_envelope
+                .extra
                 .get("trace_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
@@ -784,7 +785,10 @@ where
             attestation_type: "scores".to_owned(),
             weight: None,
             expires_at: None,
-            attestation_envelope: envelope,
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(envelope)
+                .map_err(|e| {
+                IngestError::Sign(format!("trace attestation envelope: {e}"))
+            })?,
             subject_key_ids: vec![attesting],
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
             scrub_signature_classical: None,

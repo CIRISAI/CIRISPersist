@@ -6068,7 +6068,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // Subject-side revocations only (withdraws rule 2/3/4, or a
             // consent:state:revoked stance). NOT tier-filtered — §10.1.3
             // promotion-overdue needs the local-tier rows.
-            let mut sql = String::from(
+            let mut sql = format!(
                 "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
@@ -6076,7 +6076,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
                  FROM federation_attestations \
                  WHERE ((attestation_type = 'withdraws' AND withdraws_admission_rule IN (2, 3, 4)) \
-                        OR json_extract(attestation_envelope, '$.dimension') LIKE 'consent:state:revoked%')",
+                        OR json_extract(attestation_envelope, '$.{dim}') LIKE '{rev}%')",
+                dim = crate::federation::envelope::paths::DIMENSION,
+                rev = crate::federation::consent::consent_dimension::STATE_REVOKED_PREFIX,
             );
             let mut vals: Vec<rusqlite::types::Value> = Vec::new();
             if let Some(s) = since_s {
@@ -6091,9 +6093,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             )?;
             rows.collect()
         })()
-        .map_err(|e| {
-            crate::federation::Error::Backend(format!("list_consent_revocations: {e}"))
-        })
+        .map_err(|e| crate::federation::Error::Backend(format!("list_consent_revocations: {e}")))
     }
 
     async fn communities_containing(
@@ -6730,12 +6730,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 binds.push(SqlValue::Text((*ty).to_string()));
                 ph.push(format!("?{}", binds.len()));
             }
+            // v20.0.0 (#495 C2) — the composer-target path interpolates the
+            // ONE envelope-path constant (bound to EnvelopeCore's serde
+            // name by witness); a key rename can no longer silently leave
+            // a withdrawn attestation active.
             parts.push(format!(
                 "NOT EXISTS (SELECT 1 FROM federation_attestations c \
                    WHERE c.attesting_key_id = fa.attesting_key_id \
                      AND c.attestation_type IN ({}) \
-                     AND json_extract(c.attestation_envelope, '$.references_attestation_id') = fa.attestation_id)",
-                ph.join(",")
+                     AND json_extract(c.attestation_envelope, '$.{}') = fa.attestation_id)",
+                ph.join(","),
+                crate::federation::envelope::paths::REFERENCES_ATTESTATION_ID
             ));
         }
         if let Some(c) = &cursor {
@@ -11879,12 +11884,15 @@ impl SqliteBackend {
 
         // v17.9.0 (CC#38 interim) — envelope size cap FIRST, before any
         // parsing/lookups (cheapest-most-specific-rejection-first).
-        crate::federation::admission::check_envelope_size_admission(&input.attestation_envelope)?;
+        // v20.0.0 (#495): the input envelope is TYPED (EnvelopeCore);
+        // serialize once for the Value-based admission checks.
+        let envelope_value = input.attestation_envelope.to_value();
+        crate::federation::admission::check_envelope_size_admission(&envelope_value)?;
         crate::federation::admission::check_trace_dimension_admission(
             input.dimension(),
             &input.attesting_key_id,
             &input.subject_key_ids,
-            &input.attestation_envelope,
+            &envelope_value,
         )?;
         crate::federation::trust_root::check_trust_charter_admission(
             self,
@@ -11894,7 +11902,7 @@ impl SqliteBackend {
                 .attested_key_id
                 .as_deref()
                 .unwrap_or(&input.attesting_key_id),
-            &input.attestation_envelope,
+            &envelope_value,
         )
         .await?;
 
@@ -11953,7 +11961,7 @@ impl SqliteBackend {
                 ))
             })?
         };
-        let dim = crate::federation::admission::envelope_dimension(&input.attestation_envelope);
+        let dim = input.dimension();
         crate::federation::admission::DimensionAdmissionPolicy::default().check(
             &input.attestation_type,
             dim,
@@ -24023,9 +24031,12 @@ mod tests {
             attestation_type: attestation_type.into(),
             weight: Some(1.0),
             expires_at: None,
-            attestation_envelope: serde_json::json!({
-                "id": "x", "dimension": dimension, "score": 1.0, "confidence": 0.9,
-            }),
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({
+                    "id": "x", "dimension": dimension, "score": 1.0, "confidence": 0.9,
+                }),
+            )
+            .unwrap(),
             subject_key_ids: subjects,
             cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
             scrub_signature_classical: None,
@@ -24238,7 +24249,10 @@ mod tests {
                 attestation_type: attestation_type::SCORES.into(),
                 weight: None,
                 expires_at: None,
-                attestation_envelope: env.clone(),
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    env.clone(),
+                )
+                .unwrap(),
                 subject_key_ids: vec!["subject-c".into()],
                 cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
                 scrub_signature_classical: Some(sig_classical),
@@ -24287,10 +24301,13 @@ mod tests {
                 attestation_type: attestation_type::SCORES.into(),
                 weight: None,
                 expires_at: None,
-                attestation_envelope: serde_json::json!({
-                    "id": "rev-bad", "dimension": "consent:state:revoked:v1",
-                    "score": 1.0, "confidence": 0.9,
-                }),
+                attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                    serde_json::json!({
+                        "id": "rev-bad", "dimension": "consent:state:revoked:v1",
+                        "score": 1.0, "confidence": 0.9,
+                    }),
+                )
+                .unwrap(),
                 subject_key_ids: vec!["subject-c".into()],
                 cohort_scope: crate::federation::types::cohort_scope::SELF.to_string(),
                 scrub_signature_classical: Some("AAAA".into()),
@@ -24978,7 +24995,10 @@ mod tests {
     async fn sqlite_local_requires_dimension() {
         let backend = fresh_backend_with_occurrence("occ").await;
         let mut input = local_input("occ", SCORES, "identity_binding:v1", vec![]);
-        input.attestation_envelope = serde_json::json!({"id": "x", "score": 1.0}); // no dimension
+        input.attestation_envelope = crate::federation::envelope::EnvelopeCore::from_value(
+            serde_json::json!({"id": "x", "score": 1.0}),
+        )
+        .unwrap(); // no dimension
         let err = backend.attestation_upsert_local(input).await.unwrap_err();
         assert!(
             matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("dimension")),
