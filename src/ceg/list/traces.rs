@@ -30,6 +30,17 @@ use crate::schema::{ReasoningEventType, TraceLevel};
 pub struct TraceSummary {
     /// Stable trace identifier.
     pub trace_id: String,
+    /// v20.1.0 (CIRISPersist#498) — the emitter's REGISTERED federation
+    /// `key_id`: the key that SIGNED this trace (`signing_key_id`, stamped
+    /// on every row at decompose). Under `VerifyMode::Full` this key was
+    /// resolved FROM `federation_keys` at verify time, so registration is
+    /// guaranteed by construction — a consumer scoring the agent attests
+    /// about THIS identity (FK-valid, anti-Goodhart-valid: subject IS the
+    /// agent's key, distinct from the scorer's). `None` only on
+    /// `TrustPreVerified` relay corpora whose producer key has not
+    /// federated to this node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_key_id: Option<String>,
     /// Thought-iteration identifier within the trace.
     pub thought_id: String,
     /// Optional originating task identifier.

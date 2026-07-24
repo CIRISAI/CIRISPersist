@@ -3350,6 +3350,42 @@ impl PyEngine {
     /// contract: `{"manifest_json": …, "sha256": …}` (universal envelope
     /// paths + consent-dimension prefixes). Served on `/v1/health` beside
     /// the other contract hashes; consumer tests assert it.
+    /// v20.1.0 (CIRISPersist#478) — one-time idempotent backfill: mint the
+    /// envelope-native trace attestation for every pre-18.0 trace with
+    /// projection rows but no attestation. Returns the report as JSON
+    /// (`minted`, `skipped: [(trace_id, kind)]`). Re-running converges
+    /// (same deterministic ids as the live mint).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    fn backfill_trace_attestations(&self, py: Python<'_>) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let backend = self.backend.clone();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            py.detach(move || {
+                let backend = match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(b) => {
+                        crate::engine::BackendDispatch::Postgres(b.clone())
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+                };
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    let report = engine
+                        .backfill_trace_attestations()
+                        .await
+                        .map_err(federation_err_to_py)?;
+                    serde_json::to_string(&report).map_err(|e| {
+                        PyRuntimeError::new_err(format!("backfill report serialize: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
     fn envelope_vocabulary(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         catch_panic(|| {
             let out = PyDict::new(py);

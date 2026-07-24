@@ -13101,6 +13101,7 @@ static SQLITE_TRACE_SUMMARY_SELECT: std::sync::LazyLock<String> = std::sync::Laz
              MIN(schema_version) AS schema_version, \
              MIN(signature_verified) AS signature_verified, \
              MIN(cognitive_state) AS cognitive_state, \
+             MIN(signing_key_id) AS agent_key_id, \
              {payload}, \
              MAX(cost_llm_calls) AS llm_calls, \
              MAX(cost_tokens) AS tokens_total, \
@@ -13145,6 +13146,7 @@ fn sqlite_row_to_trace_summary(
     let thought_depth: Option<i64> = row.get("thought_depth")?;
     Ok(crate::read::TraceSummary {
         trace_id: row.get("trace_id")?,
+        agent_key_id: row.get("agent_key_id")?,
         thought_id: row.get("thought_id")?,
         task_id: row.get("task_id")?,
         agent_id_hash: row.get("agent_id_hash")?,
@@ -27493,6 +27495,9 @@ mod tests {
             .unwrap();
         assert_eq!(summary.trace_id, "tr-A");
         assert_eq!(summary.agent_id_hash, "agent-h");
+        // v20.1.0 (#498) — the emitter's REGISTERED federation key rides
+        // the summary: the scorer's FK-valid, anti-Goodhart-valid subject.
+        assert_eq!(summary.agent_key_id.as_deref(), Some("key-1"));
         assert_eq!(summary.agent_name.as_deref(), Some("Scout"));
         assert_eq!(summary.task_id.as_deref(), Some("qa_en_3"));
         assert_eq!(summary.thought_depth, Some(0));

@@ -13197,6 +13197,7 @@ static TRACE_SUMMARY_SELECT: std::sync::LazyLock<String> = std::sync::LazyLock::
          MIN(schema_version) AS schema_version, \
          BOOL_AND(signature_verified) AS signature_verified, \
          MIN(cognitive_state) AS cognitive_state, \
+         MIN(signing_key_id) AS agent_key_id, \
          {payload}, \
          MAX(cost_llm_calls) AS llm_calls, \
          MAX(cost_tokens) AS tokens_total, \
@@ -13231,6 +13232,7 @@ fn pg_row_to_trace_summary(
         thought_id: row.safe_get("thought_id")?,
         task_id: row.safe_get("task_id")?,
         agent_id_hash: row.safe_get("agent_id_hash")?,
+        agent_key_id: row.safe_get("agent_key_id")?,
         agent_name: row.safe_get("agent_name")?,
         agent_role: row.safe_get("agent_role")?,
         deployment_domain: row.safe_get("deployment_domain")?,
@@ -18402,6 +18404,8 @@ mod tests {
             .expect("summary present");
         assert_eq!(s.trace_id, tid);
         assert_eq!(s.agent_id_hash, "agent-rt");
+        // v20.1.0 (#498) — the emitter's registered key rides the summary.
+        assert_eq!(s.agent_key_id.as_deref(), Some("test-key"));
         assert_eq!(s.agent_name.as_deref(), Some("Scout"));
         assert_eq!(s.deployment_domain.as_deref(), Some("moderation"));
         assert!(s.signature_verified);
