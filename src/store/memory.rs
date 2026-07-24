@@ -1897,6 +1897,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // non-conformant per CC 5.3.2.4.3.1).
         crate::federation::verify_federation_tier_ingest(self, &row).await?;
 
+        // v21.0.0 (#501) — capture the inbound trace projection while `row`
+        // is still owned (before the write closure consumes it).
+        let projected_trace =
+            crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope);
+
         // v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — a `revoked`
         // consent_record at local tier MAY *transit* the local write path
         // only if its bound-hybrid signature verifies (accept on VALID crypto
@@ -1906,61 +1911,87 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // Backend-symmetric with SQLite + Postgres.
         crate::federation::admission::verify_consent_record_transit_ingest(self, &row).await?;
 
-        let mut state = self.state.lock().expect("memory backend lock");
-        // FK enforcement parity with postgres: both attesting_key_id
-        // and attested_key_id must exist in federation_keys.
-        let attesting_identity_type = match state.federation_keys.get(&row.attesting_key_id) {
-            Some(rec) => rec.identity_type.clone(),
-            None => {
+        {
+            let mut state = self.state.lock().expect("memory backend lock");
+            // FK enforcement parity with postgres: both attesting_key_id
+            // and attested_key_id must exist in federation_keys.
+            let attesting_identity_type = match state.federation_keys.get(&row.attesting_key_id) {
+                Some(rec) => rec.identity_type.clone(),
+                None => {
+                    return Err(crate::federation::Error::InvalidArgument(format!(
+                        "attesting_key_id {} does not exist in federation_keys",
+                        row.attesting_key_id
+                    )));
+                }
+            };
+            if !state.federation_keys.contains_key(&row.attested_key_id) {
                 return Err(crate::federation::Error::InvalidArgument(format!(
-                    "attesting_key_id {} does not exist in federation_keys",
-                    row.attesting_key_id
+                    "attested_key_id {} does not exist in federation_keys",
+                    row.attested_key_id
                 )));
             }
-        };
-        if !state.federation_keys.contains_key(&row.attested_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "attested_key_id {} does not exist in federation_keys",
-                row.attested_key_id
-            )));
-        }
 
-        // v2.4.0 (CIRISPersist#102 Ask 3) — admission gate. Default
-        // policy enforces the `accord:*` × `accord_holder` rule and
-        // the four-test operational-language gate on `scores`
-        // attestations; structural primitives are exempt. See
-        // `src/federation/admission.rs`.
-        let dim = crate::federation::admission::envelope_dimension(&row.attestation_envelope);
-        crate::federation::admission::DimensionAdmissionPolicy::default().check(
-            &row.attestation_type,
-            dim,
-            &attesting_identity_type,
-        )?;
+            // v2.4.0 (CIRISPersist#102 Ask 3) — admission gate. Default
+            // policy enforces the `accord:*` × `accord_holder` rule and
+            // the four-test operational-language gate on `scores`
+            // attestations; structural primitives are exempt. See
+            // `src/federation/admission.rs`.
+            let dim = crate::federation::admission::envelope_dimension(&row.attestation_envelope);
+            crate::federation::admission::DimensionAdmissionPolicy::default().check(
+                &row.attestation_type,
+                dim,
+                &attesting_identity_type,
+            )?;
 
-        // v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer
-        // dedup on `(references_attestation_id, attestation_type,
-        // attesting_key_id)`. A duplicate composer is a typed
-        // `Ok(())` no-op; the audit chain stays complete without
-        // accumulating replayed rows. Non-composers (scores,
-        // delegates_to) skip this branch.
-        if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
-            for existing in &state.federation_attestations {
-                if crate::federation::precedence::is_dedup_match(existing, &row) {
-                    return Ok(());
+            // v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer
+            // dedup on `(references_attestation_id, attestation_type,
+            // attesting_key_id)`. A duplicate composer is a typed
+            // `Ok(())` no-op; the audit chain stays complete without
+            // accumulating replayed rows. Non-composers (scores,
+            // delegates_to) skip this branch.
+            if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
+                for existing in &state.federation_attestations {
+                    if crate::federation::precedence::is_dedup_match(existing, &row) {
+                        return Ok(());
+                    }
                 }
             }
-        }
 
-        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
-        // v17.4.0 (V106) — maintain the subject-index mirror.
-        for subj in &row.subject_key_ids {
-            state
-                .subject_index
-                .entry(subj.clone())
-                .or_default()
-                .push(row.attestation_id.clone());
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            // v17.4.0 (V106) — maintain the subject-index mirror.
+            for subj in &row.subject_key_ids {
+                state
+                    .subject_index
+                    .entry(subj.clone())
+                    .or_default()
+                    .push(row.attestation_id.clone());
+            }
+            state.federation_attestations.push(row);
+            // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
+            // `trace:complete:v1` attestation materializes its `trace_events`
+            // rows (via the SAME decompose the ingest path uses), so a
+            // replicated trace becomes scorer-readable through
+            // `list_trace_summaries`. Idempotent (the trace_events dedup index);
+            // inline form only (manifest payload is a fountain-fetch follow-up).
+            // Block-scoped: the MutexGuard ends HERE, before the projection
+            // awaits (drop() alone does not satisfy rustc's Send analysis).
         }
-        state.federation_attestations.push(row);
+        if let Some(decomposed) = projected_trace {
+            if !decomposed.events.is_empty() {
+                self.insert_trace_events_batch(&decomposed.events)
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!("trace projection: {e}"))
+                    })?;
+            }
+            if !decomposed.llm_calls.is_empty() {
+                self.insert_trace_llm_calls_batch(&decomposed.llm_calls)
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!("trace llm projection: {e}"))
+                    })?;
+            }
+        }
         Ok(())
     }
 
@@ -8042,7 +8073,11 @@ mod tests {
     async fn local_tier_rows_do_not_count_in_capability_walk_502e5() {
         use crate::federation::trust_root::trust_root_valid;
         let backend = MemoryBackend::new();
-        for (k, it) in [("e5-user", "user"), ("e5-root", "node"), ("e5-la", "accord_holder")] {
+        for (k, it) in [
+            ("e5-user", "user"),
+            ("e5-root", "node"),
+            ("e5-la", "accord_holder"),
+        ] {
             let mut rec = fix_key(k, "ref", k);
             rec.identity_type = it.to_owned();
             backend
@@ -8052,15 +8087,32 @@ mod tests {
         }
         // Build the full valid-root fixture but flip every capability row to
         // LOCAL tier — the walk must treat them as absent.
-        let mut charter = fix_charter("e5-c", "e5-root", serde_json::json!(["infra:serve", "infra:attest"]));
+        let mut charter = fix_charter(
+            "e5-c",
+            "e5-root",
+            serde_json::json!(["infra:serve", "infra:attest"]),
+        );
         charter.tier = crate::federation::types::attestation_tier::LOCAL.to_string();
         resign_fix(&mut charter);
-        backend.put_attestation(SignedAttestation { attestation: charter }).await.unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: charter,
+            })
+            .await
+            .unwrap();
 
-        let mut edge = fix_delegates_to("e5-e", "e5-user", "e5-root", serde_json::json!(["infra:serve"]));
+        let mut edge = fix_delegates_to(
+            "e5-e",
+            "e5-user",
+            "e5-root",
+            serde_json::json!(["infra:serve"]),
+        );
         edge.tier = crate::federation::types::attestation_tier::LOCAL.to_string();
         resign_fix(&mut edge);
-        backend.put_attestation(SignedAttestation { attestation: edge }).await.unwrap();
+        backend
+            .put_attestation(SignedAttestation { attestation: edge })
+            .await
+            .unwrap();
 
         let mut lc = fix_attestation("e5-lc", "e5-la", "e5-root", "e5-la");
         lc.attestation_envelope = serde_json::json!({
@@ -8069,9 +8121,14 @@ mod tests {
         lc.asserted_at = chrono::Utc::now();
         lc.tier = crate::federation::types::attestation_tier::LOCAL.to_string();
         resign_fix(&mut lc);
-        backend.put_attestation(SignedAttestation { attestation: lc }).await.unwrap();
+        backend
+            .put_attestation(SignedAttestation { attestation: lc })
+            .await
+            .unwrap();
 
-        let v = trust_root_valid(&backend, "e5-user", "e5-root").await.unwrap();
+        let v = trust_root_valid(&backend, "e5-user", "e5-root")
+            .await
+            .unwrap();
         assert!(!v.edge_exists, "local-tier edge must not count");
         assert!(!v.root_self_declares, "local-tier charter must not count");
         assert!(!v.lifecycle_active, "local-tier lifecycle must not count");

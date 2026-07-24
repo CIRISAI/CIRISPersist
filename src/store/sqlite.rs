@@ -3447,6 +3447,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // non-conformant per CC 5.3.2.4.3.1).
         crate::federation::verify_federation_tier_ingest(self, &row).await?;
 
+        // v21.0.0 (#501) — capture the inbound trace projection while `row`
+        // is still owned (before the write closure consumes it).
+        let projected_trace =
+            crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope);
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
@@ -3515,6 +3520,28 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::federation::Error::Backend(format!("insert attestation: {msg}"))
             }
         })?;
+        // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
+        // `trace:complete:v1` attestation materializes its `trace_events`
+        // rows (via the SAME decompose the ingest path uses), so a
+        // replicated trace becomes scorer-readable through
+        // `list_trace_summaries`. Idempotent (the trace_events dedup index);
+        // inline form only (manifest payload is a fountain-fetch follow-up).
+        if let Some(decomposed) = projected_trace {
+            if !decomposed.events.is_empty() {
+                self.insert_trace_events_batch(&decomposed.events)
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!("trace projection: {e}"))
+                    })?;
+            }
+            if !decomposed.llm_calls.is_empty() {
+                self.insert_trace_llm_calls_batch(&decomposed.llm_calls)
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!("trace llm projection: {e}"))
+                    })?;
+            }
+        }
         Ok(())
     }
 
