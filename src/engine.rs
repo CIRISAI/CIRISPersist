@@ -2116,6 +2116,86 @@ impl Engine {
         signer.self_enc_pubkeys()
     }
 
+    /// v21.0.0 (CIRISPersist#502 E4 followup) — put a `community` the NODE
+    /// authors, SELF-SIGNING the authority signature with the node's own
+    /// registered key. `put_community_json` (a local create-my-community
+    /// wheel API, not a wire path) uses this when the caller supplies no
+    /// authority signature — the node IS the authority for a community it
+    /// creates, so it signs the record's canonical form
+    /// (`ceg_produce_canonicalize(signing_envelope)`) exactly as the
+    /// admission gate re-verifies it.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_community_self_signed(
+        &self,
+        community: crate::federation::types::Community,
+    ) -> Result<(), crate::federation::Error> {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let authority_key_id = self
+            .local_derived_key_id()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("self-sign community: {e}")))?;
+        let canonical =
+            crate::verify::canonical::ceg_produce_canonicalize(&community.signing_envelope())
+                .map_err(|e| crate::federation::Error::Backend(format!("canonicalize: {e}")))?;
+        let sig = self
+            .sign_hybrid(&canonical)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("self-sign community: {e}")))?;
+        let signed = crate::federation::SignedCommunity {
+            community,
+            authority_key_id,
+            scrub_signature_classical: B64.encode(&sig.classical.signature),
+            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+        };
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::federation::FederationDirectory::put_community(&**b, signed).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::federation::FederationDirectory::put_community(&**b, signed).await
+            }
+        }
+    }
+
+    /// v21.0.0 (#502 E4 followup) — the `put_family` twin of
+    /// [`Self::put_community_self_signed`].
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn put_family_self_signed(
+        &self,
+        family: crate::federation::types::Family,
+    ) -> Result<(), crate::federation::Error> {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let authority_key_id = self
+            .local_derived_key_id()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("self-sign family: {e}")))?;
+        let canonical =
+            crate::verify::canonical::ceg_produce_canonicalize(&family.signing_envelope())
+                .map_err(|e| crate::federation::Error::Backend(format!("canonicalize: {e}")))?;
+        let sig = self
+            .sign_hybrid(&canonical)
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("self-sign family: {e}")))?;
+        let signed = crate::federation::SignedFamily {
+            family,
+            authority_key_id,
+            scrub_signature_classical: B64.encode(&sig.classical.signature),
+            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
+        };
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                crate::federation::FederationDirectory::put_family(&**b, signed).await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                crate::federation::FederationDirectory::put_family(&**b, signed).await
+            }
+        }
+    }
+
     /// v20.1.0 (CIRISPersist#478, envelope-native P5) — one-time idempotent
     /// BACKFILL: mint the envelope-native `scores` attestation for every
     /// pre-18.0 trace that has projection rows but no attestation.
@@ -5472,6 +5552,61 @@ mod tests {
     /// envelope-native attestation minted; re-running converges (same
     /// deterministic ids → no duplicates); an unregistered producer skips
     /// with honest accounting.
+    /// v21.0.0 (#502 E4 followup / #7) — the self-signing local create path:
+    /// a node registers its self key, then `put_community_self_signed`
+    /// authors + signs + admits a community it is the authority for — the
+    /// exact path `put_community_json` takes over the wheel when the caller
+    /// supplies no authority signature. Proves the node's registered key and
+    /// its signing key are the same (the two-signer split converges on a
+    /// software-seed engine), so the self-signature verifies at admission.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn put_community_self_signed_admits_502e4_followup() {
+        use crate::federation::FederationDirectory as _;
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        // Register the node's self key — the authority the community roots at.
+        let kid = engine
+            .register_self_federation_key(
+                "primitive",
+                "ref",
+                None,
+                serde_json::json!({}),
+                Vec::new(),
+            )
+            .await
+            .expect("register self");
+
+        let now: chrono::DateTime<chrono::Utc> = "2026-06-25T00:00:00Z".parse().unwrap();
+        let community = crate::federation::types::Community {
+            community_key_id: kid.clone(),
+            community_name: "T".into(),
+            members: vec![crate::federation::types::CommunityMember {
+                key_id: kid.clone(),
+                joined_at: now,
+                role: Some("founder".into()),
+            }],
+            founded_at: now,
+            consensus_protocol: "majority".into(),
+            policy_blob: None,
+            persist_row_hash: String::new(),
+        };
+        engine
+            .put_community_self_signed(community)
+            .await
+            .expect("(E4 followup) node self-signs + admits its own community");
+
+        // It exists + is readable.
+        let dir = engine.federation_directory();
+        let got = dir
+            .lookup_community(&kid)
+            .await
+            .expect("lookup")
+            .expect("present");
+        assert_eq!(got.community_key_id, kid);
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn backfill_trace_attestations_478() {

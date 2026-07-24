@@ -7703,35 +7703,42 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("family decode: {e}")))?;
             let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) =
                 extract_authority_fields(&value);
-            let signed = crate::federation::SignedFamily {
-                family,
-                authority_key_id,
-                scrub_signature_classical,
-                scrub_signature_pqc,
-            };
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_family(signed)
+            // v21.0.0 (#502 E4 followup) — self-sign when unsigned (node
+            // authors its own family; local API, not the wire). See
+            // put_community_json.
+            let self_sign = authority_key_id.is_empty();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let backend = self.backend.clone();
+            py.detach(move || {
+                let backend = match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(b) => {
+                        crate::engine::BackendDispatch::Postgres(b.clone())
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+                };
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    if self_sign {
+                        engine
+                            .put_family_self_signed(family)
                             .await
                             .map_err(federation_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_family(signed)
+                    } else {
+                        engine
+                            .federation_directory()
+                            .put_family(crate::federation::SignedFamily {
+                                family,
+                                authority_key_id,
+                                scrub_signature_classical,
+                                scrub_signature_pqc,
+                            })
                             .await
                             .map_err(federation_err_to_py)
-                    })
-                }
+                    }
+                })
             })
         })
     }
@@ -7762,35 +7769,45 @@ impl PyEngine {
                 .map_err(|e| PyValueError::new_err(format!("community decode: {e}")))?;
             let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) =
                 extract_authority_fields(&value);
-            let signed = crate::federation::SignedCommunity {
-                community,
-                authority_key_id,
-                scrub_signature_classical,
-                scrub_signature_pqc,
-            };
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_community(signed)
+            // v21.0.0 (#502 E4 followup) — self-sign when the caller supplies
+            // no authority signature: this is the NODE creating a community it
+            // is the authority for (a local wheel API, not a wire path), so the
+            // node signs the record's canonical form with its own registered
+            // key. A pre-signed payload (authority_key_id present) is used
+            // as-is.
+            let self_sign = authority_key_id.is_empty();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let backend = self.backend.clone();
+            py.detach(move || {
+                let backend = match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(b) => {
+                        crate::engine::BackendDispatch::Postgres(b.clone())
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+                };
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    if self_sign {
+                        engine
+                            .put_community_self_signed(community)
                             .await
                             .map_err(federation_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_community(signed)
+                    } else {
+                        engine
+                            .federation_directory()
+                            .put_community(crate::federation::SignedCommunity {
+                                community,
+                                authority_key_id,
+                                scrub_signature_classical,
+                                scrub_signature_pqc,
+                            })
                             .await
                             .map_err(federation_err_to_py)
-                    })
-                }
+                    }
+                })
             })
         })
     }
