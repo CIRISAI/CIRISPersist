@@ -5403,6 +5403,48 @@ impl PyEngine {
         })
     }
 
+    /// v21.0.0 (CIRISPersist#502 E7) — federation directory: the
+    /// revocation-folded `consent_peer_set` read. `node_key_id`'s live
+    /// `consent:replication:v1` peers, sorted + deduped, JSON array of
+    /// strings.
+    fn list_consent_peers(&self, py: Python<'_>, node_key_id: &str) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let node_key_id = node_key_id.to_owned();
+            py.detach(|| match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(pg) => {
+                    let backend = pg.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let peers = backend
+                            .list_consent_peers(&node_key_id)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&peers).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<String> JSON encode: {e}"))
+                        })
+                    })
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(sq) => {
+                    let backend = sq.clone();
+                    runtime.block_on(async move {
+                        use crate::federation::FederationDirectory;
+                        let peers = backend
+                            .list_consent_peers(&node_key_id)
+                            .await
+                            .map_err(federation_err_to_py)?;
+                        serde_json::to_string(&peers).map_err(|e| {
+                            PyRuntimeError::new_err(format!("Vec<String> JSON encode: {e}"))
+                        })
+                    })
+                }
+            })
+        })
+    }
+
     /// Federation directory: write a revocation.
     fn put_revocation(&self, py: Python<'_>, signed_revocation_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
@@ -5598,21 +5640,13 @@ impl PyEngine {
     /// `key_directory_json` = `[ThresholdMember]`; `root_stewards_json` =
     /// `[String]`. Runs the four admission checks (skew-bound, no-payment-
     /// processor, role authority, fail-closed).
-    fn put_organization(
-        &self,
-        py: Python<'_>,
-        signed_json: &str,
-        key_directory_json: &str,
-        root_stewards_json: &str,
-    ) -> PyResult<()> {
+    fn put_organization(&self, py: Python<'_>, signed_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let signed: crate::federation::SignedOrganization = serde_json::from_str(signed_json)
                 .map_err(|e| {
                 PyValueError::new_err(format!("SignedOrganization JSON decode: {e}"))
             })?;
-            let (key_directory, root_stewards) =
-                decode_role_authority_inputs(key_directory_json, root_stewards_json)?;
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
@@ -5621,7 +5655,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_organization(signed, &key_directory, &root_stewards)
+                            .put_organization(signed)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -5632,7 +5666,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_organization(signed, &key_directory, &root_stewards)
+                            .put_organization(signed)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -5645,21 +5679,13 @@ impl PyEngine {
     /// gated; CEG 1.0-RC2 §5.6.8.13). Same arg shape as
     /// [`put_organization`](Self::put_organization); `signed_json` =
     /// `SignedOrgMembership`.
-    fn put_org_membership(
-        &self,
-        py: Python<'_>,
-        signed_json: &str,
-        key_directory_json: &str,
-        root_stewards_json: &str,
-    ) -> PyResult<()> {
+    fn put_org_membership(&self, py: Python<'_>, signed_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let signed: crate::federation::SignedOrgMembership = serde_json::from_str(signed_json)
                 .map_err(|e| {
                     PyValueError::new_err(format!("SignedOrgMembership JSON decode: {e}"))
                 })?;
-            let (key_directory, root_stewards) =
-                decode_role_authority_inputs(key_directory_json, root_stewards_json)?;
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
@@ -5668,7 +5694,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_org_membership(signed, &key_directory, &root_stewards)
+                            .put_org_membership(signed)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -5679,7 +5705,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_org_membership(signed, &key_directory, &root_stewards)
+                            .put_org_membership(signed)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -5694,21 +5720,12 @@ impl PyEngine {
     /// `steward_roster_json` = `[ThresholdMember]` (the pinned roster the
     /// quorum verifies against). Runs skew-bound, no-payment-processor,
     /// set-semantics-sorted, quorum, and revision anti-rollback.
-    fn put_partner_record(
-        &self,
-        py: Python<'_>,
-        signed_json: &str,
-        steward_roster_json: &str,
-    ) -> PyResult<()> {
+    fn put_partner_record(&self, py: Python<'_>, signed_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let signed: crate::federation::SignedPartnerRecord = serde_json::from_str(signed_json)
                 .map_err(|e| {
                     PyValueError::new_err(format!("SignedPartnerRecord JSON decode: {e}"))
-                })?;
-            let roster: Vec<ciris_verify_core::threshold::ThresholdMember> =
-                serde_json::from_str(steward_roster_json).map_err(|e| {
-                    PyValueError::new_err(format!("steward_roster JSON decode: {e}"))
                 })?;
             let runtime = self.runtime.clone();
             py.detach(move || match &self.backend {
@@ -5718,7 +5735,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_partner_record(signed, &roster)
+                            .put_partner_record(signed)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -5729,7 +5746,7 @@ impl PyEngine {
                     runtime.block_on(async move {
                         use crate::federation::FederationDirectory;
                         backend
-                            .put_partner_record(signed, &roster)
+                            .put_partner_record(signed)
                             .await
                             .map_err(federation_err_to_py)
                     })
@@ -7664,39 +7681,64 @@ impl PyEngine {
     ///   "founded_at":                   "<rfc3339>",
     ///   "consensus_protocol":           "founder_only"|"unanimous"|"majority"|
     ///                                   "quorum:m/n"|"weighted:rubric"|"custom:id",
-    ///   "consensus_protocol_entrenched": false
+    ///   "consensus_protocol_entrenched": false,
+    ///   "authority_key_id":             "<federation_keys.key_id>",
+    ///   "scrub_signature_classical":    "<base64 ed25519 sig over JCS(the
+    ///                                    object above minus these 3 fields)>",
+    ///   "scrub_signature_pqc":          "<base64 ML-DSA-65 sig over
+    ///                                    canonical || ed25519_sig>"
     /// }
     /// ```
+    /// v21.0.0 (CIRISPersist#502 E4) — the last 3 fields are additive
+    /// (omit ⇒ empty/`None`) but now REQUIRED for admission: `put_family`
+    /// hybrid-Strict-verifies them before any write; a caller with no
+    /// authority signature is rejected fail-closed.
     fn put_family_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
-            let family: crate::federation::Family = serde_json::from_str(payload_json)
+            let value: serde_json::Value = serde_json::from_str(payload_json)
                 .map_err(|e| PyValueError::new_err(format!("family decode: {e}")))?;
-            let signed = crate::federation::SignedFamily { family };
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_family(signed)
+            let family: crate::federation::Family = serde_json::from_value(value.clone())
+                .map_err(|e| PyValueError::new_err(format!("family decode: {e}")))?;
+            let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) =
+                extract_authority_fields(&value);
+            // v21.0.0 (#502 E4 followup) — self-sign when unsigned (node
+            // authors its own family; local API, not the wire). See
+            // put_community_json.
+            let self_sign = authority_key_id.is_empty();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let backend = self.backend.clone();
+            py.detach(move || {
+                let backend = match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(b) => {
+                        crate::engine::BackendDispatch::Postgres(b.clone())
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+                };
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    if self_sign {
+                        engine
+                            .put_family_self_signed(family)
                             .await
                             .map_err(federation_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_family(signed)
+                    } else {
+                        engine
+                            .federation_directory()
+                            .put_family(crate::federation::SignedFamily {
+                                family,
+                                authority_key_id,
+                                scrub_signature_classical,
+                                scrub_signature_pqc,
+                            })
                             .await
                             .map_err(federation_err_to_py)
-                    })
-                }
+                    }
+                })
             })
         })
     }
@@ -7712,36 +7754,60 @@ impl PyEngine {
     /// the family path, `persist_row_hash` is backend-computed (pass `""`),
     /// and `community_key_id` + each member `key_id` must FK a registered
     /// `federation_keys` row.
+    ///
+    /// v21.0.0 (CIRISPersist#502 E4) — the payload additionally carries
+    /// `authority_key_id` / `scrub_signature_classical` / (optional)
+    /// `scrub_signature_pqc`, same shape as [`Self::put_family_json`];
+    /// `put_community` hybrid-Strict-verifies them before any write.
     fn put_community_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
-            let community: crate::federation::Community = serde_json::from_str(payload_json)
+            let value: serde_json::Value = serde_json::from_str(payload_json)
                 .map_err(|e| PyValueError::new_err(format!("community decode: {e}")))?;
-            let signed = crate::federation::SignedCommunity { community };
-            py.detach(move || match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(pg) => {
-                    let backend = pg.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_community(signed)
+            let community: crate::federation::Community = serde_json::from_value(value.clone())
+                .map_err(|e| PyValueError::new_err(format!("community decode: {e}")))?;
+            let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) =
+                extract_authority_fields(&value);
+            // v21.0.0 (#502 E4 followup) — self-sign when the caller supplies
+            // no authority signature: this is the NODE creating a community it
+            // is the authority for (a local wheel API, not a wire path), so the
+            // node signs the record's canonical form with its own registered
+            // key. A pre-signed payload (authority_key_id present) is used
+            // as-is.
+            let self_sign = authority_key_id.is_empty();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            let backend = self.backend.clone();
+            py.detach(move || {
+                let backend = match &backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(b) => {
+                        crate::engine::BackendDispatch::Postgres(b.clone())
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(b) => crate::engine::BackendDispatch::Sqlite(b.clone()),
+                };
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    if self_sign {
+                        engine
+                            .put_community_self_signed(community)
                             .await
                             .map_err(federation_err_to_py)
-                    })
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(sq) => {
-                    let backend = sq.clone();
-                    runtime.block_on(async move {
-                        use crate::federation::FederationDirectory;
-                        backend
-                            .put_community(signed)
+                    } else {
+                        engine
+                            .federation_directory()
+                            .put_community(crate::federation::SignedCommunity {
+                                community,
+                                authority_key_id,
+                                scrub_signature_classical,
+                                scrub_signature_pqc,
+                            })
                             .await
                             .map_err(federation_err_to_py)
-                    })
-                }
+                    }
+                })
             })
         })
     }
@@ -18351,10 +18417,18 @@ impl PyEngine {
             _ => None,
         };
         use crate::federation::cohort::Cohort;
+        // v21.0.0 (#502 E4) note: supersede writes via `supersede_group_row`,
+        // NOT the newly-gated `put_family`/`put_community` — the wrapper's
+        // authority fields are unused on this path (its OWN authority check
+        // is `authorization_json` above), so empty placeholders satisfy the
+        // type only.
         let family: Option<crate::federation::SignedFamily> = match cohort {
             Cohort::Family => Some(crate::federation::SignedFamily {
                 family: serde_json::from_str(new_group_json)
                     .map_err(|e| PyValueError::new_err(format!("supersede family JSON: {e}")))?,
+                authority_key_id: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
             }),
             _ => None,
         };
@@ -18364,6 +18438,9 @@ impl PyEngine {
             Cohort::Community | Cohort::Affiliations => Some(crate::federation::SignedCommunity {
                 community: serde_json::from_str(new_group_json)
                     .map_err(|e| PyValueError::new_err(format!("supersede community JSON: {e}")))?,
+                authority_key_id: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
             }),
             _ => None,
         };
@@ -18633,10 +18710,18 @@ impl PyEngine {
             serde_json::from_str(signatures_json)
                 .map_err(|e| PyValueError::new_err(format!("signatures_json: {e}")))?;
         use crate::federation::cohort::Cohort;
+        // v21.0.0 (#502 E4) note: supersede writes via `supersede_group_row`,
+        // NOT the newly-gated `put_family`/`put_community` — the wrapper's
+        // authority fields are unused on this path (its OWN authority check
+        // is the quorum verify below), so empty placeholders satisfy the
+        // type only.
         let family: Option<crate::federation::SignedFamily> = match cohort {
             Cohort::Family => Some(crate::federation::SignedFamily {
                 family: serde_json::from_str(new_group_json)
                     .map_err(|e| PyValueError::new_err(format!("supersede family JSON: {e}")))?,
+                authority_key_id: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
             }),
             _ => None,
         };
@@ -18645,6 +18730,9 @@ impl PyEngine {
             Cohort::Community | Cohort::Affiliations => Some(crate::federation::SignedCommunity {
                 community: serde_json::from_str(new_group_json)
                     .map_err(|e| PyValueError::new_err(format!("supersede community JSON: {e}")))?,
+                authority_key_id: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
             }),
             _ => None,
         };
@@ -24977,21 +25065,7 @@ enum OperationalKind {
 /// `put_organization` / `put_org_membership`: a JSON array of
 /// `ThresholdMember` (pinned hybrid pubkeys) + a JSON array of `String`
 /// root-steward key_ids.
-fn decode_role_authority_inputs(
-    key_directory_json: &str,
-    root_stewards_json: &str,
-) -> PyResult<(
-    Vec<ciris_verify_core::threshold::ThresholdMember>,
-    Vec<String>,
-)> {
-    let key_directory: Vec<ciris_verify_core::threshold::ThresholdMember> =
-        serde_json::from_str(key_directory_json)
-            .map_err(|e| PyValueError::new_err(format!("key_directory JSON decode: {e}")))?;
-    let root_stewards: Vec<String> = serde_json::from_str(root_stewards_json)
-        .map_err(|e| PyValueError::new_err(format!("root_stewards JSON decode: {e}")))?;
-    Ok((key_directory, root_stewards))
-}
-
+///
 /// v5.1.0 (CIRISPersist#65) — FFI-internal operational-data list
 /// dispatchers (not exposed to Python; the `#[pyo3]` wrappers above call
 /// them). Kept out of the `#[pymethods]` block because they take the
@@ -25838,6 +25912,37 @@ fn base64_encode(bytes: &[u8]) -> String {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     B64.encode(bytes)
+}
+
+/// v21.0.0 (CIRISPersist#502 E4) — extract the additive `authority_key_id` /
+/// `scrub_signature_classical` / `scrub_signature_pqc` fields from a flat
+/// payload JSON `Value` (the SAME value also decoded into the bare
+/// `Family`/`Community`/etc. record — those types tolerate the extra fields,
+/// serde ignores unknown keys by default). Absent fields default to
+/// empty/`None`: an old/unsigned caller's payload decodes fine and is then
+/// rejected FAIL-CLOSED at `put_family`/`put_community` (empty
+/// authority_key_id never resolves; empty/absent signature never verifies) —
+/// never silently admitted.
+fn extract_authority_fields(value: &serde_json::Value) -> (String, String, Option<String>) {
+    let authority_key_id = value
+        .get("authority_key_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let scrub_signature_classical = value
+        .get("scrub_signature_classical")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let scrub_signature_pqc = value
+        .get("scrub_signature_pqc")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    (
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    )
 }
 
 /// #249 Cut G1 / CC 4.4.3.2.8 #308 — parse a cohort wire token

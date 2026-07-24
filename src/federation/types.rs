@@ -1878,11 +1878,51 @@ pub struct Family {
     pub persist_row_hash: String,
 }
 
+impl Family {
+    /// v21.0.0 (CIRISPersist#502 E4) — the canonical envelope an authority
+    /// signs to admit this record: `Family`'s own JSON with `persist_row_hash`
+    /// stripped (server-computed, never part of what's signed). `Family`
+    /// carries no pre-existing envelope/canonical form of its own (unlike
+    /// [`Attestation`]/[`Revocation`], which already had one) — this IS the
+    /// synthesized canonical the [`SignedFamily`] admission gate
+    /// (`verify_family_admission`) verifies over, and the SAME construction
+    /// test fixtures sign through ([`super::tier_ingest::test_support`]).
+    pub fn signing_envelope(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).expect("Family always serializes");
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("persist_row_hash");
+        }
+        v
+    }
+}
+
 /// Wraps a [`Family`] payload for write submission.
+///
+/// v21.0.0 (CIRISPersist#502 E4) — `authority_key_id` +
+/// `scrub_signature_classical` + `scrub_signature_pqc` are the closing half of
+/// the keyless-declaration hole: before this, a `Family` admitted on
+/// FK-existence alone (no proof ANYONE authored the declaration). Now
+/// `put_family` hybrid-Strict-verifies `scrub_signature_{classical,pqc}` over
+/// [`Family::signing_envelope`] against `authority_key_id`'s REGISTERED
+/// pubkeys (`verify_family_admission`) before any write. Additive fields
+/// (`#[serde(default)]`) — an old/unsigned payload decodes fine and then
+/// fails closed at admission (empty signer/signature never verifies).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignedFamily {
     /// The family record being submitted.
     pub family: Family,
+    /// The claimed authority — a `federation_keys.key_id` whose REGISTERED
+    /// pubkeys the scrub signature below must verify against.
+    #[serde(default)]
+    pub authority_key_id: String,
+    /// Ed25519 signature (base64) over `JCS(Family::signing_envelope())`.
+    #[serde(default)]
+    pub scrub_signature_classical: String,
+    /// ML-DSA-65 signature (base64) over the bound payload
+    /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects
+    /// (PQC-mandatory, CC 5.3.2.4.3.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
 }
 
 /// One member of a [`Community`] — an IDENTITY key plus when they
@@ -1945,11 +1985,43 @@ pub struct Community {
     pub persist_row_hash: String,
 }
 
+impl Community {
+    /// v21.0.0 (CIRISPersist#502 E4) — the canonical envelope an authority
+    /// signs to admit this record. Same construction as
+    /// [`Family::signing_envelope`] (`Community`'s own JSON,
+    /// `persist_row_hash` stripped) — `Community` also carries no
+    /// pre-existing envelope form, so this is a synthesized canonical.
+    pub fn signing_envelope(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).expect("Community always serializes");
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("persist_row_hash");
+        }
+        v
+    }
+}
+
 /// Wraps a [`Community`] payload for write submission.
+///
+/// v21.0.0 (CIRISPersist#502 E4) — structural mirror of [`SignedFamily`]'s
+/// authority-signature fields; `put_community` hybrid-Strict-verifies
+/// `scrub_signature_{classical,pqc}` over [`Community::signing_envelope`]
+/// against `authority_key_id`'s REGISTERED pubkeys (`verify_community_admission`)
+/// before any write. Additive (`#[serde(default)]`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignedCommunity {
     /// The community record being submitted.
     pub community: Community,
+    /// The claimed authority — a `federation_keys.key_id` whose REGISTERED
+    /// pubkeys the scrub signature below must verify against.
+    #[serde(default)]
+    pub authority_key_id: String,
+    /// Ed25519 signature (base64) over `JCS(Community::signing_envelope())`.
+    #[serde(default)]
+    pub scrub_signature_classical: String,
+    /// ML-DSA-65 signature (base64) over the bound payload
+    /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
 }
 
 // ─── v4.8.0 (CIRISPersist#161, CEG §11.7.1) — Option-A forward-secrecy
@@ -2073,11 +2145,49 @@ pub struct FamilyMembershipRevocation {
     pub persist_row_hash: String,
 }
 
+impl FamilyMembershipRevocation {
+    /// v21.0.0 (CIRISPersist#502 E4) — the canonical envelope an authority
+    /// signs to admit this removal: this record's own JSON with
+    /// `persist_row_hash` stripped. Synthesized (no pre-existing envelope
+    /// form) — see [`Family::signing_envelope`]. THE load-bearing gate:
+    /// before this, a removal admitted on FK-existence alone, so any linked
+    /// peer could forge `{family_key_id: victim-family, removed_identity_key_id:
+    /// victim-member}` — a targeted de-family DoS.
+    pub fn signing_envelope(&self) -> serde_json::Value {
+        let mut v =
+            serde_json::to_value(self).expect("FamilyMembershipRevocation always serializes");
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("persist_row_hash");
+        }
+        v
+    }
+}
+
 /// Wraps a [`FamilyMembershipRevocation`] for write submission.
+///
+/// v21.0.0 (CIRISPersist#502 E4) — authority-signature fields, structural
+/// mirror of [`SignedFamily`]'s. `put_family_membership_revocation`
+/// hybrid-Strict-verifies `scrub_signature_{classical,pqc}` over
+/// [`FamilyMembershipRevocation::signing_envelope`] against
+/// `authority_key_id`'s REGISTERED pubkeys
+/// (`verify_family_membership_revocation_admission`) before any write.
+/// Additive (`#[serde(default)]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedFamilyMembershipRevocation {
     /// The revocation being submitted.
     pub family_membership_revocation: FamilyMembershipRevocation,
+    /// The claimed authority — a `federation_keys.key_id` whose REGISTERED
+    /// pubkeys the scrub signature below must verify against.
+    #[serde(default)]
+    pub authority_key_id: String,
+    /// Ed25519 signature (base64) over
+    /// `JCS(FamilyMembershipRevocation::signing_envelope())`.
+    #[serde(default)]
+    pub scrub_signature_classical: String,
+    /// ML-DSA-65 signature (base64) over the bound payload
+    /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
 }
 
 /// Removes one identity from a V060 community roster. Structural mirror
@@ -2103,11 +2213,49 @@ pub struct CommunityMembershipRevocation {
     pub persist_row_hash: String,
 }
 
+impl CommunityMembershipRevocation {
+    /// v21.0.0 (CIRISPersist#502 E4) — the canonical envelope an authority
+    /// signs to admit this removal. Synthesized, same construction as
+    /// [`FamilyMembershipRevocation::signing_envelope`]. THE worst-case E4
+    /// hole: a forged community-membership removal rotates the CC 4.4.3.2.2
+    /// community DEK epoch on write — an unauthenticated forward-secrecy DoS
+    /// (every future community write re-keys away from the real members too).
+    pub fn signing_envelope(&self) -> serde_json::Value {
+        let mut v =
+            serde_json::to_value(self).expect("CommunityMembershipRevocation always serializes");
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("persist_row_hash");
+        }
+        v
+    }
+}
+
 /// Wraps a [`CommunityMembershipRevocation`] for write submission.
+///
+/// v21.0.0 (CIRISPersist#502 E4) — authority-signature fields, structural
+/// mirror of [`SignedFamilyMembershipRevocation`]'s.
+/// `put_community_membership_revocation` hybrid-Strict-verifies
+/// `scrub_signature_{classical,pqc}` over
+/// [`CommunityMembershipRevocation::signing_envelope`] against
+/// `authority_key_id`'s REGISTERED pubkeys
+/// (`verify_community_membership_revocation_admission`) before any write —
+/// BEFORE the CC 4.4.3.2.2 DEK epoch bump. Additive (`#[serde(default)]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedCommunityMembershipRevocation {
     /// The revocation being submitted.
     pub community_membership_revocation: CommunityMembershipRevocation,
+    /// The claimed authority — a `federation_keys.key_id` whose REGISTERED
+    /// pubkeys the scrub signature below must verify against.
+    #[serde(default)]
+    pub authority_key_id: String,
+    /// Ed25519 signature (base64) over
+    /// `JCS(CommunityMembershipRevocation::signing_envelope())`.
+    #[serde(default)]
+    pub scrub_signature_classical: String,
+    /// ML-DSA-65 signature (base64) over the bound payload
+    /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
 }
 
 /// v4.10.0 (CIRISPersist#154, CEG 0.8 §5.6.8.11 / §0.8.1) — a subject's
@@ -2141,11 +2289,45 @@ pub struct LocationProof {
     pub persist_row_hash: String,
 }
 
+impl LocationProof {
+    /// v21.0.0 (CIRISPersist#502 E4) — the canonical envelope an authority
+    /// signs to admit this claim. Synthesized (no pre-existing envelope
+    /// form) — same construction as [`Family::signing_envelope`].
+    pub fn signing_envelope(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).expect("LocationProof always serializes");
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("persist_row_hash");
+        }
+        v
+    }
+}
+
 /// Wraps a [`LocationProof`] for write submission.
+///
+/// v21.0.0 (CIRISPersist#502 E4) — authority-signature fields, structural
+/// mirror of [`SignedFamily`]'s. `put_location_proof` hybrid-Strict-verifies
+/// `scrub_signature_{classical,pqc}` over [`LocationProof::signing_envelope`]
+/// against `authority_key_id`'s REGISTERED pubkeys
+/// (`verify_location_proof_admission`) before any write. Additive
+/// (`#[serde(default)]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedLocationProof {
     /// The location proof being submitted.
     pub location_proof: LocationProof,
+    /// The claimed authority — a `federation_keys.key_id` whose REGISTERED
+    /// pubkeys the scrub signature below must verify against. Typically the
+    /// subject itself (`location_proof.subject_key_id`), but not enforced to
+    /// be — E4 closes "no signature at all", not "which identity may assert
+    /// a location for this subject" (a broader policy layer, out of scope).
+    #[serde(default)]
+    pub authority_key_id: String,
+    /// Ed25519 signature (base64) over `JCS(LocationProof::signing_envelope())`.
+    #[serde(default)]
+    pub scrub_signature_classical: String,
+    /// ML-DSA-65 signature (base64) over the bound payload
+    /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
 }
 
 /// One hybrid-pending federation row — minimum fields the sweep

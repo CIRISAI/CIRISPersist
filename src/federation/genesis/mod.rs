@@ -322,7 +322,12 @@ where
     {
         return Ok(()); // already entrenched (reboot) — idempotent no-op.
     }
-    dir.put_family(crate::federation::SignedFamily { family })
+    // v21.0.0 (CIRISPersist#502 E4) — `put_family` now hybrid-Strict-verifies
+    // an authority signature; the baked HUMANITY_ACCORD family is a
+    // bake-what-exists declaration with no private key to sign with
+    // (`family_key_id` is keyless by design, see `put_family_local`'s doc).
+    // Use the trusted-local bypass, exactly as this boot path always has.
+    dir.put_family_local(family)
         .await
         .map_err(|e| format!("seed accord family: {e} (are A1/B1/C1 seeded first?)"))
 }
@@ -849,7 +854,7 @@ mod tests {
     #[tokio::test]
     async fn seeded_accord_family_resolves_and_is_idempotent() {
         use crate::federation::types::{Family, FamilyMember};
-        use crate::federation::{FederationDirectory, SignedFamily};
+        use crate::federation::FederationDirectory;
         use crate::store::backend::Backend as _;
         use crate::store::sqlite::SqliteBackend;
 
@@ -878,6 +883,15 @@ mod tests {
             .expect("idempotent re-seed");
 
         // The v13.3.0 invariant: a family with an UNREGISTERED member is refused.
+        // v21.0.0 (#502 E4) — sign with a dedicated, freshly-registered
+        // authority key (NOT A1/B1/C1 — those carry REAL ceremony pubkeys the
+        // test's deterministic `sign_envelope` cannot sign for) so the new
+        // admission gate passes and the unregistered-MEMBER check fires.
+        crate::federation::tier_ingest::test_support::register_hybrid_key(
+            &backend,
+            "test-fam-authority",
+        )
+        .await;
         let bad = Family {
             family_key_id: "test-fam".into(),
             family_name: "T".into(),
@@ -892,7 +906,10 @@ mod tests {
             persist_row_hash: String::new(),
         };
         let err = backend
-            .put_family(SignedFamily { family: bad })
+            .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                "test-fam-authority",
+                bad,
+            ))
             .await
             .expect_err("a family with an unregistered member must be refused");
         assert!(

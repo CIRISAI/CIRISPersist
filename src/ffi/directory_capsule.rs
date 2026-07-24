@@ -653,6 +653,14 @@ pub enum DirectoryOp {
         /// The delegation scope token (e.g. `infra:serve`).
         scope: String,
     },
+    /// [`FederationDirectory::list_consent_peers`] (v21.0.0,
+    /// CIRISPersist#502 E7) — the revocation-folded `consent_peer_set`
+    /// read: `node_key_id`'s live `consent:replication:v1` peers. Result
+    /// rides `ConsentPeers`. APPEND-ONLY.
+    ListConsentPeers {
+        /// The granting node whose live peer set is asked for.
+        node_key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -762,6 +770,9 @@ pub enum DirectoryOpResult {
     /// grant, or `None` if the subject holds the scope from no trusted
     /// root. APPEND-ONLY.
     TrustedGrant(Option<crate::federation::trust_root::TrustedGrant>),
+    /// `list_consent_peers` (v21.0.0, #502 E7) — the revocation-folded
+    /// `consent_peer_set` peer list, sorted + deduped. APPEND-ONLY.
+    ConsentPeers(Vec<String>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1181,6 +1192,12 @@ pub async fn dispatch_directory_op(
         DirectoryOp::UpdatePeerPolicy { key_id, policy } => {
             match dir.update_peer_policy(&key_id, policy).await {
                 Ok(()) => DirectoryOpResult::Unit,
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListConsentPeers { node_key_id } => {
+            match dir.list_consent_peers(&node_key_id).await {
+                Ok(v) => DirectoryOpResult::ConsentPeers(v),
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
@@ -2583,6 +2600,23 @@ impl FederationDirectory for OpsDirectory {
             )),
         }
     }
+
+    /// v21.0.0 (#502 E7) — the revocation-folded `consent_peer_set` read
+    /// via the capsule.
+    async fn list_consent_peers(&self, node_key_id: &str) -> Result<Vec<String>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListConsentPeers {
+                node_key_id: node_key_id.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::ConsentPeers(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
     async fn list_family_membership_revocations_for(
         &self,
         family_key_id: &str,
@@ -2612,31 +2646,17 @@ impl FederationDirectory for OpsDirectory {
             method: "communities_containing",
         })
     }
-    async fn put_organization(
-        &self,
-        signed: SignedOrganization,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
-    ) -> Result<(), Error> {
+    async fn put_organization(&self, signed: SignedOrganization) -> Result<(), Error> {
         Err(Error::Unsupported {
             method: "put_organization",
         })
     }
-    async fn put_org_membership(
-        &self,
-        signed: SignedOrgMembership,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
-    ) -> Result<(), Error> {
+    async fn put_org_membership(&self, signed: SignedOrgMembership) -> Result<(), Error> {
         Err(Error::Unsupported {
             method: "put_org_membership",
         })
     }
-    async fn put_partner_record(
-        &self,
-        signed: SignedPartnerRecord,
-        steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
-    ) -> Result<(), Error> {
+    async fn put_partner_record(&self, signed: SignedPartnerRecord) -> Result<(), Error> {
         Err(Error::Unsupported {
             method: "put_partner_record",
         })

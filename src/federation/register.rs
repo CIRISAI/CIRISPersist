@@ -457,6 +457,21 @@ pub fn validate_registration_pubkey(record: &KeyRecord) -> Result<(), Error> {
     Ok(())
 }
 
+/// v21.0.0 (CIRISPersist#502 E2) — does this record claim a role-gated
+/// identity? Canonical / accord_holder / infra:attest / co-steward
+/// registrations have their OWN admission (m-of-n co-scrub / HW), enforced
+/// by `put_public_key`'s `check_*_role_admission` gates — the E2 peer-key
+/// proof-of-possession gate MUST NOT pre-empt them (it would reject a
+/// co-scrubbed canonical for lacking a self-PoP). E2 guards only the
+/// ungated peer-key insert path — "the paths that don't verify at all".
+pub fn record_is_role_gated(record: &KeyRecord) -> bool {
+    use crate::federation::types::identity_type as it;
+    record.claims_role(it::CANONICAL)
+        || record.claims_role(it::ACCORD_HOLDER)
+        || record.claims_role("infra:attest")
+        || it::CO_STEWARD_ROLES.iter().any(|r| record.claims_role(r))
+}
+
 /// Verify a [`KeyRecord`] registration against the §5.6.8.15 admission
 /// gate, BEFORE any store. Generic over [`FederationDirectory`] so it
 /// composes against any backend (postgres, sqlite, memory) — the
@@ -937,7 +952,11 @@ mod tests {
         // the trust gate; scrub_key_id = the revoked key, self-revoke).
         let now = chrono::Utc::now();
         let rev_envelope = serde_json::json!({"revokes": dereg_id});
-        let rev_canonical = ceg_produce_canonicalize(&rev_envelope).expect("canonicalize");
+        let _rev_canonical = ceg_produce_canonicalize(&rev_envelope).expect("canonicalize");
+        // v21.0.0 (#502 E1) — sign the revocation envelope with the
+        // revoking key's registered hybrid key so admission verifies it.
+        let (__rev_och, __rev_sc, __rev_sp) =
+            crate::federation::tier_ingest::test_support::sign_envelope(&dereg_id, &rev_envelope);
         let revocation = crate::federation::Revocation {
             revocation_id: uuid::Uuid::new_v4().to_string(),
             revoked_key_id: dereg_id.clone(),
@@ -945,10 +964,10 @@ mod tests {
             reason: Some("consent:replication withdrawn".to_owned()),
             revoked_at: now,
             effective_at: now,
-            revocation_envelope: rev_envelope,
-            original_content_hash: hex::encode(Sha256::digest(&rev_canonical)),
-            scrub_signature_classical: "AA".to_owned(),
-            scrub_signature_pqc: None,
+            revocation_envelope: rev_envelope.clone(),
+            original_content_hash: __rev_och,
+            scrub_signature_classical: __rev_sc,
+            scrub_signature_pqc: __rev_sp,
             scrub_key_id: dereg_id.clone(),
             scrub_timestamp: now,
             pqc_completed_at: None,

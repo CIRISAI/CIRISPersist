@@ -5,6 +5,110 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.0.0] — 2026-07-25 — the Registry-of-Record: replication admission is mechanistically CEG-driven (#501/#502)
+
+A full CEG→replication audit found the replication trust model was not
+end-to-end CEG-driven: six inbound `put_*` planes admitted records on
+FK-existence alone, a local-tier exemption poisoned the trust-root walk,
+and operational kinds verified against a caller-passed roster. This cut
+makes the invariant mechanical: **state changes only via a hybrid-Strict-
+verified claim by a signer resolved against our OWN registered directory —
+never sender-supplied material, a stored flag, a caller-passed roster, or
+bare FK existence** (FSD `CEG_REPLICATION_MODEL.md`).
+
+### Added — the Registry-of-Record spine (§4)
+
+`federation::replication_policy`: one `KindPolicy` per replicated
+`EnvelopeKind` (the closed 14-kind enum, persist-owned as the APPLY
+authority), resolved by an **exhaustive match** (a kind without a policy is
+a compile failure). Roots of trust are **`SignerSource` variants** — so
+"verify against sender-supplied material" is *unrepresentable*, not merely
+discouraged. `WireTier::FederationOnly` is the only tier (E5, by type).
+Exported as `REPLICATION_POLICY_MANIFEST` + pinned `REPLICATION_POLICY_HASH`
+with a gating witness — cross-repo drift (edge's wire enum, server's pins)
+is a build failure, the `WIRE_VOCABULARY_HASH` pattern.
+
+### Fixed — the classical edges (each with a forgery witness)
+
+- **E1** — `put_revocation` hybrid-verifies the scrub signature against the
+  **revoking** key's REGISTERED pubkeys (was FK + trust-score only; scrub
+  sig stored, never verified → forgeable targeted de-peer/trust DoS).
+- **E2** — the fresh replicated-key insert runs the hybrid PoP gate (was
+  TOFU: a self-consistent fake `SignedKeyRecord{identity_ref: victim,
+  pubkey: attacker}` was admitted and later attestations by it verified).
+  Scoped to ungated peer keys — canonical/accord/infra keep their m-of-n/HW
+  gates.
+- **E4** — the keyless-declaration planes (`Family`/`Community`/membership-
+  revocations/`LocationProof`) now carry + verify an authority signature at
+  admission (was FK-only; a forged community-membership removal rotated the
+  DEK epoch → forward-secrecy DoS). Producer counterpart (edge/server sign)
+  lands in lockstep — CIRISEdge#394/CIRISServer#319.
+- **E5** (the widest — under all 95 claim families) — the trust-root walks
+  (`trust_root_valid` / `capability_roots_to_trusted_root`) ignore
+  non-federation-tier rows (was: a local-tier `delegates_to` could forge
+  the capability gate the instant one reached `put_attestation` from the
+  wire).
+- **E7** — the consent peer-set is a persist projection with
+  `withdraws`/`recants` folded mechanically (`list_consent_peers`), so a
+  revoked `consent:replication` peer stops receiving replication (was:
+  server's peer read ignored revocation).
+- **E9** — the operational role/quorum authority resolves the steward
+  roster from persist's OWN registered `steward` keys, dropping the
+  caller-passed `key_directory`/`root_stewards`/`steward_roster` slices
+  (was: genuine crypto verified against a caller-supplied root of trust).
+  BREAKING: the 3 operational `put_*` trait methods + their PyO3 verbs drop
+  the roster params.
+
+### Fixed — #501: the corpus leg (the trace ship)
+
+A replicated `trace:complete:v1` attestation now materializes its
+`trace_events` rows via the SAME `decompose` the ingest path uses — so a
+trace that arrives over the mesh becomes scorer-readable through
+`list_trace_summaries` (was: replication carried the attestation surface
+but not the read surface → `n_summaries=0` forever). The projection is a
+feature of writing the claim, never a hand-duplicated second surface.
+
+### Test-isolation
+
+`operational::test_support::Identity` is now deterministic (seeded from
+key_id, matching `tier_ingest::hybrid_pubkeys`) so shared test key_ids
+register idempotently on the shared pg DB — the collision E9's
+directory-resolution exposed.
+
+### E4 follow-ups (fixed in the same cut — no known defect shipped)
+
+- **Authority signature is PERSISTED** (V110): the E4 admission verify no
+  longer discards the signature — `authority_key_id` +
+  `scrub_signature_classical`/`pqc` are stored on all 5 keyless-plane
+  tables, so the durable record proves its own authorship (matching
+  `put_revocation`). No re-serve path consumes them yet; persisted for the
+  future serve path.
+- **`put_family_json`/`put_community_json` self-sign** when the caller
+  supplies no authority signature: the node is the authority for a group it
+  creates through this LOCAL wheel API (not a wire path), so it signs the
+  record's canonical form with its own registered key
+  (`Engine::put_{family,community}_self_signed`). Pre-signed payloads are
+  used as-is.
+- **Not a defect (reviewed, not fixed)**: `supersede_family`/
+  `supersede_community` are local-governance operations (the capsule proxy
+  returns `Unsupported` — never wire-reachable) and are quorum-gated where
+  it matters (`supersede_*_with_quorum`); the authority-signature edge
+  legitimately does not apply.
+
+### Cross-repo pins (edge + server assert; drift = build failure)
+
+- `REPLICATION_POLICY_HASH` (new) — the 14-kind admission policy manifest.
+- `ENVELOPE_VOCABULARY_SHA256`, `TRACE_SUMMARY_EXTRACTION_SHA256`,
+  `WIRE_VOCABULARY_HASH` (existing).
+
+### Lockstep counterpart (cross-repo, not persist)
+
+E4's producer-signing — edge/server must populate `authority_key_id` + the
+hybrid signature on `Signed{Family,Community,…}` before persist v21.0.0
+admits their family/community records (fail-closed). Filed:
+CIRISEdge#394 / CIRISServer#319.
+
+
 ## [20.1.0] — 2026-07-24 — the trace plane closes both directions: emitter identity on the summary (#498) + the P5 backfill (#478) + P4 projection-pinning (#477)
 
 ### Added — `TraceSummary.agent_key_id` (#498, the last blocker before the first trace ships)

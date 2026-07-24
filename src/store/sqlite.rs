@@ -2497,6 +2497,17 @@ impl SqliteBackend {
             ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
             ReplicatedKeyPlan::Refused => Ok(ReplicatedKeyOutcome::Refused),
             ReplicatedKeyPlan::Insert => {
+                // v21.0.0 (CIRISPersist#502 E2) — the fresh-key insert path
+                // ran NO proof-of-possession: a replicated first-sight
+                // `SignedKeyRecord{identity_ref: victim, pubkey: attacker}`
+                // was admitted TOFU, and later attestations by that key then
+                // verified. The Strict hybrid PoP gate (`verify_key_
+                // registration` — the SAME gate `register_federation_key`
+                // runs, and the upgrade branch already runs) now guards the
+                // insert too. Fail-closed before any write.
+                if !crate::federation::register::record_is_role_gated(&record.record) {
+                    crate::federation::verify_key_registration(self, &record.record).await?;
+                }
                 match crate::federation::FederationDirectory::put_public_key(self, record).await {
                     Ok(()) => Ok(ReplicatedKeyOutcome::Inserted),
                     // A row appeared between plan and act with different
@@ -3447,6 +3458,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // non-conformant per CC 5.3.2.4.3.1).
         crate::federation::verify_federation_tier_ingest(self, &row).await?;
 
+        // v21.0.0 (#501) — capture the inbound trace projection while `row`
+        // is still owned (before the write closure consumes it).
+        let projected_trace =
+            crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope);
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
@@ -3503,6 +3519,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 &row,
                 crate::federation::types::attestation_tier::FEDERATION,
             )?;
+            // v21.0.0 (CIRISPersist#502 E7) — maintain the consent_peer_set
+            // projection (grant upsert / withdraws-revocation fold) in the
+            // SAME locked scope as the insert above.
+            sqlite_project_consent_peer_set(&conn, &row)?;
             Ok(())
         })()
         .map_err(|e| {
@@ -3515,6 +3535,28 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::federation::Error::Backend(format!("insert attestation: {msg}"))
             }
         })?;
+        // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
+        // `trace:complete:v1` attestation materializes its `trace_events`
+        // rows (via the SAME decompose the ingest path uses), so a
+        // replicated trace becomes scorer-readable through
+        // `list_trace_summaries`. Idempotent (the trace_events dedup index);
+        // inline form only (manifest payload is a fountain-fetch follow-up).
+        if let Some(decomposed) = projected_trace {
+            if !decomposed.events.is_empty() {
+                self.insert_trace_events_batch(&decomposed.events)
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!("trace projection: {e}"))
+                    })?;
+            }
+            if !decomposed.llm_calls.is_empty() {
+                self.insert_trace_llm_calls_batch(&decomposed.llm_calls)
+                    .await
+                    .map_err(|e| {
+                        crate::federation::Error::Backend(format!("trace llm projection: {e}"))
+                    })?;
+            }
+        }
         Ok(())
     }
 
@@ -3580,6 +3622,28 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_by: {e}")))
     }
 
+    /// v21.0.0 (CIRISPersist#502 E7) — the revocation-folded
+    /// `consent_peer_set` read: `node_key_id`'s live peers, sorted +
+    /// deduped. The fold already happened at write time (see
+    /// `sqlite_project_consent_peer_set`), so this is a plain SELECT.
+    async fn list_consent_peers(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let node = node_key_id.to_owned();
+        (move || -> Result<Vec<String>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT peer_key_id FROM consent_peer_set \
+                 WHERE node_key_id = ?1 ORDER BY peer_key_id ASC",
+            )?;
+            let rows = stmt.query_map([&node], |r| r.get::<_, String>(0))?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_consent_peers: {e}")))
+    }
+
     async fn attestations_binding_content(
         &self,
         content_sha256: &str,
@@ -3641,6 +3705,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 gate.check_federation(&row.revoking_key_id).await?;
             }
         }
+
+        // v21.0.0 (CIRISPersist#502 E1) — mechanistic authorship: the
+        // revocation MUST be hybrid-Strict-signed by its declared revoking
+        // key, resolved from OUR registered directory (was FK + trust-score
+        // only; scrub sig stored, never verified → forgeable de-peer DoS).
+        crate::federation::verify_revocation_admission(self, &row).await?;
 
         // v3.11.0 (CIRISPersist#143) — region closed-set gate +
         // anti-rollback monotonicity. Both run BEFORE persist_row_hash
@@ -3993,7 +4063,52 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         family: crate::federation::SignedFamily,
     ) -> Result<(), crate::federation::Error> {
-        let mut row = family.family;
+        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
+        // other admission step. Hybrid-Strict vs the authority's registered
+        // pubkeys — was FK-existence only, a forgeable keyless declaration.
+        crate::federation::verify_family_admission(self, &family).await?;
+        let crate::federation::SignedFamily {
+            family: row,
+            authority_key_id,
+            scrub_signature_classical,
+            scrub_signature_pqc,
+        } = family;
+        let family_key_id = row.family_key_id.clone();
+        self.put_family_local(row).await?;
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded: the durable row had no home for it, so it couldn't
+        // prove its own authorship later). `put_family_local` (the
+        // genesis-bake bypass) is untouched — its INSERT leaves these
+        // columns NULL, correct for a legitimately-unsigned bake row; this
+        // UPDATE targets only the signed, gate-verified path.
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "UPDATE federation_families \
+                    SET authority_key_id = ?2, scrub_signature_classical = ?3, \
+                        scrub_signature_pqc = ?4 \
+                  WHERE family_key_id = ?1",
+                rusqlite::params![
+                    family_key_id,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                ],
+            )?;
+            Ok(())
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("store family authority signature: {e}"))
+        })?;
+        Ok(())
+    }
+
+    async fn put_family_local(
+        &self,
+        mut row: crate::federation::types::Family,
+    ) -> Result<(), crate::federation::Error> {
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
         // v13.3.0 (CIRISPersist#386) — the real invariant (replaces the dropped
         // family_key_id FK): every member key_id must be a registered key.
@@ -4454,6 +4569,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         community: crate::federation::SignedCommunity,
     ) -> Result<(), crate::federation::Error> {
+        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
+        // other admission step (mirrors put_family).
+        crate::federation::verify_community_admission(self, &community).await?;
         let mut row = community.community;
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
         // v4.11.0 (#154 Ask 4) — geographic cohort_subkind admission: every
@@ -4480,14 +4598,21 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             })?),
             None => None,
         };
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        let authority_key_id = community.authority_key_id;
+        let scrub_signature_classical = community.scrub_signature_classical;
+        let scrub_signature_pqc = community.scrub_signature_pqc;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_communities (\
                     community_key_id, community_name, members, founded_at, \
-                    consensus_protocol, policy_blob, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    consensus_protocol, policy_blob, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     row.community_key_id,
                     row.community_name,
@@ -4496,6 +4621,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.consensus_protocol,
                     policy_blob_json,
                     row.persist_row_hash,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
                 ],
             )?;
             Ok(())
@@ -5091,6 +5219,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         revocation: crate::federation::SignedFamilyMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
+        // other admission step.
+        crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
         let mut row = revocation.family_membership_revocation;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let witness = serde_json::to_string(&row.witness_set)
@@ -5105,14 +5236,21 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &row.removed_identity_key_id,
             row.effective_at,
         );
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        let authority_key_id = revocation.authority_key_id;
+        let scrub_signature_classical = revocation.scrub_signature_classical;
+        let scrub_signature_pqc = revocation.scrub_signature_pqc;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_family_membership_revocations (\
                     family_key_id, removed_identity_key_id, removed_at, effective_at, \
-                    reason, witness_set, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    reason, witness_set, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     row.family_key_id,
                     row.removed_identity_key_id,
@@ -5121,6 +5259,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.reason,
                     witness,
                     row.persist_row_hash,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
                 ],
             )?;
             Ok(())
@@ -5134,6 +5275,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         revocation: crate::federation::SignedCommunityMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
+        // other admission step. THE worst-case E4 hole: an unverified
+        // removal here rotates the community DEK epoch below — an
+        // unauthenticated forward-secrecy DoS.
+        crate::federation::verify_community_membership_revocation_admission(self, &revocation)
+            .await?;
         let mut row = revocation.community_membership_revocation;
         // SecReview F4 — community removal is immediate for forward-secrecy;
         // reject a future-dated effective_at BEFORE any write.
@@ -5154,6 +5301,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let removal_detail = serde_json::to_string(&removal_event.detail).map_err(|e| {
             crate::federation::Error::Backend(format!("hard_case detail serialize: {e}"))
         })?;
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        let authority_key_id = revocation.authority_key_id;
+        let scrub_signature_classical = revocation.scrub_signature_classical;
+        let scrub_signature_pqc = revocation.scrub_signature_pqc;
         let conn = self.conn.clone();
         // SecReview F5 — INSERT + hard_case + epoch bump in ONE transaction
         // under a single lock acquisition: a bump failure after the INSERT
@@ -5166,8 +5319,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             tx.execute(
                 "INSERT INTO federation_community_membership_revocations (\
                     community_key_id, removed_identity_key_id, removed_at, effective_at, \
-                    reason, witness_set, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    reason, witness_set, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     row.community_key_id,
                     row.removed_identity_key_id,
@@ -5176,6 +5330,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.reason,
                     witness,
                     row.persist_row_hash,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
                 ],
             )?;
             // Idempotent on the deterministic event_id.
@@ -5324,17 +5481,27 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         proof: crate::federation::SignedLocationProof,
     ) -> Result<(), crate::federation::Error> {
+        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
+        // other admission step.
+        crate::federation::verify_location_proof_admission(self, &proof).await?;
         let mut row = proof.location_proof;
         crate::federation::location::validate_location_cell(&row.cell_id, row.cell_resolution)?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
+        // signature the gate above already verified (was verified-then-
+        // discarded).
+        let authority_key_id = proof.authority_key_id;
+        let scrub_signature_classical = proof.scrub_signature_classical;
+        let scrub_signature_pqc = proof.scrub_signature_pqc;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
                 "INSERT INTO federation_location_proofs (\
                     subject_key_id, cell_id, cell_resolution, asserted_at, valid_until, \
-                    attestation_evidence, withdrawn_at, persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    attestation_evidence, withdrawn_at, persist_row_hash, \
+                    authority_key_id, scrub_signature_classical, scrub_signature_pqc\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     row.subject_key_id,
                     row.cell_id,
@@ -5344,6 +5511,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.attestation_evidence,
                     row.withdrawn_at.map(|t| t.to_rfc3339()),
                     row.persist_row_hash,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
                 ],
             )?;
             Ok(())
@@ -6135,8 +6305,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn put_organization(
         &self,
         signed: crate::federation::SignedOrganization,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::operational;
         let mut row = signed.organization;
@@ -6145,13 +6313,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
+        let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
         let current = self.list_org_memberships_for(&row.org_id).await?;
         operational::check_role_authority(
             &row.attesting_key_id,
             &row.org_id,
             &current,
-            key_directory,
-            root_stewards,
+            &__stw_dir,
+            &__stw_roots,
         )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let env_text = serde_json::to_string(&row.signed_envelope)
@@ -6197,8 +6366,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn put_org_membership(
         &self,
         signed: crate::federation::SignedOrgMembership,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::operational;
         let mut row = signed.org_membership;
@@ -6207,13 +6374,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
             &row.signed_envelope,
         )?;
+        let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
         let current = self.list_org_memberships_for(&row.org_id).await?;
         operational::check_role_authority(
             &row.attesting_key_id,
             &row.org_id,
             &current,
-            key_directory,
-            root_stewards,
+            &__stw_dir,
+            &__stw_roots,
         )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let env_text = serde_json::to_string(&row.signed_envelope)
@@ -6254,7 +6422,6 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn put_partner_record(
         &self,
         signed: crate::federation::SignedPartnerRecord,
-        steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
     ) -> Result<(), crate::federation::Error> {
         use crate::federation::operational;
         operational::check_skew_and_payment(
@@ -6262,7 +6429,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             chrono::Utc::now(),
             &signed.partner_record.signed_envelope,
         )?;
-        operational::check_partner_set_and_quorum(&signed, steward_roster)?;
+        let (__stw_dir, __stw_roots) = operational::resolve_steward_roster(self).await?;
+        let _ = &__stw_roots;
+        operational::check_partner_set_and_quorum(&signed, &__stw_dir)?;
         // Anti-rollback: revision MUST strictly exceed the existing max
         // for this license_id (enforced at admission, before any merge).
         let existing = self
@@ -12225,6 +12394,43 @@ fn sqlite_project_attestation_subjects(
     Ok(())
 }
 
+/// v21.0.0 (CIRISPersist#502 E7) — maintain the `consent_peer_set`
+/// projection for `row` on the given (already-locked) connection. A live
+/// `consent:replication:v1` grant upserts one row per `subject_key_ids[]`
+/// peer; a structural composer (`withdraws`/`recants`) whose
+/// `references_attestation_id` names a grant DELETEs every row this
+/// projection sourced from that grant. See
+/// `crate::federation::consent_peer_set` module docs.
+fn sqlite_project_consent_peer_set(
+    conn: &rusqlite::Connection,
+    row: &crate::federation::Attestation,
+) -> rusqlite::Result<()> {
+    if let Some(target_id) = crate::federation::consent_peer_set::revocation_fold_target(row) {
+        conn.execute(
+            "DELETE FROM consent_peer_set WHERE source_attestation_id = ?1",
+            rusqlite::params![target_id],
+        )?;
+        return Ok(());
+    }
+    if !crate::federation::consent_peer_set::is_consent_replication_grant(row) {
+        return Ok(());
+    }
+    for peer in &row.subject_key_ids {
+        conn.execute(
+            "INSERT OR REPLACE INTO consent_peer_set \
+                (node_key_id, peer_key_id, source_attestation_id, asserted_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                row.attesting_key_id,
+                peer,
+                row.attestation_id,
+                row.asserted_at.to_rfc3339(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn sqlite_row_to_attestation(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<crate::federation::Attestation> {
@@ -17685,6 +17891,49 @@ mod tests {
     /// (The rest of the #371 decision table runs Engine-level on both
     /// backends in `federation::register::tests::run_apply_replicated_matrix`;
     /// postgres twin of THIS anomaly test lives in `store::postgres::tests`.)
+    /// v21.0.0 (CIRISPersist#502 E2) — a fresh replicated key with an
+    /// INVALID proof-of-possession is REJECTED (was TOFU: a self-consistent
+    /// fake `SignedKeyRecord` inserted, later attestations by it verified).
+    #[tokio::test]
+    async fn forged_fresh_replicated_key_tofu_rejected_502e2() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        // A well-formed replicated key registration — valid PoP, admits.
+        let good = crate::federation::tier_ingest::test_support::replicated_key_record(
+            "e2-fresh", "node", "e2-fresh", "e2-fresh", "e2-nonce",
+        );
+        backend
+            .apply_replicated_key_record(crate::federation::SignedKeyRecord { record: good })
+            .await
+            .expect("(E2) valid-PoP fresh key admits");
+
+        // Forged: same self-consistent shape but the scrub signature is
+        // garbage → the Strict hybrid PoP gate rejects it before insert.
+        let mut forged = crate::federation::tier_ingest::test_support::replicated_key_record(
+            "e2-forged",
+            "node",
+            "e2-forged",
+            "e2-forged",
+            "e2-nonce2",
+        );
+        forged.scrub_signature_classical = "AAAA".into();
+        forged.scrub_signature_pqc = Some("AAAA".into());
+        let err = backend
+            .apply_replicated_key_record(crate::federation::SignedKeyRecord { record: forged })
+            .await
+            .expect_err("(E2) invalid-PoP fresh key must be rejected");
+        // Nothing was written.
+        assert!(
+            crate::federation::FederationDirectory::lookup_public_key(&backend, "e2-forged")
+                .await
+                .unwrap()
+                .is_none(),
+            "forged key left no trace, got err {}",
+            err.kind()
+        );
+    }
+
     #[tokio::test]
     async fn apply_replicated_key_record_ambiguous_owner_refused_sqlite() {
         use crate::federation::register::ReplicatedKeyOutcome;
@@ -17941,6 +18190,87 @@ mod tests {
         });
         resign_fed(&mut w); // envelope changed → re-sign (CC 5.3.2.4.3.1)
         w
+    }
+
+    /// Build a `consent:replication:v1` grant from `node` naming `peer` as
+    /// the sole `subject_key_ids` entry.
+    fn consent_grant(id: &str, node: &str, peer: &str) -> Attestation {
+        let mut g = fed_attestation(id, node, node, node);
+        g.attestation_envelope = serde_json::json!({
+            "dimension": crate::federation::consent_peer_set::DIMENSION,
+        });
+        g.subject_key_ids = vec![peer.to_string()];
+        resign_fed(&mut g); // envelope changed → re-sign (CC 5.3.2.4.3.1)
+        g
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E7) — the sqlite-path assertion of the
+    /// `consent_peer_set` revocation fold (memory-backend witness:
+    /// `consent_peer_set_folds_revocation_502e7`). A grant to peer P1 makes
+    /// `list_consent_peers` include P1; a `withdraws` referencing that
+    /// grant's `attestation_id` REMOVES P1; an untouched second grant to P2
+    /// survives.
+    #[tokio::test]
+    async fn consent_peer_set_folds_revocation_502e7_sqlite() {
+        use crate::federation::FederationDirectory;
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("node-e7", "node-e7", "node-e7"),
+            })
+            .await
+            .unwrap();
+
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: consent_grant("grant-e7-1", "node-e7", "peer-e7-1"),
+            })
+            .await
+            .expect("grant 1 admits");
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: consent_grant("grant-e7-2", "node-e7", "peer-e7-2"),
+            })
+            .await
+            .expect("grant 2 admits");
+
+        let peers = backend.list_consent_peers("node-e7").await.unwrap();
+        assert_eq!(
+            peers,
+            vec!["peer-e7-1".to_string(), "peer-e7-2".to_string()],
+            "both live grants must be visible, sorted"
+        );
+
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against("withdraw-e7-1", "node-e7", "grant-e7-1"),
+            })
+            .await
+            .expect("withdraws admits");
+
+        let peers_after = backend.list_consent_peers("node-e7").await.unwrap();
+        assert_eq!(
+            peers_after,
+            vec!["peer-e7-2".to_string()],
+            "peer-1's consent was withdrawn — it must disappear; peer-2 (untouched) survives"
+        );
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E7) — the sqlite leg of the shared
+    /// backend-parity witness (see `postgres::tests::
+    /// consent_peer_set_parity_postgres_502e7`); both call the SAME
+    /// `consent_peer_set::test_support::exercise_consent_peer_set_fold`
+    /// body, so the two backends cannot silently diverge on the fold.
+    #[tokio::test]
+    async fn consent_peer_set_parity_sqlite_502e7() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::consent_peer_set::test_support::exercise_consent_peer_set_fold(
+            &backend,
+            "sqlite-parity",
+        )
+        .await;
     }
 
     /// Build a `delegates_to` row from `granter` to `grantee` carrying
@@ -18371,8 +18701,9 @@ mod tests {
             ensure_key(&backend, k).await;
         }
         backend
-            .put_family(crate::federation::SignedFamily {
-                family: crate::federation::Family {
+            .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                &fam,
+                crate::federation::Family {
                     family_key_id: fam.clone(),
                     family_name: "Household".into(),
                     members: vec![crate::federation::types::FamilyMember {
@@ -18385,7 +18716,7 @@ mod tests {
                     consensus_protocol_entrenched: false,
                     persist_row_hash: String::new(),
                 },
-            })
+            ))
             .await
             .unwrap();
         let effective: chrono::DateTime<chrono::Utc> = "2026-06-10T12:00:00Z".parse().unwrap();
@@ -18399,9 +18730,12 @@ mod tests {
             persist_row_hash: String::new(),
         };
         backend
-            .put_family_membership_revocation(crate::federation::SignedFamilyMembershipRevocation {
-                family_membership_revocation: rev.clone(),
-            })
+            .put_family_membership_revocation(
+                crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+                    &fam,
+                    rev.clone(),
+                ),
+            )
             .await
             .unwrap();
         // Re-record the SAME removal event directly — proves the hard_case
@@ -19331,6 +19665,13 @@ mod tests {
     }
 
     fn fed_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
+        // v21.0.0 (#502 E1) — sign the envelope with the REVOKING key's
+        // deterministic hybrid key so it verifies against the pubkeys
+        // `fed_key(revoking)` registers (`hybrid_pubkeys`). The admission
+        // gate now verifies this by construction.
+        let envelope = serde_json::json!({"id": id});
+        let (och, sig_c, sig_p) =
+            crate::federation::tier_ingest::test_support::sign_envelope(revoking, &envelope);
         Revocation {
             revocation_id: id.into(),
             revoked_key_id: revoked.into(),
@@ -19338,10 +19679,10 @@ mod tests {
             reason: Some("test".into()),
             revoked_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             effective_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-            revocation_envelope: serde_json::json!({"id": id}),
-            original_content_hash: "abc123".into(),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
+            revocation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: sig_c,
+            scrub_signature_pqc: sig_p,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
@@ -19631,8 +19972,8 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
         let admin = op::Identity::new("admin-1");
-        let dir = vec![steward.member(), admin.member()];
-        let roots = vec!["steward-1".to_string()];
+        let _dir = [steward.member(), admin.member()];
+        let _roots = ["steward-1".to_string()];
 
         // steward (root) grants admin OrgAdmin — granter is the steward.
         let grant = op::signed_membership(
@@ -19645,14 +19986,26 @@ mod tests {
             op_now(),
         );
         backend
-            .put_org_membership(grant, &dir, &roots)
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: admin.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: steward.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_org_membership(grant)
             .await
             .expect("steward-rooted grant admits");
 
         // Now admin (OrgAdmin) writes an organization row — authorized.
         let org = op::signed_organization("o1", "org-x", &admin, "active", op_now());
         backend
-            .put_organization(org, &dir, &roots)
+            .put_organization(org)
             .await
             .expect("OrgAdmin actor admits organization");
 
@@ -19670,14 +20023,11 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let stranger = op::Identity::new("stranger");
-        let dir = vec![stranger.member()];
-        let roots = vec!["steward-1".to_string()]; // stranger is not rooted
+        let _dir = [stranger.member()];
+        let _roots = ["steward-1".to_string()]; // stranger is not rooted
 
         let org = op::signed_organization("o1", "org-x", &stranger, "active", op_now());
-        let err = backend
-            .put_organization(org, &dir, &roots)
-            .await
-            .unwrap_err();
+        let err = backend.put_organization(org).await.unwrap_err();
         assert_eq!(err.kind(), "federation_operational_authority");
         // nothing stored
         assert!(backend
@@ -19693,8 +20043,8 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
-        let dir = vec![steward.member()];
-        let roots = vec!["steward-1".to_string()];
+        let _dir = [steward.member()];
+        let _roots = ["steward-1".to_string()];
         let future = op_now() + chrono::Duration::minutes(10);
         let grant = op::signed_membership(
             "m1",
@@ -19705,10 +20055,7 @@ mod tests {
             "active",
             future,
         );
-        let err = backend
-            .put_org_membership(grant, &dir, &roots)
-            .await
-            .unwrap_err();
+        let err = backend.put_org_membership(grant).await.unwrap_err();
         assert_eq!(err.kind(), "federation_clock_skew_violation");
     }
 
@@ -19719,8 +20066,8 @@ mod tests {
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
-        let dir = vec![steward.member()];
-        let roots = vec!["steward-1".to_string()];
+        let _dir = [steward.member()];
+        let _roots = ["steward-1".to_string()];
         let mut grant = op::signed_membership(
             "m1",
             &steward,
@@ -19732,10 +20079,7 @@ mod tests {
         );
         // Inject a payment-processor id into an open-vocab field.
         grant.org_membership.signed_envelope["billing"] = serde_json::json!("cus_ABC123");
-        let err = backend
-            .put_org_membership(grant, &dir, &roots)
-            .await
-            .unwrap_err();
+        let err = backend.put_org_membership(grant).await.unwrap_err();
         assert_eq!(err.kind(), "federation_payment_processor_identifier");
     }
 
@@ -19747,22 +20091,30 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
         let admin = op::Identity::new("admin-1");
-        let dir = vec![steward.member(), admin.member()];
-        let roots = vec!["steward-1".to_string()];
+        let _dir = [steward.member(), admin.member()];
+        let _roots = ["steward-1".to_string()];
         backend
-            .put_org_membership(
-                op::signed_membership(
-                    "m1",
-                    &steward,
-                    "admin-1",
-                    "org-x",
-                    "org_admin",
-                    "active",
-                    op_now(),
-                ),
-                &dir,
-                &roots,
-            )
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: admin.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: steward.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_org_membership(op::signed_membership(
+                "m1",
+                &steward,
+                "admin-1",
+                "org-x",
+                "org_admin",
+                "active",
+                op_now(),
+            ))
             .await
             .unwrap();
 
@@ -19781,7 +20133,7 @@ mod tests {
                 status,
                 base + chrono::Duration::seconds(secs),
             );
-            backend.put_organization(org, &dir, &roots).await.unwrap();
+            backend.put_organization(org).await.unwrap();
         }
         let rows = backend.list_organizations_for("org-x").await.unwrap();
         assert_eq!(rows.len(), 3, "all writes stored (append-only audit)");
@@ -19800,22 +20152,30 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let steward = op::Identity::new("steward-1");
         let admin = op::Identity::new("admin-1");
-        let dir = vec![steward.member(), admin.member()];
-        let roots = vec!["steward-1".to_string()];
+        let _dir = [steward.member(), admin.member()];
+        let _roots = ["steward-1".to_string()];
         backend
-            .put_org_membership(
-                op::signed_membership(
-                    "m1",
-                    &steward,
-                    "admin-1",
-                    "org-x",
-                    "org_admin",
-                    "active",
-                    op_now(),
-                ),
-                &dir,
-                &roots,
-            )
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: admin.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: steward.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_org_membership(op::signed_membership(
+                "m1",
+                &steward,
+                "admin-1",
+                "org-x",
+                "org_admin",
+                "active",
+                op_now(),
+            ))
             .await
             .unwrap();
         let base = op_now();
@@ -19828,7 +20188,7 @@ mod tests {
                 "active",
                 base + chrono::Duration::seconds(secs),
             );
-            backend.put_organization(org, &dir, &roots).await.unwrap();
+            backend.put_organization(org).await.unwrap();
         }
         let rows = backend.list_organizations_for("org-x").await.unwrap();
         let current = crate::federation::operational::resolve_lww(&rows).unwrap();
@@ -19845,7 +20205,7 @@ mod tests {
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
         let s3 = op::Identity::new("s3");
-        let roster = vec![
+        let _roster = [
             s1.founder_member(),
             s2.founder_member(),
             s3.founder_member(),
@@ -19855,7 +20215,25 @@ mod tests {
         let pr1 =
             op::signed_partner_record("pr1", "lic-1", 1, "active", op_now(), &[&s1, &s2], 2, false);
         backend
-            .put_partner_record(pr1, &roster)
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s1.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s2.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s3.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_partner_record(pr1)
             .await
             .expect("2-of-3 admits");
 
@@ -19870,18 +20248,12 @@ mod tests {
             2,
             false,
         );
-        backend
-            .put_partner_record(pr2, &roster)
-            .await
-            .expect("rev 2 admits");
+        backend.put_partner_record(pr2).await.expect("rev 2 admits");
 
         // revision-decrease (back to 1) — REJECTED at admission.
         let pr_rollback =
             op::signed_partner_record("pr3", "lic-1", 1, "active", op_now(), &[&s1, &s2], 2, false);
-        let err = backend
-            .put_partner_record(pr_rollback, &roster)
-            .await
-            .unwrap_err();
+        let err = backend.put_partner_record(pr_rollback).await.unwrap_err();
         assert_eq!(err.kind(), "federation_partner_record_rollback");
 
         // Merge winner: revision 2 revoked beats revision 1 active.
@@ -19900,13 +20272,13 @@ mod tests {
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
         let s3 = op::Identity::new("s3");
-        let roster = vec![
+        let _roster = [
             s1.founder_member(),
             s2.founder_member(),
             s3.founder_member(),
         ];
         let pr = op::signed_partner_record("pr1", "lic-1", 1, "active", op_now(), &[&s1], 2, false);
-        let err = backend.put_partner_record(pr, &roster).await.unwrap_err();
+        let err = backend.put_partner_record(pr).await.unwrap_err();
         assert_eq!(err.kind(), "federation_operational_authority");
     }
 
@@ -19917,7 +20289,7 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
-        let roster = vec![s1.founder_member(), s2.founder_member()];
+        let _roster = [s1.founder_member(), s2.founder_member()];
         let pr = op::signed_partner_record(
             "pr1",
             "lic-1",
@@ -19928,7 +20300,7 @@ mod tests {
             2,
             true, // unsorted
         );
-        let err = backend.put_partner_record(pr, &roster).await.unwrap_err();
+        let err = backend.put_partner_record(pr).await.unwrap_err();
         assert_eq!(err.kind(), "federation_set_semantics_unsorted");
     }
 
@@ -19939,7 +20311,7 @@ mod tests {
         backend.run_migrations().await.unwrap();
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
-        let roster = vec![s1.founder_member(), s2.founder_member()];
+        let _roster = [s1.founder_member(), s2.founder_member()];
         let base = op_now();
         for (id, lic, secs) in [("a", "l1", 0), ("b", "l2", 60), ("c", "l3", 120)] {
             let pr = op::signed_partner_record(
@@ -19952,7 +20324,19 @@ mod tests {
                 2,
                 false,
             );
-            backend.put_partner_record(pr, &roster).await.unwrap();
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: s1.steward_key_record(),
+                })
+                .await
+                .ok();
+            backend
+                .put_public_key(crate::federation::SignedKeyRecord {
+                    record: s2.steward_key_record(),
+                })
+                .await
+                .ok();
+            backend.put_partner_record(pr).await.unwrap();
         }
         // since = base + 30s → excludes "a", returns "b","c" ordered.
         let cursor = base + chrono::Duration::seconds(30);
@@ -19978,7 +20362,7 @@ mod tests {
         let s1 = op::Identity::new("s1");
         let s2 = op::Identity::new("s2");
         let s3 = op::Identity::new("s3");
-        let roster = vec![
+        let _roster = [
             s1.founder_member(),
             s2.founder_member(),
             s3.founder_member(),
@@ -19987,7 +20371,25 @@ mod tests {
         let sender =
             op::signed_partner_record("pr1", "lic-1", 1, "active", op_now(), &[&s1, &s2], 2, false);
         backend
-            .put_partner_record(sender.clone(), &roster)
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s1.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s2.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: s3.steward_key_record(),
+            })
+            .await
+            .ok();
+        backend
+            .put_partner_record(sender.clone())
             .await
             .expect("2-of-3 admits");
 
@@ -20299,7 +20701,7 @@ mod tests {
     /// is refused; the FK to federation_keys holds.
     #[tokio::test]
     async fn location_proof_round_trip_and_rough_only_gate() {
-        use crate::federation::{LocationProof, SignedLocationProof};
+        use crate::federation::LocationProof;
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         backend
@@ -20311,21 +20713,29 @@ mod tests {
 
         let ll = h3o::LatLng::new(37.0, -122.0).unwrap();
         let cell7 = ll.to_cell(h3o::Resolution::Seven).to_string();
-        let proof = |cell: &str, res: u8| SignedLocationProof {
-            location_proof: LocationProof {
-                subject_key_id: "subj".into(),
-                cell_id: cell.into(),
-                cell_resolution: res,
-                asserted_at: "2026-06-09T00:00:00Z".parse().unwrap(),
-                valid_until: None,
-                attestation_evidence: None,
-                withdrawn_at: None,
-                persist_row_hash: String::new(),
-            },
+        // #502 E4 — `asserted_at` is a parameter (not post-hoc mutated) so the
+        // signature below is always computed over the EXACT stored envelope.
+        let proof = |cell: &str, res: u8, asserted_at: &str| {
+            crate::federation::tier_ingest::test_support::sign_location_proof(
+                "subj",
+                LocationProof {
+                    subject_key_id: "subj".into(),
+                    cell_id: cell.into(),
+                    cell_resolution: res,
+                    asserted_at: asserted_at.parse().unwrap(),
+                    valid_until: None,
+                    attestation_evidence: None,
+                    withdrawn_at: None,
+                    persist_row_hash: String::new(),
+                },
+            )
         };
 
         // Valid res-7 admits + round-trips.
-        backend.put_location_proof(proof(&cell7, 7)).await.unwrap();
+        backend
+            .put_location_proof(proof(&cell7, 7, "2026-06-09T00:00:00Z"))
+            .await
+            .unwrap();
         let rows = backend.list_location_proofs_for("subj").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cell_id, cell7);
@@ -20334,16 +20744,14 @@ mod tests {
 
         // Over-precise res-9 → refused (§0.8.1 rough-only).
         let cell9 = ll.to_cell(h3o::Resolution::Nine).to_string();
-        let mut input = proof(&cell9, 9);
-        input.location_proof.asserted_at = "2026-06-09T01:00:00Z".parse().unwrap();
+        let input = proof(&cell9, 9, "2026-06-09T01:00:00Z");
         let err = backend.put_location_proof(input).await.unwrap_err();
         assert!(
             matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("rough-only")),
             "got: {err:?}"
         );
         // Malformed cell → refused.
-        let mut bad = proof("not-a-cell", 7);
-        bad.location_proof.asserted_at = "2026-06-09T02:00:00Z".parse().unwrap();
+        let bad = proof("not-a-cell", 7, "2026-06-09T02:00:00Z");
         assert!(backend.put_location_proof(bad).await.is_err());
 
         // Still exactly one stored row (rejections didn't write).
@@ -20461,9 +20869,7 @@ mod tests {
     /// containing` finds the community for a cell inside its constraint.
     #[tokio::test]
     async fn geographic_community_admission_and_containing() {
-        use crate::federation::{
-            Community, CommunityMember, LocationProof, SignedCommunity, SignedLocationProof,
-        };
+        use crate::federation::{Community, CommunityMember, LocationProof};
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         for k in ["geo-comm", "alice", "bob"] {
@@ -20480,18 +20886,21 @@ mod tests {
 
         // alice has an in-force contained proof; bob has none.
         backend
-            .put_location_proof(SignedLocationProof {
-                location_proof: LocationProof {
-                    subject_key_id: "alice".into(),
-                    cell_id: inside.clone(),
-                    cell_resolution: 7,
-                    asserted_at: "2026-06-01T00:00:00Z".parse().unwrap(),
-                    valid_until: None,
-                    attestation_evidence: None,
-                    withdrawn_at: None,
-                    persist_row_hash: String::new(),
-                },
-            })
+            .put_location_proof(
+                crate::federation::tier_ingest::test_support::sign_location_proof(
+                    "alice",
+                    LocationProof {
+                        subject_key_id: "alice".into(),
+                        cell_id: inside.clone(),
+                        cell_resolution: 7,
+                        asserted_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                        valid_until: None,
+                        attestation_evidence: None,
+                        withdrawn_at: None,
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
             .await
             .unwrap();
 
@@ -20499,23 +20908,26 @@ mod tests {
             "cohort_subkind": "geographic",
             "geographic_constraint": {"cell_id": constraint, "cell_resolution": 3}
         });
-        let community = |members: Vec<&str>| SignedCommunity {
-            community: Community {
-                community_key_id: "geo-comm".into(),
-                community_name: "Geo".into(),
-                members: members
-                    .into_iter()
-                    .map(|k| CommunityMember {
-                        key_id: k.into(),
-                        joined_at: "2026-06-01T00:00:00Z".parse().unwrap(),
-                        role: None,
-                    })
-                    .collect(),
-                founded_at: "2026-06-01T00:00:00Z".parse().unwrap(),
-                consensus_protocol: "unanimous".into(),
-                policy_blob: Some(geo_policy.clone()),
-                persist_row_hash: String::new(),
-            },
+        let community = |members: Vec<&str>| {
+            crate::federation::tier_ingest::test_support::sign_community(
+                "geo-comm",
+                Community {
+                    community_key_id: "geo-comm".into(),
+                    community_name: "Geo".into(),
+                    members: members
+                        .into_iter()
+                        .map(|k| CommunityMember {
+                            key_id: k.into(),
+                            joined_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                            role: None,
+                        })
+                        .collect(),
+                    founded_at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                    consensus_protocol: "unanimous".into(),
+                    policy_blob: Some(geo_policy.clone()),
+                    persist_row_hash: String::new(),
+                },
+            )
         };
 
         // bob (no contained proof) → refused.
@@ -20557,10 +20969,7 @@ mod tests {
     /// NOT. Family/community removals filter `list_*_for_member_active`.
     #[tokio::test]
     async fn membership_revocation_round_trip_and_active_filtering() {
-        use crate::federation::{
-            FamilyMembershipRevocation, IdentityOccurrenceRevocation,
-            SignedFamilyMembershipRevocation,
-        };
+        use crate::federation::{FamilyMembershipRevocation, IdentityOccurrenceRevocation};
         let backend = SqliteBackend::open_in_memory().await.unwrap();
         backend.run_migrations().await.unwrap();
         for k in [
@@ -20590,9 +20999,10 @@ mod tests {
         }
         // Family with alice-root + bob-root.
         backend
-            .put_family(crate::federation::SignedFamily {
-                family: fed_family("fam-1", "Fam", vec!["alice-root", "bob-root"], "unanimous"),
-            })
+            .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                "fam-1",
+                fed_family("fam-1", "Fam", vec!["alice-root", "bob-root"], "unanimous"),
+            ))
             .await
             .unwrap();
 
@@ -20665,17 +21075,20 @@ mod tests {
 
         // Family removal: bob-root removed, effective in the past.
         backend
-            .put_family_membership_revocation(SignedFamilyMembershipRevocation {
-                family_membership_revocation: FamilyMembershipRevocation {
-                    family_key_id: "fam-1".into(),
-                    removed_identity_key_id: "bob-root".into(),
-                    removed_at: "2026-06-06T00:00:00Z".parse().unwrap(),
-                    effective_at: "2026-06-06T00:00:00Z".parse().unwrap(),
-                    reason: Some("left household".into()),
-                    witness_set: vec!["alice-root".into()],
-                    persist_row_hash: String::new(),
-                },
-            })
+            .put_family_membership_revocation(
+                crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+                    "fam-1",
+                    FamilyMembershipRevocation {
+                        family_key_id: "fam-1".into(),
+                        removed_identity_key_id: "bob-root".into(),
+                        removed_at: "2026-06-06T00:00:00Z".parse().unwrap(),
+                        effective_at: "2026-06-06T00:00:00Z".parse().unwrap(),
+                        reason: Some("left household".into()),
+                        witness_set: vec!["alice-root".into()],
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
             .await
             .unwrap();
         // bob-root no longer an active member; alice-root still is.
@@ -21002,9 +21415,10 @@ mod tests {
             .unwrap();
 
         backend
-            .put_family(crate::federation::SignedFamily {
-                family: fed_family("fam", "Household", vec!["alice", "bob"], "unanimous"),
-            })
+            .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                "fam",
+                fed_family("fam", "Household", vec!["alice", "bob"], "unanimous"),
+            ))
             .await
             .unwrap();
 
@@ -21096,15 +21510,18 @@ mod tests {
             member_idents.push(*ident);
         }
         backend
-            .put_community(crate::federation::SignedCommunity {
-                community: fed_community(
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
                     "comm",
-                    "Test Co-op",
-                    member_idents,
-                    crate::federation::types::consensus_protocol::MAJORITY,
-                    policy,
+                    fed_community(
+                        "comm",
+                        "Test Co-op",
+                        member_idents,
+                        crate::federation::types::consensus_protocol::MAJORITY,
+                        policy,
+                    ),
                 ),
-            })
+            )
             .await
             .unwrap();
         backend
@@ -21114,8 +21531,9 @@ mod tests {
         removed: &str,
         effective: &str,
     ) -> crate::federation::SignedCommunityMembershipRevocation {
-        crate::federation::SignedCommunityMembershipRevocation {
-            community_membership_revocation: crate::federation::CommunityMembershipRevocation {
+        crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
+            "comm",
+            crate::federation::CommunityMembershipRevocation {
                 community_key_id: "comm".into(),
                 removed_identity_key_id: removed.into(),
                 removed_at: effective.parse().unwrap(),
@@ -21124,7 +21542,7 @@ mod tests {
                 witness_set: vec![],
                 persist_row_hash: String::new(),
             },
-        }
+        )
     }
 
     /// Non-infra community with at-rest enabled → a v2 key_grant per member
@@ -21275,8 +21693,9 @@ mod tests {
         )
         .await;
         let rev = |effective: chrono::DateTime<chrono::Utc>| {
-            crate::federation::SignedCommunityMembershipRevocation {
-                community_membership_revocation: crate::federation::CommunityMembershipRevocation {
+            crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
+                "comm",
+                crate::federation::CommunityMembershipRevocation {
                     community_key_id: "comm".into(),
                     removed_identity_key_id: "bob".into(),
                     removed_at: effective,
@@ -21285,7 +21704,7 @@ mod tests {
                     witness_set: vec![],
                     persist_row_hash: String::new(),
                 },
-            }
+            )
         };
         let future = chrono::Utc::now() + chrono::Duration::days(30);
         let err = backend
@@ -21317,7 +21736,7 @@ mod tests {
     /// community machinery on the SQLite backend (pg/sqlite/memory parity).
     #[tokio::test]
     async fn affiliations_cohort_membership_lifecycle_sqlite() {
-        use crate::federation::cohort::{Cohort, RevokeSpec, RosterMember};
+        use crate::federation::cohort::{Cohort, RosterMember};
         use crate::federation::{BlobStorage, FederationDirectory};
         let backend = community_fixture(&[("alice", "alice-occ", true)], None).await;
         // Register a fresh PRIMITIVE key to admit via the affiliations cohort.
@@ -21369,11 +21788,15 @@ mod tests {
                 Cohort::Affiliations,
                 "comm",
                 "carol",
-                RevokeSpec {
-                    effective_at: chrono::Utc::now(),
-                    reason: Some("left".into()),
-                    witness_set: vec![],
-                },
+                crate::federation::tier_ingest::test_support::sign_revoke_spec(
+                    Cohort::Affiliations,
+                    "comm",
+                    "comm",
+                    "carol",
+                    chrono::Utc::now(),
+                    Some("left".into()),
+                    vec![],
+                ),
             )
             .await
             .expect("affiliations revoke_member");
@@ -22475,9 +22898,10 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_family(crate::federation::SignedFamily {
-                family: fed_family("fam", "Household", vec!["alice", "carol"], "unanimous"),
-            })
+            .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                "fam",
+                fed_family("fam", "Household", vec!["alice", "carol"], "unanimous"),
+            ))
             .await
             .unwrap();
         let plaintext = b"family blob written before carol registered a device";
@@ -22573,9 +22997,10 @@ mod tests {
             .unwrap();
         // Roster starts with alice ONLY — bob is a genuinely-new member.
         backend
-            .put_family(crate::federation::SignedFamily {
-                family: fed_family("fam", "Household", vec!["alice"], "unanimous"),
-            })
+            .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                "fam",
+                fed_family("fam", "Household", vec!["alice"], "unanimous"),
+            ))
             .await
             .unwrap();
 
@@ -22675,9 +23100,10 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_family(crate::federation::SignedFamily {
-                family: fed_family("fam", "Household", vec!["alice", "dave"], "unanimous"),
-            })
+            .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                "fam",
+                fed_family("fam", "Household", vec!["alice", "dave"], "unanimous"),
+            ))
             .await
             .unwrap();
 
@@ -22691,17 +23117,20 @@ mod tests {
 
         // Remove dave (V067 effective immediately).
         backend
-            .put_family_membership_revocation(crate::federation::SignedFamilyMembershipRevocation {
-                family_membership_revocation: crate::federation::FamilyMembershipRevocation {
-                    family_key_id: "fam".into(),
-                    removed_identity_key_id: "dave".into(),
-                    removed_at: "2026-06-11T00:00:00Z".parse().unwrap(),
-                    effective_at: "2026-06-11T00:00:00Z".parse().unwrap(),
-                    reason: Some("left the household".into()),
-                    witness_set: vec![],
-                    persist_row_hash: String::new(),
-                },
-            })
+            .put_family_membership_revocation(
+                crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+                    "fam",
+                    crate::federation::FamilyMembershipRevocation {
+                        family_key_id: "fam".into(),
+                        removed_identity_key_id: "dave".into(),
+                        removed_at: "2026-06-11T00:00:00Z".parse().unwrap(),
+                        effective_at: "2026-06-11T00:00:00Z".parse().unwrap(),
+                        reason: Some("left the household".into()),
+                        witness_set: vec![],
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
             .await
             .unwrap();
 
@@ -23521,14 +23950,15 @@ mod tests {
                 .unwrap();
         }
         backend
-            .put_family(crate::federation::SignedFamily {
-                family: fed_family(
+            .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                "acme-household",
+                fed_family(
                     "acme-household",
                     "Acme Household",
                     vec!["alice-root", "bob-root", "roku-livingroom"],
                     crate::federation::types::consensus_protocol::FOUNDER_ONLY,
                 ),
-            })
+            ))
             .await
             .unwrap();
 
@@ -23564,6 +23994,63 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E4 followup) — the authority signature
+    /// E4's admission gate verifies must be PERSISTED, not verified-then-
+    /// discarded: before this cut, `federation_families` (and its 4
+    /// siblings) had no column for `authority_key_id` /
+    /// `scrub_signature_{classical,pqc}`, so the durable row could never
+    /// prove its own authorship. Put an authority-signed family, then read
+    /// the stored row back via a direct SELECT on the V110 columns (there is
+    /// no public reconstruction of `SignedFamily` on the read side yet — see
+    /// the V110 migration note) and assert all 3 fields round-trip
+    /// byte-exact.
+    #[tokio::test]
+    async fn e4_authority_signature_persists_502_followup() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["e4sig-authority", "e4sig-member"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "acme", "e4sig-authority"),
+                })
+                .await
+                .unwrap();
+        }
+        let signed = crate::federation::tier_ingest::test_support::sign_family(
+            "e4sig-authority",
+            fed_family(
+                "e4sig-family",
+                "E4 Signature Household",
+                vec!["e4sig-member"],
+                crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+            ),
+        );
+        let expect_classical = signed.scrub_signature_classical.clone();
+        let expect_pqc = signed.scrub_signature_pqc.clone();
+        backend
+            .put_family(signed)
+            .await
+            .expect("(E4 followup) honestly-signed family admits");
+
+        let (authority_key_id, scrub_signature_classical, scrub_signature_pqc): (
+            String,
+            String,
+            Option<String>,
+        ) = {
+            let conn = backend.conn.lock();
+            conn.query_row(
+                "SELECT authority_key_id, scrub_signature_classical, scrub_signature_pqc \
+                     FROM federation_families WHERE family_key_id = ?1",
+                ["e4sig-family"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("(E4 followup) authority signature must be persisted, not discarded")
+        };
+        assert_eq!(authority_key_id, "e4sig-authority");
+        assert_eq!(scrub_signature_classical, expect_classical);
+        assert_eq!(scrub_signature_pqc, expect_pqc);
     }
 
     fn fed_community(
@@ -23611,15 +24098,18 @@ mod tests {
         }
         let policy = serde_json::json!({ "cohort_scope": "community", "visibility": "members" });
         backend
-            .put_community(crate::federation::SignedCommunity {
-                community: fed_community(
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
                     "acme-coop",
-                    "Acme Co-op",
-                    vec!["alice-root", "bob-root", "carol-root"],
-                    crate::federation::types::consensus_protocol::MAJORITY,
-                    Some(policy.clone()),
+                    fed_community(
+                        "acme-coop",
+                        "Acme Co-op",
+                        vec!["alice-root", "bob-root", "carol-root"],
+                        crate::federation::types::consensus_protocol::MAJORITY,
+                        Some(policy.clone()),
+                    ),
                 ),
-            })
+            )
             .await
             .unwrap();
 
@@ -23656,15 +24146,18 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_community(crate::federation::SignedCommunity {
-                community: fed_community(
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
                     "solo-coop",
-                    "Solo Co-op",
-                    vec![],
-                    crate::federation::types::consensus_protocol::FOUNDER_ONLY,
-                    None,
+                    fed_community(
+                        "solo-coop",
+                        "Solo Co-op",
+                        vec![],
+                        crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                        None,
+                    ),
                 ),
-            })
+            )
             .await
             .unwrap();
         let solo = backend
@@ -23694,7 +24187,9 @@ mod tests {
         for cp in ["", "quorum:3/2", "weighted:", "custom:", "raffle"] {
             let bad = fed_community("bad-coop", "bad", vec![], cp, None);
             let err = backend
-                .put_community(crate::federation::SignedCommunity { community: bad })
+                .put_community(
+                    crate::federation::tier_ingest::test_support::sign_community("bad-coop", bad),
+                )
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -23711,7 +24206,9 @@ mod tests {
         // Canonical quorum:m/n admits.
         let good = fed_community("bad-coop", "now valid", vec![], "quorum:2/3", None);
         backend
-            .put_community(crate::federation::SignedCommunity { community: good })
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community("bad-coop", good),
+            )
             .await
             .unwrap();
         assert!(backend
@@ -23748,7 +24245,10 @@ mod tests {
         ] {
             let bad = fed_family("bad-family", "bad", vec![], cp);
             let err = backend
-                .put_family(crate::federation::SignedFamily { family: bad })
+                .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                    "bad-family",
+                    bad,
+                ))
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -23762,7 +24262,10 @@ mod tests {
         // Canonical quorum:m/n with m<=n and n>0 admits.
         let good = fed_family("bad-family", "now valid", vec![], "quorum:2/3");
         backend
-            .put_family(crate::federation::SignedFamily { family: good })
+            .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                "bad-family",
+                good,
+            ))
             .await
             .unwrap();
         assert!(backend.lookup_family("bad-family").await.unwrap().is_some());
@@ -30574,15 +31077,18 @@ mod tests {
             .unwrap();
         let policy = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
         backend
-            .put_community(crate::federation::SignedCommunity {
-                community: fed_community(
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
                     community_id,
-                    "ob-test",
-                    members,
-                    crate::federation::types::consensus_protocol::FOUNDER_ONLY,
-                    policy,
+                    fed_community(
+                        community_id,
+                        "ob-test",
+                        members,
+                        crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                        policy,
+                    ),
                 ),
-            })
+            )
             .await
     }
 
@@ -30691,20 +31197,23 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let put_comm = |cid: &str, founder: &str| crate::federation::SignedCommunity {
-            community: crate::federation::Community {
-                community_key_id: cid.into(),
-                community_name: "nm-test".into(),
-                members: vec![crate::federation::CommunityMember {
-                    key_id: founder.into(),
-                    joined_at: "2026-06-04T00:00:00Z".parse().unwrap(),
-                    role: Some(MEMBER_ROLE_FOUNDER.into()),
-                }],
-                founded_at: "2026-06-04T00:00:00Z".parse().unwrap(),
-                consensus_protocol: consensus_protocol::FOUNDER_ONLY.into(),
-                policy_blob: None,
-                persist_row_hash: String::new(),
-            },
+        let put_comm = |cid: &str, founder: &str| {
+            crate::federation::tier_ingest::test_support::sign_community(
+                cid,
+                crate::federation::Community {
+                    community_key_id: cid.into(),
+                    community_name: "nm-test".into(),
+                    members: vec![crate::federation::CommunityMember {
+                        key_id: founder.into(),
+                        joined_at: "2026-06-04T00:00:00Z".parse().unwrap(),
+                        role: Some(MEMBER_ROLE_FOUNDER.into()),
+                    }],
+                    founded_at: "2026-06-04T00:00:00Z".parse().unwrap(),
+                    consensus_protocol: consensus_protocol::FOUNDER_ONLY.into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            )
         };
         // Storage-only put_community is NOT the federate gate — both records
         // (moderatored AND moderator-less) store fine.
@@ -30769,18 +31278,18 @@ mod tests {
         //     untouched (loss-processing / recovery must not be blocked).
         backend
             .put_community_membership_revocation(
-                crate::federation::SignedCommunityMembershipRevocation {
-                    community_membership_revocation:
-                        crate::federation::CommunityMembershipRevocation {
-                            community_key_id: "nm-no".into(),
-                            removed_identity_key_id: "nm-prim".into(),
-                            removed_at: "2026-06-05T00:00:00Z".parse().unwrap(),
-                            effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
-                            reason: None,
-                            witness_set: Vec::new(),
-                            persist_row_hash: String::new(),
-                        },
-                },
+                crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
+                    "nm-no",
+                    crate::federation::CommunityMembershipRevocation {
+                        community_key_id: "nm-no".into(),
+                        removed_identity_key_id: "nm-prim".into(),
+                        removed_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                        effective_at: "2026-06-05T00:00:00Z".parse().unwrap(),
+                        reason: None,
+                        witness_set: Vec::new(),
+                        persist_row_hash: String::new(),
+                    },
+                ),
             )
             .await
             .expect("membership revocation is storage, not a federation apply step");
@@ -31228,15 +31737,18 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_community(crate::federation::SignedCommunity {
-                community: fed_community(
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
                     "duty-comm",
-                    "Duty Co-op",
-                    vec!["owner"],
-                    crate::federation::types::consensus_protocol::MAJORITY,
-                    None,
+                    fed_community(
+                        "duty-comm",
+                        "Duty Co-op",
+                        vec!["owner"],
+                        crate::federation::types::consensus_protocol::MAJORITY,
+                        None,
+                    ),
                 ),
-            })
+            )
             .await
             .expect("steward-bound member admitted under MAJORITY");
 
@@ -34340,15 +34852,18 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_community(crate::federation::SignedCommunity {
-                community: fed_community(
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
                     "acm-comm",
-                    "acm",
-                    vec!["acm-0", "acm-1", "acm-2"],
-                    crate::federation::types::consensus_protocol::FOUNDER_ONLY,
-                    None,
+                    fed_community(
+                        "acm-comm",
+                        "acm",
+                        vec!["acm-0", "acm-1", "acm-2"],
+                        crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                        None,
+                    ),
                 ),
-            })
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -34361,18 +34876,18 @@ mod tests {
         );
         backend
             .put_community_membership_revocation(
-                crate::federation::SignedCommunityMembershipRevocation {
-                    community_membership_revocation:
-                        crate::federation::CommunityMembershipRevocation {
-                            community_key_id: "acm-comm".into(),
-                            removed_identity_key_id: "acm-1".into(),
-                            removed_at: chrono::Utc::now(),
-                            effective_at: chrono::Utc::now(),
-                            reason: None,
-                            witness_set: vec![],
-                            persist_row_hash: String::new(),
-                        },
-                },
+                crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
+                    "acm-comm",
+                    crate::federation::CommunityMembershipRevocation {
+                        community_key_id: "acm-comm".into(),
+                        removed_identity_key_id: "acm-1".into(),
+                        removed_at: chrono::Utc::now(),
+                        effective_at: chrono::Utc::now(),
+                        reason: None,
+                        witness_set: vec![],
+                        persist_row_hash: String::new(),
+                    },
+                ),
             )
             .await
             .unwrap();
@@ -34409,19 +34924,21 @@ mod tests {
                 .unwrap();
         }
         backend
-            .put_family(crate::federation::SignedFamily {
-                family: fed_family(
+            .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                "afm-fam",
+                fed_family(
                     "afm-fam",
                     "fam",
                     vec!["afm-carol", "afm-dave"],
                     crate::federation::types::consensus_protocol::FOUNDER_ONLY,
                 ),
-            })
+            ))
             .await
             .unwrap();
         let rev = |member: &str, effective_at: chrono::DateTime<chrono::Utc>| {
-            crate::federation::SignedFamilyMembershipRevocation {
-                family_membership_revocation: crate::federation::FamilyMembershipRevocation {
+            crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+                "afm-fam",
+                crate::federation::FamilyMembershipRevocation {
                     family_key_id: "afm-fam".into(),
                     removed_identity_key_id: member.into(),
                     removed_at: chrono::Utc::now(),
@@ -34430,7 +34947,7 @@ mod tests {
                     witness_set: vec![],
                     persist_row_hash: String::new(),
                 },
-            }
+            )
         };
         // carol: future-dated → stays active. dave: effective now → drops.
         let future = chrono::Utc::now() + chrono::Duration::days(30);
@@ -34464,15 +34981,18 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_community(crate::federation::SignedCommunity {
-                community: fed_community(
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
                     "addc-comm",
-                    "addc",
-                    vec!["addc-0"],
-                    crate::federation::types::consensus_protocol::FOUNDER_ONLY,
-                    None,
+                    fed_community(
+                        "addc-comm",
+                        "addc",
+                        vec!["addc-0"],
+                        crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+                        None,
+                    ),
                 ),
-            })
+            )
             .await
             .unwrap();
         assert!(backend
@@ -34551,7 +35071,9 @@ mod tests {
         );
         community.members[0].role = Some(MEMBER_ROLE_FOUNDER.into());
         backend
-            .put_community(crate::federation::SignedCommunity { community })
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community("mod-comm", community),
+            )
             .await
             .unwrap();
         backend

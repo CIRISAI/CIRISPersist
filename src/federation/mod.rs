@@ -44,6 +44,7 @@ pub mod capacity;
 pub mod cohort;
 pub mod community_dek;
 pub mod consent;
+pub mod consent_peer_set;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
 pub mod genesis;
@@ -93,6 +94,7 @@ pub struct TraceBackfillReport {
 
 pub mod register;
 pub mod replication;
+pub mod replication_policy;
 pub mod rooting;
 pub mod schema_resolver;
 pub mod scores;
@@ -229,7 +231,10 @@ pub use stream_sth::{
     STREAM_LOG_ID_PREFIX,
 };
 pub use tier_ingest::{
-    verify_envelope_hybrid_signature, verify_federation_tier_ingest, verify_row_hybrid_signature,
+    verify_community_admission, verify_community_membership_revocation_admission,
+    verify_envelope_hybrid_signature, verify_family_admission,
+    verify_family_membership_revocation_admission, verify_federation_tier_ingest,
+    verify_location_proof_admission, verify_revocation_admission, verify_row_hybrid_signature,
 };
 pub use topology::{
     build_delegation_graph, build_trust_topology, AuditChainEntry, AuditChainProof, DelegationEdge,
@@ -683,6 +688,23 @@ pub trait FederationDirectory: Send + Sync {
     /// "which keys does K vouch for?"). Ordered by `asserted_at` DESC.
     async fn list_attestations_by(&self, attesting_key_id: &str)
         -> Result<Vec<Attestation>, Error>;
+
+    /// v21.0.0 (CIRISPersist#502 E7) — the revocation-folded
+    /// `consent_peer_set` projection (V109): `node_key_id`'s LIVE
+    /// `consent:replication:v1` peers, sorted + deduped, with any
+    /// `withdraws`/`recants`-revoked peer already excluded. Closes the
+    /// hole where CIRISServer's `replication_peers_from_consent` read
+    /// `list_attestations_by` + flat-mapped `subject_key_ids` without
+    /// folding revocation — a revoked peer kept receiving replication.
+    /// Maintained by [`consent_peer_set`](super::consent_peer_set) IN the
+    /// same transaction as `put_attestation`'s insert. Default
+    /// `Unsupported`; sqlite/postgres/memory override.
+    async fn list_consent_peers(&self, node_key_id: &str) -> Result<Vec<String>, Error> {
+        let _ = node_key_id;
+        Err(Error::Unsupported {
+            method: "list_consent_peers",
+        })
+    }
 
     /// v3.6.0 (CIRISPersist#134, CEG 0.3 §8.1.10 Policy J / §11.5.3)
     /// — return the chain of `content_rating:*` attestations rooted
@@ -1150,6 +1172,25 @@ pub trait FederationDirectory: Send + Sync {
     /// gate.
     async fn put_family(&self, family: SignedFamily) -> Result<(), Error>;
 
+    /// v21.0.0 (CIRISPersist#502 E4) — write a **trusted-local** `Family`,
+    /// bypassing the [`Self::put_family`] authority-signature gate
+    /// (`verify_family_admission`). For the genesis boot-seed
+    /// (`crate::federation::genesis::seed_accord_family`) ONLY: the baked
+    /// HUMANITY_ACCORD family is a *bake-what-exists* declaration over a
+    /// compiled-in ceremony artifact — `family_key_id` is **keyless by
+    /// design** (no private key for a "family" identity ever exists — see
+    /// [`Self::put_family`]'s FK-only precedent and the constitutional-family
+    /// invariant), so there is no key the boot process could sign with.
+    /// **Never reachable from the replication apply / any wire surface** —
+    /// mirrors [`Self::put_identity_occurrence_revocation_local`]'s
+    /// trusted-local precedent. Default impl errors; backends override.
+    async fn put_family_local(&self, family: Family) -> Result<(), Error> {
+        let _ = family;
+        Err(Error::Backend(
+            "put_family_local not implemented for this backend".into(),
+        ))
+    }
+
     /// v6.2.0 (CIRISPersist#161 A4/A5, CEG §11.7.1) — admit one identity
     /// into an existing family roster, additively. This is the **roster-
     /// grow** primitive that makes family-member *addition* first-class
@@ -1369,12 +1410,7 @@ pub trait FederationDirectory: Send + Sync {
     /// Append-only on `attestation_id`; idempotent re-submit of identical
     /// content is `Ok(())`. Current-state is resolved at read time by
     /// [`operational::resolve_lww`] (stable-id grouping on `org_id`).
-    async fn put_organization(
-        &self,
-        signed: SignedOrganization,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
-    ) -> Result<(), Error>;
+    async fn put_organization(&self, signed: SignedOrganization) -> Result<(), Error>;
 
     /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — admit
     /// an `org_membership` envelope. Role-gated (`lww_skew_bounded`).
@@ -1390,12 +1426,7 @@ pub trait FederationDirectory: Send + Sync {
     /// Current-state is resolved at read time by
     /// [`operational::resolve_lww`] (stable-id grouping on
     /// `(user_id, org_id)`).
-    async fn put_org_membership(
-        &self,
-        signed: SignedOrgMembership,
-        key_directory: &[ciris_verify_core::threshold::ThresholdMember],
-        root_stewards: &[String],
-    ) -> Result<(), Error>;
+    async fn put_org_membership(&self, signed: SignedOrgMembership) -> Result<(), Error>;
 
     /// v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — admit
     /// a `partner_record` envelope. M-of-N steward quorum
@@ -1419,11 +1450,7 @@ pub trait FederationDirectory: Send + Sync {
     /// Current-state is resolved at read time by
     /// [`operational::resolve_monotonic_quorum`] (stable-id grouping on
     /// `license_id`).
-    async fn put_partner_record(
-        &self,
-        signed: SignedPartnerRecord,
-        steward_roster: &[ciris_verify_core::threshold::ThresholdMember],
-    ) -> Result<(), Error>;
+    async fn put_partner_record(&self, signed: SignedPartnerRecord) -> Result<(), Error>;
 
     /// v5.1.0 (CIRISPersist#65) — all stored `organization` rows for
     /// `org_id` (in-force and withdrawn — full history). Callers resolve
@@ -1972,6 +1999,9 @@ pub trait FederationDirectory: Send + Sync {
             effective_at,
             reason,
             witness_set,
+            authority_key_id,
+            scrub_signature_classical,
+            scrub_signature_pqc,
         } = spec;
         // #249 Cut G4 (§9) — `kind` of the membership-change "removed" event to
         // emit after a family/community revocation (`self` uses the occurrence
@@ -1990,12 +2020,23 @@ pub trait FederationDirectory: Send + Sync {
                     family_membership_revocation: types::FamilyMembershipRevocation {
                         family_key_id: group_key_id.to_string(),
                         removed_identity_key_id: removed_key_id.to_string(),
-                        removed_at: now,
+                        // v21.0.0 (#502 E4) — `removed_at` is `effective_at`, NOT
+                        // a freshly-minted `now`: the caller signs the revocation
+                        // BEFORE calling `revoke_member` (it has no way to
+                        // predict a server-minted timestamp), so every field the
+                        // gate verifies over must be caller-known in advance.
+                        removed_at: effective_at,
                         effective_at,
                         reason,
                         witness_set,
                         persist_row_hash: String::new(),
                     },
+                    // v21.0.0 (#502 E4) — the caller-supplied authority
+                    // signature; `put_family_membership_revocation` hybrid-
+                    // Strict-verifies it before any write.
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
                 })
                 .await?;
             }
@@ -2008,12 +2049,18 @@ pub trait FederationDirectory: Send + Sync {
                         community_membership_revocation: types::CommunityMembershipRevocation {
                             community_key_id: group_key_id.to_string(),
                             removed_identity_key_id: removed_key_id.to_string(),
-                            removed_at: now,
+                            // v21.0.0 (#502 E4) — see the family arm above:
+                            // `removed_at` MUST be caller-predictable.
+                            removed_at: effective_at,
                             effective_at,
                             reason,
                             witness_set,
                             persist_row_hash: String::new(),
                         },
+                        // v21.0.0 (#502 E4) — see the family arm above.
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
                     },
                 )
                 .await?;

@@ -134,6 +134,19 @@ fn is_expired(a: &Attestation, now: chrono::DateTime<chrono::Utc>) -> bool {
     a.expires_at.is_some_and(|e| e <= now)
 }
 
+/// v21.0.0 (CIRISPersist#502 E5) — does this row COUNT in a capability
+/// decision? Only FEDERATION-tier rows do. A local-tier attestation is
+/// producer-only (deferred signature, visible solely to the producing
+/// occurrence); before this it silently counted in `trust_root_valid` /
+/// `capability_roots_to_trusted_root`, so a local-tier `delegates_to(user
+/// → root)` or root self-charter could forge the capability gate the
+/// instant any local-tier row reached `put_attestation` from the wire.
+/// The walk now ignores every non-federation-tier row — the exploit is
+/// closed at the READ side regardless of how the row was admitted.
+fn counts_in_capability_walk(a: &Attestation) -> bool {
+    a.tier == super::types::attestation_tier::FEDERATION
+}
+
 /// Is this envelope's [`CHARTER_PRE_ROTATION_FIELD`] present and
 /// well-formed (64 lowercase hex — a sha256)?
 fn charter_commitment_well_formed(envelope: &serde_json::Value) -> bool {
@@ -244,6 +257,7 @@ where
             && a.attested_key_id == root_key_id
             && !user_dead.contains(&a.attestation_id)
             && !is_expired(a, now)
+            && counts_in_capability_walk(a)
     });
 
     // 2. Charter: live delegates_to(root → root) carrying BOTH
@@ -260,6 +274,7 @@ where
                 && a.attested_key_id == root_key_id
                 && !root_dead.contains(&a.attestation_id)
                 && !is_expired(a, now)
+                && counts_in_capability_walk(a)
                 && scope_contains(&a.attestation_envelope, INFRA_SERVE_SCOPE)
                 && scope_contains(&a.attestation_envelope, INFRA_ATTEST_SCOPE)
         })
@@ -282,6 +297,7 @@ where
                 == Some(ACCORD_LIFECYCLE_DIMENSION)
             && !about_dead.contains(&a.attestation_id)
             && !is_expired(a, now)
+            && counts_in_capability_walk(a)
             && now.signed_duration_since(a.asserted_at) <= window
     });
 
@@ -376,6 +392,7 @@ where
                 && a.attesting_key_id != subject_key_id
                 && !dead.contains(&a.attestation_id)
                 && !is_expired(a, now)
+                && counts_in_capability_walk(a)
                 && scope_contains(&a.attestation_envelope, scope)
         })
         .filter(|a| seen.insert(a.attesting_key_id.clone()))
@@ -494,6 +511,7 @@ where
                     && a.attested_key_id == old_root
                     && !old_dead.contains(&a.attestation_id)
                     && !is_expired(a, now)
+                    && counts_in_capability_walk(a)
                     && a.attestation_envelope
                         .get(CHARTER_PRE_ROTATION_FIELD)
                         .and_then(|v| v.as_str())

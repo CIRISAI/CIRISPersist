@@ -164,6 +164,17 @@ impl From<types::IdentityOccurrence> for RosterMember {
 /// across the three cohorts. `effective_at` may be future-dated (the member
 /// stays active until it arrives); `witness_set` is the vouch set — the
 /// member cosignatures the Cut G3 quorum gate will count land here.
+///
+/// v21.0.0 (CIRISPersist#502 E4) — `authority_key_id` +
+/// `scrub_signature_classical` + `scrub_signature_pqc`: `FederationDirectory::
+/// revoke_member`'s family/community branches build a
+/// `SignedFamilyMembershipRevocation` / `SignedCommunityMembershipRevocation`
+/// from this spec and hand it to the now-gated `put_family_membership_
+/// revocation` / `put_community_membership_revocation` — the caller (the
+/// `cohort_revoke_member` / `cohort_swap_member` PyO3 surface) supplies the
+/// authority signature here so the gate has something real to verify.
+/// Additive (`#[serde(default)]`) so an old JSON payload decodes fine and
+/// then fails closed at admission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevokeSpec {
     /// When the removal takes effect (`effective_at <= now` ⇒ active-drop).
@@ -174,6 +185,17 @@ pub struct RevokeSpec {
     /// Vouch set (`federation_keys.key_id`s) — Cut G3's quorum cosignatures.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub witness_set: Vec<String>,
+    /// The claimed authority for the removal — a `federation_keys.key_id`.
+    #[serde(default)]
+    pub authority_key_id: String,
+    /// Ed25519 signature (base64) over the removal's
+    /// `signing_envelope()` (JCS-canonicalized).
+    #[serde(default)]
+    pub scrub_signature_classical: String,
+    /// ML-DSA-65 signature (base64) over the bound payload
+    /// `canonical ‖ ed25519_sig`. `None` ⇒ hybrid-Strict verify rejects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub_signature_pqc: Option<String>,
 }
 
 /// A group identity, uniform across the three cohorts (the `lookup_group` /

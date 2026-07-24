@@ -36,6 +36,33 @@ use crate::verify::{canonical::Canonicalizer, Error as VerifyError};
 /// ratification alongside the CC#38 size discipline.
 pub const TRACE_ATTESTATION_DIMENSION: &str = "trace:complete:v1";
 
+/// v21.0.0 (CIRISPersist#501) — the INBOUND projection: reconstruct
+/// `trace_events` rows from a replicated `trace:complete:v1` attestation by
+/// re-running the SAME [`crate::store::decompose::decompose`] the ingest
+/// path uses — so the projection is a FEATURE of writing the claim, never a
+/// hand-duplicated second surface (the divergence that left the corpus leg
+/// dark: replication carried the attestation surface but not the
+/// `trace_events` read surface, so `list_trace_summaries` saw nothing and
+/// the scorer's `n_summaries=0` forever).
+///
+/// Returns the decomposed rows for the INLINE form (`envelope["trace"]`);
+/// `None` for the manifest form (payload on the fountain plane, not in the
+/// envelope — that reassembly is the P3 fountain-fetch follow-up) or a
+/// non-trace / unparseable envelope. Idempotent at the insert (the
+/// `trace_events` dedup index), so a replayed replication is a no-op.
+pub fn project_trace_events_from_attestation(
+    envelope: &serde_json::Value,
+) -> Option<crate::store::decompose::Decomposed> {
+    if crate::federation::admission::envelope_dimension(envelope)
+        != Some(TRACE_ATTESTATION_DIMENSION)
+    {
+        return None;
+    }
+    let trace_value = envelope.get("trace")?;
+    let trace: crate::schema::CompleteTrace = serde_json::from_value(trace_value.clone()).ok()?;
+    crate::store::decompose::decompose(&trace).ok()
+}
+
 /// v18.0.0/#473 (single-sourced v20.1.0 for the #478 backfill) — the
 /// DETERMINISTIC trace-attestation id: sha256("ciris:trace-attestation:v1:"
 /// ‖ trace_id) folded into a UUID (pg's attestation_id is ::uuid-cast). The
@@ -1625,6 +1652,133 @@ mod tests {
             page2.items[0].attestation_id, minted_id,
             "same deterministic id"
         );
+    }
+
+    /// v21.0.0 (CIRISPersist#501) — THE corpus-leg witness, the exact field
+    /// scenario that sat dark: node A ingests (mints the trace attestation);
+    /// the attestation REPLICATES to node B (arrives via `put_attestation`,
+    /// the wire path — NOT the ingest API); node B's scorer read
+    /// (`list_trace_summaries`) MUST see it. Before this cut node B's
+    /// `put_attestation` wrote `federation_attestations` only — the corpus
+    /// stayed empty forever (`n_summaries=0`, no error).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn replicated_trace_attestation_materializes_scorer_corpus_501() {
+        use crate::federation::FederationDirectory as _;
+        use crate::read::ReadEngine as _;
+
+        // ── Node A: real ingest (the same fixture as the mint witness). ──
+        let (bytes, key_id, vkey) = make_signed_batch_bytes().await;
+        let node_a = MemoryBackend::new();
+        node_a.add_public_key(&key_id, vkey);
+        let (signer, signer_key_id) = make_test_signer().await;
+        let pipeline = IngestPipeline {
+            backend: &node_a,
+            canonicalizer: &PythonJsonDumpsCanonicalizer,
+            scrubber: &NullScrubber,
+            signer: &*signer,
+            signer_key_id: &signer_key_id,
+        };
+        let s1 = pipeline.receive_and_persist(&bytes).await.unwrap();
+        assert_eq!(s1.trace_attestations_minted, 1);
+
+        // The minted attestation — what replication carries.
+        let filter: crate::read::AttestationFilter = serde_json::from_value(serde_json::json!({
+            "dimension_exact": TRACE_ATTESTATION_DIMENSION,
+            "tier": "Local",
+        }))
+        .unwrap();
+        let minted = node_a
+            .list_scores(&key_id, filter, None, 10)
+            .await
+            .unwrap()
+            .items
+            .remove(0);
+
+        // ── Node B (the canonical): the attestation arrives over the WIRE
+        // (put_attestation), promoted to federation tier as replication
+        // does. Sign it as the wire admission requires.
+        let node_b = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .unwrap();
+        node_b.run_migrations().await.unwrap();
+        node_b
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: crate::federation::tier_ingest::test_support::replicated_key_record(
+                    &key_id,
+                    "node",
+                    &key_id,
+                    &key_id,
+                    "501-nonce",
+                ),
+            })
+            .await
+            .expect("register producer on node B");
+        let mut replicated = minted.clone();
+        replicated.tier = crate::federation::types::attestation_tier::FEDERATION.to_string();
+        let (och, sig_c, sig_p) = crate::federation::tier_ingest::test_support::sign_envelope(
+            &key_id,
+            &replicated.attestation_envelope,
+        );
+        replicated.original_content_hash = och;
+        replicated.scrub_signature_classical = sig_c;
+        replicated.scrub_signature_pqc = sig_p;
+        replicated.scrub_key_id = key_id.clone();
+        node_b
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: replicated,
+            })
+            .await
+            .expect("replicated trace attestation admits on node B");
+
+        // ── THE assertion: node B's scorer corpus is no longer dark. ──
+        let summaries = node_b
+            .list_trace_summaries(
+                crate::read::TraceFilter::default(),
+                None,
+                10,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .expect("list_trace_summaries");
+        assert_eq!(
+            summaries.items.len(),
+            1,
+            "(501) the replicated trace MUST appear in the scorer's corpus"
+        );
+        assert_eq!(
+            summaries.items[0].trace_id,
+            minted
+                .attestation_envelope
+                .get("trace_id")
+                .and_then(|v| v.as_str())
+                .unwrap()
+        );
+
+        // Idempotent: re-applying the same replication batch is a no-op.
+        let mut again = minted;
+        again.tier = crate::federation::types::attestation_tier::FEDERATION.to_string();
+        let (och2, sig_c2, sig_p2) = crate::federation::tier_ingest::test_support::sign_envelope(
+            &key_id,
+            &again.attestation_envelope,
+        );
+        again.original_content_hash = och2;
+        again.scrub_signature_classical = sig_c2;
+        again.scrub_signature_pqc = sig_p2;
+        again.scrub_key_id = key_id.clone();
+        let _ = node_b
+            .put_attestation(crate::federation::SignedAttestation { attestation: again })
+            .await; // Conflict-or-ok; either way:
+        let after = node_b
+            .list_trace_summaries(
+                crate::read::TraceFilter::default(),
+                None,
+                10,
+                crate::scope::CallerScope::Unauthenticated,
+            )
+            .await
+            .unwrap();
+        assert_eq!(after.items.len(), 1, "no duplicate summaries on replay");
     }
 
     /// v18.0.0 (#473) — an UNREGISTERED producer (the relay
