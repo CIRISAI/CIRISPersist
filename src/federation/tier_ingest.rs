@@ -269,6 +269,124 @@ where
     Ok(computed_hash)
 }
 
+/// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
+/// [`SignedFamily`](super::SignedFamily): hybrid-Strict verify the scrub
+/// signature against the **claimed authority**'s REGISTERED pubkeys, over
+/// [`super::types::Family::signing_envelope`]. Before this, `put_family`
+/// admitted on FK-existence alone — a `Family` is a **keyless declaration**
+/// (no signature at all was carried), so any linked peer could forge one
+/// wholesale. Run BEFORE any DB work (mirrors the #502 E1
+/// `verify_revocation_admission` shape this helper replicates for the family
+/// plane).
+pub async fn verify_family_admission<F>(
+    directory: &F,
+    signed: &super::SignedFamily,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    verify_envelope_hybrid_signature(
+        directory,
+        &signed.authority_key_id,
+        &signed.family.signing_envelope(),
+        &signed.scrub_signature_classical,
+        signed.scrub_signature_pqc.as_deref(),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
+/// [`SignedCommunity`](super::SignedCommunity). Structural mirror of
+/// [`verify_family_admission`]; verifies over
+/// [`super::types::Community::signing_envelope`].
+pub async fn verify_community_admission<F>(
+    directory: &F,
+    signed: &super::SignedCommunity,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    verify_envelope_hybrid_signature(
+        directory,
+        &signed.authority_key_id,
+        &signed.community.signing_envelope(),
+        &signed.scrub_signature_classical,
+        signed.scrub_signature_pqc.as_deref(),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
+/// [`SignedFamilyMembershipRevocation`](super::SignedFamilyMembershipRevocation).
+/// Structural mirror of [`verify_family_admission`]; verifies over
+/// [`super::types::FamilyMembershipRevocation::signing_envelope`].
+pub async fn verify_family_membership_revocation_admission<F>(
+    directory: &F,
+    signed: &super::SignedFamilyMembershipRevocation,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    verify_envelope_hybrid_signature(
+        directory,
+        &signed.authority_key_id,
+        &signed.family_membership_revocation.signing_envelope(),
+        &signed.scrub_signature_classical,
+        signed.scrub_signature_pqc.as_deref(),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
+/// [`SignedCommunityMembershipRevocation`](super::SignedCommunityMembershipRevocation).
+/// THE worst-case E4 closure: before this, a forged community-membership
+/// removal admitted on FK-existence alone and rotated the CC 4.4.3.2.2
+/// community DEK epoch — an unauthenticated forward-secrecy DoS. Structural
+/// mirror of [`verify_family_admission`]; verifies over
+/// [`super::types::CommunityMembershipRevocation::signing_envelope`].
+pub async fn verify_community_membership_revocation_admission<F>(
+    directory: &F,
+    signed: &super::SignedCommunityMembershipRevocation,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    verify_envelope_hybrid_signature(
+        directory,
+        &signed.authority_key_id,
+        &signed.community_membership_revocation.signing_envelope(),
+        &signed.scrub_signature_classical,
+        signed.scrub_signature_pqc.as_deref(),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// v21.0.0 (CIRISPersist#502 E4) — mechanistic admission for a replicated
+/// [`SignedLocationProof`](super::SignedLocationProof). Structural mirror of
+/// [`verify_family_admission`]; verifies over
+/// [`super::types::LocationProof::signing_envelope`].
+pub async fn verify_location_proof_admission<F>(
+    directory: &F,
+    signed: &super::SignedLocationProof,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    verify_envelope_hybrid_signature(
+        directory,
+        &signed.authority_key_id,
+        &signed.location_proof.signing_envelope(),
+        &signed.scrub_signature_classical,
+        signed.scrub_signature_pqc.as_deref(),
+    )
+    .await
+    .map(|_| ())
+}
+
 /// v9.0.0 (CIRISPersist#237) — shared test-support for the
 /// federation-tier ingest gate. Mirrors
 /// [`super::operational::test_support`]: a deterministic-per-`key_id`
@@ -449,6 +567,151 @@ pub(crate) mod test_support {
             B64.encode(&ed_sig),
             Some(B64.encode(&pqc_sig)),
         )
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E4) — sign a [`Family`](crate::federation::types::Family)
+    /// for submission: hybrid-signs `family.signing_envelope()` with
+    /// `authority_key_id`'s deterministic keypair and wraps the result as a
+    /// [`SignedFamily`](crate::federation::SignedFamily). `authority_key_id`
+    /// MUST already be registered (e.g. via [`register_hybrid_key`]) for the
+    /// wrapped record to verify at `put_family`.
+    pub fn sign_family(
+        authority_key_id: &str,
+        family: crate::federation::types::Family,
+    ) -> crate::federation::SignedFamily {
+        let (_hash, classical, pqc) = sign_envelope(authority_key_id, &family.signing_envelope());
+        crate::federation::SignedFamily {
+            family,
+            authority_key_id: authority_key_id.to_owned(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E4) — sign a
+    /// [`Community`](crate::federation::types::Community) for submission.
+    /// Mirrors [`sign_family`].
+    pub fn sign_community(
+        authority_key_id: &str,
+        community: crate::federation::types::Community,
+    ) -> crate::federation::SignedCommunity {
+        let (_hash, classical, pqc) =
+            sign_envelope(authority_key_id, &community.signing_envelope());
+        crate::federation::SignedCommunity {
+            community,
+            authority_key_id: authority_key_id.to_owned(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E4) — sign a
+    /// [`FamilyMembershipRevocation`](crate::federation::types::FamilyMembershipRevocation)
+    /// for submission. Mirrors [`sign_family`].
+    pub fn sign_family_membership_revocation(
+        authority_key_id: &str,
+        revocation: crate::federation::types::FamilyMembershipRevocation,
+    ) -> crate::federation::SignedFamilyMembershipRevocation {
+        let (_hash, classical, pqc) =
+            sign_envelope(authority_key_id, &revocation.signing_envelope());
+        crate::federation::SignedFamilyMembershipRevocation {
+            family_membership_revocation: revocation,
+            authority_key_id: authority_key_id.to_owned(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E4) — sign a
+    /// [`CommunityMembershipRevocation`](crate::federation::types::CommunityMembershipRevocation)
+    /// for submission. Mirrors [`sign_family`].
+    pub fn sign_community_membership_revocation(
+        authority_key_id: &str,
+        revocation: crate::federation::types::CommunityMembershipRevocation,
+    ) -> crate::federation::SignedCommunityMembershipRevocation {
+        let (_hash, classical, pqc) =
+            sign_envelope(authority_key_id, &revocation.signing_envelope());
+        crate::federation::SignedCommunityMembershipRevocation {
+            community_membership_revocation: revocation,
+            authority_key_id: authority_key_id.to_owned(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E4) — sign a
+    /// [`LocationProof`](crate::federation::types::LocationProof) for
+    /// submission. Mirrors [`sign_family`].
+    pub fn sign_location_proof(
+        authority_key_id: &str,
+        proof: crate::federation::types::LocationProof,
+    ) -> crate::federation::SignedLocationProof {
+        let (_hash, classical, pqc) = sign_envelope(authority_key_id, &proof.signing_envelope());
+        crate::federation::SignedLocationProof {
+            location_proof: proof,
+            authority_key_id: authority_key_id.to_owned(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E4) — build a signed
+    /// [`RevokeSpec`](crate::federation::cohort::RevokeSpec) for
+    /// `revoke_member` / `swap_member` whose authority signature matches
+    /// EXACTLY what `FederationDirectory::revoke_member` constructs
+    /// internally for the `Family`/`Community` cohorts — **`removed_at` is
+    /// `effective_at`**, never a server-minted `now` (see the #502 E4 comment
+    /// on `revoke_member`; the caller cannot predict a server timestamp, so
+    /// the callee never mints one for a field it verifies). `SelfId` takes
+    /// the trusted-local path (no gate) — its `RevokeSpec` carries empty
+    /// authority fields, which is correct (nothing to verify there).
+    pub fn sign_revoke_spec(
+        cohort: crate::federation::cohort::Cohort,
+        authority_key_id: &str,
+        group_key_id: &str,
+        removed_key_id: &str,
+        effective_at: chrono::DateTime<chrono::Utc>,
+        reason: Option<String>,
+        witness_set: Vec<String>,
+    ) -> crate::federation::cohort::RevokeSpec {
+        use crate::federation::cohort::Cohort;
+        let (scrub_signature_classical, scrub_signature_pqc) = match cohort {
+            Cohort::Family => {
+                let rec = crate::federation::types::FamilyMembershipRevocation {
+                    family_key_id: group_key_id.to_owned(),
+                    removed_identity_key_id: removed_key_id.to_owned(),
+                    removed_at: effective_at,
+                    effective_at,
+                    reason: reason.clone(),
+                    witness_set: witness_set.clone(),
+                    persist_row_hash: String::new(),
+                };
+                let (_hash, c, p) = sign_envelope(authority_key_id, &rec.signing_envelope());
+                (c, p)
+            }
+            Cohort::Community | Cohort::Affiliations => {
+                let rec = crate::federation::types::CommunityMembershipRevocation {
+                    community_key_id: group_key_id.to_owned(),
+                    removed_identity_key_id: removed_key_id.to_owned(),
+                    removed_at: effective_at,
+                    effective_at,
+                    reason: reason.clone(),
+                    witness_set: witness_set.clone(),
+                    persist_row_hash: String::new(),
+                };
+                let (_hash, c, p) = sign_envelope(authority_key_id, &rec.signing_envelope());
+                (c, p)
+            }
+            Cohort::SelfId => (String::new(), None),
+        };
+        crate::federation::cohort::RevokeSpec {
+            effective_at,
+            reason,
+            witness_set,
+            authority_key_id: authority_key_id.to_owned(),
+            scrub_signature_classical,
+            scrub_signature_pqc,
+        }
     }
 
     /// #371 — register `key_id` with its REAL deterministic hybrid pubkeys

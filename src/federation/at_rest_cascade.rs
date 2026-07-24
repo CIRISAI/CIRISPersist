@@ -917,11 +917,23 @@ pub mod orchestrate {
     /// shared epoch to bump (forward secrecy holds without a re-key). Only the
     /// community tier shares one DEK per `(community, epoch)` and therefore must
     /// rotate on removal.
+    ///
+    /// v21.0.0 (CIRISPersist#502 E4) — `authority_key_id` /
+    /// `scrub_signature_classical` / `scrub_signature_pqc` are the caller's
+    /// authority signature over the removal; `put_community_membership_revocation`
+    /// hybrid-Strict-verifies them before any write (including the epoch bump
+    /// below) — closing the exact hole this function's own doc names: an
+    /// unauthenticated caller of this cascade could otherwise force a DEK
+    /// rotation (forward-secrecy DoS) with no proof of authority at all.
+    #[allow(clippy::too_many_arguments)]
     pub async fn rekey_community_member_revoke<B>(
         backend: &B,
         community_key_id: &str,
         removed_identity_key_id: &str,
         observed_at: chrono::DateTime<chrono::Utc>,
+        authority_key_id: &str,
+        scrub_signature_classical: &str,
+        scrub_signature_pqc: Option<&str>,
     ) -> Result<u64, BlobError>
     where
         B: FederationDirectory + BlobStorage + Sync,
@@ -942,6 +954,9 @@ pub mod orchestrate {
                             witness_set: Vec::new(),
                             persist_row_hash: String::new(),
                         },
+                    authority_key_id: authority_key_id.to_string(),
+                    scrub_signature_classical: scrub_signature_classical.to_string(),
+                    scrub_signature_pqc: scrub_signature_pqc.map(str::to_string),
                 },
             )
             .await

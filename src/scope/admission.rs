@@ -275,8 +275,7 @@ impl CallerAdmission {
 mod revocation_honesty_tests {
     use crate::federation::{
         FamilyMembershipRevocation, FederationDirectory, IdentityOccurrence,
-        IdentityOccurrenceRevocation, KeyRecord, SignedFamily, SignedFamilyMembershipRevocation,
-        SignedKeyRecord,
+        IdentityOccurrenceRevocation, KeyRecord, SignedKeyRecord,
     };
     use crate::signing::LocalSigner;
     use crate::Engine;
@@ -293,11 +292,16 @@ mod revocation_honesty_tests {
     }
 
     fn key(k: &str) -> SignedKeyRecord {
+        // v21.0.0 (CIRISPersist#502 E4) — REAL deterministic hybrid pubkeys
+        // (was an all-zeros placeholder) so `k` can also act as a `Signed*`
+        // authority (`sign_family` / `sign_family_membership_revocation`
+        // below sign with the SAME derivation).
+        let (ed_pk, mldsa_pk) = crate::federation::tier_ingest::test_support::hybrid_pubkeys(k);
         SignedKeyRecord {
             record: KeyRecord {
                 key_id: k.into(),
-                pubkey_ed25519_base64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-                pubkey_ml_dsa_65_base64: None,
+                pubkey_ed25519_base64: ed_pk,
+                pubkey_ml_dsa_65_base64: mldsa_pk,
                 algorithm: crate::federation::types::algorithm::HYBRID.into(),
                 identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
                 identity_ref: k.into(),
@@ -341,8 +345,9 @@ mod revocation_honesty_tests {
         })
         .await
         .unwrap();
-        sq.put_family(SignedFamily {
-            family: crate::federation::Family {
+        sq.put_family(crate::federation::tier_ingest::test_support::sign_family(
+            "fam-1",
+            crate::federation::Family {
                 family_key_id: "fam-1".into(),
                 family_name: "Fam".into(),
                 members: vec![crate::federation::FamilyMember {
@@ -355,7 +360,7 @@ mod revocation_honesty_tests {
                 consensus_protocol_entrenched: false,
                 persist_row_hash: String::new(),
             },
-        })
+        ))
         .await
         .unwrap();
 
@@ -405,8 +410,9 @@ mod revocation_honesty_tests {
         for k in ["bob-root", "fam-1"] {
             sq.put_public_key(key(k)).await.unwrap();
         }
-        sq.put_family(SignedFamily {
-            family: crate::federation::Family {
+        sq.put_family(crate::federation::tier_ingest::test_support::sign_family(
+            "fam-1",
+            crate::federation::Family {
                 family_key_id: "fam-1".into(),
                 family_name: "Fam".into(),
                 members: vec![crate::federation::FamilyMember {
@@ -419,7 +425,7 @@ mod revocation_honesty_tests {
                 consensus_protocol_entrenched: false,
                 persist_row_hash: String::new(),
             },
-        })
+        ))
         .await
         .unwrap();
         // bob-root is a singleton identity (no occurrence binding) in fam-1.
@@ -428,17 +434,20 @@ mod revocation_honesty_tests {
             .unwrap();
         assert!(adm.family_key_ids.contains("fam-1"));
 
-        sq.put_family_membership_revocation(SignedFamilyMembershipRevocation {
-            family_membership_revocation: FamilyMembershipRevocation {
-                family_key_id: "fam-1".into(),
-                removed_identity_key_id: "bob-root".into(),
-                removed_at: "2026-06-02T00:00:00Z".parse().unwrap(),
-                effective_at: "2026-06-02T00:00:00Z".parse().unwrap(),
-                reason: None,
-                witness_set: vec![],
-                persist_row_hash: String::new(),
-            },
-        })
+        sq.put_family_membership_revocation(
+            crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+                "fam-1",
+                FamilyMembershipRevocation {
+                    family_key_id: "fam-1".into(),
+                    removed_identity_key_id: "bob-root".into(),
+                    removed_at: "2026-06-02T00:00:00Z".parse().unwrap(),
+                    effective_at: "2026-06-02T00:00:00Z".parse().unwrap(),
+                    reason: None,
+                    witness_set: vec![],
+                    persist_row_hash: String::new(),
+                },
+            ),
+        )
         .await
         .unwrap();
 

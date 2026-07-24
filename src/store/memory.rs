@@ -2806,7 +2806,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         family: crate::federation::SignedFamily,
     ) -> Result<(), crate::federation::Error> {
-        let mut row = family.family;
+        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE the
+        // state lock (the verify resolves keys via the directory, which
+        // locks itself). Hybrid-Strict vs the authority's registered
+        // pubkeys — was FK-existence only, a forgeable keyless declaration.
+        crate::federation::verify_family_admission(self, &family).await?;
+        self.put_family_local(family.family).await
+    }
+
+    async fn put_family_local(
+        &self,
+        mut row: crate::federation::types::Family,
+    ) -> Result<(), crate::federation::Error> {
         // v3.12.0 — value-validation admission (consensus_protocol
         // canonical form). Full signature-counting enforcement is v3.13+.
         crate::federation::check_consensus_protocol_form(&row.consensus_protocol)?;
@@ -3064,6 +3075,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         community: crate::federation::SignedCommunity,
     ) -> Result<(), crate::federation::Error> {
+        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
+        // other admission step (mirrors put_family). Hybrid-Strict vs the
+        // authority's registered pubkeys.
+        crate::federation::verify_community_admission(self, &community).await?;
         let mut row = community.community;
         // v4.0 — value-validation admission (consensus_protocol
         // canonical form). Mirrors put_family.
@@ -3487,6 +3502,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         revocation: crate::federation::SignedFamilyMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE the
+        // state lock (the verify resolves keys via the directory, which
+        // locks itself). Was FK-existence only — a forged removal was
+        // indistinguishable from a real one.
+        crate::federation::verify_family_membership_revocation_admission(self, &revocation).await?;
         let mut row = revocation.family_membership_revocation;
         let mut state = self.state.lock().expect("memory backend lock");
         for k in [&row.family_key_id, &row.removed_identity_key_id] {
@@ -3524,6 +3544,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         revocation: crate::federation::SignedCommunityMembershipRevocation,
     ) -> Result<(), crate::federation::Error> {
+        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
+        // other admission step. THE worst-case E4 hole: an unverified
+        // removal here rotates the community DEK epoch below — an
+        // unauthenticated forward-secrecy DoS.
+        crate::federation::verify_community_membership_revocation_admission(self, &revocation)
+            .await?;
         let mut row = revocation.community_membership_revocation;
         // SecReview F4 — community removal is immediate for forward-secrecy;
         // reject a future-dated effective_at BEFORE any state mutation
@@ -3839,6 +3865,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         proof: crate::federation::SignedLocationProof,
     ) -> Result<(), crate::federation::Error> {
+        // v21.0.0 (CIRISPersist#502 E4) — mechanistic authorship BEFORE any
+        // other admission step.
+        crate::federation::verify_location_proof_admission(self, &proof).await?;
         let mut row = proof.location_proof;
         // §0.8 canonicalization + §0.8.1 rough-only gate before write.
         crate::federation::location::validate_location_cell(&row.cell_id, row.cell_resolution)?;
@@ -8991,22 +9020,25 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_community(crate::federation::SignedCommunity {
-                community: crate::federation::types::Community {
-                    community_key_id: community_id.into(),
-                    community_name: "test-community".into(),
-                    members: vec![crate::federation::types::CommunityMember {
-                        key_id: founder.into(),
-                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                        role: Some("founder".into()),
-                    }],
-                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
-                        .into(),
-                    policy_blob: None,
-                    persist_row_hash: String::new(),
-                },
-            })
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
+                    community_id,
+                    crate::federation::types::Community {
+                        community_key_id: community_id.into(),
+                        community_name: "test-community".into(),
+                        members: vec![crate::federation::types::CommunityMember {
+                            key_id: founder.into(),
+                            joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                            role: Some("founder".into()),
+                        }],
+                        founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        consensus_protocol:
+                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+                        policy_blob: None,
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
             .await
             .expect("seed community");
     }
@@ -9600,18 +9632,21 @@ mod tests {
             .unwrap();
         let policy_blob = cohort_subkind.map(|sk| serde_json::json!({ "cohort_subkind": sk }));
         backend
-            .put_community(crate::federation::SignedCommunity {
-                community: crate::federation::types::Community {
-                    community_key_id: community_id.into(),
-                    community_name: "ob-test".into(),
-                    members,
-                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
-                        .into(),
-                    policy_blob,
-                    persist_row_hash: String::new(),
-                },
-            })
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
+                    community_id,
+                    crate::federation::types::Community {
+                        community_key_id: community_id.into(),
+                        community_name: "ob-test".into(),
+                        members,
+                        founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        consensus_protocol:
+                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+                        policy_blob,
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
             .await
     }
 
@@ -9929,9 +9964,13 @@ mod tests {
     async fn community_revocation_rejects_future_dated_effective_at() {
         let backend = MemoryBackend::new();
         seed_ob_keys(&backend).await; // ob-owner (community key proxy) + ob-node exist
+                                      // #502 E4 — sign with `ob-owner` (real deterministic hybrid keys via
+                                      // `fix_key`/`seed_ob_keys`) so the new admission gate passes and the
+                                      // future-dated check below is the actual thing under test.
         let rev = |effective_at: chrono::DateTime<chrono::Utc>| {
-            crate::federation::SignedCommunityMembershipRevocation {
-                community_membership_revocation: crate::federation::CommunityMembershipRevocation {
+            crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
+                "ob-owner",
+                crate::federation::CommunityMembershipRevocation {
                     community_key_id: "ob-owner".into(),
                     removed_identity_key_id: "ob-node".into(),
                     removed_at: effective_at,
@@ -9940,7 +9979,7 @@ mod tests {
                     witness_set: vec![],
                     persist_row_hash: String::new(),
                 },
-            }
+            )
         };
         // Future-dated (now + 30d) → REJECTED before any write.
         let future = chrono::Utc::now() + chrono::Duration::days(30);
@@ -9969,7 +10008,7 @@ mod tests {
     /// removal. Asserted via the uniform [`FederationDirectory`] cohort surface.
     #[tokio::test]
     async fn affiliations_cohort_membership_lifecycle_mirrors_community() {
-        use crate::federation::cohort::{Cohort, RevokeSpec, RosterMember};
+        use crate::federation::cohort::{Cohort, RosterMember};
         use crate::federation::FederationDirectory;
         let backend = MemoryBackend::new();
         seed_ob_keys(&backend).await; // ob-owner (user), ob-node, ob-agent
@@ -10035,11 +10074,15 @@ mod tests {
                 Cohort::Affiliations,
                 group,
                 "ob-joiner",
-                RevokeSpec {
-                    effective_at: chrono::Utc::now(),
-                    reason: Some("left".into()),
-                    witness_set: vec![],
-                },
+                crate::federation::tier_ingest::test_support::sign_revoke_spec(
+                    Cohort::Affiliations,
+                    group,
+                    group,
+                    "ob-joiner",
+                    chrono::Utc::now(),
+                    Some("left".into()),
+                    vec![],
+                ),
             )
             .await
             .expect("affiliations revoke_member");
@@ -10530,9 +10573,7 @@ mod tests {
 
     use crate::federation::hard_case::{self, HardCaseFilter};
     use crate::federation::types::{consent_record, FamilyMember};
-    use crate::federation::{
-        Family, FamilyMembershipRevocation, SignedFamily, SignedFamilyMembershipRevocation,
-    };
+    use crate::federation::{Family, FamilyMembershipRevocation};
 
     /// Bootstrap a backend with a family + the two keys, returning it.
     async fn family_backend(family_key: &str, member_key: &str) -> MemoryBackend {
@@ -10552,8 +10593,9 @@ mod tests {
             .await
             .unwrap();
         backend
-            .put_family(SignedFamily {
-                family: Family {
+            .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                family_key,
+                Family {
                     family_key_id: family_key.into(),
                     family_name: "Test Household".into(),
                     members: vec![FamilyMember {
@@ -10566,7 +10608,7 @@ mod tests {
                     consensus_protocol_entrenched: false,
                     persist_row_hash: String::new(),
                 },
-            })
+            ))
             .await
             .unwrap();
         backend
@@ -10592,9 +10634,12 @@ mod tests {
             persist_row_hash: String::new(),
         };
         backend
-            .put_family_membership_revocation(SignedFamilyMembershipRevocation {
-                family_membership_revocation: rev.clone(),
-            })
+            .put_family_membership_revocation(
+                crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+                    "fam-A",
+                    rev.clone(),
+                ),
+            )
             .await
             .unwrap();
 
@@ -10618,9 +10663,11 @@ mod tests {
         // Idempotent: a re-submit at the same effective_at writes no
         // duplicate (the forward-secrecy re-key keys on effective_at).
         backend
-            .put_family_membership_revocation(SignedFamilyMembershipRevocation {
-                family_membership_revocation: rev,
-            })
+            .put_family_membership_revocation(
+                crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+                    "fam-A", rev,
+                ),
+            )
             .await
             .unwrap();
         let events2 = backend
@@ -11150,18 +11197,18 @@ mod tests {
         // Revoke acm-1 effective now → N−1.
         backend
             .put_community_membership_revocation(
-                crate::federation::SignedCommunityMembershipRevocation {
-                    community_membership_revocation:
-                        crate::federation::CommunityMembershipRevocation {
-                            community_key_id: "acm-comm".into(),
-                            removed_identity_key_id: "acm-1".into(),
-                            removed_at: chrono::Utc::now(),
-                            effective_at: chrono::Utc::now(),
-                            reason: None,
-                            witness_set: vec![],
-                            persist_row_hash: String::new(),
-                        },
-                },
+                crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
+                    "acm-comm",
+                    crate::federation::CommunityMembershipRevocation {
+                        community_key_id: "acm-comm".into(),
+                        removed_identity_key_id: "acm-1".into(),
+                        removed_at: chrono::Utc::now(),
+                        effective_at: chrono::Utc::now(),
+                        reason: None,
+                        witness_set: vec![],
+                        persist_row_hash: String::new(),
+                    },
+                ),
             )
             .await
             .unwrap();
@@ -11197,17 +11244,20 @@ mod tests {
         // future-date a revocation of the real member and assert it stays.
         let future = chrono::Utc::now() + chrono::Duration::days(30);
         backend
-            .put_family_membership_revocation(SignedFamilyMembershipRevocation {
-                family_membership_revocation: FamilyMembershipRevocation {
-                    family_key_id: "afm-fam".into(),
-                    removed_identity_key_id: "afm-carol".into(),
-                    removed_at: chrono::Utc::now(),
-                    effective_at: future,
-                    reason: None,
-                    witness_set: vec![],
-                    persist_row_hash: String::new(),
-                },
-            })
+            .put_family_membership_revocation(
+                crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+                    "afm-fam",
+                    FamilyMembershipRevocation {
+                        family_key_id: "afm-fam".into(),
+                        removed_identity_key_id: "afm-carol".into(),
+                        removed_at: chrono::Utc::now(),
+                        effective_at: future,
+                        reason: None,
+                        witness_set: vec![],
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
             .await
             .unwrap();
         let active = backend.active_family_members("afm-fam").await.unwrap();
@@ -11220,17 +11270,20 @@ mod tests {
 
         // Now an effective (now) revocation DOES drop it → empty roster.
         backend
-            .put_family_membership_revocation(SignedFamilyMembershipRevocation {
-                family_membership_revocation: FamilyMembershipRevocation {
-                    family_key_id: "afm-fam".into(),
-                    removed_identity_key_id: "afm-carol".into(),
-                    removed_at: chrono::Utc::now(),
-                    effective_at: chrono::Utc::now(),
-                    reason: None,
-                    witness_set: vec![],
-                    persist_row_hash: String::new(),
-                },
-            })
+            .put_family_membership_revocation(
+                crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+                    "afm-fam",
+                    FamilyMembershipRevocation {
+                        family_key_id: "afm-fam".into(),
+                        removed_identity_key_id: "afm-carol".into(),
+                        removed_at: chrono::Utc::now(),
+                        effective_at: chrono::Utc::now(),
+                        reason: None,
+                        witness_set: vec![],
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
             .await
             .unwrap();
         let active = backend.active_family_members("afm-fam").await.unwrap();
@@ -11316,22 +11369,25 @@ mod tests {
         }
         // Community whose authority root is the founder.
         backend
-            .put_community(crate::federation::SignedCommunity {
-                community: crate::federation::types::Community {
-                    community_key_id: "mod-comm".into(),
-                    community_name: "mods".into(),
-                    members: vec![crate::federation::types::CommunityMember {
-                        key_id: "mod-founder".into(),
-                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                        role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
-                    }],
-                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
-                        .into(),
-                    policy_blob: None,
-                    persist_row_hash: String::new(),
-                },
-            })
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
+                    "mod-comm",
+                    crate::federation::types::Community {
+                        community_key_id: "mod-comm".into(),
+                        community_name: "mods".into(),
+                        members: vec![crate::federation::types::CommunityMember {
+                            key_id: "mod-founder".into(),
+                            joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                            role: Some(crate::federation::admission::MEMBER_ROLE_FOUNDER.into()),
+                        }],
+                        founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        consensus_protocol:
+                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+                        policy_blob: None,
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
             .await
             .unwrap();
         // founder delegates `moderate` to deputy.
@@ -11439,9 +11495,12 @@ mod tests {
                 persist_row_hash: String::new(),
             };
             backend
-                .put_community(crate::federation::SignedCommunity {
-                    community: community.clone(),
-                })
+                .put_community(
+                    crate::federation::tier_ingest::test_support::sign_community(
+                        cid,
+                        community.clone(),
+                    ),
+                )
                 .await
                 .expect("record stored (put_community is not the moderator gate)");
             community
@@ -11557,21 +11616,24 @@ mod tests {
                 .await
                 .unwrap();
             backend
-                .put_community(crate::federation::SignedCommunity {
-                    community: crate::federation::types::Community {
-                        community_key_id: cid.into(),
-                        community_name: "bk".into(),
-                        members: vec![crate::federation::types::CommunityMember {
-                            key_id: founder.into(),
-                            joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                            role: Some(MEMBER_ROLE_FOUNDER.into()),
-                        }],
-                        founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                        consensus_protocol: consensus_protocol::FOUNDER_ONLY.into(),
-                        policy_blob: None,
-                        persist_row_hash: String::new(),
-                    },
-                })
+                .put_community(
+                    crate::federation::tier_ingest::test_support::sign_community(
+                        cid,
+                        crate::federation::types::Community {
+                            community_key_id: cid.into(),
+                            community_name: "bk".into(),
+                            members: vec![crate::federation::types::CommunityMember {
+                                key_id: founder.into(),
+                                joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                                role: Some(MEMBER_ROLE_FOUNDER.into()),
+                            }],
+                            founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                            consensus_protocol: consensus_protocol::FOUNDER_ONLY.into(),
+                            policy_blob: None,
+                            persist_row_hash: String::new(),
+                        },
+                    ),
+                )
                 .await
                 .expect("storage-only put_community is NOT the moderator gate");
         }
@@ -11659,18 +11721,18 @@ mod tests {
         //     4.5.13 recovery must not be blocked by the federate gate.
         seed(&b, "bk-no", "bk-prim", identity_type::PRIMITIVE).await;
         b.put_community_membership_revocation(
-            crate::federation::SignedCommunityMembershipRevocation {
-                community_membership_revocation:
-                    crate::federation::types::CommunityMembershipRevocation {
-                        community_key_id: "bk-no".into(),
-                        removed_identity_key_id: "bk-prim".into(),
-                        removed_at: "2026-05-02T00:00:00Z".parse().unwrap(),
-                        effective_at: "2026-05-02T00:00:00Z".parse().unwrap(),
-                        reason: Some("storage-only membership op stays ungated".into()),
-                        witness_set: Vec::new(),
-                        persist_row_hash: String::new(),
-                    },
-            },
+            crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
+                "bk-no",
+                crate::federation::types::CommunityMembershipRevocation {
+                    community_key_id: "bk-no".into(),
+                    removed_identity_key_id: "bk-prim".into(),
+                    removed_at: "2026-05-02T00:00:00Z".parse().unwrap(),
+                    effective_at: "2026-05-02T00:00:00Z".parse().unwrap(),
+                    reason: Some("storage-only membership op stays ungated".into()),
+                    witness_set: Vec::new(),
+                    persist_row_hash: String::new(),
+                },
+            ),
         )
         .await
         .expect("membership revocation on a moderator-less community is storage, not federation");
@@ -13986,6 +14048,417 @@ mod tests {
         assert!(
             !is_steward_bound(&backend, "ml-N").await.unwrap(),
             "the node/agent fail-secure path is unchanged by the minor gate",
+        );
+    }
+
+    // ─── v21.0.0 (CIRISPersist#502 E4) — keyless-declaration forgery
+    //     witnesses. `Family` / `Community` / `FamilyMembershipRevocation` /
+    //     `CommunityMembershipRevocation` / `LocationProof` carried NO
+    //     per-record signature at all (admission was FK-existence only), so
+    //     any linked peer could forge one wholesale — worst case, a forged
+    //     community-membership removal rotates the CC 4.4.3.2.2 DEK epoch
+    //     (an unauthenticated forward-secrecy DoS). Each witness below: an
+    //     honestly-signed record admits; the SAME record re-signed by a
+    //     DIFFERENT key (while still CLAIMING the honest authority's
+    //     `authority_key_id`) is rejected fail-closed and leaves no trace.
+
+    /// A forged `Family`: claims `authority_key_id: "e4-fam-authority"` but
+    /// the envelope is actually signed by `e4-fam-attacker`'s key — the
+    /// registered pubkeys of the claimed authority won't verify it.
+    #[tokio::test]
+    async fn forged_family_wrong_signer_rejected_502e4() {
+        let backend = MemoryBackend::new();
+        for k in [
+            "e4-fam-authority",
+            "e4-fam-attacker",
+            "e4-fam-member",
+            "e4-fam-good",
+            "e4-fam-forged",
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "ref", k),
+                })
+                .await
+                .unwrap();
+        }
+        let fam = |key_id: &str| crate::federation::types::Family {
+            family_key_id: key_id.into(),
+            family_name: "E4 Household".into(),
+            members: vec![crate::federation::types::FamilyMember {
+                key_id: "e4-fam-member".into(),
+                joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                role: None,
+            }],
+            founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            consensus_protocol: "founder_only".into(),
+            consensus_protocol_entrenched: false,
+            persist_row_hash: String::new(),
+        };
+        // Honest: signed by the authority it claims to be — admits.
+        backend
+            .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                "e4-fam-authority",
+                fam("e4-fam-good"),
+            ))
+            .await
+            .expect("(E4) honestly-signed family admits");
+
+        // Forged: same shape, but the SIGNATURE comes from the attacker's
+        // key while `authority_key_id` still claims the honest authority.
+        let mut forged = crate::federation::tier_ingest::test_support::sign_family(
+            "e4-fam-attacker",
+            fam("e4-fam-forged"),
+        );
+        forged.authority_key_id = "e4-fam-authority".to_owned();
+        let err = backend
+            .put_family(forged)
+            .await
+            .expect_err("(E4) forged family must be rejected");
+        assert!(
+            err.kind().contains("federation_tier_unverified") || err.kind().contains("unverified"),
+            "rejected by hybrid verify, got kind {}",
+            err.kind()
+        );
+        assert!(
+            backend
+                .lookup_family("e4-fam-forged")
+                .await
+                .unwrap()
+                .is_none(),
+            "(E4) rejected family must NOT be stored (fail-secure)"
+        );
+    }
+
+    /// A forged `Community`: same shape as the family witness.
+    #[tokio::test]
+    async fn forged_community_wrong_signer_rejected_502e4() {
+        let backend = MemoryBackend::new();
+        for k in [
+            "e4-comm-authority",
+            "e4-comm-attacker",
+            "e4-comm-member",
+            "e4-comm-good",
+            "e4-comm-forged",
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "ref", k),
+                })
+                .await
+                .unwrap();
+        }
+        let comm = |key_id: &str| crate::federation::types::Community {
+            community_key_id: key_id.into(),
+            community_name: "E4 Co-op".into(),
+            members: vec![crate::federation::types::CommunityMember {
+                key_id: "e4-comm-member".into(),
+                joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                role: None,
+            }],
+            founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+            consensus_protocol: "founder_only".into(),
+            policy_blob: None,
+            persist_row_hash: String::new(),
+        };
+        backend
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
+                    "e4-comm-authority",
+                    comm("e4-comm-good"),
+                ),
+            )
+            .await
+            .expect("(E4) honestly-signed community admits");
+
+        let mut forged = crate::federation::tier_ingest::test_support::sign_community(
+            "e4-comm-attacker",
+            comm("e4-comm-forged"),
+        );
+        forged.authority_key_id = "e4-comm-authority".to_owned();
+        let err = backend
+            .put_community(forged)
+            .await
+            .expect_err("(E4) forged community must be rejected");
+        assert!(
+            err.kind().contains("federation_tier_unverified") || err.kind().contains("unverified"),
+            "rejected by hybrid verify, got kind {}",
+            err.kind()
+        );
+        assert!(
+            backend
+                .lookup_community("e4-comm-forged")
+                .await
+                .unwrap()
+                .is_none(),
+            "(E4) rejected community must NOT be stored (fail-secure)"
+        );
+    }
+
+    /// A forged `FamilyMembershipRevocation`.
+    #[tokio::test]
+    async fn forged_family_membership_revocation_wrong_signer_rejected_502e4() {
+        let backend = MemoryBackend::new();
+        for k in [
+            "e4-fmr-authority",
+            "e4-fmr-attacker",
+            "e4-fmr-fam",
+            "e4-fmr-member",
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "ref", k),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_family(crate::federation::tier_ingest::test_support::sign_family(
+                "e4-fmr-fam",
+                crate::federation::types::Family {
+                    family_key_id: "e4-fmr-fam".into(),
+                    family_name: "E4 FMR Household".into(),
+                    members: vec![crate::federation::types::FamilyMember {
+                        key_id: "e4-fmr-member".into(),
+                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        role: None,
+                    }],
+                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                    consensus_protocol: "founder_only".into(),
+                    consensus_protocol_entrenched: false,
+                    persist_row_hash: String::new(),
+                },
+            ))
+            .await
+            .expect("seed family");
+
+        let effective: chrono::DateTime<chrono::Utc> = "2026-06-10T00:00:00Z".parse().unwrap();
+        let rev = crate::federation::FamilyMembershipRevocation {
+            family_key_id: "e4-fmr-fam".into(),
+            removed_identity_key_id: "e4-fmr-member".into(),
+            removed_at: effective,
+            effective_at: effective,
+            reason: None,
+            witness_set: vec![],
+            persist_row_hash: String::new(),
+        };
+        // Honest: signed by e4-fmr-authority — admits.
+        backend
+            .put_family_membership_revocation(
+                crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+                    "e4-fmr-authority",
+                    rev.clone(),
+                ),
+            )
+            .await
+            .expect("(E4) honestly-signed revocation admits");
+
+        // Forged: a DIFFERENT removal (so it isn't a no-op re-submit),
+        // signed by the attacker but claiming the honest authority.
+        let forged_rev = crate::federation::FamilyMembershipRevocation {
+            removed_identity_key_id: "e4-fmr-fam".into(), // different removal target
+            ..rev
+        };
+        let mut forged =
+            crate::federation::tier_ingest::test_support::sign_family_membership_revocation(
+                "e4-fmr-attacker",
+                forged_rev,
+            );
+        forged.authority_key_id = "e4-fmr-authority".to_owned();
+        let err = backend
+            .put_family_membership_revocation(forged)
+            .await
+            .expect_err("(E4) forged revocation must be rejected");
+        assert!(
+            err.kind().contains("federation_tier_unverified") || err.kind().contains("unverified"),
+            "rejected by hybrid verify, got kind {}",
+            err.kind()
+        );
+        assert!(
+            backend
+                .list_family_membership_revocations_for("e4-fmr-fam")
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.removed_identity_key_id != "e4-fmr-fam"),
+            "(E4) rejected revocation must NOT be stored (fail-secure)"
+        );
+    }
+
+    /// A forged `CommunityMembershipRevocation` — THE worst-case E4 hole: an
+    /// unverified removal rotates the CC 4.4.3.2.2 community DEK epoch, an
+    /// unauthenticated forward-secrecy DoS.
+    #[tokio::test]
+    async fn forged_community_membership_revocation_wrong_signer_rejected_502e4() {
+        let backend = MemoryBackend::new();
+        for k in [
+            "e4-cmr-authority",
+            "e4-cmr-attacker",
+            "e4-cmr-comm",
+            "e4-cmr-member",
+        ] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "ref", k),
+                })
+                .await
+                .unwrap();
+        }
+        backend
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
+                    "e4-cmr-comm",
+                    crate::federation::types::Community {
+                        community_key_id: "e4-cmr-comm".into(),
+                        community_name: "E4 CMR Co-op".into(),
+                        members: vec![crate::federation::types::CommunityMember {
+                            key_id: "e4-cmr-member".into(),
+                            joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                            role: None,
+                        }],
+                        founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        consensus_protocol: "founder_only".into(),
+                        policy_blob: None,
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
+            .await
+            .expect("seed community");
+        assert_eq!(backend.community_dek_epoch("e4-cmr-comm"), 0);
+
+        let effective: chrono::DateTime<chrono::Utc> = "2026-06-10T00:00:00Z".parse().unwrap();
+        // Forged FIRST: signed by the attacker but claiming the honest
+        // authority — must be rejected BEFORE the epoch bump.
+        let forged_rev = crate::federation::CommunityMembershipRevocation {
+            community_key_id: "e4-cmr-comm".into(),
+            removed_identity_key_id: "e4-cmr-member".into(),
+            removed_at: effective,
+            effective_at: effective,
+            reason: None,
+            witness_set: vec![],
+            persist_row_hash: String::new(),
+        };
+        let mut forged =
+            crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
+                "e4-cmr-attacker",
+                forged_rev,
+            );
+        forged.authority_key_id = "e4-cmr-authority".to_owned();
+        let err = backend
+            .put_community_membership_revocation(forged)
+            .await
+            .expect_err("(E4) forged community removal must be rejected");
+        assert!(
+            err.kind().contains("federation_tier_unverified") || err.kind().contains("unverified"),
+            "rejected by hybrid verify, got kind {}",
+            err.kind()
+        );
+        assert_eq!(
+            backend.community_dek_epoch("e4-cmr-comm"),
+            0,
+            "(E4) a forged removal must NOT rotate the DEK epoch (forward-secrecy DoS closed)"
+        );
+        assert!(
+            backend
+                .list_community_membership_revocations_for("e4-cmr-comm")
+                .await
+                .unwrap()
+                .is_empty(),
+            "(E4) rejected removal must NOT be stored (fail-secure)"
+        );
+
+        // Honest, same content, signed by the real authority — admits +
+        // bumps the epoch.
+        let honest_rev = crate::federation::CommunityMembershipRevocation {
+            community_key_id: "e4-cmr-comm".into(),
+            removed_identity_key_id: "e4-cmr-member".into(),
+            removed_at: effective,
+            effective_at: effective,
+            reason: None,
+            witness_set: vec![],
+            persist_row_hash: String::new(),
+        };
+        backend
+            .put_community_membership_revocation(
+                crate::federation::tier_ingest::test_support::sign_community_membership_revocation(
+                    "e4-cmr-authority",
+                    honest_rev,
+                ),
+            )
+            .await
+            .expect("(E4) honestly-signed removal admits");
+        assert_eq!(backend.community_dek_epoch("e4-cmr-comm"), 1);
+    }
+
+    /// A forged `LocationProof`.
+    #[tokio::test]
+    async fn forged_location_proof_wrong_signer_rejected_502e4() {
+        let backend = MemoryBackend::new();
+        for k in ["e4-loc-authority", "e4-loc-attacker", "e4-loc-subject"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "ref", k),
+                })
+                .await
+                .unwrap();
+        }
+        let cell7 = h3o::LatLng::new(37.0, -122.0)
+            .unwrap()
+            .to_cell(h3o::Resolution::Seven)
+            .to_string();
+        let proof = |asserted_at: &str| crate::federation::types::LocationProof {
+            subject_key_id: "e4-loc-subject".into(),
+            cell_id: cell7.clone(),
+            cell_resolution: 7,
+            asserted_at: asserted_at.parse().unwrap(),
+            valid_until: None,
+            attestation_evidence: None,
+            withdrawn_at: None,
+            persist_row_hash: String::new(),
+        };
+        // Honest: signed by e4-loc-authority — admits.
+        backend
+            .put_location_proof(
+                crate::federation::tier_ingest::test_support::sign_location_proof(
+                    "e4-loc-authority",
+                    proof("2026-06-01T00:00:00Z"),
+                ),
+            )
+            .await
+            .expect("(E4) honestly-signed location proof admits");
+
+        // Forged: a DIFFERENT proof (distinct asserted_at, so it isn't a
+        // no-op re-submit), signed by the attacker, claiming the honest
+        // authority.
+        let mut forged = crate::federation::tier_ingest::test_support::sign_location_proof(
+            "e4-loc-attacker",
+            proof("2026-06-02T00:00:00Z"),
+        );
+        forged.authority_key_id = "e4-loc-authority".to_owned();
+        let err = backend
+            .put_location_proof(forged)
+            .await
+            .expect_err("(E4) forged location proof must be rejected");
+        assert!(
+            err.kind().contains("federation_tier_unverified") || err.kind().contains("unverified"),
+            "rejected by hybrid verify, got kind {}",
+            err.kind()
+        );
+        let rows = backend
+            .list_location_proofs_for("e4-loc-subject")
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "(E4) rejected proof must NOT be stored (fail-secure)"
+        );
+        assert_eq!(
+            rows[0].asserted_at,
+            "2026-06-01T00:00:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
         );
     }
 }

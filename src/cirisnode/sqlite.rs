@@ -3981,23 +3981,28 @@ mod tests {
     /// Seed a community keyed by `community_id` with a `founder` member.
     async fn seed_community(backend: &SqliteBackend, community_id: &str, founder: &str) {
         use crate::federation::FederationDirectory;
+        // v21.0.0 (CIRISPersist#502 E4) — sign with `founder` (already
+        // registered with real deterministic hybrid keys).
         backend
-            .put_community(crate::federation::SignedCommunity {
-                community: crate::federation::types::Community {
-                    community_key_id: community_id.into(),
-                    community_name: "tc".into(),
-                    members: vec![crate::federation::types::CommunityMember {
-                        key_id: founder.into(),
-                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                        role: Some("founder".into()),
-                    }],
-                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
-                        .into(),
-                    policy_blob: None,
-                    persist_row_hash: String::new(),
-                },
-            })
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
+                    founder,
+                    crate::federation::types::Community {
+                        community_key_id: community_id.into(),
+                        community_name: "tc".into(),
+                        members: vec![crate::federation::types::CommunityMember {
+                            key_id: founder.into(),
+                            joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                            role: Some("founder".into()),
+                        }],
+                        founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        consensus_protocol:
+                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+                        policy_blob: None,
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
             .await
             .unwrap();
     }

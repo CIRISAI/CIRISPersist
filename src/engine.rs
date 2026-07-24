@@ -3342,11 +3342,19 @@ impl Engine {
     /// so a removed member is excluded from future writes inherently (no epoch
     /// to bump) — use [`Engine::revoke_member`](crate::federation::FederationDirectory::revoke_member)
     /// there (it still emits the §9 event).
+    /// v21.0.0 (CIRISPersist#502 E4) — `authority_key_id` /
+    /// `scrub_signature_classical` / `scrub_signature_pqc` are the caller's
+    /// authority signature over the removal, hybrid-Strict-verified before
+    /// any write (see [`at_rest_cascade::orchestrate::rekey_community_member_revoke`]).
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn rekey_community_member_revoke(
         &self,
         community_key_id: &str,
         removed_identity_key_id: &str,
+        authority_key_id: &str,
+        scrub_signature_classical: &str,
+        scrub_signature_pqc: Option<&str>,
     ) -> Result<u64, crate::federation::BlobError> {
         use crate::federation::at_rest_cascade::orchestrate::rekey_community_member_revoke;
         let now = chrono::Utc::now();
@@ -3358,6 +3366,9 @@ impl Engine {
                     community_key_id,
                     removed_identity_key_id,
                     now,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
                 )
                 .await
             }
@@ -3368,6 +3379,9 @@ impl Engine {
                     community_key_id,
                     removed_identity_key_id,
                     now,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
                 )
                 .await
             }
@@ -9964,22 +9978,25 @@ mod tests {
             .expect("seed community key");
         engine
             .federation_directory()
-            .put_community(crate::federation::SignedCommunity {
-                community: crate::federation::types::Community {
-                    community_key_id: community_id.into(),
-                    community_name: "cut-c-community".into(),
-                    members: vec![crate::federation::types::CommunityMember {
-                        key_id: founder_key_id.into(),
-                        joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                        role: Some("founder".into()),
-                    }],
-                    founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-                    consensus_protocol: crate::federation::types::consensus_protocol::FOUNDER_ONLY
-                        .into(),
-                    policy_blob: None,
-                    persist_row_hash: String::new(),
-                },
-            })
+            .put_community(
+                crate::federation::tier_ingest::test_support::sign_community(
+                    community_id,
+                    crate::federation::types::Community {
+                        community_key_id: community_id.into(),
+                        community_name: "cut-c-community".into(),
+                        members: vec![crate::federation::types::CommunityMember {
+                            key_id: founder_key_id.into(),
+                            joined_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                            role: Some("founder".into()),
+                        }],
+                        founded_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+                        consensus_protocol:
+                            crate::federation::types::consensus_protocol::FOUNDER_ONLY.into(),
+                        policy_blob: None,
+                        persist_row_hash: String::new(),
+                    },
+                ),
+            )
             .await
             .expect("seed community");
     }
@@ -11044,8 +11061,9 @@ mod tests {
         }
         let joined: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
 
-        d.put_family(crate::federation::SignedFamily {
-            family: types::Family {
+        d.put_family(crate::federation::tier_ingest::test_support::sign_family(
+            &founder,
+            types::Family {
                 family_key_id: fam.clone(),
                 family_name: "g1-fam".into(),
                 members: vec![types::FamilyMember {
@@ -11058,24 +11076,27 @@ mod tests {
                 consensus_protocol_entrenched: false,
                 persist_row_hash: String::new(),
             },
-        })
+        ))
         .await
         .expect("put_family");
-        d.put_community(crate::federation::SignedCommunity {
-            community: types::Community {
-                community_key_id: comm.clone(),
-                community_name: "g1-comm".into(),
-                members: vec![types::CommunityMember {
-                    key_id: founder.clone(),
-                    joined_at: joined,
-                    role: Some("founder".into()),
-                }],
-                founded_at: joined,
-                consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
-                policy_blob: None,
-                persist_row_hash: String::new(),
-            },
-        })
+        d.put_community(
+            crate::federation::tier_ingest::test_support::sign_community(
+                &founder,
+                types::Community {
+                    community_key_id: comm.clone(),
+                    community_name: "g1-comm".into(),
+                    members: vec![types::CommunityMember {
+                        key_id: founder.clone(),
+                        joined_at: joined,
+                        role: Some("founder".into()),
+                    }],
+                    founded_at: joined,
+                    consensus_protocol: types::consensus_protocol::FOUNDER_ONLY.into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ),
+        )
         .await
         .expect("put_community");
 
@@ -11148,11 +11169,15 @@ mod tests {
                 cohort,
                 group,
                 &mem_b,
-                RevokeSpec {
-                    effective_at: chrono::Utc::now(),
-                    reason: Some("test".into()),
-                    witness_set: vec![],
-                },
+                crate::federation::tier_ingest::test_support::sign_revoke_spec(
+                    cohort,
+                    &founder,
+                    group,
+                    &mem_b,
+                    chrono::Utc::now(),
+                    Some("test".into()),
+                    vec![],
+                ),
             )
             .await
             .expect("revoke_member");
@@ -11172,11 +11197,15 @@ mod tests {
                         joined_at: joined,
                         role: None
                     },
-                    RevokeSpec {
-                        effective_at: chrono::Utc::now(),
-                        reason: None,
-                        witness_set: vec![],
-                    },
+                    crate::federation::tier_ingest::test_support::sign_revoke_spec(
+                        cohort,
+                        &founder,
+                        group,
+                        &founder,
+                        chrono::Utc::now(),
+                        None,
+                        vec![],
+                    ),
                 )
                 .await
                 .expect("swap_member"),
@@ -11240,6 +11269,11 @@ mod tests {
                 effective_at: chrono::Utc::now(),
                 reason: None,
                 witness_set: vec![],
+                // #502 E4 — SelfId takes the trusted-local path (no gate);
+                // no authority signature to supply.
+                authority_key_id: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
             },
         )
         .await
@@ -11326,8 +11360,9 @@ mod tests {
         };
 
         // Genesis: 3-member quorum:2/3 family (version 1).
-        d.put_family(crate::federation::SignedFamily {
-            family: types::Family {
+        d.put_family(crate::federation::tier_ingest::test_support::sign_family(
+            &fam,
+            types::Family {
                 family_key_id: fam.clone(),
                 family_name: "accord".into(),
                 members: mk_members(3),
@@ -11336,11 +11371,16 @@ mod tests {
                 consensus_protocol_entrenched: true,
                 persist_row_hash: String::new(),
             },
-        })
+        ))
         .await
         .expect("genesis put_family");
 
         // Supersede → 5-member quorum:3/5 (the expansion the write gap blocked).
+        // #502 E4 note: `supersede_family` writes via `supersede_group_row`, NOT
+        // the newly-gated `put_family` — the wrapper's authority fields are
+        // unused on this path (out of scope; the quorum authorization below is
+        // this path's OWN real authority check), so empty placeholders satisfy
+        // the type only.
         let auth = serde_json::json!({"membership_change": "expand 3->5", "quorum": "2/3"});
         let new_version = d
             .supersede_family(
@@ -11354,6 +11394,9 @@ mod tests {
                         consensus_protocol_entrenched: true,
                         persist_row_hash: String::new(),
                     },
+                    authority_key_id: String::new(),
+                    scrub_signature_classical: String::new(),
+                    scrub_signature_pqc: None,
                 },
                 Some(auth.clone()),
             )
@@ -11404,6 +11447,9 @@ mod tests {
                         consensus_protocol_entrenched: true,
                         persist_row_hash: String::new(),
                     },
+                    authority_key_id: String::new(),
+                    scrub_signature_classical: String::new(),
+                    scrub_signature_pqc: None,
                 },
                 None,
             )
@@ -11463,9 +11509,15 @@ mod tests {
             register_hybrid_key(d, k).await;
         }
         let joined: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
+        // #502 E4: `fam` is registered above via `register_hybrid_key`, so
+        // signing with it here covers both the gated `put_family` call and
+        // the `supersede_family_with_quorum` calls (unused there, but a real
+        // signature is no more effort than a placeholder and keeps this
+        // closure valid if that path is ever gated too).
         let fam_row = |members: Vec<String>, cp: &str| -> crate::federation::SignedFamily {
-            crate::federation::SignedFamily {
-                family: types::Family {
+            crate::federation::tier_ingest::test_support::sign_family(
+                &fam,
+                types::Family {
                     family_key_id: fam.clone(),
                     family_name: "accord".into(),
                     members: members
@@ -11481,7 +11533,7 @@ mod tests {
                     consensus_protocol_entrenched: true,
                     persist_row_hash: String::new(),
                 },
-            }
+            )
         };
 
         // Genesis: quorum:2/3 family (3 members, M=2).
@@ -11649,7 +11701,7 @@ mod tests {
         D: crate::federation::FederationDirectory + crate::federation::BlobStorage + Sync,
     {
         use crate::federation::at_rest_cascade;
-        use crate::federation::cohort::{Cohort, RevokeSpec, RosterMember};
+        use crate::federation::cohort::{Cohort, RosterMember};
         use crate::federation::hard_case::{change_kind, kind, HardCaseFilter};
         use crate::federation::types;
 
@@ -11667,24 +11719,27 @@ mod tests {
         for k in &cm {
             d.put_public_key(sweeper_test_key(k)).await.expect("seed");
         }
-        d.put_community(crate::federation::SignedCommunity {
-            community: types::Community {
-                community_key_id: comm.clone(),
-                community_name: "c".into(),
-                members: cm
-                    .iter()
-                    .map(|k| types::CommunityMember {
-                        key_id: k.clone(),
-                        joined_at: joined,
-                        role: None,
-                    })
-                    .collect(),
-                founded_at: joined,
-                consensus_protocol: "founder_only".into(),
-                policy_blob: None,
-                persist_row_hash: String::new(),
-            },
-        })
+        d.put_community(
+            crate::federation::tier_ingest::test_support::sign_community(
+                &comm,
+                types::Community {
+                    community_key_id: comm.clone(),
+                    community_name: "c".into(),
+                    members: cm
+                        .iter()
+                        .map(|k| types::CommunityMember {
+                            key_id: k.clone(),
+                            joined_at: joined,
+                            role: None,
+                        })
+                        .collect(),
+                    founded_at: joined,
+                    consensus_protocol: "founder_only".into(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ),
+        )
         .await
         .expect("put_community");
 
@@ -11692,11 +11747,31 @@ mod tests {
             .community_dek_bump_epoch(&comm)
             .await
             .expect("genesis epoch");
+        // #502 E4 — sign the removal with `comm` (registered above with real
+        // deterministic hybrid keys).
+        let revoke_at = chrono::Utc::now();
+        let rev_rec = types::CommunityMembershipRevocation {
+            community_key_id: comm.clone(),
+            removed_identity_key_id: cm[0].clone(),
+            removed_at: revoke_at,
+            effective_at: revoke_at,
+            reason: None,
+            witness_set: Vec::new(),
+            persist_row_hash: String::new(),
+        };
+        let (_h, revoke_classical, revoke_pqc) =
+            crate::federation::tier_ingest::test_support::sign_envelope(
+                &comm,
+                &rev_rec.signing_envelope(),
+            );
         let e2 = at_rest_cascade::orchestrate::rekey_community_member_revoke(
             d,
             &comm,
             &cm[0],
-            chrono::Utc::now(),
+            revoke_at,
+            &comm,
+            &revoke_classical,
+            revoke_pqc.as_deref(),
         )
         .await
         .expect("rekey on revoke");
@@ -11738,8 +11813,9 @@ mod tests {
         for k in &fmk {
             d.put_public_key(sweeper_test_key(k)).await.expect("seed");
         }
-        d.put_family(crate::federation::SignedFamily {
-            family: types::Family {
+        d.put_family(crate::federation::tier_ingest::test_support::sign_family(
+            &fam,
+            types::Family {
                 family_key_id: fam.clone(),
                 family_name: "f".into(),
                 members: vec![types::FamilyMember {
@@ -11752,7 +11828,7 @@ mod tests {
                 consensus_protocol_entrenched: false,
                 persist_row_hash: String::new(),
             },
-        })
+        ))
         .await
         .expect("put_family");
 
@@ -11774,11 +11850,15 @@ mod tests {
             Cohort::Family,
             &fam,
             &fmk[0],
-            RevokeSpec {
-                effective_at: chrono::Utc::now(),
-                reason: None,
-                witness_set: vec![],
-            },
+            crate::federation::tier_ingest::test_support::sign_revoke_spec(
+                Cohort::Family,
+                &fam,
+                &fam,
+                &fmk[0],
+                chrono::Utc::now(),
+                None,
+                vec![],
+            ),
         )
         .await
         .expect("revoke_member");

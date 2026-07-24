@@ -231,8 +231,10 @@ pub use stream_sth::{
     STREAM_LOG_ID_PREFIX,
 };
 pub use tier_ingest::{
-    verify_envelope_hybrid_signature, verify_federation_tier_ingest, verify_revocation_admission,
-    verify_row_hybrid_signature,
+    verify_community_admission, verify_community_membership_revocation_admission,
+    verify_envelope_hybrid_signature, verify_family_admission,
+    verify_family_membership_revocation_admission, verify_federation_tier_ingest,
+    verify_location_proof_admission, verify_revocation_admission, verify_row_hybrid_signature,
 };
 pub use topology::{
     build_delegation_graph, build_trust_topology, AuditChainEntry, AuditChainProof, DelegationEdge,
@@ -1170,6 +1172,25 @@ pub trait FederationDirectory: Send + Sync {
     /// gate.
     async fn put_family(&self, family: SignedFamily) -> Result<(), Error>;
 
+    /// v21.0.0 (CIRISPersist#502 E4) — write a **trusted-local** `Family`,
+    /// bypassing the [`Self::put_family`] authority-signature gate
+    /// (`verify_family_admission`). For the genesis boot-seed
+    /// (`crate::federation::genesis::seed_accord_family`) ONLY: the baked
+    /// HUMANITY_ACCORD family is a *bake-what-exists* declaration over a
+    /// compiled-in ceremony artifact — `family_key_id` is **keyless by
+    /// design** (no private key for a "family" identity ever exists — see
+    /// [`Self::put_family`]'s FK-only precedent and the constitutional-family
+    /// invariant), so there is no key the boot process could sign with.
+    /// **Never reachable from the replication apply / any wire surface** —
+    /// mirrors [`Self::put_identity_occurrence_revocation_local`]'s
+    /// trusted-local precedent. Default impl errors; backends override.
+    async fn put_family_local(&self, family: Family) -> Result<(), Error> {
+        let _ = family;
+        Err(Error::Backend(
+            "put_family_local not implemented for this backend".into(),
+        ))
+    }
+
     /// v6.2.0 (CIRISPersist#161 A4/A5, CEG §11.7.1) — admit one identity
     /// into an existing family roster, additively. This is the **roster-
     /// grow** primitive that makes family-member *addition* first-class
@@ -1978,6 +1999,9 @@ pub trait FederationDirectory: Send + Sync {
             effective_at,
             reason,
             witness_set,
+            authority_key_id,
+            scrub_signature_classical,
+            scrub_signature_pqc,
         } = spec;
         // #249 Cut G4 (§9) — `kind` of the membership-change "removed" event to
         // emit after a family/community revocation (`self` uses the occurrence
@@ -1996,12 +2020,23 @@ pub trait FederationDirectory: Send + Sync {
                     family_membership_revocation: types::FamilyMembershipRevocation {
                         family_key_id: group_key_id.to_string(),
                         removed_identity_key_id: removed_key_id.to_string(),
-                        removed_at: now,
+                        // v21.0.0 (#502 E4) — `removed_at` is `effective_at`, NOT
+                        // a freshly-minted `now`: the caller signs the revocation
+                        // BEFORE calling `revoke_member` (it has no way to
+                        // predict a server-minted timestamp), so every field the
+                        // gate verifies over must be caller-known in advance.
+                        removed_at: effective_at,
                         effective_at,
                         reason,
                         witness_set,
                         persist_row_hash: String::new(),
                     },
+                    // v21.0.0 (#502 E4) — the caller-supplied authority
+                    // signature; `put_family_membership_revocation` hybrid-
+                    // Strict-verifies it before any write.
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
                 })
                 .await?;
             }
@@ -2014,12 +2049,18 @@ pub trait FederationDirectory: Send + Sync {
                         community_membership_revocation: types::CommunityMembershipRevocation {
                             community_key_id: group_key_id.to_string(),
                             removed_identity_key_id: removed_key_id.to_string(),
-                            removed_at: now,
+                            // v21.0.0 (#502 E4) — see the family arm above:
+                            // `removed_at` MUST be caller-predictable.
+                            removed_at: effective_at,
                             effective_at,
                             reason,
                             witness_set,
                             persist_row_hash: String::new(),
                         },
+                        // v21.0.0 (#502 E4) — see the family arm above.
+                        authority_key_id,
+                        scrub_signature_classical,
+                        scrub_signature_pqc,
                     },
                 )
                 .await?;

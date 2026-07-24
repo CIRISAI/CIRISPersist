@@ -7681,16 +7681,34 @@ impl PyEngine {
     ///   "founded_at":                   "<rfc3339>",
     ///   "consensus_protocol":           "founder_only"|"unanimous"|"majority"|
     ///                                   "quorum:m/n"|"weighted:rubric"|"custom:id",
-    ///   "consensus_protocol_entrenched": false
+    ///   "consensus_protocol_entrenched": false,
+    ///   "authority_key_id":             "<federation_keys.key_id>",
+    ///   "scrub_signature_classical":    "<base64 ed25519 sig over JCS(the
+    ///                                    object above minus these 3 fields)>",
+    ///   "scrub_signature_pqc":          "<base64 ML-DSA-65 sig over
+    ///                                    canonical || ed25519_sig>"
     /// }
     /// ```
+    /// v21.0.0 (CIRISPersist#502 E4) — the last 3 fields are additive
+    /// (omit ⇒ empty/`None`) but now REQUIRED for admission: `put_family`
+    /// hybrid-Strict-verifies them before any write; a caller with no
+    /// authority signature is rejected fail-closed.
     fn put_family_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
-            let family: crate::federation::Family = serde_json::from_str(payload_json)
+            let value: serde_json::Value = serde_json::from_str(payload_json)
                 .map_err(|e| PyValueError::new_err(format!("family decode: {e}")))?;
-            let signed = crate::federation::SignedFamily { family };
+            let family: crate::federation::Family = serde_json::from_value(value.clone())
+                .map_err(|e| PyValueError::new_err(format!("family decode: {e}")))?;
+            let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) =
+                extract_authority_fields(&value);
+            let signed = crate::federation::SignedFamily {
+                family,
+                authority_key_id,
+                scrub_signature_classical,
+                scrub_signature_pqc,
+            };
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
@@ -7729,13 +7747,27 @@ impl PyEngine {
     /// the family path, `persist_row_hash` is backend-computed (pass `""`),
     /// and `community_key_id` + each member `key_id` must FK a registered
     /// `federation_keys` row.
+    ///
+    /// v21.0.0 (CIRISPersist#502 E4) — the payload additionally carries
+    /// `authority_key_id` / `scrub_signature_classical` / (optional)
+    /// `scrub_signature_pqc`, same shape as [`Self::put_family_json`];
+    /// `put_community` hybrid-Strict-verifies them before any write.
     fn put_community_json(&self, py: Python<'_>, payload_json: &str) -> PyResult<()> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
-            let community: crate::federation::Community = serde_json::from_str(payload_json)
+            let value: serde_json::Value = serde_json::from_str(payload_json)
                 .map_err(|e| PyValueError::new_err(format!("community decode: {e}")))?;
-            let signed = crate::federation::SignedCommunity { community };
+            let community: crate::federation::Community = serde_json::from_value(value.clone())
+                .map_err(|e| PyValueError::new_err(format!("community decode: {e}")))?;
+            let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) =
+                extract_authority_fields(&value);
+            let signed = crate::federation::SignedCommunity {
+                community,
+                authority_key_id,
+                scrub_signature_classical,
+                scrub_signature_pqc,
+            };
             py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
@@ -18368,10 +18400,18 @@ impl PyEngine {
             _ => None,
         };
         use crate::federation::cohort::Cohort;
+        // v21.0.0 (#502 E4) note: supersede writes via `supersede_group_row`,
+        // NOT the newly-gated `put_family`/`put_community` — the wrapper's
+        // authority fields are unused on this path (its OWN authority check
+        // is `authorization_json` above), so empty placeholders satisfy the
+        // type only.
         let family: Option<crate::federation::SignedFamily> = match cohort {
             Cohort::Family => Some(crate::federation::SignedFamily {
                 family: serde_json::from_str(new_group_json)
                     .map_err(|e| PyValueError::new_err(format!("supersede family JSON: {e}")))?,
+                authority_key_id: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
             }),
             _ => None,
         };
@@ -18381,6 +18421,9 @@ impl PyEngine {
             Cohort::Community | Cohort::Affiliations => Some(crate::federation::SignedCommunity {
                 community: serde_json::from_str(new_group_json)
                     .map_err(|e| PyValueError::new_err(format!("supersede community JSON: {e}")))?,
+                authority_key_id: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
             }),
             _ => None,
         };
@@ -18650,10 +18693,18 @@ impl PyEngine {
             serde_json::from_str(signatures_json)
                 .map_err(|e| PyValueError::new_err(format!("signatures_json: {e}")))?;
         use crate::federation::cohort::Cohort;
+        // v21.0.0 (#502 E4) note: supersede writes via `supersede_group_row`,
+        // NOT the newly-gated `put_family`/`put_community` — the wrapper's
+        // authority fields are unused on this path (its OWN authority check
+        // is the quorum verify below), so empty placeholders satisfy the
+        // type only.
         let family: Option<crate::federation::SignedFamily> = match cohort {
             Cohort::Family => Some(crate::federation::SignedFamily {
                 family: serde_json::from_str(new_group_json)
                     .map_err(|e| PyValueError::new_err(format!("supersede family JSON: {e}")))?,
+                authority_key_id: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
             }),
             _ => None,
         };
@@ -18662,6 +18713,9 @@ impl PyEngine {
             Cohort::Community | Cohort::Affiliations => Some(crate::federation::SignedCommunity {
                 community: serde_json::from_str(new_group_json)
                     .map_err(|e| PyValueError::new_err(format!("supersede community JSON: {e}")))?,
+                authority_key_id: String::new(),
+                scrub_signature_classical: String::new(),
+                scrub_signature_pqc: None,
             }),
             _ => None,
         };
@@ -25841,6 +25895,37 @@ fn base64_encode(bytes: &[u8]) -> String {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     B64.encode(bytes)
+}
+
+/// v21.0.0 (CIRISPersist#502 E4) — extract the additive `authority_key_id` /
+/// `scrub_signature_classical` / `scrub_signature_pqc` fields from a flat
+/// payload JSON `Value` (the SAME value also decoded into the bare
+/// `Family`/`Community`/etc. record — those types tolerate the extra fields,
+/// serde ignores unknown keys by default). Absent fields default to
+/// empty/`None`: an old/unsigned caller's payload decodes fine and is then
+/// rejected FAIL-CLOSED at `put_family`/`put_community` (empty
+/// authority_key_id never resolves; empty/absent signature never verifies) —
+/// never silently admitted.
+fn extract_authority_fields(value: &serde_json::Value) -> (String, String, Option<String>) {
+    let authority_key_id = value
+        .get("authority_key_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let scrub_signature_classical = value
+        .get("scrub_signature_classical")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let scrub_signature_pqc = value
+        .get("scrub_signature_pqc")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    (
+        authority_key_id,
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    )
 }
 
 /// #249 Cut G1 / CC 4.4.3.2.8 #308 — parse a cohort wire token
