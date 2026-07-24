@@ -69,7 +69,11 @@ pub fn revocation_fold_target(row: &super::Attestation) -> Option<&str> {
 /// see `self_at_login::test_support` for the same pattern). `suffix` scopes
 /// every fixture id so a run against a shared test DB (postgres) doesn't
 /// collide with a prior run.
-#[cfg(test)]
+// The shared fold-witness body is consumed only by the sqlite/postgres
+// parity tests; under a no-backend build (`--features server`) those
+// callers are absent, so gate the module on a backend to avoid dead_code
+// under `-D warnings`.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {
     use super::DIMENSION;
     use crate::federation::types::{attestation_tier, attestation_type};
