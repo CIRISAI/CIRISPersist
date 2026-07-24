@@ -8034,6 +8034,50 @@ mod tests {
         assert_eq!(err.kind(), "federation_genesis_bundle_invalid");
     }
 
+    /// v21.0.0 (CIRISPersist#502 E5) — a LOCAL-tier delegates_to/charter
+    /// must NEVER count in the capability walk. Before this a local-tier
+    /// `delegates_to(user→root)` + local-tier root self-charter silently
+    /// satisfied `trust_root_valid` (the hole under all 95 claim families).
+    #[tokio::test]
+    async fn local_tier_rows_do_not_count_in_capability_walk_502e5() {
+        use crate::federation::trust_root::trust_root_valid;
+        let backend = MemoryBackend::new();
+        for (k, it) in [("e5-user", "user"), ("e5-root", "node"), ("e5-la", "accord_holder")] {
+            let mut rec = fix_key(k, "ref", k);
+            rec.identity_type = it.to_owned();
+            backend
+                .put_public_key(SignedKeyRecord { record: rec })
+                .await
+                .unwrap();
+        }
+        // Build the full valid-root fixture but flip every capability row to
+        // LOCAL tier — the walk must treat them as absent.
+        let mut charter = fix_charter("e5-c", "e5-root", serde_json::json!(["infra:serve", "infra:attest"]));
+        charter.tier = crate::federation::types::attestation_tier::LOCAL.to_string();
+        resign_fix(&mut charter);
+        backend.put_attestation(SignedAttestation { attestation: charter }).await.unwrap();
+
+        let mut edge = fix_delegates_to("e5-e", "e5-user", "e5-root", serde_json::json!(["infra:serve"]));
+        edge.tier = crate::federation::types::attestation_tier::LOCAL.to_string();
+        resign_fix(&mut edge);
+        backend.put_attestation(SignedAttestation { attestation: edge }).await.unwrap();
+
+        let mut lc = fix_attestation("e5-lc", "e5-la", "e5-root", "e5-la");
+        lc.attestation_envelope = serde_json::json!({
+            "id": "e5-lc", "dimension": "accord:lifecycle:v1", "score": 1.0, "confidence": 0.9,
+        });
+        lc.asserted_at = chrono::Utc::now();
+        lc.tier = crate::federation::types::attestation_tier::LOCAL.to_string();
+        resign_fix(&mut lc);
+        backend.put_attestation(SignedAttestation { attestation: lc }).await.unwrap();
+
+        let v = trust_root_valid(&backend, "e5-user", "e5-root").await.unwrap();
+        assert!(!v.edge_exists, "local-tier edge must not count");
+        assert!(!v.root_self_declares, "local-tier charter must not count");
+        assert!(!v.lifecycle_active, "local-tier lifecycle must not count");
+        assert!(!v.valid, "no local-tier row satisfies the capability gate");
+    }
+
     /// v19.0.0 (CIRISPersist#488) — the RC3 charter deltas, all three:
     /// (1) CRITICAL: a charter without a pre-rotation commitment REFUSES at
     /// admission; a recovery declaration must BIND to the predecessor's
