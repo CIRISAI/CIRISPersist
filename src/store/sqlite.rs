@@ -3669,6 +3669,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             }
         }
 
+        // v21.0.0 (CIRISPersist#502 E1) — mechanistic authorship: the
+        // revocation MUST be hybrid-Strict-signed by its declared revoking
+        // key, resolved from OUR registered directory (was FK + trust-score
+        // only; scrub sig stored, never verified → forgeable de-peer DoS).
+        crate::federation::verify_revocation_admission(self, &row).await?;
+
         // v3.11.0 (CIRISPersist#143) — region closed-set gate +
         // anti-rollback monotonicity. Both run BEFORE persist_row_hash
         // is computed and BEFORE INSERT, so a rejected row leaves no
@@ -19358,6 +19364,13 @@ mod tests {
     }
 
     fn fed_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
+        // v21.0.0 (#502 E1) — sign the envelope with the REVOKING key's
+        // deterministic hybrid key so it verifies against the pubkeys
+        // `fed_key(revoking)` registers (`hybrid_pubkeys`). The admission
+        // gate now verifies this by construction.
+        let envelope = serde_json::json!({"id": id});
+        let (och, sig_c, sig_p) =
+            crate::federation::tier_ingest::test_support::sign_envelope(revoking, &envelope);
         Revocation {
             revocation_id: id.into(),
             revoked_key_id: revoked.into(),
@@ -19365,10 +19378,10 @@ mod tests {
             reason: Some("test".into()),
             revoked_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             effective_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-            revocation_envelope: serde_json::json!({"id": id}),
-            original_content_hash: "abc123".into(),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
+            revocation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: sig_c,
+            scrub_signature_pqc: sig_p,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,

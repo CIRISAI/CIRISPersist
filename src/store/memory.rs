@@ -2342,6 +2342,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         revocation: crate::federation::SignedRevocation,
     ) -> Result<(), crate::federation::Error> {
         let mut row = revocation.revocation;
+        // v21.0.0 (CIRISPersist#502 E1) — mechanistic authorship BEFORE the
+        // state lock (the verify resolves keys via the directory, which
+        // locks itself). Hybrid-Strict vs the revoking key's registered
+        // pubkeys — was FK + trust-score only, forgeable de-peer DoS.
+        crate::federation::verify_revocation_admission(self, &row).await?;
         let mut state = self.state.lock().expect("memory backend lock");
         if !state.federation_keys.contains_key(&row.revoked_key_id) {
             return Err(crate::federation::Error::InvalidArgument(format!(
@@ -6406,6 +6411,10 @@ mod tests {
     }
 
     fn fix_revocation(id: &str, revoked: &str, revoking: &str, scrub_key_id: &str) -> Revocation {
+        // v21.0.0 (#502 E1) — real hybrid sig by the revoking key.
+        let __rev_env = serde_json::json!({"id": id});
+        let (__rev_och, __rev_sc, __rev_sp) =
+            crate::federation::tier_ingest::test_support::sign_envelope(revoking, &__rev_env);
         Revocation {
             revocation_id: id.into(),
             revoked_key_id: revoked.into(),
@@ -6413,10 +6422,10 @@ mod tests {
             reason: Some("test".into()),
             revoked_at: "2026-05-01T00:00:00Z".parse().unwrap(),
             effective_at: "2026-05-01T00:00:00Z".parse().unwrap(),
-            revocation_envelope: serde_json::json!({"id": id}),
-            original_content_hash: "abc123".into(),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
+            revocation_envelope: __rev_env,
+            original_content_hash: __rev_och,
+            scrub_signature_classical: __rev_sc,
+            scrub_signature_pqc: __rev_sp,
             scrub_key_id: scrub_key_id.into(),
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
@@ -8063,6 +8072,50 @@ mod tests {
             .await
             .expect_err("tampered authorization must refuse");
         assert_eq!(err.kind(), "federation_genesis_bundle_invalid");
+    }
+
+    /// v21.0.0 (CIRISPersist#502 E1) — a forged revocation (scrub sig by a
+    /// key OTHER than the declared revoking key) is REJECTED. The attack:
+    /// any linked peer forging `{revoked: victim, revoking: any-existing}`
+    /// for a targeted de-peer. Before this it admitted on FK-existence.
+    #[tokio::test]
+    async fn forged_revocation_wrong_signer_rejected_502e1() {
+        let backend = MemoryBackend::new();
+        for k in ["e1-victim", "e1-revoker", "e1-attacker"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, "ref", k),
+                })
+                .await
+                .unwrap();
+        }
+        // Honest revocation (revoker signs) — admits.
+        let good = fix_revocation("e1-good", "e1-victim", "e1-revoker", "e1-revoker");
+        backend
+            .put_revocation(crate::federation::SignedRevocation { revocation: good })
+            .await
+            .expect("(E1) honestly-signed revocation admits");
+
+        // Forged: claims revoking=e1-revoker but the envelope is signed by
+        // the ATTACKER's key. The registered pubkeys of e1-revoker won't
+        // verify it → reject.
+        let mut forged = fix_revocation("e1-forged", "e1-victim", "e1-revoker", "e1-revoker");
+        let (och, sc, sp) = crate::federation::tier_ingest::test_support::sign_envelope(
+            "e1-attacker",
+            &forged.revocation_envelope,
+        );
+        forged.original_content_hash = och;
+        forged.scrub_signature_classical = sc;
+        forged.scrub_signature_pqc = sp;
+        let err = backend
+            .put_revocation(crate::federation::SignedRevocation { revocation: forged })
+            .await
+            .expect_err("(E1) forged revocation must be rejected");
+        assert!(
+            err.kind().contains("federation_tier_unverified") || err.kind().contains("unverified"),
+            "rejected by hybrid verify, got kind {}",
+            err.kind()
+        );
     }
 
     /// v21.0.0 (CIRISPersist#502 E5) — a LOCAL-tier delegates_to/charter

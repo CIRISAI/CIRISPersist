@@ -180,6 +180,32 @@ where
     Ok(())
 }
 
+/// v21.0.0 (CIRISPersist#502 E1) — mechanistic admission for a replicated
+/// `Revocation`: hybrid-Strict verify the scrub signature against the
+/// **revoking** key's REGISTERED pubkeys. Before this, `put_revocation`
+/// admitted on FK-existence + a trust-score threshold only — the scrub sig
+/// was stored, never verified — so any linked peer could forge
+/// `{revoked_key_id: victim, revoking_key_id: any-existing}` for a targeted
+/// de-peer / trust DoS. Now the revocation must be signed by the key it
+/// claims to act as, resolved from OUR directory.
+pub async fn verify_revocation_admission<F>(
+    directory: &F,
+    row: &crate::federation::types::Revocation,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    verify_envelope_hybrid_signature(
+        directory,
+        &row.revoking_key_id,
+        &row.revocation_envelope,
+        &row.scrub_signature_classical,
+        row.scrub_signature_pqc.as_deref(),
+    )
+    .await
+    .map(|_| ())
+}
+
 /// v12.6.0 (CIRISPersist#171) — the envelope-level bound-hybrid verify
 /// primitive shared by [`verify_row_hybrid_signature`] (row form) and the
 /// §10.1.3 transit revocation local-write path (which has no assembled row

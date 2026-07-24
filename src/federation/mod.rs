@@ -230,7 +230,8 @@ pub use stream_sth::{
     STREAM_LOG_ID_PREFIX,
 };
 pub use tier_ingest::{
-    verify_envelope_hybrid_signature, verify_federation_tier_ingest, verify_row_hybrid_signature,
+    verify_envelope_hybrid_signature, verify_federation_tier_ingest, verify_revocation_admission,
+    verify_row_hybrid_signature,
 };
 pub use topology::{
     build_delegation_graph, build_trust_topology, AuditChainEntry, AuditChainProof, DelegationEdge,

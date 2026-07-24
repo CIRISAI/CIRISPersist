@@ -3984,6 +3984,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             }
         }
 
+        // v21.0.0 (CIRISPersist#502 E1) — mechanistic authorship: the
+        // revocation MUST be hybrid-Strict-signed by its declared revoking
+        // key, resolved from OUR registered directory (was FK + trust-score
+        // only; scrub sig stored, never verified → forgeable de-peer DoS).
+        crate::federation::verify_revocation_admission(self, &row).await?;
+
         // v3.11.0 (CIRISPersist#143) — region closed-set gate +
         // anti-rollback monotonicity. Both run BEFORE persist_row_hash
         // is computed and BEFORE INSERT (same discipline as v3.9.1
@@ -21438,6 +21444,9 @@ mod tests {
         // revocation_id column is `::uuid` cast in put_revocation —
         // must be a valid UUID string, not the uuid_like() hex token.
         let rev_id = uuid::Uuid::new_v4().to_string();
+        let __rev_env = serde_json::json!({"id": rev_id});
+        let (__rev_och, __rev_sc, __rev_sp) =
+            crate::federation::tier_ingest::test_support::sign_envelope(&revoking_id, &__rev_env);
         let rev = crate::federation::Revocation {
             revocation_id: rev_id.clone(),
             revoked_key_id: revoked_id.clone(),
@@ -21445,14 +21454,13 @@ mod tests {
             reason: Some("test".into()),
             revoked_at: now,
             effective_at: now,
-            revocation_envelope: serde_json::json!({"id": rev_id}),
+            revocation_envelope: __rev_env.clone(),
             // sha256-shaped placeholder hex — persist's revocation
             // path runs hex-decode on original_content_hash and rejects
             // odd-length strings. Use a full 64-char hex string.
-            original_content_hash:
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
+            original_content_hash: __rev_och,
+            scrub_signature_classical: __rev_sc,
+            scrub_signature_pqc: __rev_sp,
             scrub_key_id: revoking_id.clone(),
             scrub_timestamp: now,
             pqc_completed_at: None,
@@ -25439,6 +25447,9 @@ mod tests {
         // original_content_hash — the revocation path hex-decodes it).
         let now = chrono::Utc::now();
         let rev_id = uuid::Uuid::new_v4().to_string();
+        let __rev_env = serde_json::json!({"id": rev_id});
+        let (__rev_och, __rev_sc, __rev_sp) =
+            crate::federation::tier_ingest::test_support::sign_envelope(&steward, &__rev_env);
         let rev = crate::federation::Revocation {
             revocation_id: rev_id.clone(),
             revoked_key_id: target.clone(),
@@ -25446,11 +25457,10 @@ mod tests {
             reason: Some("test".into()),
             revoked_at: now,
             effective_at: now,
-            revocation_envelope: serde_json::json!({ "id": rev_id }),
-            original_content_hash:
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
-            scrub_signature_classical: "c2ln".into(),
-            scrub_signature_pqc: None,
+            revocation_envelope: __rev_env.clone(),
+            original_content_hash: __rev_och,
+            scrub_signature_classical: __rev_sc,
+            scrub_signature_pqc: __rev_sp,
             scrub_key_id: steward.clone(),
             scrub_timestamp: now,
             pqc_completed_at: None,
