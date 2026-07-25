@@ -295,6 +295,10 @@ struct State {
     /// mirror, keyed like `federation_location_proofs`.
     federation_location_proof_authority_sigs:
         HashMap<(String, chrono::DateTime<chrono::Utc>), AuthoritySig>,
+    /// v21.1.0 (CIRISPersist#507b, V111 mirror) — the shared signed-wire
+    /// content-hash index: `(kind, content_hash) -> record_key`. Memory
+    /// mirror of the `signed_wire_index` table.
+    signed_wire_index: HashMap<(String, String), String>,
 }
 
 /// v21.0.0 (CIRISPersist#502 E7) — one row of the in-memory
@@ -381,6 +385,7 @@ impl Default for MemoryBackend {
                 federation_family_membership_revocation_authority_sigs: HashMap::new(),
                 federation_community_membership_revocation_authority_sigs: HashMap::new(),
                 federation_location_proof_authority_sigs: HashMap::new(),
+                signed_wire_index: HashMap::new(),
             }),
         }
     }
@@ -1600,7 +1605,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 row.key_id
             )));
         }
+        // v21.1.0 (CIRISPersist#507b) — `SignedKeyRecord` wraps the exact
+        // `row` the read surface re-serializes.
+        let wire_index_key = crate::federation::wire_index::record_key(&[("key_id", &row.key_id)]);
+        let wire_index_hash =
+            crate::federation::wire_index::content_hash_of(&crate::federation::SignedKeyRecord {
+                record: row.clone(),
+            })?;
         state.federation_keys.insert(row.key_id.clone(), row);
+        state
+            .signed_wire_index
+            .insert(("Key".to_string(), wire_index_hash), wire_index_key);
         Ok(())
     }
 
@@ -2069,6 +2084,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                         asserted_at: row.asserted_at,
                     });
                 }
+            }
+            // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation-
+            // tier only, the E5 invariant). `Attestation` IS its own signed
+            // wrapper (inline scrub signature). Computed before the push
+            // moves `row`.
+            if row.tier == crate::federation::types::attestation_tier::FEDERATION {
+                let wire_index_key = crate::federation::wire_index::record_key(&[(
+                    "attestation_id",
+                    &row.attestation_id,
+                )]);
+                let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
+                state
+                    .signed_wire_index
+                    .insert(("Attestation".to_string(), wire_index_hash), wire_index_key);
             }
             state.federation_attestations.push(row);
             // v21.0.0 (CIRISPersist#501) — INBOUND trace projection: a replicated
@@ -2634,6 +2663,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 None
             };
             if newer {
+                // v21.1.0 (CIRISPersist#507b) — computed before the moves
+                // below consume `row` / `occurrence.*`.
+                let wire_index_key = crate::federation::wire_index::record_key(&[
+                    ("identity_key_id", &row.identity_key_id),
+                    ("occurrence_key_id", &row.occurrence_key_id),
+                ]);
+                let wire_index_hash = crate::federation::wire_index::content_hash_of(
+                    &crate::federation::SignedIdentityOccurrence {
+                        identity_occurrence: row.clone(),
+                        attesting_key_id: occurrence.attesting_key_id.clone(),
+                        signed_envelope: occurrence.signed_envelope.clone(),
+                        signature: occurrence.signature.clone(),
+                    },
+                )?;
                 // #418 — store the signature container in lockstep so the
                 // replication read reconstructs the tuple that was put.
                 state.federation_identity_occurrence_sigs.insert(
@@ -2645,6 +2688,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     ),
                 );
                 state.federation_identity_occurrences.insert(key, row);
+                state.signed_wire_index.insert(
+                    ("IdentityOccurrence".to_string(), wire_index_hash),
+                    wire_index_key,
+                );
             }
             projected_route
         };
@@ -2769,7 +2816,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 signed.signature.clone(),
             ),
         );
-        state.transport_destinations.insert(key, d.clone());
+        state.transport_destinations.insert(key.clone(), d.clone());
+        // v21.1.0 (CIRISPersist#507b) — `signed` IS the exact value
+        // `list_signed_transport_destinations_since` re-serializes.
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("occurrence_key_id", &key.0),
+            ("transport_kind", &key.1),
+        ]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(signed)?;
+        state.signed_wire_index.insert(
+            ("TransportDestination".to_string(), wire_index_hash),
+            wire_index_key,
+        );
         Ok(if fresh {
             Outcome::Inserted
         } else {
@@ -2977,13 +3035,33 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .expect("memory backend lock")
             .federation_family_authority_sigs
             .insert(
-                family_key_id,
+                family_key_id.clone(),
                 (
+                    authority_key_id.clone(),
+                    scrub_signature_classical.clone(),
+                    scrub_signature_pqc.clone(),
+                ),
+            );
+        // v21.1.0 (CIRISPersist#507b) — wire-index the FULL `SignedFamily`
+        // shape `list_signed_families_since` re-serializes. Reload rather
+        // than reuse the pre-write `Family` value: `put_family_local` stamps
+        // `persist_row_hash` on its OWN local copy, invisible from here.
+        if let Some(reloaded) = self.lookup_family(&family_key_id).await? {
+            let wire_index_key =
+                crate::federation::wire_index::record_key(&[("family_key_id", &family_key_id)]);
+            let wire_index_hash =
+                crate::federation::wire_index::content_hash_of(&crate::federation::SignedFamily {
+                    family: reloaded,
                     authority_key_id,
                     scrub_signature_classical,
                     scrub_signature_pqc,
-                ),
-            );
+                })?;
+            self.state
+                .lock()
+                .expect("memory backend lock")
+                .signed_wire_index
+                .insert(("Family".to_string(), wire_index_hash), wire_index_key);
+        }
         Ok(())
     }
 
@@ -3282,6 +3360,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             )));
         }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // v21.1.0 (CIRISPersist#507b) — computed before the moves below
+        // consume `row.clone()` / `community.*`.
+        let wire_index_key = crate::federation::wire_index::record_key(&[(
+            "community_key_id",
+            &row.community_key_id,
+        )]);
+        let wire_index_hash =
+            crate::federation::wire_index::content_hash_of(&crate::federation::SignedCommunity {
+                community: row.clone(),
+                authority_key_id: community.authority_key_id.clone(),
+                scrub_signature_classical: community.scrub_signature_classical.clone(),
+                scrub_signature_pqc: community.scrub_signature_pqc.clone(),
+            })?;
         // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
         // signature the gate above already verified (was verified-then-
         // discarded).
@@ -3296,6 +3387,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         state
             .federation_communities
             .insert(row.community_key_id.clone(), row);
+        state
+            .signed_wire_index
+            .insert(("Community".to_string(), wire_index_hash), wire_index_key);
         Ok(())
     }
 
@@ -3616,6 +3710,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let key = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
+        // v21.1.0 (CIRISPersist#507b) — computed before the moves below
+        // consume `row` / `attesting_key_id` / `signed_envelope` / `signature`.
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("identity_key_id", &key.0),
+            ("occurrence_key_id", &key.1),
+        ]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(
+            &crate::federation::SignedIdentityOccurrenceRevocation {
+                identity_occurrence_revocation: row.clone(),
+                attesting_key_id: attesting_key_id.clone(),
+                signed_envelope: signed_envelope.clone(),
+                signature: signature.clone(),
+            },
+        )?;
         // #421 — store the signature container in lockstep so the replication
         // read reconstructs the tuple that was put (mirror of the occurrence
         // sig map).
@@ -3627,6 +3735,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         state
             .federation_identity_occurrence_revocations
             .insert(key, row);
+        state.signed_wire_index.insert(
+            ("IdentityOccurrenceRevocation".to_string(), wire_index_hash),
+            wire_index_key,
+        );
         // #446 de-projection (the projection's inverse): retire the LOCAL
         // derived route materialized from this occurrence's binding. Narrow
         // on purpose: only the signature-free projected/local row; a live
@@ -3718,6 +3830,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             row.family_key_id.clone(),
             row.removed_identity_key_id.clone(),
         );
+        // v21.1.0 (CIRISPersist#507b) — computed before the moves below
+        // consume `row.clone()` / `revocation.*`.
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("family_key_id", &revocation_key.0),
+            ("removed_identity_key_id", &revocation_key.1),
+        ]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(
+            &crate::federation::SignedFamilyMembershipRevocation {
+                family_membership_revocation: row.clone(),
+                authority_key_id: revocation.authority_key_id.clone(),
+                scrub_signature_classical: revocation.scrub_signature_classical.clone(),
+                scrub_signature_pqc: revocation.scrub_signature_pqc.clone(),
+            },
+        )?;
         // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
         // signature the gate above already verified (was verified-then-
         // discarded).
@@ -3734,6 +3860,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         state
             .federation_family_membership_revocations
             .insert(revocation_key, row);
+        state.signed_wire_index.insert(
+            ("FamilyMembershipRevocation".to_string(), wire_index_hash),
+            wire_index_key,
+        );
         Ok(())
     }
 
@@ -3806,6 +3936,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .federation_community_dek_epoch
             .entry(row.community_key_id.clone())
             .or_insert(0) += 1;
+        // v21.1.0 (CIRISPersist#507b) — computed before the moves below
+        // consume `row.clone()` / `revocation.*`.
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("community_key_id", &revocation_key.0),
+            ("removed_identity_key_id", &revocation_key.1),
+        ]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(
+            &crate::federation::SignedCommunityMembershipRevocation {
+                community_membership_revocation: row.clone(),
+                authority_key_id: revocation.authority_key_id.clone(),
+                scrub_signature_classical: revocation.scrub_signature_classical.clone(),
+                scrub_signature_pqc: revocation.scrub_signature_pqc.clone(),
+            },
+        )?;
         // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
         // signature the gate above already verified (was verified-then-
         // discarded).
@@ -3822,6 +3966,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         state
             .federation_community_membership_revocations
             .insert(revocation_key, row);
+        state.signed_wire_index.insert(
+            ("CommunityMembershipRevocation".to_string(), wire_index_hash),
+            wire_index_key,
+        );
         Ok(())
     }
 
@@ -4090,6 +4238,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let proof_key = (row.subject_key_id.clone(), row.asserted_at);
+        // v21.1.0 (CIRISPersist#507b) — computed before the moves below
+        // consume `row.clone()` / `proof.*`.
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("subject_key_id", &proof_key.0),
+            ("asserted_at", &proof_key.1.to_rfc3339()),
+        ]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(
+            &crate::federation::SignedLocationProof {
+                location_proof: row.clone(),
+                authority_key_id: proof.authority_key_id.clone(),
+                scrub_signature_classical: proof.scrub_signature_classical.clone(),
+                scrub_signature_pqc: proof.scrub_signature_pqc.clone(),
+            },
+        )?;
         // v21.0.0 (CIRISPersist#502 E4 followup) — persist the authority
         // signature the gate above already verified (was verified-then-
         // discarded).
@@ -4102,6 +4264,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             ),
         );
         state.federation_location_proofs.insert(proof_key, row);
+        state.signed_wire_index.insert(
+            ("LocationProof".to_string(), wire_index_hash),
+            wire_index_key,
+        );
         Ok(())
     }
 
@@ -4168,12 +4334,24 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             &__stw_roots,
         )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // v21.1.0 (CIRISPersist#507b) — `Organization` carries its own
+        // single-signer signature fields inline — it IS the value
+        // `list_organizations_since` re-serializes, no separate wrapper.
+        // Computed before the insert below moves `row`.
+        let wire_index_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
         memory_idempotent_insert(
             &mut state.federation_organizations,
             row.attestation_id.clone(),
             row,
             "organization",
-        )
+        )?;
+        state.signed_wire_index.insert(
+            ("Organization".to_string(), wire_index_hash),
+            wire_index_key,
+        );
+        Ok(())
     }
 
     async fn put_org_membership(
@@ -4201,12 +4379,23 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             &__stw_roots,
         )?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // v21.1.0 (CIRISPersist#507b) — `OrgMembership` carries its own
+        // single-signer signature fields inline; see `put_organization`'s
+        // wire-index comment.
+        let wire_index_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
         memory_idempotent_insert(
             &mut state.federation_org_memberships,
             row.attestation_id.clone(),
             row,
             "org_membership",
-        )
+        )?;
+        state.signed_wire_index.insert(
+            ("OrgMembership".to_string(), wire_index_hash),
+            wire_index_key,
+        );
+        Ok(())
     }
 
     async fn put_partner_record(
@@ -4242,6 +4431,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut row = signed.partner_record;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let attestation_id = row.attestation_id.clone();
+        // v21.1.0 (CIRISPersist#507b) — `PartnerRecord`'s M-of-N steward
+        // quorum is EXTERNAL to the row, so the read surface
+        // (`list_signed_partner_records_since`) returns the
+        // `SignedPartnerRecord` wrapper — hash that shape, not the bare row.
+        // Computed before the moves below.
+        let wire_index_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", &attestation_id)]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(
+            &crate::federation::SignedPartnerRecord {
+                partner_record: row.clone(),
+                steward_signatures: steward_signatures.clone(),
+                threshold,
+            },
+        )?;
         memory_idempotent_insert(
             &mut state.federation_partner_records,
             attestation_id.clone(),
@@ -4251,6 +4454,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         state
             .federation_partner_record_sigs
             .insert(attestation_id, (steward_signatures, threshold));
+        state.signed_wire_index.insert(
+            ("PartnerRecord".to_string(), wire_index_hash),
+            wire_index_key,
+        );
         Ok(())
     }
 
@@ -4604,6 +4811,243 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    // ─── v21.1.0 (CIRISPersist#507c) — bulk signed-since reads for the 5
+    //     PRIMARY signed planes.
+
+    async fn list_signed_key_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedKeyRecord>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        // Every `federation_keys` row is signed — `scrub_signature_classical`
+        // is required at admission, so there is no filter to apply here.
+        let mut rows: Vec<_> = state
+            .federation_keys
+            .values()
+            .filter(|k| since.is_none_or(|s| k.scrub_timestamp > s))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.scrub_timestamp
+                .cmp(&b.scrub_timestamp)
+                .then_with(|| a.key_id.cmp(&b.key_id))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows
+            .into_iter()
+            .map(|record| crate::federation::SignedKeyRecord { record })
+            .collect())
+    }
+
+    async fn list_signed_identity_occurrences_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedIdentityOccurrence>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        // Signed-put rows only (join against the sig side-map); trusted-
+        // local rows (no sig entry) are omitted.
+        let mut rows: Vec<crate::federation::SignedIdentityOccurrence> = state
+            .federation_identity_occurrences
+            .iter()
+            .filter(|(_, occ)| since.is_none_or(|s| occ.asserted_at > s))
+            .filter_map(|(key, occ)| {
+                state.federation_identity_occurrence_sigs.get(key).map(
+                    |(attesting_key_id, signed_envelope, signature)| {
+                        crate::federation::SignedIdentityOccurrence {
+                            identity_occurrence: occ.clone(),
+                            attesting_key_id: attesting_key_id.clone(),
+                            signed_envelope: signed_envelope.clone(),
+                            signature: signature.clone(),
+                        }
+                    },
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.identity_occurrence
+                .asserted_at
+                .cmp(&b.identity_occurrence.asserted_at)
+                .then_with(|| {
+                    a.identity_occurrence
+                        .identity_key_id
+                        .cmp(&b.identity_occurrence.identity_key_id)
+                })
+                .then_with(|| {
+                    a.identity_occurrence
+                        .occurrence_key_id
+                        .cmp(&b.identity_occurrence.occurrence_key_id)
+                })
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_signed_transport_destinations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedTransportDestination>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        // Signed-put rows only; RETIRED rows ARE included — tombstones must
+        // gossip, matching `list_signed_transport_destinations_for`.
+        let mut rows: Vec<crate::federation::SignedTransportDestination> = state
+            .transport_destinations
+            .iter()
+            .filter(|(_, td)| since.is_none_or(|s| td.asserted_at > s))
+            .filter_map(|(key, td)| {
+                state.transport_destination_sigs.get(key).map(
+                    |(attesting_key_id, signed_envelope, signature)| {
+                        crate::federation::SignedTransportDestination {
+                            transport_destination: td.clone(),
+                            attesting_key_id: attesting_key_id.clone(),
+                            signed_envelope: signed_envelope.clone(),
+                            signature: signature.clone(),
+                        }
+                    },
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.transport_destination
+                .asserted_at
+                .cmp(&b.transport_destination.asserted_at)
+                .then_with(|| {
+                    a.transport_destination
+                        .occurrence_key_id
+                        .cmp(&b.transport_destination.occurrence_key_id)
+                })
+                .then_with(|| {
+                    a.transport_destination
+                        .transport_kind
+                        .cmp(&b.transport_destination.transport_kind)
+                })
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_attestations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        // E5 invariant: federation-tier rows only — a local-tier row must
+        // never reach the advertise/serve wire surface.
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                since.is_none_or(|s| a.asserted_at > s)
+                    && a.tier == crate::federation::types::attestation_tier::FEDERATION
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            a.asserted_at
+                .cmp(&b.asserted_at)
+                .then_with(|| a.attestation_id.cmp(&b.attestation_id))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_signed_identity_occurrence_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedIdentityOccurrenceRevocation>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        // Signed-put rows only — same contract as
+        // `list_signed_identity_occurrence_revocations_for`.
+        let mut rows: Vec<crate::federation::SignedIdentityOccurrenceRevocation> = state
+            .federation_identity_occurrence_revocations
+            .iter()
+            .filter(|(_, rev)| since.is_none_or(|s| rev.revoked_at > s))
+            .filter_map(|(key, rev)| {
+                state
+                    .federation_identity_occurrence_revocation_sigs
+                    .get(key)
+                    .map(|(attesting_key_id, signed_envelope, signature)| {
+                        crate::federation::SignedIdentityOccurrenceRevocation {
+                            identity_occurrence_revocation: rev.clone(),
+                            attesting_key_id: attesting_key_id.clone(),
+                            signed_envelope: signed_envelope.clone(),
+                            signature: signature.clone(),
+                        }
+                    })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.identity_occurrence_revocation
+                .revoked_at
+                .cmp(&b.identity_occurrence_revocation.revoked_at)
+                .then_with(|| {
+                    a.identity_occurrence_revocation
+                        .identity_key_id
+                        .cmp(&b.identity_occurrence_revocation.identity_key_id)
+                })
+                .then_with(|| {
+                    a.identity_occurrence_revocation
+                        .occurrence_key_id
+                        .cmp(&b.identity_occurrence_revocation.occurrence_key_id)
+                })
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    // ─── v21.1.0 (CIRISPersist#507b) — the shared signed-wire content-hash
+    //     index (V111 mirror: `signed_wire_index` HashMap).
+
+    async fn lookup_signed_record_by_content_hash(
+        &self,
+        kind: &str,
+        content_hash: &str,
+    ) -> Result<Option<Vec<u8>>, crate::federation::Error> {
+        let record_key = {
+            let state = self.state.lock().expect("memory backend lock");
+            state
+                .signed_wire_index
+                .get(&(kind.to_owned(), content_hash.to_owned()))
+                .cloned()
+        };
+        let Some(record_key) = record_key else {
+            return Ok(None);
+        };
+        let bytes =
+            crate::federation::wire_index::reload_record_bytes(self, kind, &record_key).await?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let recomputed = crate::federation::wire_index::content_hash_of_bytes(&bytes);
+        if recomputed != content_hash {
+            tracing::warn!(
+                kind,
+                content_hash,
+                recomputed = %recomputed,
+                "signed_wire_index content-hash mismatch; self-healing (returning None)"
+            );
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+
+    async fn rebuild_signed_wire_index(&self) -> Result<u64, crate::federation::Error> {
+        let triples = crate::federation::wire_index::all_kind_hash_keys(self).await?;
+        let count = triples.len() as u64;
+        let mut state = self.state.lock().expect("memory backend lock");
+        for (kind, hash, record_key) in triples {
+            state
+                .signed_wire_index
+                .insert((kind.to_owned(), hash), record_key);
+        }
+        Ok(count)
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -4706,6 +5150,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        // v21.1.0 (CIRISPersist#507b) — the promoted row is now federation-
+        // tier and therefore wire-servable; index it under its final
+        // post-promotion shape (matches `list_attestations_since`).
+        let wire_index_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(&*row)?;
+        state
+            .signed_wire_index
+            .insert(("Attestation".to_string(), wire_index_hash), wire_index_key);
         Ok(true)
     }
 

@@ -6231,6 +6231,329 @@ impl PyEngine {
         })
     }
 
+    /// v21.1.0 (CIRISPersist#507c, edge advertise/serve bridge) —
+    /// bulk-list `SignedKeyRecord` wrappers since a cursor, as a JSON array,
+    /// ordered `(scrub_timestamp ASC, key_id ASC)`. Every `federation_keys`
+    /// row qualifies (the classical scrub signature is required at
+    /// admission, so there is no unsigned shape to filter).
+    #[pyo3(signature = (since_rfc3339, limit))]
+    fn list_signed_key_records_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                    .with_timezone(&chrono::Utc),
+            ),
+            None => None,
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .list_signed_key_records_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "signed key_record list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
+    /// `SignedIdentityOccurrence` wrappers since a cursor, as a JSON array.
+    /// Signed rows only (trusted-local rows omitted); ordered `(asserted_at
+    /// ASC, identity_key_id ASC, occurrence_key_id ASC)`.
+    #[pyo3(signature = (since_rfc3339, limit))]
+    fn list_signed_identity_occurrences_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                    .with_timezone(&chrono::Utc),
+            ),
+            None => None,
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .list_signed_identity_occurrences_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "signed identity_occurrence list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
+    /// `SignedTransportDestination` wrappers since a cursor, as a JSON
+    /// array. Signed rows only; RETIRED rows ARE included (tombstones must
+    /// gossip); ordered `(asserted_at ASC, occurrence_key_id ASC,
+    /// transport_kind ASC)`.
+    #[pyo3(signature = (since_rfc3339, limit))]
+    fn list_signed_transport_destinations_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                    .with_timezone(&chrono::Utc),
+            ),
+            None => None,
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .list_signed_transport_destinations_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "signed transport_destination list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v21.1.0 (CIRISPersist#507c) — bulk-list `Attestation` rows since a
+    /// cursor, as a JSON array, **federation tier only** (the E5
+    /// invariant — a local-tier row must never reach the advertise/serve
+    /// wire surface). Ordered `(asserted_at ASC, attestation_id ASC)`.
+    #[pyo3(signature = (since_rfc3339, limit))]
+    fn list_attestations_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                    .with_timezone(&chrono::Utc),
+            ),
+            None => None,
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .list_attestations_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "attestation list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
+    /// `SignedIdentityOccurrenceRevocation` wrappers since a cursor, as a
+    /// JSON array. Signed rows only; ordered `(revoked_at ASC,
+    /// identity_key_id ASC, occurrence_key_id ASC)`.
+    #[pyo3(signature = (since_rfc3339, limit))]
+    fn list_signed_identity_occurrence_revocations_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                    .with_timezone(&chrono::Utc),
+            ),
+            None => None,
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .list_signed_identity_occurrence_revocations_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "signed identity_occurrence_revocation list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v21.1.0 (CIRISPersist#507b) — the content-hash point-read: `kind` is
+    /// the `EnvelopeKind::as_str()` token, `content_hash` the lowercase-hex
+    /// sha256 over the record's wire JSON bytes (see
+    /// `FederationDirectory::lookup_signed_record_by_content_hash`'s doc for
+    /// the full lockstep contract). Returns Python `bytes` on a hit, `None`
+    /// on an unknown hash or a self-healing index-mismatch.
+    #[pyo3(signature = (kind, content_hash))]
+    fn lookup_signed_record_by_content_hash(
+        &self,
+        py: Python<'_>,
+        kind: String,
+        content_hash: String,
+    ) -> PyResult<Option<Py<PyBytes>>> {
+        self.ensure_usable()?;
+        let bytes = catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            b.lookup_signed_record_by_content_hash(&kind, &content_hash)
+                                .await
+                                .map_err(federation_err_to_py)
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })?;
+        Ok(bytes.map(|b| PyBytes::new(py, &b).unbind()))
+    }
+
+    /// v21.1.0 (CIRISPersist#507b) — full rebuild/backfill of the
+    /// `signed_wire_index`: scans every covered kind's current rows and
+    /// upserts `(kind, content_hash, record_key)`. Returns the count of
+    /// rows indexed. Operators run this once post-upgrade (or CIRISEdge
+    /// triggers it on adoption); a fresh install's table starts empty and
+    /// stays current via the per-put hook from that point forward.
+    fn rebuild_signed_wire_index(&self, py: Python<'_>) -> PyResult<u64> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            b.rebuild_signed_wire_index()
+                                .await
+                                .map_err(federation_err_to_py)
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
     /// Federation directory: attach the cold-path PQC signature to a
     /// hybrid-pending federation_keys row. See docs/FEDERATION_DIRECTORY.md
     /// §"Trust contract" for the writer contract — this is step 4
