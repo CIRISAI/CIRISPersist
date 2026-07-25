@@ -80,7 +80,16 @@ pub(crate) mod test_support {
     use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
 
     fn grant(id: &str, node: &str, peer: &str) -> Attestation {
-        let envelope = serde_json::json!({ "dimension": DIMENSION });
+        // v21.3.0 (CIRISPersist#510 P1) — a `consent:replication:v1` row
+        // now admits through the closed-grammar gate (`put_attestation`),
+        // so this E7/#509 projection fixture needs a minimally-valid
+        // `payload` (the prefix content is irrelevant to these tests —
+        // they exercise the peer-set fold / list methods, not grammar
+        // semantics).
+        let envelope = serde_json::json!({
+            "dimension": DIMENSION,
+            "payload": {"grants": "replication", "attestation_prefixes": ["e7-fixture:"]},
+        });
         let (och, ed_sig, pqc_sig) =
             crate::federation::tier_ingest::test_support::sign_envelope(node, &envelope);
         let now = chrono::Utc::now();

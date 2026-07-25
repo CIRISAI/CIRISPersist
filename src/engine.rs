@@ -2452,12 +2452,13 @@ impl Engine {
         }
     }
 
-    /// v21.2.0 (CIRISPersist#509 FLOOR) — "the payload follows the
-    /// consent edge": promote every `local`-tier attestation whose
-    /// envelope dimension is covered by a LIVE self-authored
-    /// `consent:replication:v1` grant to `federation` tier (via
-    /// [`Self::attestation_promote`]) and stamp its `cohort_scope` to
-    /// [`crate::federation::types::cohort_scope::FEDERATION`].
+    /// v21.2.0 (CIRISPersist#509 FLOOR, policy-driven since #510 P1) —
+    /// "the payload follows the consent edge": promote every `local`-tier
+    /// attestation whose envelope dimension is covered by a LIVE
+    /// self-authored `consent:replication:v1` grant to `federation` tier,
+    /// and stamp its `cohort_scope` to the COVERING grant's OWN `audience`
+    /// (no longer hardcoded `federation` — see "Audience resolution"
+    /// below).
     ///
     /// # Two chokepoints, one idempotent sweep
     ///
@@ -2479,33 +2480,78 @@ impl Engine {
     /// grants/backlog converges to a zero [`crate::federation::ConsentSweepReport`]
     /// — safe to call unconditionally at either chokepoint.
     ///
-    /// # Method
+    /// # Method (v21.3.0 / CIRISPersist#510 P1 — policy-driven)
     ///
     /// 1. Resolve this node's own derived federation key_id
     ///    ([`Self::local_derived_key_id`]).
     /// 2. [`crate::federation::FederationDirectory::list_live_consent_grants_by`]
     ///    — every LIVE grant this node authored about itself (E7's
     ///    `consent_peer_set` projection already folded revocation; this
-    ///    sweep never re-derives that fold). Union every grant's
-    ///    [`crate::federation::consent_grammar::grant_attestation_prefixes`]
-    ///    into one prefix set. Empty ⇒ zero report, no page walk.
+    ///    sweep never re-derives that fold). Parse each through
+    ///    [`crate::federation::consent_grammar::parse_grant_payload`] —
+    ///    a grant that fails to parse is `tracing::warn!`'d and SKIPPED
+    ///    (fail-closed: unparseable ⇒ covers nothing; it would have been
+    ///    rejected at admission post-#510, but pre-#510 rows may still
+    ///    exist). A parsed grant is ACTIVE iff `direction ==
+    ///    Egress`, `kinds` contains `"Attestation"`, the payload's
+    ///    `valid_until` (when `Some`) is still in the future, AND the
+    ///    grant row's own `expires_at` column (when `Some`) is still in
+    ///    the future. The union of every ACTIVE grant's
+    ///    `attestation_prefixes` gates the page walk (empty ⇒ zero
+    ///    report, no page walk) — the same cheap pre-filter #509 used,
+    ///    just sourced from the typed policy instead of the raw reader.
     /// 3. Cursor-page
     ///    [`crate::federation::FederationDirectory::list_local_tier_attestations`]
-    ///    (512 rows/page, ascending `attestation_id`); for each row whose
-    ///    envelope dimension is
-    ///    [`crate::federation::consent_grammar::covers`]ed by the prefix
-    ///    set, call [`Self::attestation_promote`], then
-    ///    [`crate::federation::FederationDirectory::set_attestation_cohort_scope`]
-    ///    it to `federation`. A promote `Err` on ONE row is
-    ///    `tracing::warn!`'d and counted in `skipped` — it does NOT abort
-    ///    the sweep (the same honest-accounting posture as the #473 mint
-    ///    skip). The cursor advances past a page regardless of any skips
-    ///    within it, so one poisoned row cannot wedge the walk.
+    ///    (512 rows/page, ascending `attestation_id`); for each row,
+    ///    re-derive the SPECIFIC active grants that
+    ///    [`crate::federation::consent_grammar::covers`] its dimension
+    ///    (not just the pre-filter union — a grant only contributes its
+    ///    own `audience`/`restrictions` to rows ITS OWN prefixes cover).
+    ///    No covering grant ⇒ skip the row (uncovered).
+    ///
+    /// # Audience resolution (a P1 determinism rule)
+    ///
+    /// When several grants cover the same row and they don't all name the
+    /// same `audience`, cohort-scope ordering across the 7 closed values
+    /// is not well-defined, so this is NOT resolved by "widen to the
+    /// broadest" — floor rule: if every covering grant agrees, use that
+    /// audience; otherwise use `federation` if every covering grant names
+    /// `federation`; otherwise deterministically pick the FIRST covering
+    /// grant sorted by `attestation_id` and `tracing::warn!` the
+    /// divergence (naming every covering grant + its audience). The #510
+    /// issue tracks refining this rule; this is the documented P1 floor.
+    ///
+    /// # Restriction application
+    ///
+    /// The UNION of every covering grant's `restrictions` is applied
+    /// before signing. `RecipientCapability` restrictions are recorded in
+    /// the grammar but apply NO transform at promotion time (serve-layer
+    /// enforcement, a P3 follow-up). When the union contains at least one
+    /// `StripField`, [`Self::promote_attestation_with_strips`] signs the
+    /// STRIPPED envelope and writes it back via
+    /// [`crate::federation::FederationDirectory::promote_attestation_transformed`];
+    /// with NO `StripField` restrictions, [`Self::attestation_promote`]
+    /// is used unchanged (the byte-identical-wire property #509
+    /// established is preserved for the common case).
+    ///
+    /// A promote `Err` on ONE row is `tracing::warn!`'d and counted in
+    /// `skipped` — it does NOT abort the sweep (the same honest-
+    /// accounting posture as the #473 mint skip). The cursor advances
+    /// past a page regardless of any skips within it, so one poisoned row
+    /// cannot wedge the walk.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     pub async fn promote_consented_backlog(
         &self,
     ) -> Result<crate::federation::ConsentSweepReport, crate::federation::Error> {
         use crate::federation::{consent_grammar, types::cohort_scope, Error, FederationDirectory};
+
+        /// A LIVE grant that survived the fail-closed parse + the
+        /// direction/kinds/expiry pre-filter — this sweep's unit of
+        /// "still counts".
+        struct ActiveGrant {
+            attestation_id: String,
+            policy: consent_grammar::ConsentTransferPolicy,
+        }
 
         let mut report = crate::federation::ConsentSweepReport::default();
 
@@ -2520,11 +2566,50 @@ impl Engine {
             #[cfg(feature = "sqlite")]
             BackendDispatch::Sqlite(b) => b.list_live_consent_grants_by(&self_key).await?,
         };
-        let mut prefix_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        let now = chrono::Utc::now();
+        let mut active: Vec<ActiveGrant> = Vec::new();
         for grant in &grants {
-            prefix_set.extend(consent_grammar::grant_attestation_prefixes(
-                &grant.attestation_envelope,
-            ));
+            let policy = match consent_grammar::parse_grant_payload(&grant.attestation_envelope) {
+                Ok(p) => p,
+                Err(reason) => {
+                    tracing::warn!(
+                        attestation_id = %grant.attestation_id,
+                        reason = %reason,
+                        "promote_consented_backlog: live grant failed the closed #510 grammar; \
+                         treating it as covering nothing (fail-closed)"
+                    );
+                    continue;
+                }
+            };
+            if policy.direction != consent_grammar::Direction::Egress {
+                continue;
+            }
+            if !policy.kinds.iter().any(|k| k == "Attestation") {
+                continue;
+            }
+            if let Some(valid_until) = policy.valid_until {
+                if valid_until <= now {
+                    continue;
+                }
+            }
+            if let Some(expires_at) = grant.expires_at {
+                if expires_at <= now {
+                    continue;
+                }
+            }
+            active.push(ActiveGrant {
+                attestation_id: grant.attestation_id.clone(),
+                policy,
+            });
+        }
+        if active.is_empty() {
+            return Ok(report);
+        }
+
+        let mut prefix_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for g in &active {
+            prefix_set.extend(g.policy.attestation_prefixes.iter().cloned());
         }
         if prefix_set.is_empty() {
             return Ok(report);
@@ -2561,14 +2646,76 @@ impl Engine {
                 if !consent_grammar::covers(&prefixes, dimension) {
                     continue;
                 }
-                match self.attestation_promote(&row.attestation_id).await {
+
+                // Re-derive the SPECIFIC covering grants for this row —
+                // the pre-filter union only cheaply gates the page walk;
+                // audience/restriction composition must come from grants
+                // whose OWN prefixes actually cover this dimension.
+                let covering: Vec<&ActiveGrant> = active
+                    .iter()
+                    .filter(|g| consent_grammar::covers(&g.policy.attestation_prefixes, dimension))
+                    .collect();
+                if covering.is_empty() {
+                    // Defensive — the union pre-filter implies at least
+                    // one active grant covers, but never trust that
+                    // implication over a direct re-check.
+                    continue;
+                }
+
+                // ── audience resolution (the P1 determinism rule) ──
+                let all_same_audience = covering
+                    .iter()
+                    .all(|g| g.policy.audience == covering[0].policy.audience);
+                let chosen_audience: String = if all_same_audience {
+                    covering[0].policy.audience.clone()
+                } else if covering
+                    .iter()
+                    .all(|g| g.policy.audience == cohort_scope::FEDERATION)
+                {
+                    cohort_scope::FEDERATION.to_string()
+                } else {
+                    let mut sorted = covering.clone();
+                    sorted.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
+                    tracing::warn!(
+                        attestation_id = %row.attestation_id,
+                        covering_grants = ?sorted
+                            .iter()
+                            .map(|g| (g.attestation_id.clone(), g.policy.audience.clone()))
+                            .collect::<Vec<_>>(),
+                        "promote_consented_backlog: covering grants disagree on audience; \
+                         picking the first by attestation_id (P1 determinism rule — CIRISPersist#510 \
+                         issue refines this)"
+                    );
+                    sorted[0].policy.audience.clone()
+                };
+
+                // ── restriction union ──
+                let mut strip_paths: Vec<String> = Vec::new();
+                for g in &covering {
+                    for r in &g.policy.restrictions {
+                        if let consent_grammar::RestrictionOp::StripField { path } = r {
+                            strip_paths.push(path.clone());
+                        }
+                        // RecipientCapability: no promotion-time transform
+                        // (serve-layer enforcement, P3).
+                    }
+                }
+
+                let promote_result = if strip_paths.is_empty() {
+                    self.attestation_promote(&row.attestation_id).await
+                } else {
+                    self.promote_attestation_with_strips(row, &strip_paths)
+                        .await
+                };
+
+                match promote_result {
                     Ok(true) => {
                         let scope_write = match &self.backend {
                             #[cfg(feature = "postgres")]
                             BackendDispatch::Postgres(b) => {
                                 b.set_attestation_cohort_scope(
                                     &row.attestation_id,
-                                    cohort_scope::FEDERATION,
+                                    &chosen_audience,
                                 )
                                 .await
                             }
@@ -2576,7 +2723,7 @@ impl Engine {
                             BackendDispatch::Sqlite(b) => {
                                 b.set_attestation_cohort_scope(
                                     &row.attestation_id,
-                                    cohort_scope::FEDERATION,
+                                    &chosen_audience,
                                 )
                                 .await
                             }
@@ -2608,6 +2755,86 @@ impl Engine {
             }
         }
         Ok(report)
+    }
+
+    /// v21.3.0 (CIRISPersist#510 P1) — the strip-then-sign half of
+    /// [`Self::promote_consented_backlog`]: apply every `strip_paths`
+    /// entry ([`crate::federation::consent_grammar::strip_field`]) to a
+    /// CLONE of `row`'s envelope, canonicalize + hybrid-sign the
+    /// STRIPPED bytes (NEVER the original — the signature must cover
+    /// exactly what a recipient will see), and write back through
+    /// [`crate::federation::FederationDirectory::promote_attestation_transformed`].
+    /// `original_content_hash` is the hash of the STRIPPED canonical — it
+    /// is the content actually signed/shipped, matching how
+    /// [`Self::attestation_promote`] hashes the (unstripped) canonical it
+    /// signs. The row's full PRE-strip form remains queryable via the
+    /// `trace_events` projection (decomposed at ingest/emit time, before
+    /// any strip is applied), so this never destroys the substrate's own
+    /// copy — only the federation-tier envelope this promotes narrows.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn promote_attestation_with_strips(
+        &self,
+        row: &crate::federation::Attestation,
+        strip_paths: &[String],
+    ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::FederationDirectory;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        let mut stripped = row.attestation_envelope.clone();
+        for path in strip_paths {
+            crate::federation::consent_grammar::strip_field(&mut stripped, path);
+        }
+
+        let canonical =
+            crate::verify::canonical::ceg_produce_canonicalize(&stripped).map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "promote_attestation_with_strips canonicalize: {e}"
+                ))
+            })?;
+        let original_content_hash_hex = hex::encode(Sha256::digest(&canonical));
+        let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "promote_attestation_with_strips sign_hybrid: {e}"
+            ))
+        })?;
+        let classical_b64 = B64.encode(&sig.classical.signature);
+        let pqc_b64 = B64.encode(&sig.pqc.signature);
+        let scrub_key_id = self.local_derived_key_id().await.map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "promote_attestation_with_strips derive scrub_key_id: {e}"
+            ))
+        })?;
+        let now = chrono::Utc::now();
+
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => {
+                b.promote_attestation_transformed(
+                    &row.attestation_id,
+                    &stripped,
+                    &classical_b64,
+                    Some(&pqc_b64),
+                    &original_content_hash_hex,
+                    &scrub_key_id,
+                    now,
+                )
+                .await
+            }
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => {
+                b.promote_attestation_transformed(
+                    &row.attestation_id,
+                    &stripped,
+                    &classical_b64,
+                    Some(&pqc_b64),
+                    &original_content_hash_hex,
+                    &scrub_key_id,
+                    now,
+                )
+                .await
+            }
+        }
     }
 
     /// v9.3.0 (CIRISPersist#248) — THE high-level emit primitive: produce
@@ -10058,6 +10285,200 @@ mod tests {
             after.tier,
             crate::federation::types::attestation_tier::LOCAL,
             "no grants ⇒ local rows untouched"
+        );
+    }
+
+    // ── v21.3.0 (CIRISPersist#510 P1) — the closed grammar drives the
+    //    sweep: policy-parsed grants, audience resolution, restriction
+    //    (strip_field) application, expiry.
+
+    /// Emit a self-authored `consent:replication:v1` grant carrying an
+    /// arbitrary #510 payload (audience / restrictions / valid_until /
+    /// kinds), via `emit_attestation_self` — the #510 analogue of
+    /// `emit_509_grant` (which only ever set `attestation_prefixes`).
+    #[cfg(feature = "sqlite")]
+    async fn emit_510_grant(engine: &Engine, peer: &str, payload: serde_json::Value) -> String {
+        let envelope = crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+            "dimension": crate::federation::consent_peer_set::DIMENSION,
+            "subject_key_ids": [peer],
+            "payload": payload,
+            "subject_kind": "consent_replication",
+        }))
+        .unwrap();
+        let mut input = crate::federation::EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::SCORES,
+            envelope,
+        );
+        input.subject_key_ids = vec![peer.to_owned()];
+        engine
+            .emit_attestation_self(input)
+            .await
+            .expect("510 grant emits")
+    }
+
+    /// A grant carrying a `strip_field` restriction over a member of the
+    /// trace envelope (`agent_id_hash`) promotes the row with that member
+    /// REMOVED, `tier = federation`, `cohort_scope` set to the grant's
+    /// audience, and a scrub signature that verifies over the STRIPPED
+    /// canonical — via the SAME `verify_federation_tier_ingest` recipe
+    /// production's federation-tier ingest gate uses (the row's
+    /// `original_content_hash` / envelope / scrub signature must all
+    /// agree, or that verify call itself fails).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn promotion_applies_strip_field_510() {
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("node-510strip");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "node-510strip"))
+            .await
+            .expect("seed key");
+
+        let trace_id = sq
+            .attestation_insert_local(build_509_trace_input(&derived, "trace-510strip-1"))
+            .await
+            .expect("insert local trace");
+        let before = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert!(
+            before.attestation_envelope.get("agent_id_hash").is_some(),
+            "sanity: the fixture carries agent_id_hash before any strip"
+        );
+
+        let _grant_id = emit_510_grant(
+            &engine,
+            "peer-510strip",
+            serde_json::json!({
+                "grants": "transfer",
+                "attestation_prefixes": ["trace:"],
+                "audience": "federation",
+                "restrictions": [{"op": "strip_field", "path": "/agent_id_hash"}],
+            }),
+        )
+        .await;
+
+        let after = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(
+            after.tier,
+            crate::federation::types::attestation_tier::FEDERATION,
+            "the strip_field restriction still promotes the row"
+        );
+        assert_eq!(
+            after.cohort_scope,
+            crate::federation::types::cohort_scope::FEDERATION
+        );
+        assert!(
+            after.attestation_envelope.get("agent_id_hash").is_none(),
+            "agent_id_hash must be ABSENT from the promoted envelope: {:?}",
+            after.attestation_envelope
+        );
+        // Protected root members and the rest of the shape survive.
+        assert_eq!(after.attestation_envelope["dimension"], "trace:complete:v1");
+        assert_eq!(after.attestation_envelope["trace_id"], "trace-510strip-1");
+
+        // The scrub signature verifies over the STRIPPED canonical — the
+        // same federation-tier ingest verify recipe production uses.
+        crate::federation::tier_ingest::verify_federation_tier_ingest(&*sq, &after)
+            .await
+            .expect("promoted row's scrub signature verifies over the stripped canonical");
+    }
+
+    /// A grant whose `audience` is `"community"` (not the #509-floor's
+    /// hardcoded `federation`) promotes the covered row with
+    /// `cohort_scope = community` — the sweep now reads the audience from
+    /// the covering grant's OWN policy.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn promotion_honors_audience_510() {
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("node-510aud");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "node-510aud"))
+            .await
+            .expect("seed key");
+
+        let trace_id = sq
+            .attestation_insert_local(build_509_trace_input(&derived, "trace-510aud-1"))
+            .await
+            .expect("insert local trace");
+
+        let _grant_id = emit_510_grant(
+            &engine,
+            "peer-510aud",
+            serde_json::json!({
+                "grants": "transfer",
+                "attestation_prefixes": ["trace:"],
+                "audience": "community",
+            }),
+        )
+        .await;
+
+        let after = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(
+            after.tier,
+            crate::federation::types::attestation_tier::FEDERATION
+        );
+        assert_eq!(
+            after.cohort_scope,
+            crate::federation::types::cohort_scope::COMMUNITY,
+            "the grant's own audience (community), not a hardcoded federation, is stamped"
+        );
+    }
+
+    /// A grant whose payload `valid_until` is already in the PAST does
+    /// not cover anything — the sweep promotes zero rows, the same
+    /// fail-closed posture `expired_grant_does_not_cover_510` names.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn expired_grant_does_not_cover_510() {
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("node-510exp");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "node-510exp"))
+            .await
+            .expect("seed key");
+
+        let trace_id = sq
+            .attestation_insert_local(build_509_trace_input(&derived, "trace-510exp-1"))
+            .await
+            .expect("insert local trace");
+
+        let _grant_id = emit_510_grant(
+            &engine,
+            "peer-510exp",
+            serde_json::json!({
+                "grants": "transfer",
+                "attestation_prefixes": ["trace:"],
+                "valid_until": "2020-01-01T00:00:00Z",
+            }),
+        )
+        .await;
+
+        // The (c) emit-time hook already ran the sweep once; an explicit
+        // second sweep must also promote nothing.
+        let report = engine.promote_consented_backlog().await.expect("sweep");
+        assert_eq!(report.promoted, 0, "an expired grant covers nothing");
+        assert_eq!(report.skipped, 0);
+
+        let after = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(
+            after.tier,
+            crate::federation::types::attestation_tier::LOCAL,
+            "an expired grant's row stays local — never promoted"
         );
     }
 

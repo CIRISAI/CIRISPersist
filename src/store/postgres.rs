@@ -3731,6 +3731,28 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         .await?;
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
+        // v21.3.0 (CIRISPersist#510 P1) — the closed consent-transfer
+        // grammar admission chokepoint (parity with sqlite + memory). A
+        // `consent:replication:v1` grant's `payload` MUST parse through
+        // `consent_grammar::parse_grant_payload` (closed enums, strict
+        // `deny_unknown_fields`) — an unknown restriction op, an
+        // unrecognized payload field, a non-consentable `kinds` entry, a
+        // bad `grants` token, a bad `audience`, or an empty-string
+        // `attestation_prefixes` entry rejects the WHOLE grant. No-op for
+        // every other dimension. Runs BEFORE persist_row_hash + INSERT so
+        // a rejected grant leaves no trace.
+        if crate::federation::admission::envelope_dimension(&row.attestation_envelope)
+            == Some(crate::federation::consent_grammar::GRANT_DIMENSION)
+        {
+            if let Err(reason) = crate::federation::consent_grammar::validate_grant_admission(
+                &row.attestation_envelope,
+            ) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "consent grant rejected by the closed grammar (#510): {reason}"
+                )));
+            }
+        }
+
         // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11; keying broadened by
         // #369) — no-moderator-no-federate FEDERATION-APPLY re-check (point
         // ii). A federation-tier row keyed on a community under ANY substrate
@@ -7543,6 +7565,96 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .await
             .map_err(|e| {
                 crate::federation::Error::Backend(format!("promote_attestation projection: {e}"))
+            })?;
+        Ok(true)
+    }
+
+    async fn promote_attestation_transformed(
+        &self,
+        attestation_id: &str,
+        envelope_json: &serde_json::Value,
+        scrub_signature_classical: &str,
+        scrub_signature_pqc: Option<&str>,
+        original_content_hash_hex: &str,
+        scrub_key_id: &str,
+        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::types::attestation_tier;
+        let mut row = self.get_attestation(attestation_id).await?.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "federation_attestations row {attestation_id} does not exist"
+            ))
+        })?;
+        if row.tier == attestation_tier::FEDERATION {
+            return Ok(false); // idempotent
+        }
+        let och: Vec<u8> = hex::decode(original_content_hash_hex).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let now = scrub_timestamp;
+        let pqc_owned = scrub_signature_pqc.map(|s| s.to_owned());
+        row.attestation_envelope = envelope_json.clone();
+        row.original_content_hash = original_content_hash_hex.to_owned();
+        row.scrub_signature_classical = scrub_signature_classical.to_owned();
+        row.scrub_signature_pqc = pqc_owned.clone();
+        row.scrub_key_id = scrub_key_id.to_owned();
+        row.scrub_timestamp = now;
+        row.pqc_completed_at = pqc_owned.as_ref().map(|_| now);
+        row.tier = attestation_tier::FEDERATION.to_string();
+        row.promoted_at = Some(now);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        let pqc_completed = row.pqc_completed_at;
+        let att_uuid = uuid::Uuid::parse_str(attestation_id).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("attestation_id uuid: {e}"))
+        })?;
+
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_attestations \
+                 SET attestation_envelope = $1, original_content_hash = $2, \
+                     scrub_signature_classical = $3, scrub_signature_pqc = $4, \
+                     scrub_key_id = $5, scrub_timestamp = $6, pqc_completed_at = $7, \
+                     persist_row_hash = $8, tier = 'federation', promoted_at = $6 \
+                 WHERE attestation_id = $9 AND tier = 'local'",
+                &[
+                    &row.attestation_envelope,
+                    &och,
+                    &scrub_signature_classical,
+                    &pqc_owned,
+                    &scrub_key_id,
+                    &now,
+                    &pqc_completed,
+                    &new_hash,
+                    &att_uuid,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("promote_attestation_transformed: {e}"))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_attestations row {attestation_id} was concurrently promoted"
+            )));
+        }
+        // v17.4.0 (V106) — projection: the promoted row is now federation-tier.
+        client
+            .execute(
+                "UPDATE cirislens.attestation_subjects SET tier = 'federation' \
+                 WHERE attestation_id = $1",
+                &[&att_uuid],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "promote_attestation_transformed projection: {e}"
+                ))
             })?;
         Ok(true)
     }
@@ -18056,6 +18168,28 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         let suffix = uuid_like();
         crate::federation::consent_peer_set::test_support::exercise_509_backend_methods(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
+    /// v21.3.0 (CIRISPersist#510 P1) — the postgres leg of the shared
+    /// closed-consent-grammar admission-rejection witness (see
+    /// `sqlite::tests::consent_grammar_admission_rejections_sqlite_510`);
+    /// both call the SAME
+    /// `consent_grammar::test_support::exercise_510_admission_rejections`
+    /// body, so sqlite and postgres cannot silently diverge.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn consent_grammar_admission_rejections_postgres_510() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::consent_grammar::test_support::exercise_510_admission_rejections(
             &backend, &suffix,
         )
         .await;

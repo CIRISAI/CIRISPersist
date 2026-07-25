@@ -1927,6 +1927,30 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         .await?;
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
+        // v21.3.0 (CIRISPersist#510 P1) — the closed consent-transfer
+        // grammar admission chokepoint (parity with sqlite + postgres). A
+        // `consent:replication:v1` grant's `payload` MUST parse through
+        // `consent_grammar::parse_grant_payload` (closed enums, strict
+        // `deny_unknown_fields`) — an unknown restriction op, an
+        // unrecognized payload field, a non-consentable `kinds` entry, a
+        // bad `grants` token, a bad `audience`, or an empty-string
+        // `attestation_prefixes` entry rejects the WHOLE grant. No-op for
+        // every other dimension. Pure function over the envelope — no
+        // directory access needed — so it runs here BEFORE the state lock
+        // for the same reason the other pre-lock gates do, and BEFORE
+        // persist — a rejected grant leaves no trace.
+        if crate::federation::admission::envelope_dimension(&row.attestation_envelope)
+            == Some(crate::federation::consent_grammar::GRANT_DIMENSION)
+        {
+            if let Err(reason) = crate::federation::consent_grammar::validate_grant_admission(
+                &row.attestation_envelope,
+            ) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "consent grant rejected by the closed grammar (#510): {reason}"
+                )));
+            }
+        }
+
         // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
         // federate FEDERATION-APPLY re-check (point ii). A federation-tier row
         // keyed on a community is a federation
@@ -4671,6 +4695,46 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             return Ok(false);
         }
         let now = scrub_timestamp;
+        row.original_content_hash = original_content_hash_hex.to_owned();
+        row.scrub_signature_classical = scrub_signature_classical.to_owned();
+        row.scrub_signature_pqc = scrub_signature_pqc.map(|s| s.to_owned());
+        row.scrub_key_id = scrub_key_id.to_owned();
+        row.scrub_timestamp = now;
+        row.pqc_completed_at = scrub_signature_pqc.map(|_| now);
+        row.tier = attestation_tier::FEDERATION.to_string();
+        row.promoted_at = Some(now);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        Ok(true)
+    }
+
+    async fn promote_attestation_transformed(
+        &self,
+        attestation_id: &str,
+        envelope_json: &serde_json::Value,
+        scrub_signature_classical: &str,
+        scrub_signature_pqc: Option<&str>,
+        original_content_hash_hex: &str,
+        scrub_key_id: &str,
+        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::types::attestation_tier;
+        let mut state = self.state.lock().expect("memory backend lock");
+        let row = state
+            .federation_attestations
+            .iter_mut()
+            .find(|a| a.attestation_id == attestation_id)
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "federation_attestations row {attestation_id} does not exist"
+                ))
+            })?;
+        if row.tier == attestation_tier::FEDERATION {
+            return Ok(false);
+        }
+        let now = scrub_timestamp;
+        row.attestation_envelope = envelope_json.clone();
         row.original_content_hash = original_content_hash_hex.to_owned();
         row.scrub_signature_classical = scrub_signature_classical.to_owned();
         row.scrub_signature_pqc = scrub_signature_pqc.map(|s| s.to_owned());
@@ -8325,8 +8389,14 @@ mod tests {
     /// the sole `subject_key_ids` entry.
     fn fix_consent_grant(id: &str, node: &str, peer: &str) -> Attestation {
         let mut g = fix_attestation(id, node, node, node);
+        // v21.3.0 (CIRISPersist#510 P1) — a `consent:replication:v1` row
+        // now admits through the closed-grammar gate; this E7 fixture
+        // needs a minimally-valid `payload` (its content is irrelevant to
+        // this test, which exercises the peer-set fold, not grammar
+        // semantics).
         g.attestation_envelope = serde_json::json!({
             "dimension": crate::federation::consent_peer_set::DIMENSION,
+            "payload": {"grants": "replication", "attestation_prefixes": ["e7-fixture:"]},
         });
         g.subject_key_ids = vec![peer.to_string()];
         resign_fix(&mut g); // envelope changed → re-sign (CC 5.3.2.4.3.1)
@@ -8385,6 +8455,94 @@ mod tests {
             vec!["peer-e7-2".to_string()],
             "peer-1's consent was withdrawn — it must disappear; peer-2 (untouched) survives"
         );
+    }
+
+    /// v21.3.0 (CIRISPersist#510 P1) — the memory-backend leg of the
+    /// closed consent-grammar admission gate (see
+    /// `sqlite::tests::consent_grammar_admission_rejections_sqlite_510` /
+    /// `postgres::tests::consent_grammar_admission_rejections_postgres_510`):
+    /// an unknown restriction op, an unrecognized top-level payload
+    /// field, and a non-consentable `kinds` entry each reject the WHOLE
+    /// grant at `put_attestation`. Memory duplicates its own fixture
+    /// helpers (`fix_key`/`fix_attestation`/`resign_fix`) rather than
+    /// sharing `consent_grammar::test_support` (that module is
+    /// feature-gated on sqlite/postgres so a no-backend build compiles
+    /// cleanly — the same reason `consent_peer_set_folds_revocation_502e7`
+    /// above doesn't share `consent_peer_set::test_support` either).
+    #[tokio::test]
+    async fn consent_grant_admission_rejects_closed_grammar_violations_510() {
+        let backend = MemoryBackend::new();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("node-510m", "node", "node-510m"),
+            })
+            .await
+            .unwrap();
+
+        fn bad_grant(id: &str, node: &str, payload: serde_json::Value) -> Attestation {
+            let mut g = fix_attestation(id, node, node, node);
+            g.attestation_envelope = serde_json::json!({
+                "dimension": crate::federation::consent_peer_set::DIMENSION,
+                "payload": payload,
+            });
+            g.subject_key_ids = vec![format!("peer-of-{node}")];
+            resign_fix(&mut g); // envelope changed → re-sign (CC 5.3.2.4.3.1)
+            g
+        }
+
+        fn expect_510_reject(result: &Result<(), crate::federation::Error>, what: &str) {
+            match result {
+                Err(crate::federation::Error::InvalidArgument(msg)) => {
+                    assert!(
+                        msg.contains("#510"),
+                        "{what} must reject with a #510-tagged reason, got: {msg}"
+                    );
+                }
+                other => panic!("{what} must reject as InvalidArgument, got: {other:?}"),
+            }
+        }
+
+        let bad1 = bad_grant(
+            "510m-restr",
+            "node-510m",
+            serde_json::json!({
+                "grants": "replication",
+                "attestation_prefixes": ["trace:"],
+                "restrictions": [{"op": "quantum_redaction"}],
+            }),
+        );
+        let err1 = backend
+            .put_attestation(SignedAttestation { attestation: bad1 })
+            .await;
+        expect_510_reject(&err1, "an unknown restriction op");
+
+        let bad2 = bad_grant(
+            "510m-field",
+            "node-510m",
+            serde_json::json!({
+                "grants": "replication",
+                "attestation_prefixes": ["trace:"],
+                "unexpected_field_510": true,
+            }),
+        );
+        let err2 = backend
+            .put_attestation(SignedAttestation { attestation: bad2 })
+            .await;
+        expect_510_reject(&err2, "an unknown top-level payload field");
+
+        let bad3 = bad_grant(
+            "510m-kind",
+            "node-510m",
+            serde_json::json!({
+                "grants": "replication",
+                "attestation_prefixes": ["trace:"],
+                "kinds": ["Key"],
+            }),
+        );
+        let err3 = backend
+            .put_attestation(SignedAttestation { attestation: bad3 })
+            .await;
+        expect_510_reject(&err3, "a non-consentable kind");
     }
 
     /// Build a memory-backend `delegates_to` carrying `scope`.

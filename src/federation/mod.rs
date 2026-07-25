@@ -2881,6 +2881,57 @@ pub trait FederationDirectory: Send + Sync {
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, Error>;
 
+    /// v21.3.0 (CIRISPersist#510 P1) — the STRIP-then-promote write-back:
+    /// same contract as [`Self::promote_attestation`] (local→federation,
+    /// idempotent, `Err` if absent), except the caller has ALREADY applied
+    /// a covering grant's `StripField` restriction(s) to a CLONE of the
+    /// row's envelope and hybrid-signed THAT stripped canonical — so this
+    /// method additionally overwrites the `attestation_envelope` column
+    /// with `envelope_json` (the stripped shape) in the SAME write as the
+    /// tier flip. `original_content_hash_hex` is the hash of the STRIPPED
+    /// canonical (it is the content actually signed/shipped), not the
+    /// original.
+    ///
+    /// [`crate::Engine::promote_consented_backlog`] calls this INSTEAD of
+    /// [`Self::promote_attestation`] only when the restriction union for a
+    /// row contains at least one `StripField`; with no `StripField`
+    /// restrictions the byte-identical-wire property is preserved by
+    /// continuing to use `promote_attestation` unchanged. The row's full
+    /// PRE-strip form remains queryable via the `trace_events` projection
+    /// (decomposed at ingest/emit time, before any strip is applied), so a
+    /// downstream strip never destroys the substrate's own copy of the
+    /// original content — only the federation-tier envelope this method
+    /// writes back is narrowed.
+    ///
+    /// Default `Unsupported` (the same posture as the #509 FLOOR's three
+    /// new directory methods — this is an engine-internal primitive, not
+    /// wired into the FFI directory capsule); sqlite/postgres/memory
+    /// override.
+    #[allow(clippy::too_many_arguments)]
+    async fn promote_attestation_transformed(
+        &self,
+        attestation_id: &str,
+        envelope_json: &serde_json::Value,
+        scrub_signature_classical: &str,
+        scrub_signature_pqc: Option<&str>,
+        original_content_hash_hex: &str,
+        scrub_key_id: &str,
+        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, Error> {
+        let _ = (
+            attestation_id,
+            envelope_json,
+            scrub_signature_classical,
+            scrub_signature_pqc,
+            original_content_hash_hex,
+            scrub_key_id,
+            scrub_timestamp,
+        );
+        Err(Error::Unsupported {
+            method: "promote_attestation_transformed",
+        })
+    }
+
     // ── Hybrid-pending sweep (CIRISPersist#11, v0.3.2) ─────────────
     //
     // Per V004's schema header §"Phase transitions":
