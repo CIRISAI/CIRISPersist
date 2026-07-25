@@ -4288,6 +4288,213 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .collect())
     }
 
+    // ─── v21.0.0 (CIRISPersist#504 FLOOR) — bulk signed-since reads for the
+    //     5 E4 keyless-declaration planes (edge advertise/serve bridge).
+    //     Signed-only: a record is included only if its key is present in
+    //     the corresponding `*_authority_sigs` side-map — the memory mirror
+    //     of the sqlite/pg `authority_key_id IS NOT NULL AND <> ''` filter.
+    //     `put_family_local` genesis-bake rows never populate the side-map,
+    //     so they are excluded here exactly as they are on the SQL backends.
+
+    async fn list_signed_families_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedFamily>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_families
+            .values()
+            .filter(|f| since.is_none_or(|s| f.founded_at > s))
+            .filter_map(|f| {
+                let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
+                    .federation_family_authority_sigs
+                    .get(&f.family_key_id)?
+                    .clone();
+                Some(crate::federation::SignedFamily {
+                    family: f.clone(),
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.family
+                .founded_at
+                .cmp(&b.family.founded_at)
+                .then_with(|| a.family.family_key_id.cmp(&b.family.family_key_id))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_signed_communities_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedCommunity>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_communities
+            .values()
+            .filter(|c| since.is_none_or(|s| c.founded_at > s))
+            .filter_map(|c| {
+                let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
+                    .federation_community_authority_sigs
+                    .get(&c.community_key_id)?
+                    .clone();
+                Some(crate::federation::SignedCommunity {
+                    community: c.clone(),
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.community
+                .founded_at
+                .cmp(&b.community.founded_at)
+                .then_with(|| {
+                    a.community
+                        .community_key_id
+                        .cmp(&b.community.community_key_id)
+                })
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_signed_location_proofs_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedLocationProof>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_location_proofs
+            .values()
+            .filter(|p| since.is_none_or(|s| p.asserted_at > s))
+            .filter_map(|p| {
+                let key = (p.subject_key_id.clone(), p.asserted_at);
+                let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
+                    .federation_location_proof_authority_sigs
+                    .get(&key)?
+                    .clone();
+                Some(crate::federation::SignedLocationProof {
+                    location_proof: p.clone(),
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.location_proof
+                .asserted_at
+                .cmp(&b.location_proof.asserted_at)
+                .then_with(|| {
+                    a.location_proof
+                        .subject_key_id
+                        .cmp(&b.location_proof.subject_key_id)
+                })
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_signed_family_membership_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedFamilyMembershipRevocation>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_family_membership_revocations
+            .values()
+            .filter(|r| since.is_none_or(|s| r.removed_at > s))
+            .filter_map(|r| {
+                let key = (r.family_key_id.clone(), r.removed_identity_key_id.clone());
+                let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
+                    .federation_family_membership_revocation_authority_sigs
+                    .get(&key)?
+                    .clone();
+                Some(crate::federation::SignedFamilyMembershipRevocation {
+                    family_membership_revocation: r.clone(),
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.family_membership_revocation
+                .removed_at
+                .cmp(&b.family_membership_revocation.removed_at)
+                .then_with(|| {
+                    a.family_membership_revocation
+                        .family_key_id
+                        .cmp(&b.family_membership_revocation.family_key_id)
+                })
+                .then_with(|| {
+                    a.family_membership_revocation
+                        .removed_identity_key_id
+                        .cmp(&b.family_membership_revocation.removed_identity_key_id)
+                })
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn list_signed_community_membership_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedCommunityMembershipRevocation>, crate::federation::Error>
+    {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_community_membership_revocations
+            .values()
+            .filter(|r| since.is_none_or(|s| r.removed_at > s))
+            .filter_map(|r| {
+                let key = (
+                    r.community_key_id.clone(),
+                    r.removed_identity_key_id.clone(),
+                );
+                let (authority_key_id, scrub_signature_classical, scrub_signature_pqc) = state
+                    .federation_community_membership_revocation_authority_sigs
+                    .get(&key)?
+                    .clone();
+                Some(crate::federation::SignedCommunityMembershipRevocation {
+                    community_membership_revocation: r.clone(),
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.community_membership_revocation
+                .removed_at
+                .cmp(&b.community_membership_revocation.removed_at)
+                .then_with(|| {
+                    a.community_membership_revocation
+                        .community_key_id
+                        .cmp(&b.community_membership_revocation.community_key_id)
+                })
+                .then_with(|| {
+                    a.community_membership_revocation
+                        .removed_identity_key_id
+                        .cmp(&b.community_membership_revocation.removed_identity_key_id)
+                })
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,

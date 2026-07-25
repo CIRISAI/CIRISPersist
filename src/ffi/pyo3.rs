@@ -5868,6 +5868,265 @@ impl PyEngine {
         })
     }
 
+    /// v21.0.0 (CIRISPersist#504 FLOOR, edge advertise/serve bridge) —
+    /// bulk-list the full `SignedFamily` wrappers (row + the V110 authority
+    /// signature `put_family`'s E4 gate verified at admission) since a
+    /// cursor, as a JSON array, ordered `(founded_at ASC, family_key_id
+    /// ASC)`. **Signed rows only** — a `put_family_local` genesis-bake row
+    /// (legitimately unsigned) is never emitted; serving one would hand the
+    /// edge responder empty signature bytes.
+    #[pyo3(signature = (since_rfc3339, limit))]
+    fn list_signed_families_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                    .with_timezone(&chrono::Utc),
+            ),
+            None => None,
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .list_signed_families_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "signed family list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
+    /// `SignedCommunity` wrappers since a cursor, as a JSON array. Same
+    /// contract as
+    /// [`list_signed_families_since`](Self::list_signed_families_since);
+    /// ordered `(founded_at ASC, community_key_id ASC)`.
+    #[pyo3(signature = (since_rfc3339, limit))]
+    fn list_signed_communities_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                    .with_timezone(&chrono::Utc),
+            ),
+            None => None,
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .list_signed_communities_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "signed community list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
+    /// `SignedLocationProof` wrappers since a cursor, as a JSON array. Same
+    /// contract as
+    /// [`list_signed_families_since`](Self::list_signed_families_since);
+    /// ordered `(asserted_at ASC, subject_key_id ASC)`.
+    #[pyo3(signature = (since_rfc3339, limit))]
+    fn list_signed_location_proofs_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                    .with_timezone(&chrono::Utc),
+            ),
+            None => None,
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .list_signed_location_proofs_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "signed location_proof list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
+    /// `SignedFamilyMembershipRevocation` wrappers since a cursor, as a JSON
+    /// array. Same contract as
+    /// [`list_signed_families_since`](Self::list_signed_families_since);
+    /// ordered `(removed_at ASC, family_key_id ASC,
+    /// removed_identity_key_id ASC)`.
+    #[pyo3(signature = (since_rfc3339, limit))]
+    fn list_signed_family_membership_revocations_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                    .with_timezone(&chrono::Utc),
+            ),
+            None => None,
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .list_signed_family_membership_revocations_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "signed family_membership_revocation list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
+    /// v21.0.0 (CIRISPersist#504 FLOOR) — bulk-list the full
+    /// `SignedCommunityMembershipRevocation` wrappers since a cursor, as a
+    /// JSON array. Same contract as
+    /// [`list_signed_families_since`](Self::list_signed_families_since);
+    /// ordered `(removed_at ASC, community_key_id ASC,
+    /// removed_identity_key_id ASC)`.
+    #[pyo3(signature = (since_rfc3339, limit))]
+    fn list_signed_community_membership_revocations_since(
+        &self,
+        py: Python<'_>,
+        since_rfc3339: Option<&str>,
+        limit: u32,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let since = match since_rfc3339.filter(|s| !s.is_empty()) {
+            Some(s) => Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map_err(|e| PyValueError::new_err(format!("since_rfc3339 parse: {e}")))?
+                    .with_timezone(&chrono::Utc),
+            ),
+            None => None,
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                runtime.block_on(async move {
+                    use crate::federation::FederationDirectory;
+                    macro_rules! dispatch {
+                        ($backend:expr) => {{
+                            let b = $backend.clone();
+                            let rows = b
+                                .list_signed_community_membership_revocations_since(since, limit)
+                                .await
+                                .map_err(federation_err_to_py)?;
+                            serde_json::to_string(&rows).map_err(|e| {
+                                PyRuntimeError::new_err(format!(
+                                    "signed community_membership_revocation list JSON encode: {e}"
+                                ))
+                            })
+                        }};
+                    }
+                    match &self.backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(pg) => dispatch!(pg),
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(sq) => dispatch!(sq),
+                    }
+                })
+            })
+        })
+    }
+
     /// Federation directory: attach the cold-path PQC signature to a
     /// hybrid-pending federation_keys row. See docs/FEDERATION_DIRECTORY.md
     /// §"Trust contract" for the writer contract — this is step 4
