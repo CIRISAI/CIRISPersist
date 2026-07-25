@@ -199,6 +199,155 @@ pub(crate) mod test_support {
             "peer-1's consent was withdrawn — it must disappear; peer-2 (untouched) survives"
         );
     }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the shared, backend-agnostic
+    /// parity witness for the three new #509 `FederationDirectory`
+    /// methods (`list_live_consent_grants_by` /
+    /// `list_local_tier_attestations` / `set_attestation_cohort_scope`),
+    /// run by the sqlite / postgres test suites against `&dyn
+    /// FederationDirectory` — the same discipline as
+    /// [`exercise_consent_peer_set_fold`], this module's sibling witness
+    /// for the E7 projection these three methods build on.
+    ///
+    /// `list_local_tier_attestations` is intentionally NOT scoped by
+    /// attester (the sweep walks a node's ENTIRE local backlog), so on a
+    /// shared postgres test database that may already carry other tests'
+    /// leftover `local`-tier rows, this witness verifies the CURSOR
+    /// CONTRACT (ascending order, no duplicates, eventual termination,
+    /// both our rows found) rather than asserting the page's exact
+    /// contents — the same robustness discipline a real multi-tenant
+    /// table would demand.
+    pub(crate) async fn exercise_509_backend_methods(dir: &dyn FederationDirectory, suffix: &str) {
+        use crate::federation::types::cohort_scope;
+        use crate::federation::types::LocalAttestationInput;
+
+        let node = format!("node-509b-{suffix}");
+        let peer = format!("peer-509b-{suffix}");
+        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &node).await;
+
+        // ── list_local_tier_attestations: the cursor contract ──
+        let local_input = || LocalAttestationInput {
+            attestation_id: None,
+            attesting_key_id: node.clone(),
+            attested_key_id: None,
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: None,
+            expires_at: None,
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({ "dimension": "misc_509b:v1" }),
+            )
+            .unwrap(),
+            subject_key_ids: vec![],
+            cohort_scope: cohort_scope::SELF.to_owned(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        };
+        let local1 = dir
+            .attestation_insert_local(local_input())
+            .await
+            .expect("insert local1");
+        let local2 = dir
+            .attestation_insert_local(local_input())
+            .await
+            .expect("insert local2");
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..200 {
+            let page = dir
+                .list_local_tier_attestations(cursor.as_deref(), 50)
+                .await
+                .expect("list_local_tier_attestations page");
+            if page.is_empty() {
+                break;
+            }
+            for row in &page {
+                assert_eq!(
+                    row.tier,
+                    attestation_tier::LOCAL,
+                    "the page source must never emit a non-local row"
+                );
+                if let Some(last) = seen.last() {
+                    assert!(
+                        row.attestation_id.as_str() > last.as_str(),
+                        "ascending, strictly-after-cursor order: {last} then {}",
+                        row.attestation_id
+                    );
+                }
+                seen.push(row.attestation_id.clone());
+            }
+            cursor = page.last().map(|r| r.attestation_id.clone());
+        }
+        assert!(seen.contains(&local1), "local1 must appear in the walk");
+        assert!(seen.contains(&local2), "local2 must appear in the walk");
+        let mut dedup = seen.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(
+            dedup.len(),
+            seen.len(),
+            "no attestation_id repeats across pages"
+        );
+
+        // ── set_attestation_cohort_scope: write-back + validation ──
+        dir.set_attestation_cohort_scope(&local1, cohort_scope::FEDERATION)
+            .await
+            .expect("cohort_scope write-back");
+        let after = dir.get_attestation(&local1).await.unwrap().expect("row");
+        assert_eq!(after.cohort_scope, cohort_scope::FEDERATION);
+
+        let invalid = dir
+            .set_attestation_cohort_scope(&local1, "not-a-real-scope")
+            .await;
+        assert!(
+            matches!(invalid, Err(crate::federation::Error::InvalidArgument(_))),
+            "an out-of-closed-set cohort_scope is rejected: {invalid:?}"
+        );
+
+        let missing = dir
+            .set_attestation_cohort_scope(
+                "00000000-0000-0000-0000-000000000000",
+                cohort_scope::FEDERATION,
+            )
+            .await;
+        assert!(
+            matches!(missing, Err(crate::federation::Error::InvalidArgument(_))),
+            "a nonexistent attestation_id is rejected: {missing:?}"
+        );
+
+        // ── list_live_consent_grants_by: grant → live, withdraw → gone ──
+        let grant_id = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(SignedAttestation {
+            attestation: grant(&grant_id, &node, &peer),
+        })
+        .await
+        .expect("grant admits");
+
+        let live = dir
+            .list_live_consent_grants_by(&node)
+            .await
+            .expect("live grants");
+        assert!(
+            live.iter().any(|a| a.attestation_id == grant_id),
+            "the live grant must be visible"
+        );
+
+        let withdraws_id = uuid::Uuid::new_v4().to_string();
+        dir.put_attestation(SignedAttestation {
+            attestation: withdraws(&withdraws_id, &node, &grant_id),
+        })
+        .await
+        .expect("withdraws admits");
+
+        let live_after = dir
+            .list_live_consent_grants_by(&node)
+            .await
+            .expect("live grants after withdraw");
+        assert!(
+            !live_after.iter().any(|a| a.attestation_id == grant_id),
+            "a withdrawn grant must no longer be LIVE"
+        );
+    }
 }
 
 #[cfg(test)]

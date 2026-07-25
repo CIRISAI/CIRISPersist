@@ -2410,6 +2410,91 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(peers)
     }
 
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — `node_key_id`'s LIVE
+    /// `consent:replication:v1` self-grants: filtered by attester +
+    /// dimension + presence in the `consent_peer_set` mirror (by
+    /// `source_attestation_id`).
+    async fn list_live_consent_grants_by(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let live_ids: std::collections::HashSet<&str> = state
+            .consent_peer_set
+            .iter()
+            .map(|r| r.source_attestation_id.as_str())
+            .collect();
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                a.attesting_key_id == node_key_id
+                    && crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                        == Some(crate::federation::consent_peer_set::DIMENSION)
+                    && live_ids.contains(a.attestation_id.as_str())
+            })
+            .cloned()
+            .collect();
+        rows.sort_by_key(|a| std::cmp::Reverse(a.asserted_at));
+        Ok(rows)
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the `promote_consented_backlog`
+    /// sweep's page source: ascending-`attestation_id` keyset cursor over
+    /// `local`-tier rows.
+    async fn list_local_tier_attestations(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                a.tier == crate::federation::types::attestation_tier::LOCAL
+                    && match after_attestation_id {
+                        Some(after) => a.attestation_id.as_str() > after,
+                        None => true,
+                    }
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the promote-on-consent
+    /// write-back: validate against the closed cohort_scope set, stamp
+    /// it, and recompute `persist_row_hash`.
+    async fn set_attestation_cohort_scope(
+        &self,
+        attestation_id: &str,
+        cohort_scope: &str,
+    ) -> Result<(), crate::federation::Error> {
+        if !crate::federation::types::cohort_scope::is_valid(cohort_scope) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "set_attestation_cohort_scope: invalid cohort_scope {cohort_scope:?}"
+            )));
+        }
+        let mut state = self.state.lock().expect("memory backend lock");
+        let row = state
+            .federation_attestations
+            .iter_mut()
+            .find(|a| a.attestation_id == attestation_id)
+            .ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "federation_attestations row {attestation_id} does not exist"
+                ))
+            })?;
+        row.cohort_scope = cohort_scope.to_owned();
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        Ok(())
+    }
+
     async fn attestations_binding_content(
         &self,
         content_sha256: &str,

@@ -2452,6 +2452,164 @@ impl Engine {
         }
     }
 
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — "the payload follows the
+    /// consent edge": promote every `local`-tier attestation whose
+    /// envelope dimension is covered by a LIVE self-authored
+    /// `consent:replication:v1` grant to `federation` tier (via
+    /// [`Self::attestation_promote`]) and stamp its `cohort_scope` to
+    /// [`crate::federation::types::cohort_scope::FEDERATION`].
+    ///
+    /// # Two chokepoints, one idempotent sweep
+    ///
+    /// This ONE primitive fires at both ends of the #509 design: (c)
+    /// right after THIS node admits a self-authored consent grant through
+    /// the emit funnel ([`Self::emit_attestation_assemble`]), and (a)
+    /// after every ingest batch (the pyo3 `receive_and_persist` wrapper).
+    /// Either chokepoint converges the backlog; whichever ran most
+    /// recently makes the other a no-op at the next call. A REPLICATED
+    /// third-party grant arriving via raw `put_attestation` deliberately
+    /// does NOT fire this sweep — that consent is not OURS to act on;
+    /// only this node's own still-live, self-authored grants ever widen
+    /// its own local backlog.
+    ///
+    /// # Self-limiting
+    ///
+    /// A promoted row leaves the `local` tier (the sweep's own page
+    /// source excludes it thereafter), so re-running with no new
+    /// grants/backlog converges to a zero [`crate::federation::ConsentSweepReport`]
+    /// — safe to call unconditionally at either chokepoint.
+    ///
+    /// # Method
+    ///
+    /// 1. Resolve this node's own derived federation key_id
+    ///    ([`Self::local_derived_key_id`]).
+    /// 2. [`crate::federation::FederationDirectory::list_live_consent_grants_by`]
+    ///    — every LIVE grant this node authored about itself (E7's
+    ///    `consent_peer_set` projection already folded revocation; this
+    ///    sweep never re-derives that fold). Union every grant's
+    ///    [`crate::federation::consent_grammar::grant_attestation_prefixes`]
+    ///    into one prefix set. Empty ⇒ zero report, no page walk.
+    /// 3. Cursor-page
+    ///    [`crate::federation::FederationDirectory::list_local_tier_attestations`]
+    ///    (512 rows/page, ascending `attestation_id`); for each row whose
+    ///    envelope dimension is
+    ///    [`crate::federation::consent_grammar::covers`]ed by the prefix
+    ///    set, call [`Self::attestation_promote`], then
+    ///    [`crate::federation::FederationDirectory::set_attestation_cohort_scope`]
+    ///    it to `federation`. A promote `Err` on ONE row is
+    ///    `tracing::warn!`'d and counted in `skipped` — it does NOT abort
+    ///    the sweep (the same honest-accounting posture as the #473 mint
+    ///    skip). The cursor advances past a page regardless of any skips
+    ///    within it, so one poisoned row cannot wedge the walk.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn promote_consented_backlog(
+        &self,
+    ) -> Result<crate::federation::ConsentSweepReport, crate::federation::Error> {
+        use crate::federation::{consent_grammar, types::cohort_scope, Error, FederationDirectory};
+
+        let mut report = crate::federation::ConsentSweepReport::default();
+
+        let self_key = self
+            .local_derived_key_id()
+            .await
+            .map_err(|e| Error::Backend(format!("promote_consented_backlog derive key_id: {e}")))?;
+
+        let grants = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.list_live_consent_grants_by(&self_key).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.list_live_consent_grants_by(&self_key).await?,
+        };
+        let mut prefix_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for grant in &grants {
+            prefix_set.extend(consent_grammar::grant_attestation_prefixes(
+                &grant.attestation_envelope,
+            ));
+        }
+        if prefix_set.is_empty() {
+            return Ok(report);
+        }
+        let prefixes: Vec<String> = prefix_set.into_iter().collect();
+
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    b.list_local_tier_attestations(cursor.as_deref(), 512)
+                        .await?
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    b.list_local_tier_attestations(cursor.as_deref(), 512)
+                        .await?
+                }
+            };
+            if page.is_empty() {
+                break;
+            }
+            // Advance the cursor past this page regardless of any
+            // per-row skip below — a poisoned row must not wedge the walk.
+            cursor = page.last().map(|r| r.attestation_id.clone());
+
+            for row in &page {
+                let Some(dimension) =
+                    crate::federation::admission::envelope_dimension(&row.attestation_envelope)
+                else {
+                    continue;
+                };
+                if !consent_grammar::covers(&prefixes, dimension) {
+                    continue;
+                }
+                match self.attestation_promote(&row.attestation_id).await {
+                    Ok(true) => {
+                        let scope_write = match &self.backend {
+                            #[cfg(feature = "postgres")]
+                            BackendDispatch::Postgres(b) => {
+                                b.set_attestation_cohort_scope(
+                                    &row.attestation_id,
+                                    cohort_scope::FEDERATION,
+                                )
+                                .await
+                            }
+                            #[cfg(feature = "sqlite")]
+                            BackendDispatch::Sqlite(b) => {
+                                b.set_attestation_cohort_scope(
+                                    &row.attestation_id,
+                                    cohort_scope::FEDERATION,
+                                )
+                                .await
+                            }
+                        };
+                        if let Err(e) = scope_write {
+                            tracing::warn!(
+                                attestation_id = %row.attestation_id,
+                                error = %e,
+                                "promote_consented_backlog: cohort_scope write-back failed \
+                                 after a successful promote (row is federation-tier; \
+                                 cohort_scope may be stale)"
+                            );
+                        }
+                        report.promoted += 1;
+                    }
+                    // Already federation-tier — the `tier = 'local'` page
+                    // source structurally excludes this, but stay
+                    // idempotent regardless.
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            attestation_id = %row.attestation_id,
+                            error = %e,
+                            "promote_consented_backlog: attestation_promote failed; skipping"
+                        );
+                        report.skipped += 1;
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
     /// v9.3.0 (CIRISPersist#248) — THE high-level emit primitive: produce
     /// ONE signed, **federation-tier** CEG attestation.
     ///
@@ -2646,10 +2804,55 @@ impl Engine {
             promoted_at: None,
         };
         let attestation_id = row.attestation_id.clone();
+        // v21.2.0 (CIRISPersist#509 FLOOR) — chokepoint (c): capture what
+        // the promote-on-consent sweep needs to know BEFORE `row` moves
+        // into `put_attestation` below.
+        let is_grant_dimension =
+            crate::federation::admission::envelope_dimension(&row.attestation_envelope)
+                == Some(crate::federation::consent_grammar::GRANT_DIMENSION);
+        let attester_key_id = row.attesting_key_id.clone();
 
         self.federation_directory()
             .put_attestation(crate::federation::SignedAttestation { attestation: row })
             .await?;
+
+        // v21.2.0 (CIRISPersist#509 FLOOR) — "the payload follows the
+        // consent edge": a newly-admitted SELF-authored
+        // `consent:replication:v1` grant fires the promote-on-consent
+        // sweep right here (chokepoint (c) of 2; (a) is every ingest
+        // batch — see `Self::promote_consented_backlog`). Gated on BOTH
+        // the dimension AND `attester_key_id == this node's own derived
+        // key_id`: a `consent:replication:v1` row this call merely
+        // RELAYED for a distinct attester (e.g. `emit_attestation` signing
+        // on behalf of a different identity than this Engine's own) is
+        // NOT our own consent and must never trigger our sweep. A
+        // `local_derived_key_id` lookup failure is treated the same as a
+        // mismatch — conservatively skip rather than risk sweeping under
+        // the wrong identity. Replicated third-party grants arriving via
+        // raw `put_attestation` (bypassing this assemble path entirely)
+        // never reach here at all — consistent with the same posture.
+        //
+        // NEVER fail the emit over a sweep hiccup: the grant is already
+        // durably admitted (the `put_attestation` above succeeded), and
+        // promotion self-heals at the very next chokepoint. Mirrors the
+        // #473 mint's skip-and-log posture; it matters here because
+        // CIRISServer's consent route is idempotent-no-op on retry, so a
+        // hard error surfaced from this best-effort step would strand
+        // the backlog with no way for the caller to force a retry.
+        if is_grant_dimension {
+            match self.local_derived_key_id().await {
+                Ok(derived) if derived == attester_key_id => {
+                    if let Err(e) = self.promote_consented_backlog().await {
+                        tracing::warn!(
+                            error = %e,
+                            "emit_attestation_assemble: consent-sweep chokepoint (c) failed; \
+                             backlog self-heals at the next chokepoint"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
         Ok(attestation_id)
     }
 
@@ -9587,6 +9790,275 @@ mod tests {
             after.scrub_signature_classical
         );
         assert_eq!(after2.promoted_at, after.promoted_at);
+    }
+
+    // ── v21.2.0 (CIRISPersist#509 FLOOR) — "the payload follows the
+    //    consent edge": promote_consented_backlog + its two chokepoints.
+
+    /// A local-tier `trace:complete:v1` `LocalAttestationInput`, shaped
+    /// like `ingest::build_trace_attestation_input` (attestation_type
+    /// `scores`, self-subject, `cohort_scope = self`, an inline (empty
+    /// object) `trace` — the trace-dimension admission gate only checks
+    /// shape, not content).
+    #[cfg(feature = "sqlite")]
+    fn build_509_trace_input(
+        derived: &str,
+        trace_id: &str,
+    ) -> crate::federation::types::LocalAttestationInput {
+        crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
+            attesting_key_id: derived.to_owned(),
+            attested_key_id: None,
+            attestation_type: crate::federation::types::attestation_type::SCORES.to_owned(),
+            weight: None,
+            expires_at: None,
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({
+                    "dimension": "trace:complete:v1",
+                    "trace_id": trace_id,
+                    "agent_id_hash": "agent-hash-509",
+                    "trace": {},
+                }),
+            )
+            .unwrap(),
+            subject_key_ids: vec![derived.to_owned()],
+            cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        }
+    }
+
+    /// Emit a self-authored `consent:replication:v1` grant naming `peer`
+    /// as the consented recipient and `prefixes` as the covered
+    /// `attestation_prefixes`, via `emit_attestation_self` (so it lands
+    /// federation-tier, hybrid-signed, and drives the E7
+    /// `consent_peer_set` projection exactly like a real node would).
+    #[cfg(feature = "sqlite")]
+    async fn emit_509_grant(engine: &Engine, peer: &str, prefixes: &[&str]) -> String {
+        let envelope = crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+            "dimension": crate::federation::consent_peer_set::DIMENSION,
+            "subject_key_ids": [peer],
+            "payload": {"grants": "replication", "attestation_prefixes": prefixes},
+            "subject_kind": "consent_replication",
+        }))
+        .unwrap();
+        let mut input = crate::federation::EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::SCORES,
+            envelope,
+        );
+        input.subject_key_ids = vec![peer.to_owned()];
+        engine
+            .emit_attestation_self(input)
+            .await
+            .expect("509 grant emits")
+    }
+
+    /// Emit a self-authored `withdraws` referencing `target_id` — the E7
+    /// revocation fold's trigger shape (`references_attestation_id` +
+    /// rule-1 producer self-revocation, since the same engine authored
+    /// both the target and the withdraws).
+    #[cfg(feature = "sqlite")]
+    async fn emit_509_withdraws(engine: &Engine, target_id: &str) -> String {
+        let envelope = crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+            "references_attestation_id": target_id,
+            "withdrawal_reason": "509 test",
+        }))
+        .unwrap();
+        let input = crate::federation::EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::WITHDRAWS,
+            envelope,
+        );
+        engine
+            .emit_attestation_self(input)
+            .await
+            .expect("509 withdraws emits")
+    }
+
+    /// The (c) chokepoint: emitting a self-authored grant whose
+    /// `attestation_prefixes` covers an existing local-tier trace row
+    /// promotes it to federation tier — WITHOUT an explicit
+    /// `promote_consented_backlog` call. The row's `cohort_scope` flips
+    /// to `federation` and it carries a real hybrid scrub. A subsequent
+    /// explicit sweep is idempotent (nothing left to promote).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn consent_sweep_promotes_covered_backlog_509() {
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("node-509a");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "node-509a"))
+            .await
+            .expect("seed key");
+
+        let trace_id = sq
+            .attestation_insert_local(build_509_trace_input(&derived, "trace-509a-1"))
+            .await
+            .expect("insert local trace");
+        let before = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(
+            before.tier,
+            crate::federation::types::attestation_tier::LOCAL
+        );
+
+        // (c) hook: emitting the self-authored grant fires the sweep with
+        // no explicit call.
+        let _grant_id = emit_509_grant(&engine, "peer-509a", &["trace:"]).await;
+
+        let after = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(
+            after.tier,
+            crate::federation::types::attestation_tier::FEDERATION,
+            "the (c) hook promotes the covered local backlog during the grant's own emit"
+        );
+        assert_eq!(
+            after.cohort_scope,
+            crate::federation::types::cohort_scope::FEDERATION,
+            "promotion also stamps cohort_scope to federation"
+        );
+        assert!(!after.scrub_signature_classical.is_empty());
+        assert!(after
+            .scrub_signature_pqc
+            .as_deref()
+            .is_some_and(|s| !s.is_empty()));
+
+        // Idempotent: an explicit sweep now finds nothing left to promote.
+        let report = engine.promote_consented_backlog().await.expect("sweep");
+        assert_eq!(report.promoted, 0);
+        assert_eq!(report.skipped, 0);
+    }
+
+    /// A grant whose `attestation_prefixes` cover an UNRELATED dimension
+    /// (`capacity:`) must not promote a `trace:complete:v1` backlog row —
+    /// neither via the (c) hook during the grant's own emit, nor via an
+    /// explicit sweep afterward.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn consent_sweep_ignores_uncovered_dimension_509() {
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("node-509b");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "node-509b"))
+            .await
+            .expect("seed key");
+
+        let trace_id = sq
+            .attestation_insert_local(build_509_trace_input(&derived, "trace-509b-1"))
+            .await
+            .expect("insert local trace");
+
+        let _grant_id = emit_509_grant(&engine, "peer-509b", &["capacity:"]).await;
+
+        let after = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(
+            after.tier,
+            crate::federation::types::attestation_tier::LOCAL,
+            "a grant covering an unrelated prefix must not promote the trace backlog"
+        );
+
+        let report = engine.promote_consented_backlog().await.expect("sweep");
+        assert_eq!(report.promoted, 0);
+        assert_eq!(report.skipped, 0);
+    }
+
+    /// Withdrawing a grant folds the E7 `consent_peer_set` projection
+    /// (the grant is no longer LIVE), so a NEW local-tier row inserted
+    /// after the withdraws does not get promoted by a subsequent sweep —
+    /// revoked consent no longer promotes.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn consent_sweep_stops_after_withdraw_509() {
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("node-509c");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "node-509c"))
+            .await
+            .expect("seed key");
+
+        let trace1_id = sq
+            .attestation_insert_local(build_509_trace_input(&derived, "trace-509c-1"))
+            .await
+            .expect("insert trace1");
+
+        let grant_id = emit_509_grant(&engine, "peer-509c", &["trace:"]).await;
+        let after1 = sq.get_attestation(&trace1_id).await.unwrap().expect("row");
+        assert_eq!(
+            after1.tier,
+            crate::federation::types::attestation_tier::FEDERATION,
+            "trace1 promotes during the grant's own emit (the (c) hook)"
+        );
+
+        // Withdraw the grant — E7's projection folds it: consent_peer_set
+        // loses the row sourced from `grant_id`, so it is no longer LIVE.
+        let _withdraws_id = emit_509_withdraws(&engine, &grant_id).await;
+        assert!(
+            sq.list_consent_peers(&derived).await.unwrap().is_empty(),
+            "the withdraws must fold the consent_peer_set projection"
+        );
+
+        let trace2_id = sq
+            .attestation_insert_local(build_509_trace_input(&derived, "trace-509c-2"))
+            .await
+            .expect("insert trace2");
+
+        let report = engine.promote_consented_backlog().await.expect("sweep");
+        assert_eq!(report.promoted, 0, "revoked consent no longer promotes");
+        assert_eq!(report.skipped, 0);
+
+        let after2 = sq.get_attestation(&trace2_id).await.unwrap().expect("row");
+        assert_eq!(
+            after2.tier,
+            crate::federation::types::attestation_tier::LOCAL,
+            "trace2 stays local — the grant that would have covered it is no longer live"
+        );
+    }
+
+    /// No live grants at all ⇒ the sweep is a strict no-op: zero report,
+    /// local rows untouched.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn consent_sweep_no_grants_noop_509() {
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("node-509d");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "node-509d"))
+            .await
+            .expect("seed key");
+
+        let trace_id = sq
+            .attestation_insert_local(build_509_trace_input(&derived, "trace-509d-1"))
+            .await
+            .expect("insert trace");
+
+        let report = engine.promote_consented_backlog().await.expect("sweep");
+        assert_eq!(report.promoted, 0);
+        assert_eq!(report.skipped, 0);
+
+        let after = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(
+            after.tier,
+            crate::federation::types::attestation_tier::LOCAL,
+            "no grants ⇒ local rows untouched"
+        );
     }
 
     // ── v9.3.0 (CIRISPersist#247 + #248) CEG-DX foundation ──

@@ -44,6 +44,7 @@ pub mod capacity;
 pub mod cohort;
 pub mod community_dek;
 pub mod consent;
+pub mod consent_grammar;
 pub mod consent_peer_set;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
@@ -90,6 +91,23 @@ pub struct TraceBackfillReport {
     pub minted: usize,
     /// `(trace_id, error kind)` for traces the funnels refused.
     pub skipped: Vec<(String, String)>,
+}
+
+/// v21.2.0 (CIRISPersist#509 FLOOR) — one
+/// [`crate::Engine::promote_consented_backlog`] sweep's tally: local-tier
+/// attestations promoted to federation tier (their dimension was covered
+/// by a LIVE self-authored `consent:replication:v1` grant) vs. skipped
+/// (an `attestation_promote` error on that ONE row — logged via
+/// `tracing::warn!` and counted, never wedging the rest of the sweep;
+/// the same honest-accounting posture [`TraceBackfillReport`]
+/// established for the #478 backfill).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ConsentSweepReport {
+    /// Local-tier attestations promoted to federation tier this sweep.
+    pub promoted: u64,
+    /// Local-tier attestations that matched a live grant's prefix set
+    /// but failed to promote (logged, never aborting the sweep).
+    pub skipped: u64,
 }
 
 pub mod register;
@@ -703,6 +721,70 @@ pub trait FederationDirectory: Send + Sync {
         let _ = node_key_id;
         Err(Error::Unsupported {
             method: "list_consent_peers",
+        })
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — `node_key_id`'s LIVE
+    /// `consent:replication:v1` grants it authored about ITSELF
+    /// (`attesting_key_id = node_key_id`): rows whose envelope dimension
+    /// is [`consent_peer_set::DIMENSION`] AND that still have a
+    /// `consent_peer_set` row sourced from them (`source_attestation_id
+    /// = attestation_id`) — i.e. NOT folded by a subsequent
+    /// `withdraws`/`recants`. The E7 revocation fold already ran at
+    /// write time ([`consent_peer_set`]'s projection maintenance); this
+    /// method never re-derives it, only reads the result. Feeds
+    /// [`crate::Engine::promote_consented_backlog`]'s prefix union.
+    /// Default `Unsupported`; sqlite/postgres/memory override.
+    async fn list_live_consent_grants_by(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = node_key_id;
+        Err(Error::Unsupported {
+            method: "list_live_consent_grants_by",
+        })
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — a plain keyset cursor over
+    /// `local`-tier attestations, ascending `attestation_id`:
+    /// [`crate::Engine::promote_consented_backlog`]'s page source.
+    /// `after_attestation_id = None` starts from the beginning;
+    /// `Some(id)` resumes strictly after it (`attestation_id > after`,
+    /// lexical string ordering — a stable resumption point, not a
+    /// chronological one). Backends order + page: `ORDER BY
+    /// attestation_id ASC LIMIT limit`. Default `Unsupported`;
+    /// sqlite/postgres/memory override.
+    async fn list_local_tier_attestations(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = (after_attestation_id, limit);
+        Err(Error::Unsupported {
+            method: "list_local_tier_attestations",
+        })
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — stamp a NEW `cohort_scope` onto
+    /// an EXISTING attestation row: the promote-on-consent write-back
+    /// ([`crate::Engine::promote_consented_backlog`] flips a
+    /// freshly-promoted row's `cohort_scope` to
+    /// [`types::cohort_scope::FEDERATION`] right after
+    /// [`crate::Engine::attestation_promote`] has hybrid-signed it).
+    /// `cohort_scope` MUST be one of the closed-set values
+    /// ([`types::cohort_scope::is_valid`]) — implementations validate
+    /// before writing and reject an out-of-set value with
+    /// `InvalidArgument`. Also `InvalidArgument` if `attestation_id`
+    /// does not exist. Default `Unsupported`; sqlite/postgres/memory
+    /// override.
+    async fn set_attestation_cohort_scope(
+        &self,
+        attestation_id: &str,
+        cohort_scope: &str,
+    ) -> Result<(), Error> {
+        let _ = (attestation_id, cohort_scope);
+        Err(Error::Unsupported {
+            method: "set_attestation_cohort_scope",
         })
     }
 

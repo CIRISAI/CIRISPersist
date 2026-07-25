@@ -3644,6 +3644,129 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| crate::federation::Error::Backend(format!("list_consent_peers: {e}")))
     }
 
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — `node_key_id`'s LIVE
+    /// `consent:replication:v1` self-grants: candidate rows filtered by
+    /// `attesting_key_id` + an `EXISTS` against `consent_peer_set`
+    /// (already revocation-folded at write time — see
+    /// `sqlite_project_consent_peer_set`); the dimension is then
+    /// confirmed in Rust (`federation_attestations` has no `dimension`
+    /// column — it lives inside the JSON envelope).
+    async fn list_live_consent_grants_by(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let node = node_key_id.to_owned();
+        let candidates =
+            (move || -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let conn = conn.lock();
+                let mut stmt = conn.prepare(
+                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                        subject_key_ids, withdraws_admission_rule, cohort_scope, tier, \
+                        promoted_at \
+                     FROM federation_attestations \
+                     WHERE attesting_key_id = ?1 \
+                       AND EXISTS (SELECT 1 FROM consent_peer_set \
+                                   WHERE source_attestation_id = \
+                                         federation_attestations.attestation_id) \
+                     ORDER BY asserted_at DESC",
+                )?;
+                let rows = stmt.query_map([&node], sqlite_row_to_attestation)?;
+                rows.collect()
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
+            })?;
+        Ok(candidates
+            .into_iter()
+            .filter(|a| {
+                crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                    == Some(crate::federation::consent_peer_set::DIMENSION)
+            })
+            .collect())
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the `promote_consented_backlog`
+    /// sweep's page source: a plain ascending-`attestation_id` keyset
+    /// cursor over `local`-tier rows.
+    async fn list_local_tier_attestations(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let after = after_attestation_id.map(str::to_owned);
+        let limit = i64::from(limit);
+        (move || -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                 FROM federation_attestations \
+                 WHERE tier = 'local' AND (?1 IS NULL OR attestation_id > ?1) \
+                 ORDER BY attestation_id ASC LIMIT ?2",
+            )?;
+            let rows =
+                stmt.query_map(rusqlite::params![after, limit], sqlite_row_to_attestation)?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_local_tier_attestations: {e}"))
+        })
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the promote-on-consent
+    /// write-back: stamp a new `cohort_scope` onto an existing row
+    /// (validated against the closed set) and recompute
+    /// `persist_row_hash` (the field is part of the hashed content).
+    async fn set_attestation_cohort_scope(
+        &self,
+        attestation_id: &str,
+        cohort_scope: &str,
+    ) -> Result<(), crate::federation::Error> {
+        if !crate::federation::types::cohort_scope::is_valid(cohort_scope) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "set_attestation_cohort_scope: invalid cohort_scope {cohort_scope:?}"
+            )));
+        }
+        let mut row = self.get_attestation(attestation_id).await?.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "federation_attestations row {attestation_id} does not exist"
+            ))
+        })?;
+        row.cohort_scope = cohort_scope.to_owned();
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+
+        let conn = self.conn.clone();
+        let id = attestation_id.to_owned();
+        let scope = cohort_scope.to_owned();
+        let n = (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "UPDATE federation_attestations SET cohort_scope = ?1, persist_row_hash = ?2 \
+                 WHERE attestation_id = ?3",
+                rusqlite::params![scope, new_hash, id],
+            )
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("set_attestation_cohort_scope: {e}"))
+        })?;
+        if n == 0 {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "federation_attestations row {attestation_id} does not exist"
+            )));
+        }
+        Ok(())
+    }
+
     async fn attestations_binding_content(
         &self,
         content_sha256: &str,
@@ -18498,6 +18621,23 @@ mod tests {
         crate::federation::consent_peer_set::test_support::exercise_consent_peer_set_fold(
             &backend,
             "sqlite-parity",
+        )
+        .await;
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the sqlite leg of the shared
+    /// backend-parity witness for the three new #509 methods (see
+    /// `postgres::tests::consent_509_backend_methods_parity_postgres`);
+    /// both call the SAME
+    /// `consent_peer_set::test_support::exercise_509_backend_methods`
+    /// body, so sqlite and postgres cannot silently diverge.
+    #[tokio::test]
+    async fn consent_509_backend_methods_parity_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::consent_peer_set::test_support::exercise_509_backend_methods(
+            &backend,
+            "sqlite-509-parity",
         )
         .await;
     }

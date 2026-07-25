@@ -3980,6 +3980,140 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .collect()
     }
 
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — `node_key_id`'s LIVE
+    /// `consent:replication:v1` self-grants. Structural mirror of the
+    /// sqlite impl: an `EXISTS` against `consent_peer_set` (already
+    /// revocation-folded at write time — see `pg_project_consent_peer_set`),
+    /// dimension confirmed in Rust (`federation_attestations` carries no
+    /// `dimension` column — it lives inside the JSONB envelope).
+    async fn list_live_consent_grants_by(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let rows = client
+            .query(
+                "SELECT fa.attestation_id::text, fa.attesting_key_id, fa.attested_key_id, \
+                    fa.attestation_type, fa.weight::float8 AS weight, fa.asserted_at, \
+                    fa.expires_at, fa.attestation_envelope, fa.original_content_hash, \
+                    fa.scrub_signature_classical, fa.scrub_signature_pqc, fa.scrub_key_id, \
+                    fa.scrub_timestamp, fa.pqc_completed_at, fa.persist_row_hash, \
+                    fa.subject_key_ids, fa.withdraws_admission_rule, fa.cohort_scope, fa.tier, \
+                    fa.promoted_at \
+                 FROM cirislens.federation_attestations fa \
+                 WHERE fa.attesting_key_id = $1 \
+                   AND EXISTS (SELECT 1 FROM cirislens.consent_peer_set cps \
+                               WHERE cps.source_attestation_id = fa.attestation_id::text) \
+                 ORDER BY fa.asserted_at DESC",
+                &[&node_key_id],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
+            })?;
+        let candidates: Vec<crate::federation::Attestation> = rows
+            .into_iter()
+            .map(pg_row_to_attestation)
+            .collect::<Result<_, _>>()?;
+        Ok(candidates
+            .into_iter()
+            .filter(|a| {
+                crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                    == Some(crate::federation::consent_peer_set::DIMENSION)
+            })
+            .collect())
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the `promote_consented_backlog`
+    /// sweep's page source. Structural mirror of the sqlite impl:
+    /// ascending-`attestation_id` keyset cursor over `local`-tier rows.
+    /// `attestation_id` is `uuid`; the cursor compares on the `::text`
+    /// cast (lexical string ordering, matching the sqlite TEXT-column
+    /// comparison).
+    async fn list_local_tier_attestations(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT attestation_id::text, attesting_key_id, attested_key_id, \
+                    attestation_type, weight::float8 AS weight, asserted_at, expires_at, \
+                    attestation_envelope, original_content_hash, scrub_signature_classical, \
+                    scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
+                    persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, \
+                    tier, promoted_at \
+                 FROM cirislens.federation_attestations \
+                 WHERE tier = 'local' \
+                   AND ($1::text IS NULL OR attestation_id::text > $1) \
+                 ORDER BY attestation_id ASC LIMIT $2",
+                &[&after_attestation_id, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_local_tier_attestations: {e}"))
+            })?;
+        rows.into_iter().map(pg_row_to_attestation).collect()
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the promote-on-consent
+    /// write-back. Structural mirror of the sqlite impl: validate against
+    /// the closed cohort_scope set, then `UPDATE` + recompute
+    /// `persist_row_hash`.
+    async fn set_attestation_cohort_scope(
+        &self,
+        attestation_id: &str,
+        cohort_scope: &str,
+    ) -> Result<(), crate::federation::Error> {
+        if !crate::federation::types::cohort_scope::is_valid(cohort_scope) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "set_attestation_cohort_scope: invalid cohort_scope {cohort_scope:?}"
+            )));
+        }
+        let mut row = self.get_attestation(attestation_id).await?.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "federation_attestations row {attestation_id} does not exist"
+            ))
+        })?;
+        row.cohort_scope = cohort_scope.to_owned();
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        // get_attestation already succeeded above → attestation_id parses.
+        let att_uuid = uuid::Uuid::parse_str(attestation_id).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("attestation_id uuid: {e}"))
+        })?;
+
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let n = client
+            .execute(
+                "UPDATE cirislens.federation_attestations \
+                 SET cohort_scope = $1, persist_row_hash = $2 WHERE attestation_id = $3",
+                &[&cohort_scope, &new_hash, &att_uuid],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("set_attestation_cohort_scope: {e}"))
+            })?;
+        if n == 0 {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "federation_attestations row {attestation_id} does not exist"
+            )));
+        }
+        Ok(())
+    }
+
     async fn attestations_binding_content(
         &self,
         content_sha256: &str,
@@ -17900,6 +18034,28 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         let suffix = uuid_like();
         crate::federation::consent_peer_set::test_support::exercise_consent_peer_set_fold(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the postgres leg of the shared
+    /// backend-parity witness for the three new #509 methods (see
+    /// `sqlite::tests::consent_509_backend_methods_parity_sqlite`); both
+    /// call the SAME
+    /// `consent_peer_set::test_support::exercise_509_backend_methods`
+    /// body, so sqlite and postgres cannot silently diverge.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn consent_509_backend_methods_parity_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::consent_peer_set::test_support::exercise_509_backend_methods(
             &backend, &suffix,
         )
         .await;

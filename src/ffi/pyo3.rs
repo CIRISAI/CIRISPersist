@@ -3386,6 +3386,57 @@ impl PyEngine {
         })
     }
 
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — run the promote-on-consent
+    /// sweep ON DEMAND: the same idempotent
+    /// `Engine::promote_consented_backlog` primitive the two automatic
+    /// chokepoints already fire (chokepoint (c) inside
+    /// `emit_attestation`/`emit_attestation_self`; chokepoint (a) at the
+    /// end of every `receive_and_persist` batch). Useful for an
+    /// operator-driven backfill after a grant's `attestation_prefixes`
+    /// widen, or to drain a backlog larger than either automatic
+    /// chokepoint walks in one pass. Returns `{"promoted": u64,
+    /// "skipped": u64}`.
+    ///
+    /// Raises `RuntimeError` if this Engine has no local software signing
+    /// identity configured — the same "a signerless node cannot promote"
+    /// posture the automatic (a) chokepoint applies silently, surfaced
+    /// loudly here since the caller explicitly asked for the sweep.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    fn promote_consented_backlog<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let local_signer = self.local_signer.clone().ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "promote_consented_backlog requires a local software signing identity",
+                )
+            })?;
+            let runtime = self.runtime.clone();
+            let backend = self.backend.clone();
+            let signer = self.signer.clone();
+            let report = py
+                .detach(move || {
+                    let backend = match &backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(b) => {
+                            crate::engine::BackendDispatch::Postgres(b.clone())
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(b) => {
+                            crate::engine::BackendDispatch::Sqlite(b.clone())
+                        }
+                    };
+                    let engine =
+                        crate::Engine::from_shared_with_local(backend, signer, Some(local_signer));
+                    runtime.block_on(async move { engine.promote_consented_backlog().await })
+                })
+                .map_err(federation_err_to_py)?;
+            let dict = PyDict::new(py);
+            dict.set_item("promoted", report.promoted)?;
+            dict.set_item("skipped", report.skipped)?;
+            Ok(dict)
+        })
+    }
+
     fn envelope_vocabulary(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         catch_panic(|| {
             let out = PyDict::new(py);
@@ -3706,6 +3757,59 @@ impl PyEngine {
                     dict.set_item("trace_llm_calls_inserted", s.trace_llm_calls_inserted)?;
                     dict.set_item("scrubbed_fields", s.scrubbed_fields)?;
                     dict.set_item("signatures_verified", s.signatures_verified)?;
+
+                    // v21.2.0 (CIRISPersist#509 FLOOR) — chokepoint (a):
+                    // after every ingest batch, run the idempotent
+                    // promote-on-consent sweep (warn-not-fail; the batch
+                    // already landed durably above — see
+                    // `Engine::promote_consented_backlog`'s doc for the
+                    // "never fail on a sweep hiccup" rationale, which
+                    // applies here identically). A signerless ingest node
+                    // (no `local_signer` configured — e.g. a pure relay)
+                    // cannot hybrid-sign a promotion, so skip
+                    // silently-with-debug-log rather than construct an
+                    // Engine that can only fail on the very first covered
+                    // row: honest and correct, not a missing feature.
+                    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+                    match self.local_signer.clone() {
+                        None => {
+                            tracing::debug!(
+                                "receive_and_persist: no local_signer configured — skipping \
+                                 the #509 consent-sweep chokepoint (a)"
+                            );
+                        }
+                        Some(local_signer) => {
+                            let backend = self.backend.clone();
+                            let signer = self.signer.clone();
+                            let runtime = self.runtime.clone();
+                            py.detach(move || {
+                                let backend = match &backend {
+                                    #[cfg(feature = "postgres")]
+                                    BackendDispatch::Postgres(b) => {
+                                        crate::engine::BackendDispatch::Postgres(b.clone())
+                                    }
+                                    #[cfg(feature = "sqlite")]
+                                    BackendDispatch::Sqlite(b) => {
+                                        crate::engine::BackendDispatch::Sqlite(b.clone())
+                                    }
+                                };
+                                let engine = crate::Engine::from_shared_with_local(
+                                    backend,
+                                    signer,
+                                    Some(local_signer),
+                                );
+                                runtime.block_on(async move {
+                                    if let Err(e) = engine.promote_consented_backlog().await {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "receive_and_persist: consent-sweep chokepoint (a) \
+                                             failed; backlog self-heals at the next chokepoint"
+                                        );
+                                    }
+                                });
+                            });
+                        }
+                    }
                     Ok(dict)
                 }
                 // THREAT_MODEL.md AV-15: sanitize at the FFI boundary.
