@@ -711,6 +711,68 @@ pub enum DirectoryOp {
         /// Page cap.
         limit: u32,
     },
+    /// [`FederationDirectory::list_signed_key_records_since`] (v21.1.0,
+    /// CIRISPersist#507c) — bulk-list `SignedKeyRecord` wrappers since a
+    /// cursor, for the edge advertise/serve responder. Result rides
+    /// `SignedKeyRecords`. APPEND-ONLY.
+    ListSignedKeyRecordsSince {
+        /// Cursor: rows with `scrub_timestamp > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap.
+        limit: u32,
+    },
+    /// [`FederationDirectory::list_signed_identity_occurrences_since`]
+    /// (v21.1.0, CIRISPersist#507c). Structural mirror of
+    /// [`DirectoryOp::ListSignedKeyRecordsSince`]. Result rides
+    /// `SignedIdentityOccurrences`. APPEND-ONLY.
+    ListSignedIdentityOccurrencesSince {
+        /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap.
+        limit: u32,
+    },
+    /// [`FederationDirectory::list_signed_transport_destinations_since`]
+    /// (v21.1.0, CIRISPersist#507c). Structural mirror of
+    /// [`DirectoryOp::ListSignedKeyRecordsSince`]. Result rides
+    /// `SignedTransportDestinationsSince`. APPEND-ONLY.
+    ListSignedTransportDestinationsSince {
+        /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap.
+        limit: u32,
+    },
+    /// [`FederationDirectory::list_attestations_since`] (v21.1.0,
+    /// CIRISPersist#507c) — federation-tier-only bulk read (the E5
+    /// invariant). Result rides `Attestations`. APPEND-ONLY.
+    ListAttestationsSince {
+        /// Cursor: rows with `asserted_at > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap.
+        limit: u32,
+    },
+    /// [`FederationDirectory::list_signed_identity_occurrence_revocations_since`]
+    /// (v21.1.0, CIRISPersist#507c). Structural mirror of
+    /// [`DirectoryOp::ListSignedKeyRecordsSince`]. Result rides
+    /// `SignedIdentityOccurrenceRevocationsSince`. APPEND-ONLY.
+    ListSignedIdentityOccurrenceRevocationsSince {
+        /// Cursor: rows with `revoked_at > since` (None ⇒ from start).
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Page cap.
+        limit: u32,
+    },
+    /// [`FederationDirectory::lookup_signed_record_by_content_hash`]
+    /// (v21.1.0, CIRISPersist#507b) — the content-hash point-read. Result
+    /// rides `OptionalBytes`. APPEND-ONLY.
+    LookupSignedRecordByContentHash {
+        /// The `EnvelopeKind::as_str()` token.
+        kind: String,
+        /// Lowercase-hex sha256 over the record's wire JSON bytes.
+        content_hash: String,
+    },
+    /// [`FederationDirectory::rebuild_signed_wire_index`] (v21.1.0,
+    /// CIRISPersist#507b) — full backfill/rebuild of `signed_wire_index`.
+    /// Result rides `U64` (rows indexed). APPEND-ONLY.
+    RebuildSignedWireIndex,
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -839,6 +901,25 @@ pub enum DirectoryOpResult {
     /// `list_signed_community_membership_revocations_since` (v21.0.0,
     /// CIRISPersist#504 FLOOR). APPEND-ONLY.
     SignedCommunityMembershipRevocations(Vec<SignedCommunityMembershipRevocation>),
+    /// `list_signed_key_records_since` (v21.1.0, CIRISPersist#507c).
+    /// APPEND-ONLY.
+    SignedKeyRecords(Vec<SignedKeyRecord>),
+    /// `list_signed_identity_occurrences_since` (v21.1.0, CIRISPersist#507c).
+    /// APPEND-ONLY.
+    SignedIdentityOccurrencesSince(Vec<SignedIdentityOccurrence>),
+    /// `list_signed_transport_destinations_since` (v21.1.0,
+    /// CIRISPersist#507c). APPEND-ONLY.
+    SignedTransportDestinationsSince(Vec<self_at_login::SignedTransportDestination>),
+    /// `list_attestations_since` (v21.1.0, CIRISPersist#507c) — federation-
+    /// tier-only rows. APPEND-ONLY.
+    Attestations(Vec<Attestation>),
+    /// `list_signed_identity_occurrence_revocations_since` (v21.1.0,
+    /// CIRISPersist#507c). APPEND-ONLY.
+    SignedIdentityOccurrenceRevocationsSince(Vec<SignedIdentityOccurrenceRevocation>),
+    /// `lookup_signed_record_by_content_hash` (v21.1.0, CIRISPersist#507b) —
+    /// the re-serialized record bytes, or `None` on a miss/index-mismatch.
+    /// APPEND-ONLY.
+    OptionalBytes(Option<Vec<u8>>),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1303,6 +1384,58 @@ pub async fn dispatch_directory_op(
                 Err(e) => DirectoryOpResult::Err(e.to_string()),
             }
         }
+        DirectoryOp::ListSignedKeyRecordsSince { since, limit } => {
+            match dir.list_signed_key_records_since(since, limit).await {
+                Ok(v) => DirectoryOpResult::SignedKeyRecords(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedIdentityOccurrencesSince { since, limit } => {
+            match dir
+                .list_signed_identity_occurrences_since(since, limit)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SignedIdentityOccurrencesSince(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedTransportDestinationsSince { since, limit } => {
+            match dir
+                .list_signed_transport_destinations_since(since, limit)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SignedTransportDestinationsSince(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListAttestationsSince { since, limit } => {
+            match dir.list_attestations_since(since, limit).await {
+                Ok(v) => DirectoryOpResult::Attestations(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::ListSignedIdentityOccurrenceRevocationsSince { since, limit } => {
+            match dir
+                .list_signed_identity_occurrence_revocations_since(since, limit)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::SignedIdentityOccurrenceRevocationsSince(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::LookupSignedRecordByContentHash { kind, content_hash } => {
+            match dir
+                .lookup_signed_record_by_content_hash(&kind, &content_hash)
+                .await
+            {
+                Ok(v) => DirectoryOpResult::OptionalBytes(v),
+                Err(e) => DirectoryOpResult::Err(e.to_string()),
+            }
+        }
+        DirectoryOp::RebuildSignedWireIndex => match dir.rebuild_signed_wire_index().await {
+            Ok(v) => DirectoryOpResult::U64(v),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
     }
 }
 
@@ -2814,6 +2947,137 @@ impl FederationDirectory for OpsDirectory {
             )),
         }
     }
+
+    /// v21.1.0 (CIRISPersist#507c) — the signed key-record bulk read via
+    /// the capsule, for the edge advertise/serve responder.
+    async fn list_signed_key_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedKeyRecord>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedKeyRecordsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedKeyRecords(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v21.1.0 (CIRISPersist#507c) — structural mirror of
+    /// [`Self::list_signed_key_records_since`].
+    async fn list_signed_identity_occurrences_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedIdentityOccurrence>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedIdentityOccurrencesSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedIdentityOccurrencesSince(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v21.1.0 (CIRISPersist#507c) — structural mirror of
+    /// [`Self::list_signed_key_records_since`].
+    async fn list_signed_transport_destinations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<self_at_login::SignedTransportDestination>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedTransportDestinationsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedTransportDestinationsSince(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v21.1.0 (CIRISPersist#507c) — structural mirror of
+    /// [`Self::list_signed_key_records_since`]; federation-tier-only rows
+    /// (the E5 invariant).
+    async fn list_attestations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListAttestationsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::Attestations(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v21.1.0 (CIRISPersist#507c) — structural mirror of
+    /// [`Self::list_signed_key_records_since`].
+    async fn list_signed_identity_occurrence_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedIdentityOccurrenceRevocation>, Error> {
+        match self
+            .run_op(&DirectoryOp::ListSignedIdentityOccurrenceRevocationsSince { since, limit })
+            .await?
+        {
+            DirectoryOpResult::SignedIdentityOccurrenceRevocationsSince(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v21.1.0 (CIRISPersist#507b) — the content-hash point-read via the
+    /// capsule.
+    async fn lookup_signed_record_by_content_hash(
+        &self,
+        kind: &str,
+        content_hash: &str,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        match self
+            .run_op(&DirectoryOp::LookupSignedRecordByContentHash {
+                kind: kind.to_owned(),
+                content_hash: content_hash.to_owned(),
+            })
+            .await?
+        {
+            DirectoryOpResult::OptionalBytes(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
+    /// v21.1.0 (CIRISPersist#507b) — the full-rebuild backfill via the
+    /// capsule.
+    async fn rebuild_signed_wire_index(&self) -> Result<u64, Error> {
+        match self.run_op(&DirectoryOp::RebuildSignedWireIndex).await? {
+            DirectoryOpResult::U64(v) => Ok(v),
+            DirectoryOpResult::Err(s) => Err(Error::Backend(s)),
+            _ => Err(Error::Backend(
+                "directory ops proxy: unexpected result variant".into(),
+            )),
+        }
+    }
+
     async fn list_family_membership_revocations_for(
         &self,
         family_key_id: &str,

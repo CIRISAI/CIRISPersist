@@ -2848,6 +2848,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             serde_json::to_string(&row.additional_scrubs).map_err(|e| {
                 crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
             })?;
+        // v21.1.0 (CIRISPersist#507b) — compute the wire-index entry from
+        // `row` BEFORE it moves into the INSERT closure below (`row` is the
+        // exact value `SignedKeyRecord` wraps for the read surface).
+        let wire_index_key = crate::federation::wire_index::record_key(&[("key_id", &row.key_id)]);
+        let wire_index_hash =
+            crate::federation::wire_index::content_hash_of(&crate::federation::SignedKeyRecord {
+                record: row.clone(),
+            })?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -2882,6 +2890,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     additional_scrubs_text,
                 ],
             )?;
+            sqlite_upsert_wire_index(&conn, "Key", &wire_index_hash, &wire_index_key)?;
             Ok(())
         })()
         .map_err(|e| crate::federation::Error::Backend(format!("insert federation_keys: {e}")))?;
@@ -3435,6 +3444,31 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .await?;
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
+        // v21.3.0 (CIRISPersist#510 P1) — the closed consent-transfer
+        // grammar admission chokepoint. A `consent:replication:v1` grant's
+        // `payload` MUST parse through
+        // `consent_grammar::parse_grant_payload` (closed enums, strict
+        // `deny_unknown_fields`) — an unknown restriction op, an
+        // unrecognized payload field, a non-consentable `kinds` entry, a
+        // bad `grants` token, a bad `audience`, or an empty-string
+        // `attestation_prefixes` entry rejects the WHOLE grant. No-op for
+        // every other dimension (a `withdraws`/`recants` referencing a
+        // grant carries its OWN dimension, never GRANT_DIMENSION, so it
+        // never reaches this check). Runs BEFORE persist_row_hash + INSERT
+        // so a rejected grant leaves no trace. Backend-symmetric with
+        // postgres + memory.
+        if crate::federation::admission::envelope_dimension(&row.attestation_envelope)
+            == Some(crate::federation::consent_grammar::GRANT_DIMENSION)
+        {
+            if let Err(reason) = crate::federation::consent_grammar::validate_grant_admission(
+                &row.attestation_envelope,
+            ) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "consent grant rejected by the closed grammar (#510): {reason}"
+                )));
+            }
+        }
+
         // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11; keying broadened by
         // #369) — no-moderator-no-federate FEDERATION-APPLY re-check (point
         // ii). A federation-tier row keyed on a community under ANY substrate
@@ -3480,6 +3514,24 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             crate::federation::Error::Backend(format!("subject_key_ids serialize: {e}"))
         })?;
         let withdraws_admission_rule: Option<i64> = row.withdraws_admission_rule.map(|v| v as i64);
+        // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation-tier
+        // only, the E5 invariant — `put_attestation` is the federation write
+        // path so this always holds in practice; the tier check is a
+        // defensive belt). Computed from `row` before the closure moves it;
+        // `Attestation` IS its own signed wrapper (carries the scrub
+        // signature inline), so this hashes the exact `list_attestations_since`
+        // read-surface value.
+        let wire_index_entry = (row.tier == crate::federation::types::attestation_tier::FEDERATION)
+            .then(|| {
+                Ok::<_, crate::federation::Error>((
+                    crate::federation::wire_index::record_key(&[(
+                        "attestation_id",
+                        &row.attestation_id,
+                    )]),
+                    crate::federation::wire_index::content_hash_of(&row)?,
+                ))
+            })
+            .transpose()?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -3523,6 +3575,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // projection (grant upsert / withdraws-revocation fold) in the
             // SAME locked scope as the insert above.
             sqlite_project_consent_peer_set(&conn, &row)?;
+            if let Some((wire_index_key, wire_index_hash)) = &wire_index_entry {
+                sqlite_upsert_wire_index(&conn, "Attestation", wire_index_hash, wire_index_key)?;
+            }
             Ok(())
         })()
         .map_err(|e| {
@@ -3642,6 +3697,129 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             rows.collect()
         })()
         .map_err(|e| crate::federation::Error::Backend(format!("list_consent_peers: {e}")))
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — `node_key_id`'s LIVE
+    /// `consent:replication:v1` self-grants: candidate rows filtered by
+    /// `attesting_key_id` + an `EXISTS` against `consent_peer_set`
+    /// (already revocation-folded at write time — see
+    /// `sqlite_project_consent_peer_set`); the dimension is then
+    /// confirmed in Rust (`federation_attestations` has no `dimension`
+    /// column — it lives inside the JSON envelope).
+    async fn list_live_consent_grants_by(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let node = node_key_id.to_owned();
+        let candidates =
+            (move || -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+                let conn = conn.lock();
+                let mut stmt = conn.prepare(
+                    "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                        weight, asserted_at, expires_at, attestation_envelope, \
+                        original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                        subject_key_ids, withdraws_admission_rule, cohort_scope, tier, \
+                        promoted_at \
+                     FROM federation_attestations \
+                     WHERE attesting_key_id = ?1 \
+                       AND EXISTS (SELECT 1 FROM consent_peer_set \
+                                   WHERE source_attestation_id = \
+                                         federation_attestations.attestation_id) \
+                     ORDER BY asserted_at DESC",
+                )?;
+                let rows = stmt.query_map([&node], sqlite_row_to_attestation)?;
+                rows.collect()
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("list_live_consent_grants_by: {e}"))
+            })?;
+        Ok(candidates
+            .into_iter()
+            .filter(|a| {
+                crate::federation::admission::envelope_dimension(&a.attestation_envelope)
+                    == Some(crate::federation::consent_peer_set::DIMENSION)
+            })
+            .collect())
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the `promote_consented_backlog`
+    /// sweep's page source: a plain ascending-`attestation_id` keyset
+    /// cursor over `local`-tier rows.
+    async fn list_local_tier_attestations(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let after = after_attestation_id.map(str::to_owned);
+        let limit = i64::from(limit);
+        (move || -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                 FROM federation_attestations \
+                 WHERE tier = 'local' AND (?1 IS NULL OR attestation_id > ?1) \
+                 ORDER BY attestation_id ASC LIMIT ?2",
+            )?;
+            let rows =
+                stmt.query_map(rusqlite::params![after, limit], sqlite_row_to_attestation)?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_local_tier_attestations: {e}"))
+        })
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the promote-on-consent
+    /// write-back: stamp a new `cohort_scope` onto an existing row
+    /// (validated against the closed set) and recompute
+    /// `persist_row_hash` (the field is part of the hashed content).
+    async fn set_attestation_cohort_scope(
+        &self,
+        attestation_id: &str,
+        cohort_scope: &str,
+    ) -> Result<(), crate::federation::Error> {
+        if !crate::federation::types::cohort_scope::is_valid(cohort_scope) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "set_attestation_cohort_scope: invalid cohort_scope {cohort_scope:?}"
+            )));
+        }
+        let mut row = self.get_attestation(attestation_id).await?.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "federation_attestations row {attestation_id} does not exist"
+            ))
+        })?;
+        row.cohort_scope = cohort_scope.to_owned();
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+
+        let conn = self.conn.clone();
+        let id = attestation_id.to_owned();
+        let scope = cohort_scope.to_owned();
+        let n = (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "UPDATE federation_attestations SET cohort_scope = ?1, persist_row_hash = ?2 \
+                 WHERE attestation_id = ?3",
+                rusqlite::params![scope, new_hash, id],
+            )
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("set_attestation_cohort_scope: {e}"))
+        })?;
+        if n == 0 {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "federation_attestations row {attestation_id} does not exist"
+            )));
+        }
+        Ok(())
     }
 
     async fn attestations_binding_content(
@@ -3845,6 +4023,22 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .transport_binding
             .as_ref()
             .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at));
+        // v21.1.0 (CIRISPersist#507b) — compute the wire-index entry from the
+        // exact `SignedIdentityOccurrence` `list_signed_identity_occurrences_since`
+        // would re-serialize, BEFORE the closure below moves `row` /
+        // `attesting_key_id` / `signed_envelope` / `signature`.
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("identity_key_id", &row.identity_key_id),
+            ("occurrence_key_id", &row.occurrence_key_id),
+        ]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(
+            &crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: row.clone(),
+                attesting_key_id: attesting_key_id.clone(),
+                signed_envelope: signed_envelope.clone(),
+                signature: signature.clone(),
+            },
+        )?;
         let conn = self.conn.clone();
         let occurrence_applied = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
@@ -3904,6 +4098,21 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 crate::federation::FederationDirectory::put_transport_destination(self, route)
                     .await?;
             }
+            let conn = self.conn.clone();
+            (move || -> Result<(), rusqlite::Error> {
+                let conn = conn.lock();
+                sqlite_upsert_wire_index(
+                    &conn,
+                    "IdentityOccurrence",
+                    &wire_index_hash,
+                    &wire_index_key,
+                )
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "put_identity_occurrence wire index: {e}"
+                ))
+            })?;
         }
         Ok(())
     }
@@ -4083,6 +4292,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // columns NULL, correct for a legitimately-unsigned bake row; this
         // UPDATE targets only the signed, gate-verified path.
         let conn = self.conn.clone();
+        let family_key_id_for_db = family_key_id.clone();
+        let authority_key_id_for_db = authority_key_id.clone();
+        let scrub_signature_classical_for_db = scrub_signature_classical.clone();
+        let scrub_signature_pqc_for_db = scrub_signature_pqc.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
@@ -4091,10 +4304,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         scrub_signature_pqc = ?4 \
                   WHERE family_key_id = ?1",
                 rusqlite::params![
-                    family_key_id,
-                    authority_key_id,
-                    scrub_signature_classical,
-                    scrub_signature_pqc,
+                    family_key_id_for_db,
+                    authority_key_id_for_db,
+                    scrub_signature_classical_for_db,
+                    scrub_signature_pqc_for_db,
                 ],
             )?;
             Ok(())
@@ -4102,6 +4315,29 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         .map_err(|e| {
             crate::federation::Error::Backend(format!("store family authority signature: {e}"))
         })?;
+        // v21.1.0 (CIRISPersist#507b) — wire-index the FULL `SignedFamily`
+        // shape `list_signed_families_since` re-serializes. Reload rather
+        // than reuse the pre-write `Family` value: `put_family_local` stamps
+        // `persist_row_hash` on its OWN local copy, invisible from here.
+        if let Some(reloaded) = self.lookup_family(&family_key_id).await? {
+            let wire_index_key =
+                crate::federation::wire_index::record_key(&[("family_key_id", &family_key_id)]);
+            let wire_index_hash =
+                crate::federation::wire_index::content_hash_of(&crate::federation::SignedFamily {
+                    family: reloaded,
+                    authority_key_id,
+                    scrub_signature_classical,
+                    scrub_signature_pqc,
+                })?;
+            let conn = self.conn.clone();
+            (move || -> Result<(), rusqlite::Error> {
+                let conn = conn.lock();
+                sqlite_upsert_wire_index(&conn, "Family", &wire_index_hash, &wire_index_key)
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("put_family wire index: {e}"))
+            })?;
+        }
         Ok(())
     }
 
@@ -4604,6 +4840,20 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let authority_key_id = community.authority_key_id;
         let scrub_signature_classical = community.scrub_signature_classical;
         let scrub_signature_pqc = community.scrub_signature_pqc;
+        // v21.1.0 (CIRISPersist#507b) — computed from `row` (with its final
+        // `persist_row_hash` already stamped above) before the INSERT
+        // closure moves everything.
+        let wire_index_key = crate::federation::wire_index::record_key(&[(
+            "community_key_id",
+            &row.community_key_id,
+        )]);
+        let wire_index_hash =
+            crate::federation::wire_index::content_hash_of(&crate::federation::SignedCommunity {
+                community: row.clone(),
+                authority_key_id: authority_key_id.clone(),
+                scrub_signature_classical: scrub_signature_classical.clone(),
+                scrub_signature_pqc: scrub_signature_pqc.clone(),
+            })?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -4626,6 +4876,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_pqc,
                 ],
             )?;
+            sqlite_upsert_wire_index(&conn, "Community", &wire_index_hash, &wire_index_key)?;
             Ok(())
         })()
         .map_err(|e| {
@@ -5125,6 +5376,20 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
         let signature_json = serde_json::to_string(&signature)
             .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
+        // v21.1.0 (CIRISPersist#507b) — computed before the closure moves
+        // `row` / `attesting_key_id` / `signed_envelope` / `signature`.
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("identity_key_id", &row.identity_key_id),
+            ("occurrence_key_id", &row.occurrence_key_id),
+        ]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(
+            &crate::federation::SignedIdentityOccurrenceRevocation {
+                identity_occurrence_revocation: row.clone(),
+                attesting_key_id: attesting_key_id.clone(),
+                signed_envelope: signed_envelope.clone(),
+                signature: signature.clone(),
+            },
+        )?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -5146,6 +5411,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     signed_envelope_json,
                     signature_json,
                 ],
+            )?;
+            sqlite_upsert_wire_index(
+                &conn,
+                "IdentityOccurrenceRevocation",
+                &wire_index_hash,
+                &wire_index_key,
             )?;
             // #446 de-projection (the projection's inverse): retire the LOCAL
             // derived route materialized from this occurrence's binding — else
@@ -5242,6 +5513,20 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let authority_key_id = revocation.authority_key_id;
         let scrub_signature_classical = revocation.scrub_signature_classical;
         let scrub_signature_pqc = revocation.scrub_signature_pqc;
+        // v21.1.0 (CIRISPersist#507b) — computed before the INSERT closure
+        // moves everything.
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("family_key_id", &row.family_key_id),
+            ("removed_identity_key_id", &row.removed_identity_key_id),
+        ]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(
+            &crate::federation::SignedFamilyMembershipRevocation {
+                family_membership_revocation: row.clone(),
+                authority_key_id: authority_key_id.clone(),
+                scrub_signature_classical: scrub_signature_classical.clone(),
+                scrub_signature_pqc: scrub_signature_pqc.clone(),
+            },
+        )?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -5263,6 +5548,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_classical,
                     scrub_signature_pqc,
                 ],
+            )?;
+            sqlite_upsert_wire_index(
+                &conn,
+                "FamilyMembershipRevocation",
+                &wire_index_hash,
+                &wire_index_key,
             )?;
             Ok(())
         })()
@@ -5307,6 +5598,20 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let authority_key_id = revocation.authority_key_id;
         let scrub_signature_classical = revocation.scrub_signature_classical;
         let scrub_signature_pqc = revocation.scrub_signature_pqc;
+        // v21.1.0 (CIRISPersist#507b) — computed before the transaction
+        // closure moves everything.
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("community_key_id", &row.community_key_id),
+            ("removed_identity_key_id", &row.removed_identity_key_id),
+        ]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(
+            &crate::federation::SignedCommunityMembershipRevocation {
+                community_membership_revocation: row.clone(),
+                authority_key_id: authority_key_id.clone(),
+                scrub_signature_classical: scrub_signature_classical.clone(),
+                scrub_signature_pqc: scrub_signature_pqc.clone(),
+            },
+        )?;
         let conn = self.conn.clone();
         // SecReview F5 — INSERT + hard_case + epoch bump in ONE transaction
         // under a single lock acquisition: a bump failure after the INSERT
@@ -5334,6 +5639,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_classical,
                     scrub_signature_pqc,
                 ],
+            )?;
+            sqlite_upsert_wire_index(
+                &tx,
+                "CommunityMembershipRevocation",
+                &wire_index_hash,
+                &wire_index_key,
             )?;
             // Idempotent on the deterministic event_id.
             tx.execute(
@@ -5493,6 +5804,20 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let authority_key_id = proof.authority_key_id;
         let scrub_signature_classical = proof.scrub_signature_classical;
         let scrub_signature_pqc = proof.scrub_signature_pqc;
+        // v21.1.0 (CIRISPersist#507b) — computed before the INSERT closure
+        // moves everything.
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("subject_key_id", &row.subject_key_id),
+            ("asserted_at", &row.asserted_at.to_rfc3339()),
+        ]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(
+            &crate::federation::SignedLocationProof {
+                location_proof: row.clone(),
+                authority_key_id: authority_key_id.clone(),
+                scrub_signature_classical: scrub_signature_classical.clone(),
+                scrub_signature_pqc: scrub_signature_pqc.clone(),
+            },
+        )?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -5516,6 +5841,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_signature_pqc,
                 ],
             )?;
+            sqlite_upsert_wire_index(&conn, "LocationProof", &wire_index_hash, &wire_index_key)?;
             Ok(())
         })()
         .map_err(map_revocation_sqlite_err("location_proof"))?;
@@ -5770,6 +6096,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 "transport_destination epoch exceeds i64".into(),
             )
         })?;
+        // v21.1.0 (CIRISPersist#507b) — the stored row is byte-identical to
+        // `signed` (its fields, verbatim), so `signed` itself IS the exact
+        // value `list_signed_transport_destinations_since` re-serializes.
+        let wire_index_key = crate::federation::wire_index::record_key(&[
+            ("occurrence_key_id", &d.occurrence_key_id),
+            ("transport_kind", &d.transport_kind),
+        ]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(signed)?;
         let conn = self.conn.clone();
         (move || -> Result<Outcome, rusqlite::Error> {
             let conn = conn.lock();
@@ -5852,6 +6186,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     envelope_json,
                     signature_json,
                 ],
+            )?;
+            sqlite_upsert_wire_index(
+                &conn,
+                "TransportDestination",
+                &wire_index_hash,
+                &wire_index_key,
             )?;
             Ok(if inserted_fresh {
                 Outcome::Inserted
@@ -6325,6 +6665,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let env_text = serde_json::to_string(&row.signed_envelope)
             .map_err(|e| crate::federation::Error::Backend(format!("serialize envelope: {e}")))?;
+        // v21.1.0 (CIRISPersist#507b) — `Organization` carries its own
+        // single-signer signature fields inline (same shape as `KeyRecord`/
+        // `Attestation`) — it IS the value `list_organizations_since`
+        // re-serializes, no separate wrapper. Computed before the INSERT
+        // closure moves `row`.
+        let wire_index_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -6357,6 +6705,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.persist_row_hash,
                 ],
             )?;
+            sqlite_upsert_wire_index(&conn, "Organization", &wire_index_hash, &wire_index_key)?;
             Ok(())
         })()
         .map_err(map_revocation_sqlite_err("organization"))?;
@@ -6386,6 +6735,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let env_text = serde_json::to_string(&row.signed_envelope)
             .map_err(|e| crate::federation::Error::Backend(format!("serialize envelope: {e}")))?;
+        // v21.1.0 (CIRISPersist#507b) — `OrgMembership` carries its own
+        // single-signer signature fields inline; see `put_organization`'s
+        // wire-index comment.
+        let wire_index_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -6413,6 +6768,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.persist_row_hash,
                 ],
             )?;
+            sqlite_upsert_wire_index(&conn, "OrgMembership", &wire_index_hash, &wire_index_key)?;
             Ok(())
         })()
         .map_err(map_revocation_sqlite_err("org_membership"))?;
@@ -6454,6 +6810,21 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let env_text = serde_json::to_string(&row.signed_envelope)
             .map_err(|e| crate::federation::Error::Backend(format!("serialize envelope: {e}")))?;
+        // v21.1.0 (CIRISPersist#507b) — `PartnerRecord`'s M-of-N steward
+        // quorum is EXTERNAL to the row (unlike Organization/OrgMembership),
+        // so the read surface (`list_signed_partner_records_since`) returns
+        // the `SignedPartnerRecord` wrapper — hash that shape, not the bare
+        // row. `signed.steward_signatures`/`.threshold` are still valid here
+        // (only `.partner_record` was moved out above — a partial move).
+        let wire_index_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(
+            &crate::federation::SignedPartnerRecord {
+                partner_record: row.clone(),
+                steward_signatures: signed.steward_signatures.clone(),
+                threshold: signed.threshold,
+            },
+        )?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -6488,6 +6859,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     threshold,
                 ],
             )?;
+            sqlite_upsert_wire_index(&conn, "PartnerRecord", &wire_index_hash, &wire_index_key)?;
             Ok(())
         })()
         .map_err(map_revocation_sqlite_err("partner_record"))?;
@@ -6781,6 +7153,234 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    // ─── v21.1.0 (CIRISPersist#507c) — bulk signed-since reads for the 5
+    //     PRIMARY signed planes.
+
+    async fn list_signed_key_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedKeyRecord>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT * FROM federation_keys \
+                 WHERE (?1 IS NULL OR scrub_timestamp > ?1) \
+                 ORDER BY scrub_timestamp ASC, key_id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![since, limit], sqlite_row_to_key_record)?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(crate::federation::SignedKeyRecord { record: r? });
+            }
+            Ok(out)
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_signed_key_records_since: {e}"))
+        })
+    }
+
+    async fn list_signed_identity_occurrences_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedIdentityOccurrence>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            // Signed-put rows only (trusted-local NULL sig cols omitted) —
+            // same contract as `list_signed_identity_occurrences_for`.
+            let mut stmt = conn.prepare(
+                "SELECT identity_key_id, occurrence_key_id, device_class, \
+                        hardware_attestation, asserted_at, valid_until, persist_row_hash, \
+                        pubkey_x25519_base64, pubkey_ml_kem_768_base64, transport_binding, \
+                        attesting_key_id, signed_envelope, signature \
+                     FROM federation_identity_occurrences \
+                     WHERE (?1 IS NULL OR asserted_at > ?1) \
+                       AND attesting_key_id IS NOT NULL \
+                       AND signed_envelope IS NOT NULL \
+                       AND signature IS NOT NULL \
+                     ORDER BY asserted_at ASC, identity_key_id ASC, occurrence_key_id ASC \
+                     LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![since, limit],
+                sqlite_row_to_signed_identity_occurrence,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_signed_identity_occurrences_since: {e}"
+            ))
+        })
+    }
+
+    async fn list_signed_transport_destinations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedTransportDestination>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            // Signed-put rows only; RETIRED rows ARE included — tombstones
+            // must gossip, matching `list_signed_transport_destinations_for`.
+            let mut stmt = conn.prepare(
+                "SELECT occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
+                    transport_ed25519_pubkey_base64, transport_x25519_pubkey_base64, \
+                    binding_provenance, epoch, retired_at, \
+                    attesting_key_id, signed_envelope, signature \
+                 FROM transport_destinations \
+                 WHERE (?1 IS NULL OR asserted_at > ?1) \
+                   AND attesting_key_id IS NOT NULL \
+                   AND signed_envelope IS NOT NULL \
+                   AND signature IS NOT NULL \
+                 ORDER BY asserted_at ASC, occurrence_key_id ASC, transport_kind ASC \
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![since, limit],
+                sqlite_row_to_signed_transport_destination,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_signed_transport_destinations_since: {e}"
+            ))
+        })
+    }
+
+    async fn list_attestations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            // E5 invariant: `tier = 'federation'` only — a local-tier row
+            // must never reach the advertise/serve wire surface.
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                 FROM federation_attestations \
+                 WHERE (?1 IS NULL OR COALESCE(promoted_at, asserted_at) > ?1) \
+                   AND tier = 'federation' \
+                 ORDER BY COALESCE(promoted_at, asserted_at) ASC, attestation_id ASC LIMIT ?2",
+            )?;
+            let rows =
+                stmt.query_map(rusqlite::params![since, limit], sqlite_row_to_attestation)?;
+            rows.collect()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("list_attestations_since: {e}")))
+    }
+
+    async fn list_signed_identity_occurrence_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::SignedIdentityOccurrenceRevocation>, crate::federation::Error>
+    {
+        let conn = self.conn.clone();
+        let since = since.map(|t| t.to_rfc3339());
+        (move || -> Result<Vec<_>, rusqlite::Error> {
+            let conn = conn.lock();
+            // Signed-put rows only — same contract as
+            // `list_signed_identity_occurrence_revocations_for`.
+            let mut stmt = conn.prepare(
+                "SELECT identity_key_id, occurrence_key_id, revoked_at, effective_at, \
+                        reason, witness_set, persist_row_hash, \
+                        attesting_key_id, signed_envelope, signature \
+                     FROM federation_identity_occurrence_revocations \
+                     WHERE (?1 IS NULL OR revoked_at > ?1) \
+                       AND attesting_key_id IS NOT NULL \
+                       AND signed_envelope IS NOT NULL \
+                       AND signature IS NOT NULL \
+                     ORDER BY revoked_at ASC, identity_key_id ASC, occurrence_key_id ASC \
+                     LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![since, limit],
+                sqlite_row_to_signed_identity_occurrence_revocation,
+            )?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "list_signed_identity_occurrence_revocations_since: {e}"
+            ))
+        })
+    }
+
+    // ─── v21.1.0 (CIRISPersist#507b) — the shared signed-wire content-hash
+    //     index (V111 `signed_wire_index`).
+
+    async fn lookup_signed_record_by_content_hash(
+        &self,
+        kind: &str,
+        content_hash: &str,
+    ) -> Result<Option<Vec<u8>>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let kind_owned = kind.to_owned();
+        let hash_owned = content_hash.to_owned();
+        let record_key = (move || -> Result<Option<String>, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT record_key FROM signed_wire_index WHERE kind = ?1 AND content_hash = ?2",
+                rusqlite::params![kind_owned, hash_owned],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("signed_wire_index lookup: {e}")))?;
+        let Some(record_key) = record_key else {
+            return Ok(None);
+        };
+        let bytes =
+            crate::federation::wire_index::reload_record_bytes(self, kind, &record_key).await?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let recomputed = crate::federation::wire_index::content_hash_of_bytes(&bytes);
+        if recomputed != content_hash {
+            tracing::warn!(
+                kind,
+                content_hash,
+                recomputed = %recomputed,
+                "signed_wire_index content-hash mismatch; self-healing (returning None)"
+            );
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+
+    async fn rebuild_signed_wire_index(&self) -> Result<u64, crate::federation::Error> {
+        let triples = crate::federation::wire_index::all_kind_hash_keys(self).await?;
+        let count = triples.len() as u64;
+        let conn = self.conn.clone();
+        (move || -> Result<(), rusqlite::Error> {
+            let conn = conn.lock();
+            for (kind, hash, record_key) in &triples {
+                sqlite_upsert_wire_index(&conn, kind, hash, record_key)?;
+            }
+            Ok(())
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("rebuild_signed_wire_index: {e}"))
+        })?;
+        Ok(count)
+    }
+
     async fn attach_key_pqc_signature(
         &self,
         key_id: &str,
@@ -6962,6 +7562,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let scrub_key = scrub_key_id.to_owned();
         let ts = now.to_rfc3339();
         let pqc_completed = row.pqc_completed_at.map(|t| t.to_rfc3339());
+        let new_hash_for_db = new_hash.clone();
         let n = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
@@ -6978,12 +7579,135 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_key,
                     ts,
                     pqc_completed,
-                    new_hash,
+                    new_hash_for_db,
                     id
                 ],
             )
         })()
         .map_err(|e| crate::federation::Error::Backend(format!("promote_attestation: {e}")))?;
+        if n == 0 {
+            return Err(crate::federation::Error::Conflict(format!(
+                "federation_attestations row {attestation_id} was concurrently promoted"
+            )));
+        }
+        // v21.1.0 (CIRISPersist#507b) — the promoted row is now
+        // federation-tier and therefore wire-servable; index it under the
+        // SAME post-promotion shape `list_attestations_since` will read back
+        // (`persist_row_hash` = the newly-stamped `new_hash`, not the
+        // pre-promotion value still on `row`).
+        {
+            row.persist_row_hash = new_hash;
+            let wire_index_key = crate::federation::wire_index::record_key(&[(
+                "attestation_id",
+                &row.attestation_id,
+            )]);
+            let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
+            let conn = self.conn.clone();
+            (move || -> Result<(), rusqlite::Error> {
+                let conn = conn.lock();
+                sqlite_upsert_wire_index(&conn, "Attestation", &wire_index_hash, &wire_index_key)
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("promote_attestation wire index: {e}"))
+            })?;
+        }
+        // v17.4.0 (V106) — projection: the promoted row is now federation-tier.
+        {
+            let conn = self.conn.clone();
+            let id = attestation_id.to_owned();
+            (move || -> Result<(), rusqlite::Error> {
+                let conn = conn.lock();
+                conn.execute(
+                    "UPDATE attestation_subjects SET tier = 'federation' WHERE attestation_id = ?1",
+                    rusqlite::params![id],
+                )?;
+                Ok(())
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("promote_attestation projection: {e}"))
+            })?;
+        }
+        Ok(true)
+    }
+
+    async fn promote_attestation_transformed(
+        &self,
+        attestation_id: &str,
+        envelope_json: &serde_json::Value,
+        scrub_signature_classical: &str,
+        scrub_signature_pqc: Option<&str>,
+        original_content_hash_hex: &str,
+        scrub_key_id: &str,
+        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::types::attestation_tier;
+        // Load + tier-check + stamp the row's promoted shape (with the
+        // STRIPPED envelope substituted) so we can recompute
+        // persist_row_hash over the post-promotion fields — same shape as
+        // `promote_attestation`, plus the envelope overwrite (#510 P1).
+        let mut row = self.get_attestation(attestation_id).await?.ok_or_else(|| {
+            crate::federation::Error::InvalidArgument(format!(
+                "federation_attestations row {attestation_id} does not exist"
+            ))
+        })?;
+        if row.tier == attestation_tier::FEDERATION {
+            return Ok(false); // idempotent: already promoted / native-federation
+        }
+        let och = hex::decode(original_content_hash_hex).map_err(|e| {
+            crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
+        })?;
+        let now = scrub_timestamp;
+        row.attestation_envelope = envelope_json.clone();
+        row.original_content_hash = original_content_hash_hex.to_owned();
+        row.scrub_signature_classical = scrub_signature_classical.to_owned();
+        row.scrub_signature_pqc = scrub_signature_pqc.map(|s| s.to_owned());
+        row.scrub_key_id = scrub_key_id.to_owned();
+        row.scrub_timestamp = now;
+        row.pqc_completed_at = scrub_signature_pqc.map(|_| now);
+        row.tier = attestation_tier::FEDERATION.to_string();
+        row.promoted_at = Some(now);
+        let mut for_hash = row.clone();
+        for_hash.persist_row_hash = String::new();
+        let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        // Stamp the row's final served shape now (the wire-index hook below
+        // hashes `row`; `new_hash` itself moves into the UPDATE closure).
+        row.persist_row_hash = new_hash.clone();
+
+        let envelope_text = serde_json::to_string(&row.attestation_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
+
+        let conn = self.conn.clone();
+        let id = attestation_id.to_owned();
+        let classical = scrub_signature_classical.to_owned();
+        let pqc = scrub_signature_pqc.map(|s| s.to_owned());
+        let scrub_key = scrub_key_id.to_owned();
+        let ts = now.to_rfc3339();
+        let pqc_completed = row.pqc_completed_at.map(|t| t.to_rfc3339());
+        let n = (move || -> Result<usize, rusqlite::Error> {
+            let conn = conn.lock();
+            conn.execute(
+                "UPDATE federation_attestations \
+                 SET attestation_envelope = ?1, original_content_hash = ?2, \
+                     scrub_signature_classical = ?3, scrub_signature_pqc = ?4, \
+                     scrub_key_id = ?5, scrub_timestamp = ?6, pqc_completed_at = ?7, \
+                     persist_row_hash = ?8, tier = 'federation', promoted_at = ?6 \
+                 WHERE attestation_id = ?9 AND tier = 'local'",
+                rusqlite::params![
+                    envelope_text,
+                    och,
+                    classical,
+                    pqc,
+                    scrub_key,
+                    ts,
+                    pqc_completed,
+                    new_hash,
+                    id
+                ],
+            )
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("promote_attestation_transformed: {e}"))
+        })?;
         if n == 0 {
             return Err(crate::federation::Error::Conflict(format!(
                 "federation_attestations row {attestation_id} was concurrently promoted"
@@ -7002,7 +7726,32 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 Ok(())
             })()
             .map_err(|e| {
-                crate::federation::Error::Backend(format!("promote_attestation projection: {e}"))
+                crate::federation::Error::Backend(format!(
+                    "promote_attestation_transformed projection: {e}"
+                ))
+            })?;
+        }
+        // v21.2.0 (#507 × #510) — the transformed promotion CHANGES the
+        // served bytes (stripped envelope + new sigs + new persist_row_hash),
+        // so the wire index must be refreshed under the NEW content hash —
+        // same hook as `promote_attestation`. The stale pre-transform hash
+        // entry (if any) self-heals via the defensive re-hash on read.
+        // (`row.persist_row_hash` was stamped to the new hash above.)
+        {
+            let wire_index_key = crate::federation::wire_index::record_key(&[(
+                "attestation_id",
+                &row.attestation_id,
+            )]);
+            let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
+            let conn = self.conn.clone();
+            (move || -> Result<(), rusqlite::Error> {
+                let conn = conn.lock();
+                sqlite_upsert_wire_index(&conn, "Attestation", &wire_index_hash, &wire_index_key)
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "promote_attestation_transformed wire index: {e}"
+                ))
             })?;
         }
         Ok(true)
@@ -12095,6 +12844,24 @@ fn sqlite_row_to_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Tr
             pqc_key_id: row.get("pqc_key_id")?,
         },
     ))
+}
+
+/// v21.1.0 (CIRISPersist#507b) — upsert one `(kind, content_hash) ->
+/// record_key` row into `signed_wire_index`. Shared by every signed-record
+/// write chokepoint's post-write hook and by `rebuild_signed_wire_index`.
+fn sqlite_upsert_wire_index(
+    conn: &rusqlite::Connection,
+    kind: &str,
+    content_hash: &str,
+    record_key: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO signed_wire_index (kind, content_hash, record_key) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT(kind, content_hash) DO UPDATE SET record_key = excluded.record_key",
+        rusqlite::params![kind, content_hash, record_key],
+    )?;
+    Ok(())
 }
 
 fn sqlite_row_to_key_record(
@@ -18425,8 +19192,14 @@ mod tests {
     /// the sole `subject_key_ids` entry.
     fn consent_grant(id: &str, node: &str, peer: &str) -> Attestation {
         let mut g = fed_attestation(id, node, node, node);
+        // v21.3.0 (CIRISPersist#510 P1) — a `consent:replication:v1` row
+        // now admits through the closed-grammar gate; this E7 fixture
+        // needs a minimally-valid `payload` (its content is irrelevant to
+        // this test, which exercises the peer-set fold, not grammar
+        // semantics).
         g.attestation_envelope = serde_json::json!({
             "dimension": crate::federation::consent_peer_set::DIMENSION,
+            "payload": {"grants": "replication", "attestation_prefixes": ["e7-fixture:"]},
         });
         g.subject_key_ids = vec![peer.to_string()];
         resign_fed(&mut g); // envelope changed → re-sign (CC 5.3.2.4.3.1)
@@ -18498,6 +19271,41 @@ mod tests {
         crate::federation::consent_peer_set::test_support::exercise_consent_peer_set_fold(
             &backend,
             "sqlite-parity",
+        )
+        .await;
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — the sqlite leg of the shared
+    /// backend-parity witness for the three new #509 methods (see
+    /// `postgres::tests::consent_509_backend_methods_parity_postgres`);
+    /// both call the SAME
+    /// `consent_peer_set::test_support::exercise_509_backend_methods`
+    /// body, so sqlite and postgres cannot silently diverge.
+    #[tokio::test]
+    async fn consent_509_backend_methods_parity_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::consent_peer_set::test_support::exercise_509_backend_methods(
+            &backend,
+            "sqlite-509-parity",
+        )
+        .await;
+    }
+
+    /// v21.3.0 (CIRISPersist#510 P1) — the sqlite leg of the shared
+    /// closed-consent-grammar admission-rejection witness (see
+    /// `postgres::tests::consent_grammar_admission_rejections_postgres_510`
+    /// and `memory::tests::consent_grant_admission_rejects_closed_grammar_
+    /// violations_510`); all three call/mirror the SAME
+    /// `consent_grammar::test_support::exercise_510_admission_rejections`
+    /// body, so no backend can silently diverge on the closed grammar.
+    #[tokio::test]
+    async fn consent_grammar_admission_rejections_sqlite_510() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::consent_grammar::test_support::exercise_510_admission_rejections(
+            &backend,
+            "sqlite-510-parity",
         )
         .await;
     }
@@ -24745,6 +25553,484 @@ mod tests {
             serde_json::to_vec(&rows[0]).unwrap(),
             "returned SignedCommunityMembershipRevocation must be byte-identical to what was put"
         );
+    }
+
+    // ─── v21.1.0 (CIRISPersist#507c) — the 5 PRIMARY-plane signed-since-
+    //     cursor bulk read witnesses. Each: signed-put one record via REAL
+    //     hybrid signing (never hand-faked), assert `list_*_since(None, 100)`
+    //     returns it byte-exact, and assert `since == the row's own cursor`
+    //     excludes it (strict `>`).
+
+    /// `list_signed_key_records_since` returns exactly the one registered
+    /// `SignedKeyRecord`, byte-identical to the stored row.
+    #[tokio::test]
+    async fn list_signed_key_records_since_507c() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let key = fed_key("kr507-key", "acme", "kr507-key");
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: key.clone(),
+            })
+            .await
+            .unwrap();
+
+        let rows = backend
+            .list_signed_key_records_since(None, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let mut expect = key;
+        expect.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(&expect).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&SignedKeyRecord {
+                record: expect.clone()
+            })
+            .unwrap(),
+            serde_json::to_vec(&rows[0]).unwrap(),
+            "returned SignedKeyRecord must be byte-identical to the stored row"
+        );
+
+        let excluded = backend
+            .list_signed_key_records_since(Some(expect.scrub_timestamp), 100)
+            .await
+            .unwrap();
+        assert!(excluded.is_empty(), "since == cursor must exclude the row");
+    }
+
+    /// `list_attestations_since` returns exactly the one federation-tier
+    /// attestation (federation-TIER ROWS ONLY, the E5 invariant) and excludes
+    /// a local-tier row.
+    #[tokio::test]
+    async fn list_attestations_since_507c() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["att507-a", "att507-b"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "acme", k),
+                })
+                .await
+                .unwrap();
+        }
+        let row = fed_attestation("att507-1", "att507-a", "att507-b", "att507-a");
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .unwrap();
+
+        // Local-tier row must never appear (E5 invariant).
+        backend
+            .attestation_upsert_local(local_input(
+                "att507-a",
+                crate::federation::types::attestation_type::SCORES,
+                "identity_binding:v1",
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let rows = backend.list_attestations_since(None, 100).await.unwrap();
+        assert_eq!(rows.len(), 1, "local-tier row must be excluded (E5)");
+        let expect = backend
+            .get_attestation(&row.attestation_id)
+            .await
+            .unwrap()
+            .expect("stored attestation");
+        assert_eq!(
+            serde_json::to_vec(&expect).unwrap(),
+            serde_json::to_vec(&rows[0]).unwrap(),
+            "returned Attestation must be byte-identical to the stored row"
+        );
+
+        let excluded = backend
+            .list_attestations_since(Some(expect.asserted_at), 100)
+            .await
+            .unwrap();
+        assert!(excluded.is_empty(), "since == cursor must exclude the row");
+    }
+
+    /// `list_signed_identity_occurrences_since` returns exactly the one
+    /// signed-put occurrence, byte-identical (including the detached
+    /// signature container), and the since-cursor excludes it at
+    /// `since == asserted_at`.
+    #[tokio::test]
+    async fn list_signed_identity_occurrences_since_507c() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
+        use ciris_verify_core::self_at_login::HybridSigningIdentity;
+        use ciris_verify_core::transport_binding::{
+            compute_destination_hash, produce_signed_identity_occurrence,
+        };
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let signer = Box::new(HybridSigningIdentity::new(
+            "io507-id",
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let member = signer.directory_member().unwrap();
+        let mut id_rec = fed_key("io507-id", "acme", "io507-id");
+        id_rec.pubkey_ed25519_base64 = member.ed25519_public_key_base64.clone();
+        id_rec.pubkey_ml_dsa_65_base64 = member.mldsa65_public_key_base64.clone();
+        backend
+            .put_public_key(SignedKeyRecord { record: id_rec })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("io507-occ", "acme", "io507-occ"),
+            })
+            .await
+            .unwrap();
+
+        let transport_ed = [0x41u8; 32];
+        let transport_x = [0x42u8; 32];
+        let content_x = [0x43u8; 32];
+        let app = "ciris.federation";
+        let aspects = vec!["announce".to_string(), "v1".to_string()];
+        let dest_hash =
+            compute_destination_hash(app, &aspects, &transport_x, &transport_ed).unwrap();
+        let envelope = serde_json::json!({
+            "identity_key_id": "io507-id",
+            "occurrence_key_id": "io507-occ",
+            "transport_destination": {
+                "reticulum_x25519_pubkey": B64.encode(transport_x),
+                "reticulum_ed25519_pubkey": B64.encode(transport_ed),
+                "destination_hash": B64.encode(dest_hash),
+                "app_name": app,
+                "aspects": aspects,
+            },
+            "encryption_pubkeys": {
+                "x25519_base64": B64.encode(content_x),
+                "ml_kem_768_base64": B64.encode(vec![0x44u8; 1184]),
+            },
+            "asserted_at": "2026-06-10T00:00:00.000Z",
+        });
+        let (signed_envelope, signature) =
+            produce_signed_identity_occurrence(signer.as_ref(), envelope)
+                .await
+                .unwrap();
+        let signed = crate::federation::SignedIdentityOccurrence {
+            identity_occurrence: crate::federation::IdentityOccurrence {
+                identity_key_id: "io507-id".into(),
+                occurrence_key_id: "io507-occ".into(),
+                device_class: crate::federation::types::device_class::AGENT.into(),
+                hardware_attestation: None,
+                asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
+                    x25519_base64: B64.encode(content_x),
+                    ml_kem_768_base64: B64.encode(vec![0x44u8; 1184]),
+                }),
+                transport_binding: Some(crate::federation::types::OccurrenceTransportBinding {
+                    reticulum_x25519_pubkey_base64: B64.encode(transport_x),
+                    reticulum_ed25519_pubkey_base64: B64.encode(transport_ed),
+                    destination_hash_base64: B64.encode(dest_hash),
+                    app_name: app.into(),
+                    aspects: aspects.clone(),
+                }),
+                persist_row_hash: String::new(),
+            },
+            attesting_key_id: "io507-id".to_string(),
+            signed_envelope,
+            signature,
+        };
+        backend
+            .put_identity_occurrence(signed.clone())
+            .await
+            .expect("genuinely-signed occurrence must be admitted");
+
+        let rows = backend
+            .list_signed_identity_occurrences_since(None, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let mut expect = signed;
+        expect.identity_occurrence.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(&expect.identity_occurrence)
+                .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&expect).unwrap(),
+            serde_json::to_vec(&rows[0]).unwrap(),
+            "returned SignedIdentityOccurrence must be byte-identical to what was put"
+        );
+
+        let excluded = backend
+            .list_signed_identity_occurrences_since(
+                Some(expect.identity_occurrence.asserted_at),
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(excluded.is_empty(), "since == cursor must exclude the row");
+    }
+
+    /// `list_signed_transport_destinations_since` returns exactly the one
+    /// signed-put route, byte-identical to the submitted `signed` (the
+    /// stored row is byte-identical to it by construction).
+    #[tokio::test]
+    async fn list_signed_transport_destinations_since_507c() {
+        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
+        use ciris_verify_core::self_at_login::HybridSigningIdentity;
+        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let signer = Box::new(HybridSigningIdentity::new(
+            "td507-occ",
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let member = signer.directory_member().unwrap();
+        let mut occ_rec = fed_key("td507-occ", "acme", "td507-occ");
+        occ_rec.pubkey_ed25519_base64 = member.ed25519_public_key_base64.clone();
+        occ_rec.pubkey_ml_dsa_65_base64 = member.mldsa65_public_key_base64.clone();
+        backend
+            .put_public_key(SignedKeyRecord { record: occ_rec })
+            .await
+            .unwrap();
+
+        let dest = crate::federation::self_at_login::TransportDestination {
+            occurrence_key_id: "td507-occ".into(),
+            transport_kind: "reticulum".into(),
+            destination: "td507-dest".into(),
+            asserted_at: "2026-06-10T00:00:00Z".parse().unwrap(),
+            last_seen_at: None,
+            transport_ed25519_pubkey_base64: None,
+            transport_x25519_pubkey_base64: None,
+            binding_provenance: crate::federation::self_at_login::BindingProvenance::Rooted,
+            epoch: 0,
+            retired_at: None,
+        };
+        let (signed_envelope, signature) = produce_signed_identity_occurrence(
+            signer.as_ref(),
+            serde_json::to_value(&dest).unwrap(),
+        )
+        .await
+        .unwrap();
+        let signed = crate::federation::SignedTransportDestination {
+            transport_destination: dest,
+            attesting_key_id: "td507-occ".into(),
+            signed_envelope,
+            signature,
+        };
+        assert_eq!(
+            backend
+                .put_signed_transport_destination(&signed)
+                .await
+                .unwrap(),
+            crate::federation::TransportDestinationApplyOutcome::Inserted
+        );
+
+        let rows = backend
+            .list_signed_transport_destinations_since(None, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            serde_json::to_vec(&signed).unwrap(),
+            serde_json::to_vec(&rows[0]).unwrap(),
+            "returned SignedTransportDestination must be byte-identical to what was put"
+        );
+
+        let excluded = backend
+            .list_signed_transport_destinations_since(
+                Some(signed.transport_destination.asserted_at),
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(excluded.is_empty(), "since == cursor must exclude the row");
+    }
+
+    /// `list_signed_identity_occurrence_revocations_since` returns exactly
+    /// the one signed-put revocation, byte-identical to what was submitted.
+    #[tokio::test]
+    async fn list_signed_identity_occurrence_revocations_since_507c() {
+        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
+        use ciris_verify_core::self_at_login::HybridSigningIdentity;
+        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let alice = Box::new(HybridSigningIdentity::new(
+            "ior507-id",
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let member = alice.directory_member().unwrap();
+        let mut id_rec = fed_key("ior507-id", "acme", "ior507-id");
+        id_rec.pubkey_ed25519_base64 = member.ed25519_public_key_base64.clone();
+        id_rec.pubkey_ml_dsa_65_base64 = member.mldsa65_public_key_base64.clone();
+        backend
+            .put_public_key(SignedKeyRecord { record: id_rec })
+            .await
+            .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fed_key("ior507-occ", "acme", "ior507-occ"),
+            })
+            .await
+            .unwrap();
+        // The occurrence itself rides the trusted-local path (the occurrence
+        // gate has its own dedicated adversarial tests); the revocation write
+        // goes through `put_identity_occurrence_revocation`'s REAL gate.
+        backend
+            .put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+                identity_key_id: "ior507-id".into(),
+                occurrence_key_id: "ior507-occ".into(),
+                device_class: crate::federation::types::device_class::AGENT.into(),
+                hardware_attestation: None,
+                asserted_at: "2026-06-08T00:00:00Z".parse().unwrap(),
+                valid_until: None,
+                encryption_pubkeys: None,
+                transport_binding: None,
+                persist_row_hash: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let rev_env = serde_json::json!({
+            "identity_key_id": "ior507-id",
+            "occurrence_key_id": "ior507-occ",
+            "revoked_at": "2026-06-10T00:00:00Z",
+            "effective_at": "2026-06-10T00:00:00Z",
+        });
+        let (signed_envelope, signature) =
+            produce_signed_identity_occurrence(alice.as_ref(), rev_env)
+                .await
+                .unwrap();
+        let signed = crate::federation::SignedIdentityOccurrenceRevocation {
+            identity_occurrence_revocation: crate::federation::IdentityOccurrenceRevocation {
+                identity_key_id: "ior507-id".into(),
+                occurrence_key_id: "ior507-occ".into(),
+                revoked_at: "2026-06-10T00:00:00Z".parse().unwrap(),
+                effective_at: "2026-06-10T00:00:00Z".parse().unwrap(),
+                reason: None,
+                witness_set: vec![],
+                persist_row_hash: String::new(),
+            },
+            attesting_key_id: "ior507-id".into(),
+            signed_envelope,
+            signature,
+        };
+        backend
+            .put_identity_occurrence_revocation(signed.clone())
+            .await
+            .expect("genuinely-signed self-revocation must be admitted");
+
+        let rows = backend
+            .list_signed_identity_occurrence_revocations_since(None, 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let mut expect = signed;
+        expect.identity_occurrence_revocation.persist_row_hash =
+            crate::federation::types::compute_persist_row_hash(
+                &expect.identity_occurrence_revocation,
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&expect).unwrap(),
+            serde_json::to_vec(&rows[0]).unwrap(),
+            "returned SignedIdentityOccurrenceRevocation must be byte-identical to what was put"
+        );
+
+        let excluded = backend
+            .list_signed_identity_occurrence_revocations_since(
+                Some(expect.identity_occurrence_revocation.revoked_at),
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(excluded.is_empty(), "since == cursor must exclude the row");
+    }
+
+    // ─── v21.1.0 (CIRISPersist#507b) — the content-hash point-read + full-
+    //     rebuild witnesses.
+
+    /// Put a signed family → `lookup_signed_record_by_content_hash` finds it
+    /// by the hash computed the same way (`content_hash_of`), an unknown
+    /// hash returns `None`, and `rebuild_signed_wire_index` reindexes after
+    /// a manual index-row delete.
+    #[tokio::test]
+    async fn signed_wire_index_point_read_and_rebuild_507b() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        for k in ["wi507-auth", "wi507-member"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fed_key(k, "acme", k),
+                })
+                .await
+                .unwrap();
+        }
+        let signed = crate::federation::tier_ingest::test_support::sign_family(
+            "wi507-auth",
+            fed_family(
+                "wi507-family",
+                "507 Household",
+                vec!["wi507-member"],
+                crate::federation::types::consensus_protocol::FOUNDER_ONLY,
+            ),
+        );
+        backend.put_family(signed.clone()).await.unwrap();
+
+        let rows = backend.list_signed_families_since(None, 100).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let content_hash = crate::federation::wire_index::content_hash_of(&rows[0]).unwrap();
+        let expected_bytes = serde_json::to_vec(&rows[0]).unwrap();
+
+        let hit = backend
+            .lookup_signed_record_by_content_hash("Family", &content_hash)
+            .await
+            .unwrap()
+            .expect("indexed at put_family");
+        assert_eq!(
+            hit, expected_bytes,
+            "point-read must return byte-exact bytes"
+        );
+
+        // Unknown hash → None.
+        assert!(backend
+            .lookup_signed_record_by_content_hash("Family", "0000000000000000")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Manually delete the index row, then rebuild.
+        {
+            let conn = backend.conn.lock();
+            conn.execute(
+                "DELETE FROM signed_wire_index WHERE kind = 'Family' AND content_hash = ?1",
+                rusqlite::params![content_hash],
+            )
+            .unwrap();
+        }
+        assert!(
+            backend
+                .lookup_signed_record_by_content_hash("Family", &content_hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "the manual delete must have taken effect"
+        );
+        let indexed = backend.rebuild_signed_wire_index().await.unwrap();
+        assert!(indexed >= 1, "rebuild must index at least the family row");
+        let rehit = backend
+            .lookup_signed_record_by_content_hash("Family", &content_hash)
+            .await
+            .unwrap()
+            .expect("rebuild_signed_wire_index must reindex the row");
+        assert_eq!(rehit, expected_bytes);
     }
 
     /// consensus_protocol that doesn't parse into a canonical shape is

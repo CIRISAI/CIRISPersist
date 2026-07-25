@@ -44,6 +44,7 @@ pub mod capacity;
 pub mod cohort;
 pub mod community_dek;
 pub mod consent;
+pub mod consent_grammar;
 pub mod consent_peer_set;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
@@ -92,6 +93,23 @@ pub struct TraceBackfillReport {
     pub skipped: Vec<(String, String)>,
 }
 
+/// v21.2.0 (CIRISPersist#509 FLOOR) — one
+/// [`crate::Engine::promote_consented_backlog`] sweep's tally: local-tier
+/// attestations promoted to federation tier (their dimension was covered
+/// by a LIVE self-authored `consent:replication:v1` grant) vs. skipped
+/// (an `attestation_promote` error on that ONE row — logged via
+/// `tracing::warn!` and counted, never wedging the rest of the sweep;
+/// the same honest-accounting posture [`TraceBackfillReport`]
+/// established for the #478 backfill).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ConsentSweepReport {
+    /// Local-tier attestations promoted to federation tier this sweep.
+    pub promoted: u64,
+    /// Local-tier attestations that matched a live grant's prefix set
+    /// but failed to promote (logged, never aborting the sweep).
+    pub skipped: u64,
+}
+
 pub mod register;
 pub mod replication;
 pub mod replication_policy;
@@ -112,6 +130,10 @@ pub mod hard_case;
 pub mod self_at_login;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_open;
+// CIRISPersist#507b — the shared signed-wire content-hash index
+// (V111 `signed_wire_index`): content-hash + record-key helpers every
+// backend's signed-record write chokepoint calls.
+pub mod wire_index;
 // v4.1 (CIRISPersist#142 Cut C2) — streaming-chunk AES-256-GCM + STREAM
 // nonce. Gated on `secrets`: routes through that feature's
 // `secrets::crypto` facade (MISSION §1.4 sole symmetric-crypto site).
@@ -703,6 +725,70 @@ pub trait FederationDirectory: Send + Sync {
         let _ = node_key_id;
         Err(Error::Unsupported {
             method: "list_consent_peers",
+        })
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — `node_key_id`'s LIVE
+    /// `consent:replication:v1` grants it authored about ITSELF
+    /// (`attesting_key_id = node_key_id`): rows whose envelope dimension
+    /// is [`consent_peer_set::DIMENSION`] AND that still have a
+    /// `consent_peer_set` row sourced from them (`source_attestation_id
+    /// = attestation_id`) — i.e. NOT folded by a subsequent
+    /// `withdraws`/`recants`. The E7 revocation fold already ran at
+    /// write time ([`consent_peer_set`]'s projection maintenance); this
+    /// method never re-derives it, only reads the result. Feeds
+    /// [`crate::Engine::promote_consented_backlog`]'s prefix union.
+    /// Default `Unsupported`; sqlite/postgres/memory override.
+    async fn list_live_consent_grants_by(
+        &self,
+        node_key_id: &str,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = node_key_id;
+        Err(Error::Unsupported {
+            method: "list_live_consent_grants_by",
+        })
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — a plain keyset cursor over
+    /// `local`-tier attestations, ascending `attestation_id`:
+    /// [`crate::Engine::promote_consented_backlog`]'s page source.
+    /// `after_attestation_id = None` starts from the beginning;
+    /// `Some(id)` resumes strictly after it (`attestation_id > after`,
+    /// lexical string ordering — a stable resumption point, not a
+    /// chronological one). Backends order + page: `ORDER BY
+    /// attestation_id ASC LIMIT limit`. Default `Unsupported`;
+    /// sqlite/postgres/memory override.
+    async fn list_local_tier_attestations(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = (after_attestation_id, limit);
+        Err(Error::Unsupported {
+            method: "list_local_tier_attestations",
+        })
+    }
+
+    /// v21.2.0 (CIRISPersist#509 FLOOR) — stamp a NEW `cohort_scope` onto
+    /// an EXISTING attestation row: the promote-on-consent write-back
+    /// ([`crate::Engine::promote_consented_backlog`] flips a
+    /// freshly-promoted row's `cohort_scope` to
+    /// [`types::cohort_scope::FEDERATION`] right after
+    /// [`crate::Engine::attestation_promote`] has hybrid-signed it).
+    /// `cohort_scope` MUST be one of the closed-set values
+    /// ([`types::cohort_scope::is_valid`]) — implementations validate
+    /// before writing and reject an out-of-set value with
+    /// `InvalidArgument`. Also `InvalidArgument` if `attestation_id`
+    /// does not exist. Default `Unsupported`; sqlite/postgres/memory
+    /// override.
+    async fn set_attestation_cohort_scope(
+        &self,
+        attestation_id: &str,
+        cohort_scope: &str,
+    ) -> Result<(), Error> {
+        let _ = (attestation_id, cohort_scope);
+        Err(Error::Unsupported {
+            method: "set_attestation_cohort_scope",
         })
     }
 
@@ -1578,6 +1664,170 @@ pub trait FederationDirectory: Send + Sync {
         since: Option<chrono::DateTime<chrono::Utc>>,
         limit: u32,
     ) -> Result<Vec<SignedCommunityMembershipRevocation>, Error>;
+
+    // ─── v21.1.0 (CIRISPersist#507c) — bulk signed-since reads for the 5
+    //     PRIMARY signed planes (edge advertise/serve bridge; extends the
+    //     #504 pattern past the E4 keyless-declaration set). Signed-only
+    //     per plane, but the concrete "signed" test differs by shape —
+    //     these 5 planes carry their signature material three different
+    //     ways: inline on the row (`Key`/`Attestation`, both share the
+    //     `KeyRecord`-style scrub-signature fields), in a sibling nullable
+    //     detached-signature container (`IdentityOccurrence`,
+    //     `IdentityOccurrenceRevocation`, `TransportDestination`), or —
+    //     for `federation_keys` specifically — always-required so no
+    //     filter applies at all.
+
+    /// v21.1.0 (CIRISPersist#507c) — bulk-list [`SignedKeyRecord`] wrappers
+    /// (one per `federation_keys` row) since a cursor. `since` filters on
+    /// `scrub_timestamp > since` (`None` = from the start — `scrub_timestamp`
+    /// is the row's registration time, when its scrub-signature was issued);
+    /// rows are ordered by `(scrub_timestamp ASC, key_id ASC)` so the cursor
+    /// is a stable resumption point, mirroring
+    /// [`Self::list_organizations_since`]. `limit` caps the page.
+    ///
+    /// **Every row qualifies.** Unlike the #504 keyless planes,
+    /// `federation_keys.scrub_signature_classical` is `NOT NULL` — a key
+    /// registration cannot be admitted unsigned, so there is no
+    /// legitimately-unsigned shape to filter out here. [`KeyRecord`] already
+    /// carries its own scrub-signature fields inline (it IS the signed
+    /// wrapper for read purposes); [`SignedKeyRecord`] exists only so the
+    /// write-input and bulk-read shapes match (`{ record: KeyRecord }`).
+    async fn list_signed_key_records_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedKeyRecord>, Error>;
+
+    /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
+    /// [`SignedIdentityOccurrence`] wrappers (row + the detached
+    /// `{attesting_key_id, signed_envelope, signature}` container V102
+    /// added) since a cursor — the bulk-read mirror of
+    /// [`Self::list_signed_identity_occurrences_for`] (which is per-subject).
+    /// `since` filters on `asserted_at > since`; rows are ordered by
+    /// `(asserted_at ASC, identity_key_id ASC, occurrence_key_id ASC)`.
+    /// `limit` caps the page.
+    ///
+    /// **Signed rows only**: a [`Self::put_identity_occurrence_local`]
+    /// trusted-local row (NULL signature columns) is never emitted — same
+    /// contract as the per-subject read.
+    async fn list_signed_identity_occurrences_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedIdentityOccurrence>, Error>;
+
+    /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
+    /// [`self_at_login::SignedTransportDestination`] wrappers since a
+    /// cursor — the bulk-read mirror of
+    /// [`Self::list_signed_transport_destinations_for`]. `since` filters on
+    /// `asserted_at > since`; rows are ordered by `(asserted_at ASC,
+    /// occurrence_key_id ASC, transport_kind ASC)`. `limit` caps the page.
+    ///
+    /// **Signed rows only** (trusted-local NULL-signature rows omitted).
+    /// RETIRED rows ARE included — tombstones must gossip, matching
+    /// [`Self::list_signed_transport_destinations_for`].
+    async fn list_signed_transport_destinations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<self_at_login::SignedTransportDestination>, Error>;
+
+    /// v21.2.0 (CIRISPersist#507c) — bulk-list [`Attestation`] rows since a
+    /// cursor, **federation tier only** (`WHERE tier = 'federation'`) — the
+    /// E5 invariant: a `local`-tier row is producer-only-authority and must
+    /// never reach the advertise/serve wire surface (see
+    /// [`replication_policy::WireTier`]).
+    ///
+    /// The cursor is the **visibility timestamp**
+    /// `COALESCE(promoted_at, asserted_at)` — filtered `> since`, ordered
+    /// `(visibility ASC, attestation_id ASC)`, mirroring
+    /// [`Self::list_organizations_since`] otherwise. `asserted_at` alone
+    /// would be wrong here (unlike every other `_since` read): a
+    /// consent-promoted row (#509) becomes federation-visible at
+    /// `promoted_at`, possibly long after it was asserted — a pure-delta
+    /// consumer cursoring past its `asserted_at` would otherwise never see
+    /// it. `limit` caps the page.
+    ///
+    /// The `Attestation` row carries its own hybrid scrub-signature fields
+    /// inline (same shape as [`KeyRecord`]) — it IS the signed wrapper; no
+    /// separate `SignedAttestation`-shaped read type exists for the bulk
+    /// surface (`SignedAttestation` is write-input-only, `{ attestation:
+    /// Attestation }`).
+    async fn list_attestations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error>;
+
+    /// v21.1.0 (CIRISPersist#507c) — bulk-list the full
+    /// [`SignedIdentityOccurrenceRevocation`] wrappers since a cursor — the
+    /// bulk-read mirror of
+    /// [`Self::list_signed_identity_occurrence_revocations_for`]. `since`
+    /// filters on `revoked_at > since`; rows are ordered by `(revoked_at ASC,
+    /// identity_key_id ASC, occurrence_key_id ASC)`. `limit` caps the page.
+    ///
+    /// **Signed rows only** (trusted-local NULL-signature rows omitted),
+    /// same contract as the per-subject read.
+    async fn list_signed_identity_occurrence_revocations_since(
+        &self,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        limit: u32,
+    ) -> Result<Vec<SignedIdentityOccurrenceRevocation>, Error>;
+
+    // ─── v21.1.0 (CIRISPersist#507b) — the shared signed-wire content-hash
+    //     index (V111 `signed_wire_index`). One shared table covers every
+    //     kind edge serves: the 5 primary planes above, the 5 #504 E4
+    //     keyless planes, and the org/org_membership/partner_record trio —
+    //     13 of the 14 `EnvelopeKind`s (`Revocation`, the key-level
+    //     revocation plane, is out of #507's scope). See
+    //     [`super::wire_index`] for the shared hash/record-key helpers
+    //     backends call at each signed write chokepoint.
+
+    /// v21.1.0 (CIRISPersist#507b) — **the content-hash point-read.** The
+    /// content hash of a signed record is the lowercase-hex sha256 over the
+    /// exact JSON bytes persist's read surface returns for that record
+    /// (`sha256(serde_json::to_vec(record))` — the SAME value the
+    /// `list_signed_*_since` / [`Self::list_attestations_since`] reads
+    /// return). This is the lockstep fact CIRISEdge's fetch map depends on:
+    /// edge keys its fetch map by `sha256(wire_bytes)` per `(kind, hash)`,
+    /// which makes persist's hash equal edge's BY CONSTRUCTION (both hash
+    /// the same bytes for the same record).
+    ///
+    /// `kind` is the [`replication_policy::EnvelopeKind::as_str`] token.
+    /// Looks up `(kind, content_hash)` in the `signed_wire_index`, reloads
+    /// the record by its stored `record_key`, re-serializes it, and
+    /// DEFENSIVELY recomputes the hash before returning — a mismatch
+    /// (index drift) logs a warning and returns `Ok(None)` rather than
+    /// handing back bytes that don't actually hash to what was asked for
+    /// (self-healing posture: the caller falls back to
+    /// [`Self::rebuild_signed_wire_index`] or a bulk `_since` read).
+    ///
+    /// `Ok(None)` on unknown `(kind, content_hash)` or on a stale/mismatched
+    /// index entry. Default impl errors; backends override.
+    async fn lookup_signed_record_by_content_hash(
+        &self,
+        kind: &str,
+        content_hash: &str,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let _ = (kind, content_hash);
+        Err(Error::Backend(
+            "lookup_signed_record_by_content_hash not implemented for this backend".into(),
+        ))
+    }
+
+    /// v21.1.0 (CIRISPersist#507b) — full rebuild of the `signed_wire_index`:
+    /// scans every covered kind's current rows, recomputes each hash, and
+    /// upserts `(kind, content_hash, record_key)`. Returns the count of rows
+    /// indexed. This is the upgrade/backfill path — operators run it once
+    /// post-upgrade (a fresh V111 table starts empty; every write from that
+    /// point forward stays current via the per-put hook, but pre-existing
+    /// rows need this to become point-readable), or CIRISEdge triggers it on
+    /// adoption. Default impl errors; backends override.
+    async fn rebuild_signed_wire_index(&self) -> Result<u64, Error> {
+        Err(Error::Backend(
+            "rebuild_signed_wire_index not implemented for this backend".into(),
+        ))
+    }
 
     /// v4.8.0 (#161 Ask 2) — occurrences of `identity_key_id` that are
     /// **currently active**: admitted AND with no revocation whose
@@ -2798,6 +3048,57 @@ pub trait FederationDirectory: Send + Sync {
         scrub_key_id: &str,
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, Error>;
+
+    /// v21.3.0 (CIRISPersist#510 P1) — the STRIP-then-promote write-back:
+    /// same contract as [`Self::promote_attestation`] (local→federation,
+    /// idempotent, `Err` if absent), except the caller has ALREADY applied
+    /// a covering grant's `StripField` restriction(s) to a CLONE of the
+    /// row's envelope and hybrid-signed THAT stripped canonical — so this
+    /// method additionally overwrites the `attestation_envelope` column
+    /// with `envelope_json` (the stripped shape) in the SAME write as the
+    /// tier flip. `original_content_hash_hex` is the hash of the STRIPPED
+    /// canonical (it is the content actually signed/shipped), not the
+    /// original.
+    ///
+    /// [`crate::Engine::promote_consented_backlog`] calls this INSTEAD of
+    /// [`Self::promote_attestation`] only when the restriction union for a
+    /// row contains at least one `StripField`; with no `StripField`
+    /// restrictions the byte-identical-wire property is preserved by
+    /// continuing to use `promote_attestation` unchanged. The row's full
+    /// PRE-strip form remains queryable via the `trace_events` projection
+    /// (decomposed at ingest/emit time, before any strip is applied), so a
+    /// downstream strip never destroys the substrate's own copy of the
+    /// original content — only the federation-tier envelope this method
+    /// writes back is narrowed.
+    ///
+    /// Default `Unsupported` (the same posture as the #509 FLOOR's three
+    /// new directory methods — this is an engine-internal primitive, not
+    /// wired into the FFI directory capsule); sqlite/postgres/memory
+    /// override.
+    #[allow(clippy::too_many_arguments)]
+    async fn promote_attestation_transformed(
+        &self,
+        attestation_id: &str,
+        envelope_json: &serde_json::Value,
+        scrub_signature_classical: &str,
+        scrub_signature_pqc: Option<&str>,
+        original_content_hash_hex: &str,
+        scrub_key_id: &str,
+        scrub_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, Error> {
+        let _ = (
+            attestation_id,
+            envelope_json,
+            scrub_signature_classical,
+            scrub_signature_pqc,
+            original_content_hash_hex,
+            scrub_key_id,
+            scrub_timestamp,
+        );
+        Err(Error::Unsupported {
+            method: "promote_attestation_transformed",
+        })
+    }
 
     // ── Hybrid-pending sweep (CIRISPersist#11, v0.3.2) ─────────────
     //
