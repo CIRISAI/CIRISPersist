@@ -1732,13 +1732,21 @@ pub trait FederationDirectory: Send + Sync {
         limit: u32,
     ) -> Result<Vec<self_at_login::SignedTransportDestination>, Error>;
 
-    /// v21.1.0 (CIRISPersist#507c) — bulk-list [`Attestation`] rows since a
+    /// v21.2.0 (CIRISPersist#507c) — bulk-list [`Attestation`] rows since a
     /// cursor, **federation tier only** (`WHERE tier = 'federation'`) — the
     /// E5 invariant: a `local`-tier row is producer-only-authority and must
     /// never reach the advertise/serve wire surface (see
-    /// [`replication_policy::WireTier`]). `since` filters on `asserted_at >
-    /// since`; rows are ordered by `(asserted_at ASC, attestation_id ASC)`,
-    /// mirroring [`Self::list_organizations_since`]. `limit` caps the page.
+    /// [`replication_policy::WireTier`]).
+    ///
+    /// The cursor is the **visibility timestamp**
+    /// `COALESCE(promoted_at, asserted_at)` — filtered `> since`, ordered
+    /// `(visibility ASC, attestation_id ASC)`, mirroring
+    /// [`Self::list_organizations_since`] otherwise. `asserted_at` alone
+    /// would be wrong here (unlike every other `_since` read): a
+    /// consent-promoted row (#509) becomes federation-visible at
+    /// `promoted_at`, possibly long after it was asserted — a pure-delta
+    /// consumer cursoring past its `asserted_at` would otherwise never see
+    /// it. `limit` caps the page.
     ///
     /// The `Attestation` row carries its own hybrid scrub-signature fields
     /// inline (same shape as [`KeyRecord`]) — it IS the signed wrapper; no

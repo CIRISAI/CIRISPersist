@@ -10159,6 +10159,62 @@ mod tests {
         assert_eq!(report.skipped, 0);
     }
 
+    /// v21.2.0 (#507 × #509) — the `list_attestations_since` VISIBILITY
+    /// cursor: a consent-promoted row becomes wire-visible at
+    /// `promoted_at`, not `asserted_at`. A pure-delta consumer whose
+    /// cursor already passed the row's `asserted_at` must still see it
+    /// once promotion happens — under an `asserted_at`-only cursor the
+    /// late promotion would be invisible forever.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn promoted_row_appears_in_visibility_delta_507_509() {
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("node-509v");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "node-509v"))
+            .await
+            .expect("seed key");
+
+        let trace_id = sq
+            .attestation_insert_local(build_509_trace_input(&derived, "trace-509v-1"))
+            .await
+            .expect("insert local trace");
+        // The delta cursor sits exactly AT the row's asserted_at — a
+        // strict `>` filter on asserted_at alone would exclude it forever.
+        let since = sq
+            .get_attestation(&trace_id)
+            .await
+            .unwrap()
+            .expect("row")
+            .asserted_at;
+
+        // Ensure promoted_at lands strictly after the cursor even on
+        // coarse clocks, then promote via the (c) hook.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let _grant_id = emit_509_grant(&engine, "peer-509v", &["trace:"]).await;
+        let after = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(
+            after.tier,
+            crate::federation::types::attestation_tier::FEDERATION
+        );
+
+        let delta = sq
+            .list_attestations_since(Some(since), 100)
+            .await
+            .expect("delta read");
+        assert!(
+            delta.iter().any(|a| a.attestation_id == trace_id),
+            "a row promoted after the consumer's cursor passed its asserted_at \
+             must appear in the visibility delta (cursor = COALESCE(promoted_at, \
+             asserted_at))"
+        );
+    }
+
     /// A grant whose `attestation_prefixes` cover an UNRELATED dimension
     /// (`capacity:`) must not promote a `trace:complete:v1` backlog row —
     /// neither via the (c) hook during the grant's own emit, nor via an

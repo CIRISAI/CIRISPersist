@@ -7680,8 +7680,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
                     subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
                  FROM cirislens.federation_attestations \
-                 WHERE ($1::timestamptz IS NULL OR asserted_at > $1) AND tier = 'federation' \
-                 ORDER BY asserted_at ASC, attestation_id ASC LIMIT $2",
+                 WHERE ($1::timestamptz IS NULL OR COALESCE(promoted_at, asserted_at) > $1) \
+                   AND tier = 'federation' \
+                 ORDER BY COALESCE(promoted_at, asserted_at) ASC, attestation_id ASC LIMIT $2",
                 &[&since, &limit],
             )
             .await
@@ -8119,6 +8120,16 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     "promote_attestation_transformed projection: {e}"
                 ))
             })?;
+        // v21.2.0 (#507 × #510) — the transformed promotion CHANGES the
+        // served bytes (stripped envelope + new sigs + new persist_row_hash),
+        // so the wire index must be refreshed under the NEW content hash —
+        // same hook as `promote_attestation`. The stale pre-transform hash
+        // entry (if any) self-heals via the defensive re-hash on read.
+        row.persist_row_hash = new_hash;
+        let wire_index_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
+        pg_upsert_wire_index(&**client, "Attestation", &wire_index_hash, &wire_index_key).await?;
         Ok(true)
     }
 

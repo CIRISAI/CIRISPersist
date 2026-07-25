@@ -5,6 +5,129 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.2.0] — 2026-07-25 — the payload follows the consent edge (#509) + the closed consent grammar (#510 P1) + the hot-path serve reads (#507)
+
+A `trace:complete:v1` attestation is born **local**-tier (producer-only — the
+privacy-correct default), while the owner's `consent:replication:v1` grant lives
+at federation tier. Replication correctly ships only federation-tier objects —
+so the trace never left the device even though the consent edge existed
+(CIRISServer#315, validated by the CIRISAgent ladder). Design gap, not a bug:
+`tier` + `cohort_scope` ARE the edge-scope semantics; the fix makes a producer
+payload inherit its scope FROM the consent edge — at birth or by explicit
+promotion, **never silently at ship time**.
+
+### Added — the consent sweep (#509 (a) + (c) as ONE mechanism)
+
+`Engine::promote_consented_backlog()` — an idempotent sweep: every local-tier
+attestation whose dimension is covered by a LIVE self-authored
+`consent:replication:v1` grant is promoted to federation tier via the existing
+`attestation_promote` primitive (#171: canonicalize → hybrid-sign → tier flip)
+and its row `cohort_scope` set to `federation` (advertisable). Promoted rows
+leave local tier, so the sweep is self-limiting. **Promotion is a projection of
+consent state** — the same one-chokepoint-fans-out shape as the `trace_events`
+projection (#501).
+
+Fired at two chokepoints:
+- **(c) promote-on-consent** — after a **self-authored** grant admits through
+  the `emit_attestation` funnel (the server consent route's path), the matching
+  local backlog promotes. Covers the mobile ordering where the wizard authors
+  consent AFTER the first traces sealed. Warn-not-fail: the grant is durably
+  admitted; a sweep failure self-heals at the next chokepoint (the server route
+  is idempotent-no-op on retry, so a hard error would strand the backlog).
+- **(a) seal-time** — after every ingest batch (PyO3 `receive_and_persist`),
+  the sweep runs: with a live covering grant, a just-sealed trace is
+  federation-tier before the ingest call returns ("born federation").
+
+A replicated **third-party** grant never triggers the sweep — their consent is
+not ours (Registry-of-Record: only OUR OWN grant drives OUR egress).
+
+### Added — `federation::consent_grammar` (the #510 seed)
+
+Reads the grant's existing wire field `payload.attestation_prefixes`
+(JCS-sorted, trailing-colon-significant — CIRISServer peer.rs has written it
+since the grant existed; persist just never read it). Fail-closed: missing/
+malformed → covers nothing; empty-string prefixes skipped (an empty prefix
+would be an accidental total grant). Grant liveness reuses the E7
+`consent_peer_set` projection (a grant is live iff its rows survive the
+revocation fold) — no second folding implementation. The full closed grammar
+(ConsentTransferPolicy, restriction ops, CONSENT_GRAMMAR_HASH) is #510.
+
+### Added — directory surface
+
+Three `FederationDirectory` methods on all three backends (engine-internal
+plumbing, not on the ABI capsule): `list_live_consent_grants_by`,
+`list_local_tier_attestations` (keyset cursor), `set_attestation_cohort_scope`.
+PyO3: `promote_consented_backlog()` verb returning `{promoted, skipped}`.
+
+### Added — the closed consent grammar (#510 P1): `ConsentTransferPolicy` + `CONSENT_GRAMMAR_HASH`
+
+No external policy language (XACML/ODRL/Rego are open-world: unhashable,
+unverifiable, un-exhaustive) — a small conjunctive, data-only algebra over the
+machine-checked inventories, the `KindPolicy` pattern applied to consent
+(contextual-integrity mapping per ciris.ai/contextual-integrity/):
+
+- **`ConsentTransferPolicy`** — the typed grant payload: `direction`
+  (egress|ingress), `kinds` (validated against the exhaustive 14-kind
+  `consent_transferability` — `Attestation` is Consentable, every structural
+  plane replicates per KindPolicy, not consent; kind #15 without a decision is
+  a compile failure), `attestation_prefixes`, `principle`
+  (retain|share|analyze|train|publish), `audience` (the closed 7-value
+  cohort_scope), `purpose`, `valid_until`, `restrictions`.
+- **Fail-closed admission** — grants are validated at the single
+  `put_attestation` chokepoint (all three backends, emitted AND replicated): an
+  unknown restriction op, unknown payload field, or non-consentable kind
+  REJECTS the grant. Never ignore-and-widen. The legacy server payload
+  (`{"grants":"replication","attestation_prefixes":[...]}`) parses unchanged
+  (closed defaults: egress / Attestation / share / federation / no
+  restrictions).
+- **Wire-enforceable restrictions** — `strip_field(path)` applies at promotion
+  BEFORE hybrid-signing (`promote_attestation_transformed`): the
+  federation-tier object *literally does not contain* the stripped member; the
+  full private form stays queryable via the `trace_events` projection.
+  `recipient_capability` validates in-grammar (serve-layer enforcement is the
+  edge's P3). Protected members (`dimension`) cannot be stripped.
+- **Policy-driven sweep** — coverage now honors direction, kinds,
+  `valid_until`/`expires_at` expiry, and the grant's `audience` (promoted
+  cohort_scope follows the edge, not a hardcoded constant); restriction UNION
+  across covering grants (most-restrictive).
+- **`CONSENT_GRAMMAR_HASH`** =
+  `2064b567c60062fe9583ea983224d977db7440c8d240d6902a2db50e3e157d05` —
+  canonical manifest of the whole grammar exported beside
+  `REPLICATION_POLICY_HASH`/`WIRE_VOCABULARY_HASH` with a gating witness:
+  cross-repo drift is a build failure. Third leg of the tripod. Server (P2)
+  and edge (P3, CIRISEdge#397) pin it — lockstep tracked in #510.
+
+### Added — the hot-path serve reads (#507, closing the #504 deferrals)
+
+- **(c) Since-cursor bulk reads for the 5 primary signed planes** —
+  `list_signed_key_records_since` / `list_signed_identity_occurrences_since` /
+  `list_signed_transport_destinations_since` / `list_attestations_since` /
+  `list_signed_identity_occurrence_revocations_since`, the same contract as the
+  #504 keyless five (signed wrapper, since-cursor, `ORDER BY cursor ASC, pk
+  ASC`). The 30 s edge advertise now pulls deltas for EVERY plane instead of
+  O(kinds × subjects) per-subject scans. `list_attestations_since` returns
+  federation-TIER rows only — a local-tier row can never reach the advertise
+  surface (the E5 invariant, now enforced at the read) — and cursors on the
+  **visibility timestamp** `COALESCE(promoted_at, asserted_at)`: a
+  consent-promoted row (#509) becomes wire-visible at `promoted_at`, so an
+  `asserted_at` cursor would hide late promotions from delta consumers
+  forever (the #507 × #509 integration catch; witness
+  `promoted_row_appears_in_visibility_delta_507_509`). The #510 transformed
+  promotion likewise refreshes the wire index under its post-strip content
+  hash (#507 × #510).
+- **(b) Content-hash point-read** — `lookup_signed_record_by_content_hash(kind,
+  hash)`; the hash contract is pinned to edge's actual keying (lowercase-hex
+  sha256 over the exact JSON bytes persist's read surface returns — edge keys
+  its fetch map by sha256(wire bytes) per (kind, hash), so the two agree by
+  construction). Backed by V111 `signed_wire_index` maintained at the signed-
+  record write chokepoints, with a defensive re-hash on read (mismatch → warn +
+  miss, self-healing) and `rebuild_signed_wire_index()` as the upgrade/backfill
+  path. Retires edge's full-scan-coupled in-memory fetch cache (CIRISEdge#396's
+  resolved-routing item 3).
+
+Acceptance: the CIRISAgent ladder — `4.ship` flips and walks to `7.scored`.
+Refs: #509, #510 (grammar), #507, CIRISServer#315, #501/#502 (Registry-of-Record),
+CIRISEdge#396 (resolved routing).
 ## [21.1.0] — 2026-07-24 — signed since-cursor reads for the 5 keyless planes (#504)
 
 The E4 admission work in v21.0.0 (#502) gave `Family` / `Community` /

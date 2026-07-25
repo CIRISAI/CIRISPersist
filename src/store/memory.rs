@@ -4936,18 +4936,26 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let state = self.state.lock().expect("memory backend lock");
         // E5 invariant: federation-tier rows only — a local-tier row must
         // never reach the advertise/serve wire surface.
+        //
+        // v21.2.0 (#507 × #509) — the cursor is the VISIBILITY timestamp
+        // `COALESCE(promoted_at, asserted_at)`: a consent-promoted row
+        // (#509) becomes wire-visible at `promoted_at`, which can be long
+        // after `asserted_at` — cursoring on `asserted_at` alone would make
+        // late promotions invisible to pure-delta consumers forever.
+        let visible_at =
+            |a: &crate::federation::Attestation| a.promoted_at.unwrap_or(a.asserted_at);
         let mut rows: Vec<_> = state
             .federation_attestations
             .iter()
             .filter(|a| {
-                since.is_none_or(|s| a.asserted_at > s)
+                since.is_none_or(|s| visible_at(a) > s)
                     && a.tier == crate::federation::types::attestation_tier::FEDERATION
             })
             .cloned()
             .collect();
         rows.sort_by(|a, b| {
-            a.asserted_at
-                .cmp(&b.asserted_at)
+            visible_at(a)
+                .cmp(&visible_at(b))
                 .then_with(|| a.attestation_id.cmp(&b.attestation_id))
         });
         rows.truncate(limit as usize);
@@ -5199,6 +5207,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        // v21.2.0 (#507 × #510) — the transformed promotion CHANGES the
+        // served bytes, so the wire index must carry the NEW content hash —
+        // same hook as `promote_attestation`. (Hash computed while the row
+        // borrow is live; the map insert happens after it ends.)
+        let wire_index_key =
+            crate::federation::wire_index::record_key(&[("attestation_id", &row.attestation_id)]);
+        let wire_index_hash = crate::federation::wire_index::content_hash_of(&*row)?;
+        state
+            .signed_wire_index
+            .insert(("Attestation".to_string(), wire_index_hash), wire_index_key);
         Ok(true)
     }
 

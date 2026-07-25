@@ -7274,8 +7274,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
                     subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
                  FROM federation_attestations \
-                 WHERE (?1 IS NULL OR asserted_at > ?1) AND tier = 'federation' \
-                 ORDER BY asserted_at ASC, attestation_id ASC LIMIT ?2",
+                 WHERE (?1 IS NULL OR COALESCE(promoted_at, asserted_at) > ?1) \
+                   AND tier = 'federation' \
+                 ORDER BY COALESCE(promoted_at, asserted_at) ASC, attestation_id ASC LIMIT ?2",
             )?;
             let rows =
                 stmt.query_map(rusqlite::params![since, limit], sqlite_row_to_attestation)?;
@@ -7668,6 +7669,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        // Stamp the row's final served shape now (the wire-index hook below
+        // hashes `row`; `new_hash` itself moves into the UPDATE closure).
+        row.persist_row_hash = new_hash.clone();
 
         let envelope_text = serde_json::to_string(&row.attestation_envelope)
             .map_err(|e| crate::federation::Error::Backend(format!("envelope serialize: {e}")))?;
@@ -7724,6 +7728,29 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .map_err(|e| {
                 crate::federation::Error::Backend(format!(
                     "promote_attestation_transformed projection: {e}"
+                ))
+            })?;
+        }
+        // v21.2.0 (#507 × #510) — the transformed promotion CHANGES the
+        // served bytes (stripped envelope + new sigs + new persist_row_hash),
+        // so the wire index must be refreshed under the NEW content hash —
+        // same hook as `promote_attestation`. The stale pre-transform hash
+        // entry (if any) self-heals via the defensive re-hash on read.
+        // (`row.persist_row_hash` was stamped to the new hash above.)
+        {
+            let wire_index_key = crate::federation::wire_index::record_key(&[(
+                "attestation_id",
+                &row.attestation_id,
+            )]);
+            let wire_index_hash = crate::federation::wire_index::content_hash_of(&row)?;
+            let conn = self.conn.clone();
+            (move || -> Result<(), rusqlite::Error> {
+                let conn = conn.lock();
+                sqlite_upsert_wire_index(&conn, "Attestation", &wire_index_hash, &wire_index_key)
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "promote_attestation_transformed wire index: {e}"
                 ))
             })?;
         }
