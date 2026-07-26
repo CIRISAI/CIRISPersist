@@ -1094,7 +1094,8 @@ pub(crate) mod test_support {
         assert_eq!(rows.len(), 1, "(1) exactly one projected route");
         let r = &rows[0];
         assert_eq!(r.transport_kind, OccurrenceTransportBinding::TRANSPORT_KIND);
-        assert_eq!(r.destination, B64.encode([0x10u8; 16]));
+        // v21.3.0 (#512) — the projected destination is canonical HEX.
+        assert_eq!(r.destination, hex::encode([0x10u8; 16]));
         assert_eq!(
             r.transport_x25519_pubkey_base64.as_deref(),
             Some(B64.encode([0x10u8; 32]).as_str())
@@ -1123,7 +1124,7 @@ pub(crate) mod test_support {
             .expect("(2) newer local occurrence put");
         let rows = dir.list_transport_destinations_for(&occ).await.unwrap();
         assert_eq!(rows.len(), 1, "(2) superseded in place, never a 2nd row");
-        assert_eq!(rows[0].destination, B64.encode([0x20u8; 16]));
+        assert_eq!(rows[0].destination, hex::encode([0x20u8; 16]));
 
         // (3) De-projection: revoking the occurrence retires the projected
         // route — a revoked occurrence must not leave a live routable peer.
@@ -1154,6 +1155,6 @@ pub(crate) mod test_support {
             .expect("(4) re-established occurrence put");
         let rows = dir.list_transport_destinations_for(&occ).await.unwrap();
         assert_eq!(rows.len(), 1, "(4) a newer occurrence revives the route");
-        assert_eq!(rows[0].destination, B64.encode([0x30u8; 16]));
+        assert_eq!(rows[0].destination, hex::encode([0x30u8; 16]));
     }
 }

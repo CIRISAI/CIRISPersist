@@ -3600,6 +3600,73 @@ pub async fn check_canonical_role_admission_over_roster(
     }
 
     // (3)-(7) the shared accord-family m-of-n co-scrub quorum core.
+    //
+    // v21.3.0 (CIRISPersist#513) — the hardware anti-Sybil floor: a NEW
+    // canonical requires `max(strict_majority, 3)` DISTINCT co-scrubbers,
+    // each with a verified FIPS-140-3 Yubico custody attestation chained to
+    // the pinned [`YUBICO_ATTESTATION_ROOT_1_DER`]. Minting a trust root is
+    // thereby costly-but-possible: three hardware-bound, touch-required
+    // humans — non-virtualizable. Two declared exemptions, both honest:
+    //
+    // - **The compiled-in genesis canonical** (grandfather): the baked
+    //   ceremony record predates the floor with 2 scrubbers; it is matched
+    //   BYTE-EXACT on (key_id, registration_envelope, base scrub signature)
+    //   against OUR OWN embedded seed — an attacker cannot ride this
+    //   exemption without presenting the exact already-trusted artifact.
+    //   The NEXT canonical rotation meets the full floor (the gate runs at
+    //   every write chokepoint, so a rotated-in successor is gated too).
+    // - **The test anchor** (feature-gated + runtime-armed): its rosters
+    //   are explicitly declared software keys; the floor would make every
+    //   test-anchor mint impossible. Prod builds compile the override to
+    //   const-false.
+    let legacy = is_baked_genesis_canonical(row)
+        || crate::federation::genesis::test_anchor_override_active();
+    let verify_result = if legacy {
+        verify_accord_family_coscrub(directory, row, roster_key_ids).await
+    } else {
+        verify_accord_family_coscrub_with(
+            directory,
+            row,
+            roster_key_ids,
+            CANONICAL_MIN_COSCRUBBERS,
+            true,
+        )
+        .await
+    };
+    verify_result.map_err(|reason| Error::CanonicalRoleNotAccordConferred {
+        key_id: row.key_id.clone(),
+        scrub_key_id: row.scrub_key_id.clone(),
+        reason,
+    })
+}
+
+/// v21.3.0 (CIRISPersist#513) — the LEGACY (pre-floor) canonical admission
+/// over an injected roster: withdrawal-wins + the strict-majority quorum
+/// core WITHOUT the FIPS-custody floor. **Test-only** — the quorum-core
+/// semantics surface (distinct-founder counting, self-scrub exclusion,
+/// forged-scrub rejection, m-of-n arithmetic) for rosters of software test
+/// identities, which by design can never carry a genuine Yubico custody
+/// attestation. The production gate
+/// ([`check_canonical_role_admission_over_roster`]) is strict; its floor is
+/// exercised by the `*_513` witnesses and the run-the-real-artifact boot
+/// tests (the grandfathered genesis canonical through the real gate).
+#[cfg(test)]
+pub(crate) async fn check_canonical_role_admission_over_roster_legacy(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+    roster_key_ids: &[String],
+) -> Result<(), Error> {
+    if !row.claims_role(identity_type::CANONICAL) {
+        return Ok(());
+    }
+    if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
+        if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
+            return Err(Error::CanonicalRoleWithdrawn {
+                key_id: row.key_id.clone(),
+                superseded_by: w.superseded_by.clone(),
+            });
+        }
+    }
     verify_accord_family_coscrub(directory, row, roster_key_ids)
         .await
         .map_err(|reason| Error::CanonicalRoleNotAccordConferred {
@@ -3607,6 +3674,25 @@ pub async fn check_canonical_role_admission_over_roster(
             scrub_key_id: row.scrub_key_id.clone(),
             reason,
         })
+}
+
+/// v21.3.0 (CIRISPersist#513) — does `row` belong to the compiled-in
+/// genesis canonical LINEAGE (same `key_id` as an embedded
+/// `canonical_seed.json` record)?
+///
+/// #513 is a Sybil floor on trust-root **minting** — scarcity for NEW
+/// roots. The genesis lineage id predates the floor (its real history
+/// includes 2-scrub artifacts: the pre-ceremony anchor, the re-blessed
+/// v2 record), so records for THAT id keep exactly today's bar: the
+/// legacy strict-majority accord quorum + withdrawal-wins — real A1/B1/C1
+/// signatures, no regression, nothing an attacker gains that they don't
+/// already need. Every NEW canonical `key_id` — including a rotation
+/// successor, which is how an unattested root would otherwise launder in —
+/// meets the full floor (this gate runs at every write chokepoint).
+fn is_baked_genesis_canonical(row: &super::KeyRecord) -> bool {
+    crate::federation::genesis::canonical_genesis_records()
+        .iter()
+        .any(|baked| baked.record.key_id == row.key_id)
 }
 
 /// The accord-family **m-of-n co-scrub quorum core** — the shared enforcement
@@ -3640,6 +3726,106 @@ async fn verify_accord_family_coscrub(
     row: &super::KeyRecord,
     roster_key_ids: &[String],
 ) -> Result<(), String> {
+    verify_accord_family_coscrub_with(directory, row, roster_key_ids, 0, false).await
+}
+
+/// v21.3.0 (CIRISPersist#513) — the PINNED durable accord-custody trust
+/// anchor: **Yubico Attestation Root 1**
+/// (`developers.yubico.com/PKI/yubico-ca-1.pem`, CN="Yubico Attestation
+/// Root 1", DER) — byte-identical to CIRISServer's
+/// `YUBICO_ATTESTATION_ROOT_1_DER` pin (one trust anchor across the
+/// federation, drift caught by the sha256 pin witness). The durable ROOT is
+/// pinned, never the rotating "Yubico PIV Attestation B 1" intermediate; the
+/// f9 device cert + intermediates ride in each holder's custody-attestation
+/// chain, which `verify_accord_custody_attestation` walks up to this anchor.
+pub const YUBICO_ATTESTATION_ROOT_1_DER: &[u8] =
+    include_bytes!("accord_pki/yubico_attestation_root_1.der");
+
+/// v21.3.0 (CIRISPersist#513) — the canonical-admission hardware anti-Sybil
+/// floor: a NEW canonical (trust root) requires at least this many DISTINCT
+/// FIPS-custody-verified accord co-scrubbers, regardless of roster size
+/// (`quorum = max(strict_majority, 3)`). Scoped to canonicals ONLY — never
+/// ordinary node/agent admission.
+pub const CANONICAL_MIN_COSCRUBBERS: usize = 3;
+
+/// v21.3.0 (CIRISPersist#513) — verify one accord member's **FIPS-140-3
+/// Yubico custody attestation**, the per-member half of the canonical
+/// anti-Sybil floor.
+///
+/// The member's `KeyRecord.attestation_evidence` must deserialize as the
+/// signed custody-attestation CEG object
+/// ([`ciris_verify_core::accord_custody_attestation::ACCORD_CUSTODY_ATTESTATION_KIND`],
+/// the sibling artifact the accord ceremony produces), and
+/// [`verify_accord_custody_attestation`](ciris_verify_core::accord_custody_attestation::verify_accord_custody_attestation)
+/// must confirm: the bundle is holder-authored (bound-hybrid against the
+/// member's PINNED directory pubkeys), the 9c cert chains to the pinned
+/// [`YUBICO_ATTESTATION_ROOT_1_DER`] (every link a real signature verify),
+/// the attested key IS the member's federation Ed25519 key, and the Yubico
+/// extensions mark **FIPS-certified + touch=always** — the same predicate
+/// CIRISServer's holder-admission gate applies. Fail-closed: absent/
+/// malformed/unverifiable evidence ⇒ `Err` ⇒ the member does not count.
+///
+/// **Honest scope (encode, don't paper over — #513):** the FIPS attestation
+/// covers the **Ed25519 (classical) half** of the hybrid identity; the
+/// ML-DSA-65 half is software sealed-media custody the harness does not
+/// check. This is a Sybil/identity anchor on the classical key — it does
+/// not imply PQ hardware custody. Pre-rotation successors are NOT verified
+/// here against their commitments (hashes reveal nothing to attest); they
+/// are gated at ROTATION time instead — this gate runs at every
+/// `federation_keys` write chokepoint, so a rotated-in successor passes the
+/// same floor before it can carry `canonical`.
+pub fn verify_member_fips_custody(
+    rec: &super::KeyRecord,
+) -> Result<ciris_verify_core::accord_custody_attestation::CustodyVerdict, String> {
+    use ciris_verify_core::accord_custody_attestation::verify_accord_custody_attestation;
+    use ciris_verify_core::ceg_outbox::SignedCegObject;
+    use ciris_verify_core::threshold::{Role, ThresholdMember};
+
+    let ev = rec
+        .attestation_evidence
+        .as_ref()
+        .ok_or_else(|| "no attestation_evidence on the record".to_string())?;
+    let obj: SignedCegObject = serde_json::from_value(ev.clone()).map_err(|e| {
+        format!("attestation_evidence is not a signed custody-attestation object: {e}")
+    })?;
+    let member = ThresholdMember {
+        member_id: rec.key_id.clone(),
+        ed25519_public_key_base64: rec.pubkey_ed25519_base64.clone(),
+        mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64.clone(),
+        role: Some(Role::Founder),
+    };
+    let verdict = verify_accord_custody_attestation(&obj, &member, YUBICO_ATTESTATION_ROOT_1_DER)
+        .map_err(|e| format!("custody attestation verify failed: {e}"))?;
+    if !verdict.fips_certified {
+        return Err("custody attestation is not FIPS-certified (Yubico ext …3.10 absent)".into());
+    }
+    if !verdict.touch_always {
+        return Err("custody attestation touch policy is not 'always' (Yubico ext …3.8)".into());
+    }
+    Ok(verdict)
+}
+
+/// The parameterized body of [`verify_accord_family_coscrub`].
+///
+/// v21.3.0 (CIRISPersist#513) — two strictness knobs, BOTH engaged only by
+/// the canonical gate (`min_quorum = `[`CANONICAL_MIN_COSCRUBBERS`]`,
+/// require_fips_custody = true`); every other caller (infra:attest, the
+/// supersede-tombstone probe) passes `(0, false)` = the legacy
+/// strict-majority behavior, unchanged:
+///
+/// - `require_fips_custody` — a roster member counts toward `n` ONLY with a
+///   verified FIPS-140-3 Yubico custody attestation
+///   ([`verify_member_fips_custody`]). Fail-closed: an unattested member
+///   silently doesn't count (recorded in the error on quorum failure).
+/// - `min_quorum` — `m = max(n/2 + 1, min_quorum)`; when `m > n` the quorum
+///   is honestly unreachable and the verify fails with the full accounting.
+async fn verify_accord_family_coscrub_with(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+    roster_key_ids: &[String],
+    min_quorum: usize,
+    require_fips_custody: bool,
+) -> Result<(), String> {
     use ciris_verify_core::threshold::{
         verify_quorum_policy, QuorumPolicy, Role, ThresholdMember, ThresholdSignature,
     };
@@ -3647,13 +3833,22 @@ async fn verify_accord_family_coscrub(
     // (3) Standing founder roster = the accord family resolved to their PINNED
     // directory pubkeys (never caller-supplied keys). Skip any that don't
     // resolve; `n` tracks the LIVE roster so the policy is dynamic.
+    // #513: under `require_fips_custody`, membership additionally requires a
+    // verified FIPS custody attestation — the hardware anti-Sybil floor.
     let mut roster: Vec<ThresholdMember> = Vec::with_capacity(roster_key_ids.len());
+    let mut custody_rejected: Vec<String> = Vec::new();
     for kid in roster_key_ids {
         if let Some(rec) = directory
             .lookup_public_key(kid)
             .await
             .map_err(|e| format!("roster resolve failed for {kid}: {e}"))?
         {
+            if require_fips_custody {
+                if let Err(why) = verify_member_fips_custody(&rec) {
+                    custody_rejected.push(format!("{kid}: {why}"));
+                    continue;
+                }
+            }
             roster.push(ThresholdMember {
                 member_id: rec.key_id,
                 ed25519_public_key_base64: rec.pubkey_ed25519_base64,
@@ -3665,9 +3860,26 @@ async fn verify_accord_family_coscrub(
     let n = roster.len();
 
     // (4) Strict-majority policy over the live roster (2-of-3 today; 3-of-4 if
-    // the family grows). `verify_quorum_policy` re-validates `2·M > N` and
-    // `N == founder_count`, so this is NOT a frozen constant.
-    let policy = QuorumPolicy::new(n / 2 + 1, n);
+    // the family grows), floored at `min_quorum` (#513: 3 for canonicals — a
+    // hardware-bound, touch-required, distinct-human scarcity mechanism).
+    // `verify_quorum_policy` re-validates `2·M > N` and `N == founder_count`,
+    // so this is NOT a frozen constant.
+    let m = std::cmp::max(n / 2 + 1, min_quorum);
+    if m > n {
+        return Err(format!(
+            "accord quorum unreachable: floor {m} exceeds the {n} qualifying roster \
+             member(s){}",
+            if custody_rejected.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (FIPS-custody-rejected: [{}])",
+                    custody_rejected.join("; ")
+                )
+            }
+        ));
+    }
+    let policy = QuorumPolicy::new(m, n);
 
     // (6) The exact canonical bytes the scrubs signed = JCS(registration_envelope)
     // — the IDENTICAL function the single-scrub verify uses, so a base-field
@@ -7126,6 +7338,104 @@ mod canonical_gate_tests {
     use ed25519_dalek::SigningKey;
     use sha2::{Digest, Sha256};
 
+    /// v21.3.0 (CIRISPersist#513) — the pinned Yubico Attestation Root 1 DER
+    /// is byte-identical to CIRISServer's pin (one trust anchor across the
+    /// federation). A silent swap of the anchor is a build failure here
+    /// first, a behavior change second.
+    #[test]
+    fn yubico_root_pin_sha256_513() {
+        assert_eq!(
+            hex::encode(Sha256::digest(super::YUBICO_ATTESTATION_ROOT_1_DER)),
+            "62760c6a6ef91679f454c8902b80fd009825b3f25da90f1fbace2ec6586cd5a8",
+            "the pinned Yubico attestation root changed — re-pin DELIBERATELY \
+             and in lockstep with CIRISServer"
+        );
+    }
+
+    /// v21.3.0 (CIRISPersist#513) — the REAL baked accord holders (A1/B1/C1,
+    /// the actual ceremony artifacts embedded as the genesis seed) each carry
+    /// a custody attestation that GENUINELY verifies: holder-authored
+    /// bound-hybrid signature, 9c cert chained link-by-link to the pinned
+    /// Yubico root, attested key == the holder's federation Ed25519 key,
+    /// FIPS-certified + touch=always extensions. Real hardware, real chain —
+    /// the positive half of the anti-Sybil floor, no mocks.
+    #[test]
+    fn baked_accord_holders_fips_custody_verifies_513() {
+        let holders = crate::federation::genesis::accord_holder_genesis_records();
+        assert_eq!(holders.len(), 3, "A1/B1/C1");
+        for h in holders {
+            let verdict = super::verify_member_fips_custody(&h.record).unwrap_or_else(|e| {
+                panic!(
+                    "baked holder {} custody attestation must verify: {e}",
+                    h.record.key_id
+                )
+            });
+            assert!(verdict.fips_certified, "{}: FIPS ext", h.record.key_id);
+            assert!(verdict.touch_always, "{}: touch ext", h.record.key_id);
+        }
+    }
+
+    /// v21.3.0 (CIRISPersist#513) — the floor refuses a canonical minted by
+    /// an accord roster WITHOUT verified FIPS custody: software members
+    /// silently don't count, the 3-floor is unreachable, and the refusal
+    /// names both facts. This is the anti-Sybil property end-to-end at the
+    /// strict over-roster gate.
+    #[tokio::test]
+    async fn canonical_floor_refuses_unattested_roster_513() {
+        let backend = crate::store::memory::MemoryBackend::new();
+        let holders = [
+            Identity::new("f513-0"),
+            Identity::new("f513-1"),
+            Identity::new("f513-2"),
+        ];
+        for h in &holders {
+            super::super::operational::test_support::register_accord_holder(&backend, h)
+                .await
+                .unwrap();
+        }
+        let roster: Vec<String> = holders.iter().map(|h| h.key_id.clone()).collect();
+        let rec = signed_canonical_record(
+            "canon-floor-513",
+            "canonical,node",
+            serde_json::json!({ "key_id": "canon-floor-513" }),
+            &[&holders[0], &holders[1], &holders[2]],
+        );
+        let err = super::check_canonical_role_admission_over_roster(&backend, &rec, &roster)
+            .await
+            .expect_err("3 genuine software scrubs must still be refused by the FIPS floor");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("floor 3") || msg.contains("unreachable"),
+            "refusal must cite the floor: {msg}"
+        );
+        assert!(
+            msg.contains("attestation_evidence") || msg.contains("custody"),
+            "refusal must cite the custody rejections: {msg}"
+        );
+    }
+
+    /// v21.3.0 (CIRISPersist#513) — the grandfather matcher covers exactly
+    /// the embedded genesis LINEAGE (by key_id: today's quorum bar, real
+    /// accord signatures still required); any NEW canonical key_id — the
+    /// trust-root MINTING the floor exists for — is not lineage.
+    #[test]
+    fn baked_genesis_canonical_matcher_is_lineage_scoped_513() {
+        let baked = &crate::federation::genesis::canonical_genesis_records()[0];
+        assert!(super::is_baked_genesis_canonical(&baked.record));
+        // The lineage id with a different envelope is STILL lineage — it
+        // faces the same real-accord-quorum bar as today (no floor, no
+        // regression; the pre-ceremony → re-blessed history is exactly
+        // this shape).
+        let mut lineage_variant = baked.record.clone();
+        lineage_variant.registration_envelope =
+            serde_json::json!({ "key_id": lineage_variant.key_id });
+        assert!(super::is_baked_genesis_canonical(&lineage_variant));
+        // A NEW key_id is a NEW trust root → the full #513 floor.
+        let mut new_root = baked.record.clone();
+        new_root.key_id = "ciris-canonical-2-newroot".into();
+        assert!(!super::is_baked_genesis_canonical(&new_root));
+    }
+
     /// Build a `federation_keys` `KeyRecord` for `key_id` carrying
     /// `identity_type`, scrubbed by `scrub_key_id` (set `== key_id` for a
     /// self-signed row). The scrub-signature is NOT verified at the
@@ -7201,7 +7511,7 @@ mod canonical_gate_tests {
         let roster: Vec<String> = founders.iter().map(|f| f.key_id.clone()).collect();
         let env = |kid: &str| serde_json::json!({ "key_id": kid });
         let gate = |rec: KeyRecord, roster: Vec<String>| async move {
-            super::check_canonical_role_admission_over_roster(dir, &rec, &roster).await
+            super::check_canonical_role_admission_over_roster_legacy(dir, &rec, &roster).await
         };
 
         // (1) ADMITTED: 2 DISTINCT valid founder scrubs (strict majority of 3).
@@ -7374,7 +7684,11 @@ mod canonical_gate_tests {
         for a in &accord {
             register_founder(dir, a).await;
         }
-        let good = format!("canon-good-{tag}");
+        // v21.3.0 (#513) — the GENESIS-LINEAGE id keeps today's bar (legacy
+        // 2-of-3 accord quorum, no floor): the full positive prod-path
+        // round-trip rides it. A NEW key_id (a fresh trust root) meets the
+        // FIPS floor — asserted below.
+        let good = "ciris-canonical-1-d7bdeu223k".to_string();
         let good_env = serde_json::json!({
             "key_id": good,
             "transport_hints": [{ "kind": "ip", "destination": "108.61.242.236:4242" }],
@@ -7388,8 +7702,30 @@ mod canonical_gate_tests {
             ),
         })
         .await
-        .expect("2-of-3 canonical admits through the production gate");
+        .expect("2-of-3 lineage canonical admits through the production gate");
         assert!(is_canonical(dir, &good).await.expect("is_canonical"));
+
+        // #513 e2e: a NEW canonical key_id minted by the same (software,
+        // unattested) accord roster is REFUSED by the hardware anti-Sybil
+        // floor at the SAME production chokepoint.
+        let fresh = format!("canon-new-root-{tag}");
+        let floor_err = dir
+            .put_public_key(SignedKeyRecord {
+                record: signed_canonical_record(
+                    &fresh,
+                    "canonical,node",
+                    serde_json::json!({ "key_id": fresh }),
+                    &[&accord[0], &accord[1]],
+                ),
+            })
+            .await
+            .expect_err("a NEW trust root without FIPS custody must be refused (floor)");
+        let floor_msg = format!("{floor_err}");
+        assert!(
+            floor_msg.contains("floor 3") || floor_msg.contains("custody"),
+            "refusal must cite the #513 floor: {floor_msg}"
+        );
+        assert!(dir.lookup_public_key(&fresh).await.unwrap().is_none());
 
         // Round-trip: the 2nd scrub survives store→read.
         let read = dir.lookup_public_key(&good).await.unwrap().unwrap();
@@ -8371,7 +8707,14 @@ mod canonical_withdrawal_tests {
         let roster_key_ids: Vec<String> = holders.iter().map(|h| h.key_id.clone()).collect();
 
         // ── Admit a 2-of-3 anchor-scrubbed canonical, then withdraw it. ─────
-        let good = format!("cw-good-{tag}");
+        // v21.3.0 (#513): the stored canonical rides the GENESIS-LINEAGE id
+        // (legacy quorum bar — the withdrawal machinery under test is
+        // orthogonal to the new-root FIPS floor, which has its own e2e
+        // witnesses in `canonical_gate_tests`). The lineage id is the ONE
+        // storable canonical for software fixtures, so the supersede legs
+        // that need a live predecessor run FIRST, against this same row,
+        // before it is withdrawn below.
+        let good = "ciris-canonical-1-d7bdeu223k".to_string();
         put(
             dir,
             signed_canonical_record(
@@ -8384,6 +8727,92 @@ mod canonical_withdrawal_tests {
         .await
         .expect("2-of-3 anchor-scrubbed canonical must be ADMITTED");
         assert!(is_canonical_effective(dir, &good).await.unwrap());
+
+        // ── (H, moved pre-withdrawal) SUPERSEDE against the live lineage. ──
+        let new = format!("cw-new-{tag}");
+        // Fail-closed: a proposal committing to good→WRONG cannot supersede
+        // good→new (payload mismatch); neither mutation happens.
+        let d_wrong = seed_quorum(
+            dir,
+            &holders,
+            &roster,
+            OP_SUPERSEDE_CANONICAL,
+            &good,
+            Some(&format!("wrong-{tag}")),
+            &[0, 1],
+            &format!("n-wrong-{tag}"),
+        )
+        .await;
+        let err = supersede_canonical_over_roster(
+            dir,
+            &good,
+            SignedKeyRecord {
+                record: signed_canonical_record(
+                    &new,
+                    "canonical,node",
+                    env(&new),
+                    &[&accord[0], &accord[1]],
+                ),
+            },
+            &d_wrong,
+            &roster_key_ids,
+        )
+        .await
+        .expect_err("supersede with wrong-successor payload must be REFUSED");
+        assert_eq!(err.kind(), "canonical_withdrawal_authority_invalid");
+        assert!(dir.lookup_public_key(&new).await.unwrap().is_none());
+        assert!(dir
+            .lookup_canonical_withdrawal(&good)
+            .await
+            .unwrap()
+            .is_none());
+
+        // v21.3.0 (#513) — the ANTI-LAUNDERING witness: a fully-authorized
+        // supersede (correct payload, real 2-of-3 authority) whose SUCCESSOR
+        // is a NEW, FIPS-unattested root is REFUSED at the successor's own
+        // admission (the floor runs inside `put_public_key`, which the op
+        // calls BEFORE recording the tombstone) — a rotation cannot launder
+        // an unattested trust root in, and the failed op leaves NO partial
+        // state: predecessor still effective, no tombstone, successor absent.
+        let d_sup = seed_quorum(
+            dir,
+            &holders,
+            &roster,
+            OP_SUPERSEDE_CANONICAL,
+            &good,
+            Some(&new),
+            &[0, 1],
+            &format!("n-sup-{tag}"),
+        )
+        .await;
+        let floor_err = supersede_canonical_over_roster(
+            dir,
+            &good,
+            SignedKeyRecord {
+                record: signed_canonical_record(
+                    &new,
+                    "canonical,node",
+                    env(&new),
+                    &[&accord[0], &accord[1]],
+                ),
+            },
+            &d_sup,
+            &roster_key_ids,
+        )
+        .await
+        .expect_err("an unattested successor root must be refused by the #513 floor");
+        let floor_msg = format!("{floor_err}");
+        assert!(
+            floor_msg.contains("floor 3") || floor_msg.contains("custody"),
+            "supersede refusal must cite the floor: {floor_msg}"
+        );
+        assert!(is_canonical_effective(dir, &good).await.unwrap());
+        assert!(dir.lookup_public_key(&new).await.unwrap().is_none());
+        assert!(dir
+            .lookup_canonical_withdrawal(&good)
+            .await
+            .unwrap()
+            .is_none());
 
         // (A) FORGED-AUTHORITY REJECTION: a stored proposal committing to
         //     (withdraw, good) but with ZERO participations → the re-tally
@@ -8550,97 +8979,43 @@ mod canonical_withdrawal_tests {
         assert!(!is_canonical_effective(dir, &repl).await.unwrap());
         assert!(dir.lookup_public_key(&repl).await.unwrap().is_none());
 
-        // ── (H) SUPERSEDE: admit successor + withdraw predecessor atomically. ─
-        let old = format!("cw-old-{tag}");
-        let new = format!("cw-new-{tag}");
-        put(
+        // ── (H2) Successor-exemption + withdrawn-wins VERDICTS (legacy
+        // gate — the exemption logic is identical in the strict path; the
+        // completing old→new supersede itself now requires FIPS-attested
+        // successors, witnessed above as the floor refusal). ──
+        let ex_old = format!("cw-ex-{tag}");
+        let ex_succ = format!("cw-exsucc-{tag}");
+        dir.record_canonical_withdrawal(&ex_old, Some(&ex_succ), "digest-h2")
+            .await
+            .expect("record exemption tombstone");
+        // The named SUCCESSOR is exempt from withdrawal-wins and admits
+        // under the (legacy) quorum.
+        super::check_canonical_role_admission_over_roster_legacy(
             dir,
-            signed_canonical_record(&old, "canonical,node", env(&old), &[&accord[0], &accord[1]]),
+            &signed_canonical_record(
+                &ex_succ,
+                "canonical,node",
+                env(&ex_succ),
+                &[&accord[0], &accord[1]],
+            ),
+            &accord.iter().map(|a| a.key_id.clone()).collect::<Vec<_>>(),
         )
         .await
-        .expect("admit predecessor canonical (2-of-3)");
-        assert!(is_canonical_effective(dir, &old).await.unwrap());
-
-        // Fail-closed: a proposal committing to old→WRONG cannot supersede
-        // old→new (payload mismatch); neither mutation happens.
-        let d_wrong = seed_quorum(
+        .expect("the tombstone-named successor is exempt from withdrawal-wins");
+        // The WITHDRAWN key itself stays refused even with valid scrubs.
+        let werr = super::check_canonical_role_admission_over_roster_legacy(
             dir,
-            &holders,
-            &roster,
-            OP_SUPERSEDE_CANONICAL,
-            &old,
-            Some(&format!("wrong-{tag}")),
-            &[0, 1],
-            &format!("n-wrong-{tag}"),
-        )
-        .await;
-        let err = supersede_canonical_over_roster(
-            dir,
-            &old,
-            SignedKeyRecord {
-                // Authority is verified BEFORE the successor is admitted, so a
-                // payload mismatch refuses before this record is even inspected.
-                record: signed_canonical_record(
-                    &new,
-                    "canonical,node",
-                    env(&new),
-                    &[&accord[0], &accord[1]],
-                ),
-            },
-            &d_wrong,
-            &roster_key_ids,
+            &signed_canonical_record(
+                &ex_old,
+                "canonical,node",
+                env(&ex_old),
+                &[&accord[0], &accord[1]],
+            ),
+            &accord.iter().map(|a| a.key_id.clone()).collect::<Vec<_>>(),
         )
         .await
-        .expect_err("supersede with wrong-successor payload must be REFUSED");
-        assert_eq!(err.kind(), "canonical_withdrawal_authority_invalid");
-        assert!(dir.lookup_public_key(&new).await.unwrap().is_none());
-        assert!(dir
-            .lookup_canonical_withdrawal(&old)
-            .await
-            .unwrap()
-            .is_none());
-
-        // Valid supersede: proposal committing to old→new with 2 YES votes.
-        let d_sup = seed_quorum(
-            dir,
-            &holders,
-            &roster,
-            OP_SUPERSEDE_CANONICAL,
-            &old,
-            Some(&new),
-            &[0, 1],
-            &format!("n-sup-{tag}"),
-        )
-        .await;
-        supersede_canonical_over_roster(
-            dir,
-            &old,
-            SignedKeyRecord {
-                record: signed_canonical_record(
-                    &new,
-                    "canonical,node",
-                    env(&new),
-                    &[&accord[0], &accord[1]],
-                ),
-            },
-            &d_sup,
-            &roster_key_ids,
-        )
-        .await
-        .expect("valid supersede");
-        assert!(is_canonical_effective(dir, &new).await.unwrap());
-        assert!(!is_canonical_effective(dir, &old).await.unwrap());
-        let w = dir
-            .lookup_canonical_withdrawal(&old)
-            .await
-            .unwrap()
-            .expect("predecessor tombstone");
-        assert_eq!(w.superseded_by.as_deref(), Some(new.as_str()));
-        assert!(dir
-            .lookup_canonical_withdrawal(&new)
-            .await
-            .unwrap()
-            .is_none());
+        .expect_err("a withdrawn key must stay refused (withdrawal-wins)");
+        assert_eq!(werr.kind(), "canonical_role_withdrawn");
     }
 
     #[cfg(feature = "sqlite")]
@@ -8732,7 +9107,7 @@ mod canonical_withdrawal_tests {
         // rejection cause.
         let rec =
             signed_canonical_record("K", "canonical,node", env("K"), &[&accord[0], &accord[1]]);
-        let err = super::check_canonical_role_admission_over_roster(dir, &rec, &roster)
+        let err = super::check_canonical_role_admission_over_roster_legacy(dir, &rec, &roster)
             .await
             .expect_err("withdrawn key cannot be re-conferred canonical");
         assert_eq!(err.kind(), "canonical_role_withdrawn");
@@ -8740,7 +9115,7 @@ mod canonical_withdrawal_tests {
         // A NON-withdrawn key with a valid 2-of-3 scrub set passes the gate.
         let ok =
             signed_canonical_record("J", "canonical,node", env("J"), &[&accord[0], &accord[1]]);
-        super::check_canonical_role_admission_over_roster(dir, &ok, &roster)
+        super::check_canonical_role_admission_over_roster_legacy(dir, &ok, &roster)
             .await
             .expect("non-withdrawn 2-of-3 canonical passes the gate");
 
@@ -8752,7 +9127,7 @@ mod canonical_withdrawal_tests {
             .expect("self-superseded tombstone");
         let rec_s =
             signed_canonical_record("S", "canonical,node", env("S"), &[&accord[0], &accord[1]]);
-        super::check_canonical_role_admission_over_roster(dir, &rec_s, &roster)
+        super::check_canonical_role_admission_over_roster_legacy(dir, &rec_s, &roster)
             .await
             .expect("a superseded-to-self key is exempt from the withdrawal block");
     }

@@ -2659,6 +2659,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 row.transport_binding
                     .as_ref()
                     .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at))
+                    .transpose()?
             } else {
                 None
             };
@@ -2729,7 +2730,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             let projected_route = row
                 .transport_binding
                 .as_ref()
-                .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at));
+                .map(|tb| tb.project_route(&row.occurrence_key_id, row.asserted_at))
+                .transpose()?;
             state.federation_identity_occurrences.insert(
                 (row.identity_key_id.clone(), row.occurrence_key_id.clone()),
                 row,
@@ -2758,18 +2760,32 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         //
         // v17.0.0 (#443) — route-table PK (occ, kind) + the (epoch,
         // asserted_at) monotonic guard: a stale assertion is a silent no-op.
-        // A local put that supersedes a SIGNED row drops the signature
-        // container (it attested the old content) — parity with the
-        // sqlite/postgres NULLing of the signed columns.
+        //
+        // v21.3.0 (CIRISPersist#512 precedence half) — a local put that
+        // supersedes a SIGNED row drops the signature container ONLY when
+        // it CHANGES the signed material content (destination + both
+        // transport pubkeys); an identical-content re-assertion preserves
+        // it — parity with the sqlite/postgres CASE-guarded NULLing. See
+        // the sqlite twin's comment for the full rationale.
         let key = (
             destination.occurrence_key_id.clone(),
             destination.transport_kind.clone(),
         );
-        let applies = state.transport_destinations.get(&key).is_none_or(|ex| {
+        let existing = state.transport_destinations.get(&key);
+        let applies = existing.is_none_or(|ex| {
             (destination.epoch, destination.asserted_at) > (ex.epoch, ex.asserted_at)
         });
         if applies {
-            state.transport_destination_sigs.remove(&key);
+            let same_material_content = existing.is_some_and(|ex| {
+                ex.destination == destination.destination
+                    && ex.transport_ed25519_pubkey_base64
+                        == destination.transport_ed25519_pubkey_base64
+                    && ex.transport_x25519_pubkey_base64
+                        == destination.transport_x25519_pubkey_base64
+            });
+            if !same_material_content {
+                state.transport_destination_sigs.remove(&key);
+            }
             state
                 .transport_destinations
                 .insert(key, destination.clone());
@@ -9829,7 +9845,7 @@ mod tests {
     #[tokio::test]
     async fn canonical_record_with_infra_serve_role_admits_and_reads_both_480() {
         use crate::federation::admission::{
-            check_canonical_role_admission_over_roster, has_effective_role_over_roster,
+            check_canonical_role_admission_over_roster_legacy, has_effective_role_over_roster,
         };
         use crate::federation::operational::test_support::{
             register_accord_holder, signed_canonical_record_with_roles, Identity,
@@ -9856,7 +9872,7 @@ mod tests {
         );
 
         // (a) the canonical admission gate accepts the added role.
-        check_canonical_role_admission_over_roster(&backend, &rec, &roster)
+        check_canonical_role_admission_over_roster_legacy(&backend, &rec, &roster)
             .await
             .expect("(480a) canonical admission accepts a record carrying infra:serve");
 

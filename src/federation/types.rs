@@ -1759,15 +1759,35 @@ impl OccurrenceTransportBinding {
     ///   one, in lockstep with the occurrence UPSERT guard);
     /// - carries `Rooted` provenance from the authenticated CONTEXT (the
     ///   occurrence passed `signer_acts_for`), never from a wire field.
+    ///
+    /// v21.3.0 (CIRISPersist#512) — the projected row's `destination` is
+    /// normalized to the column's ONE canonical encoding: **lowercase hex**
+    /// of the raw RNS destination hash. Every other writer (the signed
+    /// producer's `hex::encode`, the edge announce) and the #393 item-2
+    /// gate's probe speak hex; this projection alone stored the envelope's
+    /// base64 verbatim, so an occurrence-projected route could never match
+    /// the gate's probe — same 16 bytes, two dialects, one column. The
+    /// occurrence ENVELOPE keeps `destination_hash_base64` (its own
+    /// `verify_transport_binding` gate wants base64 there); only the
+    /// projected row normalizes. Malformed base64 is a fail-closed `Err` —
+    /// never an empty/garbage `destination` row.
     pub fn project_route(
         &self,
         occurrence_key_id: &str,
         asserted_at: chrono::DateTime<chrono::Utc>,
-    ) -> super::self_at_login::TransportDestination {
-        super::self_at_login::TransportDestination {
+    ) -> Result<super::self_at_login::TransportDestination, super::Error> {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let destination_hash_raw = B64.decode(&self.destination_hash_base64).map_err(|e| {
+            super::Error::InvalidArgument(format!(
+                "project_route: transport_binding.destination_hash_base64 is not valid \
+                 base64 ({e}) — refusing to project a route row with an \
+                 unnormalizable destination"
+            ))
+        })?;
+        Ok(super::self_at_login::TransportDestination {
             occurrence_key_id: occurrence_key_id.to_owned(),
             transport_kind: Self::TRANSPORT_KIND.to_owned(),
-            destination: self.destination_hash_base64.clone(),
+            destination: hex::encode(destination_hash_raw),
             asserted_at,
             last_seen_at: None,
             transport_ed25519_pubkey_base64: Some(self.reticulum_ed25519_pubkey_base64.clone()),
@@ -1775,7 +1795,7 @@ impl OccurrenceTransportBinding {
             binding_provenance: super::self_at_login::BindingProvenance::Rooted,
             epoch: 0,
             retired_at: None,
-        }
+        })
     }
 }
 
@@ -2724,6 +2744,56 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v21.3.0 (CIRISPersist#512) — `project_route` normalizes the projected
+    /// row's `destination` to the column's ONE canonical encoding (lowercase
+    /// hex of the raw dest hash — the #393 item-2 gate's probe dialect),
+    /// while the binding itself keeps base64. Malformed base64 is a
+    /// fail-closed error, never an empty/garbage destination row.
+    #[test]
+    fn project_route_normalizes_destination_to_hex_512() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let raw = [0xA5u8; 16];
+        let tb = OccurrenceTransportBinding {
+            reticulum_x25519_pubkey_base64: B64.encode([0x01u8; 32]),
+            reticulum_ed25519_pubkey_base64: B64.encode([0x02u8; 32]),
+            destination_hash_base64: B64.encode(raw),
+            app_name: "ciris.federation".into(),
+            aspects: vec!["announce".into()],
+        };
+        let route = tb
+            .project_route("occ-1", "2026-07-26T00:00:00Z".parse().unwrap())
+            .expect("valid base64 must project");
+        assert_eq!(
+            route.destination,
+            hex::encode(raw),
+            "canonical hex, the gate's dialect"
+        );
+        // The binding's own envelope field stays base64 (its verify gate
+        // wants base64 there) — only the projected row normalizes.
+        assert_eq!(tb.destination_hash_base64, B64.encode(raw));
+    }
+
+    /// The fail-closed half: a binding whose `destination_hash_base64` is
+    /// not valid base64 must refuse to project (an unnormalizable
+    /// destination row would silently never match any probe).
+    #[test]
+    fn project_route_rejects_malformed_base64_512() {
+        let tb = OccurrenceTransportBinding {
+            reticulum_x25519_pubkey_base64: "AAAA".into(),
+            reticulum_ed25519_pubkey_base64: "AAAA".into(),
+            destination_hash_base64: "!!not-base64!!".into(),
+            app_name: "ciris.federation".into(),
+            aspects: vec![],
+        };
+        let err = tb
+            .project_route("occ-1", "2026-07-26T00:00:00Z".parse().unwrap())
+            .expect_err("malformed base64 must fail closed");
+        assert!(
+            err.to_string().contains("destination_hash_base64"),
+            "error names the offending field: {err}"
+        );
+    }
 
     /// v13.1.0 (CIRISPersist#381) — `KeyRecord::transport_hints` reads the
     /// accord-attested hints from the signed envelope: present → typed list,
