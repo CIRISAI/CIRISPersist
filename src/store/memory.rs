@@ -2761,31 +2761,28 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v17.0.0 (#443) — route-table PK (occ, kind) + the (epoch,
         // asserted_at) monotonic guard: a stale assertion is a silent no-op.
         //
-        // v21.3.0 (CIRISPersist#512 precedence half) — a local put that
-        // supersedes a SIGNED row drops the signature container ONLY when
-        // it CHANGES the signed material content (destination + both
-        // transport pubkeys); an identical-content re-assertion preserves
-        // it — parity with the sqlite/postgres CASE-guarded NULLing. See
-        // the sqlite twin's comment for the full rationale.
+        // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: an
+        // unsigned writer never demotes a signed row. The signature
+        // container is NEVER dropped by this path; a content-CHANGING
+        // unsigned write against a signed row is a silent no-op (the
+        // signed content is authoritative); a same-content refresh (or any
+        // write over an unsigned row) applies the plain monotonic upsert.
+        // Parity with the sqlite/postgres guards.
         let key = (
             destination.occurrence_key_id.clone(),
             destination.transport_kind.clone(),
         );
         let existing = state.transport_destinations.get(&key);
-        let applies = existing.is_none_or(|ex| {
+        let clock_newer = existing.is_none_or(|ex| {
             (destination.epoch, destination.asserted_at) > (ex.epoch, ex.asserted_at)
         });
-        if applies {
-            let same_material_content = existing.is_some_and(|ex| {
-                ex.destination == destination.destination
-                    && ex.transport_ed25519_pubkey_base64
-                        == destination.transport_ed25519_pubkey_base64
-                    && ex.transport_x25519_pubkey_base64
-                        == destination.transport_x25519_pubkey_base64
-            });
-            if !same_material_content {
-                state.transport_destination_sigs.remove(&key);
-            }
+        let stored_signed = state.transport_destination_sigs.contains_key(&key);
+        let same_material_content = existing.is_some_and(|ex| {
+            ex.destination == destination.destination
+                && ex.transport_ed25519_pubkey_base64 == destination.transport_ed25519_pubkey_base64
+                && ex.transport_x25519_pubkey_base64 == destination.transport_x25519_pubkey_base64
+        });
+        if clock_newer && (!stored_signed || same_material_content) {
             state
                 .transport_destinations
                 .insert(key, destination.clone());
@@ -2804,13 +2801,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let d = &signed.transport_destination;
         let mut state = self.state.lock().expect("memory backend lock");
         let key = (d.occurrence_key_id.clone(), d.transport_kind.clone());
+        // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: the
+        // monotonic-clock refusal applies only against a stored row that is
+        // itself SIGNED; a signed write always reclaims an unsigned row
+        // (occurrence-projection / announce state) regardless of clocks.
+        let stored_signed = state.transport_destination_sigs.contains_key(&key);
         let fresh = match state.transport_destinations.get(&key) {
-            Some(ex) if *ex == *d => return Ok(Outcome::Unchanged),
-            Some(ex) if (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) => {
+            Some(ex) if *ex == *d && stored_signed => return Ok(Outcome::Unchanged),
+            Some(ex) if stored_signed && (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) => {
                 return Ok(Outcome::Refused {
                     reason: format!(
                         "incoming (epoch {}, asserted_at {}) does not supersede stored \
-                         (epoch {}, asserted_at {})",
+                         SIGNED (epoch {}, asserted_at {})",
                         d.epoch,
                         d.asserted_at.to_rfc3339(),
                         ex.epoch,

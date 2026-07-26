@@ -5,6 +5,64 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.4.0] — 2026-07-26 — signed wins the shared key (#515) + mock-custody mesh simulation (verify v10.6.2 / CIRISVerify#219)
+
+### Fixed — #515: an UNSIGNED writer can no longer demote, preempt, or resurrect a SIGNED route
+
+Post-#512 (encoding closed, both rows hex) the ladder's residual was exactly
+the predicted precedence defect: on the shared
+`(occurrence_key_id, transport_kind)` key, whichever unsigned writer (the
+occurrence projection or the edge announce) landed last with the freshest
+`asserted_at` NULLed the admitted signed row's signature — and the signed
+producer could never reclaim (its clock wasn't strictly newer). The #393
+item-2 gate (requires the ML-DSA-65 signature present) missed forever.
+
+**The invariant, all three backends:** SIGNED WINS THE SHARED KEY.
+- An unsigned write NEVER demotes a signed row: signature columns are
+  preserved unconditionally (the v21.3.0 preserve-on-equal still demoted on
+  any content delta — insufficient); a content-CHANGING unsigned write
+  against a signed row is a silent no-op (the signed content is
+  authoritative — updating row fields under an old signature would serve a
+  row diverging from its signed envelope).
+- A signed write supersedes an unsigned row REGARDLESS of (epoch,
+  asserted_at) — the monotonic-clock refusal applies only against a stored
+  row that is itself signed.
+- Corollary hardening: an unsigned put can no longer RESURRECT a signed
+  retirement (the tombstone was signed intent); re-establishment comes
+  through the signed plane.
+
+Witnesses: `admit_then_project_keeps_signature_515` (the exact ladder race,
+occurrence-first order: project → signed reclaims despite an OLDER clock →
+newer re-projection cannot demote), the reworked
+`unsigned_same_content_put_preserves_signed_route_512` (no-op on divergent
+unsigned, older-clock signed reclaim), and the route matrix's new
+signed-re-establishment leg.
+
+### Added — mock-custody mesh simulation (CIRISVerify v10.6.2 adoption; #513 positive coverage)
+
+Verify pins → **v10.6.2** (all six, lockstep) + a `[dev-dependencies]`
+`ciris-verify-core` with the non-default `test-support` feature: CIRISVerify#219's
+`MockYubicoCa` fabricates FIPS-shaped custody artifacts that chain to the
+mock CA's OWN root — structurally inert against the pinned production Yubico
+root (witnessed: a mock member verifies against the mock root, is REJECTED
+against the real root, and a non-FIPS mock is rejected even against its own).
+
+- `verify_member_fips_custody_against(rec, root_der)` — the root-parameterized
+  custody verify (the pinned `verify_member_fips_custody` stays the only
+  production path).
+- `check_canonical_role_admission_over_roster_with_custody_root(...)` — the
+  FULL strict canonical gate (withdrawal-wins + the ≥3-FIPS floor) with an
+  injected custody root, gated `any(test, feature = "test-anchor")`:
+  production builds never expose a caller-supplied custody trust root;
+  simulation harnesses compile with `test-anchor` (the declared-test-context
+  feature). Wiring guides: CIRISServer#321 / CIRISAgent#930.
+- Floor discriminator witness: a 3-member MOCK roster QUALIFIES past the FIPS
+  filter (failure moves from "floor 3 exceeds 0 qualifying" to the signature
+  tally) — the counting half of #513, now positively covered with fabricated
+  hardware. The full mock MINT (hybrid scrubs by mock members) waits on
+  CIRISVerify#221 (the mock's ML-DSA private half is deliberately not
+  exposed yet); the real A1/B1/C1 artifacts continue to cover the full
+  positive path.
 ## [21.3.0] — 2026-07-26 — route-encoding fix (#512) + dyn-callable rooting (#508) + the hardware anti-Sybil floor on trust-root minting (#513)
 
 ### Fixed — #512: `project_route` stored base64 in a hex column (edge's gate could never match an occurrence-projected route)

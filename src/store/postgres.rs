@@ -6330,10 +6330,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // payload — and GUARDED monotonic on (epoch, asserted_at)
         // lexicographic. A stale assertion is a silent no-op.
         //
-        // v21.3.0 (CIRISPersist#512 precedence half) — signature columns
-        // NULL only when the local writer CHANGES the signed material
-        // content; identical-content re-assertions preserve them (see the
-        // sqlite twin's comment for the full rationale).
+        // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: an
+        // unsigned writer never demotes a signed row (signature columns
+        // preserved unconditionally; a content-CHANGING unsigned write
+        // against a signed row is a silent no-op). See the sqlite twin's
+        // comment for the full rationale.
         let provenance_token = destination.binding_provenance.as_str();
         let epoch = i64::try_from(destination.epoch).map_err(|_| {
             crate::federation::Error::InvalidArgument(
@@ -6357,30 +6358,18 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     binding_provenance = EXCLUDED.binding_provenance, \
                     epoch = EXCLUDED.epoch, \
                     retired_at = EXCLUDED.retired_at, \
-                    attesting_key_id = CASE WHEN \
-                        EXCLUDED.destination = cirislens.transport_destinations.destination \
-                        AND COALESCE(EXCLUDED.transport_ed25519_pubkey_base64, '') \
-                            = COALESCE(cirislens.transport_destinations.transport_ed25519_pubkey_base64, '') \
-                        AND COALESCE(EXCLUDED.transport_x25519_pubkey_base64, '') \
-                            = COALESCE(cirislens.transport_destinations.transport_x25519_pubkey_base64, '') \
-                        THEN cirislens.transport_destinations.attesting_key_id ELSE NULL END, \
-                    signed_envelope = CASE WHEN \
-                        EXCLUDED.destination = cirislens.transport_destinations.destination \
-                        AND COALESCE(EXCLUDED.transport_ed25519_pubkey_base64, '') \
-                            = COALESCE(cirislens.transport_destinations.transport_ed25519_pubkey_base64, '') \
-                        AND COALESCE(EXCLUDED.transport_x25519_pubkey_base64, '') \
-                            = COALESCE(cirislens.transport_destinations.transport_x25519_pubkey_base64, '') \
-                        THEN cirislens.transport_destinations.signed_envelope ELSE NULL END, \
-                    signature = CASE WHEN \
-                        EXCLUDED.destination = cirislens.transport_destinations.destination \
-                        AND COALESCE(EXCLUDED.transport_ed25519_pubkey_base64, '') \
-                            = COALESCE(cirislens.transport_destinations.transport_ed25519_pubkey_base64, '') \
-                        AND COALESCE(EXCLUDED.transport_x25519_pubkey_base64, '') \
-                            = COALESCE(cirislens.transport_destinations.transport_x25519_pubkey_base64, '') \
-                        THEN cirislens.transport_destinations.signature ELSE NULL END \
-                 WHERE EXCLUDED.epoch > cirislens.transport_destinations.epoch \
+                    attesting_key_id = cirislens.transport_destinations.attesting_key_id, \
+                    signed_envelope = cirislens.transport_destinations.signed_envelope, \
+                    signature = cirislens.transport_destinations.signature \
+                 WHERE (EXCLUDED.epoch > cirislens.transport_destinations.epoch \
                     OR (EXCLUDED.epoch = cirislens.transport_destinations.epoch \
-                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at)",
+                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at)) \
+                   AND (cirislens.transport_destinations.signature IS NULL \
+                    OR (EXCLUDED.destination = cirislens.transport_destinations.destination \
+                        AND COALESCE(EXCLUDED.transport_ed25519_pubkey_base64, '') \
+                            = COALESCE(cirislens.transport_destinations.transport_ed25519_pubkey_base64, '') \
+                        AND COALESCE(EXCLUDED.transport_x25519_pubkey_base64, '') \
+                            = COALESCE(cirislens.transport_destinations.transport_x25519_pubkey_base64, '')))",
                 &[
                     &destination.occurrence_key_id,
                     &destination.transport_kind,
@@ -6439,13 +6428,34 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             })?
             .map(|row| pg_row_to_transport_destination(&row))
             .transpose()?;
+        // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY: the
+        // monotonic-clock refusal applies only against a stored row that is
+        // itself SIGNED; a signed write always reclaims an unsigned row
+        // (occurrence-projection / announce state) regardless of clocks.
+        let stored_signed: bool = if existing.is_some() {
+            client
+                .query_one(
+                    "SELECT signature IS NOT NULL FROM cirislens.transport_destinations \
+                     WHERE occurrence_key_id = $1 AND transport_kind = $2",
+                    &[&d.occurrence_key_id, &d.transport_kind],
+                )
+                .await
+                .map_err(|e| {
+                    crate::federation::Error::Backend(format!("signed-presence read: {e}"))
+                })?
+                .get(0)
+        } else {
+            false
+        };
         let fresh = match existing {
-            Some(ref ex) if *ex == *d => return Ok(Outcome::Unchanged),
-            Some(ref ex) if (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) => {
+            Some(ref ex) if *ex == *d && stored_signed => return Ok(Outcome::Unchanged),
+            Some(ref ex)
+                if stored_signed && (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) =>
+            {
                 return Ok(Outcome::Refused {
                     reason: format!(
                         "incoming (epoch {}, asserted_at {}) does not supersede stored \
-                         (epoch {}, asserted_at {})",
+                         SIGNED (epoch {}, asserted_at {})",
                         d.epoch,
                         d.asserted_at.to_rfc3339(),
                         ex.epoch,
@@ -6480,7 +6490,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     signature = EXCLUDED.signature \
                  WHERE EXCLUDED.epoch > cirislens.transport_destinations.epoch \
                     OR (EXCLUDED.epoch = cirislens.transport_destinations.epoch \
-                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at)",
+                        AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at) \
+                    OR cirislens.transport_destinations.signature IS NULL",
                 &[
                     &d.occurrence_key_id,
                     &d.transport_kind,

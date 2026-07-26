@@ -3630,10 +3630,59 @@ pub async fn check_canonical_role_admission_over_roster(
             roster_key_ids,
             CANONICAL_MIN_COSCRUBBERS,
             true,
+            YUBICO_ATTESTATION_ROOT_1_DER,
         )
         .await
     };
     verify_result.map_err(|reason| Error::CanonicalRoleNotAccordConferred {
+        key_id: row.key_id.clone(),
+        scrub_key_id: row.scrub_key_id.clone(),
+        reason,
+    })
+}
+
+/// v21.4.0 (CIRISPersist#513 / CIRISVerify#219) — the STRICT canonical
+/// gate with an INJECTED custody root: withdrawal-wins + the full #513
+/// floor (`max(strict_majority, 3)` FIPS-verified co-scrubbers), verified
+/// against `custody_root` instead of the pinned production Yubico root.
+///
+/// **The mesh-simulation surface.** CIRISVerify v10.6.2's
+/// `accord_custody_attestation::test_support::MockYubicoCa` mints members
+/// whose custody chains verify only against the mock CA's own root — pass
+/// `ca.root_der()` here to exercise REAL floor semantics over fabricated
+/// hardware. Gated `any(test, feature = "test-anchor")`: production builds
+/// never expose a caller-supplied custody trust root (Registry-of-Record);
+/// simulation harnesses (CIRISServer / CIRISAgent mesh sims) compile with
+/// `test-anchor` — the same declared-test-context feature that arms the
+/// software trust-root override.
+#[cfg(any(test, feature = "test-anchor"))]
+pub async fn check_canonical_role_admission_over_roster_with_custody_root(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+    roster_key_ids: &[String],
+    custody_root: &[u8],
+) -> Result<(), Error> {
+    if !row.claims_role(identity_type::CANONICAL) {
+        return Ok(());
+    }
+    if let Some(w) = directory.lookup_canonical_withdrawal(&row.key_id).await? {
+        if w.superseded_by.as_deref() != Some(row.key_id.as_str()) {
+            return Err(Error::CanonicalRoleWithdrawn {
+                key_id: row.key_id.clone(),
+                superseded_by: w.superseded_by.clone(),
+            });
+        }
+    }
+    verify_accord_family_coscrub_with(
+        directory,
+        row,
+        roster_key_ids,
+        CANONICAL_MIN_COSCRUBBERS,
+        true,
+        custody_root,
+    )
+    .await
+    .map_err(|reason| Error::CanonicalRoleNotAccordConferred {
         key_id: row.key_id.clone(),
         scrub_key_id: row.scrub_key_id.clone(),
         reason,
@@ -3726,7 +3775,15 @@ async fn verify_accord_family_coscrub(
     row: &super::KeyRecord,
     roster_key_ids: &[String],
 ) -> Result<(), String> {
-    verify_accord_family_coscrub_with(directory, row, roster_key_ids, 0, false).await
+    verify_accord_family_coscrub_with(
+        directory,
+        row,
+        roster_key_ids,
+        0,
+        false,
+        YUBICO_ATTESTATION_ROOT_1_DER,
+    )
+    .await
 }
 
 /// v21.3.0 (CIRISPersist#513) — the PINNED durable accord-custody trust
@@ -3777,6 +3834,19 @@ pub const CANONICAL_MIN_COSCRUBBERS: usize = 3;
 pub fn verify_member_fips_custody(
     rec: &super::KeyRecord,
 ) -> Result<ciris_verify_core::accord_custody_attestation::CustodyVerdict, String> {
+    verify_member_fips_custody_against(rec, YUBICO_ATTESTATION_ROOT_1_DER)
+}
+
+/// The root-parameterized core of [`verify_member_fips_custody`] — the
+/// attestation-verify surface downstream composes for MESH SIMULATION
+/// (CIRISVerify v10.6.2 `test_support::MockYubicoCa` mints members whose
+/// chains verify only against the mock CA's own root; pass `ca.root_der()`
+/// here). Production gates use the pinned wrapper above — a caller-supplied
+/// custody root never reaches the admission path (Registry-of-Record).
+pub fn verify_member_fips_custody_against(
+    rec: &super::KeyRecord,
+    yubico_root_der: &[u8],
+) -> Result<ciris_verify_core::accord_custody_attestation::CustodyVerdict, String> {
     use ciris_verify_core::accord_custody_attestation::verify_accord_custody_attestation;
     use ciris_verify_core::ceg_outbox::SignedCegObject;
     use ciris_verify_core::threshold::{Role, ThresholdMember};
@@ -3794,7 +3864,7 @@ pub fn verify_member_fips_custody(
         mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64.clone(),
         role: Some(Role::Founder),
     };
-    let verdict = verify_accord_custody_attestation(&obj, &member, YUBICO_ATTESTATION_ROOT_1_DER)
+    let verdict = verify_accord_custody_attestation(&obj, &member, yubico_root_der)
         .map_err(|e| format!("custody attestation verify failed: {e}"))?;
     if !verdict.fips_certified {
         return Err("custody attestation is not FIPS-certified (Yubico ext …3.10 absent)".into());
@@ -3825,6 +3895,7 @@ async fn verify_accord_family_coscrub_with(
     roster_key_ids: &[String],
     min_quorum: usize,
     require_fips_custody: bool,
+    custody_root: &[u8],
 ) -> Result<(), String> {
     use ciris_verify_core::threshold::{
         verify_quorum_policy, QuorumPolicy, Role, ThresholdMember, ThresholdSignature,
@@ -3844,7 +3915,7 @@ async fn verify_accord_family_coscrub_with(
             .map_err(|e| format!("roster resolve failed for {kid}: {e}"))?
         {
             if require_fips_custody {
-                if let Err(why) = verify_member_fips_custody(&rec) {
+                if let Err(why) = verify_member_fips_custody_against(&rec, custody_root) {
                     custody_rejected.push(format!("{kid}: {why}"));
                     continue;
                 }
@@ -7411,6 +7482,102 @@ mod canonical_gate_tests {
         assert!(
             msg.contains("attestation_evidence") || msg.contains("custody"),
             "refusal must cite the custody rejections: {msg}"
+        );
+    }
+
+    /// v21.4.0 (CIRISVerify#219 / v10.6.2) — MOCK custody attestations:
+    /// a `MockYubicoCa` member verifies against ITS OWN root, is
+    /// structurally INERT against the pinned production root, and a
+    /// non-FIPS mock is rejected even against its own root. The
+    /// per-member half of mesh simulation.
+    #[tokio::test]
+    async fn mock_member_custody_verifies_against_mock_root_only_513() {
+        use ciris_verify_core::accord_custody_attestation::test_support::MockYubicoCa;
+
+        let ca = MockYubicoCa::new();
+        let a1 = ca
+            .attest_member([0x61u8; 32], "mockA1", "2026-07-26T00:00:00Z")
+            .await;
+        let mut rec = record("mockA1", identity_type::NODE, "mockA1");
+        rec.pubkey_ed25519_base64 = a1.member.ed25519_public_key_base64.clone();
+        rec.pubkey_ml_dsa_65_base64 = a1.member.mldsa65_public_key_base64.clone();
+        rec.attestation_evidence = Some(serde_json::to_value(&a1.attestation).unwrap());
+
+        let verdict = super::verify_member_fips_custody_against(&rec, ca.root_der())
+            .expect("mock member must verify against the mock root");
+        assert!(verdict.fips_certified && verdict.touch_always);
+
+        // INERT against the pinned production root — the safety property
+        // that makes exporting the mock acceptable at all.
+        super::verify_member_fips_custody(&rec)
+            .expect_err("a mock member must NEVER verify against the real pinned root");
+
+        // A non-FIPS mock is rejected even against its own root.
+        let weak = ca
+            .attest_member_with(
+                [0x62u8; 32],
+                "mockWeak",
+                "2026-07-26T00:00:00Z",
+                false,
+                0x02, // TOUCH_POLICY_ALWAYS (private const in verify-core)
+            )
+            .await;
+        let mut wrec = record("mockWeak", identity_type::NODE, "mockWeak");
+        wrec.pubkey_ed25519_base64 = weak.member.ed25519_public_key_base64.clone();
+        wrec.pubkey_ml_dsa_65_base64 = weak.member.mldsa65_public_key_base64.clone();
+        wrec.attestation_evidence = Some(serde_json::to_value(&weak.attestation).unwrap());
+        let err = super::verify_member_fips_custody_against(&wrec, ca.root_der())
+            .expect_err("non-FIPS mock must be rejected");
+        assert!(err.contains("FIPS"), "{err}");
+    }
+
+    /// v21.4.0 (CIRISVerify#219) — the floor DISCRIMINATOR: with 3
+    /// mock-FIPS-attested roster members and the mock root injected, the
+    /// gate's failure moves PAST the custody floor ("floor 3 exceeds the 0
+    /// qualifying") to the signature tally ("insufficient distinct valid
+    /// signatures") — proving the FIPS filter genuinely counted all three
+    /// fabricated members. (A full positive mint additionally needs the
+    /// members' ML-DSA private halves, which the mock deliberately does not
+    /// expose yet — tracked verify-side; the real-artifact witnesses cover
+    /// the full positive path.)
+    #[tokio::test]
+    async fn mock_quorum_qualifies_the_floor_513() {
+        use ciris_verify_core::accord_custody_attestation::test_support::MockYubicoCa;
+
+        let backend = crate::store::memory::MemoryBackend::new();
+        let ca = MockYubicoCa::new();
+        let mut roster = Vec::new();
+        for (i, kid) in ["mq0", "mq1", "mq2"].iter().enumerate() {
+            let m = ca
+                .attest_member([0x70 + i as u8; 32], kid, "2026-07-26T00:00:00Z")
+                .await;
+            let mut rec = record(kid, identity_type::NODE, kid);
+            rec.pubkey_ed25519_base64 = m.member.ed25519_public_key_base64.clone();
+            rec.pubkey_ml_dsa_65_base64 = m.member.mldsa65_public_key_base64.clone();
+            rec.attestation_evidence = Some(serde_json::to_value(&m.attestation).unwrap());
+            backend
+                .put_public_key(SignedKeyRecord { record: rec })
+                .await
+                .unwrap();
+            roster.push((*kid).to_string());
+        }
+        let rec = record("canon-mock-513", "canonical,node", "mq0");
+        let err = super::check_canonical_role_admission_over_roster_with_custody_root(
+            &backend,
+            &rec,
+            &roster,
+            ca.root_der(),
+        )
+        .await
+        .expect_err("garbage scrubs cannot mint even with a qualified roster");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("insufficient distinct valid signatures"),
+            "failure must be at the signature tally, not the custody floor: {msg}"
+        );
+        assert!(
+            !msg.contains("floor 3 exceeds"),
+            "all 3 mock members must have QUALIFIED past the FIPS filter: {msg}"
         );
     }
 
