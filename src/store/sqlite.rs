@@ -6036,18 +6036,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // asserted_at TEXT comparison is chronological for our uniform
             // RFC-3339 UTC encoding (to_rfc3339, "+00:00").
             //
-            // v21.3.0 (CIRISPersist#512 precedence half) — a local (trusted)
-            // put that supersedes a SIGNED row NULLs the signature columns
-            // ONLY when it changes the signed material content (destination
-            // + both transport pubkeys): the old signature attested the OLD
-            // content. When the local writer merely RE-ASSERTS identical
-            // content (the edge announce / occurrence projection refreshing
-            // clocks), the signature still attests exactly this content and
-            // is PRESERVED — an unsigned writer must never downgrade a
-            // signed row it agrees with (the #393 item-2 gate requires the
-            // PQC signature to be present; the observed live failure was a
-            // signed producer row rendered unsigned by a same-content
-            // announce).
+            // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY. An
+            // unsigned writer (the occurrence projection / edge announce)
+            // carries no signature to offer, so it can NEVER demote a
+            // signed row:
+            // - signature columns are preserved UNCONDITIONALLY (the
+            //   v21.3.0 preserve-on-equal still demoted on any content
+            //   delta — the live canonical's admitted row landed
+            //   signature=NULL and the #393 item-2 gate missed);
+            // - an unsigned write that would CHANGE a signed row's material
+            //   content (destination + both transport pubkeys) is a silent
+            //   no-op (same posture as a stale assertion): the SIGNED
+            //   content is authoritative, and updating row fields while
+            //   keeping the old signature would serve a row whose plain
+            //   fields diverge from its signed envelope. Same-content
+            //   liveness refreshes (clocks) still apply.
+            // An unsigned row (signature IS NULL) keeps the plain monotonic
+            // upsert exactly as before.
             conn.execute(
                 "INSERT INTO transport_destinations \
                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
@@ -6064,30 +6069,18 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     binding_provenance = excluded.binding_provenance, \
                     epoch = excluded.epoch, \
                     retired_at = excluded.retired_at, \
-                    attesting_key_id = CASE WHEN \
-                        excluded.destination = transport_destinations.destination \
-                        AND COALESCE(excluded.transport_ed25519_pubkey_base64, '') \
-                            = COALESCE(transport_destinations.transport_ed25519_pubkey_base64, '') \
-                        AND COALESCE(excluded.transport_x25519_pubkey_base64, '') \
-                            = COALESCE(transport_destinations.transport_x25519_pubkey_base64, '') \
-                        THEN transport_destinations.attesting_key_id ELSE NULL END, \
-                    signed_envelope = CASE WHEN \
-                        excluded.destination = transport_destinations.destination \
-                        AND COALESCE(excluded.transport_ed25519_pubkey_base64, '') \
-                            = COALESCE(transport_destinations.transport_ed25519_pubkey_base64, '') \
-                        AND COALESCE(excluded.transport_x25519_pubkey_base64, '') \
-                            = COALESCE(transport_destinations.transport_x25519_pubkey_base64, '') \
-                        THEN transport_destinations.signed_envelope ELSE NULL END, \
-                    signature = CASE WHEN \
-                        excluded.destination = transport_destinations.destination \
-                        AND COALESCE(excluded.transport_ed25519_pubkey_base64, '') \
-                            = COALESCE(transport_destinations.transport_ed25519_pubkey_base64, '') \
-                        AND COALESCE(excluded.transport_x25519_pubkey_base64, '') \
-                            = COALESCE(transport_destinations.transport_x25519_pubkey_base64, '') \
-                        THEN transport_destinations.signature ELSE NULL END \
-                 WHERE excluded.epoch > transport_destinations.epoch \
+                    attesting_key_id = transport_destinations.attesting_key_id, \
+                    signed_envelope = transport_destinations.signed_envelope, \
+                    signature = transport_destinations.signature \
+                 WHERE (excluded.epoch > transport_destinations.epoch \
                     OR (excluded.epoch = transport_destinations.epoch \
-                        AND excluded.asserted_at > transport_destinations.asserted_at)",
+                        AND excluded.asserted_at > transport_destinations.asserted_at)) \
+                   AND (transport_destinations.signature IS NULL \
+                    OR (excluded.destination = transport_destinations.destination \
+                        AND COALESCE(excluded.transport_ed25519_pubkey_base64, '') \
+                            = COALESCE(transport_destinations.transport_ed25519_pubkey_base64, '') \
+                        AND COALESCE(excluded.transport_x25519_pubkey_base64, '') \
+                            = COALESCE(transport_destinations.transport_x25519_pubkey_base64, '')))",
                 rusqlite::params![
                     d.occurrence_key_id,
                     d.transport_kind,
@@ -6156,15 +6149,29 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                 )
                 .optional()?;
             if let Some(ex) = existing {
-                if ex == d {
-                    // Byte-identical typed content — idempotent re-offer.
+                // v21.3.1 (CIRISPersist#515) — SIGNED WINS THE SHARED KEY:
+                // the monotonic-clock refusal applies only against a stored
+                // row that is itself SIGNED. A signed write always reclaims
+                // an unsigned row (occurrence-projection / announce state),
+                // regardless of (epoch, asserted_at) — otherwise whichever
+                // unsigned writer landed last with the freshest clock kept
+                // the admitted producer signature out forever.
+                let stored_signed: bool = conn.query_row(
+                    "SELECT signature IS NOT NULL FROM transport_destinations \
+                     WHERE occurrence_key_id = ?1 AND transport_kind = ?2",
+                    rusqlite::params![d.occurrence_key_id, d.transport_kind],
+                    |r| r.get(0),
+                )?;
+                if ex == d && stored_signed {
+                    // Byte-identical typed content on an already-signed row —
+                    // idempotent re-offer.
                     return Ok(Outcome::Unchanged);
                 }
-                if (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) {
+                if stored_signed && (d.epoch, d.asserted_at) <= (ex.epoch, ex.asserted_at) {
                     return Ok(Outcome::Refused {
                         reason: format!(
                             "incoming (epoch {}, asserted_at {}) does not supersede stored \
-                             (epoch {}, asserted_at {})",
+                             SIGNED (epoch {}, asserted_at {})",
                             d.epoch,
                             d.asserted_at.to_rfc3339(),
                             ex.epoch,
@@ -6203,7 +6210,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     signature = excluded.signature \
                  WHERE excluded.epoch > transport_destinations.epoch \
                     OR (excluded.epoch = transport_destinations.epoch \
-                        AND excluded.asserted_at > transport_destinations.asserted_at)",
+                        AND excluded.asserted_at > transport_destinations.asserted_at) \
+                    OR transport_destinations.signature IS NULL",
                 rusqlite::params![
                     d.occurrence_key_id,
                     d.transport_kind,
@@ -25973,29 +25981,294 @@ mod tests {
             "an identical-content unsigned re-assertion must not strip the signature"
         );
 
-        // (2) CHANGED content, newer clock: signature must be NULLed
-        // (it attested the OLD content).
+        // (2) v21.3.1 (#515) — CHANGED content, newer clock, UNSIGNED
+        // writer against a SIGNED row: a silent NO-OP. The signed content
+        // is authoritative; an unsigned writer never demotes it (the
+        // v21.3.0 ELSE-NULL demotion was exactly the live canonical's
+        // signature=NULL failure).
         let mut changed = dest.clone();
         changed.asserted_at = "2026-06-12T00:00:00Z".parse().unwrap();
         changed.destination = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
         crate::federation::FederationDirectory::put_transport_destination(&backend, &changed)
             .await
             .unwrap();
-        assert!(
+        assert_eq!(
             backend
                 .list_signed_transport_destinations_for("td512-occ")
                 .await
                 .unwrap()
-                .is_empty(),
-            "a content-changing unsigned put must strip the stale signature"
+                .len(),
+            1,
+            "a content-changing unsigned put must NOT demote the signed row"
         );
-        // The row itself survived with the new content (plain read).
         let rows = backend
             .list_transport_destinations_for("td512-occ")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].destination, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(
+            rows[0].destination, "6695b346306e946bd594cac3aaf318f9",
+            "the signed row's content is authoritative — the divergent unsigned write no-ops"
+        );
+
+        // (3) v21.3.1 (#515) — a SIGNED write reclaims an UNSIGNED row
+        // regardless of clocks. Fresh key: unsigned row lands first with a
+        // NEWER clock than the signed write that follows; the signed write
+        // must still win.
+        let mut unsigned_first = dest.clone();
+        unsigned_first.occurrence_key_id = "td515-occ".into();
+        unsigned_first.asserted_at = "2026-06-20T00:00:00Z".parse().unwrap();
+        // register the second occurrence key + a signer for it
+        let signer2 = Box::new(HybridSigningIdentity::new(
+            "td515-occ",
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let member2 = signer2.directory_member().unwrap();
+        let mut occ2 = fed_key("td515-occ", "acme", "td515-occ");
+        occ2.pubkey_ed25519_base64 = member2.ed25519_public_key_base64.clone();
+        occ2.pubkey_ml_dsa_65_base64 = member2.mldsa65_public_key_base64.clone();
+        backend
+            .put_public_key(SignedKeyRecord { record: occ2 })
+            .await
+            .unwrap();
+        crate::federation::FederationDirectory::put_transport_destination(
+            &backend,
+            &unsigned_first,
+        )
+        .await
+        .unwrap();
+        assert!(backend
+            .list_signed_transport_destinations_for("td515-occ")
+            .await
+            .unwrap()
+            .is_empty());
+        let mut signed_late = unsigned_first.clone();
+        signed_late.asserted_at = "2026-06-15T00:00:00Z".parse().unwrap(); // OLDER clock
+        let (env2, sig2) = produce_signed_identity_occurrence(
+            signer2.as_ref(),
+            serde_json::to_value(&signed_late).unwrap(),
+        )
+        .await
+        .unwrap();
+        let outcome = backend
+            .put_signed_transport_destination(&crate::federation::SignedTransportDestination {
+                transport_destination: signed_late,
+                attesting_key_id: "td515-occ".into(),
+                signed_envelope: env2,
+                signature: sig2,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !matches!(
+                outcome,
+                crate::federation::TransportDestinationApplyOutcome::Refused { .. }
+            ),
+            "an older-clock SIGNED write must reclaim the unsigned row: {outcome:?}"
+        );
+        assert_eq!(
+            backend
+                .list_signed_transport_destinations_for("td515-occ")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "signed wins the shared key even against a fresher unsigned clock"
+        );
+    }
+
+    /// v21.3.1 (CIRISPersist#515) — the ADMIT-THEN-PROJECT race, the exact
+    /// class the suites kept missing (they covered the signed-producer path
+    /// only, never projection-after-signed): a SIGNED route is admitted,
+    /// then a signed identity-occurrence for the SAME occurrence arrives
+    /// (its transport binding projects an UNSIGNED route row with a newer
+    /// asserted_at). The signed route must survive: signature intact,
+    /// content authoritative — the #393 item-2 gate (hex probe + signature
+    /// present) still hits.
+    #[tokio::test]
+    async fn admit_then_project_keeps_signature_515() {
+        use crate::federation::FederationDirectory;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
+        use ciris_verify_core::self_at_login::HybridSigningIdentity;
+        use ciris_verify_core::transport_binding::{
+            compute_destination_hash, produce_signed_identity_occurrence,
+        };
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let signer = Box::new(HybridSigningIdentity::new(
+            "ap515",
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let member = signer.directory_member().unwrap();
+        let mut alice = fed_key("ap515", "ap515", "ap515");
+        alice.pubkey_ed25519_base64 = member.ed25519_public_key_base64.clone();
+        alice.pubkey_ml_dsa_65_base64 = member.mldsa65_public_key_base64.clone();
+        backend
+            .put_public_key(SignedKeyRecord { record: alice })
+            .await
+            .unwrap();
+        let transport_ed = [0x51u8; 32];
+        let transport_x = [0x52u8; 32];
+        let app = "ciris.federation";
+        let aspects = vec!["announce".to_string(), "v1".to_string()];
+        let dest_hash =
+            compute_destination_hash(app, &aspects, &transport_x, &transport_ed).unwrap();
+        let content_x = [0x53u8; 32];
+
+        // A signed occurrence for (ap515 → ap515-phone) carrying the binding;
+        // reused (with a bumped clock) for the re-projection step.
+        let occurrence_at = |asserted: &str| {
+            let tb_env = serde_json::json!({
+                "reticulum_x25519_pubkey": B64.encode(transport_x),
+                "reticulum_ed25519_pubkey": B64.encode(transport_ed),
+                "destination_hash": B64.encode(dest_hash),
+                "app_name": app,
+                "aspects": aspects,
+            });
+            let enc_env = serde_json::json!({
+                "x25519_base64": B64.encode(content_x),
+                "ml_kem_768_base64": B64.encode(vec![0x11u8; 1184]),
+            });
+            (
+                serde_json::json!({
+                    "identity_key_id": "ap515",
+                    "occurrence_key_id": "ap515",
+                    "transport_destination": tb_env,
+                    "encryption_pubkeys": enc_env,
+                    "asserted_at": format!("{asserted}.000Z"),
+                }),
+                crate::federation::IdentityOccurrence {
+                    identity_key_id: "ap515".into(),
+                    occurrence_key_id: "ap515".into(),
+                    device_class: crate::federation::types::device_class::AGENT.into(),
+                    hardware_attestation: None,
+                    asserted_at: format!("{asserted}Z").parse().unwrap(),
+                    valid_until: None,
+                    encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
+                        x25519_base64: B64.encode(content_x),
+                        ml_kem_768_base64: B64.encode(vec![0x11u8; 1184]),
+                    }),
+                    transport_binding: Some(crate::federation::types::OccurrenceTransportBinding {
+                        reticulum_x25519_pubkey_base64: B64.encode(transport_x),
+                        reticulum_ed25519_pubkey_base64: B64.encode(transport_ed),
+                        destination_hash_base64: B64.encode(dest_hash),
+                        app_name: app.into(),
+                        aspects: aspects.clone(),
+                    }),
+                    persist_row_hash: String::new(),
+                },
+            )
+        };
+
+        // 1. The OCCURRENCE admits first (the boot order): its binding
+        //    projects an UNSIGNED hex route row.
+        let (env1, occ1) = occurrence_at("2026-07-20T00:00:00");
+        let (occ_env1, occ_sig1) = produce_signed_identity_occurrence(signer.as_ref(), env1)
+            .await
+            .unwrap();
+        backend
+            .put_identity_occurrence(crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: occ1,
+                attesting_key_id: "ap515".to_string(),
+                signed_envelope: occ_env1,
+                signature: occ_sig1,
+            })
+            .await
+            .expect("occurrence 1 admits");
+        assert!(backend
+            .list_signed_transport_destinations_for("ap515")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // 2. The SIGNED producer route arrives with an OLDER clock than the
+        //    projection — pre-#515 the monotonic guard refused it forever;
+        //    now SIGNED RECLAIMS the unsigned row regardless of clocks.
+        let signed_dest = crate::federation::self_at_login::TransportDestination {
+            occurrence_key_id: "ap515".into(),
+            transport_kind: "reticulum".into(),
+            destination: hex::encode(dest_hash),
+            asserted_at: "2026-07-19T00:00:00Z".parse().unwrap(),
+            last_seen_at: None,
+            transport_ed25519_pubkey_base64: None,
+            transport_x25519_pubkey_base64: None,
+            binding_provenance: crate::federation::self_at_login::BindingProvenance::Rooted,
+            epoch: 0,
+            retired_at: None,
+        };
+        let (senv, ssig) = produce_signed_identity_occurrence(
+            signer.as_ref(),
+            serde_json::to_value(&signed_dest).unwrap(),
+        )
+        .await
+        .unwrap();
+        let outcome = backend
+            .put_signed_transport_destination(&crate::federation::SignedTransportDestination {
+                transport_destination: signed_dest,
+                attesting_key_id: "ap515".to_string(),
+                signed_envelope: senv,
+                signature: ssig,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !matches!(
+                outcome,
+                crate::federation::TransportDestinationApplyOutcome::Refused { .. }
+            ),
+            "signed must reclaim the projected unsigned row: {outcome:?}"
+        );
+        assert_eq!(
+            backend
+                .list_signed_transport_destinations_for("ap515")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // 3. A NEWER occurrence re-projects (the recurring boot/announce
+        //    refresh) — the projection must NOT demote the signed route.
+        let (env2, occ2) = occurrence_at("2026-07-22T00:00:00");
+        let (occ_env2, occ_sig2) = produce_signed_identity_occurrence(signer.as_ref(), env2)
+            .await
+            .unwrap();
+        backend
+            .put_identity_occurrence(crate::federation::SignedIdentityOccurrence {
+                identity_occurrence: occ2,
+                attesting_key_id: "ap515".to_string(),
+                signed_envelope: occ_env2,
+                signature: occ_sig2,
+            })
+            .await
+            .expect("occurrence 2 admits");
+
+        // 3. The signed route SURVIVES the projection: signature intact,
+        //    hex destination intact — the gate's predicate holds.
+        let signed_rows = backend
+            .list_signed_transport_destinations_for("ap515")
+            .await
+            .unwrap();
+        assert_eq!(
+            signed_rows.len(),
+            1,
+            "the projection must not demote the signed route"
+        );
+        let rows = backend
+            .list_transport_destinations_for("ap515")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].destination,
+            hex::encode(dest_hash),
+            "hex destination preserved — the #393 item-2 probe hits a SIGNED row"
+        );
     }
 
     /// `list_signed_identity_occurrence_revocations_since` returns exactly

@@ -1011,9 +1011,13 @@ pub(crate) mod test_support {
             .unwrap()
             .is_empty());
 
-        // (11) A trusted-local put with a HIGHER epoch re-establishes the
-        // route AND drops the stored signature container (it attested the
-        // old content) — the signed read goes quiet until the next signed put.
+        // (11) v21.4.0 (#515) — SIGNED WINS THE SHARED KEY: a trusted-local
+        // put, even at a HIGHER epoch, can NEITHER resurrect a signed
+        // retirement NOR demote the signature container. The tombstone was
+        // signed intent; an unsigned writer carries nothing that outranks
+        // it. (Pre-#515 this leg asserted the opposite — the local put
+        // re-established the route and dropped the signature — which is
+        // exactly the demotion recipe the live canonical hit.)
         dir.put_transport_destination(&route(
             &alice_id,
             "reticulum",
@@ -1023,18 +1027,52 @@ pub(crate) mod test_support {
         ))
         .await
         .unwrap();
+        assert!(
+            dir.list_transport_destinations_for(&alice_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unsigned put must not resurrect a signed retirement"
+        );
+        assert_eq!(
+            dir.list_signed_transport_destinations_for(&alice_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the signed tombstone keeps gossiping"
+        );
+
+        // (12) Re-establishment comes SIGNED: an epoch-3 signed rotation by
+        // the bound occurrence re-opens the route through the signed plane.
+        let r3 = route(&alice_id, "reticulum", "d3", 3, "2026-06-13T00:00:00Z");
+        let (env3, sig3) =
+            produce_signed_identity_occurrence(phone.as_ref(), serde_json::to_value(&r3).unwrap())
+                .await
+                .unwrap();
+        let s3 = SignedTransportDestination {
+            transport_destination: r3.clone(),
+            attesting_key_id: phone_id.clone(),
+            signed_envelope: env3,
+            signature: sig3,
+        };
+        assert!(matches!(
+            dir.put_signed_transport_destination(&s3).await.unwrap(),
+            Outcome::Superseded | Outcome::Inserted
+        ));
         let rows = dir
             .list_transport_destinations_for(&alice_id)
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].destination, "d3");
-        assert!(
+        assert_eq!(
             dir.list_signed_transport_destinations_for(&alice_id)
                 .await
                 .unwrap()
-                .is_empty(),
-            "a local supersede must drop the stale signature container"
+                .len(),
+            1,
+            "the signed re-establishment replaces the tombstone on the signed plane"
         );
     }
 
