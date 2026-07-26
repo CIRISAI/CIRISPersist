@@ -523,14 +523,14 @@ tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
 # ciris-crypto invariant (FSD §7.5a) means persist takes ZERO direct
 # deps on AES-GCM/PBKDF2/HKDF/HMAC primitive crates ever — the
 # `src/secrets/crypto.rs` facade lands as a single import-site change.
-ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.2", version = "10", features = ["pqc-ml-dsa"] }
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.2", version = "10" }
+ciris-keyring     = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.3", version = "10", features = ["pqc-ml-dsa"] }
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.3", version = "10" }
 # v0.3.6 (CIRISPersist#14) — direct ciris-crypto dep for HybridVerifier
 # in `Engine.verify_hybrid`. Same git source / tag as ciris-keyring +
 # ciris-verify-core so versions are workspace-coherent. Features
 # `ed25519` + `pqc-ml-dsa` light up the concrete Ed25519Verifier +
 # MlDsa65Verifier impls used by HybridVerifier::verify.
-ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.2", version = "10", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant"] }
+ciris-crypto      = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.3", version = "10", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "key-grant"] }
 async-trait   = "0.1"
 # v0.1.14 — filesystem advisory locks for the cohabitation
 # bootstrap (docs/COHABITATION.md). POSIX flock cross-process,
@@ -792,10 +792,10 @@ tokio-stream = "0.1"
 # key). Placed AFTER every platform-independent dep — see the v0.9.0
 # bug note on the rusqlite target table above.
 [target.'cfg(target_os = "linux")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.2", version = "10", features = ["pqc-ml-dsa"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.3", version = "10", features = ["pqc-ml-dsa"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.2", version = "10", features = ["pqc-ml-dsa", "ios"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.3", version = "10", features = ["pqc-ml-dsa", "ios"] }
 # v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
 # see the base-deps note). No iOS openssl in any configuration now.
 
@@ -803,7 +803,7 @@ ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.2
 # v3.5.2 (#132) — rusqlite `bundled` for Android. See comment block
 # before the iOS entry (~line 628) for the rationale.
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"], optional = true }
-ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.2", version = "10", features = ["pqc-ml-dsa", "android"] }
+ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.3", version = "10", features = ["pqc-ml-dsa", "android"] }
 # v12.3.0 (CIRISPersist#355) — vendored openssl removed here too (dead leaf;
 # see the base-deps note). No Android openssl in any configuration now,
 # retiring the flakiest part of the mobile wheel matrix.
@@ -815,7 +815,7 @@ ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.2
 # own root (structurally inert against the pinned real Yubico root). Same
 # git tag as the [workspace] pins — one graph version, feature-unified in
 # test builds, absent from `--edges normal`.
-ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.2", version = "10", features = [
+ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v10.6.3", version = "10", features = [
     "test-support",
 ] }
 # Mission category §4: canonicalization parity. Used to validate our

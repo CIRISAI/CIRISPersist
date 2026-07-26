@@ -5,7 +5,7 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [21.4.0] — 2026-07-26 — signed wins the shared key (#515) + mock-custody mesh simulation (verify v10.6.2 / CIRISVerify#219)
+## [21.4.0] — 2026-07-26 — signed wins the shared key (#515) + mock-custody mesh simulation (verify v10.6.3 / CIRISVerify#219+#221)
 
 ### Fixed — #515: an UNSIGNED writer can no longer demote, preempt, or resurrect a SIGNED route
 
@@ -40,7 +40,7 @@ signed-re-establishment leg.
 
 ### Added — mock-custody mesh simulation (CIRISVerify v10.6.2 adoption; #513 positive coverage)
 
-Verify pins → **v10.6.2** (all six, lockstep) + a `[dev-dependencies]`
+Verify pins → **v10.6.3** (all six, lockstep) + a `[dev-dependencies]`
 `ciris-verify-core` with the non-default `test-support` feature: CIRISVerify#219's
 `MockYubicoCa` fabricates FIPS-shaped custody artifacts that chain to the
 mock CA's OWN root — structurally inert against the pinned production Yubico
@@ -58,11 +58,13 @@ against the real root, and a non-FIPS mock is rejected even against its own).
   feature). Wiring guides: CIRISServer#321 / CIRISAgent#930.
 - Floor discriminator witness: a 3-member MOCK roster QUALIFIES past the FIPS
   filter (failure moves from "floor 3 exceeds 0 qualifying" to the signature
-  tally) — the counting half of #513, now positively covered with fabricated
-  hardware. The full mock MINT (hybrid scrubs by mock members) waits on
-  CIRISVerify#221 (the mock's ML-DSA private half is deliberately not
-  exposed yet); the real A1/B1/C1 artifacts continue to cover the full
-  positive path.
+  tally) — the counting half of #513.
+- **The FULL POSITIVE MINT** (CIRISVerify#221, v10.6.3's deterministic hybrid
+  `.holder`): three fabricated members co-scrub a NEW canonical and the strict
+  gate ADMITS it against the injected mock root
+  (`mock_full_quorum_mints_canonical_513`) — the anti-Sybil floor's complete
+  positive path with zero hardware, inert against any real gate. The real
+  A1/B1/C1 artifacts still cover the pinned-root path.
 ## [21.3.0] — 2026-07-26 — route-encoding fix (#512) + dyn-callable rooting (#508) + the hardware anti-Sybil floor on trust-root minting (#513)
 
 ### Fixed — #512: `project_route` stored base64 in a hex column (edge's gate could never match an occurrence-projected route)

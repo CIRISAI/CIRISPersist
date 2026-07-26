@@ -7581,6 +7581,71 @@ mod canonical_gate_tests {
         );
     }
 
+    /// v21.4.0 (CIRISVerify#221 / v10.6.3) — the FULL POSITIVE MINT with
+    /// fabricated hardware: three `MockYubicoCa` members (FIPS-shaped
+    /// custody artifacts + the deterministic hybrid `.holder` signer)
+    /// co-scrub a NEW canonical, and the strict gate — withdrawal-wins +
+    /// the ≥3-FIPS floor + the real quorum crypto — ADMITS it against the
+    /// injected mock root. No hardware, no ceremony, inert against any
+    /// real gate. The anti-Sybil floor's complete positive path.
+    #[tokio::test]
+    async fn mock_full_quorum_mints_canonical_513() {
+        use ciris_verify_core::accord_custody_attestation::test_support::MockYubicoCa;
+        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
+
+        let backend = crate::store::memory::MemoryBackend::new();
+        let ca = MockYubicoCa::new();
+        let envelope = serde_json::json!({ "key_id": "canon-mockmint-513" });
+
+        let mut roster = Vec::new();
+        let mut scrubs: Vec<super::super::types::ScrubSig> = Vec::new();
+        for (i, kid) in ["mm0", "mm1", "mm2"].iter().enumerate() {
+            let m = ca
+                .attest_member([0x80 + i as u8; 32], kid, "2026-07-26T00:00:00Z")
+                .await;
+            let mut rec = record(kid, identity_type::NODE, kid);
+            rec.pubkey_ed25519_base64 = m.member.ed25519_public_key_base64.clone();
+            rec.pubkey_ml_dsa_65_base64 = m.member.mldsa65_public_key_base64.clone();
+            rec.attestation_evidence = Some(serde_json::to_value(&m.attestation).unwrap());
+            backend
+                .put_public_key(SignedKeyRecord { record: rec })
+                .await
+                .unwrap();
+            roster.push((*kid).to_string());
+            // Sign the canonical's registration envelope as this member —
+            // bound-hybrid over JCS(envelope), the exact scrub contract.
+            let (_, sig) = produce_signed_identity_occurrence(&m.holder, envelope.clone())
+                .await
+                .unwrap();
+            scrubs.push(super::super::types::ScrubSig {
+                scrub_key_id: (*kid).to_string(),
+                scrub_signature_classical: sig.ed25519_signature_base64,
+                scrub_signature_pqc: sig.mldsa65_signature_base64,
+            });
+        }
+
+        let mut rec = record("canon-mockmint-513", "canonical,node", "mm0");
+        rec.registration_envelope = envelope.clone();
+        rec.original_content_hash = {
+            use sha2::{Digest, Sha256};
+            let bytes = ceg_produce_canonicalize(&envelope).unwrap();
+            hex::encode(Sha256::digest(&bytes))
+        };
+        rec.scrub_key_id = scrubs[0].scrub_key_id.clone();
+        rec.scrub_signature_classical = scrubs[0].scrub_signature_classical.clone();
+        rec.scrub_signature_pqc = scrubs[0].scrub_signature_pqc.clone();
+        rec.additional_scrubs = scrubs[1..].to_vec();
+
+        super::check_canonical_role_admission_over_roster_with_custody_root(
+            &backend,
+            &rec,
+            &roster,
+            ca.root_der(),
+        )
+        .await
+        .expect("3 mock-FIPS members with real hybrid scrubs must mint through the strict floor");
+    }
+
     /// v21.3.0 (CIRISPersist#513) — the grandfather matcher covers exactly
     /// the embedded genesis LINEAGE (by key_id: today's quorum bar, real
     /// accord signatures still required); any NEW canonical key_id — the
