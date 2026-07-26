@@ -376,7 +376,7 @@ pub(crate) async fn verify_canonical_supersede_over_roster(
     if !supersede_precheck(existing, record) {
         return Ok(false);
     }
-    match super::admission::check_canonical_role_admission_over_roster(
+    match super::admission::check_canonical_role_admission_over_roster_legacy(
         directory,
         record,
         roster_key_ids,

@@ -165,7 +165,12 @@ pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
 /// compiled in AND runtime-armed AND a decodable `CIRIS_TEST_TRUST_ROOT`)?
 /// Const-`false` on a prod build — every test-mode branch below is dead code
 /// the optimizer removes, exactly like verify's inert twins.
-fn test_anchor_override_active() -> bool {
+///
+/// `pub(crate)` since v21.3.0 (CIRISPersist#513): the canonical FIPS-custody
+/// admission floor consults it — under the (feature-gated, runtime-armed)
+/// test anchor the floor relaxes to the legacy quorum, because test-anchor
+/// rosters are explicitly declared software keys.
+pub(crate) fn test_anchor_override_active() -> bool {
     #[cfg(feature = "test-anchor")]
     {
         ciris_verify_core::test_anchor::test_trust_root_override().is_some()

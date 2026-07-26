@@ -4408,7 +4408,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // the stored occurrence.
         if occurrence_applied > 0 {
             if let Some(tb) = &row.transport_binding {
-                let route = tb.project_route(&row.occurrence_key_id, row.asserted_at);
+                let route = tb.project_route(&row.occurrence_key_id, row.asserted_at)?;
                 crate::federation::FederationDirectory::put_transport_destination(self, &route)
                     .await?;
             }
@@ -4501,7 +4501,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // invariant is "every stored occurrence carrying a binding has its
         // route materialized").
         if let Some(tb) = &row.transport_binding {
-            let route = tb.project_route(&row.occurrence_key_id, row.asserted_at);
+            let route = tb.project_route(&row.occurrence_key_id, row.asserted_at)?;
             crate::federation::FederationDirectory::put_transport_destination(self, &route).await?;
         }
         Ok(())
@@ -6328,9 +6328,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
         // #443 route-table put: keyed on (occ, kind) — `destination` is
         // payload — and GUARDED monotonic on (epoch, asserted_at)
-        // lexicographic. A stale assertion is a silent no-op. A local
-        // (trusted) put that supersedes a SIGNED row NULLs the signature
-        // columns: they attested the OLD content.
+        // lexicographic. A stale assertion is a silent no-op.
+        //
+        // v21.3.0 (CIRISPersist#512 precedence half) — signature columns
+        // NULL only when the local writer CHANGES the signed material
+        // content; identical-content re-assertions preserve them (see the
+        // sqlite twin's comment for the full rationale).
         let provenance_token = destination.binding_provenance.as_str();
         let epoch = i64::try_from(destination.epoch).map_err(|_| {
             crate::federation::Error::InvalidArgument(
@@ -6354,7 +6357,27 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     binding_provenance = EXCLUDED.binding_provenance, \
                     epoch = EXCLUDED.epoch, \
                     retired_at = EXCLUDED.retired_at, \
-                    attesting_key_id = NULL, signed_envelope = NULL, signature = NULL \
+                    attesting_key_id = CASE WHEN \
+                        EXCLUDED.destination = cirislens.transport_destinations.destination \
+                        AND COALESCE(EXCLUDED.transport_ed25519_pubkey_base64, '') \
+                            = COALESCE(cirislens.transport_destinations.transport_ed25519_pubkey_base64, '') \
+                        AND COALESCE(EXCLUDED.transport_x25519_pubkey_base64, '') \
+                            = COALESCE(cirislens.transport_destinations.transport_x25519_pubkey_base64, '') \
+                        THEN cirislens.transport_destinations.attesting_key_id ELSE NULL END, \
+                    signed_envelope = CASE WHEN \
+                        EXCLUDED.destination = cirislens.transport_destinations.destination \
+                        AND COALESCE(EXCLUDED.transport_ed25519_pubkey_base64, '') \
+                            = COALESCE(cirislens.transport_destinations.transport_ed25519_pubkey_base64, '') \
+                        AND COALESCE(EXCLUDED.transport_x25519_pubkey_base64, '') \
+                            = COALESCE(cirislens.transport_destinations.transport_x25519_pubkey_base64, '') \
+                        THEN cirislens.transport_destinations.signed_envelope ELSE NULL END, \
+                    signature = CASE WHEN \
+                        EXCLUDED.destination = cirislens.transport_destinations.destination \
+                        AND COALESCE(EXCLUDED.transport_ed25519_pubkey_base64, '') \
+                            = COALESCE(cirislens.transport_destinations.transport_ed25519_pubkey_base64, '') \
+                        AND COALESCE(EXCLUDED.transport_x25519_pubkey_base64, '') \
+                            = COALESCE(cirislens.transport_destinations.transport_x25519_pubkey_base64, '') \
+                        THEN cirislens.transport_destinations.signature ELSE NULL END \
                  WHERE EXCLUDED.epoch > cirislens.transport_destinations.epoch \
                     OR (EXCLUDED.epoch = cirislens.transport_destinations.epoch \
                         AND EXCLUDED.asserted_at > cirislens.transport_destinations.asserted_at)",

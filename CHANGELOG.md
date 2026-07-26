@@ -5,6 +5,71 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.3.0] — 2026-07-26 — route-encoding fix (#512) + dyn-callable rooting (#508) + the hardware anti-Sybil floor on trust-root minting (#513)
+
+### Fixed — #512: `project_route` stored base64 in a hex column (edge's gate could never match an occurrence-projected route)
+
+`OccurrenceTransportBinding::project_route` stored the projected
+`transport_destinations.destination` as the envelope's **base64** verbatim,
+while the signed producer, the edge announce, and the #393 item-2 gate's probe
+all speak **lowercase hex** of the raw RNS dest hash — same 16 bytes, two
+dialects, one column, diagnosed live on the canonical (CIRISServer#315
+traceflow). The projection now normalizes to hex at the write site
+(fail-closed: malformed base64 refuses to project rather than writing an
+unmatchable row; the occurrence ENVELOPE keeps base64 — its own verify gate
+wants it there). The test that had *pinned* the bug
+(`assert_eq!(destination, B64.encode(...))`) is flipped to the hex contract.
+
+**Precedence half:** the local (unsigned) route-table put NULLed a signed
+row's signature columns on every supersede. It now NULLs them ONLY when the
+signed material content (destination + both transport pubkeys) actually
+changes; an identical-content re-assertion (the announce refresh, the
+occurrence projection) PRESERVES the signature — an unsigned writer can no
+longer downgrade a signed route it merely agrees with (the observed
+hex-but-unsigned live row; the gate requires the PQC signature present).
+Witness: `unsigned_same_content_put_preserves_signed_route_512`.
+
+### Fixed — #508: `root_binding` / `root_binding_anchored` / `provenance_chain` callable with `&dyn FederationDirectory`
+
+`+ ?Sized` on the directory bound (the `trust_root_valid` precedent) — the
+handle CIRISServer actually holds (`Arc<dyn FederationDirectory>`) can now
+drive prime-time re-anchoring to the HUMANITY_ACCORD root (CIRISServer#318
+E6). Compile-time witness pins the bounds. No behavior change for concrete
+callers.
+
+### Added — #513: canonical admission = a Yubico-attested FIPS-140-3 accord of ≥3 co-scrubbers
+
+Minting a NEW trust root now requires `quorum ≥ max(strict_majority, 3)`
+DISTINCT co-scrubbers, each with a **verified FIPS-140-3 Yubico custody
+attestation**: `KeyRecord.attestation_evidence` must carry the signed custody
+CEG object whose 9c cert chains link-by-link to the pinned
+**Yubico Attestation Root 1** (`YUBICO_ATTESTATION_ROOT_1_DER`, byte-identical
+to CIRISServer's pin, sha256-witnessed), attests the member's own federation
+Ed25519 key, and marks FIPS-certified + touch=always. An unattested member
+silently does not count (fail-closed); the refusal names every custody
+rejection. Minting a trust root becomes costly-but-possible — three
+hardware-bound, touch-required humans — a non-virtualizable anti-Sybil floor.
+
+- **Real-artifact positive proof:** the baked A1/B1/C1 ceremony records'
+  custody attestations GENUINELY verify against the pinned root
+  (`baked_accord_holders_fips_custody_verifies_513`) — no mocks.
+- **Anti-laundering:** a fully-authorized supersede whose successor is an
+  unattested NEW root is refused at the successor's own admission (the floor
+  runs inside `put_public_key`, before the tombstone) — rotation cannot
+  launder an unattested root in; the failed op leaves no partial state.
+- **Genesis lineage grandfather:** records for the embedded genesis canonical
+  key_id keep exactly today's bar (legacy strict-majority accord quorum +
+  withdrawal-wins — real A1/B1/C1 signatures, no regression); the floor
+  targets trust-root MINTING (new key_ids), per the issue's scarcity intent.
+- **Honest scope (encoded in the docs):** the FIPS attestation covers the
+  classical Ed25519 half only (the ML-DSA-65 half is sealed-media software
+  custody the harness does not check); single-vendor Yubico root accepted +
+  pinned + drift-witnessed; canonicals ONLY — never ordinary node/agent
+  admission; the (feature-gated, runtime-armed) test anchor keeps legacy
+  behavior, as its rosters are declared software keys.
+- Exposed surface for edge/server composition: `verify_member_fips_custody`,
+  `YUBICO_ATTESTATION_ROOT_1_DER`, `CANONICAL_MIN_COSCRUBBERS`. Mock-chain
+  test support for downstream positive testing: CIRISVerify#219.
 ## [21.2.0] — 2026-07-25 — the payload follows the consent edge (#509) + the closed consent grammar (#510 P1) + the hot-path serve reads (#507)
 
 A `trace:complete:v1` attestation is born **local**-tier (producer-only — the

@@ -475,7 +475,7 @@ pub async fn provenance_chain<F>(
     key_id: &str,
 ) -> Result<ProvenanceChain, RootingRejection>
 where
-    F: FederationDirectory,
+    F: FederationDirectory + ?Sized,
 {
     let mut chain: Vec<ProvenanceLink> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -602,7 +602,7 @@ pub async fn root_binding<F>(
     claimed_pubkey_ed25519_base64: &str,
 ) -> RootingVerdict
 where
-    F: FederationDirectory,
+    F: FederationDirectory + ?Sized,
 {
     // Secure by default: the trusted anchor is the pinned HUMANITY_ACCORD
     // holder keyset (A1/B1/C1). Every existing caller (CIRISEdge's cold-start
@@ -630,7 +630,7 @@ pub async fn root_binding_anchored<F>(
     trusted_anchor: &[[u8; 32]],
 ) -> RootingVerdict
 where
-    F: FederationDirectory,
+    F: FederationDirectory + ?Sized,
 {
     // Step 1+2: resolve the queried row and confirm the claimed
     // pubkey. We look it up directly (rather than relying on the
@@ -795,6 +795,20 @@ fn verify_provenance_error_key_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v21.3.0 (CIRISPersist#508) — `root_binding` / `root_binding_anchored`
+    /// (and `provenance_chain`) are callable with `&dyn FederationDirectory`
+    /// (`F: ?Sized`), the handle CIRISServer actually holds
+    /// (`engine.federation_directory()` → `Arc<dyn FederationDirectory>`) —
+    /// the server-side E6 prime-time re-anchoring depends on this. A
+    /// compile-time witness: the fn below never runs, it just fails the
+    /// build if the bounds regress to `Sized`.
+    #[allow(dead_code)]
+    async fn dyn_directory_callable_508(dir: &dyn crate::federation::FederationDirectory) {
+        let _ = root_binding(dir, "k", "pk").await;
+        let _ = root_binding_anchored(dir, "k", "pk", &[[0u8; 32]]).await;
+        let _ = provenance_chain(dir, "k").await;
+    }
 
     #[test]
     fn rejection_kinds_are_stable() {
