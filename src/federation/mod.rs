@@ -98,6 +98,7 @@ pub mod envelope;
 // (persist's half; the producer surface is edge/agent's, documented for
 // adoption, not built here). See `namespace/namespace_supersets.json` §
 // `freshness_floor`.
+pub mod deletion_window;
 pub mod freshness;
 
 /// v20.1.0 (CIRISPersist#478) — the trace-attestation backfill report:

@@ -171,7 +171,58 @@ pub const PERSIST_FIELD_CONFORMANCE: &[FieldConformance] = &[
         property: "the transform algebra is strictly total (every opcode returns)",
         check: check_transform_algebra_is_total,
     },
+    FieldConformance {
+        field: "deletion_window",
+        property: "the lifecycle breach judgment is total over every window state",
+        check: check_deletion_window_processor_is_total,
+    },
 ];
+
+/// `deletion_window`'s persist-owned lifecycle processor
+/// ([`crate::federation::deletion_window`]) is TOTAL: every window state
+/// (absent / malformed / within / passed-present / passed-deleted) yields a
+/// verdict without panic. Graduates the field out of the manifest's
+/// `UNASSIGNED` row (v21.9.0 #519 c1) — a typed field with no processor is the
+/// carried-but-unprocessed class.
+fn check_deletion_window_processor_is_total() -> Result<(), String> {
+    use crate::federation::deletion_window::{deletion_window_status, DeletionWindowStatus};
+    let now: chrono::DateTime<chrono::Utc> = "2026-07-27T00:00:00Z".parse().unwrap();
+    let cases = [
+        (
+            serde_json::json!({ "dimension": "x:v1" }),
+            true,
+            DeletionWindowStatus::NoWindow,
+        ),
+        (
+            serde_json::json!({ "deletion_window": "bad" }),
+            true,
+            DeletionWindowStatus::MalformedWindow,
+        ),
+        (
+            serde_json::json!({ "deletion_window": "2099-01-01T00:00:00Z" }),
+            true,
+            DeletionWindowStatus::WithinWindow,
+        ),
+        (
+            serde_json::json!({ "deletion_window": "2020-01-01T00:00:00Z" }),
+            true,
+            DeletionWindowStatus::BreachedNotDeleted,
+        ),
+        (
+            serde_json::json!({ "deletion_window": "2020-01-01T00:00:00Z" }),
+            false,
+            DeletionWindowStatus::DeletedInTime,
+        ),
+    ];
+    for (env, present, expected) in cases {
+        if deletion_window_status(&env, present, now) != expected {
+            return Err(format!(
+                "deletion_window_status wrong for {env} present={present}"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Run every persist field-conformance check. `Ok(())` iff all pass; otherwise
 /// the collected `field: reason` violations. This is the entry a shared
@@ -222,7 +273,14 @@ mod tests {
         //     PROPOSED field in manifest v0.3.0 ("does not exist on the wire
         //     today") — persist shipped it in v21.6.0; the re-vendor adds its
         //     row. Tracked in #520.
-        const AHEAD_OF_MATRIX: &[&str] = &["transform", "fresh_as_of"];
+        // Fields persist implemented AHEAD of the vendored matrix (they
+        // graduate into `field_processor_matrix` at the next re-vendor):
+        // - "transform": the algebra pseudo-field;
+        // - "fresh_as_of": still a PROPOSED freshness_floor field in v0.3.0;
+        // - "deletion_window": v21.9.0 gave it a typed field + persist
+        //   lifecycle processor, but the manifest row is still UNASSIGNED
+        //   until the re-vendor (see supersets::KNOWN_UNASSIGNED_FIELDS).
+        const AHEAD_OF_MATRIX: &[&str] = &["transform", "fresh_as_of", "deletion_window"];
         let persist_owned: std::collections::BTreeSet<&str> =
             supersets::persist_placement_fields().into_iter().collect();
         for f in &covered {
