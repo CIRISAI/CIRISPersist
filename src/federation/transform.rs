@@ -60,12 +60,19 @@
 //!
 //! # Scope discipline — NOT this cut (follow-ups, not built here)
 //!
-//! - **Wiring the full op set into the promotion/serve path.** Only
-//!   `strip_field` is actually applied today, at promotion
-//!   ([`Engine::promote_attestation_with_strips`](crate::Engine) via
-//!   [`super::consent_grammar::strip_field`], CIRISPersist#510). Generalizing
-//!   promotion/serve to run an arbitrary [`TransformPipeline`] over a
-//!   family's declared rows is a follow-up.
+//! - **Wiring the full op set into the SERVE path.** CIRISPersist#519 item
+//!   2a-ii's application half (v21.7.0) generalized PROMOTION
+//!   ([`Engine::promote_attestation_with_transforms`](crate::Engine)) to
+//!   fold an arbitrary [`TransformPipeline`] — built from a grant's
+//!   restrictions via [`super::consent_grammar::to_transform_ops`] — over
+//!   the federation-tier envelope before signing (not a strip-only
+//!   bespoke loop anymore). [`super::consent_grammar::RestrictionOp`]
+//!   itself still carries only `strip_field` / `recipient_capability`
+//!   (the wire grammar and `CONSENT_GRAMMAR_HASH` are unchanged — a
+//!   deliberately minimal cut), so `strip_field` remains the only op a
+//!   grant can route through the pipeline today; running the algebra's
+//!   OTHER live ops (`redact`/`round`/`bucket`/…) at promotion, and at the
+//!   SERVE layer generally, over a family's declared rows is a follow-up.
 //! - **The crypto opcodes' full implementations** (`bbs_derive`'s actual
 //!   derived-proof math, `commit`'s Pedersen form, `nullifier`'s Semaphore
 //!   construction) — declared in the closed enum so the algebra is complete

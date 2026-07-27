@@ -389,6 +389,50 @@ pub fn strip_field(envelope: &mut serde_json::Value, path: &str) {
     }
 }
 
+/// Map a covering grant's `restrictions` to the transform-carrying ops the
+/// promotion pipeline executes (CIRISPersist#519 item 2a-ii — the
+/// application half: `Engine::promote_attestation_with_transforms`
+/// generalizes promotion from a bespoke strip-only loop to a full
+/// [`crate::federation::transform::TransformPipeline`], built EXCLUSIVELY
+/// through this function).
+///
+/// v21.7.0 chose the MINIMAL variant of this cut: [`RestrictionOp`] grows
+/// no new variants (still exactly `StripField` + `RecipientCapability` —
+/// the wire grammar and [`CONSENT_GRAMMAR_HASH`] are UNCHANGED). Instead,
+/// the one restriction that already carries a promotion-time transform
+/// (`StripField`) is routed through the transform algebra by name rather
+/// than by a bespoke loop:
+///
+/// - [`RestrictionOp::StripField`] maps 1:1, order-preserving, to
+///   [`crate::federation::transform::TransformOp::StripField`] — the ONLY
+///   place a `strip_field` restriction becomes a pipeline stage (single-
+///   sourced, mirroring [`strip_field`]'s own "one strip implementation"
+///   discipline one level up: one implementation, one place it is turned
+///   into an op).
+/// - [`RestrictionOp::RecipientCapability`] carries no promotion-time
+///   transform (serve-layer enforcement, a P3 follow-up) and is skipped —
+///   the returned `Vec` may be shorter than `restrictions`.
+///
+/// An empty or all-`RecipientCapability` `restrictions` slice yields an
+/// empty pipeline, whose [`crate::federation::transform::TransformPipeline::apply_all`]
+/// is the identity — callers use emptiness as the "no transform needed,
+/// take the byte-identical fast path" signal (see
+/// `Engine::promote_consented_backlog`).
+#[must_use]
+pub fn to_transform_ops(
+    restrictions: &[RestrictionOp],
+) -> Vec<crate::federation::transform::TransformOp> {
+    restrictions
+        .iter()
+        .filter_map(|r| match r {
+            RestrictionOp::StripField { path } => {
+                Some(crate::federation::transform::TransformOp::StripField { path: path.clone() })
+            }
+            RestrictionOp::RecipientCapability { .. } => None,
+        })
+        .collect()
+}
+
 // ───────────────────────── #510 P1: manifest + pinned hash ──────────
 
 /// The full closed consent grammar as canonical JSON (CIRISPersist#510
@@ -931,5 +975,70 @@ mod tests {
         assert_eq!(env, before);
         strip_field(&mut env, "");
         assert_eq!(env, before);
+    }
+
+    // ── v21.7.0 (CIRISPersist#519 item 2a-ii, promotion application) —
+    //    to_transform_ops: the single-sourced RestrictionOp → TransformOp
+    //    mapping (minimal variant: no new RestrictionOp variants).
+
+    #[test]
+    fn to_transform_ops_maps_strip_field_1_to_1() {
+        use crate::federation::transform::TransformOp;
+
+        let restrictions = vec![RestrictionOp::StripField {
+            path: "/trace/prompt".to_string(),
+        }];
+        assert_eq!(
+            to_transform_ops(&restrictions),
+            vec![TransformOp::StripField {
+                path: "/trace/prompt".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn to_transform_ops_skips_recipient_capability() {
+        let restrictions = vec![RestrictionOp::RecipientCapability {
+            capability: "moderator".to_string(),
+        }];
+        assert!(
+            to_transform_ops(&restrictions).is_empty(),
+            "recipient_capability carries no promotion-time transform"
+        );
+    }
+
+    #[test]
+    fn to_transform_ops_preserves_order_and_filters_mixed_restrictions() {
+        use crate::federation::transform::TransformOp;
+
+        let restrictions = vec![
+            RestrictionOp::StripField {
+                path: "/a".to_string(),
+            },
+            RestrictionOp::RecipientCapability {
+                capability: "moderator".to_string(),
+            },
+            RestrictionOp::StripField {
+                path: "/b".to_string(),
+            },
+        ];
+        assert_eq!(
+            to_transform_ops(&restrictions),
+            vec![
+                TransformOp::StripField {
+                    path: "/a".to_string()
+                },
+                TransformOp::StripField {
+                    path: "/b".to_string()
+                },
+            ],
+            "recipient_capability is filtered out; the two strip_field ops keep their \
+             relative order"
+        );
+    }
+
+    #[test]
+    fn to_transform_ops_empty_input_yields_empty_pipeline() {
+        assert!(to_transform_ops(&[]).is_empty());
     }
 }
