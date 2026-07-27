@@ -5013,7 +5013,12 @@ impl PyEngine {
     /// agent runs this in PROXY/SERVER mode where that signer is present.
     /// Raises if PQC is not configured (the synchronous hybrid sign can't
     /// complete).
-    fn attestation_promote(&self, py: Python<'_>, attestation_id: &str) -> PyResult<bool> {
+    fn attestation_promote(
+        &self,
+        py: Python<'_>,
+        attestation_id: &str,
+        cohort_scope: &str,
+    ) -> PyResult<bool> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
@@ -5028,6 +5033,10 @@ impl PyEngine {
             let signer = self.signer.clone();
             let local_signer = self.local_signer.clone();
             let id = attestation_id.to_owned();
+            // v21.5.0 (CIRISPersist#519) — the placement the promotion carries.
+            // A promotion cannot flip tier without a coherent federation-visible
+            // cohort_scope; `self`/invalid is rejected inside the engine.
+            let scope = cohort_scope.to_owned();
             py.detach(move || {
                 // Reconstruct a hybrid-capable Engine over the shared
                 // backend + signer (the cohabitation path, same as the
@@ -5035,7 +5044,7 @@ impl PyEngine {
                 let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
                 runtime.block_on(async move {
                     engine
-                        .attestation_promote(&id)
+                        .attestation_promote(&id, &scope)
                         .await
                         .map_err(federation_err_to_py)
                 })
@@ -28679,11 +28688,23 @@ mod tests {
                 Some(local),
             );
             assert!(
-                engine.attestation_promote(&att_id).await.unwrap(),
+                engine
+                    .attestation_promote(
+                        &att_id,
+                        crate::federation::types::cohort_scope::FEDERATION
+                    )
+                    .await
+                    .unwrap(),
                 "first promote flips local→federation"
             );
             assert!(
-                !engine.attestation_promote(&att_id).await.unwrap(),
+                !engine
+                    .attestation_promote(
+                        &att_id,
+                        crate::federation::types::cohort_scope::FEDERATION
+                    )
+                    .await
+                    .unwrap(),
                 "re-promote is idempotent (already federation)"
             );
 
