@@ -6396,6 +6396,24 @@ pub async fn check_reserved_prefix_admission(
         });
     }
 
+    // (CIRISPersist#519 item 3) — the invariant-registry-driven admission
+    // gate: applies the ADMISSION-ENFORCEABLE invariants for this row's
+    // family that no OTHER gate in this function (or elsewhere) already
+    // covers — see `crate::federation::invariant`'s module doc for the full
+    // cross-reference against `default_reserved_prefix_rules`. Cheap (no
+    // directory lookup) and placed alongside the other attester==attested
+    // arms above for the same "cheapest-most-specific-rejection-first"
+    // reason. Today this closes exactly one manifest-documented gap
+    // (`health:liveness:*` self-emission); every identity-type-reserved
+    // invariant the manifest declares is already enforced by the rest of
+    // this function, per the module's consistency witness.
+    crate::federation::invariant::enforce_admission_invariants(
+        at,
+        &row.attesting_key_id,
+        &row.attested_key_id,
+        "",
+    )?;
+
     // Which (if any) identity-gated reserved prefix does the TYPE carry?
     let is_accord = at.starts_with("accord:");
     let is_hard_case = at.starts_with("hard_case:");

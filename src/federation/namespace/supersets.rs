@@ -227,6 +227,28 @@ pub fn field_transforms() -> &'static serde_json::Value {
     })
 }
 
+/// (CIRISPersist#519 item 3) — the `invariant_registry` section: a dict
+/// keyed by CC 3.1 family prefix (`"accord:*"`, `"capacity:composite"`, …) →
+/// an array of `{rule, cc_ref, quote, primitive_constraint}` constitutional
+/// invariants for that family (104 families, 571 invariants in the v0.3.0
+/// cut). Returned as the raw vendored [`serde_json::Value`] — this module
+/// stays the single vendoring/parsing point for `namespace_supersets.json`;
+/// the typed per-family reader and the admission-enforceable classifier both
+/// live in [`crate::federation::invariant`]
+/// ([`crate::federation::invariant::invariants_for`] /
+/// [`crate::federation::invariant::admission_enforceable`]), the ONE
+/// consumer of this accessor.
+pub fn invariant_registry() -> &'static serde_json::Value {
+    static INVARIANT_REGISTRY: OnceLock<serde_json::Value> = OnceLock::new();
+    INVARIANT_REGISTRY.get_or_init(|| {
+        let root: serde_json::Value = serde_json::from_str(SUPERSETS_JSON)
+            .expect("vendored namespace_supersets.json is valid JSON");
+        root.get("invariant_registry")
+            .cloned()
+            .expect("namespace_supersets.json carries a top-level invariant_registry section")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2572,18 +2572,29 @@ impl Engine {
     /// divergence (naming every covering grant + its audience). The #510
     /// issue tracks refining this rule; this is the documented P1 floor.
     ///
-    /// # Restriction application
+    /// # Restriction application (CIRISPersist#519 item 2a-ii — the full
+    /// declared pipeline, not strip-only)
     ///
-    /// The UNION of every covering grant's `restrictions` is applied
-    /// before signing. `RecipientCapability` restrictions are recorded in
-    /// the grammar but apply NO transform at promotion time (serve-layer
-    /// enforcement, a P3 follow-up). When the union contains at least one
-    /// `StripField`, [`Self::promote_attestation_with_strips`] signs the
-    /// STRIPPED envelope and writes it back via
+    /// The UNION of every covering grant's `restrictions` is converted to a
+    /// [`crate::federation::transform::TransformPipeline`] via
+    /// [`crate::federation::consent_grammar::to_transform_ops`] (single-
+    /// sourced: this is the ONLY place a restriction becomes a pipeline
+    /// stage). `RecipientCapability` restrictions are recorded in the
+    /// grammar but contribute no pipeline stage (serve-layer enforcement, a
+    /// P3 follow-up) — `to_transform_ops` skips them. When the resulting
+    /// pipeline is non-empty, [`Self::promote_attestation_with_transforms`]
+    /// signs the TRANSFORMED envelope and writes it back via
     /// [`crate::federation::FederationDirectory::promote_attestation_transformed`];
-    /// with NO `StripField` restrictions, [`Self::attestation_promote`]
-    /// is used unchanged (the byte-identical-wire property #509
-    /// established is preserved for the common case).
+    /// with an EMPTY pipeline (no restrictions, or only
+    /// `RecipientCapability` ones), [`Self::attestation_promote`] is used
+    /// unchanged (the byte-identical-wire property #509 established is
+    /// preserved for the common case). v21.7.0 kept the closed
+    /// [`crate::federation::consent_grammar::RestrictionOp`] enum at exactly
+    /// its two #510 variants (`StripField` / `RecipientCapability`) — the
+    /// wire grammar and `CONSENT_GRAMMAR_HASH` are unchanged; only the
+    /// engine's APPLICATION of a `StripField` restriction now routes
+    /// through the general transform algebra instead of a bespoke strip
+    /// loop, so a strip-only grant promotes byte-identically to before.
     ///
     /// A promote `Err` on ONE row is `tracing::warn!`'d and counted in
     /// `skipped` — it does NOT abort the sweep (the same honest-
@@ -2740,17 +2751,18 @@ impl Engine {
                     sorted[0].policy.audience.clone()
                 };
 
-                // ── restriction union ──
-                let mut strip_paths: Vec<String> = Vec::new();
+                // ── restriction union → transform pipeline (CIRISPersist#519
+                //    item 2a-ii — single-sourced through
+                //    `consent_grammar::to_transform_ops`, not a bespoke
+                //    strip-only loop; `RecipientCapability` restrictions
+                //    contribute no pipeline stage, exactly as before). ──
+                let mut restrictions: Vec<consent_grammar::RestrictionOp> = Vec::new();
                 for g in &covering {
-                    for r in &g.policy.restrictions {
-                        if let consent_grammar::RestrictionOp::StripField { path } = r {
-                            strip_paths.push(path.clone());
-                        }
-                        // RecipientCapability: no promotion-time transform
-                        // (serve-layer enforcement, P3).
-                    }
+                    restrictions.extend(g.policy.restrictions.iter().cloned());
                 }
+                let transform_pipeline = crate::federation::transform::TransformPipeline(
+                    consent_grammar::to_transform_ops(&restrictions),
+                );
 
                 // v21.5.0 (CIRISPersist#519) — the placement (the covering
                 // grant's audience) is now CARRIED by the promotion primitive
@@ -2759,12 +2771,16 @@ impl Engine {
                 // `set_attestation_cohort_scope` step — which left a transient
                 // `(federation, self)` window and could fail independently — is
                 // gone: an incomplete promotion is no longer expressible.
-                let promote_result = if strip_paths.is_empty() {
+                let promote_result = if transform_pipeline.is_empty() {
                     self.attestation_promote(&row.attestation_id, &chosen_audience)
                         .await
                 } else {
-                    self.promote_attestation_with_strips(row, &strip_paths, &chosen_audience)
-                        .await
+                    self.promote_attestation_with_transforms(
+                        row,
+                        &transform_pipeline,
+                        &chosen_audience,
+                    )
+                    .await
                 };
 
                 match promote_result {
@@ -2789,25 +2805,48 @@ impl Engine {
         Ok(report)
     }
 
-    /// v21.3.0 (CIRISPersist#510 P1) — the strip-then-sign half of
-    /// [`Self::promote_consented_backlog`]: apply every `strip_paths`
-    /// entry ([`crate::federation::consent_grammar::strip_field`]) to a
-    /// CLONE of `row`'s envelope, canonicalize + hybrid-sign the
-    /// STRIPPED bytes (NEVER the original — the signature must cover
-    /// exactly what a recipient will see), and write back through
+    /// v21.7.0 (CIRISPersist#519 item 2a-ii — the application half) — the
+    /// transform-then-sign half of [`Self::promote_consented_backlog`]:
+    /// [`crate::federation::transform::TransformPipeline::apply_all`]
+    /// `pipeline` over a CLONE of `row`'s envelope, canonicalize +
+    /// hybrid-sign the TRANSFORMED bytes (NEVER the original — the
+    /// signature must cover exactly what a recipient will see), and write
+    /// back through
     /// [`crate::federation::FederationDirectory::promote_attestation_transformed`].
-    /// `original_content_hash` is the hash of the STRIPPED canonical — it
-    /// is the content actually signed/shipped, matching how
-    /// [`Self::attestation_promote`] hashes the (unstripped) canonical it
-    /// signs. The row's full PRE-strip form remains queryable via the
-    /// `trace_events` projection (decomposed at ingest/emit time, before
-    /// any strip is applied), so this never destroys the substrate's own
-    /// copy — only the federation-tier envelope this promotes narrows.
+    /// `original_content_hash` is the hash of the TRANSFORMED canonical —
+    /// it is the content actually signed/shipped, matching how
+    /// [`Self::attestation_promote`] hashes the (untransformed) canonical
+    /// it signs. The row's full PRE-transform form remains queryable via
+    /// the `trace_events` projection (decomposed at ingest/emit time,
+    /// before any transform is applied), so this never destroys the
+    /// substrate's own copy — only the federation-tier envelope this
+    /// promotes narrows.
+    ///
+    /// Renamed from `promote_attestation_with_strips` (v21.3.0 /
+    /// CIRISPersist#510 P1): that version ran a bespoke `for path in
+    /// strip_paths { consent_grammar::strip_field(..) }` loop; `pipeline`
+    /// is now built by the caller via
+    /// [`crate::federation::consent_grammar::to_transform_ops`] (ONE
+    /// converter, no new grammar variants — v21.7.0's MINIMAL cut of
+    /// #519 item 2a-ii) and folded here through the SAME total-algebra
+    /// dispatch [`crate::federation::transform::apply`] every other
+    /// consumer of the algebra uses. A strip-only `pipeline` — the only
+    /// shape [`RestrictionOp`](crate::federation::consent_grammar::RestrictionOp)
+    /// can produce today — folds to byte-identical output to the old
+    /// loop: `TransformPipeline::apply_all` clones `input` once and then
+    /// folds `apply` over each stage in order, exactly what the old loop
+    /// did one `strip_field` call at a time (see
+    /// `tests::promotion_pipeline_is_strip_single_sourced_519` /
+    /// `tests::promotion_applies_strip_field_510`, both green
+    /// unmodified). The protected-root-member refusal
+    /// (`dimension`/`trace_id` never stripped) lives inside
+    /// [`crate::federation::transform::apply`]'s `StripField` arm, so it
+    /// holds unchanged through the pipeline.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    async fn promote_attestation_with_strips(
+    async fn promote_attestation_with_transforms(
         &self,
         row: &crate::federation::Attestation,
-        strip_paths: &[String],
+        pipeline: &crate::federation::transform::TransformPipeline,
         cohort_scope: &str,
     ) -> Result<bool, crate::federation::Error> {
         use crate::federation::types::cohort_scope as cs;
@@ -2816,14 +2855,15 @@ impl Engine {
         use sha2::{Digest, Sha256};
 
         // v21.5.0 (CIRISPersist#519) — placement carriage, same contract as
-        // `attestation_promote`: the strip path is also a placement-touching
-        // promotion, so it carries `cohort_scope` and rejects the incoherent
-        // `(federation, self)`. Stamp the scope before the transformed
-        // tier-flip re-reads the row.
+        // `attestation_promote`: the transform path is also a placement-
+        // touching promotion, so it carries `cohort_scope` and rejects the
+        // incoherent `(federation, self)`. Stamp the scope before the
+        // transformed tier-flip re-reads the row.
         if !cs::is_valid(cohort_scope) || cohort_scope == cs::SELF {
             return Err(crate::federation::Error::InvalidArgument(format!(
-                "promote_attestation_with_strips: cohort_scope {cohort_scope:?} is not a valid \
-                 federation-visible placement (self / invalid rejected — CIRISPersist#519/#315)"
+                "promote_attestation_with_transforms: cohort_scope {cohort_scope:?} is not a \
+                 valid federation-visible placement (self / invalid rejected — \
+                 CIRISPersist#519/#315)"
             )));
         }
         if row.cohort_scope != cohort_scope {
@@ -2841,28 +2881,29 @@ impl Engine {
             }
         }
 
-        let mut stripped = row.attestation_envelope.clone();
-        for path in strip_paths {
-            crate::federation::consent_grammar::strip_field(&mut stripped, path);
-        }
+        let transformed = pipeline.apply_all(&row.attestation_envelope).map_err(|e| {
+            crate::federation::Error::Backend(format!(
+                "promote_attestation_with_transforms apply_all: {e}"
+            ))
+        })?;
 
         let canonical =
-            crate::verify::canonical::ceg_produce_canonicalize(&stripped).map_err(|e| {
+            crate::verify::canonical::ceg_produce_canonicalize(&transformed).map_err(|e| {
                 crate::federation::Error::Backend(format!(
-                    "promote_attestation_with_strips canonicalize: {e}"
+                    "promote_attestation_with_transforms canonicalize: {e}"
                 ))
             })?;
         let original_content_hash_hex = hex::encode(Sha256::digest(&canonical));
         let sig = self.sign_hybrid(&canonical).await.map_err(|e| {
             crate::federation::Error::Backend(format!(
-                "promote_attestation_with_strips sign_hybrid: {e}"
+                "promote_attestation_with_transforms sign_hybrid: {e}"
             ))
         })?;
         let classical_b64 = B64.encode(&sig.classical.signature);
         let pqc_b64 = B64.encode(&sig.pqc.signature);
         let scrub_key_id = self.local_derived_key_id().await.map_err(|e| {
             crate::federation::Error::Backend(format!(
-                "promote_attestation_with_strips derive scrub_key_id: {e}"
+                "promote_attestation_with_transforms derive scrub_key_id: {e}"
             ))
         })?;
         let now = chrono::Utc::now();
@@ -2872,7 +2913,7 @@ impl Engine {
             BackendDispatch::Postgres(b) => {
                 b.promote_attestation_transformed(
                     &row.attestation_id,
-                    &stripped,
+                    &transformed,
                     &classical_b64,
                     Some(&pqc_b64),
                     &original_content_hash_hex,
@@ -2885,7 +2926,7 @@ impl Engine {
             BackendDispatch::Sqlite(b) => {
                 b.promote_attestation_transformed(
                     &row.attestation_id,
-                    &stripped,
+                    &transformed,
                     &classical_b64,
                     Some(&pqc_b64),
                     &original_content_hash_hex,
@@ -10605,6 +10646,80 @@ mod tests {
         crate::federation::tier_ingest::verify_federation_tier_ingest(&*sq, &after)
             .await
             .expect("promoted row's scrub signature verifies over the stripped canonical");
+    }
+
+    /// v21.7.0 (CIRISPersist#519 item 2a-ii, promotion application — the
+    /// MINIMAL variant: see `Engine::promote_attestation_with_transforms`'s
+    /// doc for why `RestrictionOp` grows no new variants). This is the
+    /// "single-sourced, not a bespoke loop" witness the task calls for:
+    /// build the SAME `TransformPipeline` two ways — once directly (what
+    /// this test expects), once via `consent_grammar::to_transform_ops`
+    /// feeding `Engine::promote_attestation_with_transforms` (what the
+    /// engine actually runs) — and assert the promoted envelope is
+    /// EXACTLY `TransformPipeline::apply_all`'s own output over the
+    /// pre-promotion envelope. If the engine ever grew a strip code path
+    /// independent of the algebra, this equality would be the first thing
+    /// to break.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn promotion_pipeline_is_strip_single_sourced_519() {
+        use crate::federation::{consent_grammar, transform, FederationDirectory};
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("node-519pipe");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "node-519pipe"))
+            .await
+            .expect("seed key");
+
+        let trace_id = sq
+            .attestation_insert_local(build_509_trace_input(&derived, "trace-519pipe-1"))
+            .await
+            .expect("insert local trace");
+        let row = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+
+        // The exact restriction shape a `consent:replication:v1` grant
+        // carries for a `strip_field` restriction.
+        let restrictions = vec![consent_grammar::RestrictionOp::StripField {
+            path: "/agent_id_hash".to_string(),
+        }];
+        let ops = consent_grammar::to_transform_ops(&restrictions);
+        assert_eq!(
+            ops,
+            vec![transform::TransformOp::StripField {
+                path: "/agent_id_hash".to_string(),
+            }],
+            "to_transform_ops maps strip_field 1:1 to TransformOp::StripField"
+        );
+        let pipeline = transform::TransformPipeline(ops);
+
+        // What the total algebra itself produces over the row's own
+        // pre-promotion envelope.
+        let expected = pipeline
+            .apply_all(&row.attestation_envelope)
+            .expect("apply_all over a strip_field-only pipeline is total");
+
+        // What the engine's promotion primitive actually signs and writes.
+        let promoted = engine
+            .promote_attestation_with_transforms(
+                &row,
+                &pipeline,
+                crate::federation::types::cohort_scope::FEDERATION,
+            )
+            .await
+            .expect("promotes");
+        assert!(promoted);
+
+        let after = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(
+            after.attestation_envelope, expected,
+            "the engine's promoted envelope is EXACTLY TransformPipeline::apply_all's own \
+             output over the pre-promotion envelope — strip is routed through the algebra, \
+             not a bespoke loop"
+        );
     }
 
     /// A grant whose `audience` is `"community"` (not the #509-floor's

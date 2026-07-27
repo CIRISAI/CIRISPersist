@@ -52,6 +52,14 @@ pub mod genesis;
 pub mod goal;
 pub mod hardware_attestation;
 pub mod identity_aggregate;
+// (CIRISPersist#519 item 3) — the invariant-registry admission enforcement
+// + consistency witness: the admission-enforceable subset of the vendored
+// `invariant_registry` (571 invariants / 104 families) and the executed
+// proof that persist's hardcoded reserved-prefix admission surface cannot
+// silently drift from it. See the module doc for what's newly enforced
+// (one gap: `health:liveness:*` self-emission) vs. already-covered vs.
+// consumer-owned.
+pub mod invariant;
 pub mod location;
 pub mod namespace;
 // v5.1.0 (CIRISPersist#65, CEG 1.0-RC2 §5.6.8.13 / §10.1.6) — operational-
