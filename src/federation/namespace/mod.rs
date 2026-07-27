@@ -24,6 +24,7 @@
 //! [`registry`] for the drift-control (the vendored-copy content hash gate).
 
 pub mod registry;
+pub mod supersets;
 
 use crate::federation::types::{attestation_type, cohort_scope};
 

@@ -2374,10 +2374,40 @@ impl Engine {
     pub async fn attestation_promote(
         &self,
         attestation_id: &str,
+        cohort_scope: &str,
     ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::types::cohort_scope as cs;
         use crate::federation::FederationDirectory;
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
         use sha2::{Digest, Sha256};
+
+        // v21.5.0 (CIRISPersist#519) — a promotion is a PLACEMENT-touching
+        // primitive: it MUST carry the placement, not tier alone. Before #519
+        // this flipped `tier` local→federation and re-signed while leaving
+        // `cohort_scope` untouched — minting the incoherent `(federation,
+        // self)` a `trace:complete:v1` is born into, which the offer filter
+        // (keyed on `cohort_scope`) silently drops. That was the CIRISPersist#315
+        // dead plane: `consent:replication:v1 (federation, federation)` crossed
+        // the wire; the trace `(self, federation)` did not. The complete
+        // primitive next door — `promote_consented_backlog` — already uplifts
+        // BOTH from the covering grant's audience; this makes the low-level
+        // primitive carry it too, so no caller can flip tier without declaring
+        // a coherent, federation-visible placement.
+        if !cs::is_valid(cohort_scope) {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "attestation_promote: invalid cohort_scope {cohort_scope:?}"
+            )));
+        }
+        if cohort_scope == cs::SELF {
+            return Err(crate::federation::Error::InvalidArgument(
+                "attestation_promote: refusing to promote to federation tier with \
+                 cohort_scope=self — a self-scoped federation row is the CIRISPersist#315 \
+                 incoherent state (substrate-local-only scope on a replicate-me tier; the \
+                 offer filter drops it). Pass the covering audience, or use \
+                 promote_consented_backlog to derive it from the consent edge."
+                    .to_owned(),
+            ));
+        }
 
         // 1. Load the row (any tier).
         let row = match &self.backend {
@@ -2393,6 +2423,27 @@ impl Engine {
         })?;
         if row.tier == crate::federation::types::attestation_tier::FEDERATION {
             return Ok(false); // idempotent
+        }
+
+        // PLACEMENT BEFORE TIER: stamp the target cohort_scope on the row while
+        // it is still `local`, so it is never observable as `(federation,
+        // <stale scope>)`. `promote_attestation` below re-reads the row, so the
+        // new scope lands in the promoted `persist_row_hash`. A mid-sequence
+        // failure leaves a coherent `(local, <new scope>)` row that a retry
+        // completes.
+        if row.cohort_scope != cohort_scope {
+            match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    b.set_attestation_cohort_scope(attestation_id, cohort_scope)
+                        .await?
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    b.set_attestation_cohort_scope(attestation_id, cohort_scope)
+                        .await?
+                }
+            }
         }
 
         // 2. Canonicalize the envelope (produce gate → JCS post-cut) + hash.
@@ -2701,42 +2752,23 @@ impl Engine {
                     }
                 }
 
+                // v21.5.0 (CIRISPersist#519) — the placement (the covering
+                // grant's audience) is now CARRIED by the promotion primitive
+                // itself, atomic with the tier flip (placement-before-tier
+                // ordering inside the primitive). The old separate
+                // `set_attestation_cohort_scope` step — which left a transient
+                // `(federation, self)` window and could fail independently — is
+                // gone: an incomplete promotion is no longer expressible.
                 let promote_result = if strip_paths.is_empty() {
-                    self.attestation_promote(&row.attestation_id).await
+                    self.attestation_promote(&row.attestation_id, &chosen_audience)
+                        .await
                 } else {
-                    self.promote_attestation_with_strips(row, &strip_paths)
+                    self.promote_attestation_with_strips(row, &strip_paths, &chosen_audience)
                         .await
                 };
 
                 match promote_result {
                     Ok(true) => {
-                        let scope_write = match &self.backend {
-                            #[cfg(feature = "postgres")]
-                            BackendDispatch::Postgres(b) => {
-                                b.set_attestation_cohort_scope(
-                                    &row.attestation_id,
-                                    &chosen_audience,
-                                )
-                                .await
-                            }
-                            #[cfg(feature = "sqlite")]
-                            BackendDispatch::Sqlite(b) => {
-                                b.set_attestation_cohort_scope(
-                                    &row.attestation_id,
-                                    &chosen_audience,
-                                )
-                                .await
-                            }
-                        };
-                        if let Err(e) = scope_write {
-                            tracing::warn!(
-                                attestation_id = %row.attestation_id,
-                                error = %e,
-                                "promote_consented_backlog: cohort_scope write-back failed \
-                                 after a successful promote (row is federation-tier; \
-                                 cohort_scope may be stale)"
-                            );
-                        }
                         report.promoted += 1;
                     }
                     // Already federation-tier — the `tier = 'local'` page
@@ -2776,10 +2808,38 @@ impl Engine {
         &self,
         row: &crate::federation::Attestation,
         strip_paths: &[String],
+        cohort_scope: &str,
     ) -> Result<bool, crate::federation::Error> {
+        use crate::federation::types::cohort_scope as cs;
         use crate::federation::FederationDirectory;
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
         use sha2::{Digest, Sha256};
+
+        // v21.5.0 (CIRISPersist#519) — placement carriage, same contract as
+        // `attestation_promote`: the strip path is also a placement-touching
+        // promotion, so it carries `cohort_scope` and rejects the incoherent
+        // `(federation, self)`. Stamp the scope before the transformed
+        // tier-flip re-reads the row.
+        if !cs::is_valid(cohort_scope) || cohort_scope == cs::SELF {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "promote_attestation_with_strips: cohort_scope {cohort_scope:?} is not a valid \
+                 federation-visible placement (self / invalid rejected — CIRISPersist#519/#315)"
+            )));
+        }
+        if row.cohort_scope != cohort_scope {
+            match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    b.set_attestation_cohort_scope(&row.attestation_id, cohort_scope)
+                        .await?
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    b.set_attestation_cohort_scope(&row.attestation_id, cohort_scope)
+                        .await?
+                }
+            }
+        }
 
         let mut stripped = row.attestation_envelope.clone();
         for path in strip_paths {
@@ -4097,8 +4157,17 @@ impl Engine {
             .await?;
 
         // (5) Promote the delegation to the federation tier (§10.1.5 /
-        // #172) so peers verify the agent's authority.
-        let delegation_promoted = self.attestation_promote(&delegation_id).await?;
+        // #172) so peers verify the agent's authority. v21.5.0
+        // (CIRISPersist#519): the delegation is written local-tier at
+        // `cohort_scope::SELF` in (4), but its whole PURPOSE is peer
+        // verification — it must be federation-VISIBLE, not self-scoped. Pre-#519
+        // this promotion flipped tier alone and left `(federation, self)` — a
+        // latent instance of the #315 dead-plane class (a delegation peers
+        // could not actually see). The completed primitive carries the
+        // placement: promote to `federation` scope explicitly.
+        let delegation_promoted = self
+            .attestation_promote(&delegation_id, cohort_scope::FEDERATION)
+            .await?;
 
         // (6) Reachability: a transport_destination per occurrence that
         // supplied one (§5.6.8.8.1). #443 (route table): epoch-aware — a
@@ -9845,7 +9914,10 @@ mod tests {
         assert!(before.promoted_at.is_none());
 
         // Promote.
-        let promoted = engine.attestation_promote(&att_id).await.unwrap();
+        let promoted = engine
+            .attestation_promote(&att_id, crate::federation::types::cohort_scope::FEDERATION)
+            .await
+            .unwrap();
         assert!(promoted, "first promote flips the tier");
 
         let after = sq.get_attestation(&att_id).await.unwrap().expect("row");
@@ -9879,7 +9951,10 @@ mod tests {
         assert_eq!(after.attestation_envelope, before.attestation_envelope);
 
         // Idempotent: re-promoting a federation row is a no-op.
-        let again = engine.attestation_promote(&att_id).await.unwrap();
+        let again = engine
+            .attestation_promote(&att_id, crate::federation::types::cohort_scope::FEDERATION)
+            .await
+            .unwrap();
         assert!(!again, "re-promote of a federation row returns Ok(false)");
         let after2 = sq.get_attestation(&att_id).await.unwrap().expect("row");
         assert_eq!(
@@ -9898,12 +9973,95 @@ mod tests {
             .await
             .expect("construct engine");
         let err = engine
-            .attestation_promote("00000000-0000-0000-0000-000000000000")
+            .attestation_promote(
+                "00000000-0000-0000-0000-000000000000",
+                crate::federation::types::cohort_scope::FEDERATION,
+            )
             .await
             .expect_err("missing row");
         assert!(
             matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("does not exist")),
             "got: {err:?}"
+        );
+    }
+
+    /// v21.5.0 (CIRISPersist#519) — the incomplete-primitive fix: promotion is
+    /// PLACEMENT-touching, so `attestation_promote` REFUSES the incoherent
+    /// `(federation, self)` — the silent dead-plane state a `trace:complete:v1`
+    /// is born into (CIRISPersist#315). The completed primitive carries the
+    /// placement; `self` is rejected before any tier flip.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn attestation_promote_rejects_federation_self_519() {
+        use crate::federation::types::{attestation_type::SCORES, cohort_scope};
+        use crate::federation::FederationDirectory;
+
+        let signer = pqc_signer("occ519");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        seed_promote_key(&sq, &derived).await;
+        let input = crate::federation::types::LocalAttestationInput {
+            attestation_id: None,
+            attesting_key_id: derived.clone(),
+            attested_key_id: None,
+            attestation_type: SCORES.into(),
+            weight: Some(1.0),
+            expires_at: None,
+            // A born-local self-scoped producer payload — the shape a
+            // `trace:complete:v1` has at birth, without the trace-specific
+            // admission fields (the (federation, self) rejection under test is
+            // dimension-agnostic).
+            attestation_envelope: crate::federation::envelope::EnvelopeCore::from_value(
+                serde_json::json!({
+                    "id": "att-519", "dimension": "identity_binding:v1",
+                    "score": 1.0, "confidence": 0.9,
+                }),
+            )
+            .unwrap(),
+            subject_key_ids: vec![],
+            cohort_scope: cohort_scope::SELF.to_string(),
+            scrub_signature_classical: None,
+            scrub_signature_pqc: None,
+        };
+        let att_id = sq.attestation_upsert_local(input).await.unwrap();
+
+        // (self) is rejected — the #315 incoherent state is unrepresentable.
+        let err = engine
+            .attestation_promote(&att_id, cohort_scope::SELF)
+            .await
+            .expect_err("promoting to (federation, self) must be refused");
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(ref m) if m.contains("self")),
+            "got: {err:?}"
+        );
+        // The row is untouched — still local, still self (no partial state).
+        let unchanged = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            unchanged.tier,
+            crate::federation::types::attestation_tier::LOCAL
+        );
+        assert_eq!(unchanged.cohort_scope, cohort_scope::SELF);
+
+        // A federation-visible audience promotes cleanly AND carries the
+        // placement — the completed primitive leaves (federation, community),
+        // never (federation, self).
+        let ok = engine
+            .attestation_promote(&att_id, cohort_scope::COMMUNITY)
+            .await
+            .expect("promote with a federation-visible audience");
+        assert!(ok);
+        let after = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            after.tier,
+            crate::federation::types::attestation_tier::FEDERATION
+        );
+        assert_eq!(
+            after.cohort_scope,
+            cohort_scope::COMMUNITY,
+            "#519: the promotion carried the placement atomically — no (federation, self)"
         );
     }
 
@@ -9990,7 +10148,10 @@ mod tests {
         assert!(before.scrub_signature_classical.is_empty());
         assert!(before.original_content_hash.is_empty());
 
-        let promoted = engine.attestation_promote(&att_id).await.unwrap();
+        let promoted = engine
+            .attestation_promote(&att_id, crate::federation::types::cohort_scope::FEDERATION)
+            .await
+            .unwrap();
         assert!(promoted, "first promote flips the tier");
 
         let after = pg.get_attestation(&att_id).await.unwrap().expect("row");
@@ -10009,7 +10170,10 @@ mod tests {
         assert_eq!(after.attestation_envelope, before.attestation_envelope);
 
         // Idempotent re-promote.
-        let again = engine.attestation_promote(&att_id).await.unwrap();
+        let again = engine
+            .attestation_promote(&att_id, crate::federation::types::cohort_scope::FEDERATION)
+            .await
+            .unwrap();
         assert!(!again, "re-promote of a federation row returns Ok(false)");
         let after2 = pg.get_attestation(&att_id).await.unwrap().expect("row");
         assert_eq!(
