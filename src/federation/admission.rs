@@ -3246,19 +3246,26 @@ pub async fn check_withdraws_admission(
             // lock: an owner who is PROVABLY dead (their signed freshness
             // floor has lapsed) must be reclaimable by a verified quorum.
             // `check_ownership_reclaim_admission` is that sanctioned
-            // exception. It is consulted here with the process's
-            // configured policy — **`NO_RECLAIM_POLICY` (`None`) today**:
-            // persist ships no policy; the abandonment window and reclaim
-            // roster/threshold are CIRISConstitution#43's to ratify. With
-            // `policy = None` the reclaim check ALWAYS returns `Refused`
-            // (see its own doc), so this arm falls through to `Err(err)`
-            // exactly as before this cut — the mesh's behavior is
-            // BYTE-IDENTICAL while inert; only the mechanism's existence
-            // and witnessing are new.
+            // exception. v21.8.0 (CIRISPersist#519 activation) — persist now
+            // ships an ACTIVATED conservative DEFAULT policy (the
+            // HUMANITY_ACCORD holder quorum, resolved from persist's OWN
+            // registered accord holders, + a 180-day window) rather than the
+            // inert `None`, so the CC 3.2 "no permanent ownerless lock" MUST is
+            // satisfied by mechanism today; CIRISConstitution#43 ratifies/refines
+            // the window + authority. Activation is SAFE ahead of touch-claim
+            // producers because the abandonment test is fail-safe (an ABSENT
+            // freshness floor is never abandonment) — no node is reclaimable
+            // until it has demonstrably emitted freshness and then gone dark, so
+            // the pre-producer mesh (every floor absent) has ZERO reclaimable
+            // nodes. An empty accord roster (no holders resolved) yields an
+            // unmeetable threshold ⇒ every reclaim still `Refused` (fail-closed).
+            let reclaim_policy = super::ownership_reclaim::ReclaimPolicy::humanity_accord_default(
+                accord_holder_roster_key_ids(),
+            );
             if super::ownership_reclaim::check_ownership_reclaim_admission(
                 directory,
                 row,
-                NO_RECLAIM_POLICY,
+                Some(&reclaim_policy),
                 chrono::Utc::now(),
             )
             .await?
@@ -3272,16 +3279,6 @@ pub async fn check_withdraws_admission(
         }
     }
 }
-
-/// CIRISPersist#519 — the reclaim policy [`check_withdraws_admission`]
-/// consults at its inert chokepoint. **`None` — this crate ships no
-/// policy.** `abandonment_window` and the reclaim roster/threshold are
-/// CIRISConstitution#43's to ratify; naming this constant (rather than
-/// writing `None` inline) documents WHY it is `None`, without inventing a
-/// value. A future CC-ratified deployment threads a real
-/// `Option<&ReclaimPolicy>` in from its own configuration instead of this
-/// constant.
-const NO_RECLAIM_POLICY: Option<&'static super::ownership_reclaim::ReclaimPolicy> = None;
 
 // ─── v8.7.1 — §11.10 FULL moderation enforcement (CEG RC24/RC25/RC26) ───
 //

@@ -23,11 +23,17 @@
 //! rule 1: a THIRD PARTY's `withdraws` against a live owner-binding is
 //! admitted IFF **both**:
 //!
-//! 1. **Provably-abandoned.** The incumbent owner's (and/or the owned
-//!    node's) signed freshness floor
+//! 1. **Provably-abandoned (FAIL-SAFE).** The incumbent owner's (and/or the
+//!    owned node's) signed freshness floor
 //!    ([`super::FederationDirectory::lookup_freshness_floor`], v21.6.0
-//!    CIRISPersist#519 item 2a-iii) is ABSENT or older than
-//!    `now - abandonment_window`. This is the manifest's own "HIGHEST
+//!    CIRISPersist#519 item 2a-iii) is **PRESENT and** older than
+//!    `now - abandonment_window`. An ABSENT floor is NOT abandonment —
+//!    absence of a signed floor is absence of evidence, not evidence of
+//!    death. Only a floor that was demonstrably alive and then stopped
+//!    advancing is proof (v21.8.0 activation fix; this is what makes
+//!    activation safe before touch-claim producers exist — every node's
+//!    floor is absent today, so zero nodes are reclaimable). This is the
+//!    manifest's own "HIGHEST
 //!    VALUE" `demanded_by` entry for `ownership:*`
 //!    (`namespace_supersets.json` § `freshness_floor.demanded_by`):
 //!    distinguishing "owner alive but quiet" from "owner provably dead" is
@@ -48,25 +54,30 @@
 //!    `federation_keys` rows (Registry-of-Record), never trusted from the
 //!    caller.
 //!
-//! # Ship the mechanism INERT
+//! # Activated with a conservative default (v21.8.0)
 //!
-//! [`ReclaimPolicy`] is threaded as `Option<&ReclaimPolicy>` and is
-//! `None` by DEFAULT — this crate ships no policy. `abandonment_window`
-//! and the reclaim roster/threshold are **CIRISConstitution#43's to
-//! ratify**, not this crate's to invent:
+//! Rather than ship inert, persist ACTIVATES the mechanism with a
+//! conservative default ([`ReclaimPolicy::humanity_accord_default`]) so the
+//! CC 3.2 MUST is satisfied *by mechanism* today: reclaim authority = the
+//! HUMANITY_ACCORD holder quorum (the body that already holds the
+//! kill-switch — the least-arbitrary reclaim authority, roster resolved from
+//! persist's OWN registered accord holders, strict-majority threshold) + a
+//! **180-day** abandonment window. **CIRISConstitution#43 ratifies/refines the
+//! two parameters (the window + the authority)** — persist ships a safe
+//! default, CC sets the ratified values. This is safe to activate ahead of
+//! ratification for two reasons: the abandonment test is fail-safe (an absent
+//! floor is never abandonment, §1 above), so the pre-producer mesh has ZERO
+//! reclaimable nodes; and an empty accord roster yields an unmeetable
+//! threshold ⇒ every reclaim still refused. [`check_ownership_reclaim_admission`]
+//! still accepts `Option<&ReclaimPolicy>` (`None` ⇒ the pre-v21.8.0 inert
+//! behaviour, for a caller that wants it); the chokepoint in
+//! [`super::admission::check_withdraws_admission`] passes the accord default.
 //!
-//! - a too-short window turns a vacationing owner's node into a target;
-//! - a weak/ill-composed roster turns "reclaim" into a capture vector.
-//!
-//! Shipping a made-up default would let CC ratification be preempted by
-//! implementation accident, so [`check_ownership_reclaim_admission`]
-//! **refuses every reclaim** when `policy` is `None`
-//! ([`ReclaimVerdict::Refused`]) — fail-closed, not a silent no-op. The
-//! chokepoint wiring in [`super::admission::check_withdraws_admission`]
-//! passes `None` today (see that function's doc), so the mesh's behavior
-//! is BYTE-IDENTICAL to before this cut — the mechanism exists and is
-//! witnessed, but nothing can use it until a future, CC-ratified
-//! deployment injects a real [`ReclaimPolicy`].
+//! Concretely, a reclaim is refused unless a node has DEMONSTRABLY emitted a
+//! signed freshness floor and then gone dark for 180 days AND a strict
+//! majority of the accord holders co-signs — so ordinary owner-binding
+//! admission (a live or never-touched owner) is unaffected, and the mesh's
+//! behaviour is unchanged for every node that has not been touched-then-dark.
 //!
 //! # What is NOT built here
 //!
@@ -138,20 +149,50 @@ pub struct ReclaimQuorum {
     pub threshold: usize,
 }
 
-/// The reclaim policy CC#43 ratifies. **There is no `Default` impl and no
-/// built-in fallback value — see the module doc's "ship the mechanism
-/// INERT" section.** A caller wanting the shipped (inert) behavior passes
-/// `None` to [`check_ownership_reclaim_admission`], never a
-/// zero/degenerate `ReclaimPolicy`.
+/// The reclaim policy. As of v21.8.0 persist ships an ACTIVATED conservative
+/// DEFAULT ([`ReclaimPolicy::humanity_accord_default`]) rather than staying
+/// inert, so the CC 3.2 "no permanent ownerless lock" MUST is satisfied by
+/// mechanism today; **CIRISConstitution#43 ratifies/refines the two
+/// parameters** (the window and the reclaim authority). A caller wanting the
+/// pre-v21.8.0 INERT behavior still passes `None` to
+/// [`check_ownership_reclaim_admission`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReclaimPolicy {
-    /// An owner (and the node it stewards) whose signed freshness floor
-    /// has not advanced within this window is provably-abandoned.
-    /// CC#43-specified; this crate invents no value.
+    /// An owner (and the node it stewards) whose signed freshness floor was
+    /// PRESENT and has not advanced within this window is provably-abandoned.
+    /// The default is [`Self::DEFAULT_ABANDONMENT_WINDOW`]; CC#43 refines it.
     pub abandonment_window: Duration,
-    /// The m-of-n roster authorized to co-sign a reclaim. CC#43-specified;
-    /// this crate invents no roster.
+    /// The m-of-n roster authorized to co-sign a reclaim. The default is the
+    /// HUMANITY_ACCORD holder quorum (the body that already holds the
+    /// kill-switch — the least-arbitrary reclaim authority); CC#43 refines it.
     pub reclaim_quorum: ReclaimQuorum,
+}
+
+impl ReclaimPolicy {
+    /// The default abandonment window: **180 days**. A conservative
+    /// pre-ratification value — an owner whose signed freshness floor has not
+    /// advanced in half a year is plausibly gone. CC#43 sets the ratified value.
+    pub const DEFAULT_ABANDONMENT_WINDOW: Duration = Duration::days(180);
+
+    /// v21.8.0 (CIRISPersist#519 activation) — the shipped conservative
+    /// default: reclaim authority = the HUMANITY_ACCORD holder quorum
+    /// (`roster_key_ids`, resolved by the caller from persist's OWN registered
+    /// accord holders — never caller-supplied), strict-majority threshold, and
+    /// [`Self::DEFAULT_ABANDONMENT_WINDOW`]. Combined with the fail-safe
+    /// abandonment test (an ABSENT floor is never abandonment), this is safe to
+    /// activate before touch-claim producers exist: no node is reclaimable
+    /// until it has demonstrably emitted freshness and then gone dark. CC#43
+    /// ratifies the window + authority.
+    pub fn humanity_accord_default(roster_key_ids: Vec<String>) -> Self {
+        let n = roster_key_ids.len();
+        Self {
+            abandonment_window: Self::DEFAULT_ABANDONMENT_WINDOW,
+            reclaim_quorum: ReclaimQuorum {
+                threshold: n / 2 + 1, // strict majority; verify_quorum_policy re-validates 2M > N
+                roster_key_ids,
+            },
+        }
+    }
 }
 
 /// The outcome of [`check_ownership_reclaim_admission`].
@@ -284,7 +325,19 @@ pub async fn check_ownership_reclaim_admission(
     };
 
     // (3a) Provably-abandoned: the incumbent's (and/or the node's) signed
-    // freshness floor is absent or older than `now - abandonment_window`.
+    // freshness floor is PRESENT and older than `now - abandonment_window`.
+    //
+    // v21.8.0 (CIRISPersist#519, activation) — FAIL-SAFE: an ABSENT floor is
+    // NOT abandonment. Absence of a signed freshness floor is absence of
+    // evidence, not evidence of death — treating it as abandoned would make
+    // EVERY node reclaimable before any touch-claim producer exists (no node
+    // has a floor yet), i.e. a mass-seizable mesh the instant a policy is
+    // injected. Only a floor that was DEMONSTRABLY alive (present) and then
+    // stopped advancing past the window is proof of abandonment. Consequence
+    // (documented, tracked): a node whose owner NEVER emitted a floor stays
+    // unreclaimable until ownership-establishment bootstraps an initial touch
+    // (a #519 follow-up); the CC 3.2 MUST is satisfied for the touched-then-
+    // dark case, which is the real-world one once producers ship.
     let incumbent = target.attesting_key_id.as_str();
     let node = target.attested_key_id.as_str();
     let incumbent_floor = directory
@@ -300,14 +353,21 @@ pub async fn check_ownership_reclaim_admission(
         (None, None) => None,
     };
     let cutoff = now - policy.abandonment_window;
-    let abandoned = latest.is_none_or(|f| f < cutoff);
+    // is_some_and: absent floor ⇒ false ⇒ NOT abandoned (fail-safe).
+    let abandoned = latest.is_some_and(|f| f < cutoff);
     if !abandoned {
         return Ok(ReclaimVerdict::Refused {
-            reason: format!(
-                "incumbent owner {incumbent} (or node {node}) has a freshness floor within \
-                 the {}s abandonment window — not abandoned",
-                policy.abandonment_window.num_seconds()
-            ),
+            reason: match latest {
+                None => format!(
+                    "incumbent owner {incumbent} (and node {node}) have NO signed freshness \
+                     floor — absence is not proof of abandonment (fail-safe); not reclaimable"
+                ),
+                Some(_) => format!(
+                    "incumbent owner {incumbent} (or node {node}) has a freshness floor within \
+                     the {}s abandonment window — not abandoned",
+                    policy.abandonment_window.num_seconds()
+                ),
+            },
         });
     }
 
@@ -586,7 +646,11 @@ mod tests {
     // ── witness: reclaim_inert_without_policy_refuses ───────────────────
 
     async fn run_reclaim_inert_without_policy_refuses(dir: &dyn FederationDirectory, tag: &str) {
-        let (_owner, _node, reclaimer, target) = seed_owner_binding(dir, tag).await;
+        let (owner, _node, reclaimer, target) = seed_owner_binding(dir, tag).await;
+        // v21.8.0 fail-safe: the control below (WITH a policy → Admit) needs a
+        // genuinely-abandoned owner, i.e. a PRESENT-then-stale floor.
+        let stale = self_touch_claim(&owner, Utc::now() - Duration::days(60));
+        dir.put_touch_claim(&stale).await.expect("stale self-touch");
         let (policy, roster) = two_of_three_policy(dir, tag, Duration::days(30)).await;
         let bytes = reclaim_assertion_bytes(&target, &reclaimer).unwrap();
         let sigs = vec![
@@ -595,8 +659,8 @@ mod tests {
         ];
         let row = reclaim_row(&reclaimer, &target, &sigs);
 
-        // A well-formed reclaim (would satisfy quorum + is abandoned, no
-        // touch claim stored at all) — but policy is None.
+        // A well-formed reclaim (satisfies quorum + provably-abandoned via the
+        // stale floor above) — but policy is None ⇒ always refused.
         match check_ownership_reclaim_admission(dir, &row, None, Utc::now())
             .await
             .unwrap()
@@ -632,9 +696,15 @@ mod tests {
         dir: &dyn FederationDirectory,
         tag: &str,
     ) {
-        let (_owner, _node, reclaimer, target) = seed_owner_binding(dir, tag).await;
-        // No touch claim stored at all → freshness floor absent →
-        // provably-abandoned by construction.
+        let (owner, _node, reclaimer, target) = seed_owner_binding(dir, tag).await;
+        // v21.8.0 fail-safe semantics: PROVABLE abandonment requires a floor
+        // that was PRESENT and then went stale (absence is not proof — see
+        // reclaim_refuses_absent_floor). Store a stale self-touch (60 days ago),
+        // well outside the 30-day window.
+        let stale = self_touch_claim(&owner, Utc::now() - Duration::days(60));
+        dir.put_touch_claim(&stale)
+            .await
+            .expect("a past-dated self-touch is admitted (not future-skewed)");
         let (policy, roster) = two_of_three_policy(dir, tag, Duration::days(30)).await;
         let bytes = reclaim_assertion_bytes(&target, &reclaimer).unwrap();
         let sigs = vec![
@@ -647,7 +717,55 @@ mod tests {
                 .await
                 .unwrap(),
             ReclaimVerdict::Admit,
-            "an abandoned owner + a real 2-of-3 quorum must admit the reclaim"
+            "a present-then-stale (provably-abandoned) owner + a real 2-of-3 quorum must admit"
+        );
+    }
+
+    /// v21.8.0 (CIRISPersist#519 activation) — the shipped conservative
+    /// default: a 180-day window + a strict-majority accord quorum. Locks the
+    /// pre-ratification parameters CC#43 will confirm/refine; an empty roster
+    /// yields threshold 1 over 0 members (unmeetable) — fail-closed.
+    #[test]
+    fn humanity_accord_default_is_conservative() {
+        let p = ReclaimPolicy::humanity_accord_default(vec!["A1".into(), "B1".into(), "C1".into()]);
+        assert_eq!(p.abandonment_window, Duration::days(180));
+        assert_eq!(p.reclaim_quorum.threshold, 2, "strict majority of 3");
+        assert_eq!(p.reclaim_quorum.roster_key_ids.len(), 3);
+        // empty roster ⇒ threshold 1, roster 0 ⇒ no quorum ever meetable.
+        let empty = ReclaimPolicy::humanity_accord_default(vec![]);
+        assert_eq!(empty.reclaim_quorum.threshold, 1);
+        assert!(empty.reclaim_quorum.roster_key_ids.is_empty());
+    }
+
+    /// v21.8.0 (CIRISPersist#519 activation) — the FAIL-SAFE: an owner with NO
+    /// signed freshness floor at all is NOT reclaimable, even with a valid
+    /// quorum and a policy. Absence of a floor is absence of evidence, not
+    /// proof of death — this is what makes activation safe before any
+    /// touch-claim producer exists (every node's floor is absent today).
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn reclaim_refuses_absent_floor() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct sqlite engine");
+        let dir = engine.federation_directory();
+        let (_owner, _node, reclaimer, target) = seed_owner_binding(&*dir, "absent").await;
+        // No touch claim stored → floor absent.
+        let (policy, roster) = two_of_three_policy(&*dir, "absent", Duration::days(30)).await;
+        let bytes = reclaim_assertion_bytes(&target, &reclaimer).unwrap();
+        let sigs = vec![
+            ts::threshold_sign(&roster[0], &bytes),
+            ts::threshold_sign(&roster[2], &bytes),
+        ];
+        let row = reclaim_row(&reclaimer, &target, &sigs);
+        assert!(
+            matches!(
+                check_ownership_reclaim_admission(&*dir, &row, Some(&policy), Utc::now())
+                    .await
+                    .unwrap(),
+                ReclaimVerdict::Refused { .. }
+            ),
+            "an absent freshness floor is not abandonment — reclaim must be refused (fail-safe)"
         );
     }
 
