@@ -1515,3 +1515,140 @@ mod tests {
         assert!(matches!(err, TransformError::TypeMismatch { .. }));
     }
 }
+
+/// v21.6.0 (CIRISPersist#519 item 2a-ii) — **the opcode table drives the
+/// fuzzer.** The manifest declares the algebra STRICTLY TOTAL (named opcodes,
+/// fixed arity, no loops/recursion); these property tests VERIFY totality as
+/// law rather than on a sample per variant: over arbitrary JSON input and
+/// arbitrary op arguments, [`apply`] always RETURNS (`Ok` or a typed `Err`) and
+/// never panics, [`apply`] is deterministic, and an arbitrary bounded
+/// [`TransformPipeline`] always terminates. A non-terminating or panicking
+/// opcode — the exact failure the totality invariant exists to forbid, because
+/// a transform sits in the admission/serve gate — is caught here by
+/// construction.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::Value;
+
+    /// A bounded arbitrary JSON value — depth- and size-limited so the
+    /// STRATEGY itself terminates (an unbounded generator would be its own
+    /// totality violation). Covers every leaf kind + shallow arrays/objects.
+    fn arb_json() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::from),
+            any::<i64>().prop_map(Value::from),
+            any::<f64>()
+                .prop_filter("finite", |f| f.is_finite())
+                .prop_map(|f| serde_json::json!(f)),
+            ".{0,32}".prop_map(Value::from),
+        ];
+        leaf.prop_recursive(3, 24, 5, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..5).prop_map(Value::from),
+                prop::collection::vec(("[a-z]{1,6}", inner), 0..5)
+                    .prop_map(|kvs| { Value::Object(kvs.into_iter().collect()) }),
+            ]
+        })
+    }
+
+    /// An arbitrary op — one representative per closed [`TransformOp`] variant,
+    /// with fuzzed arguments. Covers live AND declared-only opcodes (the
+    /// declared-only ones must still be TOTAL: return a typed `Err`, not panic).
+    fn arb_op() -> impl Strategy<Value = TransformOp> {
+        prop_oneof![
+            (0usize..64).prop_map(|n| TransformOp::Truncate { n }),
+            (0usize..64).prop_map(|n| TransformOp::Prefix { n }),
+            (0usize..64).prop_map(|n| TransformOp::Suffix { n }),
+            prop::collection::vec(any::<f64>().prop_filter("finite", |f| f.is_finite()), 0..6)
+                .prop_map(|edges| TransformOp::Bucket { edges }),
+            (1i32..1_000_000).prop_map(|precision| TransformOp::Round { precision }),
+            ".{0,8}".prop_map(|sep| TransformOp::Concat { sep }),
+            proptest::option::of(".{0,8}")
+                .prop_map(|placeholder| TransformOp::Redact { placeholder }),
+            "(/[a-z*]{1,6}){0,4}".prop_map(|path| TransformOp::StripField { path }),
+            "[a-z0-9]{0,16}".prop_map(|salt_ref| TransformOp::SaltedHash { salt_ref }),
+            any::<f64>()
+                .prop_filter("finite", |f| f.is_finite())
+                .prop_map(|v| TransformOp::Gte { v }),
+            any::<f64>()
+                .prop_filter("finite", |f| f.is_finite())
+                .prop_map(|v| TransformOp::Lt { v }),
+            (
+                any::<f64>().prop_filter("finite", |f| f.is_finite()),
+                any::<f64>().prop_filter("finite", |f| f.is_finite())
+            )
+                .prop_map(|(lo, hi)| TransformOp::InRange { lo, hi }),
+            ("[a-z0-9]{0,8}", "[a-z]{0,8}")
+                .prop_map(|(epoch, scope)| TransformOp::Nullifier { epoch, scope }),
+        ]
+    }
+
+    proptest! {
+        /// TOTALITY: apply never panics and always returns, for every op over
+        /// arbitrary input. (A panic fails the case; a hang times out CI — both
+        /// are totality violations the invariant forbids.)
+        #[test]
+        fn apply_is_total(op in arb_op(), input in arb_json()) {
+            let _ = apply(&op, &input); // must simply RETURN
+        }
+
+        /// DETERMINISM: same op, same input → same result (a pure function).
+        #[test]
+        fn apply_is_deterministic(op in arb_op(), input in arb_json()) {
+            prop_assert_eq!(apply(&op, &input), apply(&op, &input));
+        }
+
+        /// PIPELINE TERMINATION: an arbitrary bounded pipeline is a finite DAG —
+        /// `apply_all` always returns, its length its own termination bound.
+        #[test]
+        fn pipeline_terminates(
+            ops in prop::collection::vec(arb_op(), 0..12),
+            input in arb_json(),
+        ) {
+            let _ = TransformPipeline(ops).apply_all(&input);
+        }
+    }
+
+    /// The MANIFEST-DRIVEN totality claim: every opcode NAME in the vendored
+    /// [`OPCODES`] table (itself 1:1-checked against
+    /// `namespace_supersets.json`) is exercised by [`arb_op`] above — so the
+    /// fuzzer covers the declared universe, not an arbitrary hand-picked
+    /// subset. A new opcode added to the table without a matching `arb_op` arm
+    /// fails this test (keeping the fuzz honest as the algebra grows).
+    #[test]
+    fn every_declared_opcode_is_fuzzed() {
+        use std::collections::BTreeSet;
+        // The op names arb_op() can produce (kept in lockstep with the strategy).
+        let fuzzed: BTreeSet<&str> = [
+            "truncate",
+            "prefix",
+            "suffix",
+            "bucket",
+            "round",
+            "concat",
+            "redact",
+            "strip_field",
+            "salted_hash",
+            "gte",
+            "lt",
+            "in_range",
+            "nullifier",
+        ]
+        .into_iter()
+        .collect();
+        // Declared-only opcodes with no runtime args worth fuzzing beyond
+        // "returns NotYetImplemented" are exempted explicitly, not silently.
+        let fuzz_exempt: BTreeSet<&str> = ["commit", "bbs_derive"].into_iter().collect();
+        for meta in OPCODES {
+            assert!(
+                fuzzed.contains(meta.name) || fuzz_exempt.contains(meta.name),
+                "opcode {:?} is in the manifest table but neither fuzzed by arb_op nor \
+                 explicitly fuzz-exempt — add a strategy arm so totality stays covered",
+                meta.name
+            );
+        }
+    }
+}

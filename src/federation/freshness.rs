@@ -128,6 +128,22 @@ pub fn coalesce_touch_ts(ts: DateTime<Utc>, precision: chrono::Duration) -> Date
     DateTime::<Utc>::from_timestamp(floored_secs, 0).unwrap_or(ts)
 }
 
+/// v21.6.0 (CIRISPersist#519 item 2a-iii) — the pure freshness-floor MERGE:
+/// **monotonic max**, the join of a bounded ⊔-semilattice. The manifest
+/// (`freshness_floor.merge_rule = "monotonic_max"`) declares this is "a pure
+/// fold, algebra-legal"; this is that fold, single-sourced. Every backend's
+/// `put_touch_claim` ON-CONFLICT guard (`WHERE excluded.fresh_as_of >
+/// stored.fresh_as_of`) implements exactly `merge_floor(stored, incoming)` —
+/// the store keeps `merge_floor` of what it had and what arrived. Being a
+/// join makes the floor **commutative, associative, and idempotent** (so
+/// replicated touches converge regardless of arrival order — the property the
+/// `merge_floor_is_a_join_semilattice` proptest verifies against the
+/// manifest's declaration) and **anti-rollback** (`merge_floor(a, b) >= a`, so
+/// the floor never retreats).
+pub fn merge_floor(a: DateTime<Utc>, b: DateTime<Utc>) -> DateTime<Utc> {
+    a.max(b)
+}
+
 /// v21.6.0 (CIRISPersist#519 item 2a-iii) — shared, backend-agnostic
 /// conformance matrices for the freshness floor, run by the sqlite /
 /// postgres / memory test suites against `&dyn FederationDirectory` so the
@@ -517,5 +533,67 @@ pub(crate) mod test_support {
             .await
             .expect_err("witness_touch of one's own key must be rejected");
         assert_eq!(err.kind(), "federation_signature_invalid");
+    }
+}
+
+/// v21.6.0 (CIRISPersist#519 item 2a-iii) — **the manifest declaration is the
+/// proptest oracle.** `namespace_supersets.json` declares
+/// `freshness_floor.merge_rule = "monotonic_max"` and calls it "a pure fold,
+/// algebra-legal"; these property tests VERIFY that claim as law — that
+/// [`merge_floor`] is a bounded join-⊔-semilattice (commutative + associative +
+/// idempotent + an upper bound), which is exactly what makes replicated
+/// touch-claims converge regardless of arrival order and the floor
+/// anti-rollback. The claim in the vendored table is not asserted by hand on a
+/// few samples — it is fuzzed over arbitrary instants.
+#[cfg(test)]
+mod proptests {
+    use super::merge_floor;
+    use chrono::{DateTime, Utc};
+    use proptest::prelude::*;
+
+    /// Arbitrary UTC instant over the representable range (seconds precision —
+    /// the wire encoding's resolution).
+    fn arb_instant() -> impl Strategy<Value = DateTime<Utc>> {
+        // Bound well inside chrono's valid range so from_timestamp never fails.
+        (-62_135_596_800i64..=253_402_300_799i64)
+            .prop_map(|s| DateTime::<Utc>::from_timestamp(s, 0).expect("in range"))
+    }
+
+    proptest! {
+        /// The manifest's `merge_rule = monotonic_max` is a join semilattice.
+        #[test]
+        fn merge_floor_is_a_join_semilattice(
+            a in arb_instant(),
+            b in arb_instant(),
+            c in arb_instant(),
+        ) {
+            // commutative
+            prop_assert_eq!(merge_floor(a, b), merge_floor(b, a));
+            // associative
+            prop_assert_eq!(
+                merge_floor(merge_floor(a, b), c),
+                merge_floor(a, merge_floor(b, c))
+            );
+            // idempotent
+            prop_assert_eq!(merge_floor(a, a), a);
+            // least upper bound: the join dominates both operands...
+            prop_assert!(merge_floor(a, b) >= a);
+            prop_assert!(merge_floor(a, b) >= b);
+            // ...and is exactly one of them (a max, not a fabricated value).
+            prop_assert!(merge_floor(a, b) == a || merge_floor(a, b) == b);
+        }
+
+        /// Anti-rollback: folding a new touch into the stored floor can only
+        /// advance it — a stale (older) touch is absorbed with no effect (the
+        /// property the backend `WHERE excluded.fresh_as_of > stored` guard
+        /// relies on).
+        #[test]
+        fn merge_floor_never_retreats(stored in arb_instant(), incoming in arb_instant()) {
+            let merged = merge_floor(stored, incoming);
+            prop_assert!(merged >= stored);
+            if incoming <= stored {
+                prop_assert_eq!(merged, stored, "a stale touch must not move the floor");
+            }
+        }
     }
 }
