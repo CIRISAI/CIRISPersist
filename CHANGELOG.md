@@ -5,6 +5,85 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.6.0] — 2026-07-27 — the total transform algebra (#519 item 2a-ii) + the signed `fresh_as_of` freshness floor (#519 item 2a-iii)
+
+Two #519 subsystems, both persist-half, built on the v21.5.0 vendored manifest.
+
+### Added — the total (terminating) transform algebra (`federation::transform`, #519 item 2a-ii)
+
+A closed algebra for what a placement field BECOMES on the wire. `TransformOp`
+is a `deny_unknown_fields` tagged enum; `apply` is an **exhaustive match** (a
+new opcode without an arm is a compile error — the Registry-of-Record pattern),
+and the algebra is **strictly total by construction**: named opcodes, fixed
+arity, no loops, no recursion, no user-defined functions — a pipeline is a
+finite DAG whose length is its own termination bound. This is the non-negotiable
+security invariant: a transform sits in the admission/serve path, so a
+non-terminating one would wedge the gate deciding whether a claim flows, and a
+Turing-complete dialect could express the very flows the architecture makes
+unrepresentable (precedent: Bitcoin Script, EVM's gas-metered quasi-TC, FHIRPath,
+Confluent's non-TC data contracts). Kept SEPARATE from version-migration rules
+and from heavy computation (the scrubber / scorer / detectors are pinned
+contracts, not opcodes).
+
+- **12 live opcodes** (pure/total on std + existing deps): `truncate`, `prefix`,
+  `suffix`, `bucket`, `round` (also the `fresh_as_of` coalescing primitive),
+  `concat`, `redact`, `strip_field`, `salted_hash` (SD-JWT primitive), and the
+  predicates `gte` / `lt` / `in_range` (disclose the answer, never the value).
+- **3 declared-only opcodes** — `commit`, `nullifier` (Semaphore), `bbs_derive`
+  (BBS+): closed-enum members, validated as known, but `apply` returns a typed
+  `NotYetImplemented` (they need a curve/pairing primitive this crate does not
+  carry — deliberately not half-wired).
+- `strip_field` is now single-sourced through the algebra — `consent_grammar`'s
+  strip (#510) is a thin wrapper; the protected-member refusal (`dimension`
+  cannot be stripped) and every #510 witness are preserved.
+- `TRANSFORM_ALGEBRA_HASH =
+  b7bd779468f4ad1ab551a5fd2dc0392df01e6f2e0ed393f924a806ed49686b4b` — a gating
+  witness pins it (the third manifest-hash tripod leg beside
+  `REPLICATION_POLICY_HASH` / `CONSENT_GRAMMAR_HASH`), and a witness cross-checks
+  the Rust opcode table 1:1 against the vendored manifest's declared opcodes.
+  `validate_family_transform_rows` asserts every per-family transform the
+  manifest declares references a known opcode (fail-closed on an unknown one).
+
+### Added — the signed `fresh_as_of` freshness floor (`federation::freshness`, #519 item 2a-iii)
+
+A **signed temporal LOWER bound** — "this object was demonstrably alive no
+earlier than T" — the dual of the existing upper bounds (`valid_until` /
+`expires_at` / `deletion_window`), and the SIGNED successor to the advisory,
+never-verified `last_seen_at`. The decomposition is why it doesn't violate the
+transform algebra's totality: **merge = monotonic max** (a pure, deterministic,
+anti-rollback fold) and **value production = a signed touch-claim** (`now()` is
+impure, so producing the value is an ATTESTATION, never an opcode — "reading
+emits a claim" is CEG-native).
+
+- `SignedTouchClaim` (`target_key_id` + `target_kind`, `fresh_as_of`, a closed
+  `SignerForm { SelfTouch, WitnessTouch, NOfMCosigned }`, hybrid signature) +
+  `put_touch_claim` / `lookup_freshness_floor` on all three backends (V112
+  `freshness_floor` table). The merge only ever ADVANCES the stored floor (an
+  incoming `fresh_as_of <= stored` is a `NotFresher` no-op — the anti-rollback
+  property, a monotonic ON-CONFLICT guard mirroring `put_transport_destination`).
+- **Admission**: `verify_signed_touch_claim` hybrid-verifies the touch against
+  the attester's registered pubkeys AND rejects `fresh_as_of > now + skew`
+  (`DEFAULT_MAX_TOUCH_SKEW = 5m`) — monotonic-max prevents rewinding, the skew
+  guard prevents jumping the floor into the future.
+- **Privacy row (mandatory)**: touch-claims are cohort-scoped and consent-gated
+  — an unrestricted read-receipt trail is an access-pattern surveillance surface
+  (for `trace:*` it would leak who reads whose reasoning); `cohort_scope` is a
+  required, validated field, and a `lookup_freshness_floor` consumer must apply
+  the same cohort/consent gating as any cohort-scoped read.
+- `coalesce_touch_ts(ts, precision)` — the producer-side `round` coalescing so
+  same-bucket touches dedupe on the wire.
+
+`fresh_as_of` is the "provably-dead" substrate the `ownership:*` ownerless-lock
+reclaim (CC 3.2 MUST, no wire path today) builds on — CIRISConstitution#43.
+
+### Deferred (within #520)
+
+`NOfMCosigned` verifies as a 1-of-1 witness-touch today (the single-signer wire
+shape carries no multi-sig envelope to tally m-of-n) — the quorum tally is a
+follow-up. The transform ops are not yet applied at the general promotion/serve
+path beyond `strip_field` (#510); generalizing that, and wiring touch-claims into
+replication gossip, are tracked. Producers (edge/agent emit touches) land per
+CIRISEdge#411 / CIRISAgent.
 ## [21.5.0] — 2026-07-26 — the namespace manifest is Registry-of-Record + the incomplete-promotion primitive is complete (#519 foundation)
 
 CIRISPersist#519 ("the namespace manifest IS the logic") is a multi-cut

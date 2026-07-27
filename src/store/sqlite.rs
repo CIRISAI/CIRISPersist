@@ -6379,6 +6379,99 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    // ── freshness_floor (CIRISPersist#519 item 2a-iii) ─────────────
+
+    async fn put_touch_claim(
+        &self,
+        claim: &crate::federation::types::SignedTouchClaim,
+    ) -> Result<crate::federation::TouchApplyOutcome, crate::federation::Error> {
+        use crate::federation::TouchApplyOutcome as Outcome;
+        // v21.6.0 (#519 item 2a-iii) — verify-before-mutation: the full
+        // hybrid admission gate, THEN the future-skew guard, THEN the
+        // monotonic-max merge. Mirrors put_signed_transport_destination.
+        crate::federation::admission::verify_signed_touch_claim(self, claim).await?;
+        crate::federation::admission::verify_touch_claim_admission(
+            claim,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
+        let target_key_id = claim.target_key_id.clone();
+        let target_kind = claim.target_kind.clone();
+        let fresh_as_of = claim.fresh_as_of.to_rfc3339();
+        let signer_form = claim.signer_form.as_str().to_owned();
+        let attesting_key_id = claim.attesting_key_id.clone();
+        let envelope_json = serde_json::to_string(&claim.signed_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
+        let signature_json = serde_json::to_string(&claim.signature)
+            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
+        let cohort_scope = claim.cohort_scope.clone();
+        let conn = self.conn.clone();
+        (move || -> Result<Outcome, rusqlite::Error> {
+            let conn = conn.lock();
+            // Monotonic-max merge: `fresh_as_of` only ever advances. A
+            // fresh insert always applies (no conflict target); against an
+            // existing row the SQL guard is the single source of truth —
+            // mirrors the put_transport_destination ON-CONFLICT guard
+            // EXACTLY, collapsed to the freshness floor's single-field
+            // monotonic comparator (no epoch tuple, no signed-wins-shared-
+            // key special case — every touch-claim row is signed by
+            // construction).
+            let changed = conn.execute(
+                "INSERT INTO freshness_floor \
+                    (target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
+                     signed_envelope, signature, cohort_scope) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(target_key_id, target_kind) \
+                 DO UPDATE SET fresh_as_of = excluded.fresh_as_of, \
+                    signer_form = excluded.signer_form, \
+                    attesting_key_id = excluded.attesting_key_id, \
+                    signed_envelope = excluded.signed_envelope, \
+                    signature = excluded.signature, \
+                    cohort_scope = excluded.cohort_scope \
+                 WHERE excluded.fresh_as_of > freshness_floor.fresh_as_of",
+                rusqlite::params![
+                    target_key_id,
+                    target_kind,
+                    fresh_as_of,
+                    signer_form,
+                    attesting_key_id,
+                    envelope_json,
+                    signature_json,
+                    cohort_scope,
+                ],
+            )?;
+            Ok(if changed > 0 {
+                Outcome::Advanced
+            } else {
+                Outcome::NotFresher
+            })
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("put_touch_claim: {e}")))
+    }
+
+    async fn lookup_freshness_floor(
+        &self,
+        target_key_id: &str,
+        target_kind: &str,
+    ) -> Result<Option<crate::federation::types::SignedTouchClaim>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let target_key_id = target_key_id.to_owned();
+        let target_kind = target_kind.to_owned();
+        (move || -> Result<Option<crate::federation::types::SignedTouchClaim>, rusqlite::Error> {
+            let conn = conn.lock();
+            use rusqlite::OptionalExtension;
+            conn.query_row(
+                "SELECT target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
+                    signed_envelope, signature, cohort_scope \
+                 FROM freshness_floor WHERE target_key_id = ?1 AND target_kind = ?2",
+                rusqlite::params![target_key_id, target_kind],
+                sqlite_row_to_signed_touch_claim,
+            )
+            .optional()
+        })()
+        .map_err(|e| crate::federation::Error::Backend(format!("lookup_freshness_floor: {e}")))
+    }
+
     // ── hard_case:* emission surface (CIRISPersist#146 Ask 3) ──────
 
     async fn record_hard_case(
@@ -13567,6 +13660,64 @@ fn sqlite_row_to_signed_transport_destination(
         attesting_key_id,
         signed_envelope,
         signature,
+    })
+}
+
+/// v21.6.0 (CIRISPersist#519 item 2a-iii) — SQLite row →
+/// [`crate::federation::types::SignedTouchClaim`]. Column order matches the
+/// `lookup_freshness_floor` SELECT (0..=7).
+fn sqlite_row_to_signed_touch_claim(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::federation::types::SignedTouchClaim> {
+    let strict_ts = |idx: usize, s: &str| -> rusqlite::Result<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    idx,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+    };
+    let fresh_as_of_str: String = row.get(2)?;
+    let fresh_as_of = strict_ts(2, &fresh_as_of_str)?;
+    let signer_form_str: String = row.get(3)?;
+    let signer_form = crate::federation::types::SignerForm::from_token(&signer_form_str)
+        .ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown freshness_floor.signer_form {signer_form_str:?}"),
+                )),
+            )
+        })?;
+    let signed_envelope_json: String = row.get(5)?;
+    let signature_json: String = row.get(6)?;
+    let json_err = |idx: usize| {
+        move |e: serde_json::Error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        }
+    };
+    let signed_envelope: serde_json::Value =
+        serde_json::from_str(&signed_envelope_json).map_err(json_err(5))?;
+    let signature: ciris_verify_core::transport_binding::TransportBindingSignature =
+        serde_json::from_str(&signature_json).map_err(json_err(6))?;
+    Ok(crate::federation::types::SignedTouchClaim {
+        target_key_id: row.get(0)?,
+        target_kind: row.get(1)?,
+        fresh_as_of,
+        signer_form,
+        attesting_key_id: row.get(4)?,
+        signed_envelope,
+        signature,
+        cohort_scope: row.get(7)?,
     })
 }
 
@@ -37652,6 +37803,88 @@ mod tests {
         backend.run_migrations().await.unwrap();
         crate::federation::self_at_login::test_support::run_signed_transport_route_matrix(
             &backend, "sqlite",
+        )
+        .await;
+    }
+
+    // ── freshness_floor (CIRISPersist#519 item 2a-iii) witnesses ────
+
+    /// The anti-rollback matrix: T1 inserts, T2>T1 advances, T0<T1 is a
+    /// no-op that does not clobber T2, and a byte-identical re-put of T2 is
+    /// also a no-op (strict `>` guard — equal never wins).
+    #[tokio::test]
+    async fn touch_claim_monotonic_max_only_advances() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::freshness::test_support::run_monotonic_max_matrix(
+            &backend,
+            "sqlite-touch-max",
+        )
+        .await;
+    }
+
+    /// A `fresh_as_of` more than [`crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW`]
+    /// ahead of `now()` is rejected — a lying clock cannot jump the floor
+    /// into the future.
+    #[tokio::test]
+    async fn touch_claim_rejects_future_beyond_skew() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::freshness::test_support::run_future_skew_rejection(
+            &backend,
+            "sqlite-touch-skew",
+        )
+        .await;
+    }
+
+    /// A forged signature is rejected; the row stays untouched. Real hybrid
+    /// crypto via `HybridSigningIdentity` — never a hand-faked signature.
+    #[tokio::test]
+    async fn touch_claim_requires_valid_hybrid_signature() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::freshness::test_support::run_forged_signature_rejection(
+            &backend,
+            "sqlite-touch-forged",
+        )
+        .await;
+    }
+
+    /// An invalid `cohort_scope` is rejected — the MANDATORY privacy row.
+    #[tokio::test]
+    async fn touch_claim_cohort_scope_validated() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::freshness::test_support::run_cohort_scope_validation(
+            &backend,
+            "sqlite-touch-cohort",
+        )
+        .await;
+    }
+
+    /// A real signed touch, once admitted, reads back via
+    /// `lookup_freshness_floor` byte-identical to what was put.
+    #[tokio::test]
+    async fn touch_claim_round_trip_byte_exact() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::freshness::test_support::run_round_trip(
+            &backend,
+            "sqlite-touch-roundtrip",
+        )
+        .await;
+    }
+
+    /// `witness_touch` signer-relationship: an independent attester is
+    /// admitted; an attester claiming to witness ITSELF is rejected (the
+    /// opposite bar from `self_touch`).
+    #[tokio::test]
+    async fn touch_claim_witness_touch_relationship_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::freshness::test_support::run_witness_touch_relationship(
+            &backend,
+            "sqlite-touch-witness",
         )
         .await;
     }

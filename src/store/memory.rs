@@ -206,6 +206,12 @@ struct State {
             ciris_verify_core::transport_binding::TransportBindingSignature,
         ),
     >,
+    /// v21.6.0 (CIRISPersist#519 item 2a-iii) — the `freshness_floor` table
+    /// (V112): the signed `fresh_as_of` touch-claim currently on file for
+    /// each `(target_key_id, target_kind)`, monotonic-max merged in
+    /// `put_touch_claim`. Parity with the postgres/sqlite `freshness_floor`
+    /// table.
+    freshness_floor: HashMap<(String, String), crate::federation::types::SignedTouchClaim>,
     /// v6.7.0 (CIRISPersist#146 Ask 3 / #161 Ask 5, CEG §7.7/§8.1.11.3) —
     /// the `hard_case:*` emission surface, keyed by the deterministic
     /// `event_id` (idempotent insert = no-op on conflict). Parity with the
@@ -364,6 +370,7 @@ impl Default for MemoryBackend {
                 blackhole_rules: HashMap::new(),
                 transport_destinations: HashMap::new(),
                 transport_destination_sigs: HashMap::new(),
+                freshness_floor: HashMap::new(),
                 federation_hard_case_events: HashMap::new(),
                 fountain_manifests: HashMap::new(),
                 fountain_symbols: HashMap::new(),
@@ -2963,6 +2970,47 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             state.transport_destination_sigs.remove(&key);
         }
         Ok(matches)
+    }
+
+    // ── freshness_floor (CIRISPersist#519 item 2a-iii) ─────────────
+
+    async fn put_touch_claim(
+        &self,
+        claim: &crate::federation::types::SignedTouchClaim,
+    ) -> Result<crate::federation::TouchApplyOutcome, crate::federation::Error> {
+        use crate::federation::TouchApplyOutcome as Outcome;
+        // v21.6.0 (#519 item 2a-iii) — verify-before-mutation (before
+        // locking; the gate locks state internally via lookup_public_key).
+        // Mirrors put_signed_transport_destination's ordering.
+        crate::federation::admission::verify_signed_touch_claim(self, claim).await?;
+        crate::federation::admission::verify_touch_claim_admission(
+            claim,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
+        let mut state = self.state.lock().expect("memory backend lock");
+        let key = (claim.target_key_id.clone(), claim.target_kind.clone());
+        // Monotonic-max merge: `fresh_as_of` only ever advances.
+        let advances = state
+            .freshness_floor
+            .get(&key)
+            .is_none_or(|ex| claim.fresh_as_of > ex.fresh_as_of);
+        if advances {
+            state.freshness_floor.insert(key, claim.clone());
+            Ok(Outcome::Advanced)
+        } else {
+            Ok(Outcome::NotFresher)
+        }
+    }
+
+    async fn lookup_freshness_floor(
+        &self,
+        target_key_id: &str,
+        target_kind: &str,
+    ) -> Result<Option<crate::federation::types::SignedTouchClaim>, crate::federation::Error> {
+        let state = self.state.lock().expect("memory backend lock");
+        let key = (target_key_id.to_owned(), target_kind.to_owned());
+        Ok(state.freshness_floor.get(&key).cloned())
     }
 
     async fn list_identity_occurrences_for(
@@ -6844,6 +6892,55 @@ mod accord_tests {
             &backend, "mem",
         )
         .await;
+    }
+
+    // ── freshness_floor (CIRISPersist#519 item 2a-iii) witnesses ────
+
+    /// The anti-rollback matrix on the memory backend. Shares the assertion
+    /// body with the sqlite + pg parity tests.
+    #[tokio::test]
+    async fn touch_claim_monotonic_max_only_advances_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::freshness::test_support::run_monotonic_max_matrix(&backend, "mem").await;
+    }
+
+    /// The future-skew rejection on the memory backend.
+    #[tokio::test]
+    async fn touch_claim_rejects_future_beyond_skew_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::freshness::test_support::run_future_skew_rejection(&backend, "mem")
+            .await;
+    }
+
+    /// The forged-signature rejection on the memory backend.
+    #[tokio::test]
+    async fn touch_claim_requires_valid_hybrid_signature_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::freshness::test_support::run_forged_signature_rejection(&backend, "mem")
+            .await;
+    }
+
+    /// The `cohort_scope` admission-gate validation on the memory backend.
+    #[tokio::test]
+    async fn touch_claim_cohort_scope_validated_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::freshness::test_support::run_cohort_scope_validation(&backend, "mem")
+            .await;
+    }
+
+    /// The byte-exact round-trip on the memory backend.
+    #[tokio::test]
+    async fn touch_claim_round_trip_byte_exact_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::freshness::test_support::run_round_trip(&backend, "mem").await;
+    }
+
+    /// `witness_touch` signer-relationship on the memory backend.
+    #[tokio::test]
+    async fn touch_claim_witness_touch_relationship_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::freshness::test_support::run_witness_touch_relationship(&backend, "mem")
+            .await;
     }
 
     /// #446 — the occurrence→route composite-projection matrix on the memory
