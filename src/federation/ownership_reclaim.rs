@@ -399,8 +399,11 @@ mod tests {
     /// `reclaimer`'s deterministic key via `ts::sign_envelope` (the row's
     /// OWN primary signature — orthogonal to the embedded quorum, which is
     /// what [`check_ownership_reclaim_admission`] actually verifies).
+    /// `attestation_id` is a fresh UUID (the postgres backend's column is
+    /// `::uuid`-typed — see `reference_test_fixtures_uuid_vs_uuid_like` —
+    /// so a human-readable tag string is REJECTED by that backend, sqlite's
+    /// laxer TEXT column just happened not to notice).
     fn reclaim_row(
-        id: &str,
         reclaimer: &str,
         target: &Attestation,
         quorum_sigs: &[ThresholdSignature],
@@ -409,7 +412,7 @@ mod tests {
         let (och, classical, pqc) = ts::sign_envelope(reclaimer, &envelope);
         let ts_now: DateTime<Utc> = Utc::now();
         Attestation {
-            attestation_id: id.to_owned(),
+            attestation_id: uuid::Uuid::new_v4().to_string(),
             attesting_key_id: reclaimer.to_owned(),
             attested_key_id: target.attested_key_id.clone(),
             attestation_type: attestation_type::WITHDRAWS.to_owned(),
@@ -448,7 +451,11 @@ mod tests {
         ts::register_identity_key(dir, &node, identity_type::NODE).await;
         ts::register_identity_key(dir, &reclaimer, identity_type::USER).await;
 
-        let binding_id = format!("recl-binding-{tag}");
+        // A fresh UUID, not a human-readable tag: the postgres backend's
+        // `attestation_id` column is `::uuid`-typed (sqlite's laxer TEXT
+        // column doesn't enforce this — see
+        // `reference_test_fixtures_uuid_vs_uuid_like`).
+        let binding_id = uuid::Uuid::new_v4().to_string();
         dir.put_attestation(SignedAttestation {
             attestation: ts::owner_binding_attestation(&binding_id, &owner, &node),
         })
@@ -494,7 +501,7 @@ mod tests {
         let now = Utc::now();
 
         // (a) not even a `withdraws` — an ordinary `scores`-shaped row.
-        let mut not_withdraws = reclaim_row(&format!("nr-a-{tag}"), &reclaimer, &target, &[]);
+        let mut not_withdraws = reclaim_row(&reclaimer, &target, &[]);
         not_withdraws.attestation_type = "scores".to_owned();
         assert_eq!(
             check_ownership_reclaim_admission(dir, &not_withdraws, None, now)
@@ -517,8 +524,10 @@ mod tests {
         });
         let (och, classical, pqc) = ts::sign_envelope(&owner, &plain_envelope);
         let plain_ts = Utc::now();
+        // Row id is a fresh UUID (postgres's `::uuid` column) — `plain_id`
+        // above is just descriptive envelope content, not the row key.
         let non_owner_target = Attestation {
-            attestation_id: plain_id,
+            attestation_id: uuid::Uuid::new_v4().to_string(),
             attesting_key_id: owner.clone(),
             attested_key_id: target.attested_key_id.clone(),
             attestation_type: attestation_type::DELEGATES_TO.to_owned(),
@@ -544,8 +553,7 @@ mod tests {
         })
         .await
         .expect("plain (non-owner) delegates_to admitted");
-        let withdraws_non_owner =
-            reclaim_row(&format!("nr-b-{tag}"), &reclaimer, &non_owner_target, &[]);
+        let withdraws_non_owner = reclaim_row(&reclaimer, &non_owner_target, &[]);
         assert_eq!(
             check_ownership_reclaim_admission(dir, &withdraws_non_owner, None, now)
                 .await
@@ -555,7 +563,7 @@ mod tests {
         );
 
         // (c) self-withdrawal — the incumbent revoking their OWN binding.
-        let self_withdraw = reclaim_row(&format!("nr-c-{tag}"), &owner, &target, &[]);
+        let self_withdraw = reclaim_row(&owner, &target, &[]);
         assert_eq!(
             check_ownership_reclaim_admission(dir, &self_withdraw, None, now)
                 .await
@@ -585,7 +593,7 @@ mod tests {
             ts::threshold_sign(&roster[0], &bytes),
             ts::threshold_sign(&roster[1], &bytes),
         ];
-        let row = reclaim_row(&format!("inert-{tag}"), &reclaimer, &target, &sigs);
+        let row = reclaim_row(&reclaimer, &target, &sigs);
 
         // A well-formed reclaim (would satisfy quorum + is abandoned, no
         // touch claim stored at all) — but policy is None.
@@ -633,7 +641,7 @@ mod tests {
             ts::threshold_sign(&roster[0], &bytes),
             ts::threshold_sign(&roster[2], &bytes),
         ];
-        let row = reclaim_row(&format!("admit-{tag}"), &reclaimer, &target, &sigs);
+        let row = reclaim_row(&reclaimer, &target, &sigs);
         assert_eq!(
             check_ownership_reclaim_admission(dir, &row, Some(&policy), Utc::now())
                 .await
@@ -670,7 +678,7 @@ mod tests {
             ts::threshold_sign(&roster[0], &bytes),
             ts::threshold_sign(&roster[1], &bytes),
         ];
-        let row = reclaim_row(&format!("live-{tag}"), &reclaimer, &target, &sigs);
+        let row = reclaim_row(&reclaimer, &target, &sigs);
         match check_ownership_reclaim_admission(dir, &row, Some(&policy), now)
             .await
             .unwrap()
@@ -699,7 +707,7 @@ mod tests {
 
         // (a) sub-threshold: only 1 of the required 2 signs.
         let sigs_short = vec![ts::threshold_sign(&roster[0], &bytes)];
-        let row_short = reclaim_row(&format!("short-{tag}"), &reclaimer, &target, &sigs_short);
+        let row_short = reclaim_row(&reclaimer, &target, &sigs_short);
         match check_ownership_reclaim_admission(dir, &row_short, Some(&policy), Utc::now())
             .await
             .unwrap()
@@ -714,7 +722,7 @@ mod tests {
         let mut forged = ts::threshold_sign(&roster[1], &bytes);
         forged.ed25519_signature_base64 = B64.encode([0u8; 64]);
         let sigs_forged = vec![ts::threshold_sign(&roster[0], &bytes), forged];
-        let row_forged = reclaim_row(&format!("forged-{tag}"), &reclaimer, &target, &sigs_forged);
+        let row_forged = reclaim_row(&reclaimer, &target, &sigs_forged);
         match check_ownership_reclaim_admission(dir, &row_forged, Some(&policy), Utc::now())
             .await
             .unwrap()
