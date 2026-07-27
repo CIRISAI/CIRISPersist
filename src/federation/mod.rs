@@ -76,6 +76,12 @@ pub mod operational;
 /// test the ALLOW path — not just the deny path.
 #[cfg(any(test, feature = "test-anchor"))]
 pub use operational::test_support as accord_test_support;
+// (CIRISPersist#519) — the `ownership:*` ownerless-lock reclaim MECHANISM
+// (CC 3.2 "No permanent ownerless lock (MUST)"). Ships INERT: refuses
+// every reclaim until a `ReclaimPolicy` is injected; CIRISConstitution#43
+// ratifies the abandonment window + reclaim roster/threshold, not this
+// crate. See the module doc for the full mechanism.
+pub mod ownership_reclaim;
 pub mod perceptual_hash;
 pub mod precedence;
 #[cfg(feature = "cirisaudit")]
@@ -239,6 +245,10 @@ pub use identity_aggregate::{
 pub use operational::{
     MergeIntent, OrgMembership, Organization, PartnerRecord, SignedOrgMembership,
     SignedOrganization, SignedPartnerRecord, SubjectKind,
+};
+pub use ownership_reclaim::{
+    check_ownership_reclaim_admission, ReclaimPolicy, ReclaimQuorum, ReclaimVerdict,
+    OWNERSHIP_FRESHNESS_TARGET_KIND, RECLAIM_WITHDRAWS_ADMISSION_RULE,
 };
 pub use perceptual_hash::{
     HashDatabaseId, HashMatchError, HashMatchResult, MatcherUnreachablePolicy,

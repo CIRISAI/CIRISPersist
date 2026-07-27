@@ -3234,9 +3234,54 @@ pub async fn check_withdraws_admission(
     {
         return Ok(None);
     }
-    let rule = resolve_withdraws_admission_rule(directory, &row.attesting_key_id, &target).await?;
-    Ok(Some(rule))
+    match resolve_withdraws_admission_rule(directory, &row.attesting_key_id, &target).await {
+        Ok(rule) => Ok(Some(rule)),
+        Err(err) => {
+            // CIRISPersist#519 — the CC 3.2 "no permanent ownerless lock"
+            // reclaim MECHANISM ([`crate::federation::ownership_reclaim`]).
+            // None of rules 1-4 gave a THIRD PARTY authority to withdraw a
+            // LIVE `ownership:*` owner-binding — correct, and it MUST stay
+            // the default (a node whose owner is merely quiet is not up
+            // for grabs). But CC 3.2 also forbids a PERMANENT ownerless
+            // lock: an owner who is PROVABLY dead (their signed freshness
+            // floor has lapsed) must be reclaimable by a verified quorum.
+            // `check_ownership_reclaim_admission` is that sanctioned
+            // exception. It is consulted here with the process's
+            // configured policy — **`NO_RECLAIM_POLICY` (`None`) today**:
+            // persist ships no policy; the abandonment window and reclaim
+            // roster/threshold are CIRISConstitution#43's to ratify. With
+            // `policy = None` the reclaim check ALWAYS returns `Refused`
+            // (see its own doc), so this arm falls through to `Err(err)`
+            // exactly as before this cut — the mesh's behavior is
+            // BYTE-IDENTICAL while inert; only the mechanism's existence
+            // and witnessing are new.
+            if super::ownership_reclaim::check_ownership_reclaim_admission(
+                directory,
+                row,
+                NO_RECLAIM_POLICY,
+                chrono::Utc::now(),
+            )
+            .await?
+                == super::ownership_reclaim::ReclaimVerdict::Admit
+            {
+                return Ok(Some(
+                    super::ownership_reclaim::RECLAIM_WITHDRAWS_ADMISSION_RULE,
+                ));
+            }
+            Err(err)
+        }
+    }
 }
+
+/// CIRISPersist#519 — the reclaim policy [`check_withdraws_admission`]
+/// consults at its inert chokepoint. **`None` — this crate ships no
+/// policy.** `abandonment_window` and the reclaim roster/threshold are
+/// CIRISConstitution#43's to ratify; naming this constant (rather than
+/// writing `None` inline) documents WHY it is `None`, without inventing a
+/// value. A future CC-ratified deployment threads a real
+/// `Option<&ReclaimPolicy>` in from its own configuration instead of this
+/// constant.
+const NO_RECLAIM_POLICY: Option<&'static super::ownership_reclaim::ReclaimPolicy> = None;
 
 // ─── v8.7.1 — §11.10 FULL moderation enforcement (CEG RC24/RC25/RC26) ───
 //
