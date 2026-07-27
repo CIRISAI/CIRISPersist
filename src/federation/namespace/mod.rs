@@ -23,6 +23,7 @@
 //! vendored (`namespace_registry.json`); CC is the single source of truth. See
 //! [`registry`] for the drift-control (the vendored-copy content hash gate).
 
+pub mod conformance;
 pub mod registry;
 pub mod supersets;
 
