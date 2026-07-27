@@ -79,6 +79,12 @@ pub mod read;
 // previously re-derived; `consent:replication` stays CEG-side
 // governance.
 pub mod envelope;
+// v21.6.0 (CIRISPersist#519 item 2a-iii) — the signed `fresh_as_of`
+// freshness floor: SignedTouchClaim's storage + monotonic-max merge
+// (persist's half; the producer surface is edge/agent's, documented for
+// adoption, not built here). See `namespace/namespace_supersets.json` §
+// `freshness_floor`.
+pub mod freshness;
 
 /// v20.1.0 (CIRISPersist#478) — the trace-attestation backfill report:
 /// what minted (incl. idempotent already-present no-ops — the funnels'
@@ -194,11 +200,12 @@ pub use admission::{
     has_effective_role_over_roster, is_canonical, is_canonical_effective, is_infra_attest,
     is_infra_attest_effective, op_withdraw_role, supersede_canonical,
     verify_canonical_supersede_authority, verify_canonical_withdraw_authority,
-    verify_signed_identity_occurrence_revocation, verify_signed_transport_destination,
-    withdraw_accord_role, withdraw_accord_role_over_roster, withdraw_canonical_role,
-    withdraw_infra_attest_role, AttestationLadderTransitionPolicy, CanonicalWithdrawal,
-    DimensionAdmissionPolicy, DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule,
-    RoleWithdrawal, ATTESTATION_LADDER_MECHANISMS,
+    verify_signed_identity_occurrence_revocation, verify_signed_touch_claim,
+    verify_signed_transport_destination, verify_touch_claim_admission, withdraw_accord_role,
+    withdraw_accord_role_over_roster, withdraw_canonical_role, withdraw_infra_attest_role,
+    AttestationLadderTransitionPolicy, CanonicalWithdrawal, DimensionAdmissionPolicy,
+    DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule, RoleWithdrawal,
+    ATTESTATION_LADDER_MECHANISMS, DEFAULT_MAX_TOUCH_SKEW,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
@@ -209,6 +216,7 @@ pub use blobs::{
 };
 pub use cohort::{Cohort, GroupRef, GroupVersion, RevokeSpec, RosterMember};
 pub use consent::consent_role_of;
+pub use freshness::{coalesce_touch_ts, TouchApplyOutcome};
 pub use goal::{
     canonicalize_goal_text, DeliberationRef, Goal, GoalScope, GoalsFilter, M1Dimension,
     MetaGoalAlignment,
@@ -277,8 +285,8 @@ pub use types::{
     PeerPolicyBlob, Revocation, SignedAttestation, SignedCommunity,
     SignedCommunityMembershipRevocation, SignedFamily, SignedFamilyMembershipRevocation,
     SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
-    SignedLocationProof, SignedRevocation, TrustClass, TrustFilter, TrustGrant, TrustRelationship,
-    TrustRow, TrustType,
+    SignedLocationProof, SignedRevocation, SignedTouchClaim, SignerForm, TrustClass, TrustFilter,
+    TrustGrant, TrustRelationship, TrustRow, TrustType,
 };
 
 /// v9.3.0 (CIRISPersist#249 Cut B) — the **roster-minus-effective-
@@ -3669,6 +3677,56 @@ pub trait FederationDirectory: Send + Sync {
         let _ = (occurrence_key_id, transport_kind, destination);
         Err(Error::Backend(
             "remove_transport_destination not implemented for this backend".into(),
+        ))
+    }
+
+    // ── freshness_floor (CIRISPersist#519 item 2a-iii) ─────────────
+
+    /// v21.6.0 (CIRISPersist#519 item 2a-iii) — admit a SIGNED touch-claim
+    /// against `(target_key_id, target_kind)`'s freshness floor
+    /// ([`freshness`]). **Monotonic max**: the stored `fresh_as_of` only
+    /// ever advances — an incoming claim with `fresh_as_of` less than or
+    /// equal to the stored one is a no-op
+    /// ([`freshness::TouchApplyOutcome::NotFresher`]), a strictly-greater
+    /// one replaces ([`freshness::TouchApplyOutcome::Advanced`]).
+    ///
+    /// Runs, BEFORE any write: [`admission::verify_signed_touch_claim`]
+    /// (hybrid signature + `cohort_scope` + signer-form relationship) AND
+    /// [`admission::verify_touch_claim_admission`] (the future-skew guard,
+    /// [`admission::DEFAULT_MAX_TOUCH_SKEW`]) — a lying clock cannot jump
+    /// the floor forward, and the monotonic-max merge itself cannot roll it
+    /// back. Default impl errors; the three backends override.
+    async fn put_touch_claim(
+        &self,
+        claim: &types::SignedTouchClaim,
+    ) -> Result<freshness::TouchApplyOutcome, Error> {
+        let _ = claim;
+        Err(Error::Backend(
+            "put_touch_claim not implemented for this backend".into(),
+        ))
+    }
+
+    /// v21.6.0 (CIRISPersist#519 item 2a-iii) — read the current freshness
+    /// floor for `(target_key_id, target_kind)`; `None` if it was never
+    /// touched. Default impl errors; the three backends override.
+    ///
+    /// **Privacy note (mandatory — see [`freshness`]'s module docs):** the
+    /// returned claim carries a `cohort_scope`. A consumer MUST apply the
+    /// same cohort/consent gating persist applies to any other
+    /// cohort-scoped read before exposing this to a peer. This method is
+    /// NOT a global read-receipt trail; composing an unrestricted "who
+    /// last touched what, when" surface out of it is exactly the
+    /// access-pattern surveillance the manifest's `privacy_row` flags
+    /// (worst case: `trace:*`, where it would leak who is reading whose
+    /// reasoning).
+    async fn lookup_freshness_floor(
+        &self,
+        target_key_id: &str,
+        target_kind: &str,
+    ) -> Result<Option<types::SignedTouchClaim>, Error> {
+        let _ = (target_key_id, target_kind);
+        Err(Error::Backend(
+            "lookup_freshness_floor not implemented for this backend".into(),
         ))
     }
 

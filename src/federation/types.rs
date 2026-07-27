@@ -2401,6 +2401,164 @@ pub struct SignedRevocation {
     pub revocation: Revocation,
 }
 
+// ─── Freshness floor (v21.6.0, CIRISPersist#519 item 2a-iii) ───────
+//
+// `namespace_supersets.json` § `freshness_floor`: a SIGNED temporal LOWER
+// bound — "this object was demonstrably alive no earlier than T" — the
+// dual of the existing upper bounds (`valid_until` / `expires_at` /
+// `deletion_window`). See [`crate::federation::freshness`] for the merge
+// semantics (monotonic max) and [`crate::federation::admission::verify_signed_touch_claim`]
+// / [`crate::federation::admission::verify_touch_claim_admission`] for the
+// admission gate. The existing gap this closes: persist already has
+// `last_seen_at` (e.g. [`crate::federation::self_at_login::TransportDestination::last_seen_at`]),
+// but that field is advisory liveness, not signed material — `fresh_as_of`
+// is its SIGNED successor, not a duplicate.
+
+/// Which signer attested a [`SignedTouchClaim`]'s `fresh_as_of` — the
+/// closed set `namespace_supersets.json` § `freshness_floor.signer_forms`
+/// names. Not merely descriptive: [`crate::federation::admission::verify_signed_touch_claim`]
+/// enforces a DIFFERENT signer-target relationship per variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignerForm {
+    /// The touched target's own clock / dead-man's-switch: the attester IS
+    /// the `target_key_id` (or a registered occurrence of it —
+    /// `signer_acts_for`). "I am still here."
+    SelfTouch,
+    /// An independent witness's clock: the attester is REQUIRED to differ
+    /// from the touched target (a witness cannot be the thing it
+    /// witnesses). "I observed this target alive."
+    WitnessTouch,
+    /// Collusion-resistant: intended to require m-of-n independent
+    /// co-signers (e.g. escalating a `self_touch` to a death finding on an
+    /// `ownership:*` binding). **This cut's wire shape carries a single
+    /// `attesting_key_id` + one [`ciris_verify_core::transport_binding::TransportBindingSignature`]**
+    /// (mirroring [`super::self_at_login::SignedTransportDestination`]
+    /// exactly), so admission currently verifies this identically to
+    /// `WitnessTouch` (1-of-1, independent of the target) — real m-of-n
+    /// tallying needs a multi-signer envelope shape and is a documented
+    /// follow-up, not built here.
+    NOfMCosigned,
+}
+
+impl SignerForm {
+    /// Stable wire token (`"self_touch"` / `"witness_touch"` /
+    /// `"n_of_m_cosigned"`) for the TEXT column and the signed envelope —
+    /// same shape as [`crate::federation::self_at_login::BindingProvenance::as_str`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SignerForm::SelfTouch => "self_touch",
+            SignerForm::WitnessTouch => "witness_touch",
+            SignerForm::NOfMCosigned => "n_of_m_cosigned",
+        }
+    }
+
+    /// Parse from the stored/wire token. Unlike
+    /// [`crate::federation::self_at_login::BindingProvenance::from_token`], there is no
+    /// back-compat default here — `signer_form` is a brand-new REQUIRED
+    /// field, so an unrecognized token is a hard read-time error (data
+    /// corruption), not a silent fallback.
+    pub fn from_token(s: &str) -> Option<Self> {
+        match s {
+            "self_touch" => Some(SignerForm::SelfTouch),
+            "witness_touch" => Some(SignerForm::WitnessTouch),
+            "n_of_m_cosigned" => Some(SignerForm::NOfMCosigned),
+            _ => None,
+        }
+    }
+}
+
+/// A SIGNED touch-claim: the producer-side attestation that
+/// `(target_key_id, target_kind)` was demonstrably alive no earlier than
+/// `fresh_as_of` (`namespace_supersets.json` § `freshness_floor`).
+/// **`now()` is not pure, so producing this value is an ATTESTATION, never
+/// a transform opcode** — "reading emits a claim" is CEG-native here.
+/// Persist stores + monotonic-max-merges these
+/// ([`crate::federation::freshness`]); PRODUCING one (deciding which
+/// `signer_form` to use, gathering witnesses/co-signers) is edge/agent's
+/// job, documented for adoption, not built here.
+///
+/// Mirrors [`crate::federation::self_at_login::SignedTransportDestination`]'s hybrid-sig
+/// shape exactly: `signed_envelope` is the EXACT bytes the producer
+/// signed (as received — authority is the envelope, never the typed
+/// projection, the #418 discipline), and `signature` is the same detached
+/// hybrid container.
+///
+/// **`cohort_scope` is MANDATORY, not optional (§4 of the #519 item
+/// 2a-iii brief):** touch-claims are cohort-scoped and consent-gated — an
+/// unrestricted read-receipt trail is an access-pattern surveillance
+/// surface, and for the `trace:*` family (already the one recipient-gated
+/// family) it would leak exactly who is reading whose reasoning. Validated
+/// at admission via [`crate::federation::admission::check_cohort_scope`].
+/// A consumer of [`crate::federation::FederationDirectory::lookup_freshness_floor`]
+/// MUST apply the same cohort/consent gating persist applies to any other
+/// cohort-scoped read — this type does NOT expose a global read-receipt
+/// trail on its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedTouchClaim {
+    /// What's being kept alive — an `occurrence_key_id`, a canonical
+    /// `key_id`, or any other object identifier the touch's consumer
+    /// resolves via `target_kind`. NOT an FK (the freshness floor is
+    /// deliberately generic across families — `ownership:*` / `trust:*` /
+    /// `consent:*` / ...).
+    pub target_key_id: String,
+    /// The kind of thing `target_key_id` names (e.g. `"occurrence"`,
+    /// `"canonical"`) — open vocab, resolved by the consumer.
+    pub target_kind: String,
+    /// The asserted LOWER bound: "alive no earlier than this instant."
+    /// Merge is monotonic max ([`crate::federation::freshness`]) — this
+    /// value only ever advances once stored.
+    pub fresh_as_of: DateTime<Utc>,
+    /// Which signer attested `fresh_as_of` — see [`SignerForm`].
+    pub signer_form: SignerForm,
+    /// The claimed signer — a `federation_keys.key_id`. The relationship
+    /// this key must have to `target_key_id` depends on `signer_form` (see
+    /// [`SignerForm`]'s variant docs); enforced by
+    /// [`crate::federation::admission::verify_signed_touch_claim`].
+    pub attesting_key_id: String,
+    /// The EXACT envelope the producer signed (signature container
+    /// stripped), as received. Byte-exact by construction (never rebuilt
+    /// from the typed projection) — see [`Self::signing_envelope`] for the
+    /// canonical CONSTRUCTION a producer (or this crate's test fixtures)
+    /// builds before signing.
+    pub signed_envelope: serde_json::Value,
+    /// The detached hybrid signature over `JCS(signed_envelope)` (Ed25519
+    /// over the bytes; ML-DSA-65 over `bytes ‖ ed25519_sig`) — the same
+    /// container type [`crate::federation::self_at_login::SignedTransportDestination`] and the
+    /// occurrence/revocation planes use.
+    pub signature: ciris_verify_core::transport_binding::TransportBindingSignature,
+    /// MANDATORY privacy row — see the struct-level docs. One of
+    /// [`cohort_scope::SELF`] / [`cohort_scope::FAMILY`] /
+    /// [`cohort_scope::COMMUNITY`] / [`cohort_scope::AFFILIATIONS`] /
+    /// [`cohort_scope::SPECIES`] / [`cohort_scope::BIOSPHERE`] /
+    /// [`cohort_scope::FEDERATION`] (validated at admission via
+    /// [`crate::federation::admission::check_cohort_scope`]).
+    pub cohort_scope: String,
+}
+
+impl SignedTouchClaim {
+    /// The canonical envelope this claim's producer signs: `target_key_id`
+    /// / `target_kind` / `fresh_as_of` (RFC-3339) / `signer_form` /
+    /// `attesting_key_id` / `cohort_scope`. A producer (or this crate's
+    /// `#[cfg(test)]` fixtures — see
+    /// [`crate::federation::freshness::test_support`]) builds this,
+    /// JCS-canonicalizes it, signs it, and puts the resulting value into
+    /// [`Self::signed_envelope`] verbatim. Mirrors [`Family::signing_envelope`]:
+    /// the admission gate never rebuilds the envelope from the typed
+    /// fields, it only cross-checks equality (the §0.9 authority-is-the-
+    /// envelope discipline).
+    pub fn signing_envelope(&self) -> serde_json::Value {
+        serde_json::json!({
+            "target_key_id": self.target_key_id,
+            "target_kind": self.target_kind,
+            "fresh_as_of": self.fresh_as_of.to_rfc3339(),
+            "signer_form": self.signer_form.as_str(),
+            "attesting_key_id": self.attesting_key_id,
+            "cohort_scope": self.cohort_scope,
+        })
+    }
+}
+
 // ─── Trust hierarchy (v1.3.0, CIRISPersist#46 + #47) ───────────────
 //
 // Persist absorbs NodeCore's `crate::trust` module surface at the

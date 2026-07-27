@@ -110,11 +110,42 @@ impl FieldProcessorRow {
     }
 }
 
+/// v21.6.0 (CIRISPersist#519 item 2a-iii) — the manifest's
+/// `freshness_floor` section: the governance record for the signed
+/// `fresh_as_of` freshness floor this cut builds the persist half of (the
+/// `SignedTouchClaim` storage + monotonic-max merge live in
+/// [`crate::federation::freshness`] / [`crate::federation::types`] /
+/// [`crate::federation::admission`]). Kept deliberately lean — just the
+/// fields the drift gate below cross-checks against the actual
+/// implementation, not the full `demanded_by` / `decomposition` prose.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FreshnessFloorSpec {
+    /// The wire field name (`"fresh_as_of"`).
+    pub canonical_field: String,
+    /// The merge semantics (`"monotonic_max"`).
+    pub merge_rule: String,
+    /// The closed set of signer relationships (`self_touch` /
+    /// `witness_touch` / `n_of_m_cosigned`) — mirrors
+    /// [`crate::federation::types::SignerForm`]'s variants.
+    #[serde(default)]
+    pub signer_forms: Vec<String>,
+    /// The admission-time future-skew rule, free text (e.g. `"reject >
+    /// now+skew"`) — enforced by
+    /// [`crate::federation::admission::verify_touch_claim_admission`].
+    #[serde(default)]
+    pub admission_guard: String,
+    /// The wire-coalescing intent, free text — see
+    /// [`crate::federation::freshness::coalesce_touch_ts`].
+    #[serde(default)]
+    pub coalescing: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawManifest {
     #[serde(rename = "_meta")]
     meta: Meta,
     field_processor_matrix: Vec<FieldProcessorRow>,
+    freshness_floor: FreshnessFloorSpec,
 }
 
 fn parsed() -> &'static RawManifest {
@@ -147,6 +178,18 @@ pub fn seed_registry_source() -> &'static str {
 /// component × processor.
 pub fn field_processor_matrix() -> &'static [FieldProcessorRow] {
     &parsed().field_processor_matrix
+}
+
+/// v21.6.0 (CIRISPersist#519 item 2a-iii) — the manifest's `freshness_floor`
+/// governance record (`_meta` sibling `freshness_floor`), the ONE additive
+/// accessor this cut adds to the vendored-manifest surface. Lets the
+/// [`crate::federation::freshness`] / [`crate::federation::types::SignerForm`]
+/// / [`crate::federation::admission::verify_touch_claim_admission`]
+/// implementation cross-check itself against the governance source of
+/// truth (see [`tests::freshness_floor_implementation_matches_manifest`])
+/// instead of drifting from it silently.
+pub fn freshness_floor_spec() -> &'static FreshnessFloorSpec {
+    &parsed().freshness_floor
 }
 
 /// The distinct placement fields persist owns a processor for — the universe a
@@ -253,6 +296,26 @@ mod tests {
         assert!(
             fields.contains(&"cohort_scope"),
             "cohort_scope must be a persist-owned placement field (the promotion carries it): {fields:?}"
+        );
+    }
+
+    /// #519 item 2a-iii — the shipped `SignedTouchClaim` +
+    /// `crate::federation::admission::verify_touch_claim_admission` +
+    /// `crate::federation::types::SignerForm` implementation must not drift
+    /// from the manifest's `freshness_floor` governance record: same
+    /// canonical field name, same merge rule, and the same closed set of
+    /// signer forms (`SignerForm`'s three variants, in the manifest's own
+    /// declared order).
+    #[test]
+    fn freshness_floor_implementation_matches_manifest() {
+        let spec = freshness_floor_spec();
+        assert_eq!(spec.canonical_field, "fresh_as_of");
+        assert_eq!(spec.merge_rule, "monotonic_max");
+        assert_eq!(
+            spec.signer_forms,
+            vec!["self_touch", "witness_touch", "n_of_m_cosigned"],
+            "SignerForm's variants must track the manifest's declared signer_forms: {:?}",
+            spec.signer_forms
         );
     }
 }

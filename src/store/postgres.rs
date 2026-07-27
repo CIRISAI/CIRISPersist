@@ -2106,6 +2106,39 @@ fn pg_row_to_signed_transport_destination(
     })
 }
 
+/// v21.6.0 (CIRISPersist#519 item 2a-iii) — Postgres row →
+/// [`crate::federation::types::SignedTouchClaim`]. Column names match
+/// `lookup_freshness_floor`'s SELECT.
+fn pg_row_to_signed_touch_claim(
+    row: &tokio_postgres::Row,
+) -> Result<crate::federation::types::SignedTouchClaim, crate::federation::Error> {
+    use crate::federation::Error as FErr;
+    let signer_form_str: String = row.safe_get_with("signer_form", FErr::Backend)?;
+    let signer_form = crate::federation::types::SignerForm::from_token(&signer_form_str)
+        .ok_or_else(|| {
+            FErr::Backend(format!(
+                "freshness_floor.signer_form has an unknown token: {signer_form_str:?}"
+            ))
+        })?;
+    let signed_envelope_json: String = row.safe_get_with("signed_envelope", FErr::Backend)?;
+    let signature_json: String = row.safe_get_with("signature", FErr::Backend)?;
+    let signed_envelope: serde_json::Value = serde_json::from_str(&signed_envelope_json)
+        .map_err(|e| FErr::Backend(format!("freshness_floor.signed_envelope: {e}")))?;
+    let signature: ciris_verify_core::transport_binding::TransportBindingSignature =
+        serde_json::from_str(&signature_json)
+            .map_err(|e| FErr::Backend(format!("freshness_floor.signature: {e}")))?;
+    Ok(crate::federation::types::SignedTouchClaim {
+        target_key_id: row.safe_get_with("target_key_id", FErr::Backend)?,
+        target_kind: row.safe_get_with("target_kind", FErr::Backend)?,
+        fresh_as_of: row.safe_get_with("fresh_as_of", FErr::Backend)?,
+        signer_form,
+        attesting_key_id: row.safe_get_with("attesting_key_id", FErr::Backend)?,
+        signed_envelope,
+        signature,
+        cohort_scope: row.safe_get_with("cohort_scope", FErr::Backend)?,
+    })
+}
+
 fn pg_row_to_installed_storage_budget(
     row: tokio_postgres::Row,
 ) -> Result<crate::fountain::storage_contention::InstalledStorageBudget, Error> {
@@ -6679,6 +6712,94 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 crate::federation::Error::Backend(format!("remove_transport_destination: {e}"))
             })?;
         Ok(n > 0)
+    }
+
+    // ── freshness_floor (CIRISPersist#519 item 2a-iii) ─────────────
+
+    async fn put_touch_claim(
+        &self,
+        claim: &crate::federation::types::SignedTouchClaim,
+    ) -> Result<crate::federation::TouchApplyOutcome, crate::federation::Error> {
+        use crate::federation::TouchApplyOutcome as Outcome;
+        // v21.6.0 (#519 item 2a-iii) — verify-before-mutation: the full
+        // hybrid admission gate, THEN the future-skew guard, THEN the
+        // monotonic-max merge. Mirrors put_signed_transport_destination.
+        crate::federation::admission::verify_signed_touch_claim(self, claim).await?;
+        crate::federation::admission::verify_touch_claim_admission(
+            claim,
+            chrono::Utc::now(),
+            crate::federation::admission::DEFAULT_MAX_TOUCH_SKEW,
+        )?;
+        let envelope_json = serde_json::to_string(&claim.signed_envelope)
+            .map_err(|e| crate::federation::Error::Backend(format!("signed_envelope: {e}")))?;
+        let signature_json = serde_json::to_string(&claim.signature)
+            .map_err(|e| crate::federation::Error::Backend(format!("signature: {e}")))?;
+        let signer_form = claim.signer_form.as_str();
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        // Monotonic-max merge: `fresh_as_of` only ever advances. A fresh
+        // insert always applies (no conflict target); against an existing
+        // row the SQL guard is the single source of truth — mirrors the
+        // put_transport_destination ON-CONFLICT guard EXACTLY, collapsed to
+        // the freshness floor's single-field monotonic comparator.
+        let n = client
+            .execute(
+                "INSERT INTO cirislens.freshness_floor \
+                    (target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
+                     signed_envelope, signature, cohort_scope) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (target_key_id, target_kind) \
+                 DO UPDATE SET fresh_as_of = EXCLUDED.fresh_as_of, \
+                    signer_form = EXCLUDED.signer_form, \
+                    attesting_key_id = EXCLUDED.attesting_key_id, \
+                    signed_envelope = EXCLUDED.signed_envelope, \
+                    signature = EXCLUDED.signature, \
+                    cohort_scope = EXCLUDED.cohort_scope \
+                 WHERE EXCLUDED.fresh_as_of > cirislens.freshness_floor.fresh_as_of",
+                &[
+                    &claim.target_key_id,
+                    &claim.target_kind,
+                    &claim.fresh_as_of,
+                    &signer_form,
+                    &claim.attesting_key_id,
+                    &envelope_json,
+                    &signature_json,
+                    &claim.cohort_scope,
+                ],
+            )
+            .await
+            .map_err(|e| crate::federation::Error::Backend(format!("put_touch_claim: {e}")))?;
+        Ok(if n > 0 {
+            Outcome::Advanced
+        } else {
+            Outcome::NotFresher
+        })
+    }
+
+    async fn lookup_freshness_floor(
+        &self,
+        target_key_id: &str,
+        target_kind: &str,
+    ) -> Result<Option<crate::federation::types::SignedTouchClaim>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let row = client
+            .query_opt(
+                "SELECT target_key_id, target_kind, fresh_as_of, signer_form, attesting_key_id, \
+                    signed_envelope, signature, cohort_scope \
+                 FROM cirislens.freshness_floor \
+                 WHERE target_key_id = $1 AND target_kind = $2",
+                &[&target_key_id, &target_kind],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("lookup_freshness_floor: {e}"))
+            })?;
+        row.map(|r| pg_row_to_signed_touch_claim(&r)).transpose()
     }
 
     // ── hard_case:* emission surface (CIRISPersist#146 Ask 3) ──────
@@ -18645,6 +18766,85 @@ mod tests {
             &backend, &suffix,
         )
         .await;
+    }
+
+    // ── freshness_floor (CIRISPersist#519 item 2a-iii) witnesses ────
+
+    /// The anti-rollback matrix on postgres. Shares the assertion body with
+    /// the memory + sqlite parity tests.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn touch_claim_monotonic_max_only_advances_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::freshness::test_support::run_monotonic_max_matrix(&backend, &suffix)
+            .await;
+    }
+
+    /// The future-skew rejection on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn touch_claim_rejects_future_beyond_skew_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::freshness::test_support::run_future_skew_rejection(&backend, &suffix)
+            .await;
+    }
+
+    /// The forged-signature rejection on postgres (real hybrid crypto).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn touch_claim_requires_valid_hybrid_signature_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::freshness::test_support::run_forged_signature_rejection(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
+    /// The `cohort_scope` admission-gate validation on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn touch_claim_cohort_scope_validated_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::freshness::test_support::run_cohort_scope_validation(&backend, &suffix)
+            .await;
+    }
+
+    /// The byte-exact round-trip on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn touch_claim_round_trip_byte_exact_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::freshness::test_support::run_round_trip(&backend, &suffix).await;
     }
 
     /// #446 — the occurrence→route composite-projection matrix on postgres.

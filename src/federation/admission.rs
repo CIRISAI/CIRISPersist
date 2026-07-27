@@ -1947,6 +1947,214 @@ pub async fn verify_signed_transport_destination(
     .await
 }
 
+/// v21.6.0 (CIRISPersist#519 item 2a-iii, CEG `namespace_supersets.json` §
+/// `freshness_floor.admission_guard`) — clock-skew tolerance for the signed
+/// `fresh_as_of` freshness floor
+/// ([`crate::federation::types::SignedTouchClaim`]). Mirrors
+/// [`crate::verify::canonical_validation::MAX_SIGNED_AT_FUTURE_SKEW`] (same
+/// 5-minute CEG §0.7 window) — persist exposes the constant so a producer
+/// or a sovereign deployment's own validation uses the same tolerance the
+/// substrate enforces.
+pub const DEFAULT_MAX_TOUCH_SKEW: chrono::Duration = chrono::Duration::minutes(5);
+
+/// v21.6.0 (CIRISPersist#519 item 2a-iii) — the freshness-floor SKEW guard:
+/// **reject `fresh_as_of > now + max_skew`**.
+///
+/// Monotonic-max ([`crate::federation::freshness`]) is the anti-ROLLBACK
+/// property — it stops a touch from ever moving the floor backward. This
+/// is the dual: nothing about a pure max-fold stops a lying clock from
+/// asserting a `fresh_as_of` far in the future and jumping the floor
+/// forward past the point any real touch could have occurred. Mirrors
+/// [`crate::verify::canonical_validation::validate_signed_at_not_future`]'s
+/// shape exactly.
+///
+/// Called by every backend's `put_touch_claim` BEFORE the merge
+/// (verify-before-mutation), ALONGSIDE — never instead of —
+/// [`verify_signed_touch_claim`] (the full hybrid-signature gate). A
+/// touch-claim is admitted only when BOTH pass.
+pub fn verify_touch_claim_admission(
+    claim: &crate::federation::types::SignedTouchClaim,
+    now: chrono::DateTime<chrono::Utc>,
+    max_skew: chrono::Duration,
+) -> Result<(), Error> {
+    let skew = claim.fresh_as_of - now;
+    if skew > max_skew {
+        return Err(Error::InvalidArgument(format!(
+            "signed touch_claim: fresh_as_of {} is {}s ahead of now ({}), beyond the {}s skew \
+             tolerance — a lying clock cannot jump the freshness floor into the future",
+            claim.fresh_as_of.to_rfc3339(),
+            skew.num_seconds(),
+            now.to_rfc3339(),
+            max_skew.num_seconds(),
+        )));
+    }
+    Ok(())
+}
+
+/// v21.6.0 (CIRISPersist#519 item 2a-iii) — the SIGNED touch-claim
+/// admission gate: the freshness-floor mirror of
+/// [`verify_signed_transport_destination`], closing the same class of hole
+/// (an unsigned/forged touch could otherwise jump anyone's liveness floor
+/// forward at will). Fail-secure; called by every `put_touch_claim` (all
+/// three backends — one gate) BEFORE any write, ALONGSIDE — never instead
+/// of — [`verify_touch_claim_admission`] (the future-skew guard): a
+/// touch-claim admits ONLY when the hybrid signature verifies AND the skew
+/// guard passes.
+///
+/// **Authority is `signed_envelope`, never the sender's typed projection**
+/// — the #418 discipline verbatim. Verifies, each fail-closed:
+/// 1. the envelope carries `target_key_id` / `target_kind` / `fresh_as_of`
+///    / `signer_form` / `attesting_key_id` / `cohort_scope`, and the typed
+///    projection persist will store EQUALS them (a divergent projection is
+///    the MITM reopening);
+/// 2. `cohort_scope` is one of the closed-set values
+///    ([`check_cohort_scope`]) — touch-claims are cohort-scoped and
+///    consent-gated by construction (the MANDATORY privacy row: an
+///    unrestricted read-receipt trail is an access-pattern surveillance
+///    surface, worst-case `trace:*` leaking who reads whose reasoning);
+/// 3. the detached hybrid signature over `JCS(signed_envelope)` verifies at
+///    threshold **1-of-1** against the PINNED federation pubkeys of
+///    `attesting_key_id` ([`verify_threshold_signatures`] — RequireHybrid;
+///    a classical-only touch does not count);
+/// 4. the **signer-form relationship**
+///    ([`crate::federation::types::SignerForm`]):
+///    [`SelfTouch`](crate::federation::types::SignerForm::SelfTouch)
+///    requires the signer to BE the touched `target_key_id` or a
+///    registered occurrence of it — the same "own clock / dead-man's-
+///    switch" bar [`check_signer_acts_for`] already draws elsewhere;
+///    [`WitnessTouch`](crate::federation::types::SignerForm::WitnessTouch) /
+///    [`NOfMCosigned`](crate::federation::types::SignerForm::NOfMCosigned)
+///    require an attester INDEPENDENT of the target — the OPPOSITE bar (a
+///    witness cannot be the thing it is witnessing).
+///
+/// **Known limitation (deliberate, documented, not built here):**
+/// `NOfMCosigned` verifies IDENTICALLY to `WitnessTouch` (a single
+/// independent attester, 1-of-1). The wire shape this cut ships — one
+/// `attesting_key_id` + one
+/// [`ciris_verify_core::transport_binding::TransportBindingSignature`],
+/// mirroring [`crate::federation::self_at_login::SignedTransportDestination`]
+/// exactly per the #519 item 2a-iii brief — has no multi-signer envelope to
+/// tally an actual m-of-n quorum over. Real collusion-resistant n-of-m
+/// aggregation needs a wire-shape change (a signer set + threshold, like
+/// [`ciris_verify_core::threshold::ThresholdSignature`] used as a LIST
+/// rather than a single value) and is a follow-up.
+///
+/// NOT feature-gated: backend-agnostic, and the MemoryBackend calls it (the
+/// #418 cfg lesson).
+///
+/// [`verify_threshold_signatures`]: ciris_verify_core::threshold::verify_threshold_signatures
+pub async fn verify_signed_touch_claim(
+    directory: &dyn super::FederationDirectory,
+    claim: &crate::federation::types::SignedTouchClaim,
+) -> Result<(), Error> {
+    use ciris_verify_core::threshold::{
+        verify_threshold_signatures, ThresholdMember, ThresholdSignature,
+    };
+
+    let env = &claim.signed_envelope;
+
+    // (1) Authoritative fields FROM the signed envelope; the typed
+    // projection must equal them (the signature covers only the envelope).
+    let str_field = |k: &str| -> Result<String, Error> {
+        env.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned())
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "signed touch_claim envelope missing string field `{k}`"
+                ))
+            })
+    };
+    let diverges = |what: &str| {
+        Error::InvalidArgument(format!(
+            "signed touch_claim: typed {what} diverges from the signed envelope (rejected)"
+        ))
+    };
+    if str_field("target_key_id")? != claim.target_key_id {
+        return Err(diverges("target_key_id"));
+    }
+    if str_field("target_kind")? != claim.target_kind {
+        return Err(diverges("target_kind"));
+    }
+    let env_fresh_str = str_field("fresh_as_of")?;
+    let env_fresh_as_of = chrono::DateTime::parse_from_rfc3339(&env_fresh_str)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .map_err(|e| {
+            Error::InvalidArgument(format!(
+                "signed touch_claim envelope `fresh_as_of` not RFC-3339: {e}"
+            ))
+        })?;
+    if env_fresh_as_of != claim.fresh_as_of {
+        return Err(diverges("fresh_as_of"));
+    }
+    if str_field("signer_form")? != claim.signer_form.as_str() {
+        return Err(diverges("signer_form"));
+    }
+    if str_field("attesting_key_id")? != claim.attesting_key_id {
+        return Err(diverges("attesting_key_id"));
+    }
+    if str_field("cohort_scope")? != claim.cohort_scope {
+        return Err(diverges("cohort_scope"));
+    }
+
+    // (2) MANDATORY privacy row: cohort_scope must be a closed-set value.
+    check_cohort_scope(&claim.cohort_scope)?;
+
+    // (3) Hybrid signature over JCS(signed_envelope) against the PINNED
+    // federation pubkeys of the claimed signer, threshold 1-of-1.
+    let Some(signer_key) = directory.lookup_public_key(&claim.attesting_key_id).await? else {
+        return Err(Error::SignatureInvalid(format!(
+            "signed touch_claim: attesting_key_id {} is not a registered federation key",
+            claim.attesting_key_id
+        )));
+    };
+    let bytes = crate::verify::canonical::ceg_produce_canonicalize(env)
+        .map_err(|e| Error::InvalidArgument(format!("signed touch_claim canonicalize: {e}")))?;
+    let members = [ThresholdMember {
+        member_id: signer_key.key_id.clone(),
+        ed25519_public_key_base64: signer_key.pubkey_ed25519_base64.clone(),
+        mldsa65_public_key_base64: signer_key.pubkey_ml_dsa_65_base64.clone(),
+        role: None,
+    }];
+    let sigs = [ThresholdSignature {
+        member_id: claim.attesting_key_id.clone(),
+        ed25519_signature_base64: claim.signature.ed25519_signature_base64.clone(),
+        mldsa65_signature_base64: claim.signature.mldsa65_signature_base64.clone(),
+    }];
+    if verify_threshold_signatures(&bytes, &members, &sigs, 1).is_err() {
+        return Err(Error::SignatureInvalid(format!(
+            "signed touch_claim for ({}, {}) not authentic (hybrid 1-of-1 over JCS(envelope) \
+             failed against the pinned key of {})",
+            claim.target_key_id, claim.target_kind, claim.attesting_key_id
+        )));
+    }
+
+    // (4) signer-form relationship — the opposite bars `SelfTouch` and
+    // `WitnessTouch`/`NOfMCosigned` draw.
+    use crate::federation::types::SignerForm;
+    match claim.signer_form {
+        SignerForm::SelfTouch => {
+            check_signer_acts_for(
+                directory,
+                &claim.attesting_key_id,
+                &claim.target_key_id,
+                "touch_claim",
+            )
+            .await?;
+        }
+        SignerForm::WitnessTouch | SignerForm::NOfMCosigned => {
+            if claim.attesting_key_id == claim.target_key_id {
+                return Err(Error::SignatureInvalid(format!(
+                    "signed touch_claim: signer_form {:?} requires an attester independent of \
+                     the touched target {} — a witness cannot be the thing it witnesses",
+                    claim.signer_form, claim.target_key_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// v3.11.0 (CIRISPersist#143, CIRISVerify FEDERATION_THREAT_MODEL
 /// §3.3.2 R1) — admission-gate validation of the producer-side
 /// `observed_region` field on a revocation.
