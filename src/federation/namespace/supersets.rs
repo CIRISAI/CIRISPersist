@@ -163,6 +163,27 @@ pub fn persist_placement_fields() -> Vec<&'static str> {
     v
 }
 
+/// v21.6.0 (CIRISPersist#519 item 2a-ii) — the `field_transforms`
+/// sub-manifest: the closed, total transform-opcode algebra plus the
+/// per-family rows declaring which placement field undergoes which
+/// transform on which egress path. Returned as the raw vendored
+/// [`serde_json::Value`] — this module stays the single vendoring/parsing
+/// point for `namespace_supersets.json`; the typed opcode algebra and the
+/// per-family-row validator both live in [`crate::federation::transform`]
+/// ([`crate::federation::transform::TransformOp`] /
+/// [`crate::federation::transform::validate_family_transform_rows`]), the
+/// ONE consumer of this accessor.
+pub fn field_transforms() -> &'static serde_json::Value {
+    static FIELD_TRANSFORMS: OnceLock<serde_json::Value> = OnceLock::new();
+    FIELD_TRANSFORMS.get_or_init(|| {
+        let root: serde_json::Value = serde_json::from_str(SUPERSETS_JSON)
+            .expect("vendored namespace_supersets.json is valid JSON");
+        root.get("field_transforms")
+            .cloned()
+            .expect("namespace_supersets.json carries a top-level field_transforms section")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

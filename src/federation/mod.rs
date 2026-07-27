@@ -152,6 +152,12 @@ pub mod stream_sth;
 // `register::verify_key_registration`; same verify contract.
 pub mod tier_ingest;
 pub mod topology;
+// v21.6.0 (CIRISPersist#519 item 2a-ii) — the closed, total (terminating)
+// transform algebra: named opcodes, fixed arity, no loops/recursion/user-
+// defined functions. `consent_grammar::strip_field` delegates here (ONE
+// strip implementation); see the module doc for the live-vs-declared-only
+// opcode split and the TRANSFORM_ALGEBRA_HASH pin.
+pub mod transform;
 pub mod trust_grant;
 pub mod types;
 pub mod verify_coord;

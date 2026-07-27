@@ -364,113 +364,28 @@ pub fn covers(prefixes: &[String], dimension: &str) -> bool {
 
 // ───────────────────────── #510 P1: restriction application ─────────
 
-/// Root-level envelope members a [`RestrictionOp::StripField`] must
-/// never remove — stripping either would destroy the discriminator
-/// (`dimension`) or the cross-reference key (`trace_id`) a downstream
-/// reader needs even to recognize what's left. A path that resolves to
-/// exactly one of these AT THE ROOT is refused (a `tracing::warn!`, not
-/// an error — the promotion still proceeds, just without that one
-/// (illegal) strip).
-const PROTECTED_ROOT_MEMBERS: &[&str] = &["dimension", "trace_id"];
-
 /// Apply one [`RestrictionOp::StripField`] `path` to `envelope` IN
-/// PLACE (CIRISPersist#510 P1). `path` is a `/`-separated JSON pointer
-/// (a leading `/` is optional and stripped); a `*` segment matches
-/// EVERY array index / object key at that level (a wildcard fan-out),
-/// and the terminal segment names the member removed wherever the path
-/// resolves:
+/// PLACE (CIRISPersist#510 P1).
 ///
-/// - Nested paths descend through objects (`get_mut(key)`) and arrays
-///   (parsed as a numeric index).
-/// - A MISSING path (any segment fails to resolve) is a silent no-op —
-///   never an error; a grant naming a path this envelope shape doesn't
-///   carry is not a grammar violation.
-/// - Root-safety: a path that resolves to exactly one segment naming a
-///   [`PROTECTED_ROOT_MEMBERS`] entry (`"dimension"` or `"trace_id"`) is
-///   REFUSED (`tracing::warn!`), never silently honored — those two
-///   members are load-bearing for every downstream reader.
+/// v21.6.0 (CIRISPersist#519 item 2a-ii) — this is now a THIN WRAPPER over
+/// [`crate::federation::transform::apply`]
+/// (`&`[`crate::federation::transform::TransformOp::StripField`]): the
+/// canonical strip implementation (wildcard fan-out, missing-path no-op,
+/// protected-root-member refusal for `dimension` / `trace_id`) moved to the
+/// [`crate::federation::transform`] module so there is ONE strip
+/// implementation, not two diverging ones — see that module's doc for the
+/// exact semantics. `apply` never errors for `StripField` (it's pure and
+/// total over every input shape), so the `Err` arm below is unreachable in
+/// practice and kept only as a defensive no-op rather than an `.expect(..)`.
 pub fn strip_field(envelope: &mut serde_json::Value, path: &str) {
-    let segments: Vec<&str> = path
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    if segments.is_empty() {
-        // Resolves to the envelope root itself — refuse (never wipe the
-        // whole envelope via an empty/root path).
-        return;
-    }
-    if segments.len() == 1 && PROTECTED_ROOT_MEMBERS.contains(&segments[0]) {
-        tracing::warn!(
-            path = %path,
-            member = %segments[0],
-            "consent_grammar::strip_field: refusing to strip a protected root member"
-        );
-        return;
-    }
-    strip_field_recursive(envelope, &segments);
-}
-
-/// The recursive descent behind [`strip_field`]. `segments` is always
-/// non-empty on entry (the public wrapper handles the empty-path case).
-fn strip_field_recursive(value: &mut serde_json::Value, segments: &[&str]) {
-    let head = segments[0];
-    let rest = &segments[1..];
-
-    if rest.is_empty() {
-        // `head` is the terminal segment — remove it here.
-        match value {
-            serde_json::Value::Object(map) => {
-                if head == "*" {
-                    map.clear();
-                } else {
-                    map.remove(head);
-                }
-            }
-            serde_json::Value::Array(arr) => {
-                if head == "*" {
-                    arr.clear();
-                } else if let Ok(idx) = head.parse::<usize>() {
-                    if idx < arr.len() {
-                        arr.remove(idx);
-                    }
-                }
-                // Non-numeric, non-`*` segment against an array: no
-                // resolution → no-op.
-            }
-            // Scalar / null: nothing to remove into → no-op.
-            _ => {}
-        }
-        return;
-    }
-
-    // Not the terminal segment — descend, fanning out on `*`.
-    match value {
-        serde_json::Value::Object(map) => {
-            if head == "*" {
-                for v in map.values_mut() {
-                    strip_field_recursive(v, rest);
-                }
-            } else if let Some(next) = map.get_mut(head) {
-                strip_field_recursive(next, rest);
-            }
-            // Missing key → no-op (missing path).
-        }
-        serde_json::Value::Array(arr) => {
-            if head == "*" {
-                for v in arr.iter_mut() {
-                    strip_field_recursive(v, rest);
-                }
-            } else if let Ok(idx) = head.parse::<usize>() {
-                if let Some(next) = arr.get_mut(idx) {
-                    strip_field_recursive(next, rest);
-                }
-            }
-            // Missing index → no-op (missing path).
-        }
-        // Scalar / null at a non-terminal segment: nothing to descend
-        // into → no-op (missing path).
-        _ => {}
+    use crate::federation::transform::{apply, TransformOp};
+    if let Ok(result) = apply(
+        &TransformOp::StripField {
+            path: path.to_string(),
+        },
+        envelope,
+    ) {
+        *envelope = result;
     }
 }
 
