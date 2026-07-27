@@ -2108,7 +2108,18 @@ pub async fn verify_signed_touch_claim(
             claim.attesting_key_id
         )));
     };
-    let bytes = crate::verify::canonical::ceg_produce_canonicalize(env)
+    // v21.10.0 (#519 b2) — the signature bytes are over the envelope WITHOUT
+    // the `touch_cosignatures` set: co-signatures cannot be inside the bytes
+    // they sign (the fixed-point the reclaim quorum solves the same way). For
+    // SelfTouch/WitnessTouch the field is absent, so this is a no-op clone.
+    let sig_env = {
+        let mut e = env.clone();
+        if let Some(obj) = e.as_object_mut() {
+            obj.remove(crate::federation::freshness::TOUCH_COSIGNATURES_FIELD);
+        }
+        e
+    };
+    let bytes = crate::verify::canonical::ceg_produce_canonicalize(&sig_env)
         .map_err(|e| Error::InvalidArgument(format!("signed touch_claim canonicalize: {e}")))?;
     let members = [ThresholdMember {
         member_id: signer_key.key_id.clone(),
@@ -2150,6 +2161,74 @@ pub async fn verify_signed_touch_claim(
                     claim.signer_form, claim.target_key_id
                 )));
             }
+        }
+    }
+
+    // (5) v21.10.0 (CIRISPersist#519 b2) — NOfMCosigned is a real m-of-n
+    // TALLY, not the 1-of-1 above. The primary attester (verified in step 3)
+    // counts as one signer; the envelope's `touch_cosignatures` extra carries
+    // the rest. Each co-signature must verify (hybrid, over the SAME
+    // JCS(envelope) bytes) against the co-signer's OWN pinned federation key,
+    // and every signer must be DISTINCT and INDEPENDENT of the target — so a
+    // forged "death finding" needs to corrupt >= NOFM_MIN_COSIGNERS+1 distinct
+    // real keys, not one. (SelfTouch / WitnessTouch ignore this field.)
+    if claim.signer_form == SignerForm::NOfMCosigned {
+        use crate::federation::freshness::{NOFM_MIN_COSIGNERS, TOUCH_COSIGNATURES_FIELD};
+        let cosigs_val = env.get(TOUCH_COSIGNATURES_FIELD).ok_or_else(|| {
+            Error::SignatureInvalid(format!(
+                "signed touch_claim: signer_form NOfMCosigned requires a `{TOUCH_COSIGNATURES_FIELD}` \
+                 co-signature set in the signed envelope"
+            ))
+        })?;
+        let cosigs: Vec<ThresholdSignature> = serde_json::from_value(cosigs_val.clone())
+            .map_err(|e| {
+                Error::InvalidArgument(format!(
+                    "signed touch_claim: `{TOUCH_COSIGNATURES_FIELD}` is not a threshold-signature array: {e}"
+                ))
+            })?;
+        // Distinct + independent-of-target signer set, primary included.
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        seen.insert(claim.attesting_key_id.clone());
+        let mut distinct_cosigners = 0usize;
+        for cs in &cosigs {
+            if cs.member_id == claim.target_key_id {
+                return Err(Error::SignatureInvalid(format!(
+                    "signed touch_claim: NOfMCosigned co-signer {} is the touched target — \
+                     independence required",
+                    cs.member_id
+                )));
+            }
+            if !seen.insert(cs.member_id.clone()) {
+                // duplicate (or equals the primary) — does not add to the tally.
+                continue;
+            }
+            let Some(cs_key) = directory.lookup_public_key(&cs.member_id).await? else {
+                return Err(Error::SignatureInvalid(format!(
+                    "signed touch_claim: NOfMCosigner {} is not a registered federation key",
+                    cs.member_id
+                )));
+            };
+            let cs_member = [ThresholdMember {
+                member_id: cs_key.key_id.clone(),
+                ed25519_public_key_base64: cs_key.pubkey_ed25519_base64.clone(),
+                mldsa65_public_key_base64: cs_key.pubkey_ml_dsa_65_base64.clone(),
+                role: None,
+            }];
+            let cs_sig = [cs.clone()];
+            if verify_threshold_signatures(&bytes, &cs_member, &cs_sig, 1).is_err() {
+                return Err(Error::SignatureInvalid(format!(
+                    "signed touch_claim: NOfMCosigner {}'s signature is not authentic over the \
+                     touch envelope",
+                    cs.member_id
+                )));
+            }
+            distinct_cosigners += 1;
+        }
+        if distinct_cosigners < NOFM_MIN_COSIGNERS {
+            return Err(Error::SignatureInvalid(format!(
+                "signed touch_claim: NOfMCosigned needs >= {NOFM_MIN_COSIGNERS} distinct valid \
+                 co-signer(s) beyond the primary attester; got {distinct_cosigners}"
+            )));
         }
     }
     Ok(())

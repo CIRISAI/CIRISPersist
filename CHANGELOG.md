@@ -5,6 +5,52 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.10.0] — 2026-07-27 — #519: the NOfMCosigned freshness tally (b2) + persist's evidence-registry rows (b5) — persist's #519 half complete
+
+### Added — the NOfMCosigned touch-claim tally (#519 b2)
+
+`SignerForm::NOfMCosigned` previously verified as 1-of-1 (a gap the freshness
+module documented). It is now a real m-of-n tally: the primary attester counts
+as one signer, and the co-signer set rides the touch envelope's `extra` under
+`freshness::TOUCH_COSIGNATURES_FIELD` (a JCS array of `ThresholdSignature`, the
+`ownership_reclaim` co-signature pattern). At admission
+(`verify_signed_touch_claim` step 5), each co-signature is hybrid-verified over
+the SAME `JCS(signed_envelope)` — canonicalized with `touch_cosignatures`
+STRIPPED, since co-signatures cannot be inside the bytes they sign (the reclaim
+fixed-point) — against the co-signer's own pinned federation key, and every
+signer must be distinct and independent of the target. `NOFM_MIN_COSIGNERS`
+distinct co-signers beyond the primary are required, so forging a "death
+finding" must corrupt a quorum of distinct real keys, not one. `SelfTouch` /
+`WitnessTouch` are byte-unchanged (the field is absent). Witnesses: primary + a
+real independent co-signer admits; the same touch with the set absent, or a
+forged co-signature, is refused (memory + sqlite + live-pg).
+
+### Added — persist's evidence-registry rows (#519 item 6 / b5)
+
+`evidence/cc_impl.tsv` — persist's 43 `path#symbol @ crate@version` evidence
+pointers, the `field_processor_matrix → CLM-nsproc` citation graph's persist
+half (the format the constitution's `check_evidence.py` resolves cross-repo).
+**Code-verified, not hand-copied**: materialized from the manifest's
+`evidence_export[CIRISPersist]` with post-cut symbol renames applied (the a2
+`promote_attestation_with_strips → _with_transforms` rename) and non-resolving
+rows dropped (3 edge-misattributed `safety/watchlist` paths + 1 prose row that
+were never persist impls). The witness `evidence_cc_impl_pointers_resolve`
+re-checks every persist `src/…` pointer against current source — the loop that
+fails the build the moment a cited processor is renamed or deleted.
+
+### #519 persist half — complete
+
+With this cut persist's entire #519 surface is shipped: the manifest as
+Registry-of-Record (v21.5.0), the complete promotion primitive (v21.5.0), the
+total transform algebra + `fresh_as_of` floor + proptests + conformance exemplar
+(v21.6.0), invariant admission + transform-serve + field-conformance FFI
+(v21.7.0), the activated ownerless-lock reclaim (v21.8.0), the
+`delivery_mode`/`deletion_window` hoist + lifecycle processor (v21.9.0), and the
+NOfM tally + evidence rows (this cut). What remains is downstream/constitutional,
+NOT persist: the CC amendments + policy ratification (CIRISConstitution#43), the
+manifest re-vendor (#520), the cross-repo conformance harness
+(CIRISConformance#83), and adoption (CIRISEdge#411, CIRISServer#326, agent
+touch-claim producers).
 ## [21.9.0] — 2026-07-27 — #519 item 2: hoist `delivery_mode` + `deletion_window` to typed EnvelopeCore fields, with the `deletion_window` lifecycle processor
 
 ### Changed — `delivery_mode` + `deletion_window` are typed `EnvelopeCore` fields (byte-invariant hoist)

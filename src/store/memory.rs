@@ -6943,6 +6943,12 @@ mod accord_tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn touch_claim_nofm_cosigned_tally_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::freshness::test_support::run_nofm_cosigned_tally(&backend, "mem").await;
+    }
+
     /// #446 — the occurrence→route composite-projection matrix on the memory
     /// backend. Shares the assertion body with the sqlite + pg parity tests.
     #[tokio::test]

@@ -72,16 +72,37 @@
 //!   family — `ownership:*`, `trust:*`, `consent:*`, ... per the
 //!   manifest's `demanded_by`). Documented for adoption.
 //! - Real m-of-n co-signature aggregation for
-//!   [`crate::federation::types::SignerForm::NOfMCosigned`] — this cut's
-//!   wire shape carries a single attester (mirroring
-//!   [`crate::federation::self_at_login::SignedTransportDestination`]
-//!   exactly), so admission verifies it identically to `WitnessTouch`. See
-//!   [`crate::federation::admission::verify_signed_touch_claim`]'s docs.
+//!   [`crate::federation::types::SignerForm::NOfMCosigned`] — **implemented in
+//!   v21.10.0 (#519 b2)**: the primary attester's signature (the typed
+//!   [`SignedTouchClaim`] container) counts as one signer, and the co-signer
+//!   set rides `extra` under [`TOUCH_COSIGNATURES_FIELD`]; admission verifies
+//!   each co-signature over the same envelope against its own pinned key,
+//!   requiring [`NOFM_MIN_COSIGNERS`] distinct independent co-signers beyond
+//!   the primary (so a lying clock must corrupt a quorum, not one key). See
+//!   [`crate::federation::admission::verify_signed_touch_claim`] step (5).
 //! - Wiring `freshness_floor` into `signed_wire_index` / replication
 //!   gossip — out of this cut's file scope.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// v21.10.0 (CIRISPersist#519 b2) — the touch envelope's `extra` key carrying
+/// the co-signature set for a [`crate::federation::types::SignerForm::NOfMCosigned`]
+/// touch: a JCS array of
+/// [`ciris_verify_core::threshold::ThresholdSignature`] (wire-identical to the
+/// reclaim quorum's `ownership_reclaim::RECLAIM_QUORUM_SIGNATURES_FIELD`), each
+/// over the SAME `JCS(signed_envelope)` the primary attester signed. Rides in
+/// `extra` — CEG-native, not a universal envelope path — so `SelfTouch` /
+/// `WitnessTouch` touches are byte-unchanged.
+pub const TOUCH_COSIGNATURES_FIELD: &str = "touch_cosignatures";
+
+/// v21.10.0 (CIRISPersist#519 b2) — the minimum DISTINCT valid signers an
+/// `NOfMCosigned` touch requires (the primary attester + at least this many
+/// independent co-signers): a collusion-resistant "death finding" needs more
+/// than one key, so a lying clock must corrupt a quorum, not a single signer.
+/// `M >= 2` total. Below this an `NOfMCosigned` touch is rejected — it would be
+/// indistinguishable from a `WitnessTouch`.
+pub const NOFM_MIN_COSIGNERS: usize = 1;
 
 /// v21.6.0 (CIRISPersist#519 item 2a-iii) — outcome of a
 /// [`crate::federation::FederationDirectory::put_touch_claim`] monotonic
@@ -532,6 +553,89 @@ pub(crate) mod test_support {
             .put_touch_claim(&self_as_witness)
             .await
             .expect_err("witness_touch of one's own key must be rejected");
+        assert_eq!(err.kind(), "federation_signature_invalid");
+    }
+
+    /// v21.10.0 (CIRISPersist#519 b2) — the **NOfMCosigned tally**: a
+    /// NOfMCosigned touch with the primary attester + a real independent
+    /// co-signature (both over the same envelope, both registered, distinct
+    /// from the target) is admitted; the SAME touch with the co-signature set
+    /// absent, or with a forged co-signature, is REFUSED — so it is genuinely
+    /// >= 2-of-N, not the 1-of-1 it verified as before this cut.
+    pub(crate) async fn run_nofm_cosigned_tally(dir: &dyn FederationDirectory, suffix: &str) {
+        use super::TOUCH_COSIGNATURES_FIELD;
+        use ciris_verify_core::threshold::ThresholdSignature;
+        use ciris_verify_core::transport_binding::produce_signed_identity_occurrence;
+
+        let target = format!("nofm-target-{suffix}");
+        let primary_id = format!("nofm-primary-{suffix}");
+        let cosigner_id = format!("nofm-cosigner-{suffix}");
+        register_identity(dir, &target).await;
+        let primary = register_identity(dir, &primary_id).await;
+        let cosigner = register_identity(dir, &cosigner_id).await;
+
+        // Primary builds + signs a NOfMCosigned touch (envelope has no
+        // cosignatures yet — they cannot be inside the bytes they sign).
+        let base = signed_claim(
+            &primary,
+            &primary_id,
+            &target,
+            "occurrence",
+            ts("2026-07-01T00:00:00Z"),
+            SignerForm::NOfMCosigned,
+            cohort_scope::SELF,
+        )
+        .await;
+
+        // The co-signer signs the SAME base envelope.
+        let (_e, cosig) =
+            produce_signed_identity_occurrence(&*cosigner, base.signed_envelope.clone())
+                .await
+                .expect("co-sign the touch envelope");
+        let cosig_ts = ThresholdSignature {
+            member_id: cosigner_id.clone(),
+            ed25519_signature_base64: cosig.ed25519_signature_base64.clone(),
+            mldsa65_signature_base64: cosig.mldsa65_signature_base64.clone(),
+        };
+        let attach = |claim: &SignedTouchClaim, sigs: serde_json::Value| -> SignedTouchClaim {
+            let mut env = claim.signed_envelope.clone();
+            env.as_object_mut()
+                .unwrap()
+                .insert(TOUCH_COSIGNATURES_FIELD.to_owned(), sigs);
+            SignedTouchClaim {
+                signed_envelope: env,
+                ..claim.clone()
+            }
+        };
+
+        // (a) missing co-signature set → refused.
+        let err = dir
+            .put_touch_claim(&base)
+            .await
+            .expect_err("NOfMCosigned without a co-signature set must be refused");
+        assert_eq!(err.kind(), "federation_signature_invalid");
+
+        // (b) a real independent co-signature → admitted.
+        let good = attach(&base, serde_json::json!([cosig_ts]));
+        assert_eq!(
+            dir.put_touch_claim(&good).await.unwrap(),
+            TouchApplyOutcome::Advanced,
+            "primary + a real independent co-signer must be admitted"
+        );
+
+        // (c) a FORGED co-signature (valid shape, wrong bytes) → refused.
+        let forged = attach(
+            &base,
+            serde_json::json!([{
+                "member_id": cosigner_id,
+                "ed25519_signature_base64": "AA",
+                "mldsa65_signature_base64": null,
+            }]),
+        );
+        let err = dir
+            .put_touch_claim(&forged)
+            .await
+            .expect_err("a forged co-signature must be refused");
         assert_eq!(err.kind(), "federation_signature_invalid");
     }
 }
