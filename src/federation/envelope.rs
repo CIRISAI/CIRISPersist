@@ -46,6 +46,16 @@ pub mod paths {
     pub const SUCCESSOR_KEYS: &str = "successor_keys";
     /// Withdraws composer: the producer's stated reason.
     pub const WITHDRAWAL_REASON: &str = "withdrawal_reason";
+    /// v21.9.0 (CIRISPersist#519 item 2 field-hoist) — the CI
+    /// recipient-RECEIVE axis: how a consented payload is delivered
+    /// (edge-owned processor `reachability.rs`; persist types it). Hoisted
+    /// from `extra` to a typed `EnvelopeCore` field, byte-invariant.
+    pub const DELIVERY_MODE: &str = "delivery_mode";
+    /// v21.9.0 (CIRISPersist#519 item 2 field-hoist) — the CI
+    /// temporal-lifecycle erasure window: the deadline by which a
+    /// consented payload must be deleted (persist-owned lifecycle
+    /// processor — the breach signal). Hoisted from `extra`, byte-invariant.
+    pub const DELETION_WINDOW: &str = "deletion_window";
 }
 
 /// A delegation `scope` in either established wire shape.
@@ -95,6 +105,17 @@ pub struct EnvelopeCore {
     /// [`paths::WITHDRAWAL_REASON`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withdrawal_reason: Option<String>,
+    /// [`paths::DELIVERY_MODE`] — v21.9.0 (#519 field-hoist). Typed here
+    /// (was untyped `extra`); the PROCESSOR is edge's
+    /// (`reachability.rs#ReachabilityTracker`). Byte-invariant: `None` ⇒ no
+    /// key, `Some` ⇒ same `delivery_mode` key/value ⇒ identical JCS bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_mode: Option<String>,
+    /// [`paths::DELETION_WINDOW`] — v21.9.0 (#519 field-hoist). Typed here
+    /// (was untyped `extra`) with a persist-owned lifecycle processor (the
+    /// breach signal — see [`super::deletion_window`]). Byte-invariant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_window: Option<String>,
     /// Every dimension-specific key, untyped and preserved. Covered by
     /// the envelope vocabulary hash, not by the compiler.
     #[serde(flatten)]
@@ -140,6 +161,8 @@ mod tests {
             recovers: Some("old-root".into()),
             successor_keys: Some(vec!["k1".into()]),
             withdrawal_reason: Some("test".into()),
+            delivery_mode: Some("mandatory".into()),
+            deletion_window: Some("2027-01-01T00:00:00Z".into()),
             extra: serde_json::Map::new(),
         };
         let v = core.to_value();
@@ -151,6 +174,8 @@ mod tests {
             (paths::RECOVERS, true),
             (paths::SUCCESSOR_KEYS, true),
             (paths::WITHDRAWAL_REASON, true),
+            (paths::DELIVERY_MODE, true),
+            (paths::DELETION_WINDOW, true),
         ] {
             assert_eq!(
                 v.get(path).is_some(),
@@ -165,6 +190,45 @@ mod tests {
             .insert("score".into(), serde_json::json!(0.9));
         let rt = EnvelopeCore::from_value(with_extra.to_value()).unwrap();
         assert_eq!(rt, with_extra, "lossless round-trip incl. extras");
+    }
+
+    /// v21.9.0 (CIRISPersist#519 field-hoist) — THE byte-invariance witness:
+    /// hoisting `delivery_mode` / `deletion_window` from untyped `extra` to
+    /// typed fields must NOT change the canonical bytes, so a signature
+    /// computed before the hoist still verifies after. A raw JSON envelope
+    /// carrying these keys must canonicalize IDENTICALLY to the same envelope
+    /// round-tripped through the (now-typed) `EnvelopeCore` — proving the two
+    /// fields land under the same wire keys with the same values. If serde
+    /// renamed them, or the flatten interaction reordered/renamed anything,
+    /// this fails.
+    #[test]
+    fn hoisted_fields_are_canonicalization_byte_invariant() {
+        use crate::verify::canonical::ceg_produce_canonicalize;
+        // A raw envelope as a producer would emit it (keys in extra, pre-hoist
+        // shape) — including an unrelated payload key to exercise flatten.
+        let raw = serde_json::json!({
+            "dimension": "trace:complete:v1",
+            "delivery_mode": "mandatory",
+            "deletion_window": "2027-01-01T00:00:00Z",
+            "trace_id": "t-1",
+            "score": 0.9,
+        });
+        let via_typed = EnvelopeCore::from_value(raw.clone()).unwrap().to_value();
+        // The typed fields captured the two keys (not left in extra)...
+        let parsed = EnvelopeCore::from_value(raw.clone()).unwrap();
+        assert_eq!(parsed.delivery_mode.as_deref(), Some("mandatory"));
+        assert_eq!(
+            parsed.deletion_window.as_deref(),
+            Some("2027-01-01T00:00:00Z")
+        );
+        assert!(!parsed.extra.contains_key("delivery_mode"));
+        assert!(!parsed.extra.contains_key("deletion_window"));
+        // ...and the canonical bytes are byte-identical raw vs round-tripped.
+        assert_eq!(
+            ceg_produce_canonicalize(&raw).unwrap(),
+            ceg_produce_canonicalize(&via_typed).unwrap(),
+            "the field-hoist changed the canonical bytes — existing signatures would break"
+        );
     }
 
     /// Both established scope wire shapes parse and match.

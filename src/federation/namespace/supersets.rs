@@ -56,11 +56,19 @@ pub const VENDORED_CONSTITUTION_REV: &str = "d192341";
 pub const VENDORED_SEED_REGISTRY_SHA256: &str =
     "ade64edccce493e99f2617d236b1dffd6b99e2dfae91a9a4c012c9f4dfd6c64b";
 
-/// The KNOWN, TRACKED placement fields the manifest itself records as
-/// `UNASSIGNED` (no typed field, no processor) — deferred to #519 item 2 /
-/// 2a-iii (wire-affecting hoist, needs edge/server lockstep). Pinned so a
-/// REGRESSION (a NEW unassigned field) fails the completeness gate, while these
-/// declared gaps stay visible-not-silent.
+/// The placement fields the vendored manifest (v0.3.0) records as `UNASSIGNED`.
+/// Pinned so a REGRESSION (a NEW unassigned field) fails the completeness gate,
+/// while the declared gap stays visible-not-silent.
+///
+/// NOTE (v21.9.0, #519 c1): `deletion_window` was hoisted to a typed
+/// `EnvelopeCore` field AND given a persist-owned lifecycle processor
+/// ([`crate::federation::deletion_window`]) — so it is no longer a real gap in
+/// CODE. It stays listed here only because the vendored manifest's
+/// `field_processor_matrix` still records the row as `UNASSIGNED`; the row
+/// graduates to persist-owned at the next manifest RE-VENDOR (tracked #520,
+/// bundled with the CC#43 re-vendor). Removing it from this list before the
+/// re-vendor would fail `unassigned_fields_match_the_known_tracked_gap_set`
+/// (the manifest and the const would disagree).
 pub const KNOWN_UNASSIGNED_FIELDS: &[&str] = &["deletion_window"];
 
 #[derive(Debug, Deserialize)]

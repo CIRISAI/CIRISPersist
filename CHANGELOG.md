@@ -5,6 +5,38 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.9.0] — 2026-07-27 — #519 item 2: hoist `delivery_mode` + `deletion_window` to typed EnvelopeCore fields, with the `deletion_window` lifecycle processor
+
+### Changed — `delivery_mode` + `deletion_window` are typed `EnvelopeCore` fields (byte-invariant hoist)
+
+Both were untyped `extra` cargo (a placement field the compiler could not see —
+the class #519 exists to close). They are now typed `Option<String>` fields on
+`EnvelopeCore` with `paths::DELIVERY_MODE` / `paths::DELETION_WINDOW` constants.
+The hoist is **byte-invariant**: each field is `skip_serializing_if =
+"Option::is_none"` under the same wire key it had in `extra`, so an absent field
+serializes to no key and a present one to the same key/value — identical JCS
+canonical bytes, so **every signature computed before the hoist still verifies**.
+Proven by `hoisted_fields_are_canonicalization_byte_invariant` (a raw envelope
+carrying both keys canonicalizes byte-identically to the same envelope
+round-tripped through the now-typed struct). No `.extra`/string-key reader of
+either field existed anywhere in the tree (they were pure cargo), so the hoist is
+safe repo-wide. `delivery_mode`'s processor is edge's (`reachability.rs`) — persist
+only types it.
+
+### Added — `federation::deletion_window`: the persist-owned lifecycle processor (#519 c1)
+
+`deletion_window` was the manifest's one `UNASSIGNED` field (a typed erasure
+deadline with no processor is exactly the carried-but-unprocessed half-measure).
+This adds the persist-owned processor: `deletion_window_status(envelope,
+row_still_present, now) -> {NoWindow | MalformedWindow | WithinWindow |
+DeletedInTime | BreachedNotDeleted}` — the pure, total breach judgment (the
+signal a periodic operator sweep emits on). The breach is an absence-of-update
+judgment: the window passed AND the row is still present (no proof of deletion);
+a malformed window is flagged, not silently ignored. Wired into the
+manifest-driven field-conformance harness (`deletion_window` now has a persist
+conformance check). The field stays in `KNOWN_UNASSIGNED_FIELDS` only because the
+vendored manifest v0.3.0's matrix row still reads `UNASSIGNED` — it graduates to
+persist-owned at the next re-vendor (#520); the code processor exists now.
 ## [21.8.0] — 2026-07-27 — #519: the ownerless-lock reclaim mechanism (CC 3.2 "no permanent ownerless lock" MUST), ACTIVATED with a conservative default
 
 ### Added — `federation::ownership_reclaim` (the highest-value #519 found defect)
