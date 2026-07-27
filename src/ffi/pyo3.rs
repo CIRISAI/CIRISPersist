@@ -29623,6 +29623,39 @@ impl ScoringFactorStream {
 /// `.so` hosts one PyO3 type registry — killing the CIRISPersist#109
 /// cross-wheel type-identity hazard the one-wheel exists to remove.
 ///
+/// v21.7.0 (CIRISPersist#519 / CIRISConformance#83) — run persist's
+/// manifest-driven field-conformance harness against the LIVE wheel and
+/// return the violations (an empty list ⇒ conformant). This is the surface a
+/// shared CIRISConformance harness calls to drive the REAL persist wheel
+/// against exactly the `field_processor_matrix` fields persist is tagged to
+/// own (the "same table generates every processor's tests" pattern). Pure —
+/// no engine handle needed.
+#[pyfunction]
+fn persist_field_conformance() -> PyResult<Vec<String>> {
+    Ok(
+        match crate::federation::namespace::conformance::run_persist_field_conformance() {
+            Ok(()) => Vec::new(),
+            Err(violations) => violations,
+        },
+    )
+}
+
+/// v21.7.0 (CIRISPersist#519) — the vendored namespace-supersets manifest
+/// version (`_meta.manifest_version`), so a cross-repo harness can assert
+/// every wheel pins the byte-identical manifest cut.
+#[pyfunction]
+fn namespace_manifest_version() -> &'static str {
+    crate::federation::namespace::supersets::manifest_version()
+}
+
+/// v21.7.0 (CIRISPersist#519) — the pinned `TRANSFORM_ALGEBRA_HASH`, so a
+/// cross-repo harness can cross-check the transform-algebra cut against the
+/// other processors' pinned copies (the third manifest-hash tripod leg).
+#[pyfunction]
+fn transform_algebra_hash() -> &'static str {
+    crate::federation::transform::TRANSFORM_ALGEBRA_HASH
+}
+
 /// Mirrors `ciris-lens-core`'s `pub fn register`. The `#[pymodule]` entry
 /// point below (the standalone `ciris_persist` wheel) simply delegates
 /// here, so the two paths register an identical surface.
@@ -29668,6 +29701,12 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // reset; the deterministic teardown door for consumer test
     // suites and the cohabitation epic.
     m.add_function(pyo3::wrap_pyfunction!(reset_engine, m)?)?;
+    // v21.7.0 (CIRISPersist#519 / CIRISConformance#83) — the manifest-driven
+    // field-conformance surface: a shared harness drives the real wheel
+    // against the fields persist is tagged to own in the shared table.
+    m.add_function(pyo3::wrap_pyfunction!(persist_field_conformance, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(namespace_manifest_version, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(transform_algebra_hash, m)?)?;
     // v0.5.4 (CIRISPersist#29) — feature-gated panic injector for the
     // Python regression suite. Off in release wheels.
     #[cfg(feature = "test-panic")]
