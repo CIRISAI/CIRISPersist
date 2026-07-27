@@ -985,13 +985,19 @@ pub struct Attestation {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subject_key_ids: Vec<String>,
     /// v3.7.0 (CIRISPersist#146, CEG 0.6 §3.2.3). Per-rule audit
-    /// metadata: which of the 4 admission rules admitted this
-    /// withdraws.
+    /// metadata: which admission rule admitted this withdraws.
     ///
     /// `Some(1)` — producer self-revocation (`issuer.key_id == T.attesting_key_id`).
     /// `Some(2)` — subject self-revocation (`issuer.key_id ∈ T.subject_key_ids`, CEG 0.6 NEW).
     /// `Some(3)` — `delegates_to` proxy chain with `consent_revocation` scope (CEG 0.6 NEW).
     /// `Some(4)` — `delegates_to` chain via any of 1-3.
+    /// `Some(5)` — v21.8.0 (CIRISPersist#519, CC 3.2) — the **ownerless-lock
+    ///             reclaim** exception: a third-party `withdraws` against a
+    ///             LIVE owner-binding, admitted ONLY when the incumbent is
+    ///             provably-abandoned (`fresh_as_of` floor stale) AND an m-of-n
+    ///             reclaim quorum verifies. Ships INERT (refused until a
+    ///             CIRISConstitution#43 policy is injected). See
+    ///             [`crate::federation::ownership_reclaim`].
     /// `None`    — non-withdraws row, or pre-v3.8.0 withdraws written
     ///             before the admission gate landed.
     #[serde(default, skip_serializing_if = "Option::is_none")]

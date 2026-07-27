@@ -5,6 +5,56 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.8.0] — 2026-07-27 — #519: the ownerless-lock reclaim mechanism (CC 3.2 "no permanent ownerless lock" MUST), ACTIVATED with a conservative default
+
+### Added — `federation::ownership_reclaim` (the highest-value #519 found defect)
+
+CC 3.2 mandates "No permanent ownerless lock (MUST)", but there was **no wire
+path**: ownership is a `delegates_to(U → node)` owner-binding, CC 2.4.1.1 forbids
+a third party withdrawing a LIVE incumbent, and there was zero reclaim /
+provably-dead mechanism — so an owner who dies or loses custody locked the node
+forever. This adds the sanctioned reclaim exception, built on the v21.6.0
+`fresh_as_of` floor as the "provably-dead" substrate (the stewardship covenant
+made mechanical).
+
+`check_ownership_reclaim_admission(dir, reclaim_row, policy, now) -> {NotAReclaim
+| Admit | Refused}`: a third-party `withdraws` against a live owner-binding is
+admitted ONLY when **both** hold — (a) the incumbent is provably-abandoned AND
+(b) a verified m-of-n reclaim quorum. The quorum reuses
+`ciris_verify_core::threshold::verify_quorum_policy` (the primitive that confers
+`canonical`/`infra:attest`), roster resolved from persist's OWN registered keys
+(never a caller-supplied anchor), fail-closed on a misconfigured threshold — a
+capability grant is m-of-n, never a 1-of-N escape hatch. The co-signed bytes are
+a reconstructable reclaim-assertion (target/incumbent/node/reclaimer), not the
+reclaim row's own envelope — sidestepping the signature-covers-itself fixed point.
+
+**Provable abandonment is FAIL-SAFE.** An ABSENT freshness floor is NOT
+abandonment — absence of a signed floor is absence of evidence, not evidence of
+death. Only a floor that was PRESENT and then went stale past the window is
+proof. This is what makes activation safe before any touch-claim producer
+exists: today every node's floor is absent, so ZERO nodes are reclaimable; a node
+becomes reclaimable only after it has demonstrably emitted freshness and then
+gone dark. (Consequence, tracked: a node whose owner NEVER emitted a floor stays
+unreclaimable until ownership-establishment bootstraps an initial touch — a
+follow-up; the MUST is satisfied for the touched-then-dark case, the real-world
+one once producers ship.)
+
+**ACTIVATED with a conservative default** (`ReclaimPolicy::humanity_accord_default`):
+reclaim authority = the HUMANITY_ACCORD holder quorum (the body that already
+holds the kill-switch — the least-arbitrary reclaim authority; strict-majority
+threshold, roster resolved from persist's own registered accord holders) + a
+**180-day** abandonment window. So the CC 3.2 MUST is satisfied *by mechanism*
+today rather than left inert. **CIRISConstitution#43 ratifies/refines the two
+parameters (the window + the authority)** — persist ships a safe default, CC
+sets the ratified values. An empty accord roster yields an unmeetable threshold
+⇒ every reclaim still refused (fail-closed). Wired as one exception in
+`check_withdraws_admission` (rule 5 on `withdraws_admission_rule`); all
+pre-existing withdraws/owner-binding tests stay green — a live/absent-floor owner
+is never reclaimable, so ordinary admission is unaffected. Witnesses:
+refuses-without-policy, admits-abandoned(present-stale)-owner-with-quorum,
+refuses-live-owner, **refuses-absent-floor (fail-safe)**, refuses-insufficient-quorum,
+non-reclaim-noop, and a default-parameter lock (sqlite + a live-pg matrix).
+
 ## [21.7.0] — 2026-07-27 — #519 wave 1: invariant-registry admission (item 3) + transform-serve generalization (item 2a-ii) + the field-conformance FFI surface
 
 ### Added — invariant-registry admission enforcement (#519 item 3)

@@ -3234,8 +3234,50 @@ pub async fn check_withdraws_admission(
     {
         return Ok(None);
     }
-    let rule = resolve_withdraws_admission_rule(directory, &row.attesting_key_id, &target).await?;
-    Ok(Some(rule))
+    match resolve_withdraws_admission_rule(directory, &row.attesting_key_id, &target).await {
+        Ok(rule) => Ok(Some(rule)),
+        Err(err) => {
+            // CIRISPersist#519 — the CC 3.2 "no permanent ownerless lock"
+            // reclaim MECHANISM ([`crate::federation::ownership_reclaim`]).
+            // None of rules 1-4 gave a THIRD PARTY authority to withdraw a
+            // LIVE `ownership:*` owner-binding — correct, and it MUST stay
+            // the default (a node whose owner is merely quiet is not up
+            // for grabs). But CC 3.2 also forbids a PERMANENT ownerless
+            // lock: an owner who is PROVABLY dead (their signed freshness
+            // floor has lapsed) must be reclaimable by a verified quorum.
+            // `check_ownership_reclaim_admission` is that sanctioned
+            // exception. v21.8.0 (CIRISPersist#519 activation) — persist now
+            // ships an ACTIVATED conservative DEFAULT policy (the
+            // HUMANITY_ACCORD holder quorum, resolved from persist's OWN
+            // registered accord holders, + a 180-day window) rather than the
+            // inert `None`, so the CC 3.2 "no permanent ownerless lock" MUST is
+            // satisfied by mechanism today; CIRISConstitution#43 ratifies/refines
+            // the window + authority. Activation is SAFE ahead of touch-claim
+            // producers because the abandonment test is fail-safe (an ABSENT
+            // freshness floor is never abandonment) — no node is reclaimable
+            // until it has demonstrably emitted freshness and then gone dark, so
+            // the pre-producer mesh (every floor absent) has ZERO reclaimable
+            // nodes. An empty accord roster (no holders resolved) yields an
+            // unmeetable threshold ⇒ every reclaim still `Refused` (fail-closed).
+            let reclaim_policy = super::ownership_reclaim::ReclaimPolicy::humanity_accord_default(
+                accord_holder_roster_key_ids(),
+            );
+            if super::ownership_reclaim::check_ownership_reclaim_admission(
+                directory,
+                row,
+                Some(&reclaim_policy),
+                chrono::Utc::now(),
+            )
+            .await?
+                == super::ownership_reclaim::ReclaimVerdict::Admit
+            {
+                return Ok(Some(
+                    super::ownership_reclaim::RECLAIM_WITHDRAWS_ADMISSION_RULE,
+                ));
+            }
+            Err(err)
+        }
+    }
 }
 
 // ─── v8.7.1 — §11.10 FULL moderation enforcement (CEG RC24/RC25/RC26) ───
