@@ -37889,6 +37889,17 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn touch_claim_nofm_cosigned_tally_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::freshness::test_support::run_nofm_cosigned_tally(
+            &backend,
+            "sqlite-touch-nofm",
+        )
+        .await;
+    }
+
     /// #446 — the occurrence→route composite-projection matrix on sqlite.
     /// Shares the assertion body with the memory + pg parity tests.
     #[tokio::test]

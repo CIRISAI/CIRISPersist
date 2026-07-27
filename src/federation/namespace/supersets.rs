@@ -261,6 +261,54 @@ pub fn invariant_registry() -> &'static serde_json::Value {
 mod tests {
     use super::*;
 
+    /// v21.10.0 (CIRISPersist#519 b5 / item 6) — the evidence loop's persist
+    /// half: every `path#symbol` in the materialized `evidence/cc_impl.tsv`
+    /// that names a persist `src/…` path MUST resolve in the current source
+    /// (the constitution's `check_evidence.py` enforces this cross-repo; this
+    /// is the in-repo mirror that fails the build the moment a cited processor
+    /// is renamed or deleted — the drift the a2 `promote_attestation_with_strips`
+    /// rename would otherwise have left stale).
+    #[test]
+    fn evidence_cc_impl_pointers_resolve() {
+        let tsv = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/evidence/cc_impl.tsv"));
+        let mut rows = 0usize;
+        for line in tsv.lines() {
+            if line.starts_with('#') || line.starts_with("decimal_id") || line.trim().is_empty() {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            assert_eq!(
+                cols.len(),
+                5,
+                "cc_impl.tsv row must have 5 columns: {line:?}"
+            );
+            rows += 1;
+            let ps = cols[3];
+            let Some((path, sym)) = ps.split_once('#') else {
+                panic!("evidence pointer missing #symbol: {ps:?}");
+            };
+            // Only persist-owned `src/…` paths are resolvable here (external
+            // crates like ciris-verify-core resolve at their own build).
+            if !path.starts_with("src/") {
+                continue;
+            }
+            let full = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), path);
+            let src = std::fs::read_to_string(&full)
+                .unwrap_or_else(|e| panic!("evidence path {path} unreadable: {e}"));
+            // Resolve the bare symbol (strip any `Type::` prefix) as a word.
+            let bare = sym.rsplit("::").next().unwrap_or(sym);
+            assert!(
+                src.contains(sym) || src.contains(bare),
+                "evidence pointer {ps} does not resolve in {path} — a cited processor was \
+                 renamed/removed (re-materialize evidence/cc_impl.tsv)"
+            );
+        }
+        assert!(
+            rows >= 40,
+            "expected persist's ~43 evidence rows, got {rows}"
+        );
+    }
+
     /// Drift gate: the compiled-in manifest is the exact cut the consts pin,
     /// and it is coherently seeded from the registry cut persist vendors.
     #[test]

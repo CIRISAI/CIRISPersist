@@ -18847,6 +18847,21 @@ mod tests {
         crate::federation::freshness::test_support::run_round_trip(&backend, &suffix).await;
     }
 
+    /// v21.10.0 (#519 b2) — the NOfMCosigned tally on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn touch_claim_nofm_cosigned_tally_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::freshness::test_support::run_nofm_cosigned_tally(&backend, &suffix)
+            .await;
+    }
+
     /// #446 — the occurrence→route composite-projection matrix on postgres.
     /// Shares the assertion body with the memory + sqlite parity tests.
     #[tokio::test]
