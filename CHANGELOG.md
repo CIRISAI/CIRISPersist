@@ -5,6 +5,47 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.7.0] — 2026-07-27 — #519 wave 1: invariant-registry admission (item 3) + transform-serve generalization (item 2a-ii) + the field-conformance FFI surface
+
+### Added — invariant-registry admission enforcement (#519 item 3)
+
+`federation::invariant` — a typed reader over the vendored `invariant_registry`
+(571 invariants / 104 CC-3.1 families) + admission-time enforcement of the
+persist-ownable subset, wired at the `check_reserved_prefix_admission`
+chokepoint. The load-bearing deliverable is the **consistency witness**
+`manifest_reserved_invariants_match_persist_admission`: it EXECUTES persist's
+real reserved-prefix gate against all 15 identity-type-reserved families the
+manifest declares and confirms both directions (wrong emitter rejected, right
+emitter admitted) — so the manifest and the hardcoded admission code provably
+cannot drift. The cross-check found every reserved family already enforced
+EXCEPT one genuine gap, now closed: `health:liveness:{version}` self-emission
+(`attester == attested`) is rejected, mirroring the existing capacity/age
+self-emission arms (the manifest's own `placement_fields_required` proposed
+exactly this fix). Consumer-applied invariants (aggregation math,
+witness-diversity, `testimonial_witness` never-sole-evidence) are documented as
+consumer-owned, not faked.
+
+### Changed — promotion applies the full declared transform pipeline (#519 item 2a-ii)
+
+`Engine::promote_attestation_with_strips` → `promote_attestation_with_transforms`:
+the consent-driven federation-tier promotion now builds a
+`transform::TransformPipeline` from the covering grants' restrictions (via the
+single-sourced `consent_grammar::to_transform_ops`) and `apply_all`s it, instead
+of a bespoke strip loop — so `strip_field` is one op in the closed algebra, and
+the path is ready for the other declared shape ops. Behaviour for a strip-only
+grant is byte-identical (the #510 witnesses stay green unmodified); the
+protected-member refusal (`dimension`/`trace_id` never stripped) rides through
+`apply`. The grammar wire vocabulary is UNCHANGED — no new `RestrictionOp`
+variants, `CONSENT_GRAMMAR_HASH` unmoved (the minimal, non-speculative choice).
+
+### Added — the field-conformance FFI surface (#519 / CIRISConformance#83)
+
+Three module-level PyO3 functions so a shared CIRISConformance harness can drive
+the REAL persist wheel against the fields persist is tagged to own in the
+`field_processor_matrix` (the "same table generates every processor's tests"
+pattern, whose reference exemplar shipped in v21.6.0):
+`persist_field_conformance() -> [str]` (violations; empty = conformant),
+`namespace_manifest_version() -> str`, `transform_algebra_hash() -> str`.
 ## [21.6.0] — 2026-07-27 — the total transform algebra (#519 item 2a-ii) + the signed `fresh_as_of` freshness floor (#519 item 2a-iii)
 
 Two #519 subsystems, both persist-half, built on the v21.5.0 vendored manifest.
