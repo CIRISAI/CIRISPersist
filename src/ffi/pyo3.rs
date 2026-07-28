@@ -3432,6 +3432,49 @@ impl PyEngine {
                 .map_err(federation_err_to_py)?;
             let dict = PyDict::new(py);
             dict.set_item("promoted", report.promoted)?;
+            dict.set_item("rescoped", report.rescoped)?;
+            dict.set_item("skipped", report.skipped)?;
+            Ok(dict)
+        })
+    }
+
+    /// v21.12.0 (CIRISPersist#530) — the REPAIR sweep: correct stranded
+    /// `(self|family, federation)` rows to their covering grant's
+    /// federation-visible audience. Returns
+    /// `{"promoted": 0, "rescoped": N, "skipped": M}` — the second motion
+    /// `promote_consented_backlog` structurally cannot perform (its
+    /// `WHERE tier = 'local'` page source excludes already-promoted rows).
+    fn repair_stranded_scope_backlog<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let local_signer = self.local_signer.clone().ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "repair_stranded_scope_backlog requires a local software signing identity",
+                )
+            })?;
+            let runtime = self.runtime.clone();
+            let backend = self.backend.clone();
+            let signer = self.signer.clone();
+            let report = py
+                .detach(move || {
+                    let backend = match &backend {
+                        #[cfg(feature = "postgres")]
+                        BackendDispatch::Postgres(b) => {
+                            crate::engine::BackendDispatch::Postgres(b.clone())
+                        }
+                        #[cfg(feature = "sqlite")]
+                        BackendDispatch::Sqlite(b) => {
+                            crate::engine::BackendDispatch::Sqlite(b.clone())
+                        }
+                    };
+                    let engine =
+                        crate::Engine::from_shared_with_local(backend, signer, Some(local_signer));
+                    runtime.block_on(async move { engine.repair_stranded_scope_backlog().await })
+                })
+                .map_err(federation_err_to_py)?;
+            let dict = PyDict::new(py);
+            dict.set_item("promoted", report.promoted)?;
+            dict.set_item("rescoped", report.rescoped)?;
             dict.set_item("skipped", report.skipped)?;
             Ok(dict)
         })

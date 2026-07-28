@@ -3776,6 +3776,43 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         })
     }
 
+    /// v21.12.0 (CIRISPersist#530) — the repair sweep's page source: the
+    /// stranded rows (`tier = 'federation'` with a suppressed
+    /// `cohort_scope`). Structural twin of `list_local_tier_attestations`;
+    /// only the `WHERE` predicate differs (`tier = 'federation'` +
+    /// `cohort_scope IN ('self','family')` — the two
+    /// `suppresses_holds_bytes` scopes, spelled literally to keep the
+    /// index-friendly SQL self-contained).
+    async fn list_stranded_federation_attestations(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let conn = self.conn.clone();
+        let after = after_attestation_id.map(str::to_owned);
+        let limit = i64::from(limit);
+        (move || -> Result<Vec<crate::federation::Attestation>, rusqlite::Error> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
+                    weight, asserted_at, expires_at, attestation_envelope, \
+                    original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                 FROM federation_attestations \
+                 WHERE tier = 'federation' AND cohort_scope IN ('self', 'family') \
+                   AND (?1 IS NULL OR attestation_id > ?1) \
+                 ORDER BY attestation_id ASC LIMIT ?2",
+            )?;
+            let rows =
+                stmt.query_map(rusqlite::params![after, limit], sqlite_row_to_attestation)?;
+            rows.collect()
+        })()
+        .map_err(|e| {
+            crate::federation::Error::Backend(format!("list_stranded_federation_attestations: {e}"))
+        })
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the promote-on-consent
     /// write-back: stamp a new `cohort_scope` onto an existing row
     /// (validated against the closed set) and recompute

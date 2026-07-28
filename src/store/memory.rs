@@ -2525,6 +2525,37 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         Ok(rows)
     }
 
+    /// v21.12.0 (CIRISPersist#530) — the repair sweep's page source: the
+    /// stranded rows (`tier = 'federation'` with a suppressed
+    /// `cohort_scope`). Twin of `list_local_tier_attestations`; the
+    /// predicate uses [`crate::federation::types::cohort_scope::suppresses_holds_bytes`]
+    /// (`self`/`family`) directly rather than a literal set so the memory
+    /// backend can never drift from the taxonomy the SQL backends spell out.
+    async fn list_stranded_federation_attestations(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        use crate::federation::types::{attestation_tier, cohort_scope};
+        let state = self.state.lock().expect("memory backend lock");
+        let mut rows: Vec<_> = state
+            .federation_attestations
+            .iter()
+            .filter(|a| {
+                a.tier == attestation_tier::FEDERATION
+                    && cohort_scope::suppresses_holds_bytes(&a.cohort_scope)
+                    && match after_attestation_id {
+                        Some(after) => a.attestation_id.as_str() > after,
+                        None => true,
+                    }
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the promote-on-consent
     /// write-back: validate against the closed cohort_scope set, stamp
     /// it, and recompute `persist_row_hash`.
@@ -7388,6 +7419,72 @@ mod tests {
         // v9.0.0 — sign the as-built envelope (CC 5.3.2.4.3.1).
         resign_fix(&mut row);
         row
+    }
+
+    /// v21.12.0 (CIRISPersist#530) — the repair page source surfaces ONLY
+    /// the stranded rows: `tier = 'federation'` AND a suppressed
+    /// (`self`/`family`) `cohort_scope`. Already-visible federation/community
+    /// scopes and any local-tier row are excluded; results page in
+    /// `attestation_id` ASC with a working keyset cursor. Rows are seeded
+    /// straight into state — a stranded row exists precisely because it
+    /// bypassed the placement machinery, so the read path must be provable
+    /// against an arbitrary stored shape.
+    #[tokio::test]
+    async fn list_stranded_federation_attestations_filters_suppressed_scopes_530() {
+        use crate::federation::types::{attestation_tier, cohort_scope};
+        let be = MemoryBackend::new();
+        for (id, tier, scope) in [
+            ("s-self", attestation_tier::FEDERATION, cohort_scope::SELF),
+            (
+                "s-family",
+                attestation_tier::FEDERATION,
+                cohort_scope::FAMILY,
+            ),
+            (
+                "v-fed",
+                attestation_tier::FEDERATION,
+                cohort_scope::FEDERATION,
+            ),
+            (
+                "v-comm",
+                attestation_tier::FEDERATION,
+                cohort_scope::COMMUNITY,
+            ),
+            ("l-self", attestation_tier::LOCAL, cohort_scope::SELF),
+        ] {
+            let mut a = fix_attestation(id, "k530", "k530", "k530");
+            a.tier = tier.to_string();
+            a.cohort_scope = scope.to_string();
+            resign_fix(&mut a);
+            be.state
+                .lock()
+                .expect("memory backend lock")
+                .federation_attestations
+                .push(a);
+        }
+
+        let ids: Vec<String> = be
+            .list_stranded_federation_attestations(None, 100)
+            .await
+            .expect("page")
+            .into_iter()
+            .map(|a| a.attestation_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["s-family".to_string(), "s-self".to_string()],
+            "only suppressed federation-tier rows, ASC by attestation_id"
+        );
+
+        // keyset cursor resumes strictly after the given id.
+        let after: Vec<String> = be
+            .list_stranded_federation_attestations(Some("s-family"), 100)
+            .await
+            .expect("page 2")
+            .into_iter()
+            .map(|a| a.attestation_id)
+            .collect();
+        assert_eq!(after, vec!["s-self".to_string()]);
     }
 
     // ── v17.4.0 (FSD-005 Appendix C) — scores read surface parity ──
