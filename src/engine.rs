@@ -276,6 +276,106 @@ pub struct SelfAtLoginOutcome {
     pub transport_destinations_registered: usize,
 }
 
+/// A LIVE egress grant that survived the fail-closed parse + the
+/// direction/kinds/expiry pre-filter — the "still counts" unit shared by
+/// BOTH consent-repair motions ([`Engine::promote_consented_backlog`] and
+/// [`Engine::repair_stranded_scope_backlog`], CIRISPersist#530). Lifted to
+/// module scope precisely so the two motions resolve a row's placement
+/// through ONE code path and can never drift on the audience/restriction
+/// rules.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+struct ConsentActiveGrant {
+    attestation_id: String,
+    policy: crate::federation::consent_grammar::ConsentTransferPolicy,
+}
+
+/// The placement a row's covering grants resolve to: the chosen audience
+/// (via the P1 determinism rule) plus the restriction→transform pipeline.
+/// The promote motion uses BOTH (transform-then-sign at the tier flip);
+/// the repair motion uses only `chosen_audience` (a stranded row is
+/// already at federation tier — repairing it is a pure placement
+/// correction, never a re-transform of already-federated bytes).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+struct RowPlacement {
+    chosen_audience: String,
+    transform_pipeline: crate::federation::transform::TransformPipeline,
+}
+
+/// Resolve the placement a single row's COVERING grants dictate, or `None`
+/// if no live grant's own prefixes cover the row's dimension. Pure over
+/// `(active, prefixes, row)` — the single source of the audience-resolution
+/// (P1 determinism) + restriction-union rules for both #530 motions.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn resolve_row_placement(
+    active: &[ConsentActiveGrant],
+    prefixes: &[String],
+    row: &crate::federation::Attestation,
+) -> Option<RowPlacement> {
+    use crate::federation::{consent_grammar, types::cohort_scope};
+
+    let dimension = crate::federation::admission::envelope_dimension(&row.attestation_envelope)?;
+    if !consent_grammar::covers(prefixes, dimension) {
+        return None;
+    }
+
+    // Re-derive the SPECIFIC covering grants for this row — the pre-filter
+    // union only cheaply gates the page walk; audience/restriction
+    // composition must come from grants whose OWN prefixes actually cover
+    // this dimension.
+    let covering: Vec<&ConsentActiveGrant> = active
+        .iter()
+        .filter(|g| consent_grammar::covers(&g.policy.attestation_prefixes, dimension))
+        .collect();
+    if covering.is_empty() {
+        // Defensive — the union pre-filter implies at least one active
+        // grant covers, but never trust that implication over a re-check.
+        return None;
+    }
+
+    // ── audience resolution (the P1 determinism rule) ──
+    let all_same_audience = covering
+        .iter()
+        .all(|g| g.policy.audience == covering[0].policy.audience);
+    let chosen_audience: String = if all_same_audience {
+        covering[0].policy.audience.clone()
+    } else if covering
+        .iter()
+        .all(|g| g.policy.audience == cohort_scope::FEDERATION)
+    {
+        cohort_scope::FEDERATION.to_string()
+    } else {
+        let mut sorted = covering.clone();
+        sorted.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
+        tracing::warn!(
+            attestation_id = %row.attestation_id,
+            covering_grants = ?sorted
+                .iter()
+                .map(|g| (g.attestation_id.clone(), g.policy.audience.clone()))
+                .collect::<Vec<_>>(),
+            "consent sweep: covering grants disagree on audience; picking the first \
+             by attestation_id (P1 determinism rule — CIRISPersist#510 issue refines this)"
+        );
+        sorted[0].policy.audience.clone()
+    };
+
+    // ── restriction union → transform pipeline (CIRISPersist#519 item
+    //    2a-ii — single-sourced through `consent_grammar::to_transform_ops`,
+    //    not a bespoke strip-only loop; `RecipientCapability` restrictions
+    //    contribute no pipeline stage). ──
+    let mut restrictions: Vec<consent_grammar::RestrictionOp> = Vec::new();
+    for g in &covering {
+        restrictions.extend(g.policy.restrictions.iter().cloned());
+    }
+    let transform_pipeline = crate::federation::transform::TransformPipeline(
+        consent_grammar::to_transform_ops(&restrictions),
+    );
+
+    Some(RowPlacement {
+        chosen_audience,
+        transform_pipeline,
+    })
+}
+
 impl Engine {
     /// Construct an Engine with a pre-loaded
     /// [`LocalSigner`](crate::signing::LocalSigner) `Arc` plus a
@@ -2606,78 +2706,14 @@ impl Engine {
     pub async fn promote_consented_backlog(
         &self,
     ) -> Result<crate::federation::ConsentSweepReport, crate::federation::Error> {
-        use crate::federation::{consent_grammar, types::cohort_scope, Error, FederationDirectory};
-
-        /// A LIVE grant that survived the fail-closed parse + the
-        /// direction/kinds/expiry pre-filter — this sweep's unit of
-        /// "still counts".
-        struct ActiveGrant {
-            attestation_id: String,
-            policy: consent_grammar::ConsentTransferPolicy,
-        }
+        use crate::federation::FederationDirectory;
 
         let mut report = crate::federation::ConsentSweepReport::default();
 
-        let self_key = self
-            .local_derived_key_id()
-            .await
-            .map_err(|e| Error::Backend(format!("promote_consented_backlog derive key_id: {e}")))?;
-
-        let grants = match &self.backend {
-            #[cfg(feature = "postgres")]
-            BackendDispatch::Postgres(b) => b.list_live_consent_grants_by(&self_key).await?,
-            #[cfg(feature = "sqlite")]
-            BackendDispatch::Sqlite(b) => b.list_live_consent_grants_by(&self_key).await?,
-        };
-
-        let now = chrono::Utc::now();
-        let mut active: Vec<ActiveGrant> = Vec::new();
-        for grant in &grants {
-            let policy = match consent_grammar::parse_grant_payload(&grant.attestation_envelope) {
-                Ok(p) => p,
-                Err(reason) => {
-                    tracing::warn!(
-                        attestation_id = %grant.attestation_id,
-                        reason = %reason,
-                        "promote_consented_backlog: live grant failed the closed #510 grammar; \
-                         treating it as covering nothing (fail-closed)"
-                    );
-                    continue;
-                }
-            };
-            if policy.direction != consent_grammar::Direction::Egress {
-                continue;
-            }
-            if !policy.kinds.iter().any(|k| k == "Attestation") {
-                continue;
-            }
-            if let Some(valid_until) = policy.valid_until {
-                if valid_until <= now {
-                    continue;
-                }
-            }
-            if let Some(expires_at) = grant.expires_at {
-                if expires_at <= now {
-                    continue;
-                }
-            }
-            active.push(ActiveGrant {
-                attestation_id: grant.attestation_id.clone(),
-                policy,
-            });
-        }
-        if active.is_empty() {
+        let (active, prefixes) = self.load_active_egress_grants().await?;
+        if active.is_empty() || prefixes.is_empty() {
             return Ok(report);
         }
-
-        let mut prefix_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for g in &active {
-            prefix_set.extend(g.policy.attestation_prefixes.iter().cloned());
-        }
-        if prefix_set.is_empty() {
-            return Ok(report);
-        }
-        let prefixes: Vec<String> = prefix_set.into_iter().collect();
 
         let mut cursor: Option<String> = None;
         loop {
@@ -2701,69 +2737,16 @@ impl Engine {
             cursor = page.last().map(|r| r.attestation_id.clone());
 
             for row in &page {
-                let Some(dimension) =
-                    crate::federation::admission::envelope_dimension(&row.attestation_envelope)
-                else {
+                // Resolve the covering grants' placement through the SAME
+                // path the repair motion uses (CIRISPersist#530) — one
+                // audience/restriction resolver, no drift.
+                let Some(placement) = resolve_row_placement(&active, &prefixes, row) else {
                     continue;
                 };
-                if !consent_grammar::covers(&prefixes, dimension) {
-                    continue;
-                }
-
-                // Re-derive the SPECIFIC covering grants for this row —
-                // the pre-filter union only cheaply gates the page walk;
-                // audience/restriction composition must come from grants
-                // whose OWN prefixes actually cover this dimension.
-                let covering: Vec<&ActiveGrant> = active
-                    .iter()
-                    .filter(|g| consent_grammar::covers(&g.policy.attestation_prefixes, dimension))
-                    .collect();
-                if covering.is_empty() {
-                    // Defensive — the union pre-filter implies at least
-                    // one active grant covers, but never trust that
-                    // implication over a direct re-check.
-                    continue;
-                }
-
-                // ── audience resolution (the P1 determinism rule) ──
-                let all_same_audience = covering
-                    .iter()
-                    .all(|g| g.policy.audience == covering[0].policy.audience);
-                let chosen_audience: String = if all_same_audience {
-                    covering[0].policy.audience.clone()
-                } else if covering
-                    .iter()
-                    .all(|g| g.policy.audience == cohort_scope::FEDERATION)
-                {
-                    cohort_scope::FEDERATION.to_string()
-                } else {
-                    let mut sorted = covering.clone();
-                    sorted.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
-                    tracing::warn!(
-                        attestation_id = %row.attestation_id,
-                        covering_grants = ?sorted
-                            .iter()
-                            .map(|g| (g.attestation_id.clone(), g.policy.audience.clone()))
-                            .collect::<Vec<_>>(),
-                        "promote_consented_backlog: covering grants disagree on audience; \
-                         picking the first by attestation_id (P1 determinism rule — CIRISPersist#510 \
-                         issue refines this)"
-                    );
-                    sorted[0].policy.audience.clone()
-                };
-
-                // ── restriction union → transform pipeline (CIRISPersist#519
-                //    item 2a-ii — single-sourced through
-                //    `consent_grammar::to_transform_ops`, not a bespoke
-                //    strip-only loop; `RecipientCapability` restrictions
-                //    contribute no pipeline stage, exactly as before). ──
-                let mut restrictions: Vec<consent_grammar::RestrictionOp> = Vec::new();
-                for g in &covering {
-                    restrictions.extend(g.policy.restrictions.iter().cloned());
-                }
-                let transform_pipeline = crate::federation::transform::TransformPipeline(
-                    consent_grammar::to_transform_ops(&restrictions),
-                );
+                let RowPlacement {
+                    chosen_audience,
+                    transform_pipeline,
+                } = placement;
 
                 // v21.5.0 (CIRISPersist#519) — the placement (the covering
                 // grant's audience) is now CARRIED by the promotion primitive
@@ -2797,6 +2780,200 @@ impl Engine {
                             attestation_id = %row.attestation_id,
                             error = %e,
                             "promote_consented_backlog: attestation_promote failed; skipping"
+                        );
+                        report.skipped += 1;
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Load this node's LIVE egress consent grants → `(active, prefixes)`:
+    /// the fail-closed-parsed grants that survived the
+    /// direction=Egress / kinds∋Attestation / not-expired pre-filter, plus
+    /// the deduped union of their `attestation_prefixes`. The shared front
+    /// half of BOTH #530 consent-repair motions — extracted so
+    /// `promote_consented_backlog` and `repair_stranded_scope_backlog`
+    /// select the same "still counts" grant set.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn load_active_egress_grants(
+        &self,
+    ) -> Result<(Vec<ConsentActiveGrant>, Vec<String>), crate::federation::Error> {
+        use crate::federation::{consent_grammar, Error, FederationDirectory};
+
+        let self_key = self
+            .local_derived_key_id()
+            .await
+            .map_err(|e| Error::Backend(format!("load_active_egress_grants derive key_id: {e}")))?;
+
+        let grants = match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.list_live_consent_grants_by(&self_key).await?,
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.list_live_consent_grants_by(&self_key).await?,
+        };
+
+        let now = chrono::Utc::now();
+        let mut active: Vec<ConsentActiveGrant> = Vec::new();
+        for grant in &grants {
+            let policy = match consent_grammar::parse_grant_payload(&grant.attestation_envelope) {
+                Ok(p) => p,
+                Err(reason) => {
+                    tracing::warn!(
+                        attestation_id = %grant.attestation_id,
+                        reason = %reason,
+                        "consent sweep: live grant failed the closed #510 grammar; \
+                         treating it as covering nothing (fail-closed)"
+                    );
+                    continue;
+                }
+            };
+            if policy.direction != consent_grammar::Direction::Egress {
+                continue;
+            }
+            if !policy.kinds.iter().any(|k| k == "Attestation") {
+                continue;
+            }
+            if let Some(valid_until) = policy.valid_until {
+                if valid_until <= now {
+                    continue;
+                }
+            }
+            if let Some(expires_at) = grant.expires_at {
+                if expires_at <= now {
+                    continue;
+                }
+            }
+            active.push(ConsentActiveGrant {
+                attestation_id: grant.attestation_id.clone(),
+                policy,
+            });
+        }
+
+        let mut prefix_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for g in &active {
+            prefix_set.extend(g.policy.attestation_prefixes.iter().cloned());
+        }
+        Ok((active, prefix_set.into_iter().collect()))
+    }
+
+    /// v21.12.0 (CIRISPersist#530) — the REPAIR sweep: the second motion
+    /// that [`Self::promote_consented_backlog`] structurally cannot perform.
+    ///
+    /// A row can reach `(cohort_scope = self|family, tier = federation)` —
+    /// past the tier gate, covered by a live grant, yet **never offered**,
+    /// because the replication offer filter keys on `cohort_scope` and the
+    /// suppressed scopes project `SelfOwn` (no directory advertisement).
+    /// It gets there by being sealed+promoted *before* a covering grant
+    /// existed, or through a pre-#519 tier-only promotion that flipped tier
+    /// without carrying the placement. The promote sweep pages `WHERE tier
+    /// = 'local'`; a stranded row is `federation`, so its self-limiting page
+    /// source excludes it **by construction** — re-running the promote
+    /// sweep at any cadence, forever, never revisits it. The property that
+    /// makes that sweep safe to call unconditionally is exactly the one that
+    /// makes it unable to repair. This is the missing motion.
+    ///
+    /// It pages [`crate::federation::FederationDirectory::list_stranded_federation_attestations`]
+    /// (`tier = 'federation'` ∧ suppressed scope), resolves each row's
+    /// covering-grant placement through the SAME
+    /// [`resolve_row_placement`] the promote sweep uses, and — **only when
+    /// the grant's resolved audience is itself federation-visible and
+    /// differs from the row's current suppressed scope** — corrects the
+    /// placement in place via
+    /// [`crate::federation::FederationDirectory::set_attestation_cohort_scope`].
+    ///
+    /// The direction is strictly toward MORE visibility:
+    /// - A grant whose audience is itself `self`/`family`
+    ///   ([`cohort_scope::suppresses_holds_bytes`](crate::federation::types::cohort_scope::suppresses_holds_bytes))
+    ///   means the row's invisibility MATCHES consent — it is not stranded;
+    ///   the repair skips it (never narrows, never re-mints the incoherent
+    ///   `(federation, self)` a demotion would create).
+    /// - No row covered by no live grant is touched.
+    ///
+    /// This is a PURE placement correction — the row is already at
+    /// federation tier, so there is no tier flip and no re-signing of
+    /// already-federated bytes (`set_attestation_cohort_scope` recomputes
+    /// only `persist_row_hash`; `cohort_scope` is a row attribute outside
+    /// the signed envelope, so the scrub signature stays valid). Restriction
+    /// transforms are NOT re-applied here — they are baked at promotion
+    /// time; a row that reached federation tier already carries whatever
+    /// transform its promotion applied. Idempotent: a second run with the
+    /// same grants re-scopes nothing (every stranded row is now aligned).
+    ///
+    /// A re-scope `Err` on ONE row is `tracing::warn!`'d and counted in
+    /// `skipped`, never aborting the sweep; the cursor advances past each
+    /// page regardless, so one poisoned row cannot wedge the walk.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn repair_stranded_scope_backlog(
+        &self,
+    ) -> Result<crate::federation::ConsentSweepReport, crate::federation::Error> {
+        use crate::federation::{types::cohort_scope, FederationDirectory};
+
+        let mut report = crate::federation::ConsentSweepReport::default();
+
+        let (active, prefixes) = self.load_active_egress_grants().await?;
+        if active.is_empty() || prefixes.is_empty() {
+            return Ok(report);
+        }
+
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = match &self.backend {
+                #[cfg(feature = "postgres")]
+                BackendDispatch::Postgres(b) => {
+                    b.list_stranded_federation_attestations(cursor.as_deref(), 512)
+                        .await?
+                }
+                #[cfg(feature = "sqlite")]
+                BackendDispatch::Sqlite(b) => {
+                    b.list_stranded_federation_attestations(cursor.as_deref(), 512)
+                        .await?
+                }
+            };
+            if page.is_empty() {
+                break;
+            }
+            // Advance past this page regardless of per-row skips — a
+            // poisoned row must not wedge the walk.
+            cursor = page.last().map(|r| r.attestation_id.clone());
+
+            for row in &page {
+                let Some(placement) = resolve_row_placement(&active, &prefixes, row) else {
+                    continue;
+                };
+                let target = placement.chosen_audience;
+
+                // Broaden-only guard: skip if the grant's audience is itself
+                // a suppressed scope (the row's invisibility matches consent —
+                // not stranded), or already equals the row's scope (nothing to
+                // do). This is what keeps the repair from ever narrowing
+                // visibility or re-minting `(federation, self)`.
+                if cohort_scope::suppresses_holds_bytes(&target) || target == row.cohort_scope {
+                    continue;
+                }
+
+                let rescope_result = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(b) => {
+                        b.set_attestation_cohort_scope(&row.attestation_id, &target)
+                            .await
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(b) => {
+                        b.set_attestation_cohort_scope(&row.attestation_id, &target)
+                            .await
+                    }
+                };
+                match rescope_result {
+                    Ok(()) => report.rescoped += 1,
+                    Err(e) => {
+                        tracing::warn!(
+                            attestation_id = %row.attestation_id,
+                            from = %row.cohort_scope,
+                            to = %target,
+                            error = %e,
+                            "repair_stranded_scope_backlog: re-scope failed; skipping"
                         );
                         report.skipped += 1;
                     }
@@ -10243,7 +10420,7 @@ mod tests {
     /// `scores`, self-subject, `cohort_scope = self`, an inline (empty
     /// object) `trace` — the trace-dimension admission gate only checks
     /// shape, not content).
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     fn build_509_trace_input(
         derived: &str,
         trace_id: &str,
@@ -10276,7 +10453,7 @@ mod tests {
     /// `attestation_prefixes`, via `emit_attestation_self` (so it lands
     /// federation-tier, hybrid-signed, and drives the E7
     /// `consent_peer_set` projection exactly like a real node would).
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     async fn emit_509_grant(engine: &Engine, peer: &str, prefixes: &[&str]) -> String {
         let envelope = crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
             "dimension": crate::federation::consent_peer_set::DIMENSION,
@@ -10295,6 +10472,294 @@ mod tests {
             .emit_attestation_self(input)
             .await
             .expect("509 grant emits")
+    }
+
+    /// Like [`emit_509_grant`] but declares an explicit `audience` in the
+    /// payload (CIRISPersist#530 tests exercise the repair sweep's
+    /// broaden-only guard, which turns on the covering grant's resolved
+    /// audience).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    async fn emit_509_grant_audience(
+        engine: &Engine,
+        peer: &str,
+        prefixes: &[&str],
+        audience: &str,
+    ) -> String {
+        let envelope = crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+            "dimension": crate::federation::consent_peer_set::DIMENSION,
+            "subject_key_ids": [peer],
+            "payload": {
+                "grants": "replication",
+                "attestation_prefixes": prefixes,
+                "audience": audience,
+            },
+            "subject_kind": "consent_replication",
+        }))
+        .unwrap();
+        let mut input = crate::federation::EmitAttestationInput::with_envelope(
+            crate::federation::types::attestation_type::SCORES,
+            envelope,
+            crate::federation::types::cohort_scope::FEDERATION,
+        );
+        input.subject_key_ids = vec![peer.to_owned()];
+        engine
+            .emit_attestation_self(input)
+            .await
+            .expect("509 grant (with audience) emits")
+    }
+
+    /// v21.12.0 (CIRISPersist#530) — synthesize a STRANDED
+    /// `(cohort_scope=self, tier=federation)` row the way production leaves
+    /// one behind: promote a local trace to federation carrying a coherent
+    /// audience, then force its scope back to `self`. That is byte-for-byte
+    /// the state a pre-#519 tier-only promotion (tier flip without placement
+    /// carriage) or a seal-before-grant produced — past the tier gate, yet
+    /// suppressed-scope invisible to the offer filter.
+    #[cfg(feature = "sqlite")]
+    async fn strand_a_federation_self_row(
+        engine: &Engine,
+        derived: &str,
+        trace_id: &str,
+    ) -> String {
+        use crate::federation::{
+            types::{attestation_tier, cohort_scope},
+            FederationDirectory,
+        };
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        let id = sq
+            .attestation_insert_local(build_509_trace_input(derived, trace_id))
+            .await
+            .expect("insert local trace");
+        engine
+            .attestation_promote(&id, cohort_scope::FEDERATION)
+            .await
+            .expect("promote to federation");
+        // set_attestation_cohort_scope PERMITS `self` (it only validates the
+        // closed set) — that asymmetry with attestation_promote (which
+        // rejects `self`) is exactly what lets a tier-only path mint the
+        // incoherent state we are reproducing.
+        sq.set_attestation_cohort_scope(&id, cohort_scope::SELF)
+            .await
+            .expect("force scope back to self (strand it)");
+        let r = sq.get_attestation(&id).await.unwrap().expect("row");
+        assert_eq!(r.tier, attestation_tier::FEDERATION);
+        assert_eq!(r.cohort_scope, cohort_scope::SELF, "row is now stranded");
+        id
+    }
+
+    /// v21.12.0 (CIRISPersist#530) — the interlock + its repair. A stranded
+    /// `(self, federation)` row is INVISIBLE to `promote_consented_backlog`
+    /// (its `WHERE tier = 'local'` page source excludes it), so no cadence of
+    /// the promote sweep can fix it; the repair sweep — paging
+    /// `tier = 'federation'` ∧ suppressed scope — re-scopes it to the
+    /// covering grant's federation-visible audience. Idempotent thereafter.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn repair_sweep_fixes_stranded_self_row_530() {
+        use crate::federation::{
+            types::{attestation_tier, cohort_scope},
+            FederationDirectory,
+        };
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("node-530a");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "node-530a"))
+            .await
+            .expect("seed key");
+
+        // A row sealed+promoted BEFORE any covering grant → stranded.
+        let trace_id = strand_a_federation_self_row(&engine, &derived, "trace-530a-1").await;
+
+        // The covering grant arrives now (audience defaults to federation).
+        // Its (c) hook auto-fires the promote sweep — which pages tier=local
+        // and therefore CANNOT see our federation-tier stranded row.
+        let _grant_id = emit_509_grant(&engine, "peer-530a", &["trace:"]).await;
+        let after_emit = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(
+            after_emit.cohort_scope,
+            cohort_scope::SELF,
+            "the promote sweep's (c) hook cannot repair a federation-tier row"
+        );
+
+        // Explicit promote sweep: still blind to it — THE interlock.
+        let promote = engine.promote_consented_backlog().await.expect("promote");
+        assert_eq!(promote.promoted, 0);
+        assert_eq!(promote.rescoped, 0);
+        let still = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(still.cohort_scope, cohort_scope::SELF);
+
+        // The repair sweep — the second motion — corrects it in place.
+        let repair = engine
+            .repair_stranded_scope_backlog()
+            .await
+            .expect("repair");
+        assert_eq!(repair.rescoped, 1, "the stranded row is re-scoped");
+        assert_eq!(repair.promoted, 0);
+        assert_eq!(repair.skipped, 0);
+        let fixed = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(fixed.tier, attestation_tier::FEDERATION);
+        assert_eq!(
+            fixed.cohort_scope,
+            cohort_scope::FEDERATION,
+            "now offer-visible: the covering grant's audience placed it"
+        );
+
+        // Idempotent: a second repair finds nothing left stranded.
+        let again = engine
+            .repair_stranded_scope_backlog()
+            .await
+            .expect("repair 2");
+        assert_eq!(again.rescoped, 0);
+        assert_eq!(again.skipped, 0);
+    }
+
+    /// v21.12.0 (CIRISPersist#530) — the repair sweep touches ONLY rows a
+    /// live grant actually covers. A stranded `(self, federation)` trace row
+    /// with only a `capacity:`-covering grant is left exactly as-is.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn repair_sweep_ignores_uncovered_stranded_row_530() {
+        use crate::federation::{types::cohort_scope, FederationDirectory};
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("node-530b");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "node-530b"))
+            .await
+            .expect("seed key");
+
+        let trace_id = strand_a_federation_self_row(&engine, &derived, "trace-530b-1").await;
+        let _grant_id = emit_509_grant(&engine, "peer-530b", &["capacity:"]).await;
+
+        let repair = engine
+            .repair_stranded_scope_backlog()
+            .await
+            .expect("repair");
+        assert_eq!(repair.rescoped, 0, "no covering grant → untouched");
+        let row = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(row.cohort_scope, cohort_scope::SELF);
+    }
+
+    /// v21.12.0 (CIRISPersist#530) — the broaden-only guard. A covering
+    /// grant whose OWN audience is `self` means the row's invisibility
+    /// MATCHES consent — it is not stranded. The repair sweep must NOT
+    /// re-scope it (never narrows, never re-mints an incoherent state), even
+    /// though the page source surfaces it.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn repair_sweep_broaden_only_skips_self_audience_grant_530() {
+        use crate::federation::{types::cohort_scope, FederationDirectory};
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("node-530c");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "node-530c"))
+            .await
+            .expect("seed key");
+
+        let trace_id = strand_a_federation_self_row(&engine, &derived, "trace-530c-1").await;
+        // A grant covering trace: but whose audience is itself `self`.
+        let _grant_id =
+            emit_509_grant_audience(&engine, "peer-530c", &["trace:"], cohort_scope::SELF).await;
+
+        let repair = engine
+            .repair_stranded_scope_backlog()
+            .await
+            .expect("repair");
+        assert_eq!(
+            repair.rescoped, 0,
+            "self-audience grant → not stranded → no re-scope (broaden-only)"
+        );
+        let row = sq.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(row.cohort_scope, cohort_scope::SELF);
+    }
+
+    /// v21.12.0 (CIRISPersist#530) — the SAME interlock + repair, proven on
+    /// a POSTGRES-backed engine end-to-end: the `tier = 'federation'` ∧
+    /// suppressed-scope page-source SQL, the engine repair logic, and the
+    /// `set_attestation_cohort_scope` write-back all exercised against real
+    /// PG. Skips when `CIRIS_PERSIST_TEST_PG_URL` is unset (as every pg test
+    /// does); `serial(postgres)` + a per-run UUID suffix keep it isolated on
+    /// the shared test DB. Asserts on the SPECIFIC row's transition (not a
+    /// global sweep count) so co-resident fixtures cannot perturb it.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn repair_sweep_fixes_stranded_self_row_postgres_530() {
+        use crate::federation::{
+            types::{attestation_tier, cohort_scope},
+            FederationDirectory,
+        };
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let node = format!("node-530pg-{suffix}");
+        let signer = crate::federation::tier_ingest::test_support::local_signer(&node);
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), &dsn)
+            .await
+            .expect("pg engine");
+        let pg = engine.postgres_backend().expect("pg").clone();
+        pg.put_public_key(sweeper_test_key_derived_for(&derived, &node))
+            .await
+            .expect("seed key");
+
+        // Strand a row on PG: insert local → promote to federation → force
+        // scope back to self (the pre-#519 tier-only shape).
+        let trace_id = pg
+            .attestation_insert_local(build_509_trace_input(
+                &derived,
+                &format!("trace-530pg-{suffix}"),
+            ))
+            .await
+            .expect("insert local trace");
+        engine
+            .attestation_promote(&trace_id, cohort_scope::FEDERATION)
+            .await
+            .expect("promote to federation");
+        pg.set_attestation_cohort_scope(&trace_id, cohort_scope::SELF)
+            .await
+            .expect("force scope back to self (strand it)");
+
+        // The covering grant arrives; its (c) hook fires the promote sweep —
+        // blind to the federation-tier row. The specific row stays stranded.
+        let _grant_id = emit_509_grant(&engine, &format!("peer-530pg-{suffix}"), &["trace:"]).await;
+        let still = pg.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(
+            still.cohort_scope,
+            cohort_scope::SELF,
+            "promote sweep cannot repair a federation-tier row on pg either"
+        );
+
+        // The repair sweep re-scopes it in place.
+        let repair = engine
+            .repair_stranded_scope_backlog()
+            .await
+            .expect("repair");
+        assert!(
+            repair.rescoped >= 1,
+            "the stranded row (and no other) is re-scoped"
+        );
+        let fixed = pg.get_attestation(&trace_id).await.unwrap().expect("row");
+        assert_eq!(fixed.tier, attestation_tier::FEDERATION);
+        assert_eq!(
+            fixed.cohort_scope,
+            cohort_scope::FEDERATION,
+            "the pg repair write-back placed it at the covering grant's audience"
+        );
     }
 
     /// Emit a self-authored `withdraws` referencing `target_id` — the E7

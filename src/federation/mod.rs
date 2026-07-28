@@ -124,10 +124,20 @@ pub struct TraceBackfillReport {
 /// established for the #478 backfill).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ConsentSweepReport {
-    /// Local-tier attestations promoted to federation tier this sweep.
+    /// Local-tier attestations promoted to federation tier this sweep
+    /// (the [`crate::Engine::promote_consented_backlog`] motion).
     pub promoted: u64,
-    /// Local-tier attestations that matched a live grant's prefix set
-    /// but failed to promote (logged, never aborting the sweep).
+    /// Federation-tier rows whose suppressed (`self`/`family`) placement
+    /// was corrected to the covering grant's federation-visible audience
+    /// (the [`crate::Engine::repair_stranded_scope_backlog`] motion —
+    /// CIRISPersist#530). `0` for the promote sweep, which never touches
+    /// federation-tier rows.
+    pub rescoped: u64,
+    /// Rows that matched a live grant's prefix set but failed the sweep's
+    /// write (promote or re-scope) on that ONE row — logged via
+    /// `tracing::warn!` and counted, never wedging the rest of the sweep;
+    /// the same honest-accounting posture [`TraceBackfillReport`]
+    /// established for the #478 backfill.
     pub skipped: u64,
 }
 
@@ -799,6 +809,40 @@ pub trait FederationDirectory: Send + Sync {
         let _ = (after_attestation_id, limit);
         Err(Error::Unsupported {
             method: "list_local_tier_attestations",
+        })
+    }
+
+    /// v21.12.0 (CIRISPersist#530) — the REPAIR sweep's page source: a
+    /// keyset cursor (identical shape to [`Self::list_local_tier_attestations`])
+    /// over the **stranded** rows — `tier = 'federation'` yet
+    /// `cohort_scope ∈ {self, family}` (the
+    /// [`types::cohort_scope::suppresses_holds_bytes`] scopes that project
+    /// `SelfOwn` and are structurally invisible to the offer filter).
+    ///
+    /// This is the second motion #530 identifies as missing.
+    /// [`Self::list_local_tier_attestations`] pages `WHERE tier = 'local'`,
+    /// so its self-limiting property (a promoted row leaves the `local`
+    /// tier and is never revisited) — the very property that makes
+    /// [`crate::Engine::promote_consented_backlog`] safe to call
+    /// unconditionally — is *exactly* what makes it unable to repair a row
+    /// that already reached `(federation, self)` (sealed-before-grant, or a
+    /// pre-#519 tier-only promotion that flipped tier without carrying the
+    /// placement). A stranded row is past the tier gate, covered by the
+    /// grant, and still never offered; only a page source that selects on
+    /// `tier = 'federation'` can see it.
+    ///
+    /// `after_attestation_id = None` starts from the beginning; `Some(id)`
+    /// resumes strictly after it (`attestation_id > after`, lexical
+    /// ordering). Backends order + page `ORDER BY attestation_id ASC LIMIT
+    /// limit`. Default `Unsupported`; sqlite/postgres/memory override.
+    async fn list_stranded_federation_attestations(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<Attestation>, Error> {
+        let _ = (after_attestation_id, limit);
+        Err(Error::Unsupported {
+            method: "list_stranded_federation_attestations",
         })
     }
 

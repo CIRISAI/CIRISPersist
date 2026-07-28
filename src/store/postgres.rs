@@ -4141,6 +4141,44 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         rows.into_iter().map(pg_row_to_attestation).collect()
     }
 
+    /// v21.12.0 (CIRISPersist#530) — the repair sweep's page source: the
+    /// stranded rows (`tier = 'federation'` with a suppressed
+    /// `cohort_scope`). Structural twin of `list_local_tier_attestations`;
+    /// only the `WHERE` predicate differs (`tier = 'federation'` +
+    /// `cohort_scope IN ('self','family')`).
+    async fn list_stranded_federation_attestations(
+        &self,
+        after_attestation_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::federation::Attestation>, crate::federation::Error> {
+        let client = self
+            .get_client()
+            .await
+            .map_err(|e| crate::federation::Error::Backend(e.to_string()))?;
+        let limit = i64::from(limit);
+        let rows = client
+            .query(
+                "SELECT attestation_id::text, attesting_key_id, attested_key_id, \
+                    attestation_type, weight::float8 AS weight, asserted_at, expires_at, \
+                    attestation_envelope, original_content_hash, scrub_signature_classical, \
+                    scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
+                    persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, \
+                    tier, promoted_at \
+                 FROM cirislens.federation_attestations \
+                 WHERE tier = 'federation' AND cohort_scope IN ('self', 'family') \
+                   AND ($1::text IS NULL OR attestation_id::text > $1) \
+                 ORDER BY attestation_id ASC LIMIT $2",
+                &[&after_attestation_id, &limit],
+            )
+            .await
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "list_stranded_federation_attestations: {e}"
+                ))
+            })?;
+        rows.into_iter().map(pg_row_to_attestation).collect()
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the promote-on-consent
     /// write-back. Structural mirror of the sqlite impl: validate against
     /// the closed cohort_scope set, then `UPDATE` + recompute
