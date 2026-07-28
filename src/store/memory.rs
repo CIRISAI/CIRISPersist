@@ -10056,6 +10056,17 @@ mod tests {
         crate::federation::operational::test_support::exercise_trust_root(&backend, "mem536").await;
     }
 
+    /// v21.16.0 (CIRISPersist#536 follow-up) — the REAL engine-backed user path
+    /// on memory: synthetic user edge skipped, user's own signer completes leg 1.
+    #[tokio::test]
+    async fn trust_root_real_user_works_on_memory_536() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_trust_root_real_user(
+            &backend, "memR536",
+        )
+        .await;
+    }
+
     /// v18.3.0 (CIRISPersist#480, persist-side compat confirmation) — a
     /// `canonical,node` record that ALSO carries `roles:["infra:serve"]`
     /// still (a) passes the 2-of-3 `check_canonical_role_admission` core
