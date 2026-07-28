@@ -5,6 +5,73 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.12.0] — 2026-07-27 — #530: the repair sweep — stranded `(self|family, federation)` rows made offerable again
+
+Found in a live agent-harness run (CIRISAgent#932) right after adopting v21.10.0:
+the tier half of #509 works; the **scope** half had a gap that only shows on rows
+that already exist.
+
+### Fixed — #530: `promote_consented_backlog`'s self-limiting page source could not repair stranded rows
+
+A row can reach `(cohort_scope = self|family, tier = federation)` — past the tier
+gate, covered by a live consent grant, yet **never offered**, because the
+replication offer filter keys on `cohort_scope` and the suppressed scopes project
+`SelfOwn` (no directory advertisement). It gets there by being sealed+promoted
+*before* a covering grant existed, or through a pre-#519 **tier-only** promotion
+that flipped tier without carrying the placement.
+
+The promote sweep pages `WHERE tier = 'local'`, so a stranded row (`federation`)
+is excluded from its page source **by construction** — re-running the sweep at
+any cadence, forever, never revisits it. The sharp part: this is the *documented*
+self-limiting property that makes the sweep safe to call unconditionally. **The
+property that makes it safe is exactly the property that makes it unable to
+repair.** Not a bug in the sweep; a missing second motion.
+
+The `(a)+(c)` pattern #509 used for the tier half, now applied to the scope half:
+
+- **New page source** `list_stranded_federation_attestations` (trait + sqlite +
+  postgres + memory): `WHERE tier = 'federation' AND cohort_scope IN
+  ('self','family')` — the two `suppresses_holds_bytes` scopes, the only ones
+  that can strand. Same keyset-cursor shape as `list_local_tier_attestations`.
+- **New motion** `Engine::repair_stranded_scope_backlog` (+ FFI): pages the
+  stranded rows, resolves each row's covering-grant placement through the SAME
+  resolver the promote sweep uses (the audience/restriction logic is now
+  single-sourced in `resolve_row_placement` + `load_active_egress_grants` — the
+  two motions **cannot drift**), and corrects the placement in place via
+  `set_attestation_cohort_scope`.
+- **Broaden-only, by construction.** A re-scope happens only when the grant's
+  resolved audience is itself federation-visible **and** differs from the row's
+  suppressed scope. A grant whose audience is itself `self`/`family` means the
+  row's invisibility *matches* consent — it is not stranded, and is skipped:
+  the repair never narrows visibility and never re-mints the incoherent
+  `(federation, self)` a demotion would create. It is a **pure placement
+  correction** — the row is already federation-tier, so there is no tier flip and
+  no re-signing (cohort_scope is a row attribute outside the signed envelope, so
+  the scrub signature stays valid). Idempotent.
+
+`ConsentSweepReport` gains `rescoped`; the FFI `repair_stranded_scope_backlog`
+returns `{promoted, rescoped, skipped}`. `promote_consented_backlog` is
+refactored onto the shared helpers with no behavior change (the #509 sweep tests
+are green unchanged). CIRISServer#327's `delivery_status().trace_plane`
+ARMED-BUT-STRANDED hint — which names both required halves — is the detector this
+fix answers.
+
+**Adoption:** operators/harnesses that see `stranded_covered_rows > 0` in
+`delivery_status().trace_plane` call `repair_stranded_scope_backlog()` once (it is
+idempotent and safe to schedule). `promote_consented_backlog` remains the
+seal-time / on-consent motion for NEW rows; the two are complementary — running
+only the promote sweep leaves already-stranded rows unrepairable, running only the
+repair leaves tomorrow's rows to strand.
+
+### Tests
+
+sqlite: the interlock (promote sweep cannot fix) + the repair + idempotence; a
+no-covering-grant negative; the broaden-only guard (a `self`-audience grant is
+skipped). memory: the page-source filter (self/family in, federation/community/
+local out) + keyset cursor. postgres: the full repair end-to-end — page-source
+SQL + engine logic + write-back — against real PG. All three backends green
+(sqlite 1423, postgres 1195).
+
 ## [21.11.0] — 2026-07-27 — the authority/fail-open hardening pass (found during CIRISServer's v21.10.0 adoption): #527 + #517 + #528 + #518
 
 Four defects surfaced by the server's adoption of the #519 surface, fixed as one
