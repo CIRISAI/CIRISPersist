@@ -1808,6 +1808,7 @@ impl Engine {
             crate::federation::types::attestation_type::WITHDRAWS,
             crate::federation::envelope::EnvelopeCore::from_value(envelope)
                 .expect("engine-built envelope is a JSON object"),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         self.emit_attestation(signer, input).await.map_err(|e| {
             crate::federation::BlobError::Backend(format!("withdraws emit_attestation: {e}"))
@@ -3099,11 +3100,17 @@ impl Engine {
         let now = chrono::Utc::now();
 
         let attested_key_id = input.attested_key_id.unwrap_or_else(|| key_id.clone());
-        let cohort_scope = if input.cohort_scope.is_empty() {
-            crate::federation::types::cohort_scope::FEDERATION.to_string()
-        } else {
-            input.cohort_scope
-        };
+        // v21.11.0 (CIRISPersist#527) — the emit chokepoint VALIDATES the
+        // recipient axis; it does NOT default it. The prior `is_empty() =>
+        // FEDERATION` was a second fail-OPEN on the same axis as
+        // `with_envelope`'s (now-removed) default: an empty `cohort_scope`
+        // was silently laundered into a valid `federation`, broadcasting
+        // federation-wide AND slipping past the put-side `check_cohort_scope`
+        // empty-rejection. Now an empty/invalid scope is REJECTED here (a
+        // producer must state the axis — `with_envelope` requires it), so no
+        // construction path can fail open.
+        crate::federation::admission::check_cohort_scope(&input.cohort_scope)?;
+        let cohort_scope = input.cohort_scope;
 
         let row = crate::federation::Attestation {
             attestation_id: uuid::Uuid::new_v4().to_string(),
@@ -3261,6 +3268,7 @@ impl Engine {
             crate::federation::types::attestation_type::DELEGATES_TO,
             crate::federation::envelope::EnvelopeCore::from_value(envelope)
                 .expect("engine-built envelope is a JSON object"),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         // The edge is keyed by its RECIPIENT: the §11.10 duty walk + the
         // `is_steward_bound` retraction bucketing both match a delegation /
@@ -3375,6 +3383,7 @@ impl Engine {
             crate::federation::types::attestation_type::DELEGATES_TO,
             crate::federation::envelope::EnvelopeCore::from_value(envelope)
                 .expect("engine-built envelope is a JSON object"),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         // Keyed by recipient, like every delegation edge (the §11.10 walk +
         // `steward_bindings_of` match by `attested_key_id`).
@@ -3450,6 +3459,7 @@ impl Engine {
             crate::federation::types::attestation_type::WITHDRAWS,
             crate::federation::envelope::EnvelopeCore::from_value(envelope)
                 .expect("engine-built envelope is a JSON object"),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         // Key the retraction by the revoked edge's recipient so the duty
         // walk's `retracted` bucket (`attested_key_id`) invalidates it.
@@ -3547,6 +3557,7 @@ impl Engine {
             crate::federation::types::attestation_type::SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(envelope)
                 .expect("engine-built envelope is a JSON object"),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         self.emit_attestation(signer, input).await
     }
@@ -10277,6 +10288,7 @@ mod tests {
         let mut input = crate::federation::EmitAttestationInput::with_envelope(
             crate::federation::types::attestation_type::SCORES,
             envelope,
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         input.subject_key_ids = vec![peer.to_owned()];
         engine
@@ -10299,6 +10311,7 @@ mod tests {
         let input = crate::federation::EmitAttestationInput::with_envelope(
             crate::federation::types::attestation_type::WITHDRAWS,
             envelope,
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         engine
             .emit_attestation_self(input)
@@ -10569,6 +10582,7 @@ mod tests {
         let mut input = crate::federation::EmitAttestationInput::with_envelope(
             crate::federation::types::attestation_type::SCORES,
             envelope,
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         input.subject_key_ids = vec![peer.to_owned()];
         engine
@@ -10875,6 +10889,7 @@ mod tests {
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         let att_id = engine
             .emit_attestation(&signer, input)
@@ -10911,6 +10926,92 @@ mod tests {
             row.original_content_hash.len(),
             64,
             "original_content_hash is the hex SHA-256 of the canonical envelope"
+        );
+    }
+
+    /// v21.11.0 (CIRISPersist#527) — the LOAD-BEARING cohort_scope is
+    /// `EmitAttestationInput::cohort_scope`, NOT the envelope's. A producer
+    /// whose ENVELOPE JSON says `federation` but whose INPUT says `self`
+    /// stores a `self`-scoped row — the envelope key rides `extra` and is
+    /// never lifted onto the row. (This is the exact confusion that made the
+    /// server's `config:*` mis-scope look like an envelope-builder typo; the
+    /// manifest's `config:*` processor row names the envelope builder, but
+    /// THIS is the site that sets the stored, enforced value.)
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn emit_stores_input_cohort_scope_not_envelope_527() {
+        use crate::federation::types::{attestation_type::SCORES, cohort_scope};
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("c527");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "c527"))
+            .await
+            .unwrap();
+
+        // Envelope JSON says federation; the INPUT says self.
+        let input = crate::federation::EmitAttestationInput::with_envelope(
+            SCORES,
+            crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+                "id": "e527", "dimension": "identity_binding:v1",
+                "score": 1.0, "confidence": 0.9,
+                "cohort_scope": "federation",
+            }))
+            .unwrap(),
+            cohort_scope::SELF,
+        );
+        let att_id = engine.emit_attestation(&signer, input).await.expect("emit");
+        let row = sq.get_attestation(&att_id).await.unwrap().expect("row");
+        assert_eq!(
+            row.cohort_scope,
+            cohort_scope::SELF,
+            "the STORED cohort_scope is the INPUT's (self), never the envelope's (federation)"
+        );
+    }
+
+    /// v21.11.0 (CIRISPersist#527) — the emit chokepoint REJECTS an empty
+    /// cohort_scope (the removed second fail-open): an empty axis is a
+    /// producer error, not a silent broadcast-to-federation. `with_envelope`
+    /// requires the arg; a struct built with "" is refused at assembly,
+    /// before it can be laundered into `federation` and slip past put's
+    /// own empty-check.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn emit_rejects_empty_cohort_scope_527() {
+        use crate::federation::types::attestation_type::SCORES;
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("c527e");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "c527e"))
+            .await
+            .unwrap();
+
+        let input = crate::federation::EmitAttestationInput::with_envelope(
+            SCORES,
+            crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+                "id": "e527e", "dimension": "identity_binding:v1",
+                "score": 1.0, "confidence": 0.9,
+            }))
+            .unwrap(),
+            "", // deliberate empty — the only way to reach the assemble guard now.
+        );
+        let err = engine
+            .emit_attestation(&signer, input)
+            .await
+            .expect_err("an empty cohort_scope must be rejected, never defaulted to federation");
+        assert!(
+            matches!(err, crate::federation::Error::CohortScopeRejected { .. })
+                || format!("{err}").to_lowercase().contains("cohort_scope"),
+            "rejection cites cohort_scope: {err:?}"
         );
     }
 
@@ -10953,6 +11054,7 @@ mod tests {
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         let att_id = engine
             .emit_attestation(&signer, input)
@@ -11011,6 +11113,7 @@ mod tests {
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         let att_id = engine
             .emit_attestation_self(input)
@@ -11069,6 +11172,7 @@ mod tests {
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         bad.subject_key_ids = vec![upper.to_owned()];
         let err = engine
@@ -11089,6 +11193,7 @@ mod tests {
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         ok.subject_key_ids = vec![upper.to_lowercase()];
         engine
@@ -11128,6 +11233,7 @@ mod tests {
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         let att_id = engine
             .emit_attestation_self(input)
@@ -11217,6 +11323,7 @@ mod tests {
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         let att_id = engine
             .emit_attestation_self(input)
@@ -11267,6 +11374,7 @@ mod tests {
                 "score": 0.42, "confidence": 0.9,
             }))
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         )
         .with_weight(Some(0.42));
         let w_id = engine
@@ -11288,6 +11396,7 @@ mod tests {
                 "score": 1.0, "confidence": 0.9,
             }))
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         let p_id = engine
             .emit_attestation(&signer, plain)
@@ -11523,6 +11632,7 @@ mod tests {
                     serde_json::json!({ "id": id }),
                 )
                 .unwrap(),
+                crate::federation::types::cohort_scope::FEDERATION,
             );
             input.attested_key_id = Some(subject.to_owned());
             (input, w_signer.clone())
@@ -11682,6 +11792,7 @@ mod tests {
                 serde_json::json!({ "id": "wtse-self-minor" }),
             )
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         engine
             .emit_attestation(&t_signer, self_minor)
@@ -11697,6 +11808,7 @@ mod tests {
                 serde_json::json!({ "id": "wtse-w-adult" }),
             )
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         cross.attested_key_id = Some(t.clone());
         let att_id = engine
@@ -11726,6 +11838,7 @@ mod tests {
                 serde_json::json!({ "id": "wtse-w-self" }),
             )
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         let e = engine
             .emit_attestation(&w_signer, selfie)
@@ -11746,6 +11859,7 @@ mod tests {
                 serde_json::json!({ "id": "wtse-t-cross" }),
             )
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         bad.attested_key_id = Some(w.clone());
         let e = engine
@@ -11799,6 +11913,7 @@ mod tests {
                         serde_json::json!({ "id": format!("pgw-self-{run}") }),
                     )
                     .unwrap(),
+                    crate::federation::types::cohort_scope::FEDERATION,
                 ),
             )
             .await
@@ -11812,6 +11927,7 @@ mod tests {
                 serde_json::json!({ "id": format!("pgw-adult-{run}") }),
             )
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         cross.attested_key_id = Some(t.clone());
         engine
@@ -11830,6 +11946,7 @@ mod tests {
                         serde_json::json!({ "id": format!("pgw-self-adult-{run}") }),
                     )
                     .unwrap(),
+                    crate::federation::types::cohort_scope::FEDERATION,
                 ),
             )
             .await
@@ -11885,6 +12002,7 @@ mod tests {
                 serde_json::json!({ "id": "mg-w-minor" }),
             )
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         minor.attested_key_id = Some("mg-ward".to_owned());
         engine
@@ -11927,6 +12045,7 @@ mod tests {
                 serde_json::json!({ "id": "mg-w-adult" }),
             )
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         adult.attested_key_id = Some(s.clone());
         engine
@@ -12039,6 +12158,7 @@ mod tests {
                 serde_json::json!({ "id": format!("mgp-minor-{run}") }),
             )
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         minor.attested_key_id = Some(ward.clone());
         engine
@@ -12051,6 +12171,7 @@ mod tests {
                 serde_json::json!({ "id": format!("mgp-adult-{run}") }),
             )
             .unwrap(),
+            crate::federation::types::cohort_scope::FEDERATION,
         );
         adult.attested_key_id = Some(s.clone());
         engine

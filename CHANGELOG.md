@@ -5,6 +5,68 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.11.0] — 2026-07-27 — the authority/fail-open hardening pass (found during CIRISServer's v21.10.0 adoption): #527 + #517 + #528 + #518
+
+Four defects surfaced by the server's adoption of the #519 surface, fixed as one
+coherent pass — three are the same class (a fail-open or self-declared-authority
+on the WRITE path); one is a backend-parity bug.
+
+### Fixed — #527: `EmitAttestationInput::with_envelope` fail-OPENed the recipient axis
+
+The write-path constructor hardcoded `cohort_scope = federation` — so a producer
+that forgot the field broadcast federation-wide (the widest exposure), inverting
+the fail-secure discipline the rest of the stack enforces. That default was the
+READ-path back-compat serde default (`default_cohort_scope`, correct for an old
+stored row) leaking onto the write path. `cohort_scope` is now a **required
+argument** of `with_envelope` (the compiler forces every producer to state the
+recipient axis — the same un-forgettable move as `attestation_promote(id,
+cohort_scope)`). A second fail-open on the same axis is also closed:
+`emit_attestation_assemble` **rejects** an empty `cohort_scope` (was: silently
+laundered to `federation`, bypassing put's own empty-check). Witnesses lock both,
+including the load-bearing invariant that the STORED scope is
+`EmitAttestationInput.cohort_scope`, NOT the envelope's (the exact confusion
+behind the server's `config:*` mis-scope; the envelope's key rides `extra` and is
+never lifted onto the row).
+
+### Fixed — #517: `reconsideration:*` / `moderation:*` derived REVIEW authority from self-declared subjects
+
+`check_delegated_duty_scores_admission` seeded the admissible duty-holder set
+from the row's OWN `subject_key_ids`, so any Rooted producer could file an
+admissible reconsideration/moderation `scores` over any community action by
+naming THEMSELVES as subject — CC 4.5.5's target→duty-holder table authorizes no
+subject-self clause for these two dimensions (only `takedown_notice`, on a
+distinct content path, gets `subject_of ∪ is_named_moderator`). Now resolves from
+the community's **named moderators only** (`duty_holders_for_community`). The
+§11.10 "already signed-state" note proves the SIGNER isn't spoofed; it does not
+prove the SUBJECT claim genuine — integrity ≠ authority. Genuine
+moderator-delegation chains are unaffected (witnessed: a founder→delegate review
+chain still admits; subject-self and subject-delegated now reject).
+
+### Fixed — #528: `capacity:*` blocked self-EMISSION but permitted self-REVOCATION (the anti-Goodhart dual)
+
+CC 3.4.5 blocks a scored agent from scoring itself UP (self-emission:
+`attesting_key_id != attested_key_id`), but nothing blocked it from scoring
+itself UN-DOWN by withdrawing its own unflattering score — the anti-Goodhart wall
+was enforced on assertion and forgotten on retraction.
+`resolve_withdraws_admission_rule` is now dimension-aware: for `capacity:*` and
+`detection:*` (the self-emission-banned families) the subject-derived withdraws
+rules (2/3/4) are DENIED — `subject_key_ids` does legitimate data-subject naming
+work but is no longer ALSO spent as revocation authority for these families. Rule
+1 (the attester who made the claim — the scorer / a canonical) still
+retracts/corrects. Witness: the scored agent's self-withdraws is refused, the
+attester's admits (rule 1).
+
+### Fixed — #518: sqlite/postgres computed the capacity feature rollup differently
+
+`refresh_factor_rollup` computed the three value-mean metrics
+(`csdma_plausibility_score` / `idma_k_eff` / `idma_correlation_risk`) as a
+row-weighted pooled mean on Postgres vs a trace-weighted mean-of-per-trace-means
+on SQLite, and the `_n` sample-count denominators disagreed (rows vs traces) —
+feeding `sample_size_gate`, so the two backends could even disagree on whether an
+agent clears the minimum-sample gate. The same corpus scored differently by
+backend. Both backends now compute the trace-weighted form (each trace weight 1;
+a retry must not inflate a capacity mean, consistent with the already-agreeing
+trace-count columns), with a cross-backend parity witness.
 ## [21.10.0] — 2026-07-27 — #519: the NOfMCosigned freshness tally (b2) + persist's evidence-registry rows (b5) — persist's #519 half complete
 
 ### Added — the NOfMCosigned touch-claim tally (#519 b2)

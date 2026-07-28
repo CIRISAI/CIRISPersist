@@ -19603,6 +19603,70 @@ mod tests {
         );
     }
 
+    /// v21.11.0 (CIRISPersist#528, CC 3.4.5 anti-Goodhart DUAL) — for a
+    /// `capacity:*` target the SUBJECT-derived withdraws authority (rules
+    /// 2/3/4) is DENIED: the scored agent (named in `subject_key_ids`) cannot
+    /// retract its own score. But rule 1 (the ATTESTER who made the claim — the
+    /// scorer / a canonical) still retracts it. Same posture for `detection:*`.
+    #[tokio::test]
+    async fn withdraws_admission_capacity_subject_denied_attester_ok_528() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let tid = format!("t-{}", uuid::Uuid::new_v4());
+        let scorer = format!("scorer-{}", uuid::Uuid::new_v4());
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        ensure_key(&backend, &scorer).await;
+        ensure_key(&backend, &agent).await;
+        // A capacity:* score: attester = scorer, attested + subject = the
+        // scored agent (attester != attested — the self-emission ban). The
+        // envelope is mutated, so re-sign for the federation-tier ingest gate.
+        let mut t = fed_attestation(&tid, &scorer, &agent, &scorer);
+        t.subject_key_ids = vec![agent.clone()];
+        t.attestation_envelope = serde_json::json!({
+            "id": tid,
+            "dimension": "capacity:sustained_coherence:v1",
+            "score": 1.0,
+            "confidence": 0.9,
+        });
+        resign_fed(&mut t);
+        backend
+            .put_attestation(SignedAttestation { attestation: t })
+            .await
+            .unwrap();
+
+        // The SCORED AGENT (a subject) tries to withdraw its own score → REFUSED.
+        let werr = backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against(
+                    &format!("w-{}", uuid::Uuid::new_v4()),
+                    &agent,
+                    &tid,
+                ),
+            })
+            .await
+            .expect_err("a scored agent must NOT withdraw its own capacity:* score");
+        assert_eq!(werr.kind(), "federation_withdraws_not_admitted");
+
+        // The SCORER (the attester) CAN retract/correct its own claim → rule 1.
+        let wid = format!("w-{}", uuid::Uuid::new_v4());
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against(&wid, &scorer, &tid),
+            })
+            .await
+            .expect("the attester (scorer) may still withdraw its own claim");
+        assert_eq!(
+            backend
+                .get_attestation(&wid)
+                .await
+                .unwrap()
+                .unwrap()
+                .withdraws_admission_rule,
+            Some(1),
+            "attester self-revocation is rule 1, unaffected by the #528 subject-denial"
+        );
+    }
+
     /// Rule 3 — proxy authority: a `consent_revocation`-scoped
     /// `delegates_to` chain from issuer reaching a canonical-hash
     /// subject in `T.subject_key_ids`.
@@ -31721,6 +31785,166 @@ mod tests {
         assert_eq!(
             r.trace_count, 1,
             "self/family row must NOT appear in the public rollup (CEG §10.1.4)"
+        );
+    }
+
+    /// CIRISPersist#518 — the parity witness. A trace with a RETRIED
+    /// step (`attempt_index` 0 and 1 both landing DMA_RESULTS /
+    /// IDMA_RESULT rows for the SAME `trace_id`) must contribute ONE
+    /// sample to `refresh_factor_rollup`'s value-mean columns — its own
+    /// per-trace average — never two pooled rows. One trace, csdma
+    /// [0.8, 0.4] → per-trace mean 0.6 → `csdma_sum=0.6, csdma_n=1`
+    /// (row-weighted would wrongly give `sum=1.2, n=2`). Same shape for
+    /// `idma_k_eff` ([10.0, 6.0] → mean 8.0) and `idma_correlation_risk`
+    /// ([0.2, 0.6] → mean 0.4). SQLite already computes this correctly
+    /// (the two-level `WITH per_trace AS (…)` in `refresh_factor_rollup`)
+    /// — this test pins the KNOWN trace-weighted numbers on SQLite; the
+    /// twin `refresh_factor_rollup_value_mean_is_trace_weighted_postgres` in
+    /// `postgres.rs` pins the IDENTICAL numbers there, which failed
+    /// before the #518 fix (Postgres pooled rows: it returned
+    /// `sum=1.2, n=2` / `sum=16, n=2` / `sum=0.8, n=2`).
+    #[tokio::test]
+    async fn refresh_factor_rollup_value_mean_is_trace_weighted_sqlite() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let base = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+        let mk_row = |event_type: ReasoningEventType,
+                      attempt_index: u32,
+                      ts_offset_ms: i64,
+                      payload: serde_json::Value|
+         -> TraceEventRow {
+            TraceEventRow {
+                trace_id: "trace-518-multi".to_owned(),
+                thought_id: "th-518".to_owned(),
+                task_id: None,
+                step_point: None,
+                event_type,
+                attempt_index,
+                ts: base + chrono::Duration::milliseconds(ts_offset_ms),
+                agent_name: Some("agent-518".to_owned()),
+                agent_id_hash: "agent-518".to_owned(),
+                cognitive_state: Some("WORK".to_owned()),
+                trace_level: TraceLevel::Detailed,
+                payload: match payload {
+                    serde_json::Value::Object(m) => m,
+                    _ => serde_json::Map::new(),
+                },
+                cost_llm_calls: None,
+                cost_tokens: None,
+                cost_usd: None,
+                signature: "sig".to_owned(),
+                signing_key_id: "key-1".to_owned(),
+                signature_verified: true,
+                verification_source: crate::store::VerificationSource::Persist,
+                schema_version: "2.7.0".to_owned(),
+                pii_scrubbed: false,
+                original_content_hash: None,
+                scrub_signature: None,
+                scrub_key_id: None,
+                scrub_timestamp: None,
+                agent_role: None,
+                agent_template: None,
+                deployment_domain: Some("d-518".to_owned()),
+                deployment_type: None,
+                deployment_region: None,
+                deployment_trust_mode: None,
+                // Must NOT be 'self'/'family' — those are structurally
+                // excluded from materialization (§10.1.4), which would
+                // make this trace invisible to the rollup entirely.
+                cohort_scope: "federation".to_owned(),
+                cohort_target_id: None,
+                signature_ml_dsa_65: None,
+                pubkey_ml_dsa_65: None,
+                pqc_key_id: None,
+            }
+        };
+        let rows = vec![
+            // Retry #1 of the DMA step: attempt_index 0 then 1, same
+            // trace_id — two ROWS, but ONE trace.
+            mk_row(
+                ReasoningEventType::DmaResults,
+                0,
+                0,
+                serde_json::json!({ "csdma_plausibility_score": 0.8 }),
+            ),
+            mk_row(
+                ReasoningEventType::DmaResults,
+                1,
+                10,
+                serde_json::json!({ "csdma_plausibility_score": 0.4 }),
+            ),
+            // Same retry shape for the IDMA step.
+            mk_row(
+                ReasoningEventType::IdmaResult,
+                0,
+                20,
+                serde_json::json!({ "idma_k_eff": 10.0, "idma_correlation_risk": 0.2 }),
+            ),
+            mk_row(
+                ReasoningEventType::IdmaResult,
+                1,
+                30,
+                serde_json::json!({ "idma_k_eff": 6.0, "idma_correlation_risk": 0.6 }),
+            ),
+        ];
+        let report = backend.insert_trace_events_batch(&rows).await.unwrap();
+        assert_eq!(report.inserted, 4, "all 4 retry rows land");
+
+        backend
+            .refresh_factor_rollup(Some(base - chrono::Duration::days(1)))
+            .await
+            .unwrap();
+
+        let conn = backend.conn.clone();
+        let (csdma_sum, csdma_n, k_eff_sum, k_eff_n, corr_sum, corr_n): (
+            f64,
+            i64,
+            f64,
+            i64,
+            f64,
+            i64,
+        ) = {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT csdma_sum, csdma_n, k_eff_sum, k_eff_n, \
+                        correlation_risk_sum, correlation_risk_n \
+                 FROM trace_events_factor_rollup_1h \
+                 WHERE agent_id_hash = 'agent-518'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+
+        // Trace-weighted: ONE trace contributes its OWN per-trace mean —
+        // NOT sum=1.2/n=2 (row-weighted, the pre-#518 possible bug shape).
+        assert!(
+            (csdma_sum - 0.6).abs() < 1e-9,
+            "csdma_sum must be the per-trace mean 0.6, got {csdma_sum}"
+        );
+        assert_eq!(csdma_n, 1, "csdma_n must be trace-count 1, not row-count 2");
+        assert!(
+            (k_eff_sum - 8.0).abs() < 1e-9,
+            "k_eff_sum must be the per-trace mean 8.0, got {k_eff_sum}"
+        );
+        assert_eq!(k_eff_n, 1, "k_eff_n must be trace-count 1, not row-count 2");
+        assert!(
+            (corr_sum - 0.4).abs() < 1e-9,
+            "correlation_risk_sum must be the per-trace mean 0.4, got {corr_sum}"
+        );
+        assert_eq!(
+            corr_n, 1,
+            "correlation_risk_n must be trace-count 1, not row-count 2"
         );
     }
 

@@ -17613,6 +17613,29 @@ impl PostgresBackend {
         } else {
             ""
         };
+        // CIRISPersist#518 — the three value-mean metrics (csdma/k_eff/
+        // correlation_risk) are computed via a per-trace CTE
+        // (`per_trace_metric` → `metric_agg`) so a trace with N retried
+        // DMA_RESULTS/IDMA_RESULT rows (`attempt_index` is first-class —
+        // retries happen) contributes ONE sample — its own per-trace
+        // average — never N pooled rows. This mirrors the SQLite
+        // `refresh_factor_rollup` two-level `WITH per_trace AS (…)` shape
+        // exactly (inner AVG per trace_id, outer SUM/COUNT over traces),
+        // so `{m}_sum` / `{m}_n` mean the SAME thing on both backends: the
+        // sum/count of PER-TRACE means, not of raw rows. Before this fix
+        // Postgres pooled rows directly (`SUM`/`COUNT` over `te` with no
+        // per-trace collapse), so a retried step silently inflated both
+        // the mean's weight and its `sample_size_gate` denominator —
+        // the two backends scored the identical corpus differently.
+        //
+        // The trace-COUNT columns (`trace_count` + the `*_trace_count`
+        // rate numerators) are UNCHANGED — kept in `bucket_agg`, the
+        // original flat `COUNT(DISTINCT trace_id) FILTER (…)` aggregation
+        // verbatim — those already agreed across backends (each already
+        // collapses to one trace via DISTINCT). `bucket_agg` and
+        // `metric_agg` share the identical grouping-key row set (same
+        // source rows, same leading GROUP BY columns), so the join below
+        // is exact; the LEFT JOIN + COALESCE is defensive only.
         let sql = format!(
             "INSERT INTO cirislens.trace_events_factor_rollup_1h ( \
                 bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
@@ -17624,46 +17647,101 @@ impl PostgresBackend {
                 coherence_fail_trace_count, optimization_veto_fail_trace_count, \
                 epistemic_humility_fail_trace_count, \
                 audit_seq_trace_count, audit_sig_trace_count) \
+             WITH bucket_agg AS ( \
+                SELECT \
+                   date_trunc('hour', te.ts) AS bucket_start, \
+                   te.agent_id_hash AS agent_id_hash, \
+                   te.deployment_domain AS deployment_domain, \
+                   te.cohort_scope AS cohort_scope, \
+                   te.cohort_target_id AS cohort_target_id, \
+                   COUNT(DISTINCT te.trace_id)::bigint AS trace_count, \
+                   COUNT(DISTINCT te.trace_id) FILTER ( \
+                       WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                         AND (te.payload->>'action_was_overridden')::bool)::bigint \
+                       AS override_trace_count, \
+                   COUNT(DISTINCT te.trace_id) FILTER ( \
+                       WHERE (te.payload->>'idma_fragility_flag')::bool)::bigint \
+                       AS fragility_trace_count, \
+                   COUNT(DISTINCT te.trace_id) FILTER ( \
+                       WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                         AND (te.payload->>'conscience_passed')::bool = false)::bigint \
+                       AS conscience_fail_trace_count, \
+                   COUNT(DISTINCT te.trace_id) FILTER ( \
+                       WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                         AND (te.payload->>'entropy_passed')::bool = false)::bigint \
+                       AS entropy_fail_trace_count, \
+                   COUNT(DISTINCT te.trace_id) FILTER ( \
+                       WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                         AND (te.payload->>'coherence_passed')::bool = false)::bigint \
+                       AS coherence_fail_trace_count, \
+                   COUNT(DISTINCT te.trace_id) FILTER ( \
+                       WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                         AND (te.payload->>'optimization_veto_passed')::bool = false)::bigint \
+                       AS optimization_veto_fail_trace_count, \
+                   COUNT(DISTINCT te.trace_id) FILTER ( \
+                       WHERE te.event_type = 'CONSCIENCE_RESULT' \
+                         AND (te.payload->>'epistemic_humility_passed')::bool = false)::bigint \
+                       AS epistemic_humility_fail_trace_count, \
+                   COUNT(DISTINCT te.trace_id) FILTER ( \
+                       WHERE te.audit_sequence_number IS NOT NULL)::bigint \
+                       AS audit_seq_trace_count, \
+                   COUNT(DISTINCT te.trace_id) FILTER ( \
+                       WHERE te.audit_signature IS NOT NULL)::bigint \
+                       AS audit_sig_trace_count \
+                FROM cirislens.trace_events te \
+                {lo_pred} \
+                {self_family_gate} \
+                GROUP BY date_trunc('hour', te.ts), te.agent_id_hash, \
+                         te.deployment_domain, te.cohort_scope, te.cohort_target_id \
+             ), \
+             per_trace_metric AS ( \
+                SELECT \
+                   date_trunc('hour', te.ts) AS bucket_start, \
+                   te.agent_id_hash AS agent_id_hash, \
+                   te.deployment_domain AS deployment_domain, \
+                   te.cohort_scope AS cohort_scope, \
+                   te.cohort_target_id AS cohort_target_id, \
+                   AVG((te.payload->>'csdma_plausibility_score')::float8) AS csdma_val, \
+                   AVG((te.payload->>'idma_k_eff')::float8) AS k_eff_val, \
+                   AVG((te.payload->>'idma_correlation_risk')::float8) AS corr_val \
+                FROM cirislens.trace_events te \
+                {lo_pred} \
+                {self_family_gate} \
+                GROUP BY date_trunc('hour', te.ts), te.agent_id_hash, \
+                         te.deployment_domain, te.cohort_scope, te.cohort_target_id, \
+                         te.trace_id \
+             ), \
+             metric_agg AS ( \
+                SELECT bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
+                       cohort_target_id, \
+                       COALESCE(SUM(csdma_val), 0)::float8 AS csdma_sum, \
+                       COUNT(csdma_val)::bigint AS csdma_n, \
+                       COALESCE(SUM(k_eff_val), 0)::float8 AS k_eff_sum, \
+                       COUNT(k_eff_val)::bigint AS k_eff_n, \
+                       COALESCE(SUM(corr_val), 0)::float8 AS correlation_risk_sum, \
+                       COUNT(corr_val)::bigint AS correlation_risk_n \
+                FROM per_trace_metric \
+                GROUP BY bucket_start, agent_id_hash, deployment_domain, cohort_scope, \
+                         cohort_target_id \
+             ) \
              SELECT \
-                date_trunc('hour', te.ts) AS bucket_start, \
-                te.agent_id_hash, te.deployment_domain, te.cohort_scope, \
-                te.cohort_target_id, \
-                COUNT(DISTINCT te.trace_id)::bigint, \
-                COALESCE(SUM((te.payload->>'csdma_plausibility_score')::float8),0)::float8, \
-                COUNT((te.payload->>'csdma_plausibility_score'))::bigint, \
-                COALESCE(SUM((te.payload->>'idma_k_eff')::float8),0)::float8, \
-                COUNT((te.payload->>'idma_k_eff'))::bigint, \
-                COALESCE(SUM((te.payload->>'idma_correlation_risk')::float8),0)::float8, \
-                COUNT((te.payload->>'idma_correlation_risk'))::bigint, \
-                COUNT(DISTINCT te.trace_id) FILTER ( \
-                    WHERE te.event_type = 'CONSCIENCE_RESULT' \
-                      AND (te.payload->>'action_was_overridden')::bool)::bigint, \
-                COUNT(DISTINCT te.trace_id) FILTER ( \
-                    WHERE (te.payload->>'idma_fragility_flag')::bool)::bigint, \
-                COUNT(DISTINCT te.trace_id) FILTER ( \
-                    WHERE te.event_type = 'CONSCIENCE_RESULT' \
-                      AND (te.payload->>'conscience_passed')::bool = false)::bigint, \
-                COUNT(DISTINCT te.trace_id) FILTER ( \
-                    WHERE te.event_type = 'CONSCIENCE_RESULT' \
-                      AND (te.payload->>'entropy_passed')::bool = false)::bigint, \
-                COUNT(DISTINCT te.trace_id) FILTER ( \
-                    WHERE te.event_type = 'CONSCIENCE_RESULT' \
-                      AND (te.payload->>'coherence_passed')::bool = false)::bigint, \
-                COUNT(DISTINCT te.trace_id) FILTER ( \
-                    WHERE te.event_type = 'CONSCIENCE_RESULT' \
-                      AND (te.payload->>'optimization_veto_passed')::bool = false)::bigint, \
-                COUNT(DISTINCT te.trace_id) FILTER ( \
-                    WHERE te.event_type = 'CONSCIENCE_RESULT' \
-                      AND (te.payload->>'epistemic_humility_passed')::bool = false)::bigint, \
-                COUNT(DISTINCT te.trace_id) FILTER ( \
-                    WHERE te.audit_sequence_number IS NOT NULL)::bigint, \
-                COUNT(DISTINCT te.trace_id) FILTER ( \
-                    WHERE te.audit_signature IS NOT NULL)::bigint \
-             FROM cirislens.trace_events te \
-             {lo_pred} \
-             {self_family_gate} \
-             GROUP BY date_trunc('hour', te.ts), te.agent_id_hash, \
-                      te.deployment_domain, te.cohort_scope, te.cohort_target_id \
+                b.bucket_start, b.agent_id_hash, b.deployment_domain, b.cohort_scope, \
+                b.cohort_target_id, b.trace_count, \
+                COALESCE(m.csdma_sum, 0), COALESCE(m.csdma_n, 0), \
+                COALESCE(m.k_eff_sum, 0), COALESCE(m.k_eff_n, 0), \
+                COALESCE(m.correlation_risk_sum, 0), COALESCE(m.correlation_risk_n, 0), \
+                b.override_trace_count, b.fragility_trace_count, \
+                b.conscience_fail_trace_count, b.entropy_fail_trace_count, \
+                b.coherence_fail_trace_count, b.optimization_veto_fail_trace_count, \
+                b.epistemic_humility_fail_trace_count, \
+                b.audit_seq_trace_count, b.audit_sig_trace_count \
+             FROM bucket_agg b \
+             LEFT JOIN metric_agg m ON \
+                b.bucket_start = m.bucket_start \
+                AND b.agent_id_hash IS NOT DISTINCT FROM m.agent_id_hash \
+                AND b.deployment_domain IS NOT DISTINCT FROM m.deployment_domain \
+                AND b.cohort_scope IS NOT DISTINCT FROM m.cohort_scope \
+                AND b.cohort_target_id IS NOT DISTINCT FROM m.cohort_target_id \
              ON CONFLICT (bucket_start, COALESCE(agent_id_hash,''), \
                           COALESCE(deployment_domain,''), COALESCE(cohort_scope,''), \
                           COALESCE(cohort_target_id,'')) \
@@ -23888,6 +23966,157 @@ mod tests {
         );
     }
 
+    /// CIRISPersist#518 — the parity witness. A trace with a RETRIED
+    /// step (`attempt_index` 0 and 1 both landing DMA_RESULTS /
+    /// IDMA_RESULT rows for the SAME `trace_id`) must contribute ONE
+    /// sample to `refresh_factor_rollup`'s value-mean columns — its own
+    /// per-trace average — never two pooled rows. One trace, csdma
+    /// [0.8, 0.4] → per-trace mean 0.6 → `csdma_sum=0.6, csdma_n=1`.
+    /// Same shape for `idma_k_eff` ([10.0, 6.0] → mean 8.0) and
+    /// `idma_correlation_risk` ([0.2, 0.6] → mean 0.4). These are the
+    /// IDENTICAL numbers the twin
+    /// `refresh_factor_rollup_value_mean_is_trace_weighted_sqlite` test (in
+    /// `sqlite.rs`) pins on the SAME corpus shape — before the #518 fix
+    /// this test FAILED on Postgres (it pooled rows:
+    /// `csdma_sum=1.2, csdma_n=2` / `k_eff_sum=16, k_eff_n=2` /
+    /// `correlation_risk_sum=0.8, correlation_risk_n=2`), proving the
+    /// two backends scored the identical corpus differently.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn refresh_factor_rollup_value_mean_is_trace_weighted_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let suffix = uuid_like();
+        let aid = format!("agent-518-{suffix}");
+        let trace_id = format!("trace-518-multi-{suffix}");
+        let now = chrono::Utc::now() - chrono::Duration::minutes(30);
+
+        let mk_row = |event_type: ReasoningEventType,
+                      attempt_index: u32,
+                      ts_offset_ms: i64,
+                      payload: serde_json::Value|
+         -> TraceEventRow {
+            TraceEventRow {
+                trace_id: trace_id.clone(),
+                thought_id: format!("th-{trace_id}"),
+                task_id: None,
+                step_point: None,
+                event_type,
+                attempt_index,
+                ts: now + chrono::Duration::milliseconds(ts_offset_ms),
+                agent_name: Some(aid.clone()),
+                agent_id_hash: aid.clone(),
+                cognitive_state: Some("work".into()),
+                trace_level: crate::schema::TraceLevel::Detailed,
+                payload: match payload {
+                    serde_json::Value::Object(m) => m,
+                    _ => serde_json::Map::new(),
+                },
+                cost_llm_calls: None,
+                cost_tokens: None,
+                cost_usd: None,
+                signature: "AAAA".into(),
+                signing_key_id: "test-key".into(),
+                signature_verified: true,
+                verification_source: crate::store::VerificationSource::Persist,
+                schema_version: "2.7.0".into(),
+                pii_scrubbed: false,
+                original_content_hash: None,
+                scrub_signature: None,
+                scrub_key_id: None,
+                scrub_timestamp: None,
+                agent_role: None,
+                agent_template: None,
+                deployment_domain: Some("d-518".into()),
+                deployment_type: None,
+                deployment_region: None,
+                deployment_trust_mode: None,
+                // Must NOT be 'self'/'family' — those are structurally
+                // excluded from materialization (§10.1.4).
+                cohort_scope: "federation".to_string(),
+                cohort_target_id: None,
+                signature_ml_dsa_65: None,
+                pubkey_ml_dsa_65: None,
+                pqc_key_id: None,
+            }
+        };
+        let rows = vec![
+            // Retry #1 of the DMA step: attempt_index 0 then 1, same
+            // trace_id — two ROWS, but ONE trace.
+            mk_row(
+                ReasoningEventType::DmaResults,
+                0,
+                0,
+                serde_json::json!({ "csdma_plausibility_score": 0.8 }),
+            ),
+            mk_row(
+                ReasoningEventType::DmaResults,
+                1,
+                10,
+                serde_json::json!({ "csdma_plausibility_score": 0.4 }),
+            ),
+            // Same retry shape for the IDMA step.
+            mk_row(
+                ReasoningEventType::IdmaResult,
+                0,
+                20,
+                serde_json::json!({ "idma_k_eff": 10.0, "idma_correlation_risk": 0.2 }),
+            ),
+            mk_row(
+                ReasoningEventType::IdmaResult,
+                1,
+                30,
+                serde_json::json!({ "idma_k_eff": 6.0, "idma_correlation_risk": 0.6 }),
+            ),
+        ];
+        backend.insert_trace_events_batch(&rows).await.unwrap();
+        refresh_factor_rollup(&backend).await;
+
+        let client = backend.pool.get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT csdma_sum, csdma_n, k_eff_sum, k_eff_n, \
+                        correlation_risk_sum, correlation_risk_n \
+                 FROM cirislens.trace_events_factor_rollup_1h \
+                 WHERE agent_id_hash = $1",
+                &[&aid],
+            )
+            .await
+            .unwrap();
+        let csdma_sum: f64 = row.safe_get("csdma_sum").unwrap();
+        let csdma_n: i64 = row.safe_get("csdma_n").unwrap();
+        let k_eff_sum: f64 = row.safe_get("k_eff_sum").unwrap();
+        let k_eff_n: i64 = row.safe_get("k_eff_n").unwrap();
+        let corr_sum: f64 = row.safe_get("correlation_risk_sum").unwrap();
+        let corr_n: i64 = row.safe_get("correlation_risk_n").unwrap();
+
+        // Trace-weighted: ONE trace contributes its OWN per-trace mean —
+        // NOT sum=1.2/n=2 (row-weighted, the pre-#518 bug shape).
+        assert!(
+            (csdma_sum - 0.6).abs() < 1e-9,
+            "csdma_sum must be the per-trace mean 0.6, got {csdma_sum}"
+        );
+        assert_eq!(csdma_n, 1, "csdma_n must be trace-count 1, not row-count 2");
+        assert!(
+            (k_eff_sum - 8.0).abs() < 1e-9,
+            "k_eff_sum must be the per-trace mean 8.0, got {k_eff_sum}"
+        );
+        assert_eq!(k_eff_n, 1, "k_eff_n must be trace-count 1, not row-count 2");
+        assert!(
+            (corr_sum - 0.4).abs() < 1e-9,
+            "correlation_risk_sum must be the per-trace mean 0.4, got {corr_sum}"
+        );
+        assert_eq!(
+            corr_n, 1,
+            "correlation_risk_n must be trace-count 1, not row-count 2"
+        );
+    }
+
     /// CIRISPersist#197 — streaming path emits one aggregate per
     /// non-empty agent and the StreamSummary tallies emitted/skipped;
     /// the callback `false` aborts the scan. Exercises the direct path
@@ -26244,15 +26473,21 @@ mod tests {
             a
         };
 
-        // (a) as-self subject → ADMIT.
-        backend
+        // (a) v21.11.0 (CIRISPersist#517, CC 4.5.5) — as-self subject → REJECT.
+        // Reconsideration REVIEW authority is `is_named_moderator` ONLY; a
+        // subject naming ITSELF confers none (`subject` is not a moderator of
+        // `comm`). Was the spoof (admitted); now refused.
+        let err = backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: report(&subject, &[&subject], None),
             })
             .await
-            .expect("(a) as-self subject admitted");
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
 
-        // (b1) subject-delegated chain → ADMIT.
+        // (b1) subject-delegated chain → REJECT. The subject never held review
+        // authority, so it cannot delegate it (the delegation row admits; the
+        // delegate's reconsideration does not) (#517).
         backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: pg_delegates_to(
@@ -26264,12 +26499,43 @@ mod tests {
             })
             .await
             .unwrap();
-        backend
+        let err = backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: report(&delegate, &[&subject], None),
             })
             .await
-            .expect("(b1) subject-delegated admitted");
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
+
+        // (b1') founder-delegated chain (founder → fdelegate, review over
+        // comm) → ADMIT. The LEGITIMATE delegated-moderator path: authority
+        // roots at a real named moderator and flows down the review-scoped
+        // delegation — #517 cut only the subject-self seed, not genuine
+        // moderator delegation.
+        let fdelegate = format!("fdelegate-{suffix}");
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(&fdelegate, "a", now, true),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_delegates_to(
+                    &founder,
+                    &fdelegate,
+                    serde_json::json!(["review"]),
+                    false,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: report(&fdelegate, &[], Some(&comm)),
+            })
+            .await
+            .expect("(b1') founder-delegated review admitted");
 
         // (b2) named-moderator (community founder, steward-bound) → ADMIT.
         backend

@@ -3158,6 +3158,31 @@ pub async fn resolve_withdraws_admission_rule(
     if issuer == target.attesting_key_id {
         return Ok(1);
     }
+
+    // v21.11.0 (CIRISPersist#528, CC 3.4.5 — the anti-Goodhart DUAL) — for the
+    // scored families whose SELF-EMISSION is banned (`capacity:*` /
+    // `detection:*`: `attesting_key_id` MUST NOT equal `attested_key_id`), the
+    // subject-derived revocation rules (2/3/4) are DENIED. The scored agent is
+    // legitimately named in `subject_key_ids` (it is who the claim is about —
+    // that field does real data-subject naming work the read path depends on),
+    // but `subject_key_ids` must NOT ALSO be spent as revocation AUTHORITY here:
+    // an agent that cannot score itself UP must not be able to score itself
+    // UN-DOWN by retracting its own unflattering rows (which reaches the same
+    // place by subtraction). The anti-Goodhart wall was enforced on assertion
+    // and forgotten on retraction — this closes the dual. Rule 1 (the attester
+    // who MADE the claim — the scorer / a canonical) still retracts/corrects;
+    // only the subject-self path is cut. `subject_key_ids` carries
+    // naming-but-not-revocation for these families (the manifest's rubric keeps
+    // `data_subject` and `recipient_revoke` distinct precisely for this).
+    let target_denies_subject_revocation = envelope_dimension(&target.attestation_envelope)
+        .is_some_and(|d| d.starts_with("capacity:") || d.starts_with("detection:"));
+    if target_denies_subject_revocation {
+        return Err(Error::WithdrawsNotAdmitted {
+            issuer: issuer.to_string(),
+            target_attestation_id: target.attestation_id.clone(),
+        });
+    }
+
     // Rule 2 — subject self-revocation. §8.1.11.2: membership in the
     // subject SET, any single element suffices (no quorum).
     if target.subject_key_ids.iter().any(|s| s == issuer) {
@@ -5993,16 +6018,23 @@ pub async fn check_delegated_duty_scores_admission(
         .get("community_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    // v8.7.2: this is the SCORES path — the row's OWN `subject_key_ids` are
-    // signed state (the producer signed THIS attestation, subjects
-    // included), not a later third party's self-declaration. So we feed the
-    // row's signed subjects directly (NOT via `subject_of_content`, which is
-    // the cirisnode-payload path where the subjects are NOT yet signed
-    // state). This is the "already signed-state, leave it" case
-    // (CIRISRegistry#96 follow-on note).
-    let duty_holders =
-        duty_holders_from_signed_subjects(directory, &row.subject_key_ids, community_id, duty)
-            .await?;
+    // v21.11.0 (CIRISPersist#517, CC 4.5.5) — resolve duty-holders from the
+    // community's NAMED MODERATORS ONLY. The prior code seeded the admissible
+    // set from the row's OWN `subject_key_ids`, so any Rooted producer could
+    // file an admissible `reconsideration:*` / `moderation:*` over any
+    // community action by naming THEMSELVES as subject — CC 4.5.5's
+    // target→duty-holder table authorizes NO subject-self clause for these two
+    // dimensions (only `takedown_notice`, on a DIFFERENT content path, gets
+    // `subject_of(content_sha256) ∪ is_named_moderator`). The §11.10 "already
+    // signed-state, leave it" note proves the SIGNER isn't spoofed; it does NOT
+    // prove the SUBJECT claim is genuine — integrity ≠ authority. If a
+    // subject-self carve-out is ever intended it must resolve against the
+    // REFERENCED prior action's signed subjects (a `subject_of`-style
+    // fail-secure resolver keyed on `references_attestation_id`), never from
+    // the row's own envelope. (`duty_holders_from_signed_subjects` is retained
+    // for that future referenced-action resolver; it is no longer reachable
+    // from this self-declared path.)
+    let duty_holders = duty_holders_for_community(directory, community_id, duty).await?;
     check_moderation_admission(
         directory,
         &row.attesting_key_id,
