@@ -93,8 +93,10 @@ struct MetaSources {
 pub struct FieldProcessorRow {
     /// The placement field name (e.g. `cohort_scope`, `dimension`).
     pub field: String,
-    /// `envelope_core_typed` | `untyped_extra` — whether the field is a typed
-    /// `EnvelopeCore` field or lives in the signature-locked `extra` map.
+    /// The value-space typing: `envelope_core_typed` (a typed `EnvelopeCore`
+    /// field), `attestation_base_typed` (a typed `AttestationBase` column), or
+    /// `untyped_extra` (the signature-locked `extra` map). Closed set gated by
+    /// [`tests::typing_value_space_is_closed`].
     #[serde(default)]
     pub typing: String,
     /// The owning component(s), slash-joined (`edge/persist/server`), or
@@ -105,6 +107,28 @@ pub struct FieldProcessorRow {
     /// The named processor (`path#symbol`) or `UNASSIGNED`.
     #[serde(default)]
     pub processor: String,
+    /// v21.13.0 (CIRISPersist#532) — every named processor/gate that touches
+    /// this field, NOT de-duplicated to the primary [`Self::processor`]. This
+    /// is the multi-processor signal the axis-fusion class needs: a field
+    /// whose distinct real processors span more than one CI axis is the
+    /// `list_attestations`-shape overload (advertise-listing vs holdings-listing,
+    /// CIRISEdge#416). Entries prefixed `proposed:` or containing `NOT LANDED`
+    /// are design notes, not live processors — [`Self::distinct_real_processors`]
+    /// filters them.
+    #[serde(default)]
+    pub processors_all: Vec<String>,
+    /// v21.13.0 (CIRISPersist#532) — the manifest walk's fusion classification
+    /// for this field's cross-axis reuse: `logical_defect` (a real overload — a
+    /// processor answers two CI questions and one answer is wrong),
+    /// `axiomatic_intent` (a deliberate, reviewed multi-role), `n/a` (benign
+    /// co-occurrence), or empty (the walk left it unclassified — persist fills
+    /// these via [`PERSIST_AUTHORED_AXIS_CLASSIFICATIONS`] pending CC ratification).
+    #[serde(default)]
+    pub asymmetry_kind: String,
+    /// The rationale prose for [`Self::asymmetry_kind`] (the "reviewed exemption
+    /// with a rationale" the fusion gate demands — CIRISPersist#532 gate 1).
+    #[serde(default)]
+    pub asymmetry_note: String,
 }
 
 impl FieldProcessorRow {
@@ -115,6 +139,39 @@ impl FieldProcessorRow {
     /// True iff this row has no processor assigned anywhere.
     pub fn is_unassigned(&self) -> bool {
         self.owner_component == "UNASSIGNED" || self.processor == "UNASSIGNED"
+    }
+    /// v21.13.0 (CIRISPersist#532) — the distinct LIVE processors touching this
+    /// field. Un-de-dupes [`Self::processors_all`] (the raw list carries repo-
+    /// prefixed and annotated variants of the same symbol), drops `proposed:` /
+    /// `NOT LANDED` design notes and `UNASSIGNED`, normalizes a leading
+    /// `CIRISPersist/` path prefix, and returns the distinct set. `>1` here is
+    /// the multi-processor signal the pre-#532 `processors_all` accessor hid by
+    /// collapsing to the single primary [`Self::processor`].
+    pub fn distinct_real_processors(&self) -> Vec<String> {
+        let mut all: Vec<String> = if self.processors_all.is_empty() {
+            vec![self.processor.clone()]
+        } else {
+            self.processors_all.clone()
+        };
+        all.retain(|p| {
+            let p = p.trim();
+            !p.is_empty()
+                && p != "UNASSIGNED"
+                && !p.starts_with("proposed:")
+                && !p.contains("NOT LANDED")
+        });
+        let mut norm: Vec<String> = all
+            .iter()
+            .map(|p| {
+                p.trim()
+                    .strip_prefix("CIRISPersist/")
+                    .unwrap_or(p.trim())
+                    .to_string()
+            })
+            .collect();
+        norm.sort();
+        norm.dedup();
+        norm
     }
 }
 
@@ -257,9 +314,206 @@ pub fn invariant_registry() -> &'static serde_json::Value {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// v21.13.0 (CIRISPersist#532) — the axis-fusion detector: "one name, two
+// axes." The CI six-axis rubric that generated this manifest ALREADY records,
+// per family, which wire field serves which axis
+// (`families.*.round2.ci_axes.<axis>.wire_fields`). What the manifest did NOT
+// do was JOIN that axis assignment onto the `field_processor_matrix` or GATE
+// on it — so a field answering two different CI questions (one wrongly) was
+// inexpressible on the matrix and invisible to CI. This section derives the
+// join IN CODE from the single existing source (rule #9: the axis truth lives
+// in exactly one place; a copied `ci_axis` column would drift) and the gate
+// tests below make cross-axis reuse a build-visible, classified fact.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The closed CI rubric axis set. `sender` / `data_subject` / `recipient_see`
+/// / `recipient_revoke` / `recipient_receive` / `information_type` /
+/// `transmission_principle` / `temporal_lifecycle` are Nissenbaum's contextual-
+/// integrity axes as the manifest's `ci_axes` keys them; `content` is the
+/// non-CI payload catch-all (a field that serves no CI axis). The vocabulary is
+/// gated closed by [`tests::ci_axis_vocabulary_is_closed`].
+pub const CI_AXES: &[&str] = &[
+    "sender",
+    "data_subject",
+    "recipient_see",
+    "recipient_revoke",
+    "recipient_receive",
+    "information_type",
+    "transmission_principle",
+    "temporal_lifecycle",
+    "content",
+];
+
+/// The closed fusion-classification vocabulary (`asymmetry_kind`).
+/// `logical_defect` — a real overload a processor gets wrong (must split or be
+/// tracked/fixed); `axiomatic_intent` — a deliberate, reviewed multi-role;
+/// `n/a` — benign co-occurrence (a field supplies context to several axes, no
+/// processor fuses them into a decision). Gated by
+/// [`tests::asymmetry_kind_vocabulary_is_closed`].
+pub const ASYMMETRY_KINDS: &[&str] = &["logical_defect", "axiomatic_intent", "n/a"];
+
+/// v21.13.0 (CIRISPersist#532) — persist-authored fusion classifications for
+/// the multi-axis `field_processor_matrix` fields the vendored v0.3.0 walk left
+/// with an EMPTY `asymmetry_kind`. These are **PROPOSED, pending
+/// CIRISConstitution ratification** — the CI rubric is the authority and these
+/// fold into the next manifest walk (tracked #520 + CIRISConstitution#44).
+/// Recorded here (not edited into the vendored Registry-of-Record) so the
+/// fusion gate is complete NOW without a unilateral edit of the constitution's
+/// artifact. `(field, kind, rationale)`; every entry is cross-checked to be a
+/// real multi-axis matrix field the manifest left unclassified
+/// ([`tests::persist_authored_classifications_cover_exactly_the_manifest_gaps`]).
+/// Ratification is tracked at CIRISConstitution#44 (fold into the #520 re-vendor).
+pub const PERSIST_AUTHORED_AXIS_CLASSIFICATIONS: &[(&str, &str, &str)] = &[
+    // ── benign co-occurrence: value/timestamp/identifier fields that supply
+    //    context to several axes, but no ONE processor decides an axis wrongly.
+    ("achieved_tier", "n/a",
+     "a tier value IS information_type; its progression over time IS temporal_lifecycle — the two roles co-occur on one immutable datum, no processor conflates them into a decision"),
+    ("committed_tier", "n/a",
+     "as achieved_tier: the committed tier is information_type content whose advance is temporal_lifecycle; benign co-occurrence"),
+    ("asserted_at", "n/a",
+     "a timestamp anchors both the temporal_lifecycle (when asserted) and the transmission context; a clock is not an authority — no processor spends it as one"),
+    ("validity_window", "n/a",
+     "a window is temporal_lifecycle data expressed as information_type; no processor reads it as anything but a time bound"),
+    ("community_key_id", "n/a",
+     "naming a community both identifies the content context (information_type) and selects that community's transmission norm — both are lookups of one identity, no wrong axis decision"),
+    ("confidence", "n/a",
+     "a confidence score is information_type the sender asserts; the sender/transmission co-occurrence is descriptive, never spent as authority"),
+    ("context", "n/a",
+     "free-form context supplies supporting information across data_subject/information_type/transmission; it is never the field a processor keys an axis decision on"),
+    ("enabled", "n/a",
+     "a boolean enable flag is temporal_lifecycle state read in a transmission decision; the flag is the state, not a second axis"),
+    ("evidence_refs", "n/a",
+     "an evidence pointer bundle legitimately touches every axis it cites (subject, info, sender, time, transmission); it is a reference list, not a decision field — no processor treats a ref as authority"),
+    ("scope", "n/a",
+     "here `scope` is the claim's coverage (information_type) with a downstream visibility implication; distinct from cohort_scope (which IS the logical_defect) — no persist processor fuses claim-scope with see-scope"),
+    ("tenant_id", "n/a",
+     "a tenant identifier names both the subject and the information context; one identity lookup serving two descriptive roles, not a fused decision"),
+    ("withdrawal_reason", "n/a",
+     "descriptive reason prose on a revoke; recipient_revoke + temporal_lifecycle co-occur because a withdrawal IS a timed revocation event — the reason text decides nothing"),
+    // ── axiomatic_intent: the multi-role is deliberate and load-bearing; the
+    //    action itself spans axes by definition, and each op uses the right one.
+    ("withdraws", "axiomatic_intent",
+     "a withdraws IS definitionally both a recipient_revoke action and a temporal_lifecycle transition — one coherent action, not two answers; the withdraws-authority arc (#517/#528) is the fusion to guard, and it is guarded on the SEPARATE subject_key_ids/attester axis, not here"),
+    ("consent", "axiomatic_intent",
+     "consent is definitionally a transmission_principle that also gates recipient_receive and carries a temporal_lifecycle — the spanning is the concept; the send-vs-receive fusion to watch is CIRISEdge#414's #396 gate, a DIRECTION overload downstream, not this substrate field"),
+    ("references_attestation_id", "axiomatic_intent",
+     "a pointer whose role is op-separated: withdraws/supersedes/recants read it as the recipient_revoke TARGET, structural composers as a temporal_lifecycle prior, subject-binding as data_subject — each op uses the correct axis; HIGHEST-risk benign member, the same pointer-decides-authority shape as #517/#528 — flagged for the CC rubric to confirm or split"),
+];
+
+/// The `families` section (per-family CI-axis assignments live under
+/// `families.<prefix>.round2.ci_axes.<axis>.wire_fields`). Raw
+/// [`serde_json::Value`] — this module stays the single parse point for the
+/// vendored manifest; [`field_ci_axes_map`] is the ONE consumer.
+fn families() -> &'static serde_json::Value {
+    static FAMILIES: OnceLock<serde_json::Value> = OnceLock::new();
+    FAMILIES.get_or_init(|| {
+        let root: serde_json::Value = serde_json::from_str(SUPERSETS_JSON)
+            .expect("vendored namespace_supersets.json is valid JSON");
+        root.get("families")
+            .cloned()
+            .expect("namespace_supersets.json carries a top-level families section")
+    })
+}
+
+/// The bare wire-field name from an annotated `wire_fields` entry, e.g.
+/// `"cohort_scope (Global/federation-wide only)"` → `"cohort_scope"`,
+/// `"ThresholdSignature[]{member_id,...}"` → `"ThresholdSignature"`. Returns
+/// `""` for an entry that does not start with an identifier.
+fn bare_wire_field(s: &str) -> &str {
+    let s = s.trim_start();
+    let end = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(s.len());
+    &s[..end]
+}
+
+/// v21.13.0 (CIRISPersist#532) — the DERIVED join: `field name → the set of CI
+/// axes it serves`, read out of every family's
+/// `round2.ci_axes.<axis>.wire_fields`. A field mapping to more than one axis
+/// is the fusion signal the gate classifies. Built once; the map borrows
+/// `'static` axis names from [`CI_AXES`] so callers get cheap `&'static str`s.
+fn field_ci_axes_map(
+) -> &'static std::collections::BTreeMap<String, std::collections::BTreeSet<&'static str>> {
+    static MAP: OnceLock<
+        std::collections::BTreeMap<String, std::collections::BTreeSet<&'static str>>,
+    > = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map: std::collections::BTreeMap<String, std::collections::BTreeSet<&'static str>> =
+            std::collections::BTreeMap::new();
+        let fams = families();
+        let Some(obj) = fams.as_object() else {
+            return map;
+        };
+        for fam in obj.values() {
+            let Some(ci_axes) = fam.get("round2").and_then(|r| r.get("ci_axes")) else {
+                continue;
+            };
+            let Some(axes_obj) = ci_axes.as_object() else {
+                continue;
+            };
+            for (axis_key, entry) in axes_obj {
+                // Resolve the axis key to its `'static` spelling in CI_AXES so
+                // the returned sets carry no owned strings.
+                let Some(&axis) = CI_AXES.iter().find(|a| **a == axis_key.as_str()) else {
+                    // An unknown axis key is caught by
+                    // `ci_axis_vocabulary_is_closed`; skip it here.
+                    continue;
+                };
+                let Some(wfs) = entry.get("wire_fields").and_then(|w| w.as_array()) else {
+                    continue;
+                };
+                for wf in wfs {
+                    let Some(wf) = wf.as_str() else { continue };
+                    let name = bare_wire_field(wf);
+                    if name.is_empty() {
+                        continue;
+                    }
+                    map.entry(name.to_string()).or_default().insert(axis);
+                }
+            }
+        }
+        map
+    })
+}
+
+/// The set of CI axes a placement `field` serves, derived from the manifest's
+/// per-family `ci_axes.wire_fields` (CIRISPersist#532). Empty for a field that
+/// names no CI axis (pure `content` payload). More than one axis is the
+/// fusion signal [`tests::every_multi_axis_field_is_classified`] gates.
+pub fn ci_axes_for_field(field: &str) -> std::collections::BTreeSet<&'static str> {
+    field_ci_axes_map().get(field).cloned().unwrap_or_default()
+}
+
+/// The fusion classification for a placement `field`: the vendored manifest's
+/// `asymmetry_kind`+note when the walk set one, else persist's proposed
+/// [`PERSIST_AUTHORED_AXIS_CLASSIFICATIONS`] entry (pending CC ratification),
+/// else `None` (an UNCLASSIFIED cross-axis field — a build failure under the
+/// fusion gate). Returns `(kind, rationale)`.
+pub fn fusion_classification(field: &str) -> Option<(&'static str, &'static str)> {
+    // Manifest first (the authored Registry-of-Record wins over persist's proposal).
+    if let Some(row) = field_processor_matrix().iter().find(|r| r.field == field) {
+        if !row.asymmetry_kind.trim().is_empty() {
+            // Return the `'static` spelling from ASYMMETRY_KINDS for the kind;
+            // the note is borrowed from the parsed manifest ('static via OnceLock).
+            let kind = ASYMMETRY_KINDS
+                .iter()
+                .find(|k| **k == row.asymmetry_kind.as_str())
+                .copied()
+                .unwrap_or("logical_defect");
+            return Some((kind, row.asymmetry_note.as_str()));
+        }
+    }
+    PERSIST_AUTHORED_AXIS_CLASSIFICATIONS
+        .iter()
+        .find(|(f, _, _)| *f == field)
+        .map(|(_, kind, note)| (*kind, *note))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     /// v21.10.0 (CIRISPersist#519 b5 / item 6) — the evidence loop's persist
     /// half: every `path#symbol` in the materialized `evidence/cc_impl.tsv`
@@ -394,6 +648,276 @@ mod tests {
             vec!["self_touch", "witness_touch", "n_of_m_cosigned"],
             "SignerForm's variants must track the manifest's declared signer_forms: {:?}",
             spec.signer_forms
+        );
+    }
+
+    // ── v21.13.0 (CIRISPersist#532) — the axis-fusion gate suite ──────────
+
+    /// The KNOWN, tracked axis fusions (`asymmetry_kind = logical_defect`) —
+    /// fields where a processor genuinely answers two CI questions and one
+    /// answer is wrong. Pinned like [`KNOWN_UNASSIGNED_FIELDS`]: a NEW
+    /// `logical_defect` (a newly-surfaced fusion, e.g. the #532 tenth) fails
+    /// the build until recorded here with its tracking issue; a RESOLVED one
+    /// (split into two axis-honest symbols) must be removed. This is the
+    /// regression tripwire the whole class was missing.
+    const KNOWN_AXIS_FUSIONS: &[&str] = &[
+        "attestation_prefixes",
+        "audience",
+        "charter_witness_ref",
+        "cohort_scope",
+        "config_scope",
+        "delegation_purpose",
+        "manifest.content_hash",
+        "registry_row",
+        "restrictions[].op=recipient_capability",
+        "tombstone_null_value",
+        "wa_adjudication_ref",
+        "weight",
+        "witness_relation",
+    ];
+
+    /// Gate: every axis key the manifest uses is in the closed [`CI_AXES`]
+    /// rubric set. A new axis token in a re-vendor must be added to the const
+    /// deliberately — the vocabulary cannot silently widen.
+    #[test]
+    fn ci_axis_vocabulary_is_closed() {
+        let closed: BTreeSet<&str> = CI_AXES.iter().copied().collect();
+        let fams = families()
+            .as_object()
+            .expect("families is an object")
+            .clone();
+        for (prefix, fam) in &fams {
+            let Some(axes) = fam
+                .get("round2")
+                .and_then(|r| r.get("ci_axes"))
+                .and_then(|a| a.as_object())
+            else {
+                continue;
+            };
+            for axis_key in axes.keys() {
+                assert!(
+                    closed.contains(axis_key.as_str()),
+                    "family {prefix} declares ci_axes key {axis_key:?} outside the closed CI \
+                     rubric set {CI_AXES:?} — widen CI_AXES deliberately or fix the manifest"
+                );
+            }
+        }
+    }
+
+    /// Gate: every fusion classification (manifest `asymmetry_kind` AND every
+    /// persist-authored entry) is in the closed [`ASYMMETRY_KINDS`] set.
+    #[test]
+    fn asymmetry_kind_vocabulary_is_closed() {
+        let closed: BTreeSet<&str> = ASYMMETRY_KINDS.iter().copied().collect();
+        for r in field_processor_matrix() {
+            let k = r.asymmetry_kind.trim();
+            if k.is_empty() {
+                continue;
+            }
+            assert!(
+                closed.contains(k),
+                "field {} has asymmetry_kind {k:?} outside {ASYMMETRY_KINDS:?}",
+                r.field
+            );
+        }
+        for (f, k, _) in PERSIST_AUTHORED_AXIS_CLASSIFICATIONS {
+            assert!(
+                closed.contains(k),
+                "persist-authored classification for {f} uses kind {k:?} outside {ASYMMETRY_KINDS:?}"
+            );
+        }
+    }
+
+    /// The derivation catches the ARC's confirmed fusions — a guard that
+    /// `ci_axes_for_field` actually joins (an empty/broken join would make the
+    /// whole gate vacuously pass). `subject_key_ids` (#528: data-subject naming
+    /// vs revocation authority) and `cohort_scope` (#527: read vs write default
+    /// / recipient_see vs receive) MUST each derive more than one axis.
+    #[test]
+    fn ci_axes_derivation_catches_the_known_fusions() {
+        for f in ["subject_key_ids", "cohort_scope"] {
+            let axes = ci_axes_for_field(f);
+            assert!(
+                axes.len() > 1,
+                "{f} must derive >1 CI axis (the fusion signal); got {axes:?} — the \
+                 families.ci_axes join is broken"
+            );
+        }
+    }
+
+    /// THE fusion gate (CIRISPersist#532 gate 1): every placement field that
+    /// serves MORE THAN ONE CI axis must carry a fusion classification — the
+    /// manifest's own `asymmetry_kind`, or persist's proposed classification.
+    /// An UNCLASSIFIED cross-axis field is exactly the "one name, two axes"
+    /// defect the arc kept finding by hand; here it is a build failure. This
+    /// converts axis fusion from latent-in-code to visible-in-artifact.
+    #[test]
+    fn every_multi_axis_field_is_classified() {
+        let mut unclassified: Vec<String> = Vec::new();
+        for r in field_processor_matrix() {
+            let axes = ci_axes_for_field(&r.field);
+            if axes.len() > 1 && fusion_classification(&r.field).is_none() {
+                unclassified.push(format!("{} {:?}", r.field, axes));
+            }
+        }
+        assert!(
+            unclassified.is_empty(),
+            "UNCLASSIFIED axis-fusion field(s) — a field serving >1 CI axis with no \
+             asymmetry_kind (manifest) nor PERSIST_AUTHORED_AXIS_CLASSIFICATIONS entry. \
+             Classify it (logical_defect + tracking issue, axiomatic_intent, or n/a) so the \
+             fusion is visible: {unclassified:?}"
+        );
+    }
+
+    /// The persist-authored classifications cover EXACTLY the manifest's
+    /// multi-axis gaps — no more, no less. Prevents both drift directions: a
+    /// stale authored entry for a field the manifest later classifies (or that
+    /// stops being multi-axis), and a real gap left uncovered. When the CC
+    /// ratification folds these into the next walk, the manifest's
+    /// `asymmetry_kind` fills and the matching authored entries must be removed
+    /// (this test names them).
+    #[test]
+    fn persist_authored_classifications_cover_exactly_the_manifest_gaps() {
+        // The gaps: multi-axis matrix fields the manifest left unclassified.
+        let mut manifest_gaps: BTreeSet<&str> = BTreeSet::new();
+        for r in field_processor_matrix() {
+            if r.asymmetry_kind.trim().is_empty() && ci_axes_for_field(&r.field).len() > 1 {
+                manifest_gaps.insert(r.field.as_str());
+            }
+        }
+        let authored: BTreeSet<&str> = PERSIST_AUTHORED_AXIS_CLASSIFICATIONS
+            .iter()
+            .map(|(f, _, _)| *f)
+            .collect();
+        assert_eq!(
+            authored, manifest_gaps,
+            "PERSIST_AUTHORED_AXIS_CLASSIFICATIONS must cover exactly the manifest's multi-axis \
+             gaps. Left = authored, right = actual gaps. A field on the right-not-left is an \
+             unclassified fusion; a field on the left-not-right is a stale authored entry (the \
+             manifest now classifies it, or it is no longer multi-axis) — remove it."
+        );
+        // Every authored entry names a real, non-empty rationale (the gate
+        // demands a reviewed exemption WITH a reason).
+        for (f, _, note) in PERSIST_AUTHORED_AXIS_CLASSIFICATIONS {
+            assert!(
+                note.len() > 20,
+                "persist-authored classification for {f} needs a substantive rationale"
+            );
+        }
+    }
+
+    /// The tracked-fusion registry is pinned: the set of `logical_defect`
+    /// fields (manifest + any persist-authored) equals [`KNOWN_AXIS_FUSIONS`].
+    /// A NEW `logical_defect` (a fusion the manifest or persist newly marks a
+    /// real bug — the #532 tenth) fails until pinned with its tracking issue; a
+    /// RESOLVED one must be removed. Same discipline as
+    /// [`unassigned_fields_match_the_known_tracked_gap_set`].
+    #[test]
+    fn known_axis_fusions_are_pinned() {
+        let mut actual: BTreeSet<&str> = field_processor_matrix()
+            .iter()
+            .filter(|r| r.asymmetry_kind.trim() == "logical_defect")
+            .map(|r| r.field.as_str())
+            .collect();
+        for (f, k, _) in PERSIST_AUTHORED_AXIS_CLASSIFICATIONS {
+            if *k == "logical_defect" {
+                actual.insert(f);
+            }
+        }
+        let pinned: BTreeSet<&str> = KNOWN_AXIS_FUSIONS.iter().copied().collect();
+        assert_eq!(
+            actual, pinned,
+            "the tracked axis-fusion set changed. A NEW logical_defect is the #532 defect class \
+             re-appearing — pin it in KNOWN_AXIS_FUSIONS with a tracking issue, or if it was \
+             split into axis-honest symbols, remove it. Left = actual, right = pinned."
+        );
+    }
+
+    /// CIRISPersist#532 (the dedup fix / #416 signal): the multi-processor
+    /// signal is SURFACED, not collapsed. The pre-#532 accessor reported `0`
+    /// fields with more than one distinct processor (it deduped to the single
+    /// primary `processor`); [`FieldProcessorRow::distinct_real_processors`]
+    /// must surface the real fan-out. `dimension` / `cohort_scope` /
+    /// `subject_key_ids` each have many distinct live processors — the exact
+    /// fields where a `list_attestations`-shape advertise-vs-holdings overload
+    /// (#416) would hide.
+    #[test]
+    fn multi_processor_fields_are_surfaced_not_deduped() {
+        let multi = field_processor_matrix()
+            .iter()
+            .filter(|r| r.distinct_real_processors().len() > 1)
+            .count();
+        assert!(
+            multi > 0,
+            "distinct_real_processors collapsed to <=1 everywhere — the dedup bug that hid #416 \
+             is back (the manifest has fields with many processors_all entries)"
+        );
+        for f in ["dimension", "cohort_scope", "subject_key_ids"] {
+            let row = field_processor_matrix()
+                .iter()
+                .find(|r| r.field == f)
+                .unwrap_or_else(|| panic!("{f} is a matrix field"));
+            assert!(
+                row.distinct_real_processors().len() > 1,
+                "{f} must surface >1 distinct live processor (the multi-processor / #416 \
+                 signal); got {:?}",
+                row.distinct_real_processors()
+            );
+        }
+    }
+
+    /// The `typing` value space is closed (`envelope_core_typed` |
+    /// `untyped_extra`), and — since the matrix carries one row per field —
+    /// each field states exactly one typing. CIRISPersist#532 gate 2 (one
+    /// field, one value space): the CROSS-REPO half (a field whose `typing`
+    /// disagrees across repos — #2 goal_id, #3 reconsideration) is a conformance
+    /// check the downstream renders run; persist enforces its own closed
+    /// value space here.
+    #[test]
+    fn typing_value_space_is_closed() {
+        // The three-value typing space: a typed EnvelopeCore field, a typed
+        // AttestationBase column, or the signature-locked `extra` map.
+        let closed: BTreeSet<&str> = [
+            "envelope_core_typed",
+            "attestation_base_typed",
+            "untyped_extra",
+        ]
+        .into_iter()
+        .collect();
+        for r in field_processor_matrix() {
+            let t = r.typing.trim();
+            if t.is_empty() {
+                continue;
+            }
+            assert!(
+                closed.contains(t),
+                "field {} has typing {t:?} outside the closed value space {closed:?}",
+                r.field
+            );
+        }
+    }
+
+    /// CIRISPersist#532 gate 3 (read/write defaults are distinct axes): the
+    /// manifest's `duality_audit` records `read<->write` as a closed duality —
+    /// the recognition that a default governing the read path and one governing
+    /// the write path are different axes, and one constant serving both is the
+    /// #527 `cohort_scope` fail-open. This asserts the recognition is present
+    /// (a re-vendor that drops it regresses the modeling).
+    #[test]
+    fn read_write_default_duality_is_recorded() {
+        let root: serde_json::Value =
+            serde_json::from_str(SUPERSETS_JSON).expect("valid manifest json");
+        let closed = root
+            .get("duality_audit")
+            .and_then(|d| d.get("known_closed_not_reported"))
+            .and_then(|v| v.as_array())
+            .expect("duality_audit.known_closed_not_reported is an array");
+        assert!(
+            closed
+                .iter()
+                .any(|v| v.as_str() == Some("read<->write")),
+            "duality_audit must record read<->write as a closed duality (CIRISPersist#532 gate 3 / \
+             #527 cohort_scope read-vs-write default): {closed:?}"
         );
     }
 }
