@@ -18864,6 +18864,23 @@ mod tests {
         crate::federation::operational::test_support::exercise_role_conferral(&backend, &tag).await;
     }
 
+    /// v21.15.0 (CIRISPersist#536) — the trust-root fixture on POSTGRES: the
+    /// same body sqlite + memory run, so `establish_trust_root` (incl. the
+    /// reserved accord:lifecycle leg + the #513 accord-holder HW-attestation
+    /// gate) is proven usable on every backend a round test might open.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn trust_root_helper_works_on_postgres_536() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg536{}", uuid_like());
+        crate::federation::operational::test_support::exercise_trust_root(&backend, &tag).await;
+    }
+
     /// #443 — the transport route-table (epoch, asserted_at) monotonic-guard
     /// matrix on postgres. Shares the assertion body with the memory + sqlite
     /// parity tests; the unique suffix scopes fixtures in the shared test DB.

@@ -5,6 +5,55 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.15.0] — 2026-07-28 — #536: `establish_trust_root` — the leg-B fixture that completes in-process round testing
+
+Follow-on to #534 (`confer_roles`, v21.14.0). That closed **leg A** of the trace-serve gate
+(the canonical's `infra:serve` is accord-conferred). This closes **leg B**
+(`capability_roots_to_trusted_root`): the served capability must root to a trust root the
+sending node trusts. With both, the whole round-seam defect class (CIRISEdge#414/#416,
+CIRISPersist#509/#530 — all *round* properties, invisible from either side alone) becomes a
+`cargo test` instead of a mesh-harness round trip each.
+
+### Added — `test_support::establish_trust_root` + `grant_scope`
+
+A consumer cannot stand up a valid trust root by hand: `trust_root_valid` needs four legs,
+and **leg 3 is the wall** — a fresh `accord:lifecycle` attestation about the root, and
+`accord:*` is a reserved family (`accord_holder`-only, CC 3.4.1), so it must be emitted *as
+an accord holder* while a test engine signs as itself. Hand-assembling and signing all five
+rows is exactly the "every consumer reassembles it slightly differently and gets it subtly
+wrong" failure #534 was filed about, on a more intricate structure.
+
+- **`establish_trust_root(directory, user_key_id, root_key_id, subject_key_id, scope)`** —
+  stands up all four legs with real signatures verified by the same walk production uses, on
+  **any** backend: (1) `delegates_to(user → root)` trust edge; (2) the root's self-declaration
+  charter carrying `infra:attest` + `infra:serve` + a well-formed `pre_rotation_commitment`;
+  (3) a fresh `accord:lifecycle:v1` row from a helper-minted `accord_holder`; (4) no halt;
+  plus the `delegates_to(root → subject)` scope edge. It does the whole honest dance — it
+  bypasses no gate.
+- **`grant_scope(directory, root, subject, scope)`** — the scope edge split out (per the
+  issue), so a consumer can grant further scopes off an established root.
+- Backend-agnostic by construction, with two more of the #534 "one-backend-tested" traps
+  closed en route: on sqlite/postgres the reserved `accord:lifecycle` needs a real
+  `accord_holder` whose registration passes the **#513 hardware-attestation gate** (memory
+  skips it — the helper supplies the accepted mock Android-StrongBox evidence with a fresh
+  nonce), and every `attestation_id` must be a real **UUID** (postgres `::uuid`-casts the
+  column; memory/sqlite tolerate TEXT). Parity trio: `trust_root_helper_works_on_*_536` runs
+  the same body on memory + sqlite + postgres.
+
+### Fixed — `confer_roles` docstring (the `infra:serve` FIPS-custody caveat)
+
+`confer_roles` confers via the roster co-scrub — right for `infra:attest`. `infra:serve` is
+stricter: its admission runs the m-of-n with `require_fips_custody = true` (#513) and the
+roster resolves from the **genesis** `accord_holder_roster_key_ids()`, never the minted
+holders — so a software `infra:serve` conferral only verifies under test-anchor **Mode A**
+(`CIRIS_TESTING_MODE=true` + `CIRIS_TEST_TRUST_ROOT*`), else the failure is an opaque
+`0 < threshold 2`. Now stated at the call site, pointing trust-root callers to
+`establish_trust_root` (a different plane — the delegation SCOPE, not the key ROLE).
+
+No wire/schema change — test-support only, under the existing `test-anchor` feature
+(`tier_ingest::test_support` is now compiled under it too). CIRISServer/`tests/trace_round_e2e.rs`
+becomes a complete local end-to-end trace pin on adopting this.
+
 ## [21.14.0] — 2026-07-28 — #534: accord-conferral test helpers work on SQLite (and Postgres), not just Memory
 
 The `operational::test_support` accord-conferral helpers were **MemoryBackend-only** — which

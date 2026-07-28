@@ -10046,6 +10046,16 @@ mod tests {
             .await;
     }
 
+    /// v21.15.0 (CIRISPersist#536) — the trust-root fixture parity body on
+    /// MemoryBackend (the same one sqlite + postgres run). establish_trust_root
+    /// stands up all four legs (incl. the reserved accord:lifecycle) + the
+    /// scope edge, and the capability walk roots the subject's infra:serve.
+    #[tokio::test]
+    async fn trust_root_helper_works_on_memory_536() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_trust_root(&backend, "mem536").await;
+    }
+
     /// v18.3.0 (CIRISPersist#480, persist-side compat confirmation) — a
     /// `canonical,node` record that ALSO carries `roles:["infra:serve"]`
     /// still (a) passes the 2-of-3 `check_canonical_role_admission` core
