@@ -18591,6 +18591,22 @@ mod accord_tests {
         crate::federation::accord_quorum::test_fixtures::exercise_accord_storage(&backend, "sq")
             .await;
     }
+
+    /// v21.14.0 (CIRISPersist#534) — the accord-conferral test helpers must
+    /// work on SQLITE, not just MemoryBackend. Before #534 this failed at
+    /// `register_accord_holder`'s non-hex `test-anchor` (sqlite hex-decodes the
+    /// column) and then starved roster resolution to 0 valid co-scrubs — the
+    /// exact "tested on one backend, used on the other" gap #518 flagged. This
+    /// runs the SAME conferral body as the memory + postgres parity tests, so
+    /// an in-process round test downstream (CIRISServer#327) has a sqlite-usable
+    /// `confer_roles`.
+    #[tokio::test]
+    async fn role_conferral_helpers_work_on_sqlite_534() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_role_conferral(&backend, "sq534")
+            .await;
+    }
 }
 
 #[cfg(test)]

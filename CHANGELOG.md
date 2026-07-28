@@ -5,6 +5,48 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.14.0] — 2026-07-28 — #534: accord-conferral test helpers work on SQLite (and Postgres), not just Memory
+
+The `operational::test_support` accord-conferral helpers were **MemoryBackend-only** — which
+blocked the one test class that would end the mesh-harness round-trips: an in-process
+two-node Attestation round (agent-shaped → canonical-shaped, real engines/bridges/`Session`
+pair, no docker). The round machinery worked; standing up a *legitimately role-conferred*
+canonical did not, on sqlite. Every predicate in the trace-delivery arc (CIRISEdge#414/#416,
+CIRISPersist#509/#530) was a **round** property — visible from neither side alone — and each
+cost a full harness round trip to find. This unblocks catching them in-process.
+
+### Fixed — three "tested on one backend, used on the other" traps (the #518 shape, ×3)
+
+`register_accord_holder` stamped placeholder columns that only MemoryBackend tolerated:
+`original_content_hash: "test-anchor"` (non-hex — sqlite hex-decodes and rejects it:
+`"Odd number of digits"`) and `scrub_signature_classical: "AA"`. So the holder never landed
+on sqlite (**blocker 1**), which then starved roster resolution to `0` valid co-scrubs
+(**blocker 2** — a *consequence* of blocker 1, not a separate roster bug). The helper now
+**self-scrubs for real**: canonicalize the registration envelope, hash it to a valid-hex
+`original_content_hash`, and sign those exact bytes with the holder's own hybrid key — which
+round-trips through every backend's column encoding. A **third** trap surfaced in the DENY
+path: an out-of-roster self-scrubber's `scrub_key_id` violated the sqlite FK (memory enforces
+none), so it now registers the scrubber (FK satisfied) while keeping it out of the roster
+(still not conferred).
+
+### Added — `test_support::confer_roles` (backend-agnostic) + a cross-backend parity trio
+
+- **`confer_roles(directory, key_id, roles, family_tag)`** — the ONE honest conferral
+  primitive: stands up a fresh 2-of-3 accord family, registers its pinned pubkeys, and writes
+  a co-scrubbed role-conferred canonical, so `has_effective_role_over_roster` reads the role
+  TRUE on **any** backend. It does the real m-of-n dance — it does NOT bypass the
+  `InfraAttestRoleNotAccordConferred` gate (that gate is correct). Consumers building the
+  round test call this instead of reassembling an accord family by hand (which every consumer
+  got subtly wrong).
+- **`exercise_role_conferral(directory, tag)`** — the shared ALLOW+DENY parity body, now run
+  from **memory, sqlite, AND postgres** backend tests (`role_conferral_helpers_work_on_*_534`).
+  Persist's own conferral test running on one backend is exactly what hid all three traps;
+  the trio closes it.
+
+No wire/schema change — test-support only. Available to downstream under the existing
+`test-anchor` feature (CIRISServer/`tests/trace_round_e2e.rs` un-ignores its positive half on
+adopting this).
+
 ## [21.13.0] — 2026-07-28 — #532: the axis-fusion gate — "one name, two axes" made build-visible
 
 Nine instances across four repos in one arc — `subject_key_ids` (data-subject naming

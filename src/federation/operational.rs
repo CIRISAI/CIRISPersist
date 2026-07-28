@@ -1090,7 +1090,24 @@ pub mod test_support {
         directory: &dyn crate::federation::FederationDirectory,
         holder: &Identity,
     ) -> Result<(), crate::federation::Error> {
+        use sha2::{Digest, Sha256};
         let m = holder.member();
+        let registration_envelope = json!({ "key_id": holder.key_id });
+        // v21.14.0 (CIRISPersist#534) — self-scrub the holder registration for
+        // real: canonicalize the envelope, hash it to a VALID-HEX
+        // `original_content_hash`, and sign those exact bytes with the holder's
+        // own hybrid key. The pre-#534 placeholders (`original_content_hash =
+        // "test-anchor"`, `scrub_signature_classical = "AA"`) are NON-HEX /
+        // NON-BASE64 and the SQLite backend hex/base64-decodes both columns on
+        // `put_public_key` — so the holder never landed on sqlite (blocker 1),
+        // which then starved roster resolution to 0 valid co-scrubs (blocker 2).
+        // MemoryBackend tolerated the placeholders, which is why this crate's
+        // own helper test only ever ran on memory (the #518 "tested on one
+        // backend, used on the other" shape). A real self-scrub round-trips on
+        // every backend.
+        let bytes = crate::verify::canonical::ceg_produce_canonicalize(&registration_envelope)
+            .expect("canonicalize holder registration envelope");
+        let (ed, pqc) = holder.sign_bytes(&bytes);
         let rec = crate::federation::types::KeyRecord {
             key_id: holder.key_id.clone(),
             pubkey_ed25519_base64: m.ed25519_public_key_base64,
@@ -1100,10 +1117,10 @@ pub mod test_support {
             identity_ref: holder.key_id.clone(),
             valid_from: chrono::Utc::now(),
             valid_until: None,
-            registration_envelope: json!({ "key_id": holder.key_id }),
-            original_content_hash: "test-anchor".to_owned(),
-            scrub_signature_classical: "AA".to_owned(),
-            scrub_signature_pqc: None,
+            registration_envelope,
+            original_content_hash: hex::encode(Sha256::digest(&bytes)),
+            scrub_signature_classical: ed,
+            scrub_signature_pqc: Some(pqc),
             scrub_key_id: holder.key_id.clone(),
             scrub_timestamp: chrono::Utc::now(),
             pqc_completed_at: None,
@@ -1118,6 +1135,111 @@ pub mod test_support {
         directory
             .put_public_key(crate::federation::types::SignedKeyRecord { record: rec })
             .await
+    }
+
+    /// v21.14.0 (CIRISPersist#534) — the ONE backend-agnostic conferral
+    /// primitive: stand up a fresh 2-of-3 accord family, register its pinned
+    /// pubkeys, and write a `key_id` canonical record whose `roles` are
+    /// genuinely co-scrubbed by two distinct holders — so
+    /// [`crate::federation::admission::has_effective_role_over_roster`] (over
+    /// the returned roster) reads the conferred roles TRUE on any backend
+    /// (sqlite / postgres / memory).
+    ///
+    /// This is the honest path the `InfraAttestRoleNotAccordConferred` gate
+    /// demands — it does the real m-of-n dance, it does NOT bypass conferral.
+    /// Consumers building an in-process round test (agent-shaped → canonical-
+    /// shaped, real engines/bridges, no docker) call this instead of
+    /// reassembling an accord family by hand (which every consumer got subtly
+    /// wrong — CIRISPersist#534). Returns the holder roster (their `key_id`s)
+    /// to pass to `has_effective_role_over_roster` / admission.
+    ///
+    /// The `family_tag` scopes the generated holder ids so repeated calls (and
+    /// a shared postgres test DB) do not collide.
+    pub async fn confer_roles(
+        directory: &dyn crate::federation::FederationDirectory,
+        key_id: &str,
+        roles: &[&str],
+        family_tag: &str,
+    ) -> Result<Vec<String>, crate::federation::Error> {
+        let holders = [
+            Identity::new(&format!("{family_tag}-h0")),
+            Identity::new(&format!("{family_tag}-h1")),
+            Identity::new(&format!("{family_tag}-h2")),
+        ];
+        for h in &holders {
+            register_accord_holder(directory, h).await?;
+        }
+        let roster: Vec<String> = holders.iter().map(|h| h.key_id.clone()).collect();
+        let record = signed_canonical_record_with_roles(
+            key_id,
+            crate::federation::types::identity_type::NODE,
+            roles.iter().map(|r| (*r).to_owned()).collect(),
+            json!({ "key_id": key_id, "conferred_by": family_tag }),
+            &[&holders[0], &holders[1]],
+        );
+        directory
+            .put_public_key(crate::federation::types::SignedKeyRecord { record })
+            .await?;
+        Ok(roster)
+    }
+
+    /// v21.14.0 (CIRISPersist#534) — the BACKEND-AGNOSTIC conferral parity
+    /// body: prove [`confer_roles`] confers `infra:serve` for real, and that a
+    /// self-scrubbed (out-of-roster) claim does NOT confer, over an arbitrary
+    /// [`crate::federation::FederationDirectory`]. Called from the memory,
+    /// sqlite AND postgres backend tests so the "tested on one backend, used on
+    /// the other" gap (CIRISPersist#534, the #518 shape) cannot reopen: the
+    /// holder registration + co-scrub now round-trip through whatever column
+    /// encoding each backend applies (the `test-anchor` placeholder that only
+    /// MemoryBackend tolerated is gone). `tag` scopes the generated ids so a
+    /// shared postgres DB does not collide across runs.
+    pub async fn exercise_role_conferral(
+        directory: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::admission::has_effective_role_over_roster;
+
+        let canon = format!("{tag}-canon");
+        // ALLOW: the honest 2-of-3 dance confers infra:serve.
+        let roster = confer_roles(directory, &canon, &["infra:serve"], tag)
+            .await
+            .expect("confer_roles admits the co-scrubbed canonical");
+        assert!(
+            has_effective_role_over_roster(directory, &canon, "infra:serve", &roster)
+                .await
+                .expect("has_effective_role read"),
+            "({tag}) genuinely accord-conferred infra:serve reads TRUE on this backend"
+        );
+
+        // DENY: same role CLAIM, but scrubbed only by an out-of-roster
+        // identity → not conferred (the never-self-claimed monotonic property).
+        // The scrubber is REGISTERED (so its `scrub_key_id` FK resolves — sqlite
+        // enforces that constraint, MemoryBackend does not; leaning on the FK-
+        // free backend is the same #518/#534 one-backend-tested trap this whole
+        // fix closes), but it is deliberately NOT in `roster`, so its scrub
+        // counts toward nothing.
+        let self_id = format!("{tag}-canon-self");
+        let self_scrubber = Identity::new(&format!("{tag}-selfscrub"));
+        register_accord_holder(directory, &self_scrubber)
+            .await
+            .expect("register the out-of-roster scrubber (FK satisfied, roster excluded)");
+        let self_only = signed_canonical_record_with_roles(
+            &self_id,
+            crate::federation::types::identity_type::NODE,
+            vec!["infra:serve".to_owned()],
+            json!({ "key_id": self_id }),
+            &[&self_scrubber],
+        );
+        directory
+            .put_public_key(crate::federation::types::SignedKeyRecord { record: self_only })
+            .await
+            .expect("self-scrubbed record still stores");
+        assert!(
+            !has_effective_role_over_roster(directory, &self_id, "infra:serve", &roster)
+                .await
+                .expect("has_effective_role read"),
+            "({tag}) self-asserted infra:serve with no accord co-scrub reads FALSE"
+        );
     }
 }
 
