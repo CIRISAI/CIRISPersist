@@ -5,6 +5,60 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.13.0] — 2026-07-28 — #532: the axis-fusion gate — "one name, two axes" made build-visible
+
+Nine instances across four repos in one arc — `subject_key_ids` (data-subject naming
+vs revocation authority, #528), `cohort_scope` default (read-path vs write-path, #527),
+`list_attestations` (advertise vs holdings, CIRISEdge#416), signed-state (integrity vs
+authority, #517), and five more — were all one defect class: **a single name answers two
+different CI questions, and one answer is wrong.** Each was found by hand (live harness
+run, adoption compile error, audit sweep, doc read…), never by reviewing the code that
+contained it — the signature of a class that defeats attention and needs a mechanical
+detector.
+
+### Added — the manifest can now express and gate axis fusion
+
+The `field_processor_matrix` recorded field → owner → processor → enforcement_point but
+**no axis** — so "no processor" (completeness) and "wrong value" (value-checks) were
+gate-able, but "one field, two axes" was structurally inexpressible. The CI six-axis
+rubric that generated the manifest already keeps the axes separate — it just wasn't
+joined onto the matrix.
+
+- **`ci_axis` derived, not duplicated** (rule #9 — one source, copies drift). The axis
+  assignments already live in `families.*.round2.ci_axes.<axis>.wire_fields`; the new
+  `ci_axes_for_field()` joins them onto the matrix in code. `subject_key_ids` derives
+  `{data_subject, recipient_revoke, sender}`; `cohort_scope` derives `{recipient_see,
+  recipient_receive, transmission_principle}` — the fusions, now first-class.
+- **The fusion gate** (`every_multi_axis_field_is_classified`): every field serving >1 CI
+  axis MUST carry a classification — the manifest's own `asymmetry_kind` (`logical_defect`
+  = a real overload, `axiomatic_intent` = deliberate multi-role, `n/a` = benign
+  co-occurrence) or a persist-authored one. An **unclassified** cross-axis field is now a
+  build failure — the tenth instance is caught by CI, not by a person.
+- **The tracked-fusion registry is pinned** (`KNOWN_AXIS_FUSIONS`, 13 `logical_defect`
+  fields): a NEW `logical_defect` fails until pinned with its issue; a resolved one must
+  be removed. Same discipline as `KNOWN_UNASSIGNED_FIELDS`.
+- **The dedup fix / #416 signal**: `distinct_real_processors()` un-collapses `processors_all`
+  (the pre-#532 accessor deduped to the single primary processor and reported `0`
+  multi-processor fields — the exact signal that would have surfaced #416). `dimension`
+  (24), `cohort_scope` (21), `subject_key_ids` (13) now surface their real processor
+  fan-out.
+- **Closed-set gates** for `ci_axis`, `asymmetry_kind`, and `typing` value spaces; and a
+  gate asserting the manifest records `read<->write` as a closed duality (gate 3 / the
+  #527 cohort_scope read-vs-write default).
+
+### Fixed — persist-authored classifications for the 15 unclassified multi-axis fields
+
+The v0.3.0 walk left 15 multi-axis matrix fields with an empty `asymmetry_kind`.
+`PERSIST_AUTHORED_AXIS_CLASSIFICATIONS` classifies each (12 `n/a` benign co-occurrences —
+timestamps/tiers/identifiers that supply context to several axes without a processor
+fusing them; 3 `axiomatic_intent` — `withdraws`, `consent`, `references_attestation_id`,
+whose multi-role is the coherent action itself, each with the fusion-to-guard named).
+These are **proposed pending CIRISConstitution ratification** (CIRISConstitution#44 — the
+CI rubric is the authority) — recorded in persist code, NOT edited into the vendored Registry-of-Record,
+so the gate is complete now without a unilateral manifest edit. No manifest re-vendor and
+no version bump: the axis data already existed; this cut is the join + gates that consume
+it.
+
 ## [21.12.0] — 2026-07-27 — #530: the repair sweep — stranded `(self|family, federation)` rows made offerable again
 
 Found in a live agent-harness run (CIRISAgent#932) right after adopting v21.10.0:
