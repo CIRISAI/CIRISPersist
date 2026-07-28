@@ -1271,16 +1271,31 @@ impl EmitAttestationInput {
     /// self-attestation defaults. `cohort_scope` defaults to
     /// `federation` (the tier of every [`crate::Engine::emit_attestation`]
     /// write).
+    /// v21.11.0 (CIRISPersist#527) — `cohort_scope` is a REQUIRED argument, not
+    /// a defaulted field. The write path must never fail-OPEN on the recipient
+    /// axis: a producer that forgets the scope previously broadcast
+    /// federation-wide (the widest exposure), inverting the fail-secure
+    /// discipline the rest of the stack is built on (a missing/unresolved input
+    /// resolves to LESS access — `self` — never a silent widening). Making it a
+    /// required arg forces every producer to state the recipient axis at the
+    /// call site — the same un-forgettable move as
+    /// [`crate::Engine::attestation_promote`]`(id, cohort_scope)` at promotion
+    /// (CIRISPersist#519/#527). This is DISTINCT from the read-path
+    /// [`default_cohort_scope`] serde default (a pre-v3.9.0 stored row with no
+    /// scope column still resolves to `federation`) — write vs read must not
+    /// share one default. Pass one of the closed
+    /// [`cohort_scope`](crate::federation::types::cohort_scope) values.
     pub fn with_envelope(
         attestation_type: impl Into<String>,
         attestation_envelope: crate::federation::envelope::EnvelopeCore,
+        cohort_scope: impl Into<String>,
     ) -> Self {
         Self {
             attestation_type: attestation_type.into(),
             attested_key_id: None,
             attestation_envelope,
             subject_key_ids: Vec::new(),
-            cohort_scope: cohort_scope::FEDERATION.to_string(),
+            cohort_scope: cohort_scope.into(),
             expires_at: None,
             weight: None,
         }

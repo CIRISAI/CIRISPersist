@@ -19603,6 +19603,70 @@ mod tests {
         );
     }
 
+    /// v21.11.0 (CIRISPersist#528, CC 3.4.5 anti-Goodhart DUAL) — for a
+    /// `capacity:*` target the SUBJECT-derived withdraws authority (rules
+    /// 2/3/4) is DENIED: the scored agent (named in `subject_key_ids`) cannot
+    /// retract its own score. But rule 1 (the ATTESTER who made the claim — the
+    /// scorer / a canonical) still retracts it. Same posture for `detection:*`.
+    #[tokio::test]
+    async fn withdraws_admission_capacity_subject_denied_attester_ok_528() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let tid = format!("t-{}", uuid::Uuid::new_v4());
+        let scorer = format!("scorer-{}", uuid::Uuid::new_v4());
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+        ensure_key(&backend, &scorer).await;
+        ensure_key(&backend, &agent).await;
+        // A capacity:* score: attester = scorer, attested + subject = the
+        // scored agent (attester != attested — the self-emission ban). The
+        // envelope is mutated, so re-sign for the federation-tier ingest gate.
+        let mut t = fed_attestation(&tid, &scorer, &agent, &scorer);
+        t.subject_key_ids = vec![agent.clone()];
+        t.attestation_envelope = serde_json::json!({
+            "id": tid,
+            "dimension": "capacity:sustained_coherence:v1",
+            "score": 1.0,
+            "confidence": 0.9,
+        });
+        resign_fed(&mut t);
+        backend
+            .put_attestation(SignedAttestation { attestation: t })
+            .await
+            .unwrap();
+
+        // The SCORED AGENT (a subject) tries to withdraw its own score → REFUSED.
+        let werr = backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against(
+                    &format!("w-{}", uuid::Uuid::new_v4()),
+                    &agent,
+                    &tid,
+                ),
+            })
+            .await
+            .expect_err("a scored agent must NOT withdraw its own capacity:* score");
+        assert_eq!(werr.kind(), "federation_withdraws_not_admitted");
+
+        // The SCORER (the attester) CAN retract/correct its own claim → rule 1.
+        let wid = format!("w-{}", uuid::Uuid::new_v4());
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: withdraws_against(&wid, &scorer, &tid),
+            })
+            .await
+            .expect("the attester (scorer) may still withdraw its own claim");
+        assert_eq!(
+            backend
+                .get_attestation(&wid)
+                .await
+                .unwrap()
+                .unwrap()
+                .withdraws_admission_rule,
+            Some(1),
+            "attester self-revocation is rule 1, unaffected by the #528 subject-denial"
+        );
+    }
+
     /// Rule 3 — proxy authority: a `consent_revocation`-scoped
     /// `delegates_to` chain from issuer reaching a canonical-hash
     /// subject in `T.subject_key_ids`.

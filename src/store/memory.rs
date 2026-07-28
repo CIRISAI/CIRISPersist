@@ -10224,8 +10224,12 @@ mod tests {
         }
         seed_community_with_founder(&backend, "comm-1", "founder").await;
 
-        // (a) as-self subject → ADMIT (subject takes down content about self).
-        backend
+        // (a) v21.11.0 (CIRISPersist#517, CC 4.5.5) — as-self subject → REJECT.
+        // A reconsideration's REVIEW authority is `is_named_moderator` ONLY;
+        // the subject naming ITSELF confers no authority (integrity of the
+        // signed subject ≠ authority over the action). `subject` is not a
+        // moderator of comm-1, so this is refused (was the spoof: admitted).
+        let err = backend
             .put_attestation(SignedAttestation {
                 attestation: fix_scores_report(
                     "r-self",
@@ -10236,10 +10240,14 @@ mod tests {
                 ),
             })
             .await
-            .expect("(a) as-self subject admitted");
-        assert!(backend.get_attestation("r-self").await.unwrap().is_some());
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
+        assert!(backend.get_attestation("r-self").await.unwrap().is_none());
 
-        // (b1) subject-delegated chain (subject → delegate, review) → ADMIT.
+        // (b1) subject-delegated chain (subject → delegate) → REJECT. The
+        // subject never held review authority (it is not a moderator), so it
+        // cannot delegate it — the delegation row is admissible, but the
+        // delegate's reconsideration is not (#517).
         backend
             .put_attestation(SignedAttestation {
                 attestation: fix_delegates_to(
@@ -10251,7 +10259,7 @@ mod tests {
             })
             .await
             .unwrap();
-        backend
+        let err = backend
             .put_attestation(SignedAttestation {
                 attestation: fix_scores_report(
                     "r-deleg",
@@ -10262,8 +10270,45 @@ mod tests {
                 ),
             })
             .await
-            .expect("(b1) subject-delegated review admitted");
-        assert!(backend.get_attestation("r-deleg").await.unwrap().is_some());
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
+        assert!(backend.get_attestation("r-deleg").await.unwrap().is_none());
+
+        // (b1') founder-delegated chain (founder → fdelegate, review over
+        // comm-1) → ADMIT. The LEGITIMATE delegated-moderator path: authority
+        // roots at a real named moderator (founder) and flows down the
+        // review-scoped delegation — proving #517 cut only the subject-self
+        // seed, not genuine moderator delegation.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("fdelegate", "primitive", "fdelegate"),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_delegates_to(
+                    "d-frev",
+                    "founder",
+                    "fdelegate",
+                    serde_json::json!(["message_io", "review"]),
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_scores_report(
+                    "r-fdeleg",
+                    "fdelegate",
+                    "reconsideration:case42:v1",
+                    &[],
+                    Some("comm-1"),
+                ),
+            })
+            .await
+            .expect("(b1') founder-delegated review admitted");
+        assert!(backend.get_attestation("r-fdeleg").await.unwrap().is_some());
 
         // (b2) named-moderator: community founder (steward-bound authority)
         // → ADMIT as-self (community-moderation case #95 unblocked).
@@ -10367,6 +10412,13 @@ mod tests {
             .unwrap();
         backend
             .put_public_key(SignedKeyRecord {
+                record: fix_user_key("founder"),
+            })
+            .await
+            .unwrap();
+        seed_community_with_founder(&backend, "comm-1", "founder").await;
+        backend
+            .put_public_key(SignedKeyRecord {
                 record: fix_key("delegate", "primitive", "delegate"),
             })
             .await
@@ -10376,7 +10428,7 @@ mod tests {
             .put_attestation(SignedAttestation {
                 attestation: fix_delegates_to(
                     "d-rev2",
-                    "subject",
+                    "founder",
                     "delegate",
                     serde_json::json!(["review"]),
                 ),
@@ -10390,7 +10442,7 @@ mod tests {
                     "delegate",
                     "moderation:rogue_action:v1",
                     &["subject"],
-                    None,
+                    Some("comm-1"),
                 ),
             })
             .await
@@ -10402,7 +10454,7 @@ mod tests {
             .put_attestation(SignedAttestation {
                 attestation: fix_delegates_to(
                     "d-mod",
-                    "subject",
+                    "founder",
                     "delegate",
                     serde_json::json!(["moderate"]),
                 ),
@@ -10416,7 +10468,7 @@ mod tests {
                     "delegate",
                     "moderation:rogue_action:v1",
                     &["subject"],
-                    None,
+                    Some("comm-1"),
                 ),
             })
             .await
@@ -10490,6 +10542,13 @@ mod tests {
             })
             .await
             .unwrap();
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_user_key("founder"),
+            })
+            .await
+            .unwrap();
+        seed_community_with_founder(&backend, "comm-1", "founder").await;
         for k in ["mid", "leaf", "agentroot", "agdel"] {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -10506,7 +10565,7 @@ mod tests {
             .put_attestation(SignedAttestation {
                 attestation: fix_delegates_to_sub(
                     "g-1",
-                    "subject",
+                    "founder",
                     "mid",
                     serde_json::json!(["review"]),
                     false,
@@ -10533,7 +10592,7 @@ mod tests {
                     "leaf",
                     "reconsideration:case42:v1",
                     &["subject"],
-                    None,
+                    Some("comm-1"),
                 ),
             })
             .await
@@ -10551,7 +10610,7 @@ mod tests {
                     "mid",
                     "reconsideration:case42:v1",
                     &["subject"],
-                    None,
+                    Some("comm-1"),
                 ),
             })
             .await
@@ -10604,7 +10663,7 @@ mod tests {
             .put_attestation(SignedAttestation {
                 attestation: fix_delegates_to_sub(
                     "h-1",
-                    "subject",
+                    "founder",
                     "h_mid",
                     serde_json::json!(["review"]),
                     true,
@@ -10632,7 +10691,7 @@ mod tests {
                     "h_leaf",
                     "reconsideration:case42:v1",
                     &["subject"],
-                    None,
+                    Some("comm-1"),
                 ),
             })
             .await
@@ -10641,7 +10700,7 @@ mod tests {
         backend
             .put_attestation(SignedAttestation {
                 attestation: {
-                    let mut w = fix_attestation("h-w", "subject", "h_mid", "subject");
+                    let mut w = fix_attestation("h-w", "founder", "h_mid", "founder");
                     w.attestation_type =
                         crate::federation::types::attestation_type::WITHDRAWS.into();
                     w.attestation_envelope =
@@ -10651,7 +10710,7 @@ mod tests {
                 },
             })
             .await
-            .expect("subject withdraws own delegation edge");
+            .expect("founder withdraws own delegation edge");
         let err = backend
             .put_attestation(SignedAttestation {
                 attestation: fix_scores_report(
@@ -10659,7 +10718,7 @@ mod tests {
                     "h_leaf",
                     "reconsideration:case42:v1",
                     &["subject"],
-                    None,
+                    Some("comm-1"),
                 ),
             })
             .await
