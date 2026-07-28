@@ -18881,6 +18881,22 @@ mod tests {
         crate::federation::operational::test_support::exercise_trust_root(&backend, &tag).await;
     }
 
+    /// v21.16.0 (CIRISPersist#536 follow-up) — the REAL engine-backed user path
+    /// on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn trust_root_real_user_works_on_postgres_536() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pgR536{}", uuid_like());
+        crate::federation::operational::test_support::exercise_trust_root_real_user(&backend, &tag)
+            .await;
+    }
+
     /// #443 — the transport route-table (epoch, asserted_at) monotonic-guard
     /// matrix on postgres. Shares the assertion body with the memory + sqlite
     /// parity tests; the unique suffix scopes fixtures in the shared test DB.

@@ -1286,8 +1286,33 @@ pub mod test_support {
         attestation_type: &str,
         envelope: serde_json::Value,
     ) -> crate::federation::Attestation {
+        // Signed by the attester's OWN deterministic key (the synthetic case).
+        signed_trust_attestation_signed_by(
+            id,
+            attester,
+            attested,
+            attestation_type,
+            envelope,
+            attester,
+        )
+    }
+
+    /// v21.16.0 (CIRISPersist#536 follow-up) — like [`signed_trust_attestation`]
+    /// but signs with `signing_key_id`'s key while stamping `attester` as the
+    /// `attesting_key_id` / `scrub_key_id`. Models a REAL engine-backed user
+    /// whose registered pubkey is `hybrid_pubkeys(signing_key_id)`, NOT the
+    /// deterministic `hybrid_pubkeys(attester)` — so its OWN signer produces an
+    /// edge that hybrid-verifies while `sign_envelope(attester)` would not.
+    fn signed_trust_attestation_signed_by(
+        id: &str,
+        attester: &str,
+        attested: &str,
+        attestation_type: &str,
+        envelope: serde_json::Value,
+        signing_key_id: &str,
+    ) -> crate::federation::Attestation {
         let (och, sc, sp) =
-            crate::federation::tier_ingest::test_support::sign_envelope(attester, &envelope);
+            crate::federation::tier_ingest::test_support::sign_envelope(signing_key_id, &envelope);
         let now = chrono::Utc::now();
         crate::federation::Attestation {
             attestation_id: id.to_owned(),
@@ -1345,8 +1370,8 @@ pub mod test_support {
     /// [`crate::federation::trust_root::trust_root_valid`] accepts, with real
     /// signatures verified by the same walk production uses, on ANY backend.
     ///
-    /// It writes all four legs plus the scope-carrying edge:
-    /// 1. `delegates_to(user → root)` — the user's live trust edge (`root != user`);
+    /// It writes the ROOT-SIDE legs plus the scope edge — everything signable
+    /// by the helper's own synthetic actors — and best-effort the user edge:
     /// 2. `delegates_to(root → root)` carrying BOTH `infra:attest` AND
     ///    `infra:serve` AND a well-formed `pre_rotation_commitment` — the root's
     ///    self-declaration + the recovery leg (#488);
@@ -1356,15 +1381,30 @@ pub mod test_support {
     ///    test engine signs as itself, so the ordinary emit path cannot produce
     ///    it (CIRISPersist#536);
     /// 4. no accord halt latched for `root` (the default state — nothing to do);
+    ///    plus `delegates_to(root → subject)` carrying `scope` (via [`grant_scope`]);
+    /// 1. `delegates_to(user → root)` — the user's live trust edge — is
+    ///    **best-effort** (see below).
     ///
-    /// plus a live `delegates_to(root → subject)` carrying `scope` (via
-    /// [`grant_scope`]).
+    /// # Real vs synthetic user (CIRISPersist#536 follow-up, v21.16.0)
     ///
-    /// `user_key_id` and `subject_key_id` must already be registered (the
-    /// round-test's own engines, keyed with the deterministic test keypair so
-    /// `sign_envelope(user_key_id)` verifies). `root_key_id` is a NEW id this
-    /// helper registers (a `node`) along with its accord-holder witness. Does
-    /// the whole honest dance — it does NOT bypass any gate.
+    /// The root and its accord witness stay synthetic — nobody needs their
+    /// private halves. The USER is the node whose serve gate you are exercising.
+    /// The user's trust edge must be signed BY the user, and this helper can only
+    /// sign it with the deterministic `sign_envelope(user_key_id)` derivation —
+    /// correct for a **synthetic** user (whose registered pubkey IS that
+    /// derivation), **wrong for a REAL engine-backed** user (whose registered
+    /// pubkey is its own signing key → the edge fails federation-tier ingest with
+    /// `FederationTierUnverified`). So the user edge is emitted best-effort: it
+    /// succeeds for a synthetic user, and for a real one it is **skipped (logged,
+    /// never fatal)** and the real user's OWN signer must emit
+    /// `delegates_to(user → root)`. `establish_trust_root` returns `Ok` once the
+    /// root side is up either way — a real-node consumer calls this and then has
+    /// its engine emit the honest trust edge (or calls
+    /// [`establish_trust_root_side`] directly and skips the synthetic attempt).
+    ///
+    /// `subject_key_id` (and, for the synthetic path, `user_key_id`) must already
+    /// be registered. `root_key_id` is a NEW id this helper registers. Does the
+    /// whole honest dance — it does NOT bypass any gate.
     pub async fn establish_trust_root(
         directory: &dyn crate::federation::FederationDirectory,
         user_key_id: &str,
@@ -1372,30 +1412,39 @@ pub mod test_support {
         subject_key_id: &str,
         scope: &str,
     ) -> Result<(), crate::federation::Error> {
+        establish_trust_root_side(directory, root_key_id, subject_key_id, scope).await?;
+        // The user's trust edge is BEST-EFFORT — see the type-level doc: it
+        // succeeds for a synthetic user and is skipped (logged) for a real
+        // engine-backed one, whose own signer must emit it. `establish_trust_root`
+        // returning Ok means the ROOT SIDE is stood up either way.
+        try_emit_synthetic_trust_edge(directory, user_key_id, root_key_id).await;
+        Ok(())
+    }
+
+    /// v21.16.0 (CIRISPersist#536 follow-up) — the ROOT-SIDE legs of a valid
+    /// trust root, all signable by the helper's own synthetic actors (nobody
+    /// needs the root's or the accord-holder's private halves): the root
+    /// self-declaration charter, the reserved `accord:lifecycle` witness, and
+    /// the `delegates_to(root → subject)` scope edge. This is the part
+    /// [`establish_trust_root`] does that a consumer genuinely cannot do itself
+    /// (the `accord:*` reservation). The user→root TRUST edge is deliberately
+    /// NOT here — for a real engine-backed user it must be emitted by the
+    /// user's OWN signer (its registered pubkey is its signing key, not the
+    /// deterministic `sign_envelope` derivation). Call this, then have the real
+    /// user emit `delegates_to(user → root)` itself.
+    pub async fn establish_trust_root_side(
+        directory: &dyn crate::federation::FederationDirectory,
+        root_key_id: &str,
+        subject_key_id: &str,
+        scope: &str,
+    ) -> Result<(), crate::federation::Error> {
         use crate::federation::trust_root::{INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE};
         use crate::federation::types::{attestation_type, identity_type};
 
-        // The helper-controlled actors: the root and its accord-holder witness.
+        // The helper-controlled synthetic actors: the root and its accord witness.
         register_typed_key(directory, root_key_id, identity_type::NODE).await?;
         let la = format!("{root_key_id}-la");
         register_typed_key(directory, &la, identity_type::ACCORD_HOLDER).await?;
-
-        // Leg 1 — the user's live trust edge (attested BY the user; the user's
-        // deterministic key must already be registered).
-        let edge_id = uuid::Uuid::new_v4().to_string();
-        let edge = signed_trust_attestation(
-            &edge_id,
-            user_key_id,
-            root_key_id,
-            attestation_type::DELEGATES_TO,
-            json!({
-                "references_attestation_id": edge_id,
-                "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
-            }),
-        );
-        directory
-            .put_attestation(crate::federation::SignedAttestation { attestation: edge })
-            .await?;
 
         // Leg 2 — the root's self-declaration charter: infra:attest AND
         // infra:serve AND a well-formed pre-rotation commitment (recovery leg).
@@ -1450,6 +1499,45 @@ pub mod test_support {
 
         // Leg 4 — no halt latched (default). Plus the scope-carrying edge.
         grant_scope(directory, root_key_id, subject_key_id, scope).await
+    }
+
+    /// v21.16.0 (CIRISPersist#536 follow-up) — emit `delegates_to(user → root)`
+    /// signed with the user's DETERMINISTIC `sign_envelope` key. Correct ONLY
+    /// for a synthetic user (whose registered pubkey IS that derivation); for a
+    /// real engine-backed user the federation-tier ingest hybrid-verify fails
+    /// (`FederationTierUnverified` — the derived key ≠ the node's real signing
+    /// key). Best-effort by design: on that failure it logs and returns, and
+    /// the real user's own signer is expected to emit the honest edge.
+    async fn try_emit_synthetic_trust_edge(
+        directory: &dyn crate::federation::FederationDirectory,
+        user_key_id: &str,
+        root_key_id: &str,
+    ) {
+        use crate::federation::trust_root::{INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE};
+        use crate::federation::types::attestation_type;
+        let edge_id = uuid::Uuid::new_v4().to_string();
+        let edge = signed_trust_attestation(
+            &edge_id,
+            user_key_id,
+            root_key_id,
+            attestation_type::DELEGATES_TO,
+            json!({
+                "references_attestation_id": edge_id,
+                "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+            }),
+        );
+        if let Err(e) = directory
+            .put_attestation(crate::federation::SignedAttestation { attestation: edge })
+            .await
+        {
+            tracing::info!(
+                user = %user_key_id, root = %root_key_id, error = %e,
+                "establish_trust_root: synthetic user→root trust edge not admitted (expected for a \
+                 REAL engine-backed user whose registered pubkey is its own signing key). The \
+                 caller must emit delegates_to(user → root) with the user's OWN signer — see \
+                 establish_trust_root_side (CIRISPersist#536)."
+            );
+        }
     }
 
     /// v21.14.0 (CIRISPersist#534) — the BACKEND-AGNOSTIC conferral parity
@@ -1566,6 +1654,100 @@ pub mod test_support {
             grant.root_key_id, root,
             "({tag}) the winning root is the one we established"
         );
+    }
+
+    /// v21.16.0 (CIRISPersist#536 follow-up) — the REAL engine-backed user path.
+    /// Models the exact case a consumer hit: `user` is registered with its OWN
+    /// signing key (NOT the deterministic `sign_envelope(user)` derivation), so
+    /// `establish_trust_root`'s synthetic user→root edge fails federation-tier
+    /// verify and is skipped (logged) — proving it does NOT forge the edge. The
+    /// root side still stands up, and the user's OWN signer then emits the honest
+    /// `delegates_to(user → root)`, at which point `trust_root_valid` flips green
+    /// and the capability walk roots. Backend-agnostic (memory/sqlite/postgres).
+    pub async fn exercise_trust_root_real_user(
+        directory: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::trust_root::{
+            capability_roots_to_trusted_root, trust_root_valid, INFRA_ATTEST_SCOPE,
+            INFRA_SERVE_SCOPE,
+        };
+        use crate::federation::types::{attestation_type, identity_type};
+
+        let user = format!("{tag}-user");
+        let user_real_key = format!("{tag}-userREAL"); // the user's true signing key
+        let root = format!("{tag}-root");
+        let subject = format!("{tag}-subject");
+
+        // Register `user` carrying the pubkeys of `user_real_key` — i.e. its
+        // registered pubkey is its OWN signing key, NOT hybrid_pubkeys(user).
+        // This is what a real engine-backed node looks like.
+        crate::federation::tier_ingest::test_support::register_hybrid_key_aliased(
+            directory,
+            &user,
+            &user_real_key,
+        )
+        .await;
+        register_typed_key(directory, &subject, identity_type::NODE)
+            .await
+            .expect("register subject");
+
+        // establish_trust_root: root side is stood up; the synthetic user edge
+        // (signed with sign_envelope(user)) fails verify against the real key and
+        // is skipped — NOT forged.
+        establish_trust_root(directory, &user, &root, &subject, INFRA_SERVE_SCOPE)
+            .await
+            .expect("root side stands up even when the synthetic user edge is skipped");
+        let v = trust_root_valid(directory, &user, &root)
+            .await
+            .expect("walk");
+        assert!(
+            !v.edge_exists,
+            "({tag}) synthetic user→root edge must be SKIPPED for a real-key user (not forged)"
+        );
+        assert!(
+            !v.valid,
+            "({tag}) not valid without the user's own trust edge"
+        );
+        assert!(
+            v.lifecycle_active && v.root_self_declares,
+            "({tag}) but the root SIDE is fully stood up: {v:?}"
+        );
+
+        // The real user emits its OWN honest trust edge, signed by its real key.
+        let edge_id = uuid::Uuid::new_v4().to_string();
+        let honest_edge = signed_trust_attestation_signed_by(
+            &edge_id,
+            &user,
+            &root,
+            attestation_type::DELEGATES_TO,
+            json!({
+                "references_attestation_id": edge_id,
+                "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+            }),
+            &user_real_key,
+        );
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: honest_edge,
+            })
+            .await
+            .expect("({tag}) the real user's own-signed trust edge hybrid-verifies + admits");
+
+        let v2 = trust_root_valid(directory, &user, &root)
+            .await
+            .expect("walk2");
+        assert!(
+            v2.valid,
+            "({tag}) valid once the real user emits its own edge: {v2:?}"
+        );
+        let grant = capability_roots_to_trusted_root(directory, &user, &subject, INFRA_SERVE_SCOPE)
+            .await
+            .expect("cap walk")
+            .unwrap_or_else(|| {
+                panic!("({tag}) subject infra:serve roots to the real-user-trusted root")
+            });
+        assert_eq!(grant.root_key_id, root);
     }
 }
 

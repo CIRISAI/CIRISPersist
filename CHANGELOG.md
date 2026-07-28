@@ -5,6 +5,41 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.16.0] — 2026-07-28 — #536 follow-up: `establish_trust_root` serves a REAL engine-backed user
+
+v21.15.0's `establish_trust_root` signed the `delegates_to(user → root)` trust edge with
+`sign_envelope(user_key_id)` — the deterministic derivation. Correct for a **synthetic**
+user, wrong for a **real engine-backed** node whose registered pubkey is its own signing
+key: the edge failed federation-tier ingest with `FederationTierUnverified … Ed25519
+verification failed`. That is precisely the realistic round-test case — the root and its
+accord witness can stay synthetic (nobody needs their private halves), but the **user is the
+node whose serve gate is being exercised**, so it is real.
+
+### Fixed — the user's trust edge is best-effort; the caller emits its own
+
+Applying the split the consumer suggested: **persist keeps the root-side legs** (the root
+self-declaration charter, the reserved `accord:lifecycle` witness a consumer *cannot* stand
+up, and the `delegates_to(root → subject)` scope edge), and the **user emits its own trust
+edge with its own signer**.
+
+- `establish_trust_root(dir, user, root, subject, scope)` keeps its signature (no consumer
+  edit) but now does the root side first and the user→root edge **best-effort last**: it
+  succeeds for a synthetic user, and for a real one the synthetic attempt is **skipped
+  (logged at info, never fatal)** — persist does NOT forge the edge. It returns `Ok` once the
+  root side is up; the real user's own engine emits `delegates_to(user → root)`, at which
+  point `trust_root_valid` flips green. (A consumer's self-healing wiring then passes with no
+  edit.)
+- New `establish_trust_root_side(dir, root, subject, scope)` — the root-side legs alone, for
+  a real-node consumer that wants no synthetic-edge attempt at all.
+- New witness `exercise_trust_root_real_user` (memory + sqlite + postgres,
+  `trust_root_real_user_works_on_*_536`): registers `user` with its OWN signing key (≠ the
+  deterministic derivation), asserts `establish_trust_root` **skips** the synthetic edge
+  (`edge_exists == false`, not forged) while the root side stands up, then the user's own
+  signer emits the honest edge and `trust_root_valid` + the capability walk go green.
+
+No wire/schema change — test-support only, under `test-anchor`. CIRISServer's
+`trace_round_e2e.rs` real-node round test now completes leg B end-to-end.
+
 ## [21.15.0] — 2026-07-28 — #536: `establish_trust_root` — the leg-B fixture that completes in-process round testing
 
 Follow-on to #534 (`confer_roles`, v21.14.0). That closed **leg A** of the trace-serve gate
