@@ -26473,15 +26473,21 @@ mod tests {
             a
         };
 
-        // (a) as-self subject → ADMIT.
-        backend
+        // (a) v21.11.0 (CIRISPersist#517, CC 4.5.5) — as-self subject → REJECT.
+        // Reconsideration REVIEW authority is `is_named_moderator` ONLY; a
+        // subject naming ITSELF confers none (`subject` is not a moderator of
+        // `comm`). Was the spoof (admitted); now refused.
+        let err = backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: report(&subject, &[&subject], None),
             })
             .await
-            .expect("(a) as-self subject admitted");
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
 
-        // (b1) subject-delegated chain → ADMIT.
+        // (b1) subject-delegated chain → REJECT. The subject never held review
+        // authority, so it cannot delegate it (the delegation row admits; the
+        // delegate's reconsideration does not) (#517).
         backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: pg_delegates_to(
@@ -26493,12 +26499,43 @@ mod tests {
             })
             .await
             .unwrap();
-        backend
+        let err = backend
             .put_attestation(crate::federation::SignedAttestation {
                 attestation: report(&delegate, &[&subject], None),
             })
             .await
-            .expect("(b1) subject-delegated admitted");
+            .unwrap_err();
+        assert_eq!(err.kind(), "federation_delegated_scope_unauthorized");
+
+        // (b1') founder-delegated chain (founder → fdelegate, review over
+        // comm) → ADMIT. The LEGITIMATE delegated-moderator path: authority
+        // roots at a real named moderator and flows down the review-scoped
+        // delegation — #517 cut only the subject-self seed, not genuine
+        // moderator delegation.
+        let fdelegate = format!("fdelegate-{suffix}");
+        backend
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: fix_section_i_key(&fdelegate, "a", now, true),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: pg_delegates_to(
+                    &founder,
+                    &fdelegate,
+                    serde_json::json!(["review"]),
+                    false,
+                ),
+            })
+            .await
+            .unwrap();
+        backend
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: report(&fdelegate, &[], Some(&comm)),
+            })
+            .await
+            .expect("(b1') founder-delegated review admitted");
 
         // (b2) named-moderator (community founder, steward-bound) → ADMIT.
         backend
