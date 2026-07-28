@@ -18607,6 +18607,18 @@ mod accord_tests {
         crate::federation::operational::test_support::exercise_role_conferral(&backend, "sq534")
             .await;
     }
+
+    /// v21.15.0 (CIRISPersist#536) — the trust-root fixture (`establish_trust_root`,
+    /// the leg-B counterpart to `confer_roles`) must work on SQLITE: the reserved
+    /// `accord:lifecycle` leg and the federation-tier hybrid-verify of every leg
+    /// round-trip here, so an in-process round test downstream (CIRISServer#327)
+    /// can stand up a genuinely valid trust root without hand-assembling five rows.
+    #[tokio::test]
+    async fn trust_root_helper_works_on_sqlite_536() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_trust_root(&backend, "sq536").await;
+    }
 }
 
 #[cfg(test)]

@@ -397,7 +397,10 @@ where
 /// `put_attestation` test fixtures on all three backends to carry REAL
 /// hybrid signatures now that the federation-tier ingest gate is
 /// mandatory (CC 5.3.2.4.3.1).
-#[cfg(test)]
+// v21.15.0 (CIRISPersist#536) — also compiled under `feature = "test-anchor"`
+// so `operational::test_support::establish_trust_root` (a downstream fixture)
+// can reuse the deterministic `sign_envelope` / `hybrid_pubkeys` derivation.
+#[cfg(any(test, feature = "test-anchor"))]
 #[allow(dead_code)]
 pub(crate) mod test_support {
     use super::*;

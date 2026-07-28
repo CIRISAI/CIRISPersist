@@ -1155,6 +1155,23 @@ pub mod test_support {
     ///
     /// The `family_tag` scopes the generated holder ids so repeated calls (and
     /// a shared postgres test DB) do not collide.
+    ///
+    /// # `infra:attest` vs `infra:serve` — the FIPS-custody caveat (CIRISPersist#536)
+    ///
+    /// This helper confers via the roster-co-scrub core, which is exactly what
+    /// `infra:attest` needs. **`infra:serve` is stricter**: its admission runs
+    /// the m-of-n with `require_fips_custody = true` (CIRISPersist#513), and the
+    /// roster resolves from
+    /// [`accord_holder_roster_key_ids`](crate::federation::admission) —
+    /// the GENESIS holders — **never from the holders this helper mints**. So a
+    /// software-signed `infra:serve` conferral only verifies under test-anchor
+    /// **Mode A** (`CIRIS_TESTING_MODE=true` + `CIRIS_TEST_TRUST_ROOT*`
+    /// publishing the genesis holders' pubkeys). Without that, the co-scrub is
+    /// checked against genesis pubkeys the minted holders do not hold and the
+    /// failure surfaces as an opaque `insufficient distinct valid signatures:
+    /// 0 < threshold 2`. If you are standing up a TRUST ROOT (the `infra:serve`
+    /// SCOPE in a `delegates_to` charter, a different plane from the key ROLE),
+    /// use [`establish_trust_root`] instead — it needs none of this.
     pub async fn confer_roles(
         directory: &dyn crate::federation::FederationDirectory,
         key_id: &str,
@@ -1181,6 +1198,258 @@ pub mod test_support {
             .put_public_key(crate::federation::types::SignedKeyRecord { record })
             .await?;
         Ok(roster)
+    }
+
+    /// v21.15.0 (CIRISPersist#536) — register `key_id` with a chosen
+    /// `identity_type` and its deterministic hybrid pubkeys (the pair
+    /// [`crate::federation::tier_ingest::test_support::sign_envelope`] signs
+    /// with), so a federation-tier row this identity attests hybrid-verifies at
+    /// the ingest gate on every backend. The placeholder scrub columns are
+    /// valid-hex / valid-base64 (unlike the pre-#534 `test-anchor`), so the
+    /// KeyRecord itself round-trips through sqlite/postgres column decoding.
+    async fn register_typed_key(
+        directory: &dyn crate::federation::FederationDirectory,
+        key_id: &str,
+        identity_type: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
+        let now = chrono::Utc::now();
+        // An `accord_holder` registration hits the #513 hardware-attestation
+        // gate on sqlite/postgres (MemoryBackend skips it — the #534/#536 trap
+        // again). Supply the established mock Android-StrongBox evidence with a
+        // FRESH nonce: the gate validates shape + freshness (≤24h), not a real
+        // cert chain, so this is the accepted test path for standing up an
+        // accord_holder on every backend.
+        let attestation_evidence = (identity_type
+            == crate::federation::types::identity_type::ACCORD_HOLDER)
+            .then(|| strongbox_evidence(now));
+        let rec = crate::federation::types::KeyRecord {
+            key_id: key_id.to_owned(),
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
+            algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+            identity_type: identity_type.to_owned(),
+            identity_ref: key_id.to_owned(),
+            valid_from: now,
+            valid_until: None,
+            registration_envelope: json!({ "id": key_id }),
+            original_content_hash: "deadbeef".to_owned(),
+            scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key_id.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            roles: Vec::new(),
+            attestation_evidence,
+            consent_role: None,
+            additional_scrubs: Vec::new(),
+        };
+        directory
+            .put_public_key(crate::federation::types::SignedKeyRecord { record: rec })
+            .await
+    }
+
+    /// The established mock Android-StrongBox `attestation_evidence` value the
+    /// #513 hardware-attestation gate accepts in test builds (shape + a fresh
+    /// `nonce_captured_at`; the cert chain is not cryptographically walked
+    /// here). Mirrors the sqlite backend's own `android_strongbox_evidence_value`
+    /// test fixture — the ONE shape that lets an `accord_holder` register
+    /// without real hardware.
+    fn strongbox_evidence(captured_at: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+        json!({
+            "platform_attestation": {
+                "Android": {
+                    "key_attestation_chain": [
+                        vec![0x30u8, 0x82, 0x01, 0x00],
+                        vec![0x30u8, 0x82, 0x02, 0x00],
+                    ],
+                    "play_integrity_token": "eyJhbGciOiJIUzI1NiJ9.fake.token",
+                    "strongbox_backed": true,
+                }
+            },
+            "nonce_captured_at": captured_at.to_rfc3339(),
+        })
+    }
+
+    /// v21.15.0 (CIRISPersist#536) — a federation-tier [`Attestation`] REALLY
+    /// signed by `attester`'s deterministic hybrid key (via `sign_envelope`),
+    /// so it passes the federation-tier ingest hybrid-verify on sqlite/postgres
+    /// (not just MemoryBackend). The graph-shaped counterpart to
+    /// [`signed_canonical_record`] (which builds a `KeyRecord`); the trust-root
+    /// legs are `delegates_to` / `scores` rows, not key records.
+    fn signed_trust_attestation(
+        id: &str,
+        attester: &str,
+        attested: &str,
+        attestation_type: &str,
+        envelope: serde_json::Value,
+    ) -> crate::federation::Attestation {
+        let (och, sc, sp) =
+            crate::federation::tier_ingest::test_support::sign_envelope(attester, &envelope);
+        let now = chrono::Utc::now();
+        crate::federation::Attestation {
+            attestation_id: id.to_owned(),
+            attesting_key_id: attester.to_owned(),
+            attested_key_id: attested.to_owned(),
+            attestation_type: attestation_type.to_owned(),
+            weight: Some(1.0),
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: sc,
+            scrub_signature_pqc: sp,
+            scrub_key_id: attester.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+            tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+        }
+    }
+
+    /// v21.15.0 (CIRISPersist#536) — the ONE scope-granting edge: a live
+    /// `delegates_to(root → subject)` carrying `scope` (e.g. `infra:serve`),
+    /// really signed by `root`. The capability half the
+    /// [`crate::federation::trust_root::capability_roots_to_trusted_root`] walk
+    /// resolves. Split out (per the issue) so a consumer can grant additional
+    /// scopes off an already-established root without re-standing the four legs.
+    /// `root` must already be registered (by [`establish_trust_root`] or the
+    /// caller); `subject` must already be registered (the caller's recipient).
+    pub async fn grant_scope(
+        directory: &dyn crate::federation::FederationDirectory,
+        root_key_id: &str,
+        subject_key_id: &str,
+        scope: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let edge = signed_trust_attestation(
+            &id,
+            root_key_id,
+            subject_key_id,
+            crate::federation::types::attestation_type::DELEGATES_TO,
+            json!({ "references_attestation_id": id, "scope": [scope] }),
+        );
+        directory
+            .put_attestation(crate::federation::SignedAttestation { attestation: edge })
+            .await
+    }
+
+    /// v21.15.0 (CIRISPersist#536) — the leg-B counterpart to [`confer_roles`]:
+    /// stand up a genuinely VALID trust root that
+    /// [`crate::federation::trust_root::trust_root_valid`] accepts, with real
+    /// signatures verified by the same walk production uses, on ANY backend.
+    ///
+    /// It writes all four legs plus the scope-carrying edge:
+    /// 1. `delegates_to(user → root)` — the user's live trust edge (`root != user`);
+    /// 2. `delegates_to(root → root)` carrying BOTH `infra:attest` AND
+    ///    `infra:serve` AND a well-formed `pre_rotation_commitment` — the root's
+    ///    self-declaration + the recovery leg (#488);
+    /// 3. a fresh `accord:lifecycle:v1` `scores` row ABOUT `root`, emitted by a
+    ///    helper-created `accord_holder` — **the leg a consumer cannot stand up
+    ///    itself**: `accord:*` is reserved to `accord_holder` (CC 3.4.1) and a
+    ///    test engine signs as itself, so the ordinary emit path cannot produce
+    ///    it (CIRISPersist#536);
+    /// 4. no accord halt latched for `root` (the default state — nothing to do);
+    ///
+    /// plus a live `delegates_to(root → subject)` carrying `scope` (via
+    /// [`grant_scope`]).
+    ///
+    /// `user_key_id` and `subject_key_id` must already be registered (the
+    /// round-test's own engines, keyed with the deterministic test keypair so
+    /// `sign_envelope(user_key_id)` verifies). `root_key_id` is a NEW id this
+    /// helper registers (a `node`) along with its accord-holder witness. Does
+    /// the whole honest dance — it does NOT bypass any gate.
+    pub async fn establish_trust_root(
+        directory: &dyn crate::federation::FederationDirectory,
+        user_key_id: &str,
+        root_key_id: &str,
+        subject_key_id: &str,
+        scope: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::trust_root::{INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE};
+        use crate::federation::types::{attestation_type, identity_type};
+
+        // The helper-controlled actors: the root and its accord-holder witness.
+        register_typed_key(directory, root_key_id, identity_type::NODE).await?;
+        let la = format!("{root_key_id}-la");
+        register_typed_key(directory, &la, identity_type::ACCORD_HOLDER).await?;
+
+        // Leg 1 — the user's live trust edge (attested BY the user; the user's
+        // deterministic key must already be registered).
+        let edge_id = uuid::Uuid::new_v4().to_string();
+        let edge = signed_trust_attestation(
+            &edge_id,
+            user_key_id,
+            root_key_id,
+            attestation_type::DELEGATES_TO,
+            json!({
+                "references_attestation_id": edge_id,
+                "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+            }),
+        );
+        directory
+            .put_attestation(crate::federation::SignedAttestation { attestation: edge })
+            .await?;
+
+        // Leg 2 — the root's self-declaration charter: infra:attest AND
+        // infra:serve AND a well-formed pre-rotation commitment (recovery leg).
+        let charter_id = uuid::Uuid::new_v4().to_string();
+        let successors = vec![
+            format!("{root_key_id}-succ-a"),
+            format!("{root_key_id}-succ-b"),
+        ];
+        let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "establish_trust_root pre_rotation_commitment: {e}"
+                ))
+            })?;
+        let charter = signed_trust_attestation(
+            &charter_id,
+            root_key_id,
+            root_key_id,
+            attestation_type::DELEGATES_TO,
+            json!({
+                "references_attestation_id": charter_id,
+                "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+                "pre_rotation_commitment": commitment,
+            }),
+        );
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: charter,
+            })
+            .await?;
+
+        // Leg 3 — the fresh accord:lifecycle row ABOUT the root, from the
+        // accord_holder (the reserved-family leg a consumer cannot produce).
+        let lc_id = uuid::Uuid::new_v4().to_string();
+        let lifecycle = signed_trust_attestation(
+            &lc_id,
+            &la,
+            root_key_id,
+            attestation_type::SCORES,
+            json!({
+                "id": lc_id,
+                "dimension": crate::federation::trust_root::ACCORD_LIFECYCLE_DIMENSION,
+                "score": 1.0,
+                "confidence": 0.9,
+            }),
+        );
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: lifecycle,
+            })
+            .await?;
+
+        // Leg 4 — no halt latched (default). Plus the scope-carrying edge.
+        grant_scope(directory, root_key_id, subject_key_id, scope).await
     }
 
     /// v21.14.0 (CIRISPersist#534) — the BACKEND-AGNOSTIC conferral parity
@@ -1239,6 +1508,63 @@ pub mod test_support {
                 .await
                 .expect("has_effective_role read"),
             "({tag}) self-asserted infra:serve with no accord co-scrub reads FALSE"
+        );
+    }
+
+    /// v21.15.0 (CIRISPersist#536) — the backend-agnostic TRUST-ROOT parity
+    /// body: prove [`establish_trust_root`] stands up a root that
+    /// [`crate::federation::trust_root::trust_root_valid`] accepts (all four
+    /// legs) AND that the subject's `infra:serve` roots to it via
+    /// [`crate::federation::trust_root::capability_roots_to_trusted_root`] (leg
+    /// B). Run from the memory, sqlite AND postgres backend tests — the leg 3
+    /// (`accord:lifecycle`) reserved-family emission and the federation-tier
+    /// hybrid-verify of every leg must round-trip on each backend, not just the
+    /// tolerant one (the #534/#536 discipline).
+    pub async fn exercise_trust_root(
+        directory: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) {
+        use crate::federation::trust_root::{
+            capability_roots_to_trusted_root, trust_root_valid, INFRA_SERVE_SCOPE,
+        };
+        use crate::federation::types::identity_type;
+
+        let user = format!("{tag}-user");
+        let root = format!("{tag}-root");
+        let subject = format!("{tag}-subject");
+
+        // The caller's own actors — registered with the deterministic test key
+        // so the edges they attest hybrid-verify (the round-test engines do
+        // this via register_self; here we do it explicitly).
+        register_typed_key(directory, &user, identity_type::NODE)
+            .await
+            .expect("register user");
+        register_typed_key(directory, &subject, identity_type::NODE)
+            .await
+            .expect("register subject");
+
+        establish_trust_root(directory, &user, &root, &subject, INFRA_SERVE_SCOPE)
+            .await
+            .expect("establish_trust_root stands up all four legs + the scope edge");
+
+        let v = trust_root_valid(directory, &user, &root)
+            .await
+            .expect("trust_root_valid walk");
+        assert!(
+            v.valid,
+            "({tag}) establish_trust_root ⇒ trust_root_valid: {v:?}"
+        );
+
+        // Leg B: the subject's infra:serve roots to a root THIS user trusts.
+        let grant = capability_roots_to_trusted_root(directory, &user, &subject, INFRA_SERVE_SCOPE)
+            .await
+            .expect("capability walk")
+            .unwrap_or_else(|| {
+                panic!("({tag}) subject's infra:serve must root to the trusted root")
+            });
+        assert_eq!(
+            grant.root_key_id, root,
+            "({tag}) the winning root is the one we established"
         );
     }
 }
