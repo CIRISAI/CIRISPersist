@@ -10033,6 +10033,19 @@ mod tests {
         let _plain = signed_canonical_record("x-484", "node", env, &[&holders[0]]);
     }
 
+    /// v21.14.0 (CIRISPersist#534) — the SAME backend-agnostic conferral body
+    /// the sqlite + postgres parity tests run, on MemoryBackend. The trio
+    /// closes the "tested on one backend, used on the other" gap: the pre-#534
+    /// helpers only ever ran here (the `test-anchor` anchor and the unregistered
+    /// self-scrubber both survived only because MemoryBackend hex-decodes
+    /// nothing and enforces no FK).
+    #[tokio::test]
+    async fn role_conferral_helpers_work_on_memory_534() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_role_conferral(&backend, "mem534")
+            .await;
+    }
+
     /// v18.3.0 (CIRISPersist#480, persist-side compat confirmation) — a
     /// `canonical,node` record that ALSO carries `roles:["infra:serve"]`
     /// still (a) passes the 2-of-3 `check_canonical_role_admission` core
