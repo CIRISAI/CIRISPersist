@@ -1719,6 +1719,7 @@ pub mod test_support {
     ///   the root side (asserting its own postcondition), the user's OWN signer
     ///   emits the honest `delegates_to(user → root)`, and then `trust_root_valid`
     ///   + the capability walk go green.
+    ///
     /// Backend-agnostic (memory/sqlite/postgres).
     pub async fn exercise_trust_root_real_user(
         directory: &dyn crate::federation::FederationDirectory,
