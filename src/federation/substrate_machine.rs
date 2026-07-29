@@ -3424,6 +3424,60 @@ mod proptests {
         );
     }
 
+    /// TEMPORARY MEASUREMENT — delete after reporting.
+    #[test]
+    fn tmp_measure_deadmission_rate() {
+        use proptest::strategy::{Strategy as _, ValueTree};
+        use proptest::test_runner::{Config, TestRunner};
+        const N: usize = 240;
+
+        let measure = |biased: bool| -> (usize, usize) {
+            let mut runner = TestRunner::new_with_rng(
+                Config {
+                    cases: N as u32,
+                    ..Config::default()
+                },
+                proptest::test_runner::TestRng::deterministic_rng(
+                    proptest::test_runner::RngAlgorithm::ChaCha,
+                ),
+            );
+            let mut seqs: Vec<Vec<Op>> = Vec::new();
+            for _ in 0..N {
+                let raw = prop::collection::vec(arb_op(), 1..=MAX_OPS)
+                    .new_tree(&mut runner)
+                    .expect("gen")
+                    .current();
+                seqs.push(if biased {
+                    bias_deadmission_followups(raw)
+                } else {
+                    raw
+                });
+            }
+            block_on(async {
+                let mut seq_hits = 0usize;
+                let mut writes = 0usize;
+                for ops in &seqs {
+                    let t = run_on_sqlite(ops, &fresh_tag()).await;
+                    if t.deadmissions_enforced > 0 {
+                        seq_hits += 1;
+                    }
+                    writes += t.deadmissions_enforced;
+                }
+                (seq_hits, writes)
+            })
+        };
+
+        let (ub_seq, ub_w) = measure(false);
+        let (b_seq, b_w) = measure(true);
+        eprintln!(
+            "MEASUREMENT (post clock fix, N={N}): UNBIASED {ub_seq}/{N} ({:.3}) sequences \
+             reached the gate, {ub_w} writes refused | BIASED {b_seq}/{N} ({:.3}) sequences, \
+             {b_w} writes refused",
+            ub_seq as f64 / N as f64,
+            b_seq as f64 / N as f64,
+        );
+    }
+
     /// **META-COVERAGE.** A generator that only ever produces refusals satisfies
     /// I1–I5 *vacuously*, and a harness that passes vacuously is worse than no
     /// harness: it reports safety it never checked. This test fails loudly if
@@ -3503,11 +3557,12 @@ mod proptests {
         }
 
         // Claims 2 + 3 + 4 — execute a slice and measure.
-        let (admitted, refused, with_signed, deadmitted) = block_on(async {
+        let (admitted, refused, with_signed, deadmitted, with_deadmit) = block_on(async {
             let mut admitted = 0usize;
             let mut refused = 0usize;
             let mut with_signed = 0usize;
             let mut deadmitted = 0usize;
+            let mut with_deadmit = 0usize;
             for ops in sequences.iter().take(EXECUTED) {
                 let t = run_on_sqlite(ops, &fresh_tag()).await;
                 for o in &t.outcomes {
@@ -3521,8 +3576,16 @@ mod proptests {
                     with_signed += 1;
                 }
                 deadmitted += t.deadmissions_enforced;
+                // Counted PER SEQUENCE as well as per write, because the two
+                // numbers answer different questions and only the per-sequence
+                // one is comparable across budgets: "what fraction of sequences
+                // reach the gate at all" is a property of the generator, while a
+                // raw write count also moves with sequence length.
+                if t.deadmissions_enforced > 0 {
+                    with_deadmit += 1;
+                }
             }
-            (admitted, refused, with_signed, deadmitted)
+            (admitted, refused, with_signed, deadmitted, with_deadmit)
         });
 
         assert!(
@@ -3537,9 +3600,11 @@ mod proptests {
         eprintln!(
             "META-COVERAGE: {} op kinds over {DRAWS} draws; {EXECUTED} sequences executed \
              ({admitted} ops admitted / {refused} refused); {with_signed}/{EXECUTED} \
-             ({fraction:.2}) left a hybrid-signed federation-tier row; {deadmitted} writes \
-             refused by the AV-77 de-admission gate",
-            seen_kinds.len()
+             ({fraction:.2}) left a hybrid-signed federation-tier row; {with_deadmit}/{EXECUTED} \
+             ({dead_fraction:.3}) reached the AV-77 de-admission gate ({deadmitted} writes \
+             refused by it)",
+            seen_kinds.len(),
+            dead_fraction = with_deadmit as f64 / EXECUTED as f64,
         );
 
         // Claim 4 — the AV-77 gate is REACHED, not merely wired. Emitting a

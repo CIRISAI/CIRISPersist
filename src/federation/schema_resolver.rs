@@ -379,7 +379,15 @@ fn is_version_segment(seg: &str) -> bool {
 /// Used by the `put_attestation` admission hook. Pulled out as a
 /// standalone helper so the admission hook stays trivial — the
 /// validation logic + violation formatting lives here.
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
+// v22.0.0 (CIRISPersist#543) — NOT cfg-gated to the SQL backends. This is pure
+// logic (schema + envelope in, violations out) with no backend dependency, and
+// the MEMORY backend now calls it too (the SCORES envelope-schema validation was
+// one of three gates memory was missing). Memory is always compiled, so gating
+// this on `postgres | sqlite` broke `--features server` — and the tempting fix,
+// gating memory's CALL SITE instead, would have silently removed the gate from
+// memory-only builds: the same parity hole this cut closed, reintroduced along a
+// cfg axis instead of a backend axis. Caught by CI's `no postgres` job, which is
+// exactly why that job exists.
 pub(crate) fn validate_envelope_against_schema(
     schema: &serde_json::Value,
     envelope: &serde_json::Value,

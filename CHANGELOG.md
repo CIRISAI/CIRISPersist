@@ -123,6 +123,15 @@ limits**).
   `Engine::set_self_key_id`/`self_key_id` and the matching PyO3 bindings, plus a test that drives
   the full de-admission lifecycle through the Engine handle and asserts the gate starts dormant,
   reads back live once declared, and returns to dormant when cleared.
+- **A fourth parity hole, along the cfg axis instead of the backend axis.** Closing memory's
+  missing SCORES envelope-schema validation broke `--features server` (the memory-only build):
+  the `validate_envelope_against_schema` helper was cfg-gated to `postgres | sqlite`, but memory
+  is always compiled. The tempting fix — gating memory's *call site* to match — would have
+  silently removed the gate from memory-only builds, **reintroducing the exact hole this cut
+  closed, one axis over.** The helper is pure logic (schema + envelope in, violations out) with no
+  backend dependency, so the cfg came off instead. Caught by CI's `no postgres` job, which is
+  precisely why that job exists; verified locally across `server`, `server sqlite`,
+  `server postgres`, and the full set.
 - **Three backend-parity holes in the #543 gates themselves.** Memory ran neither the AV-77
   de-admission gate (it had no `self_key_id` at all) nor the SCORES envelope-schema validation,
   and postgres ran the AV-77 gate with nothing proving it did. All three closed; the shared
