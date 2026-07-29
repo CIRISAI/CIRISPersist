@@ -1997,6 +1997,82 @@ impl PyEngine {
         Ok(cell.engine_view().self_key_id())
     }
 
+    /// v22.0.0 (CIRISPersist#543 / ciris.ai/contextual-integrity) —
+    /// drive ONE **deletion-window breach sweep** and return the pass
+    /// report as JSON (`{rows_scanned, windows_seen, within_window,
+    /// deleted_in_time, breaches, malformed, scan_truncated}`).
+    ///
+    /// The published promise is that "if subjects revoke and the
+    /// window expires without deletion proof, the network itself
+    /// raises a breach signal". CIRISEdge and CIRISServer reach
+    /// persist through this FFI, so without this binding "the network
+    /// itself" would mean "a Rust caller nobody has written" — the
+    /// same unreachability that made the AV-77 de-admission gate a
+    /// sanction nobody could enable (see [`Self::set_self_key_id`]).
+    ///
+    /// Sovereign callers drive it on their own cadence (Pi-cron, k8s
+    /// CronJob), like `sweep_evictions_once`. Re-running is safe and
+    /// expected: emission is idempotent on a deterministic `event_id`,
+    /// so one ongoing breach stays ONE row of evidence however often
+    /// the cron fires. `now_iso` defaults to the wall clock; pass it to
+    /// replay a pass deterministically.
+    ///
+    /// What lands is `hard_case:deletion_window_breach` (and
+    /// `hard_case:deletion_window_malformed`) observability, readable
+    /// through the usual hard-case surface. It is **evidence, never a
+    /// verdict** — persist does not emit `slashing:*`; the WA quorum is
+    /// the authority that turns evidence into sentences.
+    #[pyo3(signature = (now_iso = None))]
+    fn run_deletion_window_watch_json(
+        &self,
+        py: Python<'_>,
+        now_iso: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let now = match now_iso {
+            Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| {
+                    PyValueError::new_err(format!("run_deletion_window_watch now_iso parse: {e}"))
+                })?
+                .with_timezone(&chrono::Utc),
+            None => chrono::Utc::now(),
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let report = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::deletion_window::run_deletion_window_watch(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                now,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::deletion_window::run_deletion_window_watch(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                now,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&report).map_err(|e| {
+                    PyValueError::new_err(format!("run_deletion_window_watch serialize: {e}"))
+                })
+            })
+        })
+    }
+
     /// v3.4.0 (CIRISPersist#123) — set the local
     /// `federation_blobs` storage budget in bytes. Above
     /// `budget × steady_state_utilization` the eviction sweeper

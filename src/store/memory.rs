@@ -2115,6 +2115,10 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // This tier is IDENTICAL to the sqlite + postgres backends', gate for
         // gate and order for order.
         crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
+        // v22.0.0 (CIRISEdge#428) — closed delivery_mode vocabulary; an
+        // unknown value is refused HERE instead of being silently demoted
+        // to may-drop BestEffort at delivery. Pure predicate, tier 1.
+        crate::federation::admission::check_delivery_mode_vocabulary(&row.attestation_envelope)?;
 
         // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
         // admission-gate VALUE validation. Rejects out-of-closed-set values
@@ -2386,6 +2390,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // dimension-keyed `capacity:*` self-emission arm. Backend-symmetric
         // with SQLite + Postgres.
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
+
+        // v22.0.0 (CIRISConstitution#46) — CONSENT BEFORE SCORING. A
+        // federation-tier `capacity:*` claim about subject S from attester P is
+        // refused unless a live `analyze` consent from S covering P exists in
+        // this node's verified corpus. AV-76 TIER 4: it reads the directory
+        // (the scoped consent fold), so it must never run ahead of crypto.
+        // Placed IMMEDIATELY after the reserved-prefix gate — which carries
+        // AV-62/74's dimension-keyed self-emission arm — so a SELF-attested
+        // capacity row is still reported as self-emission rather than shadowed
+        // by "no consent". Backend-symmetric across memory / sqlite / postgres.
+        crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
 
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here. No-op when
@@ -7530,12 +7545,33 @@ mod accord_tests {
         );
     }
 
+    /// CIRISEdge#428 B6 — delivery_mode closed vocabulary on memory.
+    #[tokio::test]
+    async fn bootstrap_delivery_mode_vocabulary_memory_428() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_delivery_mode_vocabulary_gate(
+            &backend, "mem428",
+        )
+        .await;
+    }
+
     /// #543 B1 — capacity self-emission gate on memory (both wire shapes).
     #[tokio::test]
     async fn bootstrap_capacity_self_emission_gate_memory_543() {
         let backend = MemoryBackend::new();
         crate::federation::bootstrap_admission::test_support::exercise_capacity_self_emission_gate(
             &backend, "mem543",
+        )
+        .await;
+    }
+
+    /// #543 B5 / CIRISConstitution#46 — consent-before-scoring for `capacity:*`
+    /// on memory. Same shared exercise body as the sqlite + postgres arms.
+    #[tokio::test]
+    async fn bootstrap_capacity_consent_gate_memory_46() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_capacity_consent_gate(
+            &backend, "mem46",
         )
         .await;
     }

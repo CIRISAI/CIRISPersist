@@ -1428,6 +1428,164 @@ pub fn check_capacity_not_self_attested(
     Ok(())
 }
 
+/// v22.0.0 (CIRISConstitution#46) — the `capacity:*` family a row CLAIMS, on
+/// EITHER wire shape, or `None` for a non-capacity row.
+///
+/// Reputation rides `attestation_type = scores` with the family in
+/// `dimension`; the legacy type-keyed shape (`attestation_type =
+/// capacity:...`) also exists. #543 finding 2 was exactly a gate keyed to one
+/// of the two shapes and therefore reaching zero real callers — so every
+/// `capacity:*` rule reads the family through this one helper. The DIMENSION
+/// wins when both are present: it is the axis the emit path actually uses.
+///
+/// `capacity_assurance:*` is a DIFFERENT family (it does not start with
+/// `capacity:` — the next byte is `_`) and is deliberately not matched: it is
+/// role-gated (a registered `witness` assessor), not open-sender.
+#[must_use]
+pub fn capacity_claim_family(row: &super::Attestation) -> Option<&str> {
+    let dimension = envelope_dimension(&row.attestation_envelope);
+    if dimension.is_some_and(|d| d.starts_with("capacity:")) {
+        return dimension;
+    }
+    if row.attestation_type.starts_with("capacity:") {
+        return Some(row.attestation_type.as_str());
+    }
+    None
+}
+
+/// v22.0.0 (CIRISConstitution#46) — **CONSENT BEFORE SCORING**: a
+/// federation-tier `capacity:*` claim about subject S from attester P is
+/// REFUSED unless a live [`CAPACITY_CONSENT_SCOPE`] consent from S covering P
+/// exists in this node's verified corpus.
+///
+/// # The default this inverts
+///
+/// RC2's position is post-hoc revocation, optional by default. CC 3.4.5 is the
+/// *entire* emitter rule for `capacity:*` — `attesting_key_id MUST NOT equal
+/// attested_key_id`, no witness requirement, no role gate, no consent
+/// requirement — so **any registered key may score any third party**, and CC
+/// 3.3.7 says so outright ("admission is by key registration; consent is the
+/// governance record … `consent:replication` does not add a substrate
+/// admission check — by design"). Persist's own bootstrap is deliberately
+/// cheap (a self-signed hybrid PoP and nothing else), so "any registered key"
+/// means "anyone". CC#46 inverts the default for this one family.
+///
+/// This is the contextual-integrity transmission-principle question in its
+/// purest form: *were you permitted to compute and publish this about me?*
+/// It keeps persist mechanical rather than adjudicating — the substrate reads
+/// a consent edge, it never forms a verdict about who has earned the right to
+/// score (MISSION §1.10, "the substrate stores; it never adjudicates").
+///
+/// # The edge it reads (NOT a new shape)
+///
+/// The claim is the edge P → S; the consent is the REVERSE edge S → P, in the
+/// consent representation the substrate already maintains and folds:
+/// `attesting_key_id` = S, `attested_key_id` = P, envelope `dimension` =
+/// `consent:state:granted|revoked|expired:*`, envelope `scope` naming
+/// [`CAPACITY_CONSENT_SCOPE`]. It is resolved through
+/// [`resolve_scoped_consent`](super::FederationDirectory::resolve_scoped_consent)
+/// — the ONE canonical scoped fold (a default trait method, so all three
+/// backends answer from identical code): latest-wins by `asserted_at`,
+/// expiry-aware, a grant must name its scope exactly, a scope-less
+/// revocation is blanket. A bespoke parallel lookup here would be the
+/// two-lists-that-disagree class (#541); there is one list.
+///
+/// # Scope — what it deliberately does NOT catch
+///
+/// - **Non-`capacity:*` families.** CC#46's own scope boundary: open-sender
+///   families are consent-gated, role-gated ones are unchanged. An abuser
+///   never consents to `detection:*` / `moderation:*` / `slashing:*`, and the
+///   first uniform application of this rule would delete the abuse-response
+///   plane. `revocation:peer_admission:v1` (AV-77) is likewise untouched.
+/// - **Local-tier rows.** A local-tier row is not an EMISSION — it is this
+///   node's own working state, un-replicated, so consent-to-publish has
+///   nothing to bind to yet. This arm is LOAD-BEARING, not redundant, and the
+///   distinction matters: [`check_local_tier_eligibility`] does declare
+///   `capacity:*` ineligible for the local tier, but it runs ONLY on
+///   `attestation_insert_local` / `attestation_upsert_local` — **not on
+///   `put_attestation`**, which accepts a `tier = "local"` row on every
+///   backend (the `substrate_machine` alphabet draws `Tier::Local` against
+///   every family and those rows admit). So the local-tier `capacity:*` row
+///   is reachable here, and this arm is what lets it through.
+///
+///   The residual is therefore real and named rather than papered over: a
+///   local-tier `capacity:*` row written via `put_attestation` and then
+///   `attestation_promote`d becomes a federation-tier `capacity:*` row that
+///   never faced this gate. That is the PROMOTE path's pre-existing shape —
+///   it re-signs and flips `tier` without re-running ANY tier-4 put-gate, so
+///   it equally bypasses AV-45, AV-77 and the moderation gates — but note the
+///   asymmetry with this gate's own sibling: [`check_capacity_not_self_attested`]
+///   is NOT tier-gated, so self-emission is caught on a local row and missing
+///   consent is not. Closing it belongs at the chokepoint (either
+///   `put_attestation` enforcing [`check_local_tier_eligibility`], or promote
+///   re-running the tier-4 stack), not by widening this gate to refuse
+///   local-tier rows with a "no consent" message when the accurate refusal is
+///   "capacity is never local".
+/// - **Self-attestation.** `attesting_key_id == attested_key_id` is AV-62/74's
+///   rule and is refused UPSTREAM, by
+///   [`check_capacity_not_self_attested`] inside
+///   [`check_reserved_prefix_admission`], which every backend calls
+///   immediately before this gate. Skipping it here is not a hole — it keeps
+///   the self-emission refusal reporting as self-emission instead of being
+///   shadowed by "no consent" (a subject who never granted itself `analyze`
+///   would otherwise fail this gate first and get the wrong message).
+///
+/// # Genesis goes dark, deliberately
+///
+/// With no consent edges anywhere — a fresh mesh — third-party `capacity:*`
+/// scoring is refused everywhere. That IS CC#46's semantics: consent BEFORE
+/// scoring means the plane opens when subjects open it, not before. There is
+/// no bootstrap bypass on purpose; a bypass keyed to "the mesh is young" would
+/// be a permanent hole with a temporary name.
+pub async fn check_capacity_consent_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+) -> Result<(), Error> {
+    let Some(family) = capacity_claim_family(row) else {
+        return Ok(());
+    };
+    if row.tier != super::types::attestation_tier::FEDERATION {
+        return Ok(());
+    }
+    if row.attesting_key_id == row.attested_key_id {
+        return Ok(());
+    }
+
+    let stance = directory
+        .resolve_scoped_consent(
+            &row.attesting_key_id, // the consent edge points AT the attester P
+            &row.attested_key_id,  // and is authored BY the subject S
+            CAPACITY_CONSENT_SCOPE,
+            None,
+            chrono::Utc::now(),
+        )
+        .await?;
+    if stance == super::hard_case::ConsentState::Granted {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "no live consent covers this {family} emission: subject {subject} has not granted \
+         attester {attester} the \"{CAPACITY_CONSENT_SCOPE}\" scope (resolved stance: \
+         {stance:?}) — a party MUST NOT emit a capacity:* score about a subject unless a live \
+         consent:scope:{CAPACITY_CONSENT_SCOPE} from that subject covers the attester \
+         (CIRISConstitution#46). The subject authorizes it with a \
+         `{granted}:v1` row whose attested_key_id is the attester and whose envelope names \
+         scope \"{CAPACITY_CONSENT_SCOPE}\".",
+        subject = row.attested_key_id,
+        attester = row.attesting_key_id,
+        granted = super::consent::consent_dimension::STATE_GRANTED_PREFIX,
+    )))
+}
+
+/// v22.0.0 (CIRISConstitution#46) — the CC 3.3.1 consent-grant KIND that
+/// authorizes deriving scores about a subject: *"`analyze` (derive features
+/// / scores / classifications)"*. Named here rather than re-spelled at each
+/// call site, and pinned by `capacity_consent_scope_is_the_grammar_analyze_kind`
+/// to the wire token of
+/// [`consent_grammar::TransmissionPrinciple::Analyze`](crate::federation::consent_grammar::TransmissionPrinciple::Analyze)
+/// — persist has ONE `analyze` vocabulary, not two that can drift apart.
+pub const CAPACITY_CONSENT_SCOPE: &str = "analyze";
+
 /// v4.13.0 (CIRISPersist#192, CEG 0.18 §5.6.8.8) — validate an
 /// occurrence's optional content-encryption pubkeys on admit: each half
 /// MUST base64-decode to its exact raw length (x25519 = 32 bytes,
@@ -6642,6 +6800,55 @@ pub async fn check_adult_incapacity_binding(
 /// re-pin to the ratified number when CC#38 lands.
 pub const MAX_ATTESTATION_ENVELOPE_BYTES: usize = 1024 * 1024;
 
+/// v22.0.0 (CIRISEdge#428) — the closed `delivery_mode` vocabulary. Absent is
+/// legal (BestEffort); `"mandatory"` is legal. Nothing else is.
+pub const DELIVERY_MODE_VOCABULARY: [&str; 1] = ["mandatory"];
+
+/// v22.0.0 (CIRISEdge#428) — **REFUSE unknown `delivery_mode` values at the
+/// wire.** Pure envelope predicate (AV-76 tier 1): no directory read, no
+/// crypto.
+///
+/// # The hazard this closes
+///
+/// `delivery_mode` is the contextual-integrity recipient-RECEIVE axis, typed
+/// since v21.9.0 and byte-faithfully carried — and its VALUE was never
+/// validated anywhere. Edge's processor (`delivery_mode.rs`, CIRISEdge#411)
+/// recognizes exactly one value and degrades everything else to BestEffort:
+///
+/// ```text
+/// Some(DELIVERY_MODE_MANDATORY) => Mandatory,
+/// _ => BestEffort,   // <- everything else, INCLUDING TYPOS, may DROP
+/// ```
+///
+/// So `"manditory"` was admitted here, carried faithfully, and silently
+/// demoted at delivery — the producer believed they demanded delivery; the
+/// network quietly stopped promising it. That is the "accepted but not
+/// projected" class (v17.0.0/#444, AV-77's reachability finding) in delivery
+/// flavor. Refusing the typo at WRITE time turns a silent drop months later
+/// into a loud error now.
+///
+/// Absent stays legal and means BestEffort — the field is optional, not
+/// required. A present-but-non-string shape (number, null, object) is refused
+/// too: edge's typed reader resolves those to `None` ⇒ BestEffort, which is
+/// the same silent demotion wearing a different type error.
+///
+/// Vocabulary ratification: CIRISEdge#428 (assumed `{absent, "mandatory"}`,
+/// matching edge's implemented semantics exactly; future values are an
+/// additive contract change on both sides, not a silent semantics change).
+pub fn check_delivery_mode_vocabulary(envelope: &serde_json::Value) -> Result<(), Error> {
+    match envelope.get(crate::federation::envelope::paths::DELIVERY_MODE) {
+        None => Ok(()),
+        Some(serde_json::Value::String(s)) if DELIVERY_MODE_VOCABULARY.contains(&s.as_str()) => {
+            Ok(())
+        }
+        Some(other) => Err(Error::InvalidArgument(format!(
+            "delivery_mode {other} is not in the ratified vocabulary (legal: absent, or one of \
+             {DELIVERY_MODE_VOCABULARY:?}) — an unknown value would be silently demoted to \
+             may-drop BestEffort at delivery (CIRISEdge#428); refused at the wire instead"
+        ))),
+    }
+}
+
 /// v17.9.0 (CIRISConstitution#38 interim) — refuse an attestation whose
 /// envelope's canonical bytes exceed [`MAX_ATTESTATION_ENVELOPE_BYTES`].
 ///
@@ -7378,6 +7585,91 @@ mod tests {
         assert_eq!(envelope_dimension(&v3), None);
         let v4 = serde_json::json!(null);
         assert_eq!(envelope_dimension(&v4), None);
+    }
+
+    // ── CIRISConstitution#46 — consent-before-scoring vocabulary ────
+
+    /// The `analyze` verb persist gates on MUST be the same `analyze` the
+    /// closed #510 consent grammar already publishes (and pins into
+    /// `CONSENT_GRAMMAR_HASH`'s `principles` list). Two independently-spelled
+    /// `analyze`s would be the axis-fusion mistake in reverse — one concept,
+    /// two strings that can drift.
+    #[test]
+    fn capacity_consent_scope_is_the_grammar_analyze_kind() {
+        use crate::federation::consent_grammar::TransmissionPrinciple;
+        assert_eq!(
+            serde_json::to_value(TransmissionPrinciple::Analyze).unwrap(),
+            serde_json::Value::String(CAPACITY_CONSENT_SCOPE.to_string()),
+            "the gate's scope token and the grammar's transmission principle are one vocabulary"
+        );
+        assert!(
+            crate::federation::consent_grammar::consent_grammar_manifest()["principles"]
+                .as_array()
+                .expect("principles is an array")
+                .contains(&serde_json::Value::String(
+                    CAPACITY_CONSENT_SCOPE.to_string()
+                )),
+            "and it is a published grammar principle, not a private string"
+        );
+    }
+
+    /// The family reader sees BOTH wire shapes and neither neighbour.
+    /// (`capacity_assurance:` is a role-gated family — matching it here would
+    /// consent-gate the abuse-response plane, which CC#46 explicitly excludes.)
+    #[test]
+    fn capacity_claim_family_reads_both_wire_shapes() {
+        let mk = |at: &str, envelope: serde_json::Value| -> crate::federation::Attestation {
+            serde_json::from_value(serde_json::json!({
+                "attestation_id": "a-1",
+                "attesting_key_id": "p",
+                "attested_key_id": "s",
+                "attestation_type": at,
+                "asserted_at": "2026-06-01T00:00:00Z",
+                "attestation_envelope": envelope,
+                "original_content_hash": "00",
+                "scrub_signature_classical": "AA",
+                "scrub_key_id": "p",
+                "scrub_timestamp": "2026-06-01T00:00:00Z",
+                "persist_row_hash": "",
+                "cohort_scope": "federation",
+            }))
+            .expect("minimal attestation deserializes")
+        };
+        // The dimension shape — how reputation actually travels.
+        assert_eq!(
+            capacity_claim_family(&mk(
+                "scores",
+                serde_json::json!({"dimension": "capacity:core_identity:v1"})
+            )),
+            Some("capacity:core_identity:v1")
+        );
+        // The legacy type shape.
+        assert_eq!(
+            capacity_claim_family(&mk("capacity:composite", serde_json::json!({}))),
+            Some("capacity:composite")
+        );
+        // The dimension wins when both are present.
+        assert_eq!(
+            capacity_claim_family(&mk(
+                "capacity:composite",
+                serde_json::json!({"dimension": "capacity:core_identity:v1"})
+            )),
+            Some("capacity:core_identity:v1")
+        );
+        // Neighbours that must NOT be caught.
+        for (at, dim) in [
+            ("scores", "capacity_assurance:v1"),
+            ("capacity_assurance:v1", "trust:demo:v1"),
+            ("scores", "detection:probe:v1"),
+            ("scores", PEER_DEADMISSION_DIMENSION),
+            ("scores", "trust:demo:v1"),
+        ] {
+            assert_eq!(
+                capacity_claim_family(&mk(at, serde_json::json!({"dimension": dim}))),
+                None,
+                "({at}, {dim}) is not a capacity:* claim"
+            );
+        }
     }
 
     // ── v3.0.0 (CIRISPersist#116, CEG 0.2 §7.0) — reserved-prefix ──

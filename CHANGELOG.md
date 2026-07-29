@@ -44,6 +44,14 @@ limits**).
 - **New put-gates refuse rows that were previously admitted**: self-attested `capacity:*` on
   the real wire shape (AV-74), self-asserted authority-conferring `identity_type`s (AV-75), and
   writes from a de-admitted peer (AV-77).
+- **Consent before scoring (CC#46 / AV-79).** A federation-tier `capacity:*` claim about a
+  subject is refused unless the subject's live `consent:scope:analyze` covers the attester —
+  inverting RC2's any-registered-key-may-score-anyone default, build-assuming-ratification
+  (CIRISConstitution#46). Genesis goes dark deliberately: the plane opens when subjects open it.
+  The gate bites the node's own emit surface too — `emit_attestation` gets no bypass.
+- **`delivery_mode` vocabulary is closed at the wire (CIRISEdge#428 / AV-81).** Unknown values —
+  including typos — were admitted faithfully and silently demoted by edge to may-drop BestEffort;
+  they are now refused at write time naming the field, the value, and the legal set.
 - **`tier` and `promoted_at` are now actually persisted** (AV-78). Rows written at
   `Tier::Local` previously read back as `federation`; they now read back as `local`. Downstream
   code that keyed on the old (wrong) value will see the corrected one.
@@ -140,6 +148,17 @@ limits**).
   them as a pair.
 - **H2 — missing gates on two privileged paths**: `adopt_scrub_upgrade` now runs the hardware
   gate, and `supersede_canonical_record` now runs the role gates.
+
+### Added — the network raises its own breach signal (CC#47 / AV-80)
+
+The contextual-integrity page promises that when a deletion window expires without deletion
+proof, "the network itself raises a breach signal." The pure judgment shipped in v21.9.0; nothing
+drove it. `run_deletion_window_watch` now sweeps rows carrying `deletion_window`, feeds the
+single-sourced classifier, and emits `hard_case:deletion_window_breach` local-tier **evidence** —
+not a verdict: `slashing:*` stays with the WA quorum, because a substrate flag can never be sole
+slashing evidence. Replay-idempotent (keyed on the deadline, not the sweep tick), malformed
+windows flagged rather than skipped, reachable through `Engine::run_deletion_window_watch` and
+the PyO3 binding with an Engine-handle test. Ratification asks: CIRISConstitution#47 R1–R4.
 
 ### Added — `substrate_machine`, the gate gauntlet
 
