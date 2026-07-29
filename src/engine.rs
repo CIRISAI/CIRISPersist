@@ -11830,9 +11830,18 @@ mod tests {
         sq.put_public_key(sweeper_test_key_derived_for(&derived, "ciris-weight"))
             .await
             .expect("seed key");
+        // v22.0.0 (CIRISPersist#543) — the capacity-band emit below needs a
+        // SUBJECT distinct from the attester: `capacity:*` must not be
+        // self-attested (CEG §7.5 anti-Goodhart / AV-62), which is now enforced
+        // dimension-keyed at `put_attestation`, not just on the `capacity:*`
+        // attestation_type namespace.
+        let subject = "capacity-subject";
+        sq.put_public_key(sweeper_test_key_derived_for(subject, subject))
+            .await
+            .expect("seed subject key");
 
         // Weighted scores emit (the capacity-band case): weight survives.
-        let weighted = crate::federation::EmitAttestationInput::with_envelope(
+        let mut weighted = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                 "id": "emit-w-1", "dimension": "capacity:sustained_coherence:v1",
@@ -11842,6 +11851,8 @@ mod tests {
             crate::federation::types::cohort_scope::FEDERATION,
         )
         .with_weight(Some(0.42));
+        // Someone else's capacity, not the emitter's own.
+        weighted.attested_key_id = Some(subject.to_owned());
         let w_id = engine
             .emit_attestation(&signer, weighted)
             .await

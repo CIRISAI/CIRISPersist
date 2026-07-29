@@ -352,6 +352,56 @@ pub(crate) fn required_field_gaps(att: &PlatformAttestation) -> Vec<String> {
     gaps
 }
 
+/// v22.0.0 (CIRISPersist#543) — the ONE shared hardware-evidence fixture.
+///
+/// Test-only (`test` / `test-anchor`, the same gate the other `test_support`
+/// modules use) so the signing/fixture helpers stay out of release builds.
+///
+/// Exists because closing the memory backend's missing `accord_holder`
+/// hardware gate turned every `accord_holder` test fixture across the crate
+/// into a rejected row. The fix is ONE helper every fixture calls, not the
+/// same JSON blob pasted into each test module — a pasted blob is how the
+/// backends drift apart in the first place.
+#[cfg(any(test, feature = "test-anchor"))]
+#[allow(dead_code)]
+pub mod test_support {
+    /// A structurally-complete, FRESH Android-Strongbox
+    /// `attestation_evidence` value: the shape
+    /// [`super::HardwareAttestationPolicy::check`] admits under the default
+    /// policy. Fixtures that register an `accord_holder` attach this so the
+    /// gate is SATISFIED rather than bypassed — the row proves the same
+    /// custody claim on memory, sqlite and postgres alike.
+    ///
+    /// The nonce is captured at call time, so it is always inside
+    /// `max_nonce_age`. Tests exercising the stale arm build their own value
+    /// with a back-dated `nonce_captured_at`.
+    pub fn fresh_accord_holder_evidence() -> serde_json::Value {
+        serde_json::json!({
+            "platform_attestation": {
+                "Android": {
+                    "key_attestation_chain": [
+                        vec![0x30u8, 0x82, 0x01, 0x00],
+                        vec![0x30u8, 0x82, 0x02, 0x00],
+                    ],
+                    "play_integrity_token": "eyJhbGciOiJIUzI1NiJ9.fake.token",
+                    "strongbox_backed": true,
+                }
+            },
+            "nonce_captured_at": chrono::Utc::now().to_rfc3339(),
+        })
+    }
+
+    /// Attach [`fresh_accord_holder_evidence`] to `row` iff it actually
+    /// claims `accord_holder` (on either role surface — scalar set form or
+    /// the `roles` vector, i.e. `KeyRecord::claims_role`). A no-op for every
+    /// other row, so a fixture builder can call it unconditionally.
+    pub fn attach_accord_holder_evidence(row: &mut crate::federation::types::KeyRecord) {
+        if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
+            row.attestation_evidence = Some(fresh_accord_holder_evidence());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

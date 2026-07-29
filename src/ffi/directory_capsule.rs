@@ -3413,10 +3413,18 @@ mod tests {
 
     fn sample_key_record(key_id: &str) -> KeyRecord {
         let now = chrono::Utc::now();
+        // v22.0.0 (CIRISPersist#543) — REAL deterministic hybrid pubkeys, not
+        // the old `"AAAA"` placeholder. `validate_registration_pubkey` (#275)
+        // now runs on the memory backend too, and it demands a 32-byte
+        // Ed25519 key — as sqlite and postgres always have. The capsule
+        // round-trip is about the C-ABI seam, so it must carry a record every
+        // backend would actually admit.
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
         KeyRecord {
             key_id: key_id.into(),
-            pubkey_ed25519_base64: "AAAA".into(),
-            pubkey_ml_dsa_65_base64: None,
+            pubkey_ed25519_base64: ed_pk,
+            pubkey_ml_dsa_65_base64: mldsa_pk,
             algorithm: crate::federation::types::algorithm::HYBRID.into(),
             identity_type: crate::federation::types::identity_type::PRIMITIVE.into(),
             identity_ref: key_id.into(),

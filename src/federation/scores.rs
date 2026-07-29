@@ -122,6 +122,23 @@ impl RowState {
 /// admission-path handle.
 pub const RESOLVE_CANDIDATE_CAP: i64 = 4096;
 
+/// v22.0.0 (CIRISPersist#543 / AV-73) — the CC 3.1 dimension family carrying
+/// the ATTESTED anti-collusion witness-diversity signal:
+///
+/// > `witness_diversity:{contribution_id}` | Witness set meets jurisdictional +
+/// > organizational + software-stack + cell-expertise bars (P10). N=3 default.
+/// > | boolean-via-score
+///
+/// It is `boolean-via-score`, so CC 4.4.2 folds it by **Min** — any single
+/// "bars NOT met" attestation sinks the set, fail-secure.
+///
+/// Persist READS this signal; it never infers it. FSD-005 §7 RT-M4 is explicit
+/// that "diversity attributes are attested, not self-declared — else a ring
+/// varies declared attributes to inflate `witness_diversity`, defeating the gate
+/// it leans on." Deriving diversity from registration metadata persist happens
+/// to hold would be exactly that self-declaration.
+pub const WITNESS_DIVERSITY_PREFIX: &str = "witness_diversity:";
+
 /// Compose the [`ComposedVerdict`] from scope-gated candidate rows — the
 /// backend-agnostic `resolve_scores` fold, kept in ONE place so the composite
 /// substrate op (the #329 pattern) folds identically across sqlite / postgres
@@ -263,8 +280,55 @@ pub fn compose_verdict(
         })
         .count() as u32;
 
-    // ── 4. band ──
-    let band = classify(polarity, contributor_count, aggregate, open_contradictions);
+    // ── 4. witness diversity (v22.0.0, CIRISPersist#543 / AV-73) ──
+    //
+    // THE ANTI-COLLUSION n — the field FSD-005 App C §C.3 has always declared
+    // ("the anti-collusion n (NOT n_eff)") and persist has always returned
+    // `None`. Returning `None` is what made FSD-005 §7 RT-M4 live: "a brigade of
+    // M sock keys posting corroborating scores (open-emit, no bond, cost = M key
+    // admissions) moves the mean; **the diversity gate never fires**."
+    // `contributor_count` counts KEYS, and keys are free.
+    //
+    // CC 3.1 defines the signal as an ATTESTED claim, not a computed one:
+    //   `witness_diversity:{contribution_id}` | Witness set meets jurisdictional
+    //   + organizational + software-stack + cell-expertise bars (P10). N=3
+    //   default. | boolean-via-score
+    // and FSD-005 §7 RT-M4 is explicit that it MUST stay attested: "Diversity
+    // attributes are attested, not self-declared — else a ring varies declared
+    // attributes to inflate `witness_diversity`, defeating the gate it leans on."
+    // So persist does NOT infer diversity from registration data (that would be
+    // precisely the self-declaration RT-M4 forbids); it reads the attested rows
+    // and otherwise reports honestly that it does not know.
+    //
+    // `boolean-via-score` per CC 4.4.2 folds by MIN — any negative trumps
+    // positive, fail-secure — so a single "bars NOT met" attestation sinks it.
+    let diversity_rows: Vec<&Attestation> = data
+        .iter()
+        .filter(|a| {
+            super::admission::envelope_dimension(&a.attestation_envelope)
+                .is_some_and(|d| d.starts_with(WITNESS_DIVERSITY_PREFIX))
+                && state_of(a) == RowState::Live
+        })
+        .collect();
+    let witness_diversity: Option<f64> = if diversity_rows.is_empty() {
+        None
+    } else {
+        Some(
+            diversity_rows
+                .iter()
+                .map(|a| value_of(a, Polarity::BooleanMin))
+                .fold(f64::INFINITY, f64::min),
+        )
+    };
+
+    // ── 5. band ──
+    let band = classify(
+        polarity,
+        contributor_count,
+        aggregate,
+        open_contradictions,
+        witness_diversity,
+    );
 
     let age_of_head = global_head.map(|h| {
         let delta = now.signed_duration_since(h.asserted_at);
@@ -288,7 +352,7 @@ pub fn compose_verdict(
     ComposedVerdict {
         band,
         contributor_count,
-        witness_diversity: None,
+        witness_diversity,
         open_contradictions,
         age_of_head,
         policy_applied: policy_id.to_string(),
@@ -297,22 +361,51 @@ pub fn compose_verdict(
 }
 
 /// Map the scalar aggregate to a qualitative band.
+///
+/// v22.0.0 (CIRISPersist#543 / AV-73) — `witness_diversity` is now an INPUT,
+/// and `WellEstablished` is unreachable without it. See
+/// [`WITNESS_DIVERSITY_PREFIX`] for why counting keys cannot substitute.
 fn classify(
     polarity: Polarity,
     contributor_count: u32,
     aggregate: f64,
     open_contradictions: u32,
+    witness_diversity: Option<f64>,
 ) -> ConfidenceBand {
     if contributor_count == 0 {
         return ConfidenceBand::InsufficientWitnesses;
     }
+    // THE DIVERSITY BAR (CIRISPersist#543 / AV-73). `WellEstablished` requires
+    // an ATTESTED positive `witness_diversity` — absence is NOT permission.
+    //
+    // Key count is not witness count: minting keys is free, so `contributor_count
+    // >= 3` alone is a headcount an adversary buys, not corroboration it earns.
+    // CC's own thesis is that "what an adversary must defeat is correlation, not
+    // headcount", and CC 6.2.3.1 discounts correlated sources to `Signal_eff → 1`
+    // "regardless of clique size" — naming SHARED STEWARD LINEAGE as a
+    // correlation input. So three keys under one operator are one witness, and
+    // the only thing that says otherwise is an attested `witness_diversity:*`
+    // row certifying the jurisdictional / organizational / software-stack /
+    // cell-expertise bars (CC 3.1, N=3 default).
+    //
+    // Fail-secure on absence: an unknown diversity caps at `Supported`, never
+    // `WellEstablished`. This is the difference between "we have not established
+    // this" and "this is established" — and it is the whole of AV-73, because
+    // the Sybil brigade's M sock scores now buy `Supported` at most, forever.
+    //
+    // Note this bar does NOT require distinct trust ROOTS: CC asks for
+    // jurisdiction/org/stack/expertise diversity, which is orthogonal to rooting
+    // (the canonical founder set is `registry_steward_{us,eu,apac}` — one root,
+    // three jurisdictions, bars met by construction). Same-root corroboration is
+    // the intended topology; same-OPERATOR corroboration is the attack.
+    let diversity_established = witness_diversity.is_some_and(|d| d > 0.0);
     match polarity {
         Polarity::SignedMean => {
             if aggregate < 0.0 {
                 ConfidenceBand::Refuted
             } else if open_contradictions > 0 {
                 ConfidenceBand::Contested
-            } else if aggregate >= 0.66 && contributor_count >= 3 {
+            } else if aggregate >= 0.66 && contributor_count >= 3 && diversity_established {
                 ConfidenceBand::WellEstablished
             } else if aggregate >= 0.33 {
                 ConfidenceBand::Supported
@@ -322,7 +415,7 @@ fn classify(
         }
         Polarity::BooleanMin => {
             if aggregate >= 1.0 {
-                if contributor_count >= 3 {
+                if contributor_count >= 3 && diversity_established {
                     ConfidenceBand::WellEstablished
                 } else {
                     ConfidenceBand::Supported
@@ -421,6 +514,92 @@ mod tests {
 
     fn attestation_type_tier_federation() -> String {
         crate::federation::types::attestation_tier::FEDERATION.to_string()
+    }
+
+    /// A `witness_diversity:{contribution_id}` attestation (CC 3.1,
+    /// boolean-via-score): `score > 0` ⇒ the jurisdictional / organizational /
+    /// software-stack / cell-expertise bars are met.
+    fn diversity_row(id: &str, attester: &str, score: f64, ts: i64) -> Attestation {
+        let mut r = scores_row(id, attester, score, 1.0, ts);
+        r.attestation_envelope = serde_json::json!({
+            "dimension": format!("{WITNESS_DIVERSITY_PREFIX}contrib-1"),
+            "score": score,
+            "confidence": 1.0,
+        });
+        r
+    }
+
+    /// v22.0.0 (CIRISPersist#543 / AV-73) — **THE SYBIL-BRIGADE WITNESS.**
+    ///
+    /// FSD-005 §7 RT-M4: "a brigade of M sock keys posting corroborating scores
+    /// (open-emit, no bond, cost = M key admissions) moves the mean; **the
+    /// diversity gate never fires.**" It never fired because
+    /// `witness_diversity` was hardcoded `None` and the band keyed on
+    /// `contributor_count` — a headcount an adversary buys.
+    ///
+    /// Pins all three arms: the brigade cannot reach `WellEstablished`; an
+    /// ATTESTED diversity certificate unlocks it; and a NEGATIVE certificate
+    /// (bars examined and NOT met) sinks it again via the boolean-via-score Min
+    /// fold — so the gate cannot be opened by simply adding more rows.
+    #[test]
+    fn sybil_brigade_cannot_reach_well_established_without_attested_diversity_543() {
+        // Five sock keys, unanimous and emphatic — the brigade.
+        let brigade: Vec<Attestation> = (0..5)
+            .map(|i| scores_row(&format!("s{i}"), &format!("sock-{i}"), 1.0, 1.0, 10 + i))
+            .collect();
+
+        let v = compose_verdict(
+            brigade.clone(),
+            vec![],
+            "cc-4.4.2-signed-mean",
+            false,
+            t(100),
+        );
+        assert_eq!(v.contributor_count, 5, "the brigade IS five distinct keys");
+        assert_eq!(
+            v.witness_diversity, None,
+            "no attested diversity ⇒ persist reports honestly that it does not know"
+        );
+        assert_eq!(
+            v.band,
+            ConfidenceBand::Supported,
+            "AV-73: five colluding keys with a perfect aggregate must NOT reach \
+             WellEstablished — key count is not witness count"
+        );
+
+        // The same brigade, now with an ATTESTED positive diversity certificate.
+        let mut with_diversity = brigade.clone();
+        with_diversity.push(diversity_row("d1", "auditor", 1.0, 20));
+        let v = compose_verdict(
+            with_diversity,
+            vec![],
+            "cc-4.4.2-signed-mean",
+            false,
+            t(100),
+        );
+        assert_eq!(v.witness_diversity, Some(1.0));
+        assert_eq!(
+            v.band,
+            ConfidenceBand::WellEstablished,
+            "an ATTESTED diversity certificate is what unlocks the top band"
+        );
+
+        // And a NEGATIVE certificate sinks it — boolean-via-score folds by Min
+        // (CC 4.4.2), so "bars examined, NOT met" beats any number of positives.
+        let mut contested = brigade;
+        contested.push(diversity_row("d1", "auditor", 1.0, 20));
+        contested.push(diversity_row("d2", "auditor-2", -1.0, 21));
+        let v = compose_verdict(contested, vec![], "cc-4.4.2-signed-mean", false, t(100));
+        assert_eq!(
+            v.witness_diversity,
+            Some(-1.0),
+            "Min fold — any negative trumps positive, fail-secure"
+        );
+        assert_ne!(
+            v.band,
+            ConfidenceBand::WellEstablished,
+            "a refuted diversity claim must not leave the top band reachable"
+        );
     }
 
     fn composer(id: &str, attester: &str, ty: &str, upstream: &str, ts: i64) -> Attestation {

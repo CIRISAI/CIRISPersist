@@ -5,6 +5,166 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [22.0.0] — 2026-07-29 — #543: the safe mesh genesis cut
+
+**The bootstrap/Sybil admission audit, closed end to end — plus the harness that found the
+things the audit did not.**
+
+Canonical servers exist to bootstrap new peers, so admission is deliberately cheap:
+`register_federation_key` requires a self-signed hybrid proof-of-possession and nothing
+else. That proves key *custody* — not identity, not authorization. **Key material is free,
+so the threat model must assume unlimited admitted identities.** What makes that survivable
+is the layer below: an admitted peer can push rows, but every row must pass persist's
+put-gates. Edge's consent plane is send-only (CIRISEdge#426) and the server's owner-gated
+HTTP admission is bypassed entirely by the mesh receive path — **so persist's put-gates are
+the entire defence.** A gate that leaks is not defence-in-depth lost; it is the only depth.
+
+CIRISPersist#543 audited them and found five leaking. All five are closed here. Four are
+put-gates (AV-74, AV-75, AV-76, AV-77) and each carries a `{gate} × {backend}` witness matrix
+run against memory, sqlite **and** postgres — no backend is second-class, and the gates that
+shipped wired on two backends but proven on one are proven on all three now. AV-73 is a
+scoring-layer fix in `scores.rs` rather than a put-gate, so it has no backend matrix; it is
+pinned by its own witness.
+
+Two more (AV-76's own correction, AV-78) were found afterwards — by the new harness on
+sqlite, and then by *reading* postgres for the sqlite fix. Both are closed too, and the
+postgres half is a limit of the harness we record rather than paper over (see **Known
+limits**).
+
+### BREAKING
+
+- **`ConfidenceBand::WellEstablished` now requires attested witness diversity.** A score
+  reaches the top band only when a `witness_diversity:*` row establishes that the witness set
+  is actually diverse. Consumers reading the band will see fewer top-band scores until
+  diversity rows exist. This is the AV-73 fix and it is deliberate: the previous behaviour let
+  ≥3 colluding Sybils manufacture the highest confidence signal in the system.
+- **`duty_holders_from_signed_subjects` is removed.** It derived duty-holder standing from a
+  row's own signed subject list — i.e. from the claim rather than from the directory. Authority
+  is re-derived from persist's own verified state or it is not authority.
+- **New put-gates refuse rows that were previously admitted**: self-attested `capacity:*` on
+  the real wire shape (AV-74), self-asserted authority-conferring `identity_type`s (AV-75), and
+  writes from a de-admitted peer (AV-77).
+- **`tier` and `promoted_at` are now actually persisted** (AV-78). Rows written at
+  `Tier::Local` previously read back as `federation`; they now read back as `local`. Downstream
+  code that keyed on the old (wrong) value will see the corrected one.
+
+### Fixed — the five audited gates
+
+- **AV-73 — third-party reputation forgery.** `check_delegated_duty_scores_admission` gated
+  only `moderation:*` / `reconsideration:*`, so ≥3 admitted Sybils could fabricate a verdict
+  about an uninvolved subject and drive it to the top confidence band. `WellEstablished` is now
+  gated on a `witness_diversity:*` attestation, Min-folded across diversity rows.
+  `ConfidenceBand::WellEstablished` had **never been asserted by any test at all** — the top
+  band was entirely unexercised.
+- **AV-74 — capacity self-inflation.** The CC 3.4.5 self-emission arm keys on the
+  `attestation_type` namespace, but reputation rides `attestation_type = scores` with the family
+  in `dimension`. On that real shape the arm never fired, and the dimension-keyed guard written
+  for it (`check_capacity_not_self_attested`, v4.4.0 / AV-62) had **zero callers** — so
+  self-inflation was open while the vendored manifest cited the guard as a live processor. Now
+  wired, on both wire shapes, with the third-party path pinned so the gate denies self-emission
+  rather than the family.
+- **AV-75 — self-asserted privileged `identity_type` / roles.** Only 4 claims were gated, each
+  from an individual past incident. Replaced with `AUTHORITY_CONFERRING_IDENTITY_TYPES` (9
+  members) and a `ConferralMode` enum, plus a test asserting **every** authority claim declares a
+  conferral mode — so the next one added cannot be silently ungated. Routine operational
+  capability confers via `DelegatedFromTrustRoot`; gating it on accord co-scrub would have been
+  unsatisfiable in production (the accord private halves live in the #268 hardware ceremony) and
+  gating it on founder-quorum would have been circular at genesis and would have destroyed
+  trust-root portability.
+- **AV-76 — bootstrap amplification.** Hybrid verify ran *last*, after ~8 DB-walking gates, and
+  no per-peer write quota existed. Now cheapest-first across all three backends (tier 0 prologue
+  → 1 pure envelope → 2 single directory read → 3 crypto → 4 DB-walk authority → 4b §6.1 dedup →
+  5 hash+INSERT), plus a `PeerWriteQuota` ahead of the stack. See the correction below.
+- **AV-77 — no in-band response to an abuser.** Before this cut there was nothing between
+  "ignore it" and "halt the node": `moderation:*` records an event not a sanction, `slashing:*`
+  has a verdict shape with no emit and no act, and `consent:*` withdrawal is send-side so it
+  cannot stop inbound injection. Adds `revocation:peer_admission:v1` — a signed, replicable,
+  **revocable** and **scoped** act: the abuser's writes are refused, an innocent third party is
+  untouched, and the node can withdraw its own de-admission.
+
+### Fixed — found by the new harness, after the audit
+
+- **AV-76's own correction — the reorder introduced a hole.** The re-tiering placed the CEG §6.1
+  idempotent-replay dedup short-circuit at **tier 2b, ahead of crypto**. Its bare `return Ok(())`
+  did not merely reorder gates, it *skipped* every gate below: the PQC-mandatory hybrid verify
+  **and** the AV-45 write-scope gate. Present on sqlite **and** postgres; memory was correct. The
+  rule, restated: **a dedup short-circuit may return early to REFUSE, never to ACCEPT** —
+  idempotence is a promise about the *effect* of a replay, never a licence to skip the proof that
+  the replay was admissible at all. Now at tier 4b, which is the property §6.1 actually wanted.
+- **AV-78 — the `tier` column was never written.** `put_attestation`'s INSERT omitted `tier` and
+  `promoted_at` on sqlite and postgres, so the schema `DEFAULT 'federation'` silently overrode
+  every `Tier::Local` row. `tier` is a *trust* label consumed by the promotion plane (#509/#519),
+  tier-keyed reads, and the signed since-cursor planes. A label nobody wrote is a label nobody
+  can trust.
+- **Gate-order parity.** The AV-76 tiering had landed on sqlite and postgres but not memory, so
+  the three backends refused the same row at different gates. Memory now follows the same layout,
+  and the refusal-*kind* comparison was promoted from a recorded observation into a hard
+  assertion on every op of every generated sequence.
+- **`attestation_id` uniqueness on memory.** Both production backends declare
+  `attestation_id TEXT PRIMARY KEY`; memory had no equivalent, so two different rows under one id
+  both landed — `get_attestation` returned the first (**the second was accepted and then
+  shadowed, and the writer was told it succeeded**) while `list_attestations_by` returned both and
+  double-counted it. Silent write loss on one read path and inflation on another, from one missing
+  constraint. Memory now refuses at tier 5 with sqlite's exact error kind and message. The check
+  sits *ahead* of the FK emulation because that is SQLite's real evaluation order — a probe with
+  both constraints on one table shows the PK index entry is written before the FK check, so a
+  doubly-invalid row yields `UNIQUE`, not `FOREIGN KEY`. Ordered the other way, memory would have
+  answered `InvalidArgument` where sqlite answers `Backend`: **constraint evaluation order is
+  observable through `error_kind`**, and only on rows that violate both constraints at once.
+- **Three backend-parity holes in the #543 gates themselves.** Memory ran neither the AV-77
+  de-admission gate (it had no `self_key_id` at all) nor the SCORES envelope-schema validation,
+  and postgres ran the AV-77 gate with nothing proving it did. All three closed; the shared
+  `exercise_peer_deadmission` body now runs on all three backends.
+- **KEM fail-open.** The hybrid KEM check compared halves independently where it had to compare
+  them as a pair.
+- **H2 — missing gates on two privileged paths**: `adopt_scrub_upgrade` now runs the hardware
+  gate, and `supersede_canonical_record` now runs the role gates.
+
+### Added — `substrate_machine`, the gate gauntlet
+
+`src/federation/substrate_machine.rs` — a stateful, model-based proptest over
+{op sequences} × {families} × {backends}.
+
+**Every bug above sat live in the substrate while the entire hand-written suite — some 1,460
+tests — was green.** That is a gap in test *shape*, not count: every fixture exercised ONE writer against
+a FRESH row, and each real defect needed a *sequence*. #541 needed four steps and an advancing
+clock (hand fixtures reuse timestamps, and the monotonic guard makes an equal-clock write a
+trivial no-op — so the bug could not even be *expressed*). The dedup hole needed a replay against
+an existing triple.
+
+Design rules that make it work:
+
+- **Generate op sequences, not values** — shrinking then hands back a minimal repro. It found a
+  memory/sqlite admission divergence on its first serialized run, shrunk to ONE op, in 25 seconds.
+- **Differential oracle across backends** — divergence *is* the bug; no expected-value table.
+- **Use the REAL verifier as oracle**, never a hand-rolled field compare — a field compare rebuilds
+  the two-lists-that-disagree problem *inside* the test, which is the very bug (#541).
+- **Advancing clocks by default**, equal-clock a rare deliberate case (the #541 trap).
+- **Metamorphic invariants needing no oracle**: I1 real-verifier survival, I2a/I2b zero-writes-on-
+  refusal (AV-9), I3 replay idempotence, I4 monotone refusal under restriction, I5 per-op
+  differential, I6 admitted ⇒ stored.
+- **Meta-coverage assertion** — the generator must provably reach interesting states, else it
+  passes vacuously (0.38 against a 0.35 floor).
+- **Derive the wire-shape enumeration from the vocabulary, not from what the code parses** — a
+  generator sharing the code's blind assumption stays blind. That is exactly how the
+  type-vs-dimension shape hid for AV-74.
+
+Divergences it finds are pinned as `KNOWN_DIVERGENCE_*` constants with live witnesses that assert
+**the bug still exists**, and fail with "WITNESS RETIRED" the moment it is fixed. All three pins
+opened this cut have been retired.
+
+### Known limits, stated honestly
+
+- **A differential oracle is exactly as wide as its backend set.** The harness drives memory and
+  sqlite. Postgres carried the AV-78 tier bug and the tier-2b dedup hole identically, and both
+  were found by *reading* postgres for the sqlite fix — not by the oracle. Extending the harness
+  to postgres is the next thing it learns.
+- It does **not** catch spec gaps (whether `witness_diversity` *should* gate the band is a
+  Constitution question, filed for RC3 ratification), load/DoS behaviour, or anything CC is
+  silent on.
+- Cost asymmetry at admission is inherent to open bootstrap. A quota bounds volume, not per-row
+  cost.
+
 ## [21.17.1] — 2026-07-29 — #541: signed rows can no longer be desynchronised from their own envelope by unsigned local writers
 
 **Security / correctness (the arc's dominant class again: two lists of "what the signature covers,"

@@ -40,6 +40,7 @@ pub mod at_rest_cascade;
 pub mod backfill;
 pub mod blackhole;
 pub mod blobs;
+pub mod bootstrap_admission;
 pub mod capacity;
 pub mod cohort;
 pub mod community_dek;
@@ -175,6 +176,7 @@ pub mod stream_seal;
 // gate + storage live in the backends.
 pub mod stream_receipt;
 pub mod stream_sth;
+pub mod substrate_machine;
 // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — the PQC-mandatory
 // federation-tier ingest gate: hybrid-verify a federation-tier
 // attestation's envelope signature against the attester's REGISTERED

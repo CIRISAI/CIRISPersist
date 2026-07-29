@@ -4444,6 +4444,177 @@ pub async fn check_co_steward_role_admission(
         .await
 }
 
+/// v22.0.0 (CIRISPersist#543 finding 5 / AV-77) — the CEG dimension a node
+/// emits to **de-admit a peer from its own corpus**.
+///
+/// Shape: a `scores` row, `attesting_key_id` = the de-admitting node,
+/// `attested_key_id` = the de-admitted key, `score < 0` (the denial), live
+/// unless the node `withdraws` it.
+pub const PEER_DEADMISSION_DIMENSION: &str = "revocation:peer_admission:v1";
+
+/// v22.0.0 (CIRISPersist#543 / AV-77) — **THE DE-ADMISSION GATE**: refuse
+/// inbound writes authored by a key this node has de-admitted.
+///
+/// # The gap this closes
+///
+/// #543's audit found that persist's put-gates are the *entire* defence on the
+/// mesh receive path, and then that there was **no CEG-encoded way to respond to
+/// an abuser at all** — "the only thing that stops a bootstrap abuser today is
+/// the whole-node accord kill-switch, a sledgehammer requiring hardware-attested
+/// accord holders, with nothing between 'ignore it' and 'halt the node'."
+/// `moderation:*` records an *event*, not a sanction; `slashing:*` has a verdict
+/// shape but **no emit and no act**; `consent:*` withdrawal is SEND-side and so
+/// cannot stop inbound injection. This is the missing act.
+///
+/// # Why it is LOCAL, and why that is the safe design
+///
+/// De-admission is scoped to the **emitting node's own corpus**. Node N refusing
+/// K's writes is N exercising sovereignty over what N stores — it is not a
+/// federation-wide ban, and no node can decree another's admission set. That
+/// matters: a globally-effective de-admission primitive would itself be a
+/// censorship weapon, and a 1-of-N global capability-removal is exactly the
+/// shape the accord-ops invariant refuses.
+///
+/// Isolation of a genuine abuser is therefore **emergent, not decreed** — it
+/// arises when many nodes independently reach the same conclusion, which is the
+/// same shape as CC 3.2's re-rooting sovereignty ("untrust the canonical group…
+/// a forced root is a walled garden; a default-plus-re-root is a federation").
+///
+/// Note this is NOT a capability grant, so the m-of-n floor does not bind: the
+/// invariant governs granting authority, and this only ever *removes* what this
+/// node accepts. The reverse-quorum reading also holds — protection is cheap to
+/// invoke (the node alone), and the node alone can lift it by `withdraws`.
+///
+/// # Distinct from the blackhole substrate
+///
+/// [`crate::federation::blackhole`] denies **Reticulum transport addresses** —
+/// operator-driven, out-of-band, about *where bytes go*. This denies **authors**
+/// — a signed, replicable, revocable CEG attestation about *whose claims this
+/// node accepts*, which is what "responses to abuse are themselves CEG
+/// attestations, not out-of-band state" requires.
+///
+/// Fail-secure: a de-admitted author's rows are refused before any DB-walking
+/// gate runs, so de-admission also sheds the AV-76 amplification cost.
+pub async fn check_peer_deadmission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    self_key_id: &str,
+) -> Result<(), Error> {
+    // A node never de-admits itself, and a de-admission row itself must always
+    // be admissible (else a node could not lift its own denial).
+    if row.attesting_key_id == self_key_id
+        || envelope_dimension(&row.attestation_envelope) == Some(PEER_DEADMISSION_DIMENSION)
+    {
+        return Ok(());
+    }
+    // Live de-admissions THIS node authored about the row's author. The
+    // tombstone fold is the shared one — a `withdraws` against the de-admission
+    // lifts it, so re-admitting is a first-class, auditable act.
+    let mine = directory.list_attestations_by(self_key_id).await?;
+    let refs: Vec<&super::Attestation> = mine.iter().collect();
+    let dead = super::trust_root::tombstoned_ids(&refs);
+    let now = chrono::Utc::now();
+    let de_admitted = mine.iter().any(|a| {
+        a.attestation_type == attestation_type::SCORES
+            && a.attested_key_id == row.attesting_key_id
+            && envelope_dimension(&a.attestation_envelope) == Some(PEER_DEADMISSION_DIMENSION)
+            && !dead.contains(&a.attestation_id)
+            && a.expires_at.is_none_or(|e| e > now)
+    });
+    if de_admitted {
+        return Err(Error::InvalidArgument(format!(
+            "peer {} is de-admitted from this node's corpus \
+             ({PEER_DEADMISSION_DIMENSION}) — inbound writes refused (CIRISPersist#543 / AV-77). \
+             Lift with a `withdraws` against the de-admission row.",
+            row.attesting_key_id
+        )));
+    }
+    Ok(())
+}
+
+/// v22.0.0 (CIRISPersist#543 finding 3) — **THE CLOSED AUTHORITY-CLAIM GATE**:
+/// no [`identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES`] member may be
+/// SELF-ASSERTED at registration.
+///
+/// # The hole this closes
+///
+/// `register_federation_key` proves key CUSTODY (a self-signed hybrid PoP) and
+/// nothing more — deliberately, so canonical servers can bootstrap strangers.
+/// Key material is free, so the threat model assumes unlimited admitted
+/// identities. Four privileged claims were gated (each after its own incident);
+/// the rest of the privileged set was self-assertable, so a Sybil could
+/// register as `substrate_persist` / `witness` / `trusted_publisher` /
+/// `lenscore_detector` and emit under the reserved dimension families those
+/// types unlock (`system:`, `audit_chain:`, `age_assurance:`,
+/// `capacity_assurance:`, `content_rating:`, `detection:*`) — asserting system,
+/// age, capacity or detection authority **about a third party**.
+///
+/// # The rule
+///
+/// A privileged claim must be **CONFERRED, never self-declared**. Conferral is
+/// the accord m-of-n co-scrub the whole substrate already uses
+/// ([`check_accord_role_admission_over_roster`] — written to be parameterized
+/// so "every FUTURE accord-conferred role rides it with zero new gate code";
+/// this is that future). [`identity_type::ACCORD_HOLDER`] and
+/// [`identity_type::CANONICAL`] keep their dedicated gates for their CC-pinned
+/// error kinds and stronger ceremonies (hardware attestation / anchor-scrub)
+/// and are skipped here — gating them twice would demand a co-scrub the
+/// bootstrap anchor cannot produce.
+///
+/// Self-registration of a DESCRIPTIVE type (`agent` / `user` / `node` /
+/// `primitive`) is untouched: those unlock nothing, which is why they are
+/// absent from the closed set.
+///
+/// Fail-closed: [`Error::RoleNotAccordConferred`]. Runs at every
+/// `federation_keys` write chokepoint, backend-symmetric.
+pub async fn check_privileged_identity_type_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+) -> Result<(), Error> {
+    check_privileged_identity_type_admission_over_roster(
+        directory,
+        row,
+        &accord_holder_roster_key_ids(),
+    )
+    .await
+}
+
+/// [`check_privileged_identity_type_admission`] with an explicit accord-holder
+/// roster (tests inject their own signable holders).
+pub async fn check_privileged_identity_type_admission_over_roster(
+    directory: &dyn super::FederationDirectory,
+    row: &super::KeyRecord,
+    roster_key_ids: &[String],
+) -> Result<(), Error> {
+    for claim in identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES {
+        // Enforce ONLY the claims whose conferral root IS the accord co-scrub.
+        // The others are not ungated — they are gated by a DIFFERENT, stronger
+        // or differently-shaped ceremony at this same chokepoint:
+        //
+        // - HardwareAttested (`accord_holder`) → hardware_attestation_policy
+        // - AnchorScrubbed  (`canonical`)      → check_canonical_role_admission
+        // - DerivedFromVerifiedState (`witness`/`steward`/`partner`/
+        //   `wise_authority`) → the claim is DESCRIPTIVE; every use site
+        //   re-derives the authority from persist's own verified state (the
+        //   steward-binding walk, licensure quorum, WA adjudication edge), so a
+        //   self-asserted claim buys nothing. Demanding a co-scrub for these
+        //   would fail CLOSED on legitimate operators — a witness has no accord
+        //   family to co-scrub it, and at bootstrap there is no roster at all.
+        //
+        // Getting this distinction wrong in either direction is a real bug:
+        // too loose and a Sybil self-asserts authority; too strict and honest
+        // operators cannot register. The mode table makes the choice explicit
+        // and reviewable per claim rather than assumed uniformly.
+        if identity_type::conferral_mode(claim)
+            != Some(identity_type::ConferralMode::AccordCoScrubbed)
+        {
+            continue;
+        }
+        check_accord_role_admission_over_roster(directory, row, claim, roster_key_ids).await?;
+    }
+    Ok(())
+}
+
 /// [`check_co_steward_role_admission`] with an explicit accord-holder roster
 /// (tests inject their own signable holders).
 pub async fn check_co_steward_role_admission_over_roster(
@@ -4535,6 +4706,46 @@ pub async fn has_effective_role(
     role: &str,
 ) -> Result<bool, Error> {
     has_effective_role_over_roster(directory, key_id, role, &accord_holder_roster_key_ids()).await
+}
+
+/// v22.0.0 (CIRISPersist#543 / AV-75) — the **delegation-plane** effective-role
+/// read: does `key_id` hold `role` as a capability DELEGATED by a trust root
+/// that `user_key_id` itself trusts?
+///
+/// This is the counterpart to [`has_effective_role`] for roles whose
+/// [`ConferralMode`](super::types::identity_type::ConferralMode) is
+/// `DelegatedFromTrustRoot` — `trusted_publisher` and `lenscore_detector`.
+/// Where the co-scrub read asks "did the accord bless this key's identity",
+/// this asks "did a root I trust grant this key this capability", which is the
+/// plane the portable trust root already uses for `infra:*`.
+///
+/// Two conditions, both required:
+/// 1. the key CLAIMS the role (either surface — [`KeyRecord::claims_role`]);
+/// 2. the claim is BACKED by a live `delegates_to(root → key, [role])` whose
+///    root passes [`trust_root_valid`](super::trust_root) from `user_key_id`'s
+///    own records — i.e. `capability_roots_to_trusted_root`.
+///
+/// A self-asserted claim with no delegation therefore reads `false`, which is
+/// the AV-75 property: registering the string buys nothing.
+///
+/// Fail-closed: any resolution error reads `false`.
+pub async fn has_delegated_capability_role(
+    directory: &dyn super::FederationDirectory,
+    user_key_id: &str,
+    key_id: &str,
+    role: &str,
+) -> Result<bool, Error> {
+    let Some(row) = directory.lookup_public_key(key_id).await? else {
+        return Ok(false);
+    };
+    if !row.claims_role(role) {
+        return Ok(false);
+    }
+    Ok(
+        super::trust_root::capability_roots_to_trusted_root(directory, user_key_id, key_id, role)
+            .await?
+            .is_some(),
+    )
 }
 
 /// [`has_effective_role`] with an explicit accord-holder roster (tests inject
@@ -5932,28 +6143,26 @@ pub async fn duty_holders_for_content(
     Ok(holders)
 }
 
-/// v8.7.2 (CIRISPersist#233 follow-on, CEG RC27 §11.10) — the duty-holders
-/// of a content target whose subject set is ALREADY signed state in hand
-/// (the report→`scores` path: the row's own `subject_key_ids`, signed by
-/// the producer INSIDE the attestation being admitted). Unlike
-/// [`duty_holders_for_content`], no `subject_of_content` resolution is
-/// needed — the signed subjects are the attestation's own field, not a
-/// hash to resolve, and not a third-party payload declaration. Holders =
-/// `signed_subjects ∪ named_moderators(community_id, duty)`.
-///
-/// This is the §11.10 "already signed-state, fine" case: the scores row's
-/// `subject_key_ids` are part of the signed envelope, so feeding them is
-/// NOT the payload-self-declaration spoof the cirisnode path closes.
-pub async fn duty_holders_from_signed_subjects(
-    directory: &dyn super::FederationDirectory,
-    signed_subjects: &[String],
-    community_id: &str,
-    duty: &str,
-) -> Result<std::collections::HashSet<String>, Error> {
-    let mut holders: std::collections::HashSet<String> = signed_subjects.iter().cloned().collect();
-    holders.extend(named_moderator_holders(directory, community_id, duty).await?);
-    Ok(holders)
-}
+// v22.0.0 (CIRISPersist#543 finding 2b) — `duty_holders_from_signed_subjects`
+// was DELETED here, not merely un-cited.
+//
+// It unioned the row's OWN `subject_key_ids` into the duty-holder (authority)
+// set on the report→`scores` path. v21.11.0 (#517) established that this is
+// unsound — the §11.10 "already signed-state" argument proves the SIGNER is not
+// spoofed, it does NOT prove the SUBJECT claim is genuine (**integrity is not
+// authority**), so any Rooted producer could name THEMSELVES subject and self-
+// authorize a `moderation:*` / `reconsideration:*` action. #517 replaced the
+// call site with `duty_holders_for_community` (named moderators ONLY, CC 4.5.5)
+// but left this function `pub` "for a future referenced-action resolver".
+//
+// #543's citation-liveness gate then found the manifest still citing it as a
+// live processor — labelled, in the manifest's own words, "the drift site".
+// A `pub` helper that computes an authority set from caller-declared data,
+// retained with no caller, is a loaded gun: the next caller re-introduces the
+// vulnerability, and the citation made it look enforced. If a referenced-action
+// resolver is ever built, it must derive authority from persist's OWN verified
+// state (see `feedback_authority_from_own_verified_state`) — not from a set
+// handed in by the row being admitted.
 
 /// v8.7.1 (CIRISPersist#233, CEG §11.10) — the duty-holders of a
 /// **community-scoped action** with no content subject (a bare
@@ -6557,6 +6766,30 @@ pub async fn check_reserved_prefix_admission(
         });
     }
 
+    // v22.0.0 (CIRISPersist#543 finding 2) — THE DIMENSION-KEYED CAPACITY
+    // SELF-EMISSION GATE, wired at last. The CC 3.4.5 arm above keys on the
+    // `attestation_type` namespace (`capacity:*` as a TYPE), but reputation
+    // actually rides `attestation_type = scores` with `dimension = capacity:*`
+    // — so on the real emit shape that arm never fired, and
+    // `check_capacity_not_self_attested` (the dimension-keyed guard written for
+    // exactly this, v4.4.0 / AV-62) had ZERO callers: capacity self-inflation
+    // was open. Two things were wrong and both are fixed here: the live hole,
+    // and the EVIDENCE-REGISTRY UNSOUNDNESS — `namespace_supersets.json` cites
+    // this function as a live processor, and a citation that names code which
+    // never runs breaks the #519 premise that a cited processor is executed
+    // code (see `tests::every_cited_processor_has_a_non_test_caller`, the gate
+    // that now makes that mechanically true).
+    //
+    // Kept as a SEPARATE call rather than folded into the arm above: the two
+    // guards cover two different wire shapes (type-keyed and dimension-keyed)
+    // and must both hold — a row is self-attested capacity if EITHER says so.
+    // Pure (no directory lookup), so it stays in the cheap tier.
+    check_capacity_not_self_attested(
+        envelope_dimension(&row.attestation_envelope),
+        &row.attesting_key_id,
+        &row.attested_key_id,
+    )?;
+
     // (CIRISPersist#519 item 3) — the invariant-registry-driven admission
     // gate: applies the ADMISSION-ENFORCEABLE invariants for this row's
     // family that no OTHER gate in this function (or elsewhere) already
@@ -6638,6 +6871,110 @@ mod tests {
 
     fn default_policy() -> DimensionAdmissionPolicy {
         DimensionAdmissionPolicy::default()
+    }
+
+    /// v22.0.0 (CIRISPersist#543 finding 3) — **THE DRIFT-PROOF COVERAGE
+    /// GATE**: every `identity_type` that any reserved-prefix rule requires
+    /// MUST appear in
+    /// [`identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES`].
+    ///
+    /// This is what makes the fix closed-set rather than incident-driven. The
+    /// pre-#543 state gated four claims, each noticed as its own incident,
+    /// while `substrate_persist` / `witness` / `trusted_publisher` /
+    /// `lenscore_detector` — every one of which reserves a dimension family —
+    /// stayed self-assertable. Adding a rule that reserves a family to a NEW
+    /// identity type without adding that type to the closed set now fails the
+    /// build, so the enumeration cannot silently fall behind the rule table
+    /// again.
+    ///
+    /// (Direction matters: the closed set may be a strict SUPERSET — `steward`
+    /// / `partner` / `wise_authority` confer authority through paths other than
+    /// the reserved-prefix table, e.g. steward-binding and licensure.)
+    #[test]
+    fn authority_conferring_set_covers_every_reserved_prefix_rule() {
+        use std::collections::BTreeSet;
+        let closed: BTreeSet<&str> = identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES
+            .iter()
+            .copied()
+            .collect();
+        let mut required: BTreeSet<String> = BTreeSet::new();
+        for rule in default_reserved_prefix_rules() {
+            for t in rule.required_identity_types {
+                required.insert(t);
+            }
+        }
+        assert!(
+            !required.is_empty(),
+            "the reserved-prefix rule table is empty — this gate would pass vacuously"
+        );
+        let missing: Vec<&String> = required
+            .iter()
+            .filter(|t| !closed.contains(t.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "SELF-ASSERTABLE AUTHORITY (CIRISPersist#543): identity_type(s) {missing:?} reserve a \
+             dimension family in `default_reserved_prefix_rules` but are NOT in \
+             `identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES`, so a peer can self-assert them \
+             at registration and emit under the family they reserve. Add them to the closed set \
+             (they will then require accord conferral), or drop the reserved-prefix rule."
+        );
+    }
+
+    /// Every authority-conferring claim declares a conferral mode — the table
+    /// is exhaustive over the closed set, so a claim can never be added
+    /// without a reviewer stating HOW it is conferred. (`None` here would mean
+    /// a privileged claim silently falls through every gate.)
+    #[test]
+    fn every_authority_claim_declares_a_conferral_mode() {
+        for claim in identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES {
+            assert!(
+                identity_type::conferral_mode(claim).is_some(),
+                "{claim:?} is authority-conferring but declares no ConferralMode — state how it \
+                 is conferred (CIRISPersist#543)"
+            );
+        }
+        // And a descriptive type must NOT declare one (it would imply a gate
+        // that does not exist).
+        for t in [
+            identity_type::AGENT,
+            identity_type::USER,
+            identity_type::NODE,
+            identity_type::PRIMITIVE,
+        ] {
+            assert!(
+                identity_type::conferral_mode(t).is_none(),
+                "{t:?} is descriptive — it must not declare a ConferralMode"
+            );
+        }
+    }
+
+    /// The closed set names only REAL identity types (a typo would silently
+    /// gate nothing, since `claims_role` would never match it).
+    #[test]
+    fn authority_conferring_set_members_are_real_identity_types() {
+        let known = [
+            identity_type::AGENT,
+            identity_type::PRIMITIVE,
+            identity_type::STEWARD,
+            identity_type::PARTNER,
+            identity_type::ACCORD_HOLDER,
+            identity_type::SUBSTRATE_PERSIST,
+            identity_type::WITNESS,
+            identity_type::TRUSTED_PUBLISHER,
+            identity_type::USER,
+            identity_type::WISE_AUTHORITY,
+            identity_type::NODE,
+            identity_type::LENSCORE_DETECTOR,
+            identity_type::CANONICAL,
+        ];
+        for claim in identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES {
+            assert!(
+                known.contains(&claim),
+                "{claim:?} is in AUTHORITY_CONFERRING_IDENTITY_TYPES but is not a known \
+                 identity_type constant — a typo here gates nothing"
+            );
+        }
     }
 
     // ── Ask 3a: `accord:*` × `accord_holder` constitutional rule ───

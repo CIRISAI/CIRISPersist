@@ -563,6 +563,261 @@ mod tests {
         );
     }
 
+    /// Citations the manifest makes that name a symbol which is NOT a function
+    /// (a type, trait, const, enum variant, or an inherent method spelled
+    /// `Type::method`). Liveness is a property of FUNCTIONS; a cited type is
+    /// checked by the compiler instead (it cannot be referenced and absent).
+    /// Pinned so the classification stays deliberate — a NEW non-function
+    /// citation must be added here consciously, not silently skipped.
+    const NON_FUNCTION_CITATIONS: &[&str] = &[
+        "ConformityVariant",
+        "DetectionEvent",
+        "Engine::promote_attestation_with_strips",
+        "ATTESTATION_LADDER_MECHANISMS",
+        "BlobStorage",
+        "RestrictionOp::StripField",
+        "EnvelopeCore",
+        "HardCaseEvent",
+        "BlobBackedSchemaResolver",
+        "Attestation",
+        "LocalAttestationInput",
+    ];
+
+    /// Cited processors that are **exported API surface**: `pub` functions or
+    /// `FederationDirectory` trait methods that downstream (server / edge /
+    /// agent / the PyO3 wheel) calls, so persist's own non-test call count is
+    /// legitimately zero. These are NOT dead — the caller is simply in another
+    /// repo — but each is pinned here so the classification is a deliberate,
+    /// reviewable claim rather than a silent skip. Adding a name here asserts:
+    /// *this is a published surface with a real external caller.*
+    ///
+    /// (Contrast the #543 case: `check_capacity_not_self_attested` was NOT
+    /// exported API — it was an internal guard nothing called, which is exactly
+    /// the dead-citation shape this gate exists to reject.)
+    /// Citations the vendored manifest still makes to symbols persist has
+    /// DELETED — a correction owed at the next re-vendor (tracked #520), not a
+    /// live hole. The manifest is the vendored Registry-of-Record and is not
+    /// hand-edited (#519 governance), so the stale citation is recorded here
+    /// with its reason and the gate treats it as known-and-tracked rather than
+    /// failing the build on a data-file lag persist cannot unilaterally fix.
+    ///
+    /// Each entry must name a symbol that genuinely no longer exists — the gate
+    /// asserts that too, so an entry cannot be used to hide a live dead
+    /// citation (if the symbol is still present, it must satisfy the liveness
+    /// bar like everything else).
+    const DELETED_PENDING_REVENDOR: &[(&str, &str)] = &[(
+        "duty_holders_from_signed_subjects",
+        "deleted in v22.0.0 (#543): unioned caller-declared subject_key_ids into the authority \
+         set — the #517 vulnerability. The manifest labels it \"the drift site\"; the row \
+         graduates at the #520 re-vendor.",
+    )];
+
+    const EXPORTED_API_CITATIONS: &[&str] = &[
+        // `FederationDirectory` trait method — the consent-SLA watcher a host
+        // schedules (#146); persist ships it, the operator drives it.
+        "run_consent_sla_watch",
+        // `pub fn` — the namespace projection predicate consumed by the
+        // conformance/render side (#519 manifest surface).
+        "projection_for",
+        // `pub fn` — the pinned extraction-manifest digest served by
+        // CIRISServer's `/v1/health` (the contract's cross-repo pin).
+        "extraction_manifest_sha256",
+    ];
+
+    /// v22.0.0 (CIRISPersist#543 finding 2b) — **THE EVIDENCE-REGISTRY
+    /// SOUNDNESS GATE**: every `path#symbol` the manifest cites as a processor,
+    /// where `path` is a repo-local file and `symbol` names a function, MUST
+    /// resolve to a function with **at least one non-test caller**.
+    ///
+    /// #519's premise is that a mechanically-cited processor can be referenced
+    /// from the constitution via the evidence registry — i.e. that a citation
+    /// corresponds to code that RUNS. #543 found that premise violated:
+    /// `check_capacity_not_self_attested` was cited as a live processor
+    /// ("confirms scope-away") while having ZERO callers, so the manifest
+    /// asserted an enforcement that did not exist and the underlying hole
+    /// (capacity self-inflation) stayed open behind a citation that looked
+    /// discharged. A dead citation is worse than a missing one: a missing
+    /// processor is visible to the completeness gate, whereas a dead one reads
+    /// as covered.
+    ///
+    /// The bar is deliberately "non-test caller", not merely "compiles":
+    /// a function only ever called from tests enforces nothing on the live
+    /// write path, which is exactly the failure mode here.
+    ///
+    /// Cross-repo citations (`src/…` paths belonging to verify / server / edge)
+    /// are skipped — they resolve at THEIR build, and `evidence_cc_impl_pointers_resolve`
+    /// already covers persist's own evidence rows for existence.
+    #[test]
+    fn every_cited_processor_has_a_non_test_caller() {
+        use std::collections::BTreeSet;
+
+        /// Brace-matched line ranges of `#[cfg(test)]` / `#[cfg(any(test…))]`
+        /// modules. A line-number cutoff is NOT sufficient: several modules
+        /// (e.g. `admission.rs`) carry test regions in the MIDDLE of the file,
+        /// so everything after the first one would be wrongly treated as test.
+        fn test_regions(lines: &[&str]) -> Vec<(usize, usize)> {
+            let mut regions = Vec::new();
+            let mut i = 0usize;
+            while i < lines.len() {
+                let s = lines[i].trim_start();
+                if s.starts_with("#[cfg(test)]") || s.starts_with("#[cfg(any(test") {
+                    let mut j = i;
+                    while j < lines.len() && !lines[j].contains('{') {
+                        j += 1;
+                    }
+                    if j < lines.len() {
+                        let mut depth = 0i32;
+                        let mut k = j;
+                        while k < lines.len() {
+                            depth += lines[k].matches('{').count() as i32;
+                            depth -= lines[k].matches('}').count() as i32;
+                            if depth <= 0 {
+                                break;
+                            }
+                            k += 1;
+                        }
+                        regions.push((i + 1, k + 1));
+                        i = k;
+                    }
+                }
+                i += 1;
+            }
+            regions
+        }
+
+        // Collect repo-local `path#symbol` citations from the whole matrix
+        // (`processor` + every `processors_all` entry), skipping design notes.
+        let mut cites: BTreeSet<(String, String)> = BTreeSet::new();
+        for row in field_processor_matrix() {
+            let mut all: Vec<&str> = vec![row.processor.as_str()];
+            all.extend(row.processors_all.iter().map(String::as_str));
+            for v in all {
+                let v = v.trim();
+                if v.is_empty()
+                    || v == "UNASSIGNED"
+                    || v.starts_with("proposed:")
+                    || v.contains("NOT LANDED")
+                {
+                    continue;
+                }
+                let v = v.strip_prefix("CIRISPersist/").unwrap_or(v);
+                let Some((path, sym)) = v.split_once('#') else {
+                    continue;
+                };
+                let path = path.trim();
+                let full = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), path);
+                if !std::path::Path::new(&full).is_file() {
+                    continue; // cross-repo citation — resolves at their build
+                }
+                let sym: String = sym
+                    .trim()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                    .collect();
+                if !sym.is_empty() {
+                    cites.insert((path.to_string(), sym));
+                }
+            }
+        }
+        assert!(
+            cites.len() > 20,
+            "citation harvest collapsed ({} found) — the gate would pass vacuously",
+            cites.len()
+        );
+
+        // Index every persist source file once.
+        let mut sources: Vec<(String, String)> = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    if let Ok(t) = std::fs::read_to_string(&p) {
+                        out.push((p.display().to_string(), t));
+                    }
+                }
+            }
+        }
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+
+        let non_fn: BTreeSet<&str> = NON_FUNCTION_CITATIONS.iter().copied().collect();
+        let exported: BTreeSet<&str> = EXPORTED_API_CITATIONS.iter().copied().collect();
+        let mut dead: Vec<String> = Vec::new();
+        let mut test_only: Vec<String> = Vec::new();
+
+        for (path, sym) in &cites {
+            let bare = sym.rsplit("::").next().unwrap_or(sym);
+            if non_fn.contains(sym.as_str()) || non_fn.contains(bare) {
+                continue;
+            }
+            let def = format!("fn {bare}");
+            let defined = sources
+                .iter()
+                .any(|(_, t)| t.lines().any(|l| l.contains(&def)));
+            // A deliberately-deleted symbol awaiting the next re-vendor: allowed
+            // ONLY while it is genuinely absent. If it comes back it must meet
+            // the liveness bar like anything else (so this list can never hide a
+            // live dead citation).
+            if let Some((_, why)) = DELETED_PENDING_REVENDOR.iter().find(|(s, _)| *s == bare) {
+                assert!(
+                    !defined,
+                    "{bare} is listed in DELETED_PENDING_REVENDOR ({why}) but a `fn {bare}` \
+                     exists again — remove the entry and let the liveness bar apply"
+                );
+                continue;
+            }
+            if !defined {
+                // Not a function anywhere: either a type (should be pinned in
+                // NON_FUNCTION_CITATIONS) or a stale citation.
+                dead.push(format!(
+                    "{path}#{sym} — names no `fn` in persist (add to NON_FUNCTION_CITATIONS if it \
+                     is a type/const, else the citation is stale)"
+                ));
+                continue;
+            }
+            let call = format!("{bare}(");
+            let (mut non_test, mut total) = (0usize, 0usize);
+            for (f, t) in &sources {
+                let lines: Vec<&str> = t.lines().collect();
+                let regions = test_regions(&lines);
+                for (i, l) in lines.iter().enumerate() {
+                    let ln = i + 1;
+                    if l.contains(&call) && !l.contains(&def) {
+                        total += 1;
+                        if !regions.iter().any(|(a, b)| ln >= *a && ln <= *b) {
+                            non_test += 1;
+                        }
+                    }
+                }
+                let _ = f;
+            }
+            if non_test == 0 && !exported.contains(bare) {
+                if total > 0 {
+                    test_only.push(format!("{path}#{bare} (called ONLY from tests)"));
+                } else {
+                    dead.push(format!("{path}#{bare} (ZERO callers — dead citation)"));
+                }
+            }
+        }
+
+        assert!(
+            dead.is_empty() && test_only.is_empty(),
+            "EVIDENCE-REGISTRY UNSOUNDNESS (CIRISPersist#543): the manifest cites processors that \
+             do not run on any live path. A citation that names code which never executes asserts \
+             an enforcement that does not exist — the #519 premise this gate protects.\n  \
+             DEAD: {dead:?}\n  TEST-ONLY: {test_only:?}\n\
+             Fix by WIRING the processor at its real chokepoint (preferred — that is what #543 did \
+             for check_capacity_not_self_attested), or by correcting the manifest citation."
+        );
+    }
+
     /// Drift gate: the compiled-in manifest is the exact cut the consts pin,
     /// and it is coherently seeded from the registry cut persist vendors.
     #[test]
