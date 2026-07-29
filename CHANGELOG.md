@@ -5,6 +5,38 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.17.0] — 2026-07-28 — #536 follow-up: `establish_trust_root` asserts its own postcondition (no more Ok-without-the-walk)
+
+A fixture-contract fix (not a substrate defect). v21.16.0 made the user→root edge best-effort
+and then **returned `Ok(())` even when the walk it exists to satisfy did not succeed** — for a
+real engine-backed user whose synthetic edge is skipped, `establish_trust_root` reported
+success while `capability_roots_to_trusted_root` still failed. A helper whose contract is
+"after this, the walk succeeds" must not be able to return success when it doesn't.
+
+### Fixed — self-enforcing postconditions
+
+- **`establish_trust_root`** now runs `capability_roots_to_trusted_root(user, subject, scope)`
+  before returning and returns **`Err`** (naming the unmet postcondition) if it does not
+  succeed. So: a synthetic user → the synthetic edge admits → the walk holds → `Ok`; a real
+  user who emitted its own `delegates_to(user → root)` first → the walk holds → `Ok`; a real
+  user with no edge yet → **`Err`**, not a false `Ok`. The root side is still stood up (the
+  legs run before the check), and the synthetic edge is still skipped-not-forged.
+- **`establish_trust_root_side`** now asserts ITS narrower postcondition too — after the
+  root-side legs it confirms `root_self_declares && lifecycle_active`, returning `Err` if the
+  charter or `accord:lifecycle` did not admit.
+
+### Real-user flow (unchanged shape, now honest)
+
+A real-node consumer calls `establish_trust_root_side(root, subject, scope)`, has its engine
+emit `delegates_to(user → root)` with its own signer, then asserts the walk — or emits that
+edge *before* calling `establish_trust_root`, which then returns `Ok` because the walk
+genuinely holds. The witness `exercise_trust_root_real_user` (memory + sqlite + postgres) now
+pins both halves: (A) the full helper **`Err`s** for a real user with no pre-emitted edge (root
+side up, edge skipped-not-forged), and (B) the `establish_trust_root_side` + own-edge flow goes
+green.
+
+No wire/schema change — test-support only, under `test-anchor`.
+
 ## [21.16.0] — 2026-07-28 — #536 follow-up: `establish_trust_root` serves a REAL engine-backed user
 
 v21.15.0's `establish_trust_root` signed the `delegates_to(user → root)` trust edge with
