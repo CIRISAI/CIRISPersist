@@ -167,7 +167,9 @@ Design rules that make it work:
   an expected count of 0.7 at the meta-coverage budget. That is a coin flip, and lowering the
   floor to accommodate it would have defeated the reason the op was added. Fixed in the generator
   instead — follow-up writes are steered onto the sanctioned peer using an already-drawn field as
-  the coin, so shrinking still works: **20 of 240 (8.3%)**.
+  the coin, so shrinking still works: **18 of 240 (7.5%)**, independently re-measured on the
+  shipping generator (an earlier draft published 8.3%; the generator moved under it, which is
+  why the number was re-taken rather than carried forward).
 - **Metamorphic invariants needing no oracle**: I1 real-verifier survival, I2a/I2b zero-writes-on-
   refusal (AV-9), I3 replay idempotence, I4 monotone refusal under restriction, I5 per-op
   differential, I6 admitted ⇒ stored.

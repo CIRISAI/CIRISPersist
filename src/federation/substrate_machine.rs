@@ -162,9 +162,12 @@
 //! Reaching it required biasing the generator, not lowering a floor: the
 //! conjunction (a sanction that LANDS, then a write from the peer it named,
 //! both surviving the tiers ahead of the AV-77 gate) occurred in **7 of 240
-//! sequences (2.9%)** on the unbiased generator — an expected count of 0.7 at
+//! sequences (2.9%)** on the unbiased generator (measured AFTER the
+//! expiry-horizon fix of limit 7 — under the broken clock it was 0 of 240, and
+//! no generator bias could have fixed that) — an expected count of 0.7 at
 //! the meta-coverage budget, i.e. a coin flip. See
-//! [`bias_deadmission_followups`]; the rate is now **20 of 240 (8.3%)**. The op alphabet is the
+//! [`bias_deadmission_followups`]; the rate is now **18 of 240 (7.5%)** —
+//! independently re-measured on the shipping generator. The op alphabet is the
 //! harness's real coverage boundary, and it is much narrower than the write
 //! path: notably, the alphabet reaches ONE write chokepoint family
 //! (`put_attestation` + the two local paths + `promote_attestation`) on ONE
@@ -206,6 +209,45 @@
 //! coordinates, which would lift the sanction without any `withdraws`. Only the
 //! node itself writes its own local rows, so that is self-inflicted rather than
 //! an attacker path; it is unexercised here all the same.
+//!
+//! **7. A fixed model clock against wall-clock gates has an EXPIRY HORIZON, and
+//! it fails silently.** The model clock is pinned to 2026-01-01 because I3's
+//! replay and I5's differential compare `expires_at` byte for byte, so it cannot
+//! be `Utc::now()`. Substrate gates, however, evaluate liveness against
+//! `Utc::now()`. While `row_for` stamped `expires_at = at + 30 days`, every row
+//! this harness wrote was **already expired** at every such gate from 2026-01-31
+//! onward — for roughly six months, with nothing failing, because no invariant
+//! here depended on a row being LIVE. [`OpKind::Deadmit`] is what exposed it: a
+//! sanction that landed and refused nothing.
+//!
+//! Measured blast radius over 240 sequences / 1099 ops, same seed, old expiry vs
+//! new: **the ONLY outcomes that changed were the de-admission refusals
+//! themselves** (unbiased 552→545 admitted, exactly the 7 the gate now refuses;
+//! biased 582→556, exactly its 26). So the broken clock did not manufacture
+//! false AGREEMENT — it made exactly one gate unreachable. Four other
+//! wall-clock liveness folds over `delegates_to` edges
+//! ([`is_steward_bound`](super::admission::is_steward_bound),
+//! [`steward_bindings_of`](super::admission::steward_bindings_of),
+//! [`steward_binding_chain`](super::admission::steward_binding_chain) and
+//! `live_owner_binding_granters`) do read rows this harness writes, and changed
+//! no outcome under this alphabet; that is a fact about the
+//! alphabet, not a guarantee. `every_row_the_harness_writes_is_live_at_wall_clock`
+//! now pins the horizon so the next drift fails loudly instead of quietly.
+//!
+//! **8. A substrate harness cannot see whether a HOST can reach a gate.** This
+//! harness installs `self_key_id` directly on the concrete backend, which is
+//! correct for testing the substrate contract — and it is exactly why AV-77
+//! could be green here while being **unreachable in production**:
+//! `set_self_key_id` existed only on the backend types, with no `Engine` method
+//! and no PyO3 binding, so no host could turn the gate on. Every witness reached
+//! PAST the Engine to configure the backend directly, so the whole matrix agreed
+//! about a gate nobody could enable (v22.0.0, CIRISPersist#543; the fix is
+//! `Engine::set_self_key_id` plus its FFI binding). This is the
+//! "accepted but not projected" class again — v17.0.0 / CIRISPersist#444. A gate
+//! is not shipped when its code path exists and passes; it is shipped when a
+//! host can reach it, and **only a test that goes through the host surface can
+//! say so**. Reachability-from-the-host is out of scope for every test in this
+//! file, by construction.
 
 /// Shared, backend-agnostic machine + invariant bodies. Compiled under `test`
 /// and under the `test-anchor` feature (persist's test-only, never-in-a-
@@ -2675,8 +2717,13 @@ mod proptests {
     /// sanction needs a `Valid` signature (1 draw in 3), the follow-up needs a
     /// `Valid` signature too (or an earlier tier refuses it before the AV-77
     /// gate is ever consulted), and the follow-up's attester has to match the
-    /// named subject (1 in 3). Measured on the unbiased generator: **7
-    /// enforcements across 240 executed sequences, ~2.9%.**
+    /// named subject (1 in 3). Measured on the unbiased generator: **7 of 240
+    /// executed sequences, 2.9%** — re-measured after the expiry-horizon fix
+    /// (limit 7), which is the number that matters, because under the broken
+    /// clock the rate was **0 of 240**: the sanction could never be live, so no
+    /// bias could have helped. The bias treats the sampling rate; the clock was
+    /// the root cause, and a bias that had been tuned to work around it would
+    /// have hidden it.
     ///
     /// At the meta-coverage test's 24-sequence budget that is an expected count
     /// of 0.7 — so observing zero is a coin flip. Asserting on it directly
@@ -3345,6 +3392,50 @@ mod proptests {
         }
     }
 
+    /// **THE EXPIRY-HORIZON GUARD** — the model clock must stay inside the
+    /// liveness window of every row the harness writes.
+    ///
+    /// This pins the invariant behind a defect that was live in this harness for
+    /// roughly six months and failed **silently**, getting worse with age.
+    /// `row_for` stamped `expires_at = at + 30 days` off a model clock pinned to
+    /// 2026-01-01 (pinned deliberately — I3's replay and I5's differential both
+    /// compare `expires_at`, so it cannot be `Utc::now()`). Substrate gates
+    /// evaluate liveness against **wall-clock `Utc::now()`**. So on 2026-01-31
+    /// every row the harness wrote silently became expired at every such gate,
+    /// and no test noticed, because no invariant in this file depended on a row
+    /// being LIVE. It surfaced only when [`OpKind::Deadmit`] arrived and a
+    /// sanction landed and then refused nothing.
+    ///
+    /// The class is worth more than the instance: **a harness with a fixed model
+    /// clock and gates that read wall-clock time has an expiry horizon.** A
+    /// green run months from now proves less than a green run today unless
+    /// something pins the horizon. This is that something, and it costs one
+    /// comparison.
+    #[test]
+    fn every_row_the_harness_writes_is_live_at_wall_clock() {
+        use super::test_support::harness_expires_at;
+        let now = chrono::Utc::now();
+        assert!(
+            harness_expires_at() > now,
+            "EXPIRY HORIZON: the harness stamps `expires_at = {}`, which is NOT in the future \
+             relative to wall-clock now ({now}). Every row it writes is therefore already \
+             expired at every gate that compares to `Utc::now()` — including \
+             `check_peer_deadmission` — so those gates are unreachable and their coverage is \
+             silently gone. This is the failure mode that hid for six months: fix the constant, \
+             do not relax this test.",
+            harness_expires_at()
+        );
+        // And the model clock must sit BEFORE that horizon, or a row would
+        // declare an expiry earlier than its own assertion.
+        let clock_start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("fixed instant")
+            .with_timezone(&chrono::Utc);
+        assert!(
+            clock_start < harness_expires_at(),
+            "EXPIRY HORIZON: the model clock start must precede the declared expiry"
+        );
+    }
+
     /// **The provenance trail, proven on the case that motivated it.**
     ///
     /// A `Withdraw` referencing a row minted by an earlier op. The symptom, if
@@ -3421,60 +3512,6 @@ mod proptests {
         assert!(
             msg.contains("ORIGINATES at op 0"),
             "and say so in words, so the reader is not left to infer it: {msg}"
-        );
-    }
-
-    /// TEMPORARY MEASUREMENT — delete after reporting.
-    #[test]
-    fn tmp_measure_deadmission_rate() {
-        use proptest::strategy::{Strategy as _, ValueTree};
-        use proptest::test_runner::{Config, TestRunner};
-        const N: usize = 240;
-
-        let measure = |biased: bool| -> (usize, usize) {
-            let mut runner = TestRunner::new_with_rng(
-                Config {
-                    cases: N as u32,
-                    ..Config::default()
-                },
-                proptest::test_runner::TestRng::deterministic_rng(
-                    proptest::test_runner::RngAlgorithm::ChaCha,
-                ),
-            );
-            let mut seqs: Vec<Vec<Op>> = Vec::new();
-            for _ in 0..N {
-                let raw = prop::collection::vec(arb_op(), 1..=MAX_OPS)
-                    .new_tree(&mut runner)
-                    .expect("gen")
-                    .current();
-                seqs.push(if biased {
-                    bias_deadmission_followups(raw)
-                } else {
-                    raw
-                });
-            }
-            block_on(async {
-                let mut seq_hits = 0usize;
-                let mut writes = 0usize;
-                for ops in &seqs {
-                    let t = run_on_sqlite(ops, &fresh_tag()).await;
-                    if t.deadmissions_enforced > 0 {
-                        seq_hits += 1;
-                    }
-                    writes += t.deadmissions_enforced;
-                }
-                (seq_hits, writes)
-            })
-        };
-
-        let (ub_seq, ub_w) = measure(false);
-        let (b_seq, b_w) = measure(true);
-        eprintln!(
-            "MEASUREMENT (post clock fix, N={N}): UNBIASED {ub_seq}/{N} ({:.3}) sequences \
-             reached the gate, {ub_w} writes refused | BIASED {b_seq}/{N} ({:.3}) sequences, \
-             {b_w} writes refused",
-            ub_seq as f64 / N as f64,
-            b_seq as f64 / N as f64,
         );
     }
 
@@ -3614,11 +3651,20 @@ mod proptests {
         // is the assertion that would have failed on the pre-v22 memory backend,
         // which had no `self_key_id` field and therefore no gate at all.
         //
-        // MEASURED at 3 on this generator and seed (≈1 sequence in 8), so the
-        // differential's 64 cases exercise the gate several times per run. The
-        // floor is the smallest meaningful one rather than a fraction of the
-        // measurement, because the conjunction is rare enough that a fractional
-        // floor would encode the current bias as a requirement.
+        // MEASURED, at N=240 so the figure is not a small-sample artefact:
+        // **18/240 sequences (7.5%)** reach the gate with the bias, 7/240 (2.9%)
+        // without it — so the differential's 64 cases exercise it ~5 times per
+        // run.
+        //
+        // BE HONEST ABOUT WHAT THIS SLICE PROVES: at the 24-sequence budget the
+        // gate is reached in **1 sequence (3 refused writes)**. Expected is ~2,
+        // so a single sequence carries the claim, and it does so only because the
+        // RNG is pinned. That is enough to catch a DORMANT gate (the memory
+        // backend, which would score 0) and it is NOT a rate estimate — 240 is.
+        //
+        // The floor is therefore the smallest meaningful one rather than a
+        // fraction of the measurement: at 7.5% a fractional floor would encode
+        // the current bias as a requirement and flap on any generator change.
         assert!(
             deadmitted > 0,
             "META-COVERAGE: across {EXECUTED} sequences the de-admission gate refused NOTHING. \
