@@ -1385,7 +1385,17 @@ pub mod test_support {
     /// 1. `delegates_to(user → root)` — the user's live trust edge — is
     ///    **best-effort** (see below).
     ///
-    /// # Real vs synthetic user (CIRISPersist#536 follow-up, v21.16.0)
+    /// # SELF-ENFORCING postcondition (CIRISPersist#536 follow-up, v21.17.0)
+    ///
+    /// The contract of this helper is "after `Ok`, the trust walk succeeds." So
+    /// it **asserts that before returning**: after standing up the legs it runs
+    /// [`crate::federation::trust_root::capability_roots_to_trusted_root`]
+    /// `(user, subject, scope)` and returns **`Err` if that does not succeed** —
+    /// a helper whose contract is "the walk holds" must not be able to report
+    /// success when it doesn't (the v21.16.0 best-effort version could, which was
+    /// a fixture-contract bug).
+    ///
+    /// # Real vs synthetic user
     ///
     /// The root and its accord witness stay synthetic — nobody needs their
     /// private halves. The USER is the node whose serve gate you are exercising.
@@ -1393,14 +1403,16 @@ pub mod test_support {
     /// sign it with the deterministic `sign_envelope(user_key_id)` derivation —
     /// correct for a **synthetic** user (whose registered pubkey IS that
     /// derivation), **wrong for a REAL engine-backed** user (whose registered
-    /// pubkey is its own signing key → the edge fails federation-tier ingest with
-    /// `FederationTierUnverified`). So the user edge is emitted best-effort: it
-    /// succeeds for a synthetic user, and for a real one it is **skipped (logged,
-    /// never fatal)** and the real user's OWN signer must emit
-    /// `delegates_to(user → root)`. `establish_trust_root` returns `Ok` once the
-    /// root side is up either way — a real-node consumer calls this and then has
-    /// its engine emit the honest trust edge (or calls
-    /// [`establish_trust_root_side`] directly and skips the synthetic attempt).
+    /// pubkey is its own signing key → the edge fails federation-tier ingest).
+    /// The synthetic user edge is therefore **best-effort** (skipped+logged when
+    /// it won't verify). Consequently:
+    /// - **synthetic user** → the synthetic edge admits, the walk succeeds, `Ok`.
+    /// - **real user** → emit `delegates_to(user → root)` with the user's OWN
+    ///   signer **before** calling this; the walk then succeeds and it returns
+    ///   `Ok`. If you have NOT emitted it, this returns `Err` (honest — the walk
+    ///   is not satisfied). Prefer [`establish_trust_root_side`] for the
+    ///   real-user flow: it stands up only the root side (and asserts ITS
+    ///   postcondition), leaving leg 1 to your engine, then you assert the walk.
     ///
     /// `subject_key_id` (and, for the synthetic path, `user_key_id`) must already
     /// be registered. `root_key_id` is a NEW id this helper registers. Does the
@@ -1413,11 +1425,29 @@ pub mod test_support {
         scope: &str,
     ) -> Result<(), crate::federation::Error> {
         establish_trust_root_side(directory, root_key_id, subject_key_id, scope).await?;
-        // The user's trust edge is BEST-EFFORT — see the type-level doc: it
-        // succeeds for a synthetic user and is skipped (logged) for a real
-        // engine-backed one, whose own signer must emit it. `establish_trust_root`
-        // returning Ok means the ROOT SIDE is stood up either way.
+        // Best-effort synthetic user edge (see the type-level doc): admits for a
+        // synthetic user, skipped+logged for a real one.
         try_emit_synthetic_trust_edge(directory, user_key_id, root_key_id).await;
+
+        // POSTCONDITION — the reason this helper exists. Never return Ok unless
+        // the walk it is meant to satisfy actually succeeds (CIRISPersist#536).
+        let grant = crate::federation::trust_root::capability_roots_to_trusted_root(
+            directory,
+            user_key_id,
+            subject_key_id,
+            scope,
+        )
+        .await?;
+        if grant.is_none() {
+            return Err(crate::federation::Error::Backend(format!(
+                "establish_trust_root postcondition NOT met: \
+                 capability_roots_to_trusted_root(user={user_key_id}, subject={subject_key_id}, \
+                 scope={scope}) does not succeed — leg 1 delegates_to({user_key_id} → \
+                 {root_key_id}) is absent. For a REAL engine-backed user, emit that trust edge \
+                 with the user's OWN signer BEFORE this call, or use establish_trust_root_side \
+                 (which stands up only the root side) and assert the walk yourself."
+            )));
+        }
         Ok(())
     }
 
@@ -1498,7 +1528,28 @@ pub mod test_support {
             .await?;
 
         // Leg 4 — no halt latched (default). Plus the scope-carrying edge.
-        grant_scope(directory, root_key_id, subject_key_id, scope).await
+        grant_scope(directory, root_key_id, subject_key_id, scope).await?;
+
+        // POSTCONDITION (CIRISPersist#536) — the root side is GENUINELY up: the
+        // root self-declares AND its accord:lifecycle is live/fresh. (edge_exists
+        // is legitimately false here — leg 1 is the caller's to emit — so we
+        // probe the root-only legs with a throwaway user id.) A helper that
+        // returns Ok must have actually done what it claims.
+        let probe = crate::federation::trust_root::trust_root_valid(
+            directory,
+            "__side_probe__",
+            root_key_id,
+        )
+        .await?;
+        if !(probe.root_self_declares && probe.lifecycle_active) {
+            return Err(crate::federation::Error::Backend(format!(
+                "establish_trust_root_side postcondition NOT met for root={root_key_id}: \
+                 root_self_declares={} lifecycle_active={} — the charter or accord:lifecycle did \
+                 not admit",
+                probe.root_self_declares, probe.lifecycle_active
+            )));
+        }
+        Ok(())
     }
 
     /// v21.16.0 (CIRISPersist#536 follow-up) — emit `delegates_to(user → root)`
@@ -1656,14 +1707,19 @@ pub mod test_support {
         );
     }
 
-    /// v21.16.0 (CIRISPersist#536 follow-up) — the REAL engine-backed user path.
-    /// Models the exact case a consumer hit: `user` is registered with its OWN
-    /// signing key (NOT the deterministic `sign_envelope(user)` derivation), so
-    /// `establish_trust_root`'s synthetic user→root edge fails federation-tier
-    /// verify and is skipped (logged) — proving it does NOT forge the edge. The
-    /// root side still stands up, and the user's OWN signer then emits the honest
-    /// `delegates_to(user → root)`, at which point `trust_root_valid` flips green
-    /// and the capability walk roots. Backend-agnostic (memory/sqlite/postgres).
+    /// v21.17.0 (CIRISPersist#536 follow-up) — the REAL engine-backed user path,
+    /// and the HONEST CONTRACT. `user` is registered with its OWN signing key
+    /// (NOT the deterministic `sign_envelope(user)` derivation), as a real node
+    /// is. Proves two things:
+    /// - **(A) no lying**: the full [`establish_trust_root`] returns `Err` for a
+    ///   real user with no pre-emitted edge — its synthetic edge is skipped (not
+    ///   forged), the walk it promises is NOT satisfied, so it does NOT return
+    ///   `Ok`. The root side WAS stood up (the legs run before the postcondition).
+    /// - **(B) the real-user flow works**: [`establish_trust_root_side`] stands up
+    ///   the root side (asserting its own postcondition), the user's OWN signer
+    ///   emits the honest `delegates_to(user → root)`, and then `trust_root_valid`
+    ///   + the capability walk go green.
+    /// Backend-agnostic (memory/sqlite/postgres).
     pub async fn exercise_trust_root_real_user(
         directory: &dyn crate::federation::FederationDirectory,
         tag: &str,
@@ -1676,12 +1732,10 @@ pub mod test_support {
 
         let user = format!("{tag}-user");
         let user_real_key = format!("{tag}-userREAL"); // the user's true signing key
-        let root = format!("{tag}-root");
         let subject = format!("{tag}-subject");
 
-        // Register `user` carrying the pubkeys of `user_real_key` — i.e. its
-        // registered pubkey is its OWN signing key, NOT hybrid_pubkeys(user).
-        // This is what a real engine-backed node looks like.
+        // `user` registered carrying the pubkeys of `user_real_key` — its
+        // registered pubkey IS its own signing key, NOT hybrid_pubkeys(user).
         crate::federation::tier_ingest::test_support::register_hybrid_key_aliased(
             directory,
             &user,
@@ -1692,26 +1746,36 @@ pub mod test_support {
             .await
             .expect("register subject");
 
-        // establish_trust_root: root side is stood up; the synthetic user edge
-        // (signed with sign_envelope(user)) fails verify against the real key and
-        // is skipped — NOT forged.
-        establish_trust_root(directory, &user, &root, &subject, INFRA_SERVE_SCOPE)
+        // ── (A) HONEST FAILURE — the full helper does NOT claim success. ──
+        let root_a = format!("{tag}-rootA");
+        let err = establish_trust_root(directory, &user, &root_a, &subject, INFRA_SERVE_SCOPE)
             .await
-            .expect("root side stands up even when the synthetic user edge is skipped");
-        let v = trust_root_valid(directory, &user, &root)
+            .expect_err("({tag}) full helper must Err for a real user with no pre-emitted edge");
+        assert!(
+            err.to_string().contains("postcondition NOT met"),
+            "({tag}) the Err names the unmet postcondition: {err}"
+        );
+        // …yet the root side WAS stood up (legs precede the postcondition check),
+        // and the synthetic edge was skipped (not forged).
+        let va = trust_root_valid(directory, &user, &root_a)
             .await
-            .expect("walk");
+            .expect("walk A");
         assert!(
-            !v.edge_exists,
-            "({tag}) synthetic user→root edge must be SKIPPED for a real-key user (not forged)"
+            !va.edge_exists && va.root_self_declares && va.lifecycle_active,
+            "({tag}) root side up + synthetic edge skipped (not forged): {va:?}"
         );
+
+        // ── (B) THE REAL-USER FLOW — root side, then the user's own edge. ──
+        let root_b = format!("{tag}-rootB");
+        establish_trust_root_side(directory, &root_b, &subject, INFRA_SERVE_SCOPE)
+            .await
+            .expect("({tag}) establish_trust_root_side stands up + asserts the root side");
+        let vb0 = trust_root_valid(directory, &user, &root_b)
+            .await
+            .expect("walk B0");
         assert!(
-            !v.valid,
-            "({tag}) not valid without the user's own trust edge"
-        );
-        assert!(
-            v.lifecycle_active && v.root_self_declares,
-            "({tag}) but the root SIDE is fully stood up: {v:?}"
+            !vb0.valid && vb0.root_self_declares && vb0.lifecycle_active && !vb0.edge_exists,
+            "({tag}) root side up, not yet valid without the user's edge: {vb0:?}"
         );
 
         // The real user emits its OWN honest trust edge, signed by its real key.
@@ -1719,7 +1783,7 @@ pub mod test_support {
         let honest_edge = signed_trust_attestation_signed_by(
             &edge_id,
             &user,
-            &root,
+            &root_b,
             attestation_type::DELEGATES_TO,
             json!({
                 "references_attestation_id": edge_id,
@@ -1734,12 +1798,12 @@ pub mod test_support {
             .await
             .expect("({tag}) the real user's own-signed trust edge hybrid-verifies + admits");
 
-        let v2 = trust_root_valid(directory, &user, &root)
+        let vb1 = trust_root_valid(directory, &user, &root_b)
             .await
-            .expect("walk2");
+            .expect("walk B1");
         assert!(
-            v2.valid,
-            "({tag}) valid once the real user emits its own edge: {v2:?}"
+            vb1.valid,
+            "({tag}) valid once the real user emits its own edge: {vb1:?}"
         );
         let grant = capability_roots_to_trusted_root(directory, &user, &subject, INFRA_SERVE_SCOPE)
             .await
@@ -1747,7 +1811,7 @@ pub mod test_support {
             .unwrap_or_else(|| {
                 panic!("({tag}) subject infra:serve roots to the real-user-trusted root")
             });
-        assert_eq!(grant.root_key_id, root);
+        assert_eq!(grant.root_key_id, root_b);
     }
 }
 
