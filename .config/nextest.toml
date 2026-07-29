@@ -71,3 +71,24 @@ max-threads = 1
 # tests with similar destructive schema ops) is in the group.
 filter = 'test(/_pg$/) + test(/_postgres$/) + test(/::pg_/) + test(/postgres_tests::/) + test(/::postgres::/) + test(av26_concurrent_boot_advisory_lock)'
 test-group = "postgres"
+
+# v22.0.0 (CIRISPersist#543) — THE SUBSTRATE GAUNTLET NEEDS A LONGER LEASH.
+#
+# `src/federation/substrate_machine.rs` runs stateful proptests over
+# {op sequences} × {families} × {backends}. Locally the memory+sqlite
+# differential takes ~60-90s and the three-way postgres arm ~80s against a
+# local container. CI runners are slower and the pg arm talks to a service
+# container, so the default `terminate-after = 6` (six 60s warnings, then
+# SIGKILL) is uncomfortably close to a legitimate run — and a SIGKILL here
+# reads in the log exactly like the hangs this file exists to catch, so a
+# false kill would be actively misleading.
+#
+# 20 minutes of headroom for these tests only. Everything else keeps the 6
+# minute bound: a real hang in the rest of the suite still surfaces fast with
+# its name in the log, which is the property that mattered in #95.
+#
+# Deliberately NOT raising the global timeout — that would trade this cut's
+# gauntlet coverage for the hang-detection the whole file was written to get.
+[[profile.default.overrides]]
+filter = 'test(/substrate_machine/)'
+slow-timeout = { period = "60s", terminate-after = 20 }

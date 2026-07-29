@@ -2452,6 +2452,26 @@ by *reading* postgres for the sqlite fix — the harness drives memory-vs-sqlite
 only, which is its own recorded blind spot (see AV-78) and the reason
 extending it to postgres is the next thing it learns.
 
+**Reachability (v22.0.0)**: the gate shipped wired at all three backends, proven by a
+`{gate} × {backend}` matrix, and **unreachable by any host** — `set_self_key_id`
+lived only on the concrete backend types and had no caller outside the tests,
+so an embedder holding an `Engine`, or reaching persist through the PyO3 FFI
+as CIRISEdge and CIRISServer both do, could not enable it. The witnesses were
+green because each of them reached *past* the Engine to configure the backend
+directly. A sanction nobody can enable is not a sanction. Now exposed as
+`Engine::set_self_key_id` / `self_key_id` plus PyO3 bindings, with a test that
+drives the lifecycle through the Engine handle.
+
+**The class, stated generally**: a mitigation is not shipped when its code path
+exists and passes tests. It is shipped when a **host can reach it and observe
+that it is on**. Persist has hit this before (v17.0.0 / CIRISPersist#444 — the
+signed route table was admitted correctly and never surfaced), which is why it
+belongs in the threat model and not just the changelog: *"accepted but not
+projected"* is a recurring failure mode of this codebase, and a witness matrix
+that configures the substrate directly cannot detect it. **Test-support
+fixtures that bypass the host API will certify an unreachable feature as
+shipped.**
+
 #### AV-78: The tier column was never written — every local-tier row stored as `federation`
 
 **Defect** (not an adversary-driven attack; a substrate correctness failure

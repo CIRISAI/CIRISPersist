@@ -40,7 +40,24 @@
 //! | [`OpKind::Supersede`] | `put_attestation` of a `supersedes` referencing a prior row |
 //! | [`OpKind::Recant`] | `put_attestation` of a `recants` referencing a prior row |
 //! | [`OpKind::UnsignedLocalWrite`] | an unsigned `attestation_upsert_local` **on the coordinates an earlier admitted row already occupies** — the #541 shape |
+//! | [`OpKind::Deadmit`] | a `put_attestation` of the AV-77 peer de-admission row, which makes [`check_peer_deadmission`](super::admission::check_peer_deadmission) LIVE for the rest of the sequence |
 //! | [`OpKind::ReadBack`] | `list_attestations_for` / `_by` + [`FederationDirectory::list_signed_records`], each row re-verified |
+//!
+//! [`OpKind::Deadmit`] exists because of a hole this harness had and did not
+//! report. v22.0.0 fixed three backend-parity defects the differential oracle
+//! should have screamed about — memory ran **no de-admission gate at all** (it
+//! had no `self_key_id` field), memory ran **no SCORES envelope-schema
+//! validation**, and postgres ran the de-admission gate with nothing proving
+//! it. Entire gates were missing from one arm of the trio and the oracle stayed
+//! silent, because **the op alphabet could not produce a row that reaches
+//! them**. They were found by hand, by building an inventory table.
+//!
+//! That is the failure mode this module's own design notes name: *derive the
+//! enumeration from the vocabulary, not from what the code parses.* A generator
+//! that only emits families the backends already agree on will keep agreeing
+//! with itself. Every gate added to a write path is therefore also a claim
+//! about this alphabet — if no op can reach it, the trio is not being compared
+//! on it.
 //!
 //! The clock **advances by default** ([`ClockStep::Advance`], weighted 9:1 over
 //! [`ClockStep::Equal`]) — the #541 lesson, stated as a generator bias: an
@@ -104,8 +121,91 @@
 //! A generator that only ever produces refusals passes every invariant
 //! *vacuously*. [`generator_reaches_interesting_states`] fails loudly if that
 //! happens: it asserts every [`OpKind`] variant is emitted, both polarities
-//! (admitted and refused) are reached, and a floor fraction of sequences
-//! produce at least one admitted **federation-tier signed** row.
+//! (admitted and refused) are reached, a floor fraction of sequences produce at
+//! least one admitted **federation-tier signed** row, and the AV-77
+//! de-admission gate actually **refused** a write.
+//!
+//! That last claim is a different kind of assertion from the first three, and
+//! the reason is [`OpKind::Deadmit`]'s: EMITTING an op is not reaching a gate.
+//! A `Deadmit` only exercises anything when it lands AND a later op writes as
+//! the peer it named AND that write survives the gates ahead of tier 4b — a
+//! conjunction the unbiased generator hit roughly once per 24 sequences.
+//! Whenever a variant's whole point is a conjunction like that, the meta-
+//! coverage claim has to be about the CONJUNCTION, not about the draw.
+//!
+//! # Known limits
+//!
+//! Stated here rather than only in the CHANGELOG and `docs/THREAT_MODEL.md`
+//! (§3.16, AV-76/AV-78), because the person who needs them is reading this file
+//! deciding whether a green run means anything about the change they just made.
+//!
+//! **1. A differential oracle is exactly as wide as its backend set.** Both
+//! substrate bugs this harness found in v22 — `put_attestation` dropping the
+//! caller's `tier`, and the §6.1 dedup short-circuit sitting ahead of the
+//! crypto gate — were present IDENTICALLY in postgres, and the oracle found
+//! NEITHER of them there. They were caught by READING postgres while porting
+//! the sqlite fix. Three arms that share a defect agree perfectly. No
+//! differential can report a bug all its arms have, and no amount of case
+//! budget changes that — only reading, or a non-differential invariant (I1–I4,
+//! I6), can.
+//!
+//! **2. A gate no op can reach is a gate the trio is not compared on.** See
+//! [`OpKind::Deadmit`] above for the concrete miss. That gap is now CLOSED and
+//! the closure was DEMONSTRATED, not asserted: temporarily deleting memory's
+//! `check_peer_deadmission` call makes three tests here fail, and the
+//! differential names the origin op —
+//! `I5 (op 4 = Supersede…): ADMISSION DIVERGES — memory ADMITTED, sqlite
+//! REFUSED … ⇒ the divergence ORIGINATES at op 2 (Deadmit)`. Before
+//! [`OpKind::Deadmit`] existed the same deletion was invisible to every test
+//! in this file.
+//!
+//! Reaching it required biasing the generator, not lowering a floor: the
+//! conjunction (a sanction that LANDS, then a write from the peer it named,
+//! both surviving the tiers ahead of the AV-77 gate) occurred in **7 of 240
+//! sequences (2.9%)** on the unbiased generator — an expected count of 0.7 at
+//! the meta-coverage budget, i.e. a coin flip. See
+//! [`bias_deadmission_followups`]; the rate is now **20 of 240 (8.3%)**. The op alphabet is the
+//! harness's real coverage boundary, and it is much narrower than the write
+//! path: notably, the alphabet reaches ONE write chokepoint family
+//! (`put_attestation` + the two local paths + `promote_attestation`) on ONE
+//! §3 plane (attestations). `federation_keys`, revocations, transport routes,
+//! blobs, quorum state and the whole scores/trace projection plane have their
+//! own gates and are NOT driven from here.
+//!
+//! **3. The SCORES envelope-schema gate is UNREACHABLE from this harness.**
+//! Not "untested" — unreachable, and the distinction is the point. All three
+//! backends default to [`NoOpSchemaResolver`](super::NoOpSchemaResolver), whose
+//! `resolve` returns `Ok(None)`, so the validation body never executes. That is
+//! why the differential could not see memory missing the whole
+//! `if scores { resolve; validate }` block: with a no-op resolver, a backend
+//! WITH the block and a backend WITHOUT it are observationally identical.
+//! Closing it needs a schema-plane fixture — a
+//! [`BlobBackedSchemaResolver`](super::BlobBackedSchemaResolver) plus a
+//! byte-identical seeded schema blob installed on all three arms — which is a
+//! different harness, not a bigger case count here. A resolver installed just
+//! to make this section shorter would report coverage that does not exist.
+//!
+//! **4. Load, concurrency and DoS are out of scope.** Every sequence is
+//! single-threaded against a fresh corpus, so nothing here says anything about
+//! concurrent writers, lock contention, or the AV-76 amplification budget the
+//! gate ORDER exists to protect. I5 compares WHICH gate refused
+//! (`Error::kind`), which pins the ordering CONTRACT; it does not measure the
+//! work a refusal costs. `benches/` owns that.
+//!
+//! **5. Spec gaps are recorded, not resolved.** Where the substrate's behaviour
+//! is under-specified the harness pins what the code does and the question goes
+//! upstream — it never invents an answer. Open: whether `witness_diversity`
+//! *should* gate the band is a Constitution question, filed as
+//! CIRISConstitution#46.
+//!
+//! **6. De-admission is exercised at FEDERATION tier only.**
+//! [`check_peer_deadmission`](super::admission::check_peer_deadmission) does
+//! not filter on `tier`, so a LOCAL-tier de-admission row is equally
+//! enforceable — and, unlike a federation-tier one, it can be replaced by an
+//! `attestation_upsert_local` on the same `(attesting_key_id, dimension)`
+//! coordinates, which would lift the sanction without any `withdraws`. Only the
+//! node itself writes its own local rows, so that is self-inflicted rather than
+//! an attacker path; it is unexercised here all the same.
 
 /// Shared, backend-agnostic machine + invariant bodies. Compiled under `test`
 /// and under the `test-anchor` feature (persist's test-only, never-in-a-
@@ -172,6 +272,27 @@ pub mod test_support {
         pub fn key_id_in(self, tag: &str) -> String {
             format!("{}-{tag}", self.key_id())
         }
+    }
+
+    /// The cast member who is **THIS NODE** — the identity installed as the
+    /// backend's `self_key_id`, which is what makes the AV-77 de-admission gate
+    /// live (`check_peer_deadmission` is a no-op while the host has declared no
+    /// identity).
+    ///
+    /// [`Principal::A`] rather than a fourth principal, for two reasons.
+    /// Proptest shrinks toward `A`, so the minimal counterexample of any
+    /// de-admission failure is also the one where the node is the author — the
+    /// interesting case. And a node in a real mesh IS one of the writers: it
+    /// attests, it is attested about, and it de-admits, all with the same key.
+    /// A separate never-writing self principal would model a node that only
+    /// judges, which is not the shape the substrate has to survive.
+    pub const SELF_PRINCIPAL: Principal = Principal::A;
+
+    /// The key id the harness installs as the node's OWN identity for run
+    /// `tag` — see [`SELF_PRINCIPAL`] and [`run_sequence`].
+    #[must_use]
+    pub fn self_key_id_for(tag: &str) -> String {
+        SELF_PRINCIPAL.key_id_in(tag)
     }
 
     /// A key id that is deliberately NEVER registered. Used by I4 as a
@@ -371,6 +492,26 @@ pub mod test_support {
         /// `(attester, dimension)` coordinates an EARLIER ADMITTED row already
         /// occupies — a different writer, same key, later clock.
         UnsignedLocalWrite,
+        /// **The AV-77 act.** A `put_attestation` of this node's own peer
+        /// de-admission row: `scores` +
+        /// [`PEER_DEADMISSION_DIMENSION`](crate::federation::admission::PEER_DEADMISSION_DIMENSION),
+        /// authored by the node's OWN key, naming `op.subject` as the
+        /// de-admitted peer. Once admitted,
+        /// [`check_peer_deadmission`](crate::federation::admission::check_peer_deadmission)
+        /// refuses every subsequent `put_attestation` authored by that peer for
+        /// the rest of the sequence — so this is the one op whose effect is to
+        /// change how EVERY later op is judged.
+        ///
+        /// The author is FORCED to the node's own identity
+        /// ([`SELF_PRINCIPAL`]) rather than drawn, on the same reasoning
+        /// [`OpKind::UnsignedLocalWrite`] forces `cohort_scope = self`: only the
+        /// node may author an effective de-admission (the gate folds over
+        /// `list_attestations_by(self_key_id)` and nothing else), so a drawn
+        /// author would spend two draws in three on a row that is stored and
+        /// INERT. That "a peer cannot de-admit on our behalf" property is worth
+        /// more as a deterministic witness than as a 1-in-3 generator draw, and
+        /// [`third_party_deadmission_of_a_peer_is_inert`] is that witness.
+        Deadmit,
         /// Read the corpus back through the real replication surfaces and
         /// re-verify every federation row (I1, mid-sequence).
         ReadBack,
@@ -380,7 +521,7 @@ pub mod test_support {
         /// Every kind, in shrink order. Used by the meta-coverage assertion —
         /// if a variant is added and the generator is not updated, coverage
         /// fails loudly rather than silently under-testing.
-        pub const ALL: [OpKind; 9] = [
+        pub const ALL: [OpKind; 10] = [
             OpKind::InsertLocal,
             OpKind::UpsertLocal,
             OpKind::Put,
@@ -389,15 +530,17 @@ pub mod test_support {
             OpKind::Supersede,
             OpKind::Recant,
             OpKind::UnsignedLocalWrite,
+            OpKind::Deadmit,
             OpKind::ReadBack,
         ];
 
         /// True for the kinds whose `dimension` and `cohort_scope` come from the
         /// op (so I4's narrowing transforms are meaningful). `Promote` takes its
-        /// dimension from the target row and `ReadBack` writes nothing.
+        /// dimension from the target row, `Deadmit`'s dimension is fixed by the
+        /// kind itself, and `ReadBack` writes nothing.
         #[must_use]
         pub fn dimension_is_caller_supplied(self) -> bool {
-            !matches!(self, OpKind::Promote | OpKind::ReadBack)
+            !matches!(self, OpKind::Promote | OpKind::Deadmit | OpKind::ReadBack)
         }
     }
 
@@ -517,6 +660,13 @@ pub mod test_support {
         /// real hybrid signature — the meta-coverage signal that the generator
         /// is reaching interesting states rather than refusing everything.
         pub signed_federation_rows: usize,
+        /// How many writes the AV-77 de-admission gate actually REFUSED during
+        /// the sequence. A meta-coverage signal like
+        /// [`Self::signed_federation_rows`], and never a compared axis: an op
+        /// alphabet that can EMIT a de-admission but never reaches the state
+        /// where one BITES leaves the gate as unexercised as it was before the
+        /// op existed.
+        pub deadmissions_enforced: usize,
     }
 
     /// The model + driver. Holds ONLY what the substrate cannot be asked for
@@ -564,6 +714,8 @@ pub mod test_support {
         /// found the duplicate-id divergence that
         /// `memory_admits_a_duplicate_attestation_id` now witnesses.)
         resolved_targets: BTreeMap<usize, String>,
+        /// See [`Transcript::deadmissions_enforced`].
+        deadmissions_enforced: usize,
     }
 
     impl<'a> Machine<'a> {
@@ -579,6 +731,7 @@ pub mod test_support {
                 occupied: Vec::new(),
                 provenance: BTreeMap::new(),
                 resolved_targets: BTreeMap::new(),
+                deadmissions_enforced: 0,
             }
         }
 
@@ -664,6 +817,11 @@ pub mod test_support {
                     self.revocation_put(op, seq, id, attestation_type::RECANTS, at)
                         .await
                 }
+                OpKind::Deadmit => {
+                    // Always FEDERATION tier: a sanction nobody can replicate
+                    // is a sanction that dies with the node that issued it.
+                    self.put(op, seq, id, Tier::Federation, None, at).await
+                }
                 OpKind::Promote => self.promote(op, seq, at).await,
                 OpKind::ReadBack => self.read_back().await,
             }
@@ -725,9 +883,16 @@ pub mod test_support {
         ) -> OpOutcome {
             let target = self.target_for(op, seq);
             let row = self.row_for(op, id.clone(), tier, structural, at, &target);
+            // Read the coordinate off the ROW rather than off `op.family`: a
+            // `Deadmit` overrides both the attester and the dimension, and a
+            // model that recomputed them from the op would be a second list
+            // that can disagree with the row actually submitted — the exact
+            // shape this harness exists to catch (CIRISPersist#541).
             let occupied = (
                 row.attesting_key_id.clone(),
-                op.family.dimension().to_owned(),
+                crate::federation::admission::envelope_dimension(&row.attestation_envelope)
+                    .unwrap_or_default()
+                    .to_owned(),
             );
             let res = self
                 .dir
@@ -746,14 +911,32 @@ pub mod test_support {
                         selector_note: None,
                     }
                 }
-                Err(e) => OpOutcome {
-                    admitted: false,
-                    error_kind: Some(e.kind()),
-                    row_id: Some(id),
-                    stored: None,
-                    referenced: None,
-                    selector_note: None,
-                },
+                Err(e) => {
+                    // METERED, not compared. `Error::kind()` for the
+                    // de-admission refusal is the shared
+                    // `federation_invalid_argument`, so the transcript's
+                    // compared axes cannot tell "the AV-77 gate fired" from any
+                    // other argument refusal. This counter can, and
+                    // `generator_reaches_interesting_states` reads it to prove
+                    // the gate is REACHED rather than merely wired.
+                    //
+                    // The needle is the DIMENSION CONSTANT, not the English word
+                    // "de-admitted": a program constant cannot drift out from
+                    // under the test when someone rewords the message.
+                    if let crate::federation::Error::InvalidArgument(msg) = &e {
+                        if msg.contains(crate::federation::admission::PEER_DEADMISSION_DIMENSION) {
+                            self.deadmissions_enforced += 1;
+                        }
+                    }
+                    OpOutcome {
+                        admitted: false,
+                        error_kind: Some(e.kind()),
+                        row_id: Some(id),
+                        stored: None,
+                        referenced: None,
+                        selector_note: None,
+                    }
+                }
             }
         }
 
@@ -936,7 +1119,22 @@ pub mod test_support {
             at: DateTime<Utc>,
             target: &str,
         ) -> Attestation {
-            let mut envelope = envelope_for(op.family, op.attester, op.subject);
+            // A `Deadmit` names its own author, type and dimension — the gate
+            // folds over `list_attestations_by(self_key_id)` filtered on
+            // `attestation_type == scores` and the de-admission dimension, so a
+            // row missing any of the three is stored and INERT. Built here, in
+            // the ONE row builder, so I4's narrowing probes narrow the same row
+            // the sequence submitted rather than a lookalike.
+            let attester = if op.kind == OpKind::Deadmit {
+                SELF_PRINCIPAL
+            } else {
+                op.attester
+            };
+            let mut envelope = if op.kind == OpKind::Deadmit {
+                deadmission_envelope()
+            } else {
+                envelope_for(op.family, attester, op.subject)
+            };
             if structural.is_some() {
                 // A structural revocation names its target in the envelope —
                 // the field the §3.2.3 authority resolver reads. The target is
@@ -949,21 +1147,31 @@ pub mod test_support {
                     .insert("references_attestation_id".into(), target.into());
             }
             let (hash, classical, pqc) =
-                signature_for_key(op.signature, &self.kid(op.attester), &envelope);
+                signature_for_key(op.signature, &self.kid(attester), &envelope);
             Attestation {
                 attestation_id: id,
-                attesting_key_id: self.kid(op.attester),
+                attesting_key_id: self.kid(attester),
                 attested_key_id: self.kid(op.subject),
                 attestation_type: structural
                     .map_or_else(|| op.att_type_str(), std::borrow::ToOwned::to_owned),
                 weight: None,
                 asserted_at: at,
-                expires_at: Some(at + Duration::days(30)),
+                // A de-admission carries NO expiry: the constant's contract is
+                // "live unless the node `withdraws` it", and an expiring
+                // sanction would be lifted by the calendar rather than by a
+                // decision anybody made. Everything else gets
+                // [`HARNESS_EXPIRES_AT`] — see there for why it is not a
+                // relative offset.
+                expires_at: if op.kind == OpKind::Deadmit {
+                    None
+                } else {
+                    Some(harness_expires_at())
+                },
                 attestation_envelope: envelope,
                 original_content_hash: hash,
                 scrub_signature_classical: classical,
                 scrub_signature_pqc: pqc,
-                scrub_key_id: self.kid(op.attester),
+                scrub_key_id: self.kid(attester),
                 scrub_timestamp: at,
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
@@ -1315,6 +1523,56 @@ pub mod test_support {
         }
     }
 
+    /// The `expires_at` every non-de-admission row the harness writes carries.
+    ///
+    /// **A FIXED FAR-FUTURE INSTANT, deliberately, and not `at + 30 days`.**
+    /// This was `Some(at + Duration::days(30))` and it rotted, silently, on a
+    /// date: the model clock is pinned to 2026-01-01 so two independently
+    /// executed runs stamp byte-identical timestamps (I3's replay and I5's
+    /// differential both compare `expires_at`), while gates evaluate liveness
+    /// against **wall-clock `Utc::now()`**. From 2026-01-31 onward every row the
+    /// harness wrote was therefore ALREADY EXPIRED at every such gate, and any
+    /// fold with an `expires_at > now` term read the whole corpus as dead.
+    ///
+    /// [`OpKind::Deadmit`] is how that surfaced — a de-admission that landed and
+    /// then refused nothing. It had been true of the harness for months and
+    /// nothing failed, because no invariant in it depended on a row being LIVE.
+    /// Coverage that decays with the calendar is worse than absent coverage: it
+    /// was real once, so nobody looks again.
+    ///
+    /// A fixed future instant keeps both properties at once — deterministic
+    /// across runs, and live for as long as anyone will run this.
+    #[must_use]
+    pub fn harness_expires_at() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+            .expect("fixed instant")
+            .with_timezone(&Utc)
+    }
+
+    /// The AV-77 peer de-admission envelope — [`OpKind::Deadmit`]'s payload.
+    ///
+    /// The de-admitted peer is named by the ROW's `attested_key_id`, not by the
+    /// envelope: that is the column
+    /// [`check_peer_deadmission`](crate::federation::admission::check_peer_deadmission)
+    /// folds over, so putting the subject in the envelope as well would be a
+    /// second copy that can disagree with the one that decides.
+    ///
+    /// `score` is negative because the constant's contract says so ("`score < 0`
+    /// — the denial"), NOT because the gate reads it. The gate keys on
+    /// `{attestation_type, attested_key_id, dimension, tombstone, expiry}` and
+    /// never looks at the score. Emitting the documented shape is how the
+    /// harness stays a witness for the contract rather than for the
+    /// implementation: if a future validator starts enforcing the sign, this op
+    /// already carries the value that must pass.
+    #[must_use]
+    pub fn deadmission_envelope() -> serde_json::Value {
+        serde_json::json!({
+            "dimension": crate::federation::admission::PEER_DEADMISSION_DIMENSION,
+            "score": -1.0,
+            "confidence": 0.9,
+        })
+    }
+
     /// `(original_content_hash, classical_b64, pqc_b64)` for `state`.
     ///
     /// [`SigState::Valid`] runs the REAL hybrid signer over the REAL canonical
@@ -1367,6 +1625,12 @@ pub mod test_support {
                 OpKind::Withdraw => attestation_type::WITHDRAWS.to_owned(),
                 OpKind::Supersede => attestation_type::SUPERSEDES.to_owned(),
                 OpKind::Recant => attestation_type::RECANTS.to_owned(),
+                // A de-admission is `scores` BY DEFINITION: the gate's fold
+                // filters on `attestation_type == scores`, so letting the
+                // `target` selector hand this op a `delegates_to` would emit a
+                // row that looks like a sanction, stores like a sanction, and
+                // does nothing.
+                OpKind::Deadmit => attestation_type::SCORES.to_owned(),
                 _ => AttType::ALL[usize::from(self.target) % AttType::ALL.len()]
                     .as_str()
                     .to_owned(),
@@ -1439,7 +1703,10 @@ pub mod test_support {
                     op.signature == SigState::Valid
                         && matches!(
                             op.kind,
-                            OpKind::Withdraw | OpKind::Supersede | OpKind::Recant
+                            // `Deadmit` belongs here for the same reason the
+                            // structural composers do: it is ALWAYS federation
+                            // tier, so its signature is always consulted.
+                            OpKind::Withdraw | OpKind::Supersede | OpKind::Recant | OpKind::Deadmit
                         )
                         || (op.kind == OpKind::Put
                             && op.tier == Tier::Federation
@@ -1454,6 +1721,7 @@ pub mod test_support {
                         | OpKind::Withdraw
                         | OpKind::Supersede
                         | OpKind::Recant
+                        | OpKind::Deadmit
                 ),
             }
         }
@@ -1474,6 +1742,151 @@ pub mod test_support {
         }
     }
 
+    /// **The AV-77 lifecycle, as an op SEQUENCE.**
+    ///
+    /// The generator reaches de-admission-then-refusal on its own, but only in
+    /// the minority of draws where the sanction lands, names a peer other than
+    /// the node, and is followed by a write from exactly that peer — so the
+    /// lifecycle is pinned deterministically as well. `#543`'s own
+    /// `exercise_peer_deadmission` covers admit → sanction → refuse → scoped on
+    /// a hand fixture; what only a SEQUENCE can express is the leg that makes
+    /// the sanction legitimate rather than a one-way door:
+    ///
+    /// | op | act | expected |
+    /// |---|---|---|
+    /// | 0 | B writes | ADMITTED — before any judgement, a peer is a peer |
+    /// | 1 | the node de-admits B | ADMITTED — a node may always author its own sanction |
+    /// | 2 | B writes | REFUSED — the sanction is an ACT, not a note |
+    /// | 3 | C writes | ADMITTED — de-admission is about ONE peer, never a lockdown |
+    /// | 4 | the node WITHDRAWS its de-admission | ADMITTED — auditable, in-band |
+    /// | 5 | B writes | ADMITTED AGAIN — revocable, so the door swings both ways |
+    ///
+    /// Op 4 is why this belongs in the state machine at all: it is an ordinary
+    /// [`OpKind::Withdraw`] whose `target` selector resolves to the
+    /// de-admission row minted at op 1. Nothing about the composer was
+    /// specialised for AV-77 — the sanction is a CEG row like any other, which
+    /// is precisely the design claim, and this sequence is what checks that the
+    /// claim holds through the real target-selection path.
+    #[must_use]
+    pub fn deadmission_lifecycle_ops() -> Vec<Op> {
+        let write_as = |who: Principal| Op {
+            kind: OpKind::Put,
+            family: Family::Identity,
+            attester: who,
+            subject: who,
+            tier: Tier::Federation,
+            cohort_scope: Scope::Federation,
+            signature: SigState::Valid,
+            clock: ClockStep::Advance(1),
+            // `target = 0` keeps `att_type_str` on `scores` (see
+            // `AttType::ALL[target % 2]`); a `delegates_to` here would be a
+            // different plane.
+            target: 0,
+        };
+        vec![
+            write_as(Principal::B),
+            Op {
+                kind: OpKind::Deadmit,
+                // `attester` is IGNORED for a `Deadmit` (the row is authored by
+                // `SELF_PRINCIPAL` whatever is drawn); written out here so the
+                // sequence READS as what it is instead of relying on an override
+                // the reader has to go and find.
+                attester: SELF_PRINCIPAL,
+                subject: Principal::B,
+                ..write_as(Principal::B)
+            },
+            write_as(Principal::B),
+            write_as(Principal::C),
+            Op {
+                kind: OpKind::Withdraw,
+                attester: SELF_PRINCIPAL,
+                subject: Principal::B,
+                // `minted` is `[op0, op1]` when this op runs, so `1 % 2 = 1`
+                // resolves to the DE-ADMISSION row. Asserted, not assumed —
+                // `assert_deadmission_lifecycle` checks the resolved reference.
+                target: 1,
+                ..write_as(SELF_PRINCIPAL)
+            },
+            write_as(Principal::B),
+        ]
+    }
+
+    /// Assert a [`deadmission_lifecycle_ops`] transcript shows the full AV-77
+    /// lifecycle. Backend-agnostic, so the memory / sqlite / postgres arms all
+    /// state the same six claims.
+    pub fn assert_deadmission_lifecycle(name: &str, t: &Transcript) {
+        let ops = deadmission_lifecycle_ops();
+        assert_eq!(t.outcomes.len(), ops.len(), "({name}) transcript length");
+        let expect = |i: usize, admitted: bool, why: &str| {
+            assert_eq!(
+                t.outcomes[i].admitted,
+                admitted,
+                "({name}) AV-77 lifecycle op {i} ({:?}): expected {}, got {} ({:?}) — {why}",
+                ops[i].kind,
+                if admitted { "ADMITTED" } else { "REFUSED" },
+                if t.outcomes[i].admitted {
+                    "ADMITTED"
+                } else {
+                    "REFUSED"
+                },
+                t.outcomes[i].error_kind,
+            );
+        };
+        expect(
+            0,
+            true,
+            "before any judgement, a peer's writes are a peer's writes",
+        );
+        expect(
+            1,
+            true,
+            "a node may ALWAYS author its own de-admission; the gate exempts the dimension \
+             itself, so a node cannot lock itself out of lifting one",
+        );
+        expect(
+            2,
+            false,
+            "THE ACT — the leg that did not exist before v22.0.0. `moderation:*` records an \
+             event, `consent:*` withdrawal is send-side; neither stops inbound injection",
+        );
+        expect(
+            3,
+            true,
+            "SCOPED — de-admission is a judgement about ONE peer. A gate that widened to \
+             everyone would be an outage dressed as a sanction",
+        );
+        expect(
+            4,
+            true,
+            "the node can withdraw its own de-admission, in-band and auditably",
+        );
+        expect(
+            5,
+            true,
+            "REVOCABLE — the de-admitted peer is admitted again. A sanction with no exit is the \
+             censorship weapon the LOCAL scoping exists to avoid being",
+        );
+
+        // The withdraw must have pointed at the DE-ADMISSION row, not at
+        // whatever the selector happened to land on. Without this the sequence
+        // could pass by withdrawing something irrelevant while op 5 was admitted
+        // for some unrelated reason — a green test proving nothing.
+        assert_eq!(
+            t.outcomes[4].referenced.as_deref(),
+            t.outcomes[1].row_id.as_deref(),
+            "({name}) AV-77 lifecycle: op 4's `withdraws` must reference the DE-ADMISSION row \
+             minted at op 1 — if the target selector cannot reach a de-admission row then the \
+             revocability leg is untested and op 5 is admitted for the wrong reason"
+        );
+        assert_eq!(
+            t.deadmissions_enforced, 1,
+            "({name}) AV-77 lifecycle: exactly ONE write must have been refused BY THE \
+             DE-ADMISSION GATE (op 2). Zero means the gate never ran — the likeliest cause is a \
+             driver that did not install `self_key_id_for(tag)`, which makes the gate dormant and \
+             every `Deadmit` an inert write"
+        );
+    }
+
     /// Run `ops` against `dir`, asserting I1–I4 as it goes, and return the
     /// transcript the caller diffs for I5.
     ///
@@ -1481,6 +1894,28 @@ pub mod test_support {
     /// [`Op::clock`] — so two backends running the same sequence see the same
     /// caller-supplied timestamps, and the only thing that can differ is the
     /// substrate.
+    ///
+    /// # The caller must install the node's own key id
+    ///
+    /// Before calling this, install [`self_key_id_for(tag)`](self_key_id_for) on
+    /// the backend via its `set_self_key_id`. It is NOT done here because
+    /// `set_self_key_id` is an inherent method on each concrete backend type and
+    /// this function drives a `&dyn FederationDirectory` — the install needs the
+    /// concrete type, so it belongs at the construction site.
+    ///
+    /// A driver that skips it runs a **strictly weaker machine**:
+    /// [`check_peer_deadmission`](crate::federation::admission::check_peer_deadmission)
+    /// is a no-op while the host has declared no identity, so every
+    /// [`OpKind::Deadmit`] becomes an inert write and the AV-77 plane goes
+    /// unexercised without anything saying so. That is not left to trust —
+    /// [`generator_reaches_interesting_states`] asserts a de-admission actually
+    /// REFUSED a later write, which fails if the install is missing.
+    ///
+    /// Installing it does not change how de-admission-free sequences are judged:
+    /// with no de-admission row authored by the node, the gate's fold is empty
+    /// and it returns `Ok`. What it changes is that the gate now RUNS — one
+    /// `list_attestations_by(self)` per `put_attestation` — everywhere, which is
+    /// the point.
     pub async fn run_sequence(dir: &dyn FederationDirectory, ops: &[Op], tag: &str) -> Transcript {
         register_cast(dir, tag).await;
         let mut m = Machine::new(dir, tag);
@@ -1574,6 +2009,7 @@ pub mod test_support {
             final_state: m.snapshot_normalized().await,
             states,
             signed_federation_rows: m.signed_federation_row_count().await,
+            deadmissions_enforced: m.deadmissions_enforced,
         }
     }
 
@@ -1667,7 +2103,11 @@ pub mod test_support {
                     };
                     self.record_local(res, id, attester, op.family.dimension())
                 }
-                OpKind::Put | OpKind::Withdraw | OpKind::Supersede | OpKind::Recant => {
+                OpKind::Put
+                | OpKind::Withdraw
+                | OpKind::Supersede
+                | OpKind::Recant
+                | OpKind::Deadmit => {
                     let structural = match op.kind {
                         OpKind::Withdraw => Some(attestation_type::WITHDRAWS),
                         OpKind::Supersede => Some(attestation_type::SUPERSEDES),
@@ -1693,12 +2133,19 @@ pub mod test_support {
                             row.scrub_key_id = UNREGISTERED_KEY_ID.to_owned();
                         }
                         Narrowing::CorruptSignature => {
-                            // Re-sign CORRUPTLY over the row's own envelope, so
-                            // the only difference from the original is a failing
-                            // crypto check — not a shape error.
+                            // Re-sign CORRUPTLY over the row's own envelope with
+                            // the ROW's own attester, so the only difference
+                            // from the original is a failing crypto check — not
+                            // a shape error and not a different signer.
+                            // `row.attesting_key_id` rather than
+                            // `op.attester`: a `Deadmit` row is authored by the
+                            // NODE, so signing with the op's drawn attester
+                            // would have swapped the signer as well and the
+                            // probe would no longer be "the same op plus one
+                            // constraint".
                             let (hash, classical, pqc) = signature_for_key(
                                 SigState::Corrupt,
-                                &self.kid(op.attester),
+                                &row.attesting_key_id,
                                 &row.attestation_envelope,
                             );
                             row.original_content_hash = hash;
@@ -2080,8 +2527,9 @@ mod proptests {
     use proptest::prelude::*;
 
     use super::test_support::{
-        assert_parity, run_sequence, ClockStep, Family, Op, OpKind, Principal, Scope, SigState,
-        Tier, Transcript,
+        assert_deadmission_lifecycle, assert_parity, deadmission_lifecycle_ops, run_sequence,
+        self_key_id_for, ClockStep, Family, Op, OpKind, Principal, Scope, SigState, Tier,
+        Transcript,
     };
     use crate::store::{Backend as _, MemoryBackend, SqliteBackend};
 
@@ -2160,6 +2608,13 @@ mod proptests {
             1 => Just(OpKind::Supersede),
             1 => Just(OpKind::Recant),
             3 => Just(OpKind::UnsignedLocalWrite),
+            // Weighted level with `Put`, not down with the composers. A
+            // `Deadmit` only becomes INTERESTING when a later op writes as the
+            // peer it named, so the alphabet has to emit enough of them for that
+            // conjunction to occur inside 8 ops — `deadmissions_enforced` in
+            // `generator_reaches_interesting_states` is the measurement that
+            // keeps this weight honest.
+            3 => Just(OpKind::Deadmit),
             2 => Just(OpKind::ReadBack),
         ]
     }
@@ -2208,7 +2663,79 @@ mod proptests {
     }
 
     fn arb_sequence() -> impl Strategy<Value = Vec<Op>> {
-        prop::collection::vec(arb_op(), 1..=MAX_OPS)
+        prop::collection::vec(arb_op(), 1..=MAX_OPS).prop_map(bias_deadmission_followups)
+    }
+
+    /// **Make the AV-77 conjunction actually occur.**
+    ///
+    /// A [`OpKind::Deadmit`] only proves anything when it LANDS and is then
+    /// followed by a write from the very peer it named — that second write is
+    /// the one [`check_peer_deadmission`](crate::federation::admission::check_peer_deadmission)
+    /// refuses. A uniform generator reaches that conjunction rarely: the
+    /// sanction needs a `Valid` signature (1 draw in 3), the follow-up needs a
+    /// `Valid` signature too (or an earlier tier refuses it before the AV-77
+    /// gate is ever consulted), and the follow-up's attester has to match the
+    /// named subject (1 in 3). Measured on the unbiased generator: **7
+    /// enforcements across 240 executed sequences, ~2.9%.**
+    ///
+    /// At the meta-coverage test's 24-sequence budget that is an expected count
+    /// of 0.7 — so observing zero is a coin flip. Asserting on it directly
+    /// would be a flaky test reporting a real number, which this module already
+    /// calls out as the worst of both (see the deterministic-RNG note in
+    /// [`generator_reaches_interesting_states`]). **The fix belongs in the
+    /// generator, not in the floor**: lowering a coverage floor to accommodate
+    /// a newly-added op would defeat the reason the op was added.
+    ///
+    /// So: after a `Deadmit`, steer roughly half the following write ops onto
+    /// the named peer with a `Valid` signature. The steering coin is
+    /// `op.target`, a field the op ALREADY carries, so this stays a pure
+    /// function of the drawn value — proptest shrinks the pre-transform vector
+    /// and the transform re-applies deterministically at every shrink step. A
+    /// transform that consulted fresh randomness would break shrinking, which
+    /// is the whole reason this is a `prop_map` and not an RNG call.
+    ///
+    /// This biases WHERE the generator spends its budget; it does not narrow
+    /// what it can express. Unbiased draws still occur — `Deadmit` still lands
+    /// on the node itself (inert, and pinned separately by
+    /// `third_party_deadmission_of_a_peer_is_inert`), still gets corrupt
+    /// signatures, and still goes unfollowed.
+    fn bias_deadmission_followups(mut ops: Vec<Op>) -> Vec<Op> {
+        let mut sanctioned: Option<Principal> = None;
+        for op in &mut ops {
+            if op.kind == OpKind::Deadmit {
+                // A node de-admitting ITSELF is inert by construction (the gate
+                // always admits rows authored by the self key, else a node
+                // could not lift its own denial), so it is not a follow-up
+                // target worth steering toward.
+                sanctioned = if op.subject == super::test_support::SELF_PRINCIPAL {
+                    None
+                } else {
+                    // The sanction has to be admitted to exist at all.
+                    op.signature = SigState::Valid;
+                    op.tier = Tier::Federation;
+                    Some(op.subject)
+                };
+                continue;
+            }
+            let Some(peer) = sanctioned else { continue };
+            // Only steer ops that actually reach the gate: a write, carrying a
+            // signature that will survive the tiers ahead of tier 4.
+            if op.kind.dimension_is_caller_supplied() && op.target % 2 == 0 {
+                op.attester = peer;
+                op.signature = SigState::Valid;
+                // ...and a scope that survives them too. MEASURED: with the
+                // scope left to the draw this bias produced ONE enforced
+                // de-admission across the meta-coverage slice, because
+                // `arb_scope` puts only 3/8 of its weight on `federation` and
+                // the de-admission gate sits at tier 4b — BEHIND the write-scope
+                // gate. A steered write refused at tier 2 for having
+                // `cohort_scope = self` at federation tier never reaches the
+                // gate the steer exists to reach, and a bias that produces a
+                // refusal at the wrong gate is not a bias, it is noise.
+                op.cohort_scope = Scope::Federation;
+            }
+        }
+        ops
     }
 
     /// A dedicated current-thread runtime per case. `proptest` bodies are
@@ -2236,14 +2763,22 @@ mod proptests {
         )
     }
 
+    /// The three backend construction sites below are the ONLY places the
+    /// node's own key id is installed, and they all install the same thing —
+    /// [`self_key_id_for`]. It cannot happen inside `run_sequence` because
+    /// `set_self_key_id` is an inherent method on each concrete backend and
+    /// `run_sequence` drives a `&dyn FederationDirectory`; see that function's
+    /// doc for what a driver that skips it silently loses.
     async fn run_on_memory(ops: &[Op], tag: &str) -> Transcript {
         let dir = MemoryBackend::new();
+        dir.set_self_key_id(Some(self_key_id_for(tag)));
         run_sequence(&dir, ops, tag).await
     }
 
     async fn run_on_sqlite(ops: &[Op], tag: &str) -> Transcript {
         let dir = SqliteBackend::open_in_memory().await.expect("open sqlite");
         dir.run_migrations().await.expect("migrations");
+        dir.set_self_key_id(Some(self_key_id_for(tag)));
         run_sequence(&dir, ops, tag).await
     }
 
@@ -2291,6 +2826,7 @@ mod proptests {
             .await
             .expect("connect postgres");
         dir.run_migrations().await.expect("migrations");
+        dir.set_self_key_id(Some(self_key_id_for(tag)));
         run_sequence(&dir, ops, tag).await
     }
 
@@ -2344,6 +2880,27 @@ mod proptests {
             },
             TestRng::deterministic_rng(proptest::test_runner::RngAlgorithm::ChaCha),
         );
+
+        // CASE 0 IS NOT RANDOM. The AV-77 lifecycle is the one sequence whose
+        // reachability motivated `OpKind::Deadmit`, and postgres is the backend
+        // that shipped the de-admission gate with nothing proving it — so the
+        // trio runs it explicitly rather than hoping the generator lands on it
+        // inside 48 draws.
+        {
+            let ops = deadmission_lifecycle_ops();
+            let tag = fresh_tag();
+            let mem = run_on_memory(&ops, &tag).await;
+            let sq = run_on_sqlite(&ops, &tag).await;
+            let pg = run_on_postgres(&ops, &tag, &dsn).await;
+            for (name, t) in [("memory", &mem), ("sqlite", &sq), ("postgres", &pg)] {
+                assert_deadmission_lifecycle(name, t);
+            }
+            assert_three_way_parity(
+                &ops,
+                &[("memory", &mem), ("sqlite", &sq), ("postgres", &pg)],
+            );
+            eprintln!("three-way parity: AV-77 de-admission lifecycle agreed on all three arms");
+        }
 
         for case in 0..PG_CASES {
             let ops = arb_sequence()
@@ -2670,6 +3227,124 @@ mod proptests {
         }
     }
 
+    /// **AV-77 — THE FULL DE-ADMISSION LIFECYCLE, AS AN OP SEQUENCE**, on both
+    /// in-memory backends.
+    ///
+    /// Motivated by a hole in this harness rather than in the substrate. v22.0.0
+    /// closed three backend-parity defects a differential oracle should have
+    /// caught instantly — memory ran no de-admission gate at all, memory ran no
+    /// SCORES envelope-schema validation, and postgres ran the de-admission gate
+    /// unproven. The oracle stayed silent because **no op could produce a row
+    /// that reached those gates**. [`OpKind::Deadmit`] makes the first
+    /// reachable; this pins the whole lifecycle deterministically so the
+    /// coverage does not depend on a lucky draw.
+    ///
+    /// Both backends run the SAME six ops and are then diffed op-for-op: if one
+    /// backend enforces the sanction and the other does not, I5 fails on
+    /// admission before these six claims are even reached.
+    #[tokio::test]
+    async fn av77_deadmission_lifecycle_holds_and_agrees_across_backends() {
+        const TAG: &str = "av77lifecyc";
+        let ops = deadmission_lifecycle_ops();
+        let mem = run_on_memory(&ops, TAG).await;
+        let sq = run_on_sqlite(&ops, TAG).await;
+        assert_deadmission_lifecycle("memory", &mem);
+        assert_deadmission_lifecycle("sqlite", &sq);
+        assert_parity(&ops, "memory", &mem, "sqlite", &sq);
+    }
+
+    /// **A PEER CANNOT DE-ADMIT ON THIS NODE'S BEHALF.**
+    ///
+    /// The other half of "de-admission is LOCAL". The gate folds only over
+    /// `list_attestations_by(self_key_id)`, so a de-admission authored by
+    /// anyone else is stored — deliberately; it replicates, and a receiving node
+    /// may weigh it — and enforced by nobody. Without that, one admitted peer
+    /// could evict another from every node it can reach, which is the
+    /// federation-wide ban the design explicitly refuses to build.
+    ///
+    /// Asserted DIRECTLY rather than left to the generator: [`OpKind::Deadmit`]
+    /// forces the author to the node itself (see its doc), so the third-party
+    /// case is out of the alphabet by construction, and a property this sharp
+    /// deserves better than a 1-in-3 draw anyway.
+    #[tokio::test]
+    async fn third_party_deadmission_of_a_peer_is_inert() {
+        const TAG: &str = "av77inert";
+        use super::test_support::register_cast;
+        use crate::federation::admission::PEER_DEADMISSION_DIMENSION;
+        use crate::federation::bootstrap_admission::test_support::scores_row;
+        use crate::federation::{FederationDirectory, SignedAttestation};
+
+        let sq = SqliteBackend::open_in_memory().await.expect("open sqlite");
+        sq.run_migrations().await.expect("migrations");
+        sq.set_self_key_id(Some(self_key_id_for(TAG)));
+        let mem = MemoryBackend::new();
+        mem.set_self_key_id(Some(self_key_id_for(TAG)));
+
+        for (name, dir) in [
+            ("sqlite", &sq as &dyn FederationDirectory),
+            ("memory", &mem as &dyn FederationDirectory),
+        ] {
+            register_cast(dir, TAG).await;
+            let me = self_key_id_for(TAG);
+            let (b, c) = (Principal::B.key_id_in(TAG), Principal::C.key_id_in(TAG));
+            let put = |row| dir.put_attestation(SignedAttestation { attestation: row });
+
+            // B de-admits C. ADMITTED — the row is a legitimate CEG claim, and
+            // refusing it would make the sanction unreplicable.
+            put(scores_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &b,
+                &c,
+                PEER_DEADMISSION_DIMENSION,
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("({name}) a peer's de-admission row is STORED: {e}"));
+
+            // ...and INERT. C still writes here, because B does not decide what
+            // this node accepts.
+            put(scores_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &c,
+                &c,
+                "identity:handle:v1",
+            ))
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "({name}) AV-77: a de-admission authored by a PEER must not bind this node — \
+                     one admitted peer evicting another from every node it can reach is the \
+                     federation-wide ban this design refuses to build: {e}"
+                )
+            });
+
+            // The node's OWN de-admission of C, by contrast, binds immediately.
+            // This is the counter-witness: without it the test above would pass
+            // just as well on a gate that never runs.
+            put(scores_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &me,
+                &c,
+                PEER_DEADMISSION_DIMENSION,
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("({name}) the node's own de-admission is admitted: {e}"));
+            let err = put(scores_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &c,
+                &c,
+                "identity:handle:v1",
+            ))
+            .await
+            .expect_err(&format!(
+                "({name}) AV-77: once THIS node de-admits C, C's writes are refused"
+            ));
+            assert!(
+                format!("{err}").contains(PEER_DEADMISSION_DIMENSION),
+                "({name}) and the refusal names the de-admission dimension: {err}"
+            );
+        }
+    }
+
     /// **The provenance trail, proven on the case that motivated it.**
     ///
     /// A `Withdraw` referencing a row minted by an earlier op. The symptom, if
@@ -2679,10 +3354,7 @@ mod proptests {
     #[tokio::test]
     async fn a_late_symptom_names_the_op_that_actually_diverged() {
         const TAG: &str = "a_late_sympt";
-        use super::test_support::{
-            explain_provenance, run_sequence, ClockStep, Family, Op, OpKind, Principal, Scope,
-            SigState, Tier,
-        };
+        use super::test_support::explain_provenance;
 
         let ops = vec![
             Op {
@@ -2709,11 +3381,11 @@ mod proptests {
             },
         ];
 
-        let mem = MemoryBackend::new();
-        let mem_t = run_sequence(&mem, &ops, TAG).await;
-        let sq = SqliteBackend::open_in_memory().await.expect("open sqlite");
-        sq.run_migrations().await.expect("migrations");
-        let sq_t = run_sequence(&sq, &ops, TAG).await;
+        // Through the shared runners, so this test sees the SAME node identity
+        // the property tests do — a backend built inline here would run with the
+        // de-admission gate dormant, which is a different machine.
+        let mem_t = run_on_memory(&ops, TAG).await;
+        let sq_t = run_on_sqlite(&ops, TAG).await;
 
         // The withdraw names the row it aimed at...
         let target = mem_t.outcomes[1]
@@ -2757,14 +3429,23 @@ mod proptests {
     /// harness: it reports safety it never checked. This test fails loudly if
     /// that ever becomes true.
     ///
-    /// Three claims, each about the GENERATOR rather than the substrate:
+    /// Four claims, each about the GENERATOR rather than the substrate:
     ///
     /// 1. every [`OpKind`] variant is emitted across a run (so adding a variant
     ///    without wiring it into `arb_kind` fails here, not silently);
     /// 2. both polarities are reached — some ops admitted AND some refused;
     /// 3. at least [`MIN_SIGNED_SEQUENCE_FRACTION`] of sequences leave behind a
     ///    real hybrid-signed FEDERATION-tier row, which is the precondition for
-    ///    I1 to be testing anything at all.
+    ///    I1 to be testing anything at all;
+    /// 4. the AV-77 de-admission gate actually REFUSED a write. Claim 1 only
+    ///    proves the op is emitted; this proves it lands and then BITES, which
+    ///    is a different and much rarer event — and it is the claim that fails
+    ///    on a backend, or a driver, where the gate is dormant.
+    ///
+    /// Claim 4 is the one that would have caught what the v22.0.0 audit found by
+    /// hand: memory shipped the AV-77 fix with no `self_key_id` field and so ran
+    /// no de-admission gate at all, and the differential could not see it
+    /// because no op in the alphabet reached the gate on ANY backend.
     #[test]
     fn generator_reaches_interesting_states() {
         use proptest::strategy::{Strategy as _, ValueTree};
@@ -2821,11 +3502,12 @@ mod proptests {
             );
         }
 
-        // Claims 2 + 3 — execute a slice and measure.
-        let (admitted, refused, with_signed) = block_on(async {
+        // Claims 2 + 3 + 4 — execute a slice and measure.
+        let (admitted, refused, with_signed, deadmitted) = block_on(async {
             let mut admitted = 0usize;
             let mut refused = 0usize;
             let mut with_signed = 0usize;
+            let mut deadmitted = 0usize;
             for ops in sequences.iter().take(EXECUTED) {
                 let t = run_on_sqlite(ops, &fresh_tag()).await;
                 for o in &t.outcomes {
@@ -2838,8 +3520,9 @@ mod proptests {
                 if t.signed_federation_rows > 0 {
                     with_signed += 1;
                 }
+                deadmitted += t.deadmissions_enforced;
             }
-            (admitted, refused, with_signed)
+            (admitted, refused, with_signed, deadmitted)
         });
 
         assert!(
@@ -2854,8 +3537,31 @@ mod proptests {
         eprintln!(
             "META-COVERAGE: {} op kinds over {DRAWS} draws; {EXECUTED} sequences executed \
              ({admitted} ops admitted / {refused} refused); {with_signed}/{EXECUTED} \
-             ({fraction:.2}) left a hybrid-signed federation-tier row",
+             ({fraction:.2}) left a hybrid-signed federation-tier row; {deadmitted} writes \
+             refused by the AV-77 de-admission gate",
             seen_kinds.len()
+        );
+
+        // Claim 4 — the AV-77 gate is REACHED, not merely wired. Emitting a
+        // `Deadmit` is not coverage: the gate only runs against a LATER write
+        // by the peer that was named, and that conjunction is exactly the kind
+        // of thing an op alphabet can be one variant short of expressing. This
+        // is the assertion that would have failed on the pre-v22 memory backend,
+        // which had no `self_key_id` field and therefore no gate at all.
+        //
+        // MEASURED at 3 on this generator and seed (≈1 sequence in 8), so the
+        // differential's 64 cases exercise the gate several times per run. The
+        // floor is the smallest meaningful one rather than a fraction of the
+        // measurement, because the conjunction is rare enough that a fractional
+        // floor would encode the current bias as a requirement.
+        assert!(
+            deadmitted > 0,
+            "META-COVERAGE: across {EXECUTED} sequences the de-admission gate refused NOTHING. \
+             `OpKind::Deadmit` is being emitted (claim 1 passed) but never lands and gets \
+             followed by a write from the peer it named, so AV-77 is as unexercised as it was \
+             before the op existed — the same hole that let three backend-parity defects ship \
+             past this oracle in v22.0.0. Raise `Deadmit`'s weight in `arb_kind`, or check that \
+             the runners still install `self_key_id_for(tag)`."
         );
         assert!(
             fraction >= MIN_SIGNED_SEQUENCE_FRACTION,

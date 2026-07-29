@@ -1944,6 +1944,59 @@ impl PyEngine {
         Ok(())
     }
 
+    /// v22.0.0 (CIRISPersist#543 / AV-77) — declare THIS NODE'S OWN
+    /// federation key id, which is what activates the peer
+    /// de-admission gate. Call it once at startup with the same key
+    /// id the node registers as its federation identity.
+    ///
+    /// # Why this exists on the FFI and not only in Rust
+    ///
+    /// AV-77 gave the mesh its first in-band, revocable, scoped
+    /// response to an abusive peer — before it, the only thing that
+    /// actually stopped one was the whole-node accord kill-switch,
+    /// with nothing between "ignore it" and "halt the node". The gate
+    /// shipped wired at all three backends and proven by a
+    /// `{gate} × {backend}` witness matrix, and **no host could turn
+    /// it on**: the setter existed only on the concrete Rust backend
+    /// types with no caller outside the test modules. CIRISEdge and
+    /// CIRISServer reach persist through this FFI, so for them the
+    /// sanction did not exist. A sanction nobody can enable is not a
+    /// sanction — hence this binding.
+    ///
+    /// Passing `None` clears the declaration and the gate goes
+    /// dormant. That is fail-open by construction and deliberately:
+    /// de-admission is a judgement THIS node authored, so without its
+    /// own identity there is no judgement to enforce, and refusing
+    /// every inbound write would be an outage rather than a gate.
+    ///
+    /// To de-admit a peer, emit a `scores` row with
+    /// `dimension = "revocation:peer_admission:v1"`,
+    /// `attested_key_id` = the peer, and a negative score. Withdraw
+    /// that row to lift the denial — the act is revocable, and it is
+    /// scoped to the one peer named.
+    fn set_self_key_id(&self, key_id: Option<String>) -> PyResult<()> {
+        self.ensure_usable()?;
+        let slot = engine_slot();
+        let cell = slot
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
+        cell.engine_view().set_self_key_id(key_id);
+        Ok(())
+    }
+
+    /// v22.0.0 (CIRISPersist#543 / AV-77) — this node's declared own
+    /// key id, or `None` when the host has not declared one (in which
+    /// case the de-admission gate is dormant). Read it back to assert
+    /// at boot that the gate is actually live.
+    fn self_key_id(&self) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        let slot = engine_slot();
+        let cell = slot
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("engine cell missing"))?;
+        Ok(cell.engine_view().self_key_id())
+    }
+
     /// v3.4.0 (CIRISPersist#123) — set the local
     /// `federation_blobs` storage budget in bytes. Above
     /// `budget × steady_state_utilization` the eviction sweeper

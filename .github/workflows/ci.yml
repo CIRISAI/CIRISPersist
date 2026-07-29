@@ -62,13 +62,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # v22.0.0 (CIRISPersist#543) — `gauntlet` controls whether this entry
+        # runs the `substrate_machine` stateful-proptest gauntlet. It runs on
+        # `core` ONLY, and the exclusion on the other five is deliberate.
+        #
+        # The gauntlet drives {op sequences} × {families} × {backends} through
+        # `put_attestation` and the local/promote paths. NONE of the five
+        # feature axes below (cirisaudit / secrets / cirisnode / cirisgraph /
+        # telemetry) touch that code, so running it six times replays the same
+        # deterministic seeds against the same substrate for the same answer at
+        # roughly six times the runner cost — a local optimization that is a
+        # global pessimization on a limited runner pool.
+        #
+        # It stays on `core`, which carries `postgres sqlite` and gets
+        # CIRIS_PERSIST_TEST_PG_URL, so BOTH arms run: the memory+sqlite
+        # differential AND the three-way parity against real postgres. That
+        # matters — the postgres arm exists precisely because two v22 bugs sat
+        # identically in postgres and the two-arm oracle found NEITHER.
+        #
+        # If a future feature ever gates substrate write-path code, flip
+        # `gauntlet: true` on that entry. That is a real reason; "more is
+        # safer" is not.
         substrate:
-          - { name: core,       features: "postgres server pyo3 sqlite" }
-          - { name: cirisaudit, features: "postgres server pyo3 sqlite cirisaudit" }
-          - { name: secrets,    features: "postgres server pyo3 sqlite secrets" }
-          - { name: cirisnode,  features: "postgres server pyo3 sqlite cirisnode" }
-          - { name: cirisgraph, features: "postgres server pyo3 sqlite cirisgraph" }
-          - { name: telemetry,  features: "postgres server pyo3 sqlite telemetry" }
+          - { name: core,       features: "postgres server pyo3 sqlite",            gauntlet: true }
+          - { name: cirisaudit, features: "postgres server pyo3 sqlite cirisaudit", gauntlet: false }
+          - { name: secrets,    features: "postgres server pyo3 sqlite secrets",    gauntlet: false }
+          - { name: cirisnode,  features: "postgres server pyo3 sqlite cirisnode",  gauntlet: false }
+          - { name: cirisgraph, features: "postgres server pyo3 sqlite cirisgraph", gauntlet: false }
+          - { name: telemetry,  features: "postgres server pyo3 sqlite telemetry",  gauntlet: false }
     services:
       postgres:
         # CIRISPersist#222 — PLAIN postgres:16, NOT timescaledb. The
@@ -135,8 +156,17 @@ jobs:
       - name: cargo nextest (postgres + server + pyo3 + ${{ matrix.substrate.name }})
         # v2.0.1 — workflow-level kill switch independent of nextest:
         # if nextest itself stalls (or the runner does), GA aborts at
-        # 25 min instead of waiting an hour.
-        timeout-minutes: 25
+        # 35 min instead of waiting an hour.
+        #
+        # v22.0.0 (CIRISPersist#543) — 25 → 35. The `core` entry now also runs
+        # the `substrate_machine` gauntlet (two stateful-proptest bodies plus
+        # the three-way postgres arm, ~4-6 min of added wall time on a CI
+        # runner). Per-test hangs are caught much earlier and by name via
+        # `.config/nextest.toml` (`terminate-after = 6` for the suite, 20 for
+        # the gauntlet), so this step-level number is a backstop against the
+        # RUNNER stalling, not the primary hang detector — which is why adding
+        # headroom here costs no diagnostic sharpness.
+        timeout-minutes: 35
         env:
           CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
         # --test-threads=1 — nextest spawns each test in its own
@@ -157,6 +187,7 @@ jobs:
           cargo nextest run --all-targets --no-fail-fast
           --test-threads=1 --features
           "${{ matrix.substrate.features }}"
+          ${{ matrix.substrate.gauntlet && ' ' || '-E ''not test(/substrate_machine/)''' }}
       - name: cargo nextest (default — fixture suite)
         if: matrix.substrate.name == 'core'
         timeout-minutes: 5

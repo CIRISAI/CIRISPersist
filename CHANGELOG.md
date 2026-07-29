@@ -111,6 +111,18 @@ limits**).
   doubly-invalid row yields `UNIQUE`, not `FOREIGN KEY`. Ordered the other way, memory would have
   answered `InvalidArgument` where sqlite answers `Backend`: **constraint evaluation order is
   observable through `error_kind`**, and only on rows that violate both constraints at once.
+- **AV-77 shipped unreachable, and that is its own bug class.** The de-admission gate was
+  wired at all three backends and proven by a `{gate} × {backend}` witness matrix — and no host
+  could turn it on. `set_self_key_id` existed only on the concrete Rust backend types with no
+  caller outside the test modules, and CIRISEdge and CIRISServer both reach persist through the
+  PyO3 FFI, so for them the sanction did not exist. Every witness had reached *past* the Engine
+  to configure the backend directly, which is exactly why the matrix was green. This is the
+  "accepted but not projected" class from v17.0.0 (#444), where the signed route table was
+  admitted correctly and then never surfaced. **A gate is not shipped when its code path exists;
+  it is shipped when a host can turn it on and observe that it is on.** Adds
+  `Engine::set_self_key_id`/`self_key_id` and the matching PyO3 bindings, plus a test that drives
+  the full de-admission lifecycle through the Engine handle and asserts the gate starts dormant,
+  reads back live once declared, and returns to dormant when cleared.
 - **Three backend-parity holes in the #543 gates themselves.** Memory ran neither the AV-77
   de-admission gate (it had no `self_key_id` at all) nor the SCORES envelope-schema validation,
   and postgres ran the AV-77 gate with nothing proving it did. All three closed; the shared
@@ -140,6 +152,13 @@ Design rules that make it work:
 - **Use the REAL verifier as oracle**, never a hand-rolled field compare — a field compare rebuilds
   the two-lists-that-disagree problem *inside* the test, which is the very bug (#541).
 - **Advancing clocks by default**, equal-clock a rare deliberate case (the #541 trap).
+- **Bias the generator, never the floor.** Adding the de-admission op exposed that its
+  interesting conjunction — a sanction that LANDS, then a write from the peer it named, both
+  surviving the tiers ahead of the AV-77 gate — occurred in only **7 of 240 sequences (2.9%)**,
+  an expected count of 0.7 at the meta-coverage budget. That is a coin flip, and lowering the
+  floor to accommodate it would have defeated the reason the op was added. Fixed in the generator
+  instead — follow-up writes are steered onto the sanctioned peer using an already-drawn field as
+  the coin, so shrinking still works: **20 of 240 (8.3%)**.
 - **Metamorphic invariants needing no oracle**: I1 real-verifier survival, I2a/I2b zero-writes-on-
   refusal (AV-9), I3 replay idempotence, I4 monotone refusal under restriction, I5 per-op
   differential, I6 admitted ⇒ stored.
@@ -153,15 +172,52 @@ Divergences it finds are pinned as `KNOWN_DIVERGENCE_*` constants with live witn
 **the bug still exists**, and fail with "WITNESS RETIRED" the moment it is fixed. All three pins
 opened this cut have been retired.
 
+### CI
+
+The gauntlet runs in CI on the `core` matrix entry, which carries `postgres sqlite` and the test
+DSN — so **both** arms run there: the memory+sqlite differential and the three-way parity against
+real postgres. It is deliberately excluded from the other five feature entries
+(`cirisaudit`/`secrets`/`cirisnode`/`cirisgraph`/`telemetry`): none of those axes touch the
+substrate write path, so running it six times replays the same deterministic seeds for the same
+answer at six times the runner cost. `.config/nextest.toml` gives these tests a 20-minute
+per-test leash instead of the suite's 6 — a legitimate gauntlet run is minutes long, and a false
+SIGKILL would read in the log exactly like the hangs that timeout exists to catch. The
+suite-wide 6-minute bound is untouched.
+
 ### Known limits, stated honestly
 
-- **A differential oracle is exactly as wide as its backend set.** The harness drives memory and
-  sqlite. Postgres carried the AV-78 tier bug and the tier-2b dedup hole identically, and both
-  were found by *reading* postgres for the sqlite fix — not by the oracle. Extending the harness
-  to postgres is the next thing it learns.
-- It does **not** catch spec gaps (whether `witness_diversity` *should* gate the band is a
-  Constitution question, filed for RC3 ratification), load/DoS behaviour, or anything CC is
-  silent on.
+Documented in the module itself, not only here — the person who needs them is reading that file
+deciding whether a green run means anything about the change they just made.
+
+- **A differential oracle is exactly as wide as its backend set.** Postgres carried the AV-78
+  tier bug and the tier-2b dedup hole *identically*, and the oracle found **neither** — both were
+  caught by reading postgres while porting the sqlite fix. Three arms that share a defect agree
+  perfectly. The postgres arm now closes that specific gap (48/48 cases agree across all three),
+  but the shape of the limit is permanent: no differential can report a bug all its arms have.
+- **A gate no op can reach is a gate the trio is not compared on.** This one bit us: the harness
+  could not have caught the three AV-77 / schema parity holes, because no op emitted a
+  de-admission row — they were found by hand-building an inventory table. Now closed for
+  de-admission, and **demonstrated rather than asserted**: deleting memory's
+  `check_peer_deadmission` call makes three tests fail, with the differential naming
+  `op 2 (Deadmit)` as the origin. The alphabet still drives one write chokepoint family on one
+  §3 plane; `federation_keys`, revocations, transport routes, blobs and quorum state are not
+  driven from here.
+- **The SCORES envelope-schema gate is unreachable from this harness** — not untested,
+  *unreachable*, and the distinction is the point. All three backends default to
+  `NoOpSchemaResolver`, so with a no-op resolver a backend **with** the validation block and one
+  **without** are observationally identical, which is exactly why the differential could not see
+  memory missing the whole block. Closing it needs a schema-plane fixture, which is a different
+  harness. A resolver installed just to shorten this list would report coverage that does not
+  exist.
+- **Load, concurrency and DoS are out of scope.** Every sequence is single-threaded against a
+  fresh corpus. I5 pins *which* gate refused, which is the AV-76 ordering contract; it does not
+  measure what a refusal costs. `benches/` owns that.
+- **Spec gaps are recorded, not resolved** — whether `witness_diversity` *should* gate the band is
+  a Constitution question (CIRISConstitution#46), and the harness pins what the code does rather
+  than inventing an answer.
+- **A substrate-level harness cannot see whether a host can reach a gate.** AV-77 passed a full
+  `{gate} × {backend}` matrix while being impossible to enable. Every arm configured the backend
+  directly, which is correct for a substrate harness and precisely why it is blind to this class.
 - Cost asymmetry at admission is inherent to open bootstrap. A quota bounds volume, not per-row
   cost.
 
