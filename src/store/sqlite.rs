@@ -4162,6 +4162,21 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // #418 — trusted-local (grandfathered) write: NO signature gate, signed
         // columns NULL. Used only by engine-internal self-writes; never reached
         // from the replication apply.
+        //
+        // v21.17.1 (CIRISPersist#541) — but its UPSERT rewrote three
+        // envelope-covered columns (`transport_binding`, `pubkey_x25519_base64`,
+        // `pubkey_ml_kem_768_base64`) with NO guard, while the signed columns
+        // survived by omission from the SET. So a later local self-write on a key
+        // that already carries a SIGNED occurrence (e.g. engine.rs's login/DEK
+        // co-admit, which writes `transport_binding: None`) NULLed the binding on
+        // a signed row and kept the signature — `list_signed_identity_occurrences_for`
+        // then replicated a row whose typed columns diverge from its own envelope,
+        // and every peer refused it (`diverges("transport_destination")`), the
+        // same fail-closed blackout as the transport_destination defect. Fixed
+        // structurally: the DO UPDATE now carries `WHERE signature IS NULL`, so a
+        // SIGNED occurrence is authoritative and NEVER mutated by the local writer
+        // (the #446 de-projection updaters' "narrow on purpose" invariant). Unsigned
+        // rows behave exactly as before.
         let mut row = occurrence;
         crate::federation::check_device_class(&row.device_class)?;
         crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
@@ -4204,7 +4219,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     persist_row_hash = excluded.persist_row_hash, \
                     pubkey_x25519_base64 = excluded.pubkey_x25519_base64, \
                     pubkey_ml_kem_768_base64 = excluded.pubkey_ml_kem_768_base64, \
-                    transport_binding = excluded.transport_binding",
+                    transport_binding = excluded.transport_binding \
+                 WHERE federation_identity_occurrences.signature IS NULL",
                 rusqlite::params![
                     row.identity_key_id,
                     row.occurrence_key_id,
@@ -6090,6 +6106,34 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             //   liveness refreshes (clocks) still apply.
             // An unsigned row (signature IS NULL) keeps the plain monotonic
             // upsert exactly as before.
+            //
+            // v21.17.1 (CIRISPersist#541) — THE PRESERVE SET MUST EQUAL THE
+            // VERIFIED SET. #515 modelled "material content" as three columns
+            // (destination + both transport pubkeys) and guarded only those,
+            // leaving `asserted_at`, `epoch`, `binding_provenance` and
+            // `retired_at` freely writable on a SIGNED row while the signature
+            // and envelope were preserved. But `verify_signed_transport_
+            // destination` (federation/admission.rs) checks NINE fields —
+            // every column here except `last_seen_at`. So a "same-content
+            // liveness refresh" desynchronised the typed row from its own
+            // signed envelope, and persist's own verifier then rejected the
+            // row on replication with `typed asserted_at diverges from the
+            // signed envelope`. This was not an edge case: the monotonic
+            // guard REQUIRES `excluded.asserted_at > stored.asserted_at`, so
+            // every accepted unsigned refresh corrupted the row BY
+            // CONSTRUCTION. Live effect: the canonical's own signed binding
+            // went divergent locally, replicated, was refused by every peer,
+            // and the #393 item-2 hybrid-route gate then dropped all inbound
+            // frames from it — the trace plane went dark with no error at the
+            // drop site.
+            // The rule is now structural rather than enumerated: on a signed
+            // row an unsigned writer may advance ONLY `last_seen_at` (the one
+            // column the verifier does not cover — advisory liveness, "NOT a
+            // lease"); every verifier-covered column is preserved so the
+            // signature and the fields it attests to move as ONE unit.
+            // Behaviour is unchanged for unsigned rows, and unchanged for the
+            // differing-material-content case (still a whole-statement no-op
+            // via the WHERE guard, which is left exactly as #515 wrote it).
             conn.execute(
                 "INSERT INTO transport_destinations \
                     (occurrence_key_id, transport_kind, destination, asserted_at, last_seen_at, \
@@ -6098,14 +6142,26 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                      attesting_key_id, signed_envelope, signature) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, NULL) \
                  ON CONFLICT(occurrence_key_id, transport_kind) \
-                 DO UPDATE SET destination = excluded.destination, \
-                    asserted_at = excluded.asserted_at, \
+                 DO UPDATE SET destination = CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.destination ELSE transport_destinations.destination END, \
+                    asserted_at = CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.asserted_at ELSE transport_destinations.asserted_at END, \
                     last_seen_at = excluded.last_seen_at, \
-                    transport_ed25519_pubkey_base64 = excluded.transport_ed25519_pubkey_base64, \
-                    transport_x25519_pubkey_base64 = excluded.transport_x25519_pubkey_base64, \
-                    binding_provenance = excluded.binding_provenance, \
-                    epoch = excluded.epoch, \
-                    retired_at = excluded.retired_at, \
+                    transport_ed25519_pubkey_base64 = \
+                        CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.transport_ed25519_pubkey_base64 \
+                        ELSE transport_destinations.transport_ed25519_pubkey_base64 END, \
+                    transport_x25519_pubkey_base64 = \
+                        CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.transport_x25519_pubkey_base64 \
+                        ELSE transport_destinations.transport_x25519_pubkey_base64 END, \
+                    binding_provenance = CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.binding_provenance \
+                        ELSE transport_destinations.binding_provenance END, \
+                    epoch = CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.epoch ELSE transport_destinations.epoch END, \
+                    retired_at = CASE WHEN transport_destinations.signature IS NULL \
+                        THEN excluded.retired_at ELSE transport_destinations.retired_at END, \
                     attesting_key_id = transport_destinations.attesting_key_id, \
                     signed_envelope = transport_destinations.signed_envelope, \
                     signature = transport_destinations.signature \
@@ -38105,6 +38161,17 @@ mod tests {
         backend.run_migrations().await.unwrap();
         crate::federation::self_at_login::test_support::run_signed_transport_route_matrix(
             &backend, "sqlite",
+        )
+        .await;
+    }
+
+    /// #541 — the signed-row-survives-unsigned-write invariant on sqlite.
+    #[tokio::test]
+    async fn signed_row_survives_local_write_sqlite_541() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::self_at_login::test_support::exercise_signed_row_survives_local_write(
+            &backend, "sq541",
         )
         .await;
     }

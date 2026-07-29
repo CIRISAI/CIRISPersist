@@ -4514,6 +4514,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         occurrence: crate::federation::IdentityOccurrence,
     ) -> Result<(), crate::federation::Error> {
         // #418 — trusted-local (grandfathered) write; NO gate, signed cols NULL.
+        // v21.17.1 (CIRISPersist#541) — `WHERE signature IS NULL` on the DO UPDATE
+        // (parity with sqlite): a SIGNED occurrence is authoritative and is never
+        // mutated by the local writer, so a later local self-write cannot NULL its
+        // envelope-covered columns (transport_binding / both KEM pubkeys) while
+        // keeping the signature and make the row diverge from its own envelope.
         let mut row = occurrence;
         crate::federation::check_device_class(&row.device_class)?;
         crate::federation::check_encryption_pubkeys(row.encryption_pubkeys.as_ref())?;
@@ -4550,7 +4555,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     persist_row_hash = EXCLUDED.persist_row_hash, \
                     pubkey_x25519_base64 = EXCLUDED.pubkey_x25519_base64, \
                     pubkey_ml_kem_768_base64 = EXCLUDED.pubkey_ml_kem_768_base64, \
-                    transport_binding = EXCLUDED.transport_binding",
+                    transport_binding = EXCLUDED.transport_binding \
+                 WHERE cirislens.federation_identity_occurrences.signature IS NULL",
                 &[
                     &row.identity_key_id,
                     &row.occurrence_key_id,
@@ -6406,6 +6412,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // preserved unconditionally; a content-CHANGING unsigned write
         // against a signed row is a silent no-op). See the sqlite twin's
         // comment for the full rationale.
+        // v21.17.1 (CIRISPersist#541) — the preserve set must equal the
+        // VERIFIED set: `verify_signed_transport_destination` checks nine
+        // fields, so on a signed row an unsigned writer may advance only
+        // `last_seen_at`. See the sqlite guard for the full rationale.
         let provenance_token = destination.binding_provenance.as_str();
         let epoch = i64::try_from(destination.epoch).map_err(|_| {
             crate::federation::Error::InvalidArgument(
@@ -6421,14 +6431,32 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                      attesting_key_id, signed_envelope, signature) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, NULL) \
                  ON CONFLICT (occurrence_key_id, transport_kind) \
-                 DO UPDATE SET destination = EXCLUDED.destination, \
-                    asserted_at = EXCLUDED.asserted_at, \
+                 DO UPDATE SET destination = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.destination \
+                        ELSE cirislens.transport_destinations.destination END, \
+                    asserted_at = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.asserted_at \
+                        ELSE cirislens.transport_destinations.asserted_at END, \
                     last_seen_at = EXCLUDED.last_seen_at, \
-                    transport_ed25519_pubkey_base64 = EXCLUDED.transport_ed25519_pubkey_base64, \
-                    transport_x25519_pubkey_base64 = EXCLUDED.transport_x25519_pubkey_base64, \
-                    binding_provenance = EXCLUDED.binding_provenance, \
-                    epoch = EXCLUDED.epoch, \
-                    retired_at = EXCLUDED.retired_at, \
+                    transport_ed25519_pubkey_base64 = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.transport_ed25519_pubkey_base64 \
+                        ELSE cirislens.transport_destinations.transport_ed25519_pubkey_base64 END, \
+                    transport_x25519_pubkey_base64 = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.transport_x25519_pubkey_base64 \
+                        ELSE cirislens.transport_destinations.transport_x25519_pubkey_base64 END, \
+                    binding_provenance = \
+                        CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.binding_provenance \
+                        ELSE cirislens.transport_destinations.binding_provenance END, \
+                    epoch = CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.epoch ELSE cirislens.transport_destinations.epoch END, \
+                    retired_at = CASE WHEN cirislens.transport_destinations.signature IS NULL \
+                        THEN EXCLUDED.retired_at \
+                        ELSE cirislens.transport_destinations.retired_at END, \
                     attesting_key_id = cirislens.transport_destinations.attesting_key_id, \
                     signed_envelope = cirislens.transport_destinations.signed_envelope, \
                     signature = cirislens.transport_destinations.signature \
@@ -18930,6 +18958,23 @@ mod tests {
         backend.run_migrations().await.expect("migrations run");
         let suffix = uuid_like();
         crate::federation::self_at_login::test_support::run_signed_transport_route_matrix(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
+    /// #541 — the signed-row-survives-unsigned-write invariant on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn signed_row_survives_local_write_postgres_541() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = format!("pg541{}", uuid_like());
+        crate::federation::self_at_login::test_support::exercise_signed_row_survives_local_write(
             &backend, &suffix,
         )
         .await;

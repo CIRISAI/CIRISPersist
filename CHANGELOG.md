@@ -5,6 +5,49 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [21.17.1] — 2026-07-29 — #541: signed rows can no longer be desynchronised from their own envelope by unsigned local writers
+
+**Security / correctness (the arc's dominant class again: two lists of "what the signature covers,"
+maintained separately, that disagree).** An unsigned local writer preserved a signed row's
+signature+envelope while rewriting verifier-covered typed columns around it — so the row diverged
+from its own signature, every remote peer refused it, and (for `transport_destination`) the trace
+plane went dark with no error at the drop site. Found on the live two-node harness; the
+`transport_destination` fix + regression pin (leg 13) came from that report, the rest of the class
+is audited and closed here.
+
+### Fixed — the preserve set must equal the verified set
+
+- **`transport_destination`** (corrupt-by-construction — the one that took the plane dark): `#515`
+  guarded only 3 of the 9 verifier-covered columns, leaving `asserted_at` / `epoch` /
+  `binding_provenance` / `retired_at` freely writable on a signed row. And the monotonic guard
+  *requires* `asserted_at` to advance to apply at all, so **every accepted unsigned refresh
+  corrupted the row**. Now structural, all three backends: on a signed row an unsigned writer may
+  advance ONLY `last_seen_at` (the one column the verifier doesn't cover); every verifier-covered
+  column moves as one unit with the signature.
+- **`identity_occurrence`** (`put_identity_occurrence_local`, unguarded on all three backends): a
+  content-only local self-write (engine's login/DEK co-admit, `transport_binding: None`) NULLed the
+  signed row's `transport_binding` / KEM pubkeys while keeping the signature. Fixed: the DO UPDATE
+  carries `WHERE signature IS NULL` (memory: a full no-op when a sig entry exists) — a signed
+  occurrence is authoritative and never mutated locally.
+- **Fail-OPEN KEM gap** (worse in kind — every other instance fails closed): `verify_signed_identity_occurrence`
+  parsed `ml_kem_768_base64` from the envelope but compared **only** `x25519`, silently ACCEPTING a
+  diverged post-quantum content-KEM key. Now compares both halves as a pair.
+- **memory double-revoke asymmetry**: `put_identity_occurrence_revocation_local` on memory
+  silently overwrote `revoked_at`/`effective_at` (flagged in-code as "the whole attack") where
+  sqlite/postgres error on the duplicate PK. Memory now refuses the second write too.
+
+### Added — the invariant, mechanically (not two hand-maintained lists)
+
+A property test parameterised over **{family} × {backend}** (`signed_row_survives_local_write_*_541`
++ transport matrix legs 13/14): insert a signed row, apply an arbitrary unsigned local write at an
+**advancing clock** (an equal-clock write proves nothing — the monotonic guard no-ops it), read back
+through the real `list_signed_*` replication path, and re-run the family's **real `verify_signed_*`**
+asserting it still passes — *not* a hand-rolled field comparison (which rebuilds the two-lists
+problem inside the test). Verified in both directions (fails with each fix reverted). It also pins
+the fail-closed KEM rejection and the double-revoke refusal, and runs identically on memory + sqlite
++ postgres — the audit found the backends disagreeing, so cross-backend is the point. It would have
+caught every instance in this issue.
+
 ## [21.17.0] — 2026-07-28 — #536 follow-up: `establish_trust_root` asserts its own postcondition (no more Ok-without-the-walk)
 
 A fixture-contract fix (not a substrate defect). v21.16.0 made the user→root edge best-effort

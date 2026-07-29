@@ -1074,6 +1074,258 @@ pub(crate) mod test_support {
             1,
             "the signed re-establishment replaces the tombstone on the signed plane"
         );
+
+        // (13) v21.17.1 (#541) — THE PRESERVE SET MUST EQUAL THE VERIFIED SET.
+        // An unsigned SAME-CONTENT liveness refresh at a later clock — exactly
+        // what edge's announce write-through issues every round — sails
+        // through #515's guard, because #515 only compared destination + both
+        // transport pubkeys. Pre-#541 it then rewrote the typed `asserted_at`
+        // (and `epoch` / `binding_provenance` / `retired_at`) while preserving
+        // the signature and the byte-exact envelope, desynchronising the row
+        // from its own signature. `verify_signed_transport_destination` checks
+        // all nine of those fields, so every peer refused the replicated row
+        // with `typed asserted_at diverges from the signed envelope` — and the
+        // #393 item-2 gate, which needs that binding to attribute inbound
+        // frames, then dropped everything from the sender. That is how the
+        // trace plane went dark while every component reported healthy.
+        // Note this was not a rare interleaving: the monotonic guard REQUIRES
+        // `excluded.asserted_at > stored.asserted_at`, so every refresh the
+        // guard accepted corrupted the row BY CONSTRUCTION.
+        dir.put_transport_destination(&route(
+            &alice_id,
+            "reticulum",
+            "d3",
+            3,
+            "2026-06-14T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        let signed_rows = dir
+            .list_signed_transport_destinations_for(&alice_id)
+            .await
+            .unwrap();
+        assert_eq!(signed_rows.len(), 1);
+        let env_asserted = signed_rows[0]
+            .signed_envelope
+            .get("asserted_at")
+            .and_then(|v| v.as_str())
+            .expect("the signed envelope carries asserted_at");
+        assert_eq!(
+            ts(env_asserted),
+            signed_rows[0].transport_destination.asserted_at,
+            "an unsigned liveness refresh must NEVER desynchronise a signed row \
+             from its own envelope — the signature and the fields it attests to \
+             move as one unit (#541)"
+        );
+        assert_eq!(
+            signed_rows[0].transport_destination.asserted_at,
+            ts("2026-06-13T00:00:00Z"),
+            "the SIGNED clock is authoritative: an unsigned writer must not \
+             advance a signed row's asserted_at (#541)"
+        );
+        assert_eq!(
+            signed_rows[0].transport_destination.epoch, 3,
+            "nor its epoch (#541)"
+        );
+
+        // (14) v21.17.1 (#541) — close the loop with the REAL verifier, not a
+        // field comparison: after the unsigned refresh, the row read back through
+        // the replication path must still pass `verify_signed_transport_destination`.
+        // (A hand-rolled field check rebuilds the two-lists problem inside the test;
+        // the verifier IS the list.)
+        crate::federation::admission::verify_signed_transport_destination(dir, &signed_rows[0])
+            .await
+            .expect(
+                "an unsigned liveness refresh must leave a signed transport_destination \
+                 still verifiable by a remote peer (#541)",
+            );
+    }
+
+    /// v21.17.1 (CIRISPersist#541) — THE INVARIANT, mechanically: no sequence of
+    /// local writes may render a signed row unverifiable by a remote peer. This
+    /// is the `identity_occurrence` half of the class the transport matrix's leg
+    /// 13/14 pins for `transport_destination` — insert a signed row, apply an
+    /// arbitrary unsigned local write on the same key at an ADVANCED clock (an
+    /// equal-clock write proves nothing: the monotonic guard no-ops it), read
+    /// back through the real `list_signed_*` replication path, and re-run the
+    /// family's `verify_signed_*` asserting it STILL passes. Run identically
+    /// across memory + sqlite + postgres (the audit found the backends
+    /// disagreeing). Also pins the fail-OPEN KEM gap (now closed) and the
+    /// memory/sqlite double-revoke asymmetry.
+    pub(crate) async fn exercise_signed_row_survives_local_write(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use ciris_crypto::{Ed25519Signer, MlDsa65Signer};
+        use ciris_verify_core::self_at_login::HybridSigningIdentity;
+        use ciris_verify_core::transport_binding::{
+            compute_destination_hash, produce_signed_identity_occurrence,
+        };
+
+        let alice_id = format!("io-alice-{suffix}");
+        let phone_id = format!("io-phone-{suffix}");
+
+        // Box the signer + build BEFORE any await (2MB test-stack guard).
+        let alice = Box::new(HybridSigningIdentity::new(
+            &alice_id,
+            Ed25519Signer::random().unwrap(),
+            MlDsa65Signer::new().unwrap(),
+        ));
+        let member = alice.directory_member().unwrap();
+        dir.put_public_key(SignedKeyRecord {
+            record: fixture_key(
+                &alice_id,
+                member.ed25519_public_key_base64.clone(),
+                member.mldsa65_public_key_base64.clone(),
+            ),
+        })
+        .await
+        .expect("register identity key");
+        dir.put_public_key(SignedKeyRecord {
+            record: fixture_key(&phone_id, B64.encode([9u8; 32]), None),
+        })
+        .await
+        .expect("register occurrence key");
+
+        // A signed identity_occurrence carrying BOTH a transport_binding and the
+        // content-KEM pair — the envelope is authoritative, the typed row mirrors it.
+        let transport_ed = [0x01u8; 32];
+        let transport_x = [0x02u8; 32];
+        let content_x = [0x03u8; 32];
+        let ml_kem = vec![0x11u8; 1184];
+        let app = "ciris.federation";
+        let aspects = vec!["announce".to_string(), "v1".to_string()];
+        let dest_hash =
+            compute_destination_hash(app, &aspects, &transport_x, &transport_ed).unwrap();
+        let envelope = serde_json::json!({
+            "identity_key_id": alice_id,
+            "occurrence_key_id": phone_id,
+            "transport_destination": {
+                "reticulum_x25519_pubkey": B64.encode(transport_x),
+                "reticulum_ed25519_pubkey": B64.encode(transport_ed),
+                "destination_hash": B64.encode(dest_hash),
+                "app_name": app,
+                "aspects": aspects,
+            },
+            "encryption_pubkeys": {
+                "x25519_base64": B64.encode(content_x),
+                "ml_kem_768_base64": B64.encode(&ml_kem),
+            },
+            "asserted_at": "2026-06-14T00:00:00.000Z",
+        });
+        let (signed_envelope, signature) =
+            produce_signed_identity_occurrence(alice.as_ref(), envelope)
+                .await
+                .unwrap();
+        let typed = |x: &[u8], kem: &[u8]| crate::federation::IdentityOccurrence {
+            identity_key_id: alice_id.clone(),
+            occurrence_key_id: phone_id.clone(),
+            device_class: crate::federation::types::device_class::AGENT.into(),
+            hardware_attestation: None,
+            asserted_at: ts("2026-06-14T00:00:00Z"),
+            valid_until: None,
+            encryption_pubkeys: Some(crate::federation::EncryptionPubkeys {
+                x25519_base64: B64.encode(x),
+                ml_kem_768_base64: B64.encode(kem),
+            }),
+            transport_binding: Some(crate::federation::types::OccurrenceTransportBinding {
+                reticulum_x25519_pubkey_base64: B64.encode(transport_x),
+                reticulum_ed25519_pubkey_base64: B64.encode(transport_ed),
+                destination_hash_base64: B64.encode(dest_hash),
+                app_name: app.into(),
+                aspects: aspects.clone(),
+            }),
+            persist_row_hash: String::new(),
+        };
+        let signed = crate::federation::SignedIdentityOccurrence {
+            identity_occurrence: typed(&content_x, &ml_kem),
+            attesting_key_id: alice_id.clone(),
+            signed_envelope: signed_envelope.clone(),
+            signature: signature.clone(),
+        };
+        dir.put_identity_occurrence(signed.clone())
+            .await
+            .expect("signed identity_occurrence admits");
+        crate::federation::admission::verify_signed_identity_occurrence(dir, &signed)
+            .await
+            .expect("baseline: the stored signed occurrence verifies");
+
+        // THE ATTACK — an unsigned local self-write on the SAME key at an advanced
+        // clock, content-only (transport_binding: None), exactly like engine.rs's
+        // login/DEK co-admit. Pre-#541 this NULLed the envelope-covered columns
+        // while keeping the signature; the replicated row then diverged.
+        dir.put_identity_occurrence_local(crate::federation::IdentityOccurrence {
+            identity_key_id: alice_id.clone(),
+            occurrence_key_id: phone_id.clone(),
+            device_class: crate::federation::types::device_class::AGENT.into(),
+            hardware_attestation: None,
+            asserted_at: ts("2026-06-20T00:00:00Z"),
+            valid_until: None,
+            encryption_pubkeys: None,
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        })
+        .await
+        .expect("the content-only local self-write is accepted (no-op on the signed row)");
+
+        // Read back through the REAL replication path and re-run the REAL verifier.
+        let rows = dir
+            .list_signed_identity_occurrences_for(&alice_id)
+            .await
+            .expect("signed read");
+        assert_eq!(rows.len(), 1, "({suffix}) the signed occurrence survives");
+        assert!(
+            rows[0].identity_occurrence.transport_binding.is_some(),
+            "({suffix}) the local write must NOT have NULLed the signed transport_binding"
+        );
+        crate::federation::admission::verify_signed_identity_occurrence(dir, &rows[0])
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "({suffix}) a signed identity_occurrence must remain verifiable after any \
+                     unsigned local write — got {e}"
+                )
+            });
+
+        // The fail-OPEN KEM gap, now closed: a typed row whose ml_kem_768 diverges
+        // from the signed envelope (x25519 unchanged) must be REJECTED. Pre-#541
+        // the verifier compared only x25519 and silently ACCEPTED this.
+        let kem_diverged = crate::federation::SignedIdentityOccurrence {
+            identity_occurrence: typed(&content_x, &[0x22u8; 1184]),
+            attesting_key_id: alice_id.clone(),
+            signed_envelope,
+            signature,
+        };
+        let err =
+            crate::federation::admission::verify_signed_identity_occurrence(dir, &kem_diverged)
+                .await
+                .expect_err("({suffix}) a diverged content-KEM key must fail closed (#541)");
+        assert!(
+            format!("{err}").contains("diverges"),
+            "({suffix}) KEM divergence rejected as a divergence: {err}"
+        );
+
+        // The double-revoke asymmetry: a second local revocation on the same key
+        // is REFUSED on every backend (memory used to silently overwrite
+        // effective_at — "the whole attack").
+        let rev = |secs: i64| crate::federation::types::IdentityOccurrenceRevocation {
+            identity_key_id: alice_id.clone(),
+            occurrence_key_id: phone_id.clone(),
+            revoked_at: ts("2026-07-01T00:00:00Z") + chrono::Duration::seconds(secs),
+            effective_at: ts("2026-07-01T00:00:00Z") + chrono::Duration::seconds(secs),
+            reason: None,
+            witness_set: Vec::new(),
+            persist_row_hash: String::new(),
+        };
+        dir.put_identity_occurrence_revocation_local(rev(0))
+            .await
+            .expect("first local revocation admits");
+        dir.put_identity_occurrence_revocation_local(rev(100))
+            .await
+            .expect_err(
+                "({suffix}) a second local revocation on the same key must be refused (#541)",
+            );
     }
 
     /// **The #446 composite-projection matrix** (trusted-local occurrence
