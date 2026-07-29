@@ -2764,6 +2764,18 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     row.occurrence_key_id
                 )));
             }
+            // v21.17.1 (CIRISPersist#541) — parity with sqlite/postgres' `WHERE
+            // signature IS NULL`: a SIGNED occurrence (an entry in the sig map for
+            // this PK) is authoritative and is NEVER overwritten by the local
+            // writer, so a later content-only self-write cannot NULL its
+            // envelope-covered columns while its signature survives and make the
+            // replicated row diverge from its own envelope. Memory previously
+            // HashMap::inserted unconditionally — the one-backend divergence this
+            // whole issue is about.
+            let pk = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
+            if state.federation_identity_occurrence_sigs.contains_key(&pk) {
+                return Ok(());
+            }
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
             let projected_route = row
                 .transport_binding
@@ -2820,10 +2832,28 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 && ex.transport_ed25519_pubkey_base64 == destination.transport_ed25519_pubkey_base64
                 && ex.transport_x25519_pubkey_base64 == destination.transport_x25519_pubkey_base64
         });
+        //
+        // v21.17.1 (CIRISPersist#541) — THE PRESERVE SET MUST EQUAL THE
+        // VERIFIED SET. `same_material_content` above compares only three
+        // columns, but `verify_signed_transport_destination` checks NINE —
+        // everything except `last_seen_at`. So a same-content liveness refresh
+        // used to overwrite the whole typed row (advancing `asserted_at` /
+        // `epoch`, and able to flip `binding_provenance` or `retired_at`)
+        // while `transport_destination_sigs` kept the byte-exact envelope,
+        // leaving the row divergent from its own signature and refused by
+        // every peer. On a signed row an unsigned writer may now advance ONLY
+        // the advisory liveness clock. Parity with the sqlite/postgres CASE
+        // guards.
         if clock_newer && (!stored_signed || same_material_content) {
-            state
-                .transport_destinations
-                .insert(key, destination.clone());
+            if stored_signed {
+                if let Some(row) = state.transport_destinations.get_mut(&key) {
+                    row.last_seen_at = destination.last_seen_at;
+                }
+            } else {
+                state
+                    .transport_destinations
+                    .insert(key, destination.clone());
+            }
         }
         Ok(())
     }
@@ -3869,13 +3899,29 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 )));
             }
         }
+        // v21.17.1 (CIRISPersist#541) — a second write to the same PK is REFUSED,
+        // matching sqlite/postgres (a bare INSERT into a PK'd table errors on the
+        // duplicate). Memory previously HashMap::inserted unconditionally,
+        // silently overwriting `revoked_at`/`effective_at` under any stored
+        // signature — a one-backend divergence on `effective_at`, flagged in-code
+        // (admission.rs) as "the whole attack".
+        let pk = (row.identity_key_id.clone(), row.occurrence_key_id.clone());
+        if state
+            .federation_identity_occurrence_revocations
+            .contains_key(&pk)
+        {
+            return Err(crate::federation::Error::InvalidArgument(format!(
+                "identity_occurrence_revocation already recorded for ({}, {}) — a second local \
+                 revocation write is refused (parity with sqlite/postgres unique-key error, #541)",
+                row.identity_key_id, row.occurrence_key_id
+            )));
+        }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let revoked_at = row.revoked_at;
         let occurrence_key_id = row.occurrence_key_id.clone();
-        state.federation_identity_occurrence_revocations.insert(
-            (row.identity_key_id.clone(), row.occurrence_key_id.clone()),
-            row,
-        );
+        state
+            .federation_identity_occurrence_revocations
+            .insert(pk, row);
         // #446 de-projection — mirrors the signed revocation path.
         let route_key = (
             occurrence_key_id,
@@ -6921,6 +6967,16 @@ mod accord_tests {
         let backend = MemoryBackend::new();
         crate::federation::self_at_login::test_support::run_signed_transport_route_matrix(
             &backend, "mem",
+        )
+        .await;
+    }
+
+    /// #541 — the signed-row-survives-unsigned-write invariant on memory.
+    #[tokio::test]
+    async fn signed_row_survives_local_write_memory_541() {
+        let backend = MemoryBackend::new();
+        crate::federation::self_at_login::test_support::exercise_signed_row_survives_local_write(
+            &backend, "mem541",
         )
         .await;
     }

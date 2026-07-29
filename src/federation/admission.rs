@@ -1559,12 +1559,20 @@ pub async fn verify_signed_identity_occurrence(
                 && tb.destination_hash_base64 == transport_destination.destination_hash_base64 => {}
         _ => return Err(diverges("transport_destination")),
     }
-    let env_enc_x = encryption_pubkeys.as_ref().map(|e| e.x25519_base64.clone());
-    let row_enc_x = row
+    // v21.17.1 (CIRISPersist#541) — compare BOTH content-KEM halves. The
+    // envelope carries `x25519_base64` AND `ml_kem_768_base64`; comparing only
+    // x25519 was a FAIL-OPEN gap — a diverged post-quantum KEM key on the typed
+    // row (e.g. rewritten by an unsigned `put_identity_occurrence_local`) was
+    // silently ACCEPTED, unlike every other divergence in this class which
+    // fails closed. Both halves must equal the signed envelope, as a pair.
+    let env_enc = encryption_pubkeys
+        .as_ref()
+        .map(|e| (e.x25519_base64.clone(), e.ml_kem_768_base64.clone()));
+    let row_enc = row
         .encryption_pubkeys
         .as_ref()
-        .map(|e| e.x25519_base64.clone());
-    if env_enc_x != row_enc_x {
+        .map(|e| (e.x25519_base64.clone(), e.ml_kem_768_base64.clone()));
+    if env_enc != row_enc {
         return Err(diverges("encryption_pubkeys"));
     }
 
