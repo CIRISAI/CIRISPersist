@@ -19205,6 +19205,24 @@ mod tests {
 
     /// v21.16.0 (CIRISPersist#536 follow-up) — the REAL engine-backed user path
     /// on postgres.
+    /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn ceremony_plane_capability_walk_postgres_548() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::operational::test_support::exercise_ceremony_plane_capability_walk(
+            &backend,
+            &format!("pg548-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("548 exercise");
+    }
+
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn trust_root_real_user_works_on_postgres_536() {

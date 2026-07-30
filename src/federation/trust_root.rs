@@ -331,16 +331,50 @@ where
 /// consumer sees WHICH root and WHY it counted, never a bare bool).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TrustedGrant {
-    /// The root that both (a) grants `scope` to the subject via a live
-    /// `delegates_to(root → subject)` and (b) passes `trust_root_valid`
-    /// from the asking user's records.
+    /// The root that both (a) conferred `scope` on the subject (see
+    /// [`Self::conferral_plane`] for HOW) and (b) passes
+    /// [`trust_root_valid`] from the asking user's records.
     pub root_key_id: String,
-    /// The `delegates_to(root → subject)` grant's `attestation_id` (the
-    /// specific live edge that conferred the scope).
+    /// Which row carried the conferral. Its meaning is keyed by
+    /// [`Self::conferral_plane`] — the two planes confer through different
+    /// objects, and naming the axis explicitly is what keeps this from
+    /// being one field with two silent value spaces (the #532 fusion class):
+    /// - [`ConferralPlane::Delegation`]: the `delegates_to(root → subject)`
+    ///   grant's `attestation_id`.
+    /// - [`ConferralPlane::AccordCoScrub`]: the subject's `key_id` — the
+    ///   conferral lives ON the co-scrubbed `KeyRecord`, which has no
+    ///   attestation id.
     pub grant_attestation_id: String,
     /// The winning root's trust verdict (all legs green — it is the reason
     /// `valid` held).
     pub verdict: TrustRootVerdict,
+    /// v22.1.0 (CIRISPersist#548) — WHICH conferral plane produced the
+    /// candidate. `#[serde(default)]` = `Delegation`, so payloads from
+    /// pre-#548 producers deserialize unchanged.
+    #[serde(default)]
+    pub conferral_plane: ConferralPlane,
+}
+
+/// v22.1.0 (CIRISPersist#548) — the two planes a capability conferral can
+/// travel on. The portable-trust-root doctrine names them: CEREMONY (an
+/// accord 2-of-3 co-scrub on the key record — root identity) and DELEGATION
+/// (`delegates_to` rows — operational capability). The baked genesis seed
+/// carries its `infra:serve` conferral in the ceremony encoding ONLY, which
+/// is what #548 found: the walk read one plane while the admission-side
+/// effective-role read (`has_effective_role`) read the other, and a fully
+/// accord-blessed canonical could not receive traces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ConferralPlane {
+    /// A live `delegates_to(root → subject)` grant carried the scope.
+    #[default]
+    Delegation,
+    /// The subject's own key record carries the scope as a role INSIDE its
+    /// accord-co-scrubbed `registration_envelope`, verified 2-of-3 against
+    /// THIS node's effective accord roster. The candidate root is the
+    /// subject itself — the ceremony is what MAKES it a root — and the
+    /// asking user's own trust chain to it (edge, charter, lifecycle, halt)
+    /// is still required in full via [`trust_root_valid`].
+    AccordCoScrub,
 }
 
 /// v18.3.0 (CIRISPersist#483) — the composed capability walk: does
@@ -362,15 +396,38 @@ pub struct TrustedGrant {
 /// no root the user trusts — or from no root at all). Self-granted scope
 /// (`root == subject`) is skipped: a subject cannot confer capability on
 /// itself here, mirroring the self-root-is-not-an-external-root rule.
-pub async fn capability_roots_to_trusted_root<F>(
-    directory: &F,
+pub async fn capability_roots_to_trusted_root(
+    directory: &dyn FederationDirectory,
     user_key_id: &str,
     subject_key_id: &str,
     scope: &str,
-) -> Result<Option<TrustedGrant>, Error>
-where
-    F: FederationDirectory + ?Sized,
-{
+) -> Result<Option<TrustedGrant>, Error> {
+    capability_roots_to_trusted_root_over_roster(
+        directory,
+        user_key_id,
+        subject_key_id,
+        scope,
+        &super::admission::accord_holder_roster_key_ids(),
+    )
+    .await
+}
+
+/// v22.1.0 (CIRISPersist#548) — the roster-parameterized core of
+/// [`capability_roots_to_trusted_root`], mirroring the
+/// [`has_effective_role`](super::admission::has_effective_role) /
+/// [`has_effective_role_over_roster`](super::admission::has_effective_role_over_roster)
+/// split and for the same reason: the production roster is the node's OWN
+/// genesis-derived accord holders (whose private halves live in the #268
+/// hardware ceremony), so an explicit-roster variant is the only way a test
+/// or a downstream conformance run can drive the ceremony arm with keys it
+/// actually holds.
+pub async fn capability_roots_to_trusted_root_over_roster(
+    directory: &dyn FederationDirectory,
+    user_key_id: &str,
+    subject_key_id: &str,
+    scope: &str,
+    accord_roster_key_ids: &[String],
+) -> Result<Option<TrustedGrant>, Error> {
     // Every grant ABOUT the subject (delegates_to(* → subject)) plus its
     // tombstones — a withdraws/recants on a grant is attested about the
     // same subject, so the one about-read carries both.
@@ -407,6 +464,58 @@ where
                 root_key_id: root_key_id.to_owned(),
                 grant_attestation_id: grant_id.to_owned(),
                 verdict,
+                conferral_plane: ConferralPlane::Delegation,
+            }));
+        }
+    }
+    // ── CEREMONY-PLANE fallback (v22.1.0 / CIRISPersist#548) ─────────────
+    // The baked genesis seed carries its conferral as a 2-of-3 accord
+    // co-scrub on the subject's OWN key record — roles inside the
+    // scrub-signed registration_envelope, zero `delegates_to` rows. That is
+    // the ceremony encoding: the accord blesses the identity, and the
+    // blessing is what MAKES the subject a root. Before this arm, leg A
+    // (`has_effective_role`) read that plane while this walk read only
+    // delegation — so a fully accord-blessed canonical rooted to nothing and
+    // the trace plane stayed dark on a production-seeded node.
+    //
+    // The check IS leg A, by call — `has_effective_role_over_roster`
+    // (claims_role + verify_accord_family_coscrub against THIS node's
+    // effective roster), never a re-implementation: one predicate, one impl.
+    // A portable root minted by a DIFFERENT trio does not verify against our
+    // roster and does not need to — its mint already carries the delegation
+    // plane (charter + grant), which the loop above serves.
+    //
+    // HALF 2 IS UNTOUCHED, deliberately (the corrected #548 ask): the
+    // candidate still walks `trust_root_valid(user, subject-as-root)` in
+    // full — the user's OWN `delegates_to(user → subject)` edge, the
+    // subject's self-charter with a recovery commitment, a fresh
+    // accord:lifecycle witness, no halt latched. So the operator's un-trust
+    // lever survives exactly as designed: delete the one edge row and the
+    // verdict goes false, the walk returns None, the serve gate withholds,
+    // agent capabilities gate off, manifests stop — all emergent, nothing
+    // special-cased. A ceremony arm that skipped half 2 would have deleted
+    // that lever, which is strictly worse than the bug it fixes.
+    //
+    // Runs AFTER the delegation loop: delegation grants are the specific,
+    // cheap path (no quorum crypto); the ceremony check costs a 2-of-3
+    // hybrid verification, so cheapest-first ordering holds here too.
+    if super::admission::has_effective_role_over_roster(
+        directory,
+        subject_key_id,
+        scope,
+        accord_roster_key_ids,
+    )
+    .await?
+    {
+        let verdict = trust_root_valid(directory, user_key_id, subject_key_id).await?;
+        if verdict.valid {
+            return Ok(Some(TrustedGrant {
+                root_key_id: subject_key_id.to_owned(),
+                // Keyed by `conferral_plane`: the conferral lives ON the
+                // co-scrubbed KeyRecord, which has no attestation id.
+                grant_attestation_id: subject_key_id.to_owned(),
+                verdict,
+                conferral_plane: ConferralPlane::AccordCoScrub,
             }));
         }
     }

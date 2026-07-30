@@ -18892,6 +18892,18 @@ mod accord_tests {
     /// v21.16.0 (CIRISPersist#536 follow-up) — the REAL engine-backed user path
     /// on sqlite: establish_trust_root skips the synthetic user edge (real key ≠
     /// derived) and the user's own signer completes leg 1.
+    /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on sqlite.
+    #[tokio::test]
+    async fn ceremony_plane_capability_walk_sqlite_548() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_ceremony_plane_capability_walk(
+            &backend, "sq548",
+        )
+        .await
+        .expect("548 exercise");
+    }
+
     #[tokio::test]
     async fn trust_root_real_user_works_on_sqlite_536() {
         let backend = SqliteBackend::open_in_memory().await.unwrap();

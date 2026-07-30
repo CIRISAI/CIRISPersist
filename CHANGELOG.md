@@ -5,6 +5,52 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [22.1.0] — 2026-07-30 — #548: the ceremony plane is legible to the capability walk
+
+**The baked genesis seed can now serve traces.** CIRISServer found (live, two-node harness) that
+a fully accord-blessed canonical rooted to nothing: the seed carries its `infra:serve` conferral
+as a 2-of-3 accord co-scrub — roles inside the scrub-signed `registration_envelope`, zero
+`delegates_to` rows — and `capability_roots_to_trusted_root` read only the delegation plane.
+Leg A (`has_effective_role`) and leg B read two different planes for the same fact:
+`trace attestation withheld — recipient's infra:serve roots to no root this node trusts`.
+
+### Added
+
+- **Ceremony-plane candidacy** in the capability walk: a verified co-scrub conferring the scope
+  yields a candidate with the subject itself as root — the ceremony is what makes it a root. The
+  check IS leg A by call (`has_effective_role_over_roster`), never a re-implementation, verified
+  against THIS node's effective accord roster. A portable root minted by a different trio enters
+  via the delegation plane its mint already carries — portability unchanged.
+- `capability_roots_to_trusted_root_over_roster` — the roster-parameterized core, mirroring the
+  `has_effective_role`/`_over_roster` split for the same reason (genesis private halves live in
+  the #268 hardware ceremony).
+- `TrustedGrant.conferral_plane` (`#[serde(default)]`, so pre-#548 payloads deserialize
+  unchanged) — the plane is named explicitly rather than fused into `grant_attestation_id`'s
+  value space (the #532 axis-fusion class).
+
+### Deliberately unchanged — the un-trust lever (the corrected #548 ask)
+
+**Half 2 is untouched.** The ceremony candidate still walks `trust_root_valid` in full: the
+asking node's OWN `delegates_to(user → subject)` edge, the subject's self-charter with recovery
+commitment, a fresh `accord:lifecycle` witness, no halt latched. Delete the one edge row and
+trust collapses — walk returns `None`, serve gate withholds, agent capabilities gate off,
+manifests stop — all emergent, nothing special-cased. A ceremony arm that skipped half 2 would
+have deleted the operator's kill lever, which is strictly worse than the bug (CIRISServer said
+exactly this in the corrected ask, and they were right).
+
+Operationally this also means the seed alone does not serve: the canonical completes its own
+half at first boot (self-charter; lifecycle witnesses come from the accord flow), and every
+trusting node writes its own edge. The seed carries precisely what it structurally can.
+
+### Witness
+
+`exercise_ceremony_plane_capability_walk` — the baked-seed shape end to end on memory + sqlite
+(+ postgres DSN-gated): red before the arm existed (the exact #548 symptom), green after; the
+lever pinned (withdraw the one edge → `None` with the co-scrub still fully valid); negatives
+earned (1-of-3 is not a quorum; a quorum conferring a different scope confers nothing). The
+1-of-3 negative also re-found the #534 DENY-FK parity trap on the way in — the fixture now
+documents it.
+
 ## [22.0.1] — 2026-07-30 — #545: persist no longer refuses its own synthesized accord holders
 
 **Regression fix (found by CIRISServer adopting v22.0.0).** The test-anchor genesis synthesizer
