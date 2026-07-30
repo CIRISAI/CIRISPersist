@@ -4886,6 +4886,13 @@ pub async fn has_effective_role(
 /// A self-asserted claim with no delegation therefore reads `false`, which is
 /// the AV-75 property: registering the string buys nothing.
 ///
+/// v22.1.0 (CIRISPersist#548): the walk it delegates to also accepts the
+/// CEREMONY plane — a 2-of-3 accord co-scrub conferring the role inside the
+/// subject's own registration_envelope (the baked-seed encoding), still
+/// subject to the user's full trust chain to the subject-as-root. Strictly
+/// stronger evidence than one root's `delegates_to`; the AV-75 property is
+/// unchanged (a bare self-registered string still buys nothing).
+///
 /// Fail-closed: any resolution error reads `false`.
 pub async fn has_delegated_capability_role(
     directory: &dyn super::FederationDirectory,
@@ -5113,7 +5120,7 @@ pub fn canonical_withdrawal_payload_sha256(
 /// trio in production, and — only on a `test-anchor` build with the runtime
 /// gate armed (#449) — the synthesized SW test-root holders, so the whole
 /// accord quorum machinery follows the same anchor verify roots against.
-fn accord_holder_roster_key_ids() -> Vec<String> {
+pub(crate) fn accord_holder_roster_key_ids() -> Vec<String> {
     super::genesis::effective_accord_holder_records()
         .iter()
         .map(|r| r.record.key_id.clone())

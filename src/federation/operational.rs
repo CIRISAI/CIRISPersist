@@ -1200,7 +1200,9 @@ pub mod test_support {
             Identity::new(&format!("{family_tag}-h2")),
         ];
         for h in &holders {
-            register_accord_holder(directory, h).await?;
+            register_accord_holder(directory, h).await.map_err(|e| {
+                crate::federation::Error::Backend(format!("#548 step holder-reg {}: {e}", h.key_id))
+            })?;
         }
         let roster: Vec<String> = holders.iter().map(|h| h.key_id.clone()).collect();
         let record = signed_canonical_record_with_roles(
@@ -1518,6 +1520,248 @@ pub mod test_support {
         directory
             .put_attestation(crate::federation::SignedAttestation { attestation: edge })
             .await
+    }
+
+    /// **CIRISPersist#548 — the baked-seed shape: an accord co-scrub IS a
+    /// conferral the capability walk must see.** The genesis seed carries the
+    /// canonical's `infra:serve` as roles INSIDE its 2-of-3 co-scrubbed
+    /// `registration_envelope`, with ZERO `delegates_to` rows — the ceremony
+    /// encoding. Leg A (`has_effective_role`) reads it; leg B
+    /// (`capability_roots_to_trusted_root`) read only the delegation plane,
+    /// so a fully accord-blessed canonical could not receive traces:
+    /// `trace attestation withheld — recipient's infra:serve roots to no
+    /// root this node trusts`, observed live by CIRISServer.
+    ///
+    /// Exercises the corrected #548 ask: the co-scrub yields a CANDIDATE
+    /// (half 1), while the asking node's own trust chain — edge, charter,
+    /// lifecycle, halt — is still required in full (half 2, untouched).
+    /// Then the property the correction exists to protect: **delete the one
+    /// `delegates_to(user → root)` edge and trust collapses** — the
+    /// operator's un-trust lever, emergent, nothing special-cased.
+    pub async fn exercise_ceremony_plane_capability_walk(
+        directory: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::trust_root::{
+            capability_roots_to_trusted_root_over_roster, ConferralPlane, INFRA_ATTEST_SCOPE,
+            INFRA_SERVE_SCOPE,
+        };
+        use crate::federation::types::attestation_type;
+
+        let user = format!("{tag}-user");
+        let canonical = format!("{tag}-baked-canonical");
+        register_typed_key(
+            directory,
+            &user,
+            crate::federation::types::identity_type::NODE,
+        )
+        .await?;
+
+        // THE SEED SHAPE — the conferral in the accord's own encoding: a
+        // 2-of-3 co-scrubbed key record with the role inside the signed
+        // envelope, and NO delegates_to grant anywhere. Built like
+        // `confer_roles` but carrying the canonical's REAL deterministic
+        // hybrid pubkeys (as the production seed does) — the canonical must
+        // be able to SIGN its own post-boot charter, and the synthetic
+        // `[7u8;32]` pubkey in `signed_canonical_record` cannot verify
+        // anything (the #545 derivation-mismatch trap, avoided by
+        // construction).
+        let holders = [
+            Identity::new(&format!("{tag}-ch0")),
+            Identity::new(&format!("{tag}-ch1")),
+            Identity::new(&format!("{tag}-ch2")),
+        ];
+        for h in &holders {
+            register_accord_holder(directory, h).await?;
+        }
+        let roster: Vec<String> = holders.iter().map(|h| h.key_id.clone()).collect();
+        let mut record = signed_canonical_record_with_roles(
+            &canonical,
+            crate::federation::types::identity_type::NODE,
+            vec![INFRA_SERVE_SCOPE.to_owned()],
+            json!({ "key_id": canonical, "conferred_by": tag }),
+            &[&holders[0], &holders[1]],
+        );
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(&canonical);
+        record.pubkey_ed25519_base64 = ed_pk;
+        record.pubkey_ml_dsa_65_base64 = mldsa_pk;
+        directory
+            .put_public_key(crate::federation::types::SignedKeyRecord { record })
+            .await?;
+
+        // What the seed structurally CANNOT carry, written post-boot exactly
+        // as the live actors would write it:
+        // — the canonical's own charter (it holds its key at boot)...
+        let charter_id = uuid::Uuid::new_v4().to_string();
+        let successors = vec![format!("{canonical}-succ-a"), format!("{canonical}-succ-b")];
+        let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)
+            .map_err(|e| crate::federation::Error::Backend(format!("#548 pre_rotation: {e}")))?;
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: signed_trust_attestation(
+                    &charter_id,
+                    &canonical,
+                    &canonical,
+                    attestation_type::DELEGATES_TO,
+                    json!({
+                        "references_attestation_id": charter_id,
+                        "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+                        "pre_rotation_commitment": commitment,
+                    }),
+                ),
+            })
+            .await?;
+        // — a fresh accord:lifecycle witness (the reserved-family leg). The
+        //   attester must be a REGISTERED accord_holder identity — the
+        //   reserved-prefix gate refuses the dimension from anyone else —
+        //   mirroring establish_trust_root_side's `-la` witness exactly.
+        let la = format!("{canonical}-la");
+        register_typed_key(
+            directory,
+            &la,
+            crate::federation::types::identity_type::ACCORD_HOLDER,
+        )
+        .await
+        .map_err(|e| crate::federation::Error::Backend(format!("#548 step la-reg: {e}")))?;
+        let lc_id = uuid::Uuid::new_v4().to_string();
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: signed_trust_attestation(
+                    &lc_id,
+                    &la,
+                    &canonical,
+                    attestation_type::SCORES,
+                    json!({
+                        "id": lc_id,
+                        "dimension": crate::federation::trust_root::ACCORD_LIFECYCLE_DIMENSION,
+                        "score": 1.0,
+                        "confidence": 0.9,
+                    }),
+                ),
+            })
+            .await?;
+        // — and the USER'S OWN trust edge, the deletable lever (leg 1).
+        let edge_id = uuid::Uuid::new_v4().to_string();
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: signed_trust_attestation(
+                    &edge_id,
+                    &user,
+                    &canonical,
+                    attestation_type::DELEGATES_TO,
+                    json!({
+                        "id": edge_id,
+                        "scope": [INFRA_SERVE_SCOPE],
+                    }),
+                ),
+            })
+            .await?;
+
+        // THE #548 ASSERTION — the walk sees the ceremony conferral.
+        let grant = capability_roots_to_trusted_root_over_roster(
+            directory,
+            &user,
+            &canonical,
+            INFRA_SERVE_SCOPE,
+            &roster,
+        )
+        .await?
+        .unwrap_or_else(|| {
+            panic!(
+                "({tag}) #548: a 2-of-3 accord co-scrub conferring {INFRA_SERVE_SCOPE} inside \
+                 the registration_envelope, plus the user's own live trust chain, must satisfy \
+                 the capability walk — the baked genesis seed is exactly this shape and today \
+                 it roots to nothing"
+            )
+        });
+        assert_eq!(
+            grant.root_key_id, canonical,
+            "({tag}) #548: the ceremony makes the subject ITSELF the root"
+        );
+        assert_eq!(
+            grant.conferral_plane,
+            ConferralPlane::AccordCoScrub,
+            "({tag}) #548: the plane is named, not fused into the grant id"
+        );
+
+        // THE LEVER — withdraw the user's one edge; trust must collapse,
+        // emergent, with the co-scrub still fully valid.
+        let wd_id = uuid::Uuid::new_v4().to_string();
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: signed_trust_attestation(
+                    &wd_id,
+                    &user,
+                    &canonical,
+                    attestation_type::WITHDRAWS,
+                    json!({
+                        "references_attestation_id": edge_id,
+                        "withdrawal_reason": "operator un-trust: the one-row lever (#548)",
+                    }),
+                ),
+            })
+            .await?;
+        let after = capability_roots_to_trusted_root_over_roster(
+            directory,
+            &user,
+            &canonical,
+            INFRA_SERVE_SCOPE,
+            &roster,
+        )
+        .await?;
+        assert!(
+            after.is_none(),
+            "({tag}) #548: deleting the user's ONE delegates_to edge must collapse trust — \
+             the un-trust lever is the property the corrected ask exists to protect: {after:?}"
+        );
+
+        // NEGATIVES — candidacy is EARNED:
+        // (a) a 1-of-3 scrub is not a quorum, so no candidate…
+        let weak = format!("{tag}-one-scrub");
+        // Scrubbed by a REGISTERED holder (ch0, from the roster above): the
+        // point of this negative is the missing QUORUM, and sqlite's
+        // scrub_key_id FK would otherwise refuse the row for the wrong
+        // reason — an unregistered scrubber (the #534 DENY-FK trap; memory
+        // tolerates it, which is exactly the parity gap that class named).
+        let record = signed_canonical_record_with_roles(
+            &weak,
+            crate::federation::types::identity_type::NODE,
+            vec![INFRA_SERVE_SCOPE.to_owned()],
+            json!({ "key_id": weak, "conferred_by": tag }),
+            &[&holders[0]],
+        );
+        directory
+            .put_public_key(crate::federation::types::SignedKeyRecord { record })
+            .await?;
+        assert!(
+            capability_roots_to_trusted_root_over_roster(
+                directory,
+                &user,
+                &weak,
+                INFRA_SERVE_SCOPE,
+                &roster
+            )
+            .await?
+            .is_none(),
+            "({tag}) #548: ONE scrub is not an accord quorum — no candidate"
+        );
+        // (b) …and a quorum conferring a DIFFERENT scope confers nothing here.
+        let other = format!("{tag}-other-scope");
+        confer_roles(directory, &other, &["infra:store"], &format!("{tag}-os")).await?;
+        assert!(
+            capability_roots_to_trusted_root_over_roster(
+                directory,
+                &user,
+                &other,
+                INFRA_SERVE_SCOPE,
+                &roster
+            )
+            .await?
+            .is_none(),
+            "({tag}) #548: the co-scrub confers the roles it NAMES, nothing more"
+        );
+        Ok(())
     }
 
     /// v21.15.0 (CIRISPersist#536) — the leg-B counterpart to [`confer_roles`]:

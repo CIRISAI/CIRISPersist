@@ -11139,6 +11139,17 @@ mod tests {
         crate::federation::operational::test_support::exercise_trust_root(&backend, "mem536").await;
     }
 
+    /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on memory.
+    #[tokio::test]
+    async fn ceremony_plane_capability_walk_memory_548() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_ceremony_plane_capability_walk(
+            &backend, "mem548",
+        )
+        .await
+        .expect("548 exercise");
+    }
+
     /// v21.16.0 (CIRISPersist#536 follow-up) — the REAL engine-backed user path
     /// on memory: synthetic user edge skipped, user's own signer completes leg 1.
     #[tokio::test]
