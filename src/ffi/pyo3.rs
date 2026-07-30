@@ -4444,7 +4444,20 @@ impl PyEngine {
     /// co-steward roles (`registry` / `verify`): a consumer applying the
     /// single-source licensure confidence cap resolves "which co-steward is
     /// this attesting key" from the substrate instead of a local pin.
-    fn has_effective_role(&self, py: Python<'_>, key_id: &str, role: &str) -> PyResult<bool> {
+    ///
+    /// v23.0.0 (CIRISPersist#551 item 5) — BREAKING rename from
+    /// `has_effective_role` (Rust + this FFI method in the same cut, old name
+    /// deleted). This predicate reads the **accord co-scrub** plane; its
+    /// near-twin `has_root_delegated_role` (was
+    /// `has_delegated_capability_role`) reads the **delegation graph**. The
+    /// two were indistinguishable at a call site while consulting different
+    /// planes, which is the confusion #551 exists to end.
+    fn has_accord_conferred_role(
+        &self,
+        py: Python<'_>,
+        key_id: &str,
+        role: &str,
+    ) -> PyResult<bool> {
         self.ensure_usable()?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
@@ -4455,16 +4468,24 @@ impl PyEngine {
                 BackendDispatch::Postgres(pg) => {
                     let backend = pg.clone();
                     runtime.block_on(async move {
-                        crate::federation::has_effective_role(backend.as_ref(), &key_id, &role)
-                            .await
+                        crate::federation::has_accord_conferred_role(
+                            backend.as_ref(),
+                            &key_id,
+                            &role,
+                        )
+                        .await
                     })
                 }
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(sq) => {
                     let backend = sq.clone();
                     runtime.block_on(async move {
-                        crate::federation::has_effective_role(backend.as_ref(), &key_id, &role)
-                            .await
+                        crate::federation::has_accord_conferred_role(
+                            backend.as_ref(),
+                            &key_id,
+                            &role,
+                        )
+                        .await
                     })
                 }
             })
@@ -28822,7 +28843,7 @@ mod tests {
                     scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
                     pqc_completed_at: None,
                     persist_row_hash: String::new(),
-                    roles: Vec::new(),
+                    capability_roles: Vec::new(),
                     attestation_evidence: None,
                     consent_role: None,
                     additional_scrubs: Vec::new(),

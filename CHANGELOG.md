@@ -5,6 +5,247 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [23.0.0] — 2026-07-30 — #551: the naming cut — one seed shape, three named delegation jobs
+
+**A session with full source access produced four wrong statements about the trust root, and
+every one traced to a name carrying two or three referents.** CIRISServer filed #551 before
+minting the production root, on the reasoning that an artifact you cannot describe correctly is
+an artifact you cannot ceremonially bless. This cut is the substrate half: the seed shape stops
+being a judgement call and becomes a type, the three opposite jobs riding one `delegates_to`
+get names, and five name pairs that read as synonyms stop being pairs.
+
+MAJOR because deletion is the point. Old names are gone, not aliased — an alias would preserve
+exactly the ambiguity the issue is about.
+
+### Wire compatibility — what did NOT move
+
+**Nothing STORED or SIGNED moved.** Stored rows, signed envelopes, and every `persist_row_hash`
+are byte-identical across this cut, and two renames stop deliberately at the Rust boundary:
+
+| Rust name (new) | wire name (frozen) | why frozen |
+|---|---|---|
+| `KeyRecord.capability_roles` | `roles` (`#[serde(rename)]`) | every stored row + signed `registration_envelope` carries `roles`; renaming desyncs rows from their signatures — the #541 preserve-set≢verified-set class |
+| `ACCORD_HEARTBEAT_DIMENSION` | `accord:lifecycle:v1` | every existing witness carries this dimension inside a signed envelope |
+
+The baked canonical record inside the reshaped seed asset is byte-identical to the pre-v23
+content: the container changed, the row did not.
+
+**One consumer-visible payload DID change**, deliberately and breakingly: `TrustRootVerdict` —
+serialized across the FFI directory capsule to server and edge — loses `lifecycle_active` and
+gains `last_drill_at` + `drill_freshness` (item 4). Nothing signs a verdict and nothing stores
+one; it is computed per call, so there is no row to desync. Consumers deserializing a verdict
+must adopt the new shape — that is a MAJOR, and this is one.
+
+### Renames (old → new; all old names DELETED)
+
+| old | new | item |
+|---|---|---|
+| `canonical_genesis_records() -> &[SignedKeyRecord]` | `canonical_genesis_bundle() -> &GenesisBundle` | 1 |
+| bare `[{record}]` seed parse | `parse_genesis_bundle()` — the ONE door; legacy shape REFUSED | 1 |
+| `has_effective_role` | `has_accord_conferred_role` | 5 |
+| `has_effective_role_over_roster` | `has_accord_conferred_role_over_roster` | 5 |
+| `has_delegated_capability_role` | `has_root_delegated_role` | 5 |
+| `KeyRecord.roles` (Rust field) | `KeyRecord.capability_roles` | 6 |
+| `ACCORD_LIFECYCLE_DIMENSION` | `ACCORD_HEARTBEAT_DIMENSION` | 4 |
+| `ACCORD_LIFECYCLE_FRESHNESS_DAYS` | `DRILL_GREEN_MAX_DAYS` + `DRILL_YELLOW_MAX_DAYS` (band edges, not a gate threshold) | 4 |
+| `TrustRootVerdict.lifecycle_active: bool` | `last_drill_at: Option<DateTime<Utc>>` + `drill_freshness: DrillFreshness` | 4 |
+| "leg A" / "leg B" (docs) | `ConferralPlane::AccordCoScrub` / `::Delegation` | 3 |
+
+`has_accord_conferred_role` is also the PyO3 method name — Rust and FFI rename in the same cut,
+per house policy. No env var changed; see item 7 below for why.
+
+### 1 — the portable bundle is the only seed shape (the mint blocker)
+
+`canonical_seed.json` is now a `GenesisBundle`, the same artifact a ceremony emits, and the
+bare-record-list parse path is **deleted**. A record list carries the identity plane only — no
+charter, no conferral, no liveness witness — so a node seeded from one roots, reports healthy,
+and withholds every trace. That failure was silent; "is this node seeded?" had two answers and
+the wrong one looked fine. Now it is a type.
+
+A legacy `[{record}]` file fails loudly with the typed `Error::GenesisBundleInvalid`, naming
+the shape it got rather than emitting a raw serde type error:
+
+> genesis bundle refused: expected a genesis bundle object, got a bare JSON array of 1
+> element(s) — the `[{record}]` seed shape was DELETED in v23.0.0 (CIRISPersist#551 item 1). A
+> record list carries identity only: no charter, no conferral, no liveness witness, so a node
+> seeded from it roots, looks healthy, and withholds every trace. Re-emit this seed as the
+> bundle a ceremony produces (version, family_key_id, holders, serve_nodes, consensus_protocol,
+> attestations, authorizations, produced_at)
+
+Both the operator artifact path (`bake_assembled_genesis`) and the compiled-in seed enter
+through `parse_genesis_bundle` — one predicate, one impl, so the embedded asset cannot drift
+into a shape a hand-passed file would be refused for.
+
+**What the shipped bundle carries, and what it honestly does not.** `serve_nodes` holds the
+2-of-3 co-scrubbed canonical; `attestations` and `authorizations` are **empty**, and that is
+asserted by a test, not incidental. This artifact carries no delegation plane and no holder
+quorum — the very condition #551 says must stop being invisible is now readable off the fields
+and pinned by the gate. `holders` is empty on purpose: the roster is the separately-baked
+`accord_holder_genesis_records()`, and a second copy would be two lists that can disagree.
+Consequently the seed bundle is not bakeable via `bake_assembled_genesis` — no authorizations,
+so the quorum gate refuses it, loudly and correctly.
+
+### 2 — the three `delegates_to` jobs have names (ADDITIVE)
+
+One wire type, three opposite jobs, previously discriminated only by direction:
+
+| dimension | shape | read by |
+|---|---|---|
+| `trust:charter:v1` | `delegates_to(R → R)` | `trust_root_valid` → `root_self_declares` |
+| `trust:confers:v1` | `delegates_to(R → subject, scope)` | `capability_roots_to_trusted_root_over_roster` |
+| `trust:accepts:v1` | `delegates_to(node → R)` | `trust_root_valid` → `edge_exists` |
+
+The middle two point **opposite ways** and are otherwise identical in shape — the pair that cost
+#551 the most, producing the false claim that the canonical must self-charter.
+
+Each predicate now **prefers the label, refuses a contradiction, and infers when silent**:
+
+- a row carrying its own job's dimension is read as that job;
+- a row carrying a DIFFERENT job's dimension is **refused** by the predicate reading it — a
+  mislabeled lever is worse than an unlabeled one, because the label invites a reader (human or
+  code) to trust it instead of checking direction. Two self-descriptions that disagree is the
+  #541 class; the fix is the same, refuse rather than pick a winner;
+- an undimensioned row walks by direction inference exactly as before.
+
+Additive by construction: `attestation_type` stays `delegates_to`, every pre-v23 row keeps
+working with no migration and no re-signing. The emit fixtures (`grant_scope`,
+`establish_trust_root_side`, `try_emit_synthetic_trust_edge`,
+`exercise_ceremony_plane_capability_walk`, the real-user honest edge) stamp the right job.
+
+`trust:*` is a NEW dimension family. It gets persist-authored manifest rows
+(`PERSIST_AUTHORED_TRUST_JOB_DIMENSIONS`) rather than a hand-edit of the vendored CC 3.1
+registry — that file is GENERATED by the Constitution's tooling, so hand-adding a family would
+forge a constitutional record. A gate test binds every row to the live constant AND asserts the
+family is not yet CC-registered, so the table graduates into the re-vendor when registration
+lands rather than silently duplicating it.
+
+### 3 — the planes have names; use them
+
+Every "leg A" / "leg B" in persist docs and comments is now
+`ConferralPlane::{AccordCoScrub, Delegation}`. Those labels recorded the ORDER two checks run
+in, not the PLANE each consults — which is why #548's first proposed remedy would have deleted
+the operator's un-trust lever. (Edge's gate logging is CIRISEdge#386's side, flagged there.)
+
+### 4 — the drill is a trust SIGNAL, not a functionality gate
+
+**The 90-day mesh-wide darkening is gone: a stale-drilled root serves while its trust card shows
+yellow or red.**
+
+"Lifecycle" read durable, as though a state machine held a value — but the name was the smaller
+problem. It was a **deadman**: a root was live only while a witness about it was newer than 90
+days, so a BAKED witness aged out and every node depending on that root went dark **together**,
+three months after the mint, with no error at the point of use. An artifact with a shelf life
+nobody intended.
+
+A root is valid until **revoked, halted, or un-trusted**. Tombstones, the accord halt latch, and
+the user's own `trust:accepts:v1` edge are the revocation mechanisms, and all three remain hard
+gates. What a stale drill actually distinguishes is *governed* from *abandoned* — a thing to
+REPORT, not a thing to withhold service over. So `trust_root_valid` reports it instead:
+
+- `TrustRootVerdict.lifecycle_active: bool` — **removed**. Clean break, no alias field: the
+  boolean's whole meaning was "does this leg let the root serve", and that question is gone.
+- `last_drill_at: Option<DateTime<Utc>>` — the `asserted_at` of the newest LIVE drill about the
+  root, so a consumer can render "last drill performed X days ago".
+- `drill_freshness: DrillFreshness` — `Green` < `DRILL_GREEN_MAX_DAYS` (90), `Yellow` <
+  `DRILL_YELLOW_MAX_DAYS` (180), `Red` at or beyond. Band semantics, like every other score here.
+- `valid` is now `edge_exists && root_self_declares && charter_has_recovery && !halt_latched`.
+  The drill is deliberately absent from that conjunction.
+
+The fold no longer applies a freshness filter — an old drill is still a drill, and *when* it was
+is precisely the fact being reported. A tombstoned, expired, or local-tier row is still not a
+drill; those legs are unchanged.
+
+**Never-drilled reads `Red`, and there is no fourth variant.** An undrilled root and a
+long-abandoned one warrant the same skepticism, so they should read the same — and the
+distinction is not lost: it is carried, in exactly one place, by `last_drill_at: None`. A `Never`
+variant would encode the same fact a second time in a second field that could disagree with the
+first, which is the class of bug this entire cut exists to remove.
+
+`ACCORD_LIFECYCLE_FRESHNESS_DAYS` is deleted rather than renamed — it was a single number because
+it was a gate threshold, and it is a band edge now. CIRISPersist#550 asked whether a genesis root
+should need a heartbeat at all; this is the answer.
+
+### 5 — two near-identical names for opposite planes
+
+`has_effective_role` (reads the accord co-scrub) and `has_delegated_capability_role` (reads the
+delegation graph) were indistinguishable at a call site while consulting different planes.
+Now `has_accord_conferred_role` and `has_root_delegated_role`: the name says the plane.
+
+### 6 — prose said "roles"; the gate reads `identity_type`
+
+Reserved prefixes (`age_assurance:`, `system:`, `detection:`, …) gate on **`identity_type`** via
+`required_identity_types` — never on `KeyRecord.roles`. Persist asserted the opposite in #543
+("a Sybil could not mint reserved-prefix rows without roles"), and the wrongness matters:
+`identity_type` is self-assertable, which is hole 3 of that very issue. The code was right; the
+prose taught the wrong model. The Rust field is now `capability_roles` — what it actually
+governs, capability at the persist API boundary — so the two can never be read as synonyms
+again. The wire name stays `roles` (see the compatibility table).
+
+### 7 — the env var #551 asks about is not ours
+
+`CIRIS_TEST_TRUST_ROOT_SEED` (32 bytes of Ed25519 **private** key material) is **CIRISServer's**,
+read only by `CIRISServer/src/test_bless.rs` — the function they are renaming to
+`mint_trust_root`. Persist never reads it, never holds the test root's private half, and cannot
+mint with it: the harness signs and hands us signatures. Persist's own slot family is public
+material — `CIRIS_TEST_TRUST_ROOT_PQC` (ML-DSA-65 pubkeys) and
+`CIRIS_TEST_TRUST_ROOT_SCRUB[_PQC]` (scrub signatures) — plus verify's `CIRIS_TEST_TRUST_ROOT`
+anchor (pubkeys). Renaming those to `..._PRIVATE_KEY` would be false, and would break the
+harness that sets all five (`CIRISServer/harness/mesh-repro/docker-compose.yml`). So no persist
+env var changed; instead the definition carries a table saying which variable is which and who
+owns it, which is the confusion item 7 exists to end. The rename itself is CIRISServer's to make
+in the crate that reads the value.
+
+### Ratification — the RC3 batch this cut rides with
+
+The wire half ships here; the covenant half is filed. Per operator direction, functionality
+leads — it all folds into RC3 once traces flow in production:
+
+- **CIRISConstitution#48** — this cut's own semantics: the two named conferral planes, the
+  one-row un-trust lever, liveness-as-signal (drill bands, valid-until-revoked), the `trust:*`
+  dimension family (items 2–4 here are its implementation).
+- **CIRISConstitution#49** — the agent-lineage additions: the anti-Goodhart READ clause
+  (persist#552 is its wire evidence), covenant identity as maintained lineage, the swap test as
+  a drafting gate + WA symmetry, dead-clauses-keep-their-killers.
+- Standing siblings: **#40** (portable root), **#45** (ontology-lake anchors), **#46**
+  (consent-before-scoring, shipped v22.0.0), **#47** (breach-signal semantics, shipped v22.0.0).
+
+### Witness### Witness
+
+Red-first on both structural items, on real behaviour rather than compile errors:
+
+- **item 1**: the embedded asset failed to parse as a bundle (`invalid type: map, expected u32`)
+  and the legacy shape was refused only by a raw serde error naming nothing;
+- **item 2**: a trust root with its charter labeled `trust:accepts:v1` and its trust edge
+  labeled `trust:charter:v1` — every label contradicting its direction — walked to
+  `valid: true`. Now both mislabeled rows are refused, the correctly-labeled pair walks, and an
+  undimensioned pair still walks (the additive guarantee, asserted deliberately rather than
+  left to whichever fixture went unstamped);
+- **item 4**: a root with every hard leg green — edge, charter, recovery, no halt — came back
+  `valid: false` on nothing but a 120-day-old drill. That is the mesh-wide darkening, reproduced
+  in one assertion.
+
+`drill_freshness_is_a_signal_not_a_gate_551` pins all three bands plus the contrast that gives
+the change its meaning: withdraw the user's edge and trust collapses (a real gate), while the
+drill signal keeps reporting independently. `exercise_ceremony_plane_capability_walk` — which
+runs on memory, sqlite AND postgres — now pins the contract **both ways** on every backend:
+fresh drill → `valid` + `Green`; tombstone that drill → **`valid` still true**, `Red`,
+`last_drill_at: None`, and the capability walk still confers.
+
+These tests flipped from gate-asserting to signal-asserting: `trust_root_walk_and_tombstone_481`
+(both legs), the E5 local-tier walk, `exercise_trust_root_real_user` (arms A and B0), and
+`establish_trust_root_side`'s postcondition — the last one deliberately still requires `Green`,
+because it is now an assertion about *that helper's own emission* rather than about the root's
+validity: a red-drilled root is perfectly valid, but a helper that promised to mint a fresh drill
+and did not has broken its contract.
+
+`capability_roles_keeps_the_frozen_wire_name_551` pins item 6 in both directions and asserts the
+`persist_row_hash` computed from the typed row equals the one computed from raw v22 wire bytes —
+the property that actually keeps stored rows bound to their signatures.
+
+Counts: `cargo nextest run --features sqlite` 1522/1522; `--features "sqlite test-anchor"`
+1527/1527; `--features "sqlite postgres"` against a live DSN 1840/1840 (serial); clippy
+`--all-targets -D warnings` clean under both `sqlite` and `sqlite postgres`.
+
 ## [22.1.0] — 2026-07-30 — #548: the ceremony plane is legible to the capability walk
 
 **The baked genesis seed can now serve traces.** CIRISServer found (live, two-node harness) that

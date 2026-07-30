@@ -68,7 +68,7 @@ async fn register_producer<D: FederationDirectory>(dir: &D, key_id: &str, ed_pk_
             scrub_timestamp: "2026-01-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),

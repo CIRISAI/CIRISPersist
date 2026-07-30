@@ -1260,7 +1260,7 @@ pub fn check_local_tier_eligibility(
 /// materializes `ScrubTarget.roles` into the scrub-signed
 /// `registration_envelope` (`"roles"`), and `roles_in_envelope()` exposes
 /// them — but persist never read that surface, so an accord co-scrub could
-/// attest `infra:serve` and every `claims_role` / `has_effective_role`
+/// attest `infra:serve` and every `claims_role` / `has_accord_conferred_role`
 /// consumer still saw `[]`. The attestation was made and dropped on the
 /// floor (the actual root cause behind #480's dark trace plane).
 ///
@@ -1273,7 +1273,7 @@ pub fn check_local_tier_eligibility(
 ///   co-scrub admission gate — lifting creates VISIBILITY, never conferral.
 ///   Tampering the envelope's `roles` breaks the scrub signatures (the
 ///   envelope is the signed bytes), and effectiveness is ALWAYS re-derived
-///   (`has_effective_role` re-verifies the co-scrub against the live
+///   (`has_accord_conferred_role` re-verifies the co-scrub against the live
 ///   roster) — so wire-supplied top-level roles stay exactly as untrusted
 ///   as before: a claim, not a capability.
 pub fn lift_envelope_attested_roles(row: &mut super::KeyRecord) {
@@ -1283,8 +1283,8 @@ pub fn lift_envelope_attested_roles(row: &mut super::KeyRecord) {
         .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
         .unwrap_or_default();
     for role in envelope_roles {
-        if !row.roles.contains(&role) {
-            row.roles.push(role);
+        if !row.capability_roles.contains(&role) {
+            row.capability_roles.push(role);
         }
     }
 }
@@ -4259,7 +4259,8 @@ pub(crate) async fn check_canonical_role_admission_over_roster_legacy(
 /// successor, which is how an unattested root would otherwise launder in —
 /// meets the full floor (this gate runs at every write chokepoint).
 fn is_baked_genesis_canonical(row: &super::KeyRecord) -> bool {
-    crate::federation::genesis::canonical_genesis_records()
+    crate::federation::genesis::canonical_genesis_bundle()
+        .serve_nodes
         .iter()
         .any(|baked| baked.record.key_id == row.key_id)
 }
@@ -4855,22 +4856,23 @@ pub async fn check_accord_role_admission_over_roster(
 ///
 /// CIRISServer's CC 3.4.9 `licensure_cap` resolves "which co-steward is this
 /// attesting key" through this (dropping its by-pin fallback):
-/// `has_effective_role(dir, kid, identity_type::REGISTRY)` /
+/// `has_accord_conferred_role(dir, kid, identity_type::REGISTRY)` /
 /// `identity_type::VERIFY`. Role-generic on purpose; the `canonical` /
 /// `infra:attest` dedicated effective-reads stay as-is.
-pub async fn has_effective_role(
+pub async fn has_accord_conferred_role(
     directory: &dyn super::FederationDirectory,
     key_id: &str,
     role: &str,
 ) -> Result<bool, Error> {
-    has_effective_role_over_roster(directory, key_id, role, &accord_holder_roster_key_ids()).await
+    has_accord_conferred_role_over_roster(directory, key_id, role, &accord_holder_roster_key_ids())
+        .await
 }
 
 /// v22.0.0 (CIRISPersist#543 / AV-75) — the **delegation-plane** effective-role
 /// read: does `key_id` hold `role` as a capability DELEGATED by a trust root
 /// that `user_key_id` itself trusts?
 ///
-/// This is the counterpart to [`has_effective_role`] for roles whose
+/// This is the counterpart to [`has_accord_conferred_role`] for roles whose
 /// [`ConferralMode`](super::types::identity_type::ConferralMode) is
 /// `DelegatedFromTrustRoot` — `trusted_publisher` and `lenscore_detector`.
 /// Where the co-scrub read asks "did the accord bless this key's identity",
@@ -4894,7 +4896,7 @@ pub async fn has_effective_role(
 /// unchanged (a bare self-registered string still buys nothing).
 ///
 /// Fail-closed: any resolution error reads `false`.
-pub async fn has_delegated_capability_role(
+pub async fn has_root_delegated_role(
     directory: &dyn super::FederationDirectory,
     user_key_id: &str,
     key_id: &str,
@@ -4913,9 +4915,9 @@ pub async fn has_delegated_capability_role(
     )
 }
 
-/// [`has_effective_role`] with an explicit accord-holder roster (tests inject
+/// [`has_accord_conferred_role`] with an explicit accord-holder roster (tests inject
 /// their own signable holders).
-pub async fn has_effective_role_over_roster(
+pub async fn has_accord_conferred_role_over_roster(
     directory: &dyn super::FederationDirectory,
     key_id: &str,
     role: &str,
@@ -4957,7 +4959,7 @@ pub async fn is_infra_attest(
     key_id: &str,
 ) -> Result<bool, Error> {
     Ok(directory.lookup_public_key(key_id).await?.is_some_and(|r| {
-        r.roles
+        r.capability_roles
             .iter()
             .any(|role| role == super::types::roles::INFRA_ATTEST)
     }))
@@ -8675,7 +8677,7 @@ mod canonical_gate_tests {
     /// trust-root MINTING the floor exists for — is not lineage.
     #[test]
     fn baked_genesis_canonical_matcher_is_lineage_scoped_513() {
-        let baked = &crate::federation::genesis::canonical_genesis_records()[0];
+        let baked = &crate::federation::genesis::canonical_genesis_bundle().serve_nodes[0];
         assert!(super::is_baked_genesis_canonical(&baked.record));
         // The lineage id with a different envelope is STILL lineage — it
         // faces the same real-accord-quorum bar as today (no floor, no
@@ -8723,7 +8725,7 @@ mod canonical_gate_tests {
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -9198,7 +9200,7 @@ mod canonical_gate_tests {
     /// co-scrub is valid exactly as for `canonical` — the role token differs, the
     /// ceremony does not.
     fn with_infra_role(mut rec: KeyRecord) -> KeyRecord {
-        rec.roles = vec![super::super::types::roles::INFRA_ATTEST.to_owned()];
+        rec.capability_roles = vec![super::super::types::roles::INFRA_ATTEST.to_owned()];
         rec
     }
 
@@ -9301,7 +9303,7 @@ mod canonical_gate_tests {
         // (6) A record WITHOUT `infra:attest` fast-paths to Ok regardless of
         //     scrubs (plain authorization scopes in `roles` are untouched).
         let mut plain = record("i6", identity_type::NODE, &founders[0].key_id);
-        plain.roles = vec!["cirislens_pipeline_writer".to_owned()];
+        plain.capability_roles = vec!["cirislens_pipeline_writer".to_owned()];
         gate(plain, roster.clone())
             .await
             .expect("(6) a non-infra:attest record is not gated");
@@ -9453,7 +9455,7 @@ mod canonical_gate_tests {
         // (a) `canonical` in the roles VECTOR — the #441 probe case.
         let kid = format!("sp-canon-roles-{tag}");
         let mut rec = record(&kid, identity_type::NODE, &kid);
-        rec.roles = vec!["agent".to_owned(), identity_type::CANONICAL.to_owned()];
+        rec.capability_roles = vec!["agent".to_owned(), identity_type::CANONICAL.to_owned()];
         let err = put(dir, rec)
             .await
             .expect_err("(a) roles=[..,canonical] self-claim must be REFUSED");
@@ -9477,7 +9479,7 @@ mod canonical_gate_tests {
         // the gate touches ONLY the accord-conferred tokens.
         let kid = format!("sp-plain-{tag}");
         let mut rec = record(&kid, identity_type::NODE, &kid);
-        rec.roles = vec!["cirislens_pipeline_writer".to_owned()];
+        rec.capability_roles = vec!["cirislens_pipeline_writer".to_owned()];
         put(dir, rec)
             .await
             .expect("(c) plain authorization scopes must remain self-assertable");
@@ -9505,7 +9507,7 @@ mod canonical_gate_tests {
             ),
         ] {
             let mut rec = record(kid, &ident, kid);
-            rec.roles = roles;
+            rec.capability_roles = roles;
             let err = backend
                 .put_public_key(SignedKeyRecord { record: rec })
                 .await
@@ -9658,7 +9660,7 @@ mod canonical_gate_tests {
     // CIRISPersist#440 — the CC 3.4.9 co-steward roles (`registry` /
     // `verify`). Same accord m-of-n co-scrub ceremony as `canonical` /
     // `infra:attest`, via the role-generic gate; withdrawal rides the
-    // V104 generic tombstone; `has_effective_role` is the consumer read.
+    // V104 generic tombstone; `has_accord_conferred_role` is the consumer read.
     // ─────────────────────────────────────────────────────────────────
 
     /// The co-steward decision table, end-to-end through the PRODUCTION
@@ -9690,13 +9692,13 @@ mod canonical_gate_tests {
             .await
             .expect("(1) a 2-of-3 co-scrubbed registry co-steward admits");
         assert!(
-            super::has_effective_role(dir, &reg_kid, identity_type::REGISTRY)
+            super::has_accord_conferred_role(dir, &reg_kid, identity_type::REGISTRY)
                 .await
                 .unwrap(),
             "(1) the stored co-scrubbed row reads effective"
         );
         assert!(
-            !super::has_effective_role(dir, &reg_kid, identity_type::VERIFY)
+            !super::has_accord_conferred_role(dir, &reg_kid, identity_type::VERIFY)
                 .await
                 .unwrap(),
             "(1) registry is NOT the verify co-steward"
@@ -9712,7 +9714,7 @@ mod canonical_gate_tests {
         assert!(dir.lookup_public_key(&kid).await.unwrap().is_none());
         let kid = format!("cs2b-{tag}");
         let mut vec_claim = record(&kid, identity_type::NODE, &kid);
-        vec_claim.roles = vec![identity_type::VERIFY.to_owned()];
+        vec_claim.capability_roles = vec![identity_type::VERIFY.to_owned()];
         let err = put(dir, vec_claim)
             .await
             .expect_err("(2) a roles-vector verify claim must be REFUSED");
@@ -9745,7 +9747,7 @@ mod canonical_gate_tests {
             .expect_err("(4) a withdrawn co-steward cannot be re-conferred");
         assert_eq!(err.kind(), "role_withdrawn");
         assert!(
-            !super::has_effective_role(dir, &reg_kid, identity_type::REGISTRY)
+            !super::has_accord_conferred_role(dir, &reg_kid, identity_type::REGISTRY)
                 .await
                 .unwrap(),
             "(4) a withdrawn co-steward is not effective"
@@ -9756,7 +9758,7 @@ mod canonical_gate_tests {
         // self-claimed / sub-quorum — are exactly the rows (2)/(3) prove the
         // co-scrub re-verification refuses).
         assert!(
-            !super::has_effective_role(dir, &accord[0].key_id, identity_type::REGISTRY)
+            !super::has_accord_conferred_role(dir, &accord[0].key_id, identity_type::REGISTRY)
                 .await
                 .unwrap()
         );
@@ -9865,7 +9867,7 @@ mod canonical_withdrawal_tests {
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -10397,7 +10399,7 @@ mod canonical_withdrawal_tests {
     /// Stamp `infra:attest` into a co-scrubbed record's `roles` (the #422
     /// conferral shape; the co-scrub signs the envelope, not the role field).
     fn with_infra(mut rec: KeyRecord) -> KeyRecord {
-        rec.roles = vec![super::super::types::roles::INFRA_ATTEST.to_owned()];
+        rec.capability_roles = vec![super::super::types::roles::INFRA_ATTEST.to_owned()];
         rec
     }
 

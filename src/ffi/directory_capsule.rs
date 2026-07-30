@@ -632,7 +632,7 @@ pub enum DirectoryOp {
     ListAnnouncedPeers,
     /// [`crate::federation::trust_root::trust_root_valid`] (v18.2.0,
     /// CIRISPersist#481) — the pluggable-trust-root graph predicate
-    /// (edge + self-declaration + lifecycle + halt latch), served from
+    /// (edge + self-declaration + heartbeat + halt latch), served from
     /// persist so server/edge/agent share ONE implementation. Result rides
     /// `TrustRootVerdict`. APPEND-ONLY.
     TrustRootValid {
@@ -644,7 +644,8 @@ pub enum DirectoryOp {
     /// [`crate::federation::trust_root::capability_roots_to_trusted_root`]
     /// (v18.3.0, CIRISPersist#483) — the composed capability walk: does
     /// `subject_key_id` hold `scope`, granted by a root `user_key_id`
-    /// trusts? CIRISEdge#386 leg B (the trace serve gate). APPEND-ONLY.
+    /// trusts? The `ConferralPlane::Delegation` half of CIRISEdge#386's
+    /// trace serve gate. APPEND-ONLY.
     CapabilityRootsToTrustedRoot {
         /// The local node asking.
         user_key_id: String,
@@ -3438,7 +3439,7 @@ mod tests {
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),

@@ -894,7 +894,7 @@ impl MemoryBackend {
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -917,7 +917,7 @@ impl MemoryBackend {
             .federation_keys
             .get_mut(key_id)
             .expect("set_roles: key_id must exist via add_public_key first");
-        rec.roles = roles;
+        rec.capability_roles = roles;
     }
 
     /// v4.0 (CIRISPersist#160, FSD §4.6) — test helper: declare a
@@ -6181,7 +6181,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 scrub_timestamp: now,
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
-                roles: Vec::new(),
+                capability_roles: Vec::new(),
                 attestation_evidence: None,
                 consent_role: None,
                 additional_scrubs: Vec::new(),
@@ -8017,7 +8017,7 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -8988,7 +8988,7 @@ mod tests {
 
         // (c) #441 ROLES-vector form hits it too.
         let mut k = fix_key("mem-ah-roles", "humanity-accord-x", "mem-ah-roles");
-        k.roles = vec![ACCORD_HOLDER.to_string()];
+        k.capability_roles = vec![ACCORD_HOLDER.to_string()];
         let err = backend
             .put_public_key(SignedKeyRecord { record: k })
             .await
@@ -10307,7 +10307,7 @@ mod tests {
     ///    accord-conferred `infra:attest` key ROLE (which stays co-scrub
     ///    gated; see admission set-path tests);
     /// 3. `trust_root_valid` evaluates the full predicate (edge +
-    ///    self-declaration + fresh `accord:lifecycle` + halt latch);
+    ///    self-declaration + fresh heartbeat + halt latch);
     /// 4. the `withdraws` tombstone on the trust edge makes the walk treat
     ///    it as ABSENT (nuclear un-trust; base self-root untouched).
     #[tokio::test]
@@ -10367,7 +10367,7 @@ mod tests {
             .await
             .expect("delegates_to(user→root) must admit");
 
-        // Fresh accord:lifecycle about the root (accord:* attester must be
+        // Fresh heartbeat about the root (accord:* attester must be
         // an accord_holder — the constitutional asymmetry holds here too).
         let mut lc = fix_attestation("tr-lc", "tr-la", "tr-root", "tr-la");
         lc.attestation_envelope = serde_json::json!({
@@ -10381,7 +10381,7 @@ mod tests {
         backend
             .put_attestation(SignedAttestation { attestation: lc })
             .await
-            .expect("accord:lifecycle from an accord_holder must admit");
+            .expect("the heartbeat from an accord_holder must admit");
 
         // Ask 3 — the walk: every leg green.
         let v: TrustRootVerdict = trust_root_valid(&backend, "tr-user", "tr-root")
@@ -10392,7 +10392,11 @@ mod tests {
             v.root_self_declares,
             "(3) root self-declares w/ infra scope"
         );
-        assert!(v.lifecycle_active, "(3) fresh accord:lifecycle");
+        assert_eq!(
+            v.drill_freshness,
+            crate::federation::trust_root::DrillFreshness::Green,
+            "(3) fresh drill reads Green — reported, not gated on"
+        );
         assert_ne!(v.halt_latched, Some(true), "(3) no halt latched");
         assert!(v.valid, "(3) all legs ⇒ valid");
 
@@ -10419,9 +10423,293 @@ mod tests {
         assert!(!v2.edge_exists, "(4) tombstoned edge is ABSENT to the walk");
         assert!(!v2.valid, "(4) un-trust revokes validity");
         assert!(
-            v2.root_self_declares && v2.lifecycle_active,
+            v2.root_self_declares
+                && v2.drill_freshness == crate::federation::trust_root::DrillFreshness::Green,
             "(4) only the EDGE died — the root's own declarations stand"
         );
+    }
+
+    /// v23.0.0 (CIRISPersist#551 item 4, the REAL half) — **the drill is a
+    /// trust SIGNAL, not a functionality gate.**
+    ///
+    /// A genesis root is valid until revoked, halted, or un-trusted:
+    /// tombstones and the halt latch ARE the revocation mechanism, so a
+    /// deadman on top of them gave the artifact a shelf life nobody intended
+    /// — three months after the mint every node darkens together, with no
+    /// error at the point of use. What the drill actually tells you is
+    /// whether the root is GOVERNED or ABANDONED, and that is a thing to
+    /// report, not a thing to withhold service over.
+    ///
+    /// So: `valid` no longer consults the drill at all, and the freshness
+    /// rides a band — the same band-not-float discipline as every other
+    /// score in the system. The hard gates (edge, charter, recovery, halt
+    /// latch) are untouched: the kill switch and the operator's un-trust
+    /// lever still work exactly as before.
+    #[tokio::test]
+    async fn drill_freshness_is_a_signal_not_a_gate_551() {
+        use crate::federation::trust_root::{
+            trust_root_valid, DrillFreshness, TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION,
+        };
+        let backend = MemoryBackend::new();
+        for (k, it) in [
+            ("drill-user", "user"),
+            ("drill-green", "node"),
+            ("drill-yellow", "node"),
+            ("drill-never", "node"),
+            ("drill-la", "accord_holder"),
+        ] {
+            let mut rec = fix_key(k, "ref", k);
+            rec.identity_type = it.to_owned();
+            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+                &mut rec,
+            );
+            backend
+                .put_public_key(SignedKeyRecord { record: rec })
+                .await
+                .unwrap();
+        }
+        let scope = || serde_json::json!(["infra:attest", "infra:serve"]);
+        let stamp = |mut a: Attestation, dimension: &str| {
+            a.attestation_envelope["dimension"] = serde_json::json!(dimension);
+            resign_fix(&mut a);
+            a
+        };
+        // A drill row about `root`, asserted `days_ago` days back.
+        let drill = |id: &str, about: &str, days_ago: i64| {
+            let mut d = fix_attestation(id, "drill-la", about, "drill-la");
+            d.attestation_envelope = serde_json::json!({
+                "id": id,
+                "dimension": crate::federation::trust_root::ACCORD_HEARTBEAT_DIMENSION,
+                "score": 1.0,
+                "confidence": 0.9,
+            });
+            d.asserted_at = chrono::Utc::now() - chrono::Duration::days(days_ago);
+            resign_fix(&mut d);
+            d
+        };
+        // Stand up the HARD legs for each root: charter + the user's edge.
+        for root in ["drill-green", "drill-yellow", "drill-never"] {
+            for a in [
+                stamp(
+                    fix_charter(&format!("{root}-charter"), root, scope()),
+                    TRUST_CHARTER_DIMENSION,
+                ),
+                stamp(
+                    fix_delegates_to(&format!("{root}-edge"), "drill-user", root, scope()),
+                    TRUST_ACCEPTS_DIMENSION,
+                ),
+            ] {
+                backend
+                    .put_attestation(SignedAttestation { attestation: a })
+                    .await
+                    .expect("hard legs admit");
+            }
+        }
+        // Drills: fresh / aged into the yellow band / none at all.
+        for a in [
+            drill("dg-lc", "drill-green", 1),
+            drill("dy-lc", "drill-yellow", 120),
+        ] {
+            backend
+                .put_attestation(SignedAttestation { attestation: a })
+                .await
+                .expect("drill admits");
+        }
+
+        let green = trust_root_valid(&backend, "drill-user", "drill-green")
+            .await
+            .expect("walk");
+        assert!(green.valid, "fresh drill + hard legs ⇒ valid: {green:?}");
+        assert_eq!(green.drill_freshness, DrillFreshness::Green, "{green:?}");
+        assert!(green.last_drill_at.is_some(), "the drill date is reported");
+
+        // THE ASSERTION THIS TEST EXISTS FOR — a root drilled 120 days ago
+        // still SERVES. Its trust card reads yellow; nothing is withheld.
+        let yellow = trust_root_valid(&backend, "drill-user", "drill-yellow")
+            .await
+            .expect("walk");
+        assert!(
+            yellow.valid,
+            "a stale-drilled root MUST still serve — the deadman is gone: {yellow:?}"
+        );
+        assert_eq!(yellow.drill_freshness, DrillFreshness::Yellow, "{yellow:?}");
+
+        // Never drilled: valid, and RED. `last_drill_at: None` is what
+        // distinguishes "never" from "long ago" — the band does not need a
+        // fourth variant to say it.
+        let never = trust_root_valid(&backend, "drill-user", "drill-never")
+            .await
+            .expect("walk");
+        assert!(
+            never.valid,
+            "an undrilled root still serves — governance signal, not a gate: {never:?}"
+        );
+        assert_eq!(never.drill_freshness, DrillFreshness::Red, "{never:?}");
+        assert_eq!(never.last_drill_at, None, "never drilled, and it says so");
+
+        // The HARD gates are untouched: withdraw the one edge and trust
+        // collapses, drill or no drill.
+        backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_withdraws("dg-w", "drill-user", "drill-green-edge"),
+            })
+            .await
+            .expect("withdraws admits");
+        let unrooted = trust_root_valid(&backend, "drill-user", "drill-green")
+            .await
+            .expect("walk");
+        assert!(
+            !unrooted.valid && !unrooted.edge_exists,
+            "the un-trust lever still works: {unrooted:?}"
+        );
+        assert_eq!(
+            unrooted.drill_freshness,
+            DrillFreshness::Green,
+            "…and the drill signal is reported independently of the gate"
+        );
+    }
+
+    /// v23.0.0 (CIRISPersist#551 item 2) — the three `delegates_to` jobs are
+    /// NAMED, and a mislabeled lever is refused.
+    ///
+    /// One wire type, three opposite jobs, discriminated only by direction:
+    /// charter (R→R), conferral (R→subject), trust edge (node→R). #551 cost a
+    /// session four wrong statements about the trust root, every one a "which
+    /// `delegates_to` is this?" failure made while reading the source. So the
+    /// job now rides the envelope `dimension`, and each predicate reads its
+    /// own name instead of doing direction-arithmetic.
+    ///
+    /// Three properties, in the order that makes the design legible:
+    /// 1. correctly-dimensioned rows walk exactly as before (PREFERRED);
+    /// 2. an UNDIMENSIONED row still walks (direction-inference retained —
+    ///    additive, no wire break, every pre-v23 row keeps working);
+    /// 3. a row whose dimension CONTRADICTS its direction is REFUSED by the
+    ///    predicate reading it. A mislabeled lever is worse than an
+    ///    unlabeled one: unlabeled, the reader must look at direction and
+    ///    gets it right; mislabeled, the label invites the reader to trust it.
+    #[tokio::test]
+    async fn trust_job_dimensions_named_and_contradictions_refused_551() {
+        use crate::federation::trust_root::{
+            trust_root_valid, TRUST_ACCEPTS_DIMENSION, TRUST_CHARTER_DIMENSION,
+        };
+        let backend = MemoryBackend::new();
+        for (k, it) in [
+            ("d551-user", "user"),
+            ("d551-root", "node"),
+            ("d551-plain", "node"),
+            ("d551-bad", "node"),
+            ("d551-la", "accord_holder"),
+        ] {
+            let mut rec = fix_key(k, "ref", k);
+            rec.identity_type = it.to_owned();
+            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+                &mut rec,
+            );
+            backend
+                .put_public_key(SignedKeyRecord { record: rec })
+                .await
+                .unwrap();
+        }
+        // A fresh liveness witness about `root`, so the other legs are green.
+        let lifecycle = |id: &str, about: &str| {
+            let mut lc = fix_attestation(id, "d551-la", about, "d551-la");
+            lc.attestation_envelope = serde_json::json!({
+                "id": id,
+                "dimension": crate::federation::trust_root::ACCORD_HEARTBEAT_DIMENSION,
+                "score": 1.0,
+                "confidence": 0.9,
+            });
+            lc.asserted_at = chrono::Utc::now();
+            resign_fix(&mut lc);
+            lc
+        };
+        // Stamp a job dimension onto a row built by the shared fixtures.
+        let stamp = |mut a: Attestation, dimension: &str| {
+            a.attestation_envelope["dimension"] = serde_json::json!(dimension);
+            resign_fix(&mut a);
+            a
+        };
+        let scope = || serde_json::json!(["infra:attest", "infra:serve"]);
+
+        // ── (1) CORRECTLY dimensioned: charter says charter, edge says
+        //    accepts. Every leg green.
+        for a in [
+            stamp(
+                fix_charter("d551-charter", "d551-root", scope()),
+                TRUST_CHARTER_DIMENSION,
+            ),
+            stamp(
+                fix_delegates_to("d551-edge", "d551-user", "d551-root", scope()),
+                TRUST_ACCEPTS_DIMENSION,
+            ),
+            lifecycle("d551-lc", "d551-root"),
+        ] {
+            backend
+                .put_attestation(SignedAttestation { attestation: a })
+                .await
+                .expect("(1) a job-dimensioned trust row must ADMIT — item 2 is additive");
+        }
+        let v = trust_root_valid(&backend, "d551-user", "d551-root")
+            .await
+            .expect("walk");
+        assert!(
+            v.edge_exists && v.root_self_declares && v.valid,
+            "(1) correctly-named rows walk: {v:?}"
+        );
+
+        // ── (2) UNDIMENSIONED rows still walk. This is the additive
+        //    guarantee for every row written before v23.0.0: no wire break,
+        //    no migration, no re-signing. Asserted deliberately here rather
+        //    than left to whichever fixture happened not to be stamped.
+        for a in [
+            fix_charter("d551-plaincharter", "d551-plain", scope()),
+            fix_delegates_to("d551-plainedge", "d551-user", "d551-plain", scope()),
+            lifecycle("d551-plainlc", "d551-plain"),
+        ] {
+            backend
+                .put_attestation(SignedAttestation { attestation: a })
+                .await
+                .expect("(2) an undimensioned trust row admits as it always did");
+        }
+        let plain = trust_root_valid(&backend, "d551-user", "d551-plain")
+            .await
+            .expect("walk");
+        assert!(
+            plain.edge_exists && plain.root_self_declares && plain.valid,
+            "(2) direction inference still decides an unlabeled row: {plain:?}"
+        );
+
+        // ── (3) CONTRADICTION: same shapes, labels swapped. The charter
+        //    (R→R) claims to be a trust edge; the edge (user→R) claims to be
+        //    a charter. Neither predicate may accept the row that lies to it.
+        for a in [
+            stamp(
+                fix_charter("d551-badcharter", "d551-bad", scope()),
+                TRUST_ACCEPTS_DIMENSION,
+            ),
+            stamp(
+                fix_delegates_to("d551-badedge", "d551-user", "d551-bad", scope()),
+                TRUST_CHARTER_DIMENSION,
+            ),
+            lifecycle("d551-badlc", "d551-bad"),
+        ] {
+            backend
+                .put_attestation(SignedAttestation { attestation: a })
+                .await
+                .expect("a mislabeled row still WRITES — refusal is the walk's job, not ingest's");
+        }
+        let bad = trust_root_valid(&backend, "d551-user", "d551-bad")
+            .await
+            .expect("walk");
+        assert!(
+            !bad.root_self_declares,
+            "(3) a self-loop labeled `{TRUST_ACCEPTS_DIMENSION}` is NOT a charter: {bad:?}"
+        );
+        assert!(
+            !bad.edge_exists,
+            "(3) a user→root edge labeled `{TRUST_CHARTER_DIMENSION}` is NOT a trust edge: {bad:?}"
+        );
+        assert!(!bad.valid, "(3) a mislabeled lever confers nothing");
     }
 
     /// v19.1.0 (CIRISPersist#490) — THE acceptance witness: bake the REAL
@@ -10719,7 +11007,10 @@ mod tests {
             .unwrap();
         assert!(!v.edge_exists, "local-tier edge must not count");
         assert!(!v.root_self_declares, "local-tier charter must not count");
-        assert!(!v.lifecycle_active, "local-tier lifecycle must not count");
+        assert_eq!(
+            v.last_drill_at, None,
+            "a local-tier drill row must not register as a drill"
+        );
         assert!(!v.valid, "no local-tier row satisfies the capability gate");
     }
 
@@ -10898,7 +11189,10 @@ mod tests {
             "key_id": "lift-1",
             "roles": ["infra:serve"],
         });
-        assert!(rec.roles.is_empty(), "fixture: top-level roles empty");
+        assert!(
+            rec.capability_roles.is_empty(),
+            "fixture: top-level roles empty"
+        );
         backend
             .put_public_key(SignedKeyRecord { record: rec })
             .await
@@ -11042,13 +11336,13 @@ mod tests {
     }
 
     /// v18.3.0 (CIRISPersist#484) — the exported co-scrub minting helpers
-    /// let a consumer test the `has_effective_role` ALLOW path, not just the
+    /// let a consumer test the `has_accord_conferred_role` ALLOW path, not just the
     /// deny path (the CIRISEdge#379 fail-closed-blindness fix). Same crate,
     /// so `#[cfg(test)]` reaches them; downstream reaches them via the
     /// `test-anchor` feature (`ciris_persist::federation::accord_test_support`).
     #[tokio::test]
-    async fn exported_coscrub_helpers_prove_has_effective_role_allow_and_deny_484() {
-        use crate::federation::admission::has_effective_role_over_roster;
+    async fn exported_coscrub_helpers_prove_has_accord_conferred_role_allow_and_deny_484() {
+        use crate::federation::admission::has_accord_conferred_role_over_roster;
         use crate::federation::operational::test_support::{
             register_accord_holder, signed_canonical_record, signed_canonical_record_with_roles,
             Identity,
@@ -11071,7 +11365,7 @@ mod tests {
         let env = serde_json::json!({ "key_id": "canon-484", "purpose": "test" });
 
         // ALLOW: a genuinely co-scrubbed record claiming infra:serve, signed
-        // by 2 distinct holders → has_effective_role == true.
+        // by 2 distinct holders → has_accord_conferred_role == true.
         let allow = signed_canonical_record_with_roles(
             "canon-484",
             "node",
@@ -11084,10 +11378,10 @@ mod tests {
             .await
             .expect("co-scrubbed record admits");
         assert!(
-            has_effective_role_over_roster(&backend, "canon-484", "infra:serve", &roster)
+            has_accord_conferred_role_over_roster(&backend, "canon-484", "infra:serve", &roster)
                 .await
                 .unwrap(),
-            "(484) genuinely co-scrubbed record → has_effective_role ALLOW"
+            "(484) genuinely co-scrubbed record → has_accord_conferred_role ALLOW"
         );
 
         // DENY: a record with the SAME role claim but NO co-scrub (only a
@@ -11105,9 +11399,14 @@ mod tests {
             .await
             .expect("self-scrubbed record still stores");
         assert!(
-            !has_effective_role_over_roster(&backend, "canon-484-self", "infra:serve", &roster)
-                .await
-                .unwrap(),
+            !has_accord_conferred_role_over_roster(
+                &backend,
+                "canon-484-self",
+                "infra:serve",
+                &roster
+            )
+            .await
+            .unwrap(),
             "(484) self-asserted role with no accord co-scrub → DENY"
         );
 
@@ -11131,7 +11430,7 @@ mod tests {
 
     /// v21.15.0 (CIRISPersist#536) — the trust-root fixture parity body on
     /// MemoryBackend (the same one sqlite + postgres run). establish_trust_root
-    /// stands up all four legs (incl. the reserved accord:lifecycle) + the
+    /// stands up all four legs (incl. the reserved heartbeat) + the
     /// scope edge, and the capability walk roots the subject's infra:serve.
     #[tokio::test]
     async fn trust_root_helper_works_on_memory_536() {
@@ -11175,7 +11474,8 @@ mod tests {
     #[tokio::test]
     async fn canonical_record_with_infra_serve_role_admits_and_reads_both_480() {
         use crate::federation::admission::{
-            check_canonical_role_admission_over_roster_legacy, has_effective_role_over_roster,
+            check_canonical_role_admission_over_roster_legacy,
+            has_accord_conferred_role_over_roster,
         };
         use crate::federation::operational::test_support::{
             register_accord_holder, signed_canonical_record_with_roles, Identity,
@@ -11223,7 +11523,7 @@ mod tests {
             st.federation_keys.insert(stored.key_id.clone(), stored);
         }
         assert!(
-            has_effective_role_over_roster(
+            has_accord_conferred_role_over_roster(
                 &backend,
                 "ciris-canonical-test-480",
                 identity_type::CANONICAL,
@@ -11234,7 +11534,7 @@ mod tests {
             "(480) canonical role reads effective"
         );
         assert!(
-            has_effective_role_over_roster(
+            has_accord_conferred_role_over_roster(
                 &backend,
                 "ciris-canonical-test-480",
                 "infra:serve",
