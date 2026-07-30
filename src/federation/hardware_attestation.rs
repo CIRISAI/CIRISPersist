@@ -11,7 +11,11 @@
 //! policy. Persist's
 //! [`HardwareAttestationPolicy`] is that policy.
 //!
-//! Persist's verdict for an `accord_holder` row =
+//! Persist's verdict for an `accord_holder` row depends on WHICH custody
+//! story the evidence tells — see [`AttestationEvidence`]'s three arms.
+//!
+//! For [`AttestationEvidence::Hardware`] (attested against a fresh
+//! per-request nonce) =
 //!
 //! 1. `attestation_evidence` is present, non-null, deserializes as
 //!    `(PlatformAttestation, nonce_captured_at)`.
@@ -23,6 +27,13 @@
 //!    PCR values + manufacturer + discrete-vs-firmware flag).
 //! 4. The captured nonce is fresh (`now - nonce_captured_at ≤
 //!    max_nonce_age`).
+//!
+//! For [`AttestationEvidence::GenerationCustody`] (v23.1.0,
+//! CIRISPersist#554 — the device attests at key GENERATION, so there is no
+//! nonce and nothing to age) the verdict is the contract identity, the
+//! holder identity binding, the tier allowlist, and the sha256 certificate
+//! commitments — enumerated in full, together with what it deliberately
+//! defers and why, on `HardwareAttestationPolicy::check_generation_custody`.
 //!
 //! Persist does NOT do active chain validation (cert-chain to
 //! Google root for Android, EK cert validation for TPM, JWT-verify
@@ -91,7 +102,22 @@ pub struct HardwareAttestationPolicy {
     /// attestations are rejected; this defeats replay of an old
     /// attestation against a new key-binding event. Default:
     /// [`DEFAULT_MAX_NONCE_AGE`].
+    ///
+    /// Applies to [`AttestationEvidence::Hardware`] ONLY — see
+    /// [`Self::accepted_custody_tiers`] for why an
+    /// attestation-at-generation has no nonce to age.
     pub max_nonce_age: Duration,
+    /// v23.1.0 (CIRISPersist#554) — the custody tiers accepted on the
+    /// [`AttestationEvidence::GenerationCustody`] arm. Default:
+    /// `{"portable_2fa"}` (the HUMANITY_ACCORD holder custody a YubiKey
+    /// PIV slot-9c ceremony produces).
+    ///
+    /// `custody_tier` is a holder SELF-CLAIM, so it is allowlisted rather
+    /// than echoed — the same shape as [`Self::accepted_hardware_types`],
+    /// and the same reason: a consumer that gates on tier must never
+    /// inherit an unbounded unverified string. Deployments tighten or
+    /// widen by mutating the set.
+    pub accepted_custody_tiers: HashSet<String>,
 }
 
 impl Default for HardwareAttestationPolicy {
@@ -120,6 +146,14 @@ impl Default for HardwareAttestationPolicy {
         Self {
             accepted_hardware_types: accepted.into_iter().collect(),
             max_nonce_age: DEFAULT_MAX_NONCE_AGE,
+            // v23.1.0 (CIRISPersist#554) — the tier the real ceremony
+            // asserts. Sourced from verify's const so persist and the
+            // producer cannot drift on the spelling.
+            accepted_custody_tiers: [
+                ciris_verify_core::accord_custody_attestation::CUSTODY_TIER_PORTABLE_2FA.to_owned(),
+            ]
+            .into_iter()
+            .collect(),
         }
     }
 }
@@ -147,17 +181,37 @@ impl Default for HardwareAttestationPolicy {
 /// a fixture (which would have quietly certified the hardware path — the
 /// AV-77 class).
 ///
-/// Untagged: a hardware body deserializes as [`Self::Hardware`]; the exact
-/// two-field marker (and nothing else — `deny_unknown_fields`) as
+/// Untagged: a hardware body deserializes as [`Self::Hardware`]; a signed
+/// custody CEG object as [`Self::GenerationCustody`]; the exact two-field
+/// marker (and nothing else — `deny_unknown_fields`) as
 /// [`Self::SoftwareOnlyTest`]. The marker's ADMISSIBILITY is decided in
 /// [`HardwareAttestationPolicy::check`], never by parsing: it admits ONLY
 /// under a live test anchor, and its production refusal is typed and loud —
 /// "honest about what it is" is now a type, not a convention.
+///
+/// v23.1.0 (CIRISPersist#554) — **#545 one layer out.** #545 was: the type
+/// could not represent the honest software-test marker, so persist refused its
+/// own *synthesized* holders. #554 is the same failure with real hardware: the
+/// type could not represent the custody evidence a real ceremony produces —
+/// a **PIV attestation over a YubiKey slot-9c key**, which has no nonce
+/// challenge because the device attests at key GENERATION, not per request —
+/// so persist refused its own *production* holders. Both were invisible until
+/// adoption because no fixture had ever fed persist evidence it had not
+/// synthesized to satisfy itself.
+///
+/// The parse admits the SHAPE; [`HardwareAttestationPolicy::check`] decides
+/// admissibility. That split is #545's whole point and is preserved here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AttestationEvidence {
-    /// Real platform custody evidence — the only production-admissible arm.
+    /// Real platform custody evidence, attested against a fresh per-request
+    /// nonce (TPM / Secure Enclave / Android Keystore).
     Hardware(Box<HardwareCustodyEvidence>),
+    /// v23.1.0 (CIRISPersist#554) — custody attested at key GENERATION: the
+    /// device signs the attestation when the key is created, so there is no
+    /// nonce and nothing to age. YubiKey PIV slot-9c today; the same shape
+    /// fits any device that attests at generation rather than per nonce.
+    GenerationCustody(Box<GenerationCustodyAttestation>),
     /// The test-anchor genesis marker (CIRISVerify#202's
     /// `accord_custody_attestation` admits the same tier under the same
     /// condition). Never admissible without a live test anchor.
@@ -174,6 +228,84 @@ pub struct HardwareCustodyEvidence {
     /// When Verify captured the nonce challenge. Persist checks
     /// freshness against [`HardwareAttestationPolicy::max_nonce_age`].
     pub nonce_captured_at: DateTime<Utc>,
+}
+
+/// v23.1.0 (CIRISPersist#554) — the attestation-at-generation arm's body: the
+/// signed CEG object a custody ceremony emits (CIRISVerify#202's
+/// `accord_custody_attestation`, produced by
+/// `produce_accord_custody_attestation`).
+///
+/// # Why no `deny_unknown_fields`
+///
+/// The ceremony format is CIRISVerify's, not persist's, and it may GROW —
+/// pinning it closed here would make persist refuse a valid future artifact
+/// for carrying a field it does not read. The binding is done the other way
+/// round: every field persist actually gates on is REQUIRED and strictly
+/// typed, so a body that omits or mistypes one fails the parse, while an
+/// additive field rides through untouched. The `schema` id is pinned in
+/// policy (a schema CHANGE is a contract change persist must adopt
+/// consciously, not absorb silently).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationCustodyAttestation {
+    /// Relay-envelope schema tag — [`ciris_verify_core::ceg_outbox::SCHEMA`].
+    pub schema: String,
+    /// The CEG object kind; must be
+    /// [`ciris_verify_core::accord_custody_attestation::ACCORD_CUSTODY_ATTESTATION_KIND`].
+    pub kind: String,
+    /// The signing identity's federation `key_id`.
+    pub key_id: String,
+    /// RFC-3339 creation timestamp.
+    pub created_at: String,
+    /// The custody object.
+    pub body: GenerationCustodyBody,
+}
+
+/// The custody object: the holder-signed envelope plus the hash-bound
+/// attestation certificates.
+///
+/// The certificates ride here UNSIGNED and are bound to the holder's signature
+/// only through the sha256 commitments inside
+/// [`GenerationCustodyEnvelope`] — CIRISVerify#113's design, because a YubiKey's
+/// single-part `CKM_EDDSA` input is bounded and a multi-KB inline cert chain
+/// overran it. That indirection is exactly why persist recomputes the
+/// commitments: without it the certs would be free-floating attacker-editable
+/// bytes sitting next to a valid signature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationCustodyBody {
+    /// The envelope the holder hybrid-signed.
+    pub signed_envelope: GenerationCustodyEnvelope,
+    /// Ed25519 over the JCS bytes of `signed_envelope`, base64.
+    pub ed25519_signature_base64: String,
+    /// ML-DSA-65 over the bound preimage, base64. Optional on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mldsa65_signature_base64: Option<String>,
+    /// The slot-9c attestation certificate DER, hex.
+    pub yubikey_piv_attestation_9c_hex: String,
+    /// Each chain certificate DER, hex, leaf-first (excluding the pinned root).
+    pub yubikey_attestation_chain_hex: Vec<String>,
+}
+
+/// The holder-signed custody envelope. Every field here is inside the
+/// signature; the sha256 fields are the commitments that bind
+/// [`GenerationCustodyBody`]'s certificate hex to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationCustodyEnvelope {
+    /// The asserted custody tier — a SELF-CLAIM, allowlisted in policy against
+    /// [`HardwareAttestationPolicy::accepted_custody_tiers`].
+    pub custody_tier: String,
+    /// The holder this attestation is about; bound to the row's `key_id`.
+    pub holder_key_id: String,
+    /// The holder's Ed25519 public key, base64.
+    pub ed25519_public_key_base64: String,
+    /// Hex sha256 of the holder's ML-DSA-65 public key (committed, not inline
+    /// — the 1952-byte key would overrun the hardware Ed25519 preimage).
+    pub mldsa65_public_key_sha256: String,
+    /// Hex sha256 of the slot-9c attestation certificate DER.
+    pub yubikey_piv_attestation_9c_sha256: String,
+    /// Hex sha256 of each chain certificate DER, leaf-first.
+    pub yubikey_attestation_chain_sha256: Vec<String>,
+    /// RFC-3339 instant the holder signed this envelope.
+    pub signed_at: String,
 }
 
 /// Exactly `{"tier":"SoftwareOnly_TEST","test_anchor":true}` — the genesis
@@ -276,6 +408,10 @@ impl HardwareAttestationPolicy {
                         .into(),
                 });
             }
+            // v23.1.0 (CIRISPersist#554) — the attestation-at-generation arm.
+            AttestationEvidence::GenerationCustody(att) => {
+                return self.check_generation_custody(key_id, &att);
+            }
             AttestationEvidence::Hardware(hw) => *hw,
         };
 
@@ -319,6 +455,213 @@ impl HardwareAttestationPolicy {
 
         Ok(())
     }
+
+    /// v23.1.0 (CIRISPersist#554) — the admissibility decision for
+    /// [`AttestationEvidence::GenerationCustody`].
+    ///
+    /// # What this verifies
+    ///
+    /// 1. `schema` is the pinned CEG relay-envelope schema and `kind` is
+    ///    exactly `accord_holder_custody_attestation` — the contract identity.
+    /// 2. Identity binding: the signed envelope's `holder_key_id` equals the
+    ///    row's `key_id`, and the object's own `key_id` agrees with it. A
+    ///    holder cannot present another holder's custody attestation.
+    /// 3. `custody_tier` is in [`Self::accepted_custody_tiers`] — the tier is a
+    ///    self-claim, so it is allowlisted, never echoed.
+    /// 4. [`HardwareType::ExternalSecureElement`] is in
+    ///    [`Self::accepted_hardware_types`]. This arm asserts §9.4 external-
+    ///    secure-element custody, so a deployment that has removed that class
+    ///    must not get it admitted through a side door.
+    /// 5. The **sha256 commitment bindings**: the certificate DERs ride
+    ///    UNSIGNED in `body`, bound to the holder's signature only through the
+    ///    sha256 fields inside the signed envelope. Persist recomputes every
+    ///    one — leaf and each chain element, with matching lengths. Without
+    ///    this the certs would be attacker-editable bytes next to a valid
+    ///    signature.
+    /// 6. The chain is non-empty and `signed_at` parses as RFC 3339.
+    ///
+    /// # What this does NOT verify, and why
+    ///
+    /// Not checked here: the holder's hybrid signature over the envelope, the
+    /// X.509 path `9c → f9 → pinned Yubico root`, that the attested key IS the
+    /// holder's federation Ed25519 key, and the FIPS / touch-policy floor.
+    ///
+    /// `ciris_verify_core::accord_custody_attestation::verify_accord_custody_attestation`
+    /// does all four — but it requires two inputs this call site does not have:
+    /// the holder's **directory-resolved** `ThresholdMember` pubkeys, and a
+    /// **pinned Yubico attestation root**. Verify deliberately does not ship
+    /// the latter ("verify provides the verification, not the trust root"), and
+    /// [`Self::check`]'s signature is `(key_id, evidence, now)` — it holds
+    /// neither. Verifying the signature against the pubkey carried *inside the
+    /// same envelope* would be self-referential: it would prove the object is
+    /// internally consistent, not that it belongs to the key being admitted.
+    /// Fake depth is worse than declared depth, so persist does the bindings it
+    /// can do honestly and says plainly what it defers.
+    ///
+    /// This is the SAME depth the [`AttestationEvidence::Hardware`] arm has
+    /// always had (see the module header: persist does not do active chain
+    /// validation; that is the registry-side / CIRISVerify#32 Ask 5 surface).
+    /// The full chain walk runs where the pinned root lives — CIRISServer's
+    /// admission gate — and persist's storage of the evidence preserves the
+    /// audit trail either way.
+    ///
+    /// # No freshness check — deliberately
+    ///
+    /// There is no nonce to age. The device attests at key GENERATION, once,
+    /// and the artifact is durable by design: a ceremony run in June is still
+    /// the custody proof in December. Re-checking a generation-time timestamp
+    /// against `max_nonce_age` at every boot would refuse the trust root for
+    /// the crime of being old — a category error, and the reason the SQL
+    /// backends grew a separate seeding door in the first place.
+    fn check_generation_custody(
+        &self,
+        key_id: &str,
+        att: &GenerationCustodyAttestation,
+    ) -> Result<(), Error> {
+        use ciris_verify_core::accord_custody_attestation::ACCORD_CUSTODY_ATTESTATION_KIND;
+        use ciris_verify_core::ceg_outbox::SCHEMA as CEG_SCHEMA;
+
+        // Every refusal below is TYPED and names the failing check. A custody
+        // decision that reads as "malformed" teaches an operator nothing — the
+        // #545 lesson, which is what let #554 hide for a whole ceremony.
+        let refuse = |detail: String| Error::AccordHolderRequiresAttestationEvidence {
+            key_id: key_id.to_owned(),
+            detail,
+        };
+
+        // 1. Contract identity.
+        if att.schema != CEG_SCHEMA {
+            return Err(refuse(format!(
+                "custody attestation schema {:?} is not the recognized {CEG_SCHEMA:?} — \
+                 a schema change is a contract change persist must adopt consciously",
+                att.schema
+            )));
+        }
+        if att.kind != ACCORD_CUSTODY_ATTESTATION_KIND {
+            return Err(refuse(format!(
+                "custody attestation kind {:?} is not {ACCORD_CUSTODY_ATTESTATION_KIND:?}",
+                att.kind
+            )));
+        }
+
+        let env = &att.body.signed_envelope;
+
+        // 2. Identity binding — the signed self-claim must be about THIS row.
+        if env.holder_key_id != key_id {
+            return Err(refuse(format!(
+                "custody attestation holder_key_id {:?} does not match the row key_id \
+                 {key_id:?} — a holder cannot present another holder's custody proof",
+                env.holder_key_id
+            )));
+        }
+        if att.key_id != env.holder_key_id {
+            return Err(refuse(format!(
+                "custody attestation object key_id {:?} disagrees with its signed \
+                 holder_key_id {:?}",
+                att.key_id, env.holder_key_id
+            )));
+        }
+
+        // 3. Tier allowlist.
+        if !self.accepted_custody_tiers.contains(&env.custody_tier) {
+            let mut accepted: Vec<&str> = self
+                .accepted_custody_tiers
+                .iter()
+                .map(String::as_str)
+                .collect();
+            accepted.sort_unstable();
+            return Err(refuse(format!(
+                "custody_tier {:?} is not accepted (accepted: {accepted:?})",
+                env.custody_tier
+            )));
+        }
+
+        // 4. The hardware class this arm asserts must itself be policy-accepted.
+        if !self
+            .accepted_hardware_types
+            .contains(&HardwareType::ExternalSecureElement)
+        {
+            return Err(Error::HardwareTypeNotAccepted {
+                got: format!("{:?}", HardwareType::ExternalSecureElement),
+                accepted: {
+                    let mut a: Vec<String> = self
+                        .accepted_hardware_types
+                        .iter()
+                        .map(|t| format!("{t:?}"))
+                        .collect();
+                    a.sort();
+                    a
+                },
+            });
+        }
+
+        // 5. Structural floor: an empty chain proves nothing.
+        if att.body.yubikey_attestation_chain_hex.is_empty() {
+            return Err(refuse(
+                "custody attestation carries an EMPTY attestation chain — a leaf with \
+                 no path above it is not custody evidence"
+                    .into(),
+            ));
+        }
+        if att.body.yubikey_attestation_chain_hex.len()
+            != env.yubikey_attestation_chain_sha256.len()
+        {
+            return Err(refuse(format!(
+                "yubikey_attestation_chain: {} evidence cert(s) but {} signed sha256 \
+                 commitment(s) — the lists must correspond element for element",
+                att.body.yubikey_attestation_chain_hex.len(),
+                env.yubikey_attestation_chain_sha256.len()
+            )));
+        }
+
+        // 6. The sha256 bindings — the cheap, honest integrity link between the
+        // unsigned certificate bytes and the signed envelope.
+        let der_9c = hex::decode(&att.body.yubikey_piv_attestation_9c_hex)
+            .map_err(|e| refuse(format!("yubikey_piv_attestation_9c_hex is not hex: {e}")))?;
+        if !sha256_hex(&der_9c).eq_ignore_ascii_case(&env.yubikey_piv_attestation_9c_sha256) {
+            return Err(refuse(
+                "yubikey_piv_attestation_9c: the certificate does not match its signed \
+                 sha256 commitment — the evidence was altered after signing"
+                    .into(),
+            ));
+        }
+        for (i, (hex_der, commitment)) in att
+            .body
+            .yubikey_attestation_chain_hex
+            .iter()
+            .zip(env.yubikey_attestation_chain_sha256.iter())
+            .enumerate()
+        {
+            let der = hex::decode(hex_der).map_err(|e| {
+                refuse(format!(
+                    "yubikey_attestation_chain_hex[{i}] is not hex: {e}"
+                ))
+            })?;
+            if !sha256_hex(&der).eq_ignore_ascii_case(commitment) {
+                return Err(refuse(format!(
+                    "yubikey_attestation_chain[{i}]: the certificate does not match its \
+                     signed sha256 commitment — the evidence was altered after signing"
+                )));
+            }
+        }
+
+        // 7. The generation instant must be a real instant (not aged — see the
+        // "No freshness check" note above).
+        DateTime::parse_from_rfc3339(&env.signed_at).map_err(|e| {
+            refuse(format!(
+                "custody attestation signed_at {:?} is not RFC 3339: {e}",
+                env.signed_at
+            ))
+        })?;
+
+        Ok(())
+    }
+}
+
+/// Hex sha256 — the certificate commitment encoding (CIRISVerify#113).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// Derive the [`HardwareType`] from a [`PlatformAttestation`] variant.
@@ -830,6 +1173,140 @@ mod tests {
             }
             other => panic!("expected AttestationEvidenceIncomplete, got {other:?}"),
         }
+    }
+
+    /// A minimal-but-valid generation-custody value, with cert hex whose
+    /// sha256 commitments are computed (not pasted) so the bindings hold.
+    fn generation_custody_value(holder: &str, tier: &str) -> serde_json::Value {
+        let leaf = [0x30u8, 0x82, 0x01, 0x00];
+        let chain = [0x30u8, 0x82, 0x02, 0x00];
+        serde_json::json!({
+            "schema": ciris_verify_core::ceg_outbox::SCHEMA,
+            "kind": ciris_verify_core::accord_custody_attestation::ACCORD_CUSTODY_ATTESTATION_KIND,
+            "key_id": holder,
+            "created_at": "2026-06-23T03:16:34Z",
+            "body": {
+                "signed_envelope": {
+                    "custody_tier": tier,
+                    "holder_key_id": holder,
+                    "ed25519_public_key_base64": "HMxA7KlgwUn5oWQlufB4aeFouTmFGsTILNphe0E3KlM=",
+                    "mldsa65_public_key_sha256": sha256_hex(b"mldsa"),
+                    "yubikey_piv_attestation_9c_sha256": sha256_hex(&leaf),
+                    "yubikey_attestation_chain_sha256": [sha256_hex(&chain)],
+                    "signed_at": "2026-06-23T03:16:34Z",
+                },
+                "ed25519_signature_base64": "AA==",
+                "mldsa65_signature_base64": "AA==",
+                "yubikey_piv_attestation_9c_hex": hex::encode(leaf),
+                "yubikey_attestation_chain_hex": [hex::encode(chain)],
+            }
+        })
+    }
+
+    /// #554 — **untagged variant discrimination.** Adding a third arm to an
+    /// untagged enum is exactly where one arm silently swallows another's
+    /// payload. Pin that each shape still lands where it belongs: a hardware
+    /// body is `Hardware`, a custody object is `GenerationCustody`, the marker
+    /// is `SoftwareOnlyTest` — and none of them is reachable from the others.
+    #[test]
+    fn the_three_arms_do_not_capture_each_others_payloads_554() {
+        let hw = serde_json::to_value(AttestationEvidence::Hardware(Box::new(
+            HardwareCustodyEvidence {
+                platform_attestation: android_full(),
+                nonce_captured_at: Utc::now(),
+            },
+        )))
+        .unwrap();
+        let custody = generation_custody_value("A1", "portable_2fa");
+        let marker = serde_json::json!({"tier": "SoftwareOnly_TEST", "test_anchor": true});
+
+        assert!(matches!(
+            serde_json::from_value::<AttestationEvidence>(hw).unwrap(),
+            AttestationEvidence::Hardware(_)
+        ));
+        assert!(matches!(
+            serde_json::from_value::<AttestationEvidence>(custody).unwrap(),
+            AttestationEvidence::GenerationCustody(_)
+        ));
+        assert!(matches!(
+            serde_json::from_value::<AttestationEvidence>(marker).unwrap(),
+            AttestationEvidence::SoftwareOnlyTest(_)
+        ));
+    }
+
+    /// #554 — a custody attestation is NOT aged. The device attests at key
+    /// GENERATION, so the artifact is durable by design: a ceremony run years
+    /// ago is still the custody proof today. Refusing the trust root for being
+    /// old is the category error `max_nonce_age` must not commit here.
+    #[test]
+    fn generation_custody_is_not_subject_to_nonce_freshness_554() {
+        let p = HardwareAttestationPolicy::default();
+        let v = generation_custody_value("A1", "portable_2fa");
+        // Ten years on — the Hardware arm would have refused this at 24h.
+        let much_later = Utc::now() + chrono::Duration::days(3650);
+        p.check("A1", Some(&v), much_later)
+            .expect("#554: an attestation-at-generation has no nonce to age");
+    }
+
+    /// #554 — the tier allowlist is policy, so a deployment can tighten it and
+    /// the previously-admitted tier is then refused BY NAME.
+    #[test]
+    fn tightening_accepted_custody_tiers_refuses_the_tier_by_name_554() {
+        let mut p = HardwareAttestationPolicy::default();
+        p.accepted_custody_tiers.clear();
+        let v = generation_custody_value("A1", "portable_2fa");
+        let err = p.check("A1", Some(&v), Utc::now()).unwrap_err();
+        assert!(
+            format!("{err}").contains("portable_2fa"),
+            "#554: the refusal must name the tier: {err}"
+        );
+    }
+
+    /// #554 — the §9.4 hardware class this arm asserts is itself policy-gated:
+    /// dropping `ExternalSecureElement` must not leave a side door open.
+    #[test]
+    fn generation_custody_respects_accepted_hardware_types_554() {
+        let mut p = HardwareAttestationPolicy::default();
+        p.accepted_hardware_types
+            .remove(&HardwareType::ExternalSecureElement);
+        let v = generation_custody_value("A1", "portable_2fa");
+        let err = p.check("A1", Some(&v), Utc::now()).unwrap_err();
+        match err {
+            Error::HardwareTypeNotAccepted { got, .. } => {
+                assert_eq!(got, "ExternalSecureElement");
+            }
+            other => panic!("#554: expected HardwareTypeNotAccepted, got {other:?}"),
+        }
+    }
+
+    /// #554 — an empty attestation chain is refused: a leaf with no path above
+    /// it is not custody evidence, and the sha256 loop would otherwise pass
+    /// vacuously.
+    #[test]
+    fn generation_custody_with_empty_chain_is_refused_554() {
+        let p = HardwareAttestationPolicy::default();
+        let mut v = generation_custody_value("A1", "portable_2fa");
+        v["body"]["yubikey_attestation_chain_hex"] = serde_json::json!([]);
+        v["body"]["signed_envelope"]["yubikey_attestation_chain_sha256"] = serde_json::json!([]);
+        let err = p.check("A1", Some(&v), Utc::now()).unwrap_err();
+        assert!(
+            format!("{err}").contains("EMPTY attestation chain"),
+            "#554: {err}"
+        );
+    }
+
+    /// #554 — an unrecognized `schema` is a contract change, refused by name
+    /// rather than absorbed silently.
+    #[test]
+    fn generation_custody_with_unknown_schema_is_refused_554() {
+        let p = HardwareAttestationPolicy::default();
+        let mut v = generation_custody_value("A1", "portable_2fa");
+        v["schema"] = serde_json::json!("ciris.ceg.signed-object.v99");
+        let err = p.check("A1", Some(&v), Utc::now()).unwrap_err();
+        assert!(
+            format!("{err}").contains("v99"),
+            "#554: the refusal must name the schema it got: {err}"
+        );
     }
 
     #[test]

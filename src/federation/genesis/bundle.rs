@@ -236,6 +236,47 @@ where
             distinct.len()
         )));
     }
+
+    // v23.1.0 (CIRISPersist#554) — **one verdict for one artifact.** The
+    // carried holder records are cross-check input, never the quorum
+    // authority (above) — but they ARE what a consumer installs, so their
+    // evidence must clear the SAME gate `put_public_key` runs. One predicate,
+    // one impl.
+    //
+    // Before this, the two validators disagreed about the same bytes: this
+    // function passed the production bundle — structure, signatures, 2-of-3
+    // quorum all green — while the put gate refused every holder it carried
+    // as `malformed`. A producer got a green light and shipped an artifact
+    // that could not install, and the refusal surfaced at ingest with no hint
+    // that the verifier and the gate disagreed about what a valid holder
+    // record even is. A verifier whose "valid" does not mean "installable" is
+    // worse than no verifier: it converts a loud producer-side failure into a
+    // silent consumer-side one.
+    let policy = directory.hardware_attestation_policy();
+    let now = chrono::Utc::now();
+    for holder in &bundle.holders {
+        if !holder
+            .record
+            .claims_role(crate::federation::types::identity_type::ACCORD_HOLDER)
+        {
+            continue;
+        }
+        policy
+            .check(
+                &holder.record.key_id,
+                holder.record.attestation_evidence.as_ref(),
+                now,
+            )
+            .map_err(|e| {
+                refuse(format!(
+                    "holder {}: custody evidence would be REFUSED at install time \
+                     ({}: {e}) — a bundle that verifies must be a bundle that installs",
+                    holder.record.key_id,
+                    e.kind()
+                ))
+            })?;
+    }
+
     Ok(distinct.len())
 }
 

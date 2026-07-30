@@ -1746,6 +1746,17 @@ fn mem_scores_row_matches(
 
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for MemoryBackend {
+    // v23.1.0 (CIRISPersist#554) — surface THIS backend's configured policy on
+    // the trait so `genesis::verify_bundle_quorum` gates holder evidence with
+    // the same predicate `put_public_key` uses. Delegates to the inherent
+    // method (the single source of truth); a tightened deployment tightens
+    // both validators at once.
+    fn hardware_attestation_policy(
+        &self,
+    ) -> std::sync::Arc<crate::federation::HardwareAttestationPolicy> {
+        MemoryBackend::hardware_attestation_policy(self)
+    }
+
     async fn put_public_key(
         &self,
         record: crate::federation::SignedKeyRecord,

@@ -5,6 +5,127 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [23.1.0] — 2026-07-30 — #554: the mesh's first production trust root is in the tree
+
+**The genesis ceremony ran on hardware, and persist refused its own accord holders.**
+
+A1/B1/C1 on FIPS YubiKeys, 2-of-3 co-scrub, chartering `ciris-canonical-1-d7bdeu223k` with
+`infra:serve`. The bundle verified. Then `put_public_key` rejected holder A1 with
+`malformed: data did not match any variant of untagged enum AttestationEvidence`, and the
+production custody path turned out to be unrepresentable.
+
+**This is CIRISPersist#545 one layer out.** #545 was: the evidence type could not represent the
+honest software-test marker, so persist refused its own *synthesized* holders. This is the same
+failure with real hardware — the type could not represent what a real device produces, so persist
+refused its own *production* holders. `PlatformAttestation` is the TPM/Secure-Enclave shape from
+`attestation_with_nonce(challenge)`; a YubiKey PIV slot-9c attestation has no nonce, because the
+device attests at key **generation**, not per request. There was no way to say it.
+
+The lesson is the one worth keeping: **no test had ever fed persist a real YubiKey custody
+attestation.** Every accord-holder fixture in the crate used evidence synthesized to satisfy the
+gate, which is why #545 and #554 both survived to a live ceremony. A gate proven only against
+evidence written to satisfy it is not proven. `tests/accord_holder_real_custody.rs` now feeds it
+the real captured artifact, on memory, sqlite and postgres.
+
+### 1 — `AttestationEvidence::GenerationCustody` — attestation at key generation
+
+A third arm for devices that attest when the key is created rather than per nonce. Named for what
+it is, not for the vendor: YubiKey PIV today, the same shape for anything with the same custody
+story. The wire shape is CIRISVerify#202's `accord_custody_attestation` — a signed CEG object
+carrying the holder-signed envelope plus the hash-bound certificate chain.
+
+No `deny_unknown_fields`: the ceremony format is CIRISVerify's and may grow, and refusing a valid
+future artifact for carrying a field persist does not read would be the same class of defect one
+generation later. Instead every field persist gates on is required and strictly typed — additive
+fields ride through, missing ones fail the parse.
+
+Parse admits the shape; **policy decides admissibility** (the #545 doctrine, preserved). What
+`HardwareAttestationPolicy::check` verifies on this arm, exactly:
+
+- `schema` and `kind` pinned — a schema change is a contract change persist adopts consciously
+- the envelope's `holder_key_id` equals the row's `key_id` (a holder cannot present another
+  holder's custody proof), and the object's own `key_id` agrees with it
+- `custody_tier` allowlisted via the new `accepted_custody_tiers` (default `{portable_2fa}`) —
+  the tier is a self-claim, so it is allowlisted, never echoed
+- `ExternalSecureElement` is in `accepted_hardware_types` — this arm asserts §9.4 custody, so a
+  deployment that dropped that class does not get it back through a side door
+- **the sha256 commitment bindings**: the certificates ride unsigned in the body, bound to the
+  holder's signature only through the sha256 fields inside the signed envelope (CIRISVerify#113
+  put them there because a YubiKey's single-part EdDSA input is bounded). Persist recomputes every
+  one, leaf and chain, lengths included — without it those certs are attacker-editable bytes next
+  to a valid signature
+- non-empty chain; `signed_at` parses as RFC 3339
+
+**And what it does not verify, stated plainly**: the holder's hybrid signature over the envelope,
+the X.509 path `9c → f9 → pinned Yubico root`, that the attested key IS the holder's federation
+key, and the FIPS/touch floor. `ciris_verify_core::accord_custody_attestation::verify_accord_custody_attestation`
+does all four — but it needs the holder's *directory-resolved* pubkeys and a **pinned Yubico
+attestation root**, and verify deliberately ships neither ("verify provides the verification, not
+the trust root"). `check(key_id, evidence, now)` holds neither. Verifying the signature against
+the pubkey carried inside the same envelope would be self-referential — proof the object is
+internally consistent, not that it belongs to the key being admitted. This is the same depth the
+`Hardware` arm has always had, and the full walk runs where the pinned root lives. Fake depth is
+worse than declared depth.
+
+**No freshness check on this arm, deliberately.** There is no nonce to age; a ceremony run in June
+is still the custody proof in December. Aging a generation-time timestamp would refuse the trust
+root for being old.
+
+Refusals are typed and name the failing check — never bare `malformed`. A custody decision that
+reads as a parser bug is what let this hide for a whole ceremony.
+
+### 2 — one verdict for one artifact: the two validators agreed to disagree
+
+`verify_bundle_quorum` **passed** the production bundle — structure, signatures, 2-of-3 quorum all
+green — while `put_public_key` **refused** the same bytes. A producer running the bundle verifier
+got a green light and shipped an artifact that could not install, and the refusal surfaced at
+ingest with no hint that the verifier and the gate disagreed about what a valid holder record is.
+
+The verifier now runs holder-evidence admissibility through the **same** `HardwareAttestationPolicy::check`
+the put gate uses — one predicate, one impl. A bundle that verifies is a bundle that installs.
+
+`FederationDirectory::hardware_attestation_policy()` is new (default-bodied, additive) so the
+verifier reaches the directory's *configured* policy rather than `default()` — a deployment that
+tightened its accepted set tightens both validators at once, or the disagreement just returns in
+another form.
+
+This case is sharper than it looks: `authorization_digest` covers holder `key_id`s, not their
+evidence, so tampering with a holder's custody attestation leaves the quorum signatures perfectly
+valid. A verifier whose "valid" does not mean "installable" converts a loud producer-side failure
+into a silent consumer-side one.
+
+### 3 — the bake
+
+`canonical_seed.json` is the real artifact, `sha256
+5c474b7993d0c148336da47fd7958baa0a0840521faaf0c2d534a2df9e766972` (112,512 bytes). v23.0.0 shipped
+a bundle-shaped **placeholder** — `holders 0, attestations 0, authorizations 0` — the right type
+with no content. All four planes are now populated: holders A1/B1/C1 with real custody evidence,
+the re-blessed canonical serve node, the delegation plane (charter + serve grant + lifecycle), and
+the A1+B1 hybrid authorizations.
+
+`embedded_seed_is_a_genesis_bundle_551` now asserts that **content**, not just the shape. Every
+assertion it made before was satisfied by emptiness — a test that passes on a placeholder cannot
+tell you the bake happened, so a regression to one now fails loudly.
+
+The carried `holders` remain cross-check input, never the verification authority: the roster is
+still the separately-baked `accord_holder_genesis_records`, and `verify_bundle_quorum` re-derives
+authority from persist's own state (the #377 lesson). The two lists agree here because they are
+the same ceremony's output.
+
+### Added
+
+- `AttestationEvidence::GenerationCustody(Box<GenerationCustodyAttestation>)` + the
+  `GenerationCustodyAttestation` / `GenerationCustodyBody` / `GenerationCustodyEnvelope` shapes
+- `HardwareAttestationPolicy::accepted_custody_tiers` (default `{"portable_2fa"}`)
+- `FederationDirectory::hardware_attestation_policy()` — default-bodied; overridden by the memory,
+  sqlite and postgres backends to return their configured policy
+- `tests/fixtures/accord_holder_a1_real_custody.json` — the A1 holder record lifted verbatim from
+  the production bundle. Public material only: public keys, signatures, and YubiKey PIV
+  attestation certificates, which are public by construction. Nothing in this repo fabricates
+  hardware evidence.
+
+MINOR: every addition is additive. No stored row, signed envelope, or `persist_row_hash` moved.
+
 ## [23.0.0] — 2026-07-30 — #551: the naming cut — one seed shape, three named delegation jobs
 
 **A session with full source access produced four wrong statements about the trust root, and
