@@ -241,8 +241,11 @@ pub mod test_support {
     pub async fn exercise_capacity_consent_gate(dir: &dyn FederationDirectory, tag: &str) {
         use crate::federation::consent::consent_dimension;
 
-        let attester = format!("{tag}-attester"); // P — the scorer
-        let subject = format!("{tag}-subject"); // S — the scored
+        // Invocation-unique ids — see the B6 note: static ids are not
+        // re-runnable against the shared postgres database.
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let attester = format!("{tag}-attester-{run}"); // P — the scorer
+        let subject = format!("{tag}-subject-{run}"); // S — the scored
         for k in [&attester, &subject] {
             crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
         }
@@ -351,7 +354,13 @@ pub mod test_support {
     /// non-string junk shape is refused (edge's typed reader resolves it to
     /// `None` ⇒ the same silent demotion wearing a type error).
     pub async fn exercise_delivery_mode_vocabulary_gate(dir: &dyn FederationDirectory, tag: &str) {
-        let writer = format!("{tag}-dmv");
+        // Unique per INVOCATION, not per arm: the postgres arm runs against a
+        // SHARED long-lived database, and `register_hybrid_key` stamps
+        // `valid_from: Utc::now()` into hash-covered content — so a static id
+        // re-registered by a later run (or by the pre-push hook's pg sweep
+        // sharing the same DSN) is "same key, different content" and refuses.
+        // Same doctrine as `substrate_machine::fresh_tag`.
+        let writer = format!("{tag}-dmv-{}", uuid::Uuid::new_v4().simple());
         crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &writer).await;
 
         let with_mode = |mode: serde_json::Value| {
