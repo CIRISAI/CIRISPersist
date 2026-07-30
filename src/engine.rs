@@ -801,6 +801,88 @@ impl Engine {
             .clone()
     }
 
+    /// v22.0.0 (CIRISPersist#543 / AV-77) — declare THIS NODE'S OWN key id on
+    /// the underlying backend, which is what activates the peer de-admission
+    /// gate ([`crate::federation::admission::check_peer_deadmission`]).
+    ///
+    /// # Why this accessor has to exist
+    ///
+    /// AV-77 shipped the gate wired at all three backends and proven by a
+    /// `{gate} × {backend}` witness matrix — and **unreachable by any host.**
+    /// `set_self_key_id` lived only on the concrete backend types and had no
+    /// caller outside the test modules, so an embedder holding an [`Engine`]
+    /// (or reaching persist through the PyO3 FFI, which is how CIRISEdge and
+    /// CIRISServer reach it) could not turn the gate on at all. A sanction
+    /// nobody can enable is not a sanction.
+    ///
+    /// That is the "accepted but not projected" class this repo has hit before
+    /// (v17.0.0 / CIRISPersist#444, the signed route table that was admitted
+    /// and then never surfaced). A gate is not shipped when its code path
+    /// exists; it is shipped when a host can reach it.
+    ///
+    /// # Semantics
+    ///
+    /// `None` clears the declaration and the gate goes dormant — a node that
+    /// does not know its own identity cannot evaluate its own de-admissions,
+    /// which is fail-open **by construction and deliberately**: de-admission
+    /// is a judgement this node authored, so absent that identity there is no
+    /// judgement to enforce, and refusing everything would be an outage rather
+    /// than a gate. Set it to the node's federation key id at startup.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub fn set_self_key_id(&self, key_id: Option<String>) {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.set_self_key_id(key_id),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.set_self_key_id(key_id),
+        }
+    }
+
+    /// v22.0.0 (CIRISPersist#543 / AV-77) — this node's declared own key id,
+    /// or `None` when the host has not declared one (gate dormant).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[must_use]
+    pub fn self_key_id(&self) -> Option<String> {
+        match &self.backend {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(b) => b.self_key_id(),
+            #[cfg(feature = "sqlite")]
+            BackendDispatch::Sqlite(b) => b.self_key_id(),
+        }
+    }
+
+    /// v22.0.0 (CIRISPersist#543 / ciris.ai/contextual-integrity) — drive ONE
+    /// deletion-window breach sweep and return what it observed.
+    ///
+    /// The published promise is that "if subjects revoke and the window expires
+    /// without deletion proof, **the network itself raises a breach signal**".
+    /// [`crate::federation::deletion_window`] holds the judgment and the sweep;
+    /// this is the handle a HOST can actually reach, which is the difference
+    /// between a mitigation that exists and one that is shipped (the AV-77
+    /// lesson this cut paid for twice — see [`Self::set_self_key_id`]).
+    ///
+    /// Sovereign callers drive it on their own cadence (Pi-cron, k8s CronJob),
+    /// exactly like [`Self::sweep_evictions_once`]. Re-running is safe and
+    /// expected: emission is idempotent on a deterministic `event_id`, so an
+    /// ongoing breach stays ONE row of evidence no matter how often the cron
+    /// fires. `now` is a parameter rather than the wall clock so a caller can
+    /// replay a pass deterministically.
+    ///
+    /// What lands is `hard_case:deletion_window_breach` observability —
+    /// evidence, never a `slashing:*` verdict; the WA quorum is the authority
+    /// that turns evidence into sentences.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn run_deletion_window_watch(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<
+        crate::federation::deletion_window::DeletionWindowWatchReport,
+        crate::federation::Error,
+    > {
+        let dir = self.federation_directory();
+        crate::federation::deletion_window::run_deletion_window_watch(&*dir, now).await
+    }
+
     /// v3.4.0 (CIRISPersist#123) — install / clear the trust-weighted
     /// admission gate on the Engine's underlying storage backend. The
     /// four write paths consult this gate BEFORE any DB work.
@@ -7395,6 +7477,76 @@ mod tests {
         }
     }
 
+    /// v22.0.0 (CIRISPersist#543 / AV-77) — **THE HOST CAN REACH THE
+    /// DE-ADMISSION GATE.** This is the test whose absence let AV-77 ship
+    /// implemented-and-unreachable.
+    ///
+    /// The gate itself was already proven on all three backends by
+    /// [`crate::federation::bootstrap_admission::test_support::exercise_peer_deadmission`].
+    /// Every one of those witnesses reached past the Engine and called
+    /// `set_self_key_id` directly on the concrete backend type — which no host
+    /// code path does, and which CIRISEdge and CIRISServer (both of which come
+    /// in through the PyO3 FFI) cannot do at all. So the matrix was green while
+    /// the sanction was unreachable in production: the "accepted but not
+    /// projected" class from v17.0.0 (CIRISPersist#444), where the signed route
+    /// table was admitted correctly and then never surfaced to anyone.
+    ///
+    /// A gate is not shipped when its code path exists. It is shipped when a
+    /// host can turn it on and observe that it is on. This asserts both halves
+    /// through the Engine accessor, and that the same drive-it-from-outside
+    /// exercise body passes when the declaration arrives that way.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn set_self_key_id_through_the_engine_activates_the_deadmission_gate_543() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+
+        // Dormant until declared — a node that does not know its own identity
+        // has no de-admission judgement of its own to enforce.
+        assert_eq!(
+            engine.self_key_id(),
+            None,
+            "AV-77: the gate must start dormant, not silently self-configured"
+        );
+
+        const SELF: &str = "eng543d-self";
+        engine.set_self_key_id(Some(SELF.to_owned()));
+        assert_eq!(
+            engine.self_key_id().as_deref(),
+            Some(SELF),
+            "AV-77: a host must be able to READ BACK that the gate is live — \
+             otherwise it cannot assert at boot that it configured one"
+        );
+
+        // The full lifecycle, driven entirely through the Engine handle: an
+        // abuser admitted, de-admitted and refused, admitted again once the
+        // node withdraws its own denial, with an innocent third party untouched
+        // throughout.
+        let backend = match engine.backend() {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(_) => {
+                panic!("sqlite::memory: DSN must yield the sqlite backend")
+            }
+            BackendDispatch::Sqlite(b) => b.clone(),
+        };
+        crate::federation::bootstrap_admission::test_support::exercise_peer_deadmission(
+            backend.as_ref(),
+            SELF,
+            "eng543d",
+        )
+        .await;
+
+        // Clearing it returns the gate to dormant, so the declaration is a
+        // reversible piece of host configuration and not a one-way door.
+        engine.set_self_key_id(None);
+        assert_eq!(
+            engine.self_key_id(),
+            None,
+            "AV-77: clearing must be honoured"
+        );
+    }
+
     /// `from_shared` constructs an Engine without a LocalSigner;
     /// `sign_hybrid` returns `LocalSignerUnavailable` (the cohabitation
     /// consumer must rebuild a LocalSigner from
@@ -10478,7 +10630,12 @@ mod tests {
     /// payload (CIRISPersist#530 tests exercise the repair sweep's
     /// broaden-only guard, which turns on the covering grant's resolved
     /// audience).
-    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    ///
+    /// Gated on `sqlite` alone — the feature of its ONE caller. Under
+    /// `any(sqlite, postgres)` this was dead code on a postgres-without-sqlite
+    /// build (`--features pyo3`, the published-wheel shape), which
+    /// `--all-targets -D warnings` refuses.
+    #[cfg(feature = "sqlite")]
     async fn emit_509_grant_audience(
         engine: &Engine,
         peer: &str,
@@ -11830,9 +11987,49 @@ mod tests {
         sq.put_public_key(sweeper_test_key_derived_for(&derived, "ciris-weight"))
             .await
             .expect("seed key");
+        // v22.0.0 (CIRISPersist#543) — the capacity-band emit below needs a
+        // SUBJECT distinct from the attester: `capacity:*` must not be
+        // self-attested (CEG §7.5 anti-Goodhart / AV-62), which is now enforced
+        // dimension-keyed at `put_attestation`, not just on the `capacity:*`
+        // attestation_type namespace.
+        let subject = "capacity-subject";
+        // Registered via the tier_ingest derivation (not the sweeper helper):
+        // the consent grant below is SIGNED by this key, and admission
+        // hybrid-verifies it against what is registered here.
+        crate::federation::tier_ingest::test_support::register_hybrid_key(&*sq, subject).await;
+
+        // v22.0.0 (CIRISConstitution#46) — CONSENT BEFORE SCORING. The
+        // capacity:* emit below is a federation-tier claim ABOUT `subject`,
+        // so it needs S's live `analyze` grant covering this engine's
+        // emitting key. Without this row the emit is REFUSED by
+        // `check_capacity_consent_admission` — which is not a fixture
+        // inconvenience but the gate biting on the node's OWN emit surface:
+        // `emit_attestation` stores through `put_attestation`, and the local
+        // surface gets no bypass (the inverted AV-77 lesson — a gate that
+        // exempted the node's own path would be unreachable from the other
+        // side).
+        crate::federation::FederationDirectory::put_attestation(
+            &*sq,
+            crate::federation::SignedAttestation {
+                attestation:
+                    crate::federation::bootstrap_admission::test_support::consent_scope_row(
+                        &uuid::Uuid::new_v4().to_string(),
+                        subject,
+                        &derived,
+                        &format!(
+                            "{}:v1",
+                            crate::federation::consent::consent_dimension::STATE_GRANTED_PREFIX
+                        ),
+                        &[crate::federation::admission::CAPACITY_CONSENT_SCOPE],
+                        chrono::Utc::now() - chrono::Duration::seconds(60),
+                    ),
+            },
+        )
+        .await
+        .expect("seed S->P analyze consent (CC#46)");
 
         // Weighted scores emit (the capacity-band case): weight survives.
-        let weighted = crate::federation::EmitAttestationInput::with_envelope(
+        let mut weighted = crate::federation::EmitAttestationInput::with_envelope(
             SCORES,
             crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
                 "id": "emit-w-1", "dimension": "capacity:sustained_coherence:v1",
@@ -11842,6 +12039,8 @@ mod tests {
             crate::federation::types::cohort_scope::FEDERATION,
         )
         .with_weight(Some(0.42));
+        // Someone else's capacity, not the emitter's own.
+        weighted.attested_key_id = Some(subject.to_owned());
         let w_id = engine
             .emit_attestation(&signer, weighted)
             .await
@@ -13854,6 +14053,50 @@ mod tests {
         let engine = Engine::with_signer(signer, &dsn).await.expect("pg engine");
         let pg = engine.postgres_backend().expect("pg backend").clone();
         g4_rekey_events_body(&*pg, &uuid::Uuid::new_v4().simple().to_string()).await;
+    }
+
+    /// v22.0.0 (CIRISPersist#543 / ciris.ai/contextual-integrity) — **the
+    /// host-reachability witness** for the deletion-window breach sweep.
+    ///
+    /// The sweep itself is proven backend-by-backend in
+    /// [`crate::federation::deletion_window`]. This test proves the other half,
+    /// the one AV-77 taught us costs a whole release when it is skipped: that a
+    /// host holding an [`Engine`] can DRIVE it and SEE the signal, without
+    /// reaching past the handle into a concrete backend type. A breach signal
+    /// nobody can raise is not a breach signal.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn deletion_window_watch_runs_through_the_engine_handle_sqlite() {
+        use crate::federation::deletion_window::{kind, watch_witness};
+        use crate::federation::HardCaseFilter;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("dw-engine");
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let dir = engine.federation_directory();
+        let (breached_id, now) = watch_witness::seed_one_breach(&*dir, "eng").await;
+
+        // THROUGH the handle — no `engine.sqlite_backend()`, no concrete type.
+        let report = engine
+            .run_deletion_window_watch(now)
+            .await
+            .expect("the watch is reachable from an Engine");
+        assert_eq!(report.breaches, 1, "the Engine handle raises the signal");
+
+        let events = dir
+            .list_hard_case_events(HardCaseFilter {
+                kind: Some(kind::DELETION_WINDOW_BREACH.to_string()),
+                since: None,
+            })
+            .await
+            .expect("list_hard_case_events");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.target_key_id.as_deref() == Some(breached_id.as_str())),
+            "and the host can observe the evidence it raised"
+        );
     }
 
     /// #249 — `file_moderation` stores a `moderation:{allegation}` scores

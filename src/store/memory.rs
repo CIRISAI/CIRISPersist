@@ -46,6 +46,56 @@ type AuthoritySig = (String, String, Option<String>);
 /// or, more typically, the SQL DB's own MVCC.
 pub struct MemoryBackend {
     state: Mutex<State>,
+    /// v22.0.0 (CIRISPersist#543) — hardware-attestation policy for
+    /// `accord_holder` `put_public_key` admission, backend-symmetric with
+    /// [`crate::store::sqlite::SqliteBackend`] (`sqlite.rs`) and the Postgres
+    /// twin. Before this the memory backend admitted an `accord_holder` claim
+    /// with NO hardware evidence at all — the exact "tested on one backend,
+    /// used on the other" shape #518/#534/#536/#541 keep producing. Override
+    /// via [`MemoryBackend::set_hardware_attestation_policy`].
+    hardware_attestation_policy:
+        std::sync::RwLock<std::sync::Arc<crate::federation::HardwareAttestationPolicy>>,
+    /// v3.4.0 (CIRISPersist#123) — trust-weighted admission gate. `None` =
+    /// no gate (bootstrap-permissive). See
+    /// [`MemoryBackend::set_admission_gate`].
+    ///
+    /// v22.0.0 (CIRISPersist#543 finding 4): the memory backend had NO gate
+    /// field, no accessor and no call site — `AdmissionGate::check_federation`
+    /// simply never ran here, on any write path, since v3.4.0. Same
+    /// recurrence class as #541.
+    admission_gate: std::sync::RwLock<Option<crate::federation::AdmissionGate>>,
+    /// v2.5.0 (CIRISPersist#102 Ask 4) — per-axis envelope-schema resolver.
+    /// The default is [`crate::federation::NoOpSchemaResolver`], which makes
+    /// the `put_attestation` validation hook a no-op (existing callers don't
+    /// break). Override via [`MemoryBackend::set_schema_resolver`].
+    ///
+    /// v22.0.0 (CIRISPersist#543): the memory backend had no field, no
+    /// accessor and no call site, so the `scores` envelope-schema gate never
+    /// ran here — latent rather than live only because the default resolver
+    /// answers `None`. Any host that installed a REAL resolver got schema
+    /// enforcement on sqlite + postgres and silence on memory.
+    schema_resolver: std::sync::RwLock<std::sync::Arc<dyn crate::federation::SchemaResolver>>,
+    /// v22.0.0 (CIRISPersist#543 / AV-77) — this node's OWN federation key_id,
+    /// installed by the host at construction. It is the only thing that lets
+    /// the substrate tell "a de-admission I authored" from "a de-admission
+    /// someone else authored about a third party" — de-admission is scoped to
+    /// the emitting node's own corpus, so without knowing which rows are ours
+    /// the set is empty and the gate is vacuous (correct, not fail-open: a
+    /// node that has not declared an identity has authored no de-admissions).
+    ///
+    /// v22.0.0 (CIRISPersist#543): absent here entirely, so AV-77 — one of the
+    /// five findings the CHANGELOG claims are "closed on all three backends" —
+    /// was not closed on memory at all.
+    self_key_id: std::sync::RwLock<Option<String>>,
+    /// v22.0.0 (CIRISPersist#543 finding 4, AV-76) — per-peer attestation
+    /// write quota. Scoped to *this* backend instance rather than a process
+    /// global (the [`Self::hardware_attestation_policy`] precedent): the
+    /// quota is node-local admission state, and a global would leak one
+    /// engine's traffic into another's budget — and one test's into the
+    /// next's, which on the memory backend (the one every unit test reaches
+    /// for) would be an immediate cross-test flake. Always on; the limit is
+    /// a substrate constant, not an operator knob.
+    peer_write_quota: crate::federation::replication::admission::PeerWriteQuota,
 }
 
 struct State {
@@ -394,6 +444,15 @@ impl Default for MemoryBackend {
                 federation_location_proof_authority_sigs: HashMap::new(),
                 signed_wire_index: HashMap::new(),
             }),
+            hardware_attestation_policy: std::sync::RwLock::new(std::sync::Arc::new(
+                crate::federation::HardwareAttestationPolicy::default(),
+            )),
+            admission_gate: std::sync::RwLock::new(None),
+            schema_resolver: std::sync::RwLock::new(std::sync::Arc::new(
+                crate::federation::NoOpSchemaResolver,
+            )),
+            self_key_id: std::sync::RwLock::new(None),
+            peer_write_quota: crate::federation::replication::admission::PeerWriteQuota::new(),
         }
     }
 }
@@ -402,6 +461,124 @@ impl MemoryBackend {
     /// Create an empty memory backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// v22.0.0 (CIRISPersist#543) — install a custom hardware-attestation
+    /// policy. Mirrors [`crate::store::sqlite::SqliteBackend::set_hardware_attestation_policy`].
+    pub fn set_hardware_attestation_policy(
+        &self,
+        policy: std::sync::Arc<crate::federation::HardwareAttestationPolicy>,
+    ) {
+        *self
+            .hardware_attestation_policy
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = policy;
+    }
+
+    /// Snapshot the currently-installed hardware-attestation policy.
+    pub fn hardware_attestation_policy(
+        &self,
+    ) -> std::sync::Arc<crate::federation::HardwareAttestationPolicy> {
+        self.hardware_attestation_policy
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// v3.4.0 (CIRISPersist#123) — install the trust-weighted
+    /// [`AdmissionGate`](crate::federation::AdmissionGate). Passing `None`
+    /// clears the gate (bootstrap-permissive). Mirrors
+    /// [`crate::store::sqlite::SqliteBackend::set_admission_gate`].
+    pub fn set_admission_gate(&self, gate: Option<crate::federation::AdmissionGate>) {
+        *self
+            .admission_gate
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = gate;
+    }
+
+    /// Snapshot of the currently-installed admission gate, if any.
+    pub fn admission_gate(&self) -> Option<crate::federation::AdmissionGate> {
+        self.admission_gate
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// v22.0.0 (CIRISPersist#543 / AV-77) — declare this node's own federation
+    /// key_id, enabling the de-admission gate
+    /// ([`crate::federation::admission::check_peer_deadmission`]). Mirrors
+    /// [`crate::store::sqlite::SqliteBackend::set_self_key_id`].
+    pub fn set_self_key_id(&self, key_id: Option<String>) {
+        *self.self_key_id.write().unwrap_or_else(|p| p.into_inner()) = key_id;
+    }
+
+    /// This node's declared own key_id, if the host installed one.
+    pub fn self_key_id(&self) -> Option<String> {
+        self.self_key_id
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// v2.5.0 (CIRISPersist#102 Ask 4) — install a per-axis envelope-schema
+    /// resolver for the `put_attestation` admission hook. Mirrors
+    /// [`crate::store::sqlite::SqliteBackend::set_schema_resolver`].
+    pub fn set_schema_resolver(
+        &self,
+        resolver: std::sync::Arc<dyn crate::federation::SchemaResolver>,
+    ) {
+        *self
+            .schema_resolver
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = resolver;
+    }
+
+    /// Snapshot the currently-installed schema resolver.
+    pub fn schema_resolver(&self) -> std::sync::Arc<dyn crate::federation::SchemaResolver> {
+        self.schema_resolver
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// v22.0.0 (CIRISPersist#543) — genesis-trusted seed of the
+    /// HUMANITY_ACCORD holder rooting-anchor rows, the memory twin of
+    /// [`crate::store::sqlite::SqliteBackend::seed_genesis_accord_holders`].
+    ///
+    /// Skips ONLY the per-registration `accord_holder` fresh-nonce hardware
+    /// gate that `put_public_key` enforces — the pinned #268 ceremony bake IS
+    /// the trust root, so re-verifying its (stale-by-design) custody
+    /// attestation at every boot is a category error. Every OTHER invariant
+    /// still applies: the pubkey must decode to 32 bytes, the algorithm must
+    /// be hybrid, and the consent_role token must be admissible. Idempotent
+    /// on `key_id` (mirrors `ON CONFLICT (key_id) DO NOTHING`).
+    pub async fn seed_genesis_accord_holders(
+        &self,
+        records: &[crate::federation::SignedKeyRecord],
+    ) -> Result<(), crate::federation::Error> {
+        for sr in records {
+            let mut row = sr.record.clone();
+            crate::federation::register::validate_registration_pubkey(&row)?;
+            if row.algorithm != crate::federation::types::algorithm::HYBRID {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "genesis seed algorithm must be 'hybrid' (got '{}')",
+                    row.algorithm
+                )));
+            }
+            crate::federation::types::consent_role::check_admissible(row.consent_role.as_deref())?;
+            row.consent_role = row
+                .consent_role
+                .as_deref()
+                .and_then(crate::federation::types::consent_role::wire_from_stored)
+                .map(str::to_owned);
+            row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+            let mut state = self.state.lock().expect("memory backend lock");
+            state
+                .federation_keys
+                .entry(row.key_id.clone())
+                .or_insert(row);
+        }
+        Ok(())
     }
 
     // ── v9.1.0 (CC 1.13.3 / FSD §2.4, CIRISPersist#243) scope-blob store ──
@@ -1577,6 +1754,31 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v19.0.0 (#486) — lift envelope-attested roles into the claim
         // surface BEFORE the role write-gates (lift-then-gate).
         crate::federation::admission::lift_envelope_attested_roles(&mut row);
+
+        // v10.1.0 (CIRISPersist#275 hardening) — universal write-path
+        // invariant: pubkey_ed25519_base64 MUST decode to a 32-byte Ed25519
+        // key. Rejects a wrong-curve / malformed key at admission for EVERY
+        // registration path. v22.0.0 (#543): the memory backend was the one
+        // backend that skipped this, so a malformed key it accepted was
+        // refused by sqlite/postgres — restore the parity.
+        crate::federation::register::validate_registration_pubkey(&row)?;
+
+        // v2.5.0 (CIRISPersist#102 Ask 8) — hardware-attestation admission
+        // gate for accord_holder rows. Runs BEFORE persist_row_hash + insert
+        // so rejected rows leave no trace. #441: evaluated over
+        // identity_type ∪ roles (claims_role) — an `accord_holder` claim in
+        // the set form ("agent,accord_holder") or in the roles vector hits
+        // the same gate as the scalar. v22.0.0 (#543): the memory backend
+        // never ran this gate at all, so an evidence-less accord_holder that
+        // sqlite/postgres REJECT was silently admitted here.
+        if row.claims_role(crate::federation::types::identity_type::ACCORD_HOLDER) {
+            self.hardware_attestation_policy().check(
+                &row.key_id,
+                row.attestation_evidence.as_ref(),
+                chrono::Utc::now(),
+            )?;
+        }
+
         // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — same consent_role
         // admission gate + 'unregistered'⇔None normalization as the SQL
         // backends (a stored-form 'unregistered' submitted on the wire
@@ -1599,6 +1801,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // #440 — the CC 3.4.9 co-steward roles (`registry`/`verify`) are
         // accord-conferred, same ceremony. Fail-closed before any write.
         crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
+        // v22.0.0 (CIRISPersist#543 finding 3) — the CLOSED authority-claim
+        // gate: every remaining privileged `identity_type` is accord-conferred,
+        // never self-asserted. Same chokepoint, same fail-closed posture; the
+        // closed set lives in `identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES`
+        // and is proven to cover every reserved-prefix rule.
+        crate::federation::admission::check_privileged_identity_type_admission(self, &row).await?;
         // Server-computed hash (excludes the field itself).
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         let mut state = self.state.lock().expect("memory backend lock");
@@ -1653,6 +1861,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         crate::federation::admission::check_canonical_role_admission(self, &row).await?;
         crate::federation::admission::check_infra_attest_role_admission(self, &row).await?;
         crate::federation::admission::check_co_steward_role_admission(self, &row).await?;
+        // v22.0.0 (CIRISPersist#543 finding 3) — the CLOSED authority-claim
+        // gate: every remaining privileged `identity_type` is accord-conferred,
+        // never self-asserted. Same chokepoint, same fail-closed posture; the
+        // closed set lives in `identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES`
+        // and is proven to cover every reserved-prefix rule.
+        crate::federation::admission::check_privileged_identity_type_admission(self, &row).await?;
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let mut state = self.state.lock().expect("memory backend lock");
@@ -1859,15 +2073,182 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     ) -> Result<(), crate::federation::Error> {
         let mut row = attestation.attestation;
 
+        // ── AV-76 TIER 0 — the free prologue ────────────────────────
+        // Neither check below reads the row's content or touches state.
+        // Backend-symmetric with the sqlite + postgres prologue; before
+        // v22.0.0 (CIRISPersist#543 finding 4) the memory backend ran
+        // NEITHER — it had no `admission_gate` field at all, so the
+        // v3.4.0 trust gate had never run on this backend, and the AV-76
+        // quota would have shipped existing on two backends out of three.
+        if !row.attesting_key_id.is_empty() {
+            // Per-peer write quota. It LEADS because it is the only check
+            // in the whole stack that consults no shared state, so it also
+            // bounds the recursive directory walk the trust scorer runs at
+            // any threshold > 0. It answers "you are writing too fast",
+            // never "that key exists" — strictly less leaky than the gate
+            // it precedes. Per-backend-instance state.
+            self.peer_write_quota.check(&row.attesting_key_id)?;
+
+            // v3.4.0 (CIRISPersist#123) — trust-threshold gate. The
+            // cheapest reject that consults state AND the one that leaks
+            // the least; an unauthorized writer shouldn't learn about FK /
+            // envelope-schema state past it. Free at the default threshold
+            // 0 (short-circuits without dispatching to the resolver).
+            if let Some(gate) = self.admission_gate() {
+                gate.check_federation(&row.attesting_key_id).await?;
+            }
+        }
+
+        // ── AV-76 TIER 1 — PURE ENVELOPE GATES ──────────────────────
+        // v22.0.0 (CIRISPersist#543 finding 4) — every check in this tier is
+        // a pure function of `row`: no state lock, no directory read, no
+        // crypto. On this backend they used to be scattered across the stack
+        // BEHIND the lock-free authority walks (withdraws / delegated-duty /
+        // node-agency / single-owner), so a row that could never be admitted
+        // still paid for every one of them — the bootstrap amplification this
+        // cut closes.
+        //
+        // `check_envelope_size_admission` leads deliberately: it BOUNDS the
+        // JCS canonicalization that BOTH the hybrid verify (tier 3) and
+        // `compute_persist_row_hash` (tier 5) pay.
+        //
+        // This tier is IDENTICAL to the sqlite + postgres backends', gate for
+        // gate and order for order.
+        crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
+        // v22.0.0 (CIRISEdge#428) — closed delivery_mode vocabulary; an
+        // unknown value is refused HERE instead of being silently demoted
+        // to may-drop BestEffort at delivery. Pure predicate, tier 1.
+        crate::federation::admission::check_delivery_mode_vocabulary(&row.attestation_envelope)?;
+
+        // v3.9.1 (CIRISPersist#150 Ask 3, CEG 0.4 §4.2.4) — cohort_scope
+        // admission-gate VALUE validation. Rejects out-of-closed-set values
+        // (notably `global`, a §8.1.8 feed-name, never a wire value) BEFORE
+        // persist_row_hash + insert so rejected rows leave no trace.
+        // v22.0.0 (CIRISPersist#543): the memory backend never ran this, and
+        // — unlike sqlite/postgres — it has NO V056 CHECK-constraint backstop
+        // behind it, so a `global` row the SQL backends refuse at two layers
+        // was accepted unconditionally here.
+        crate::federation::admission::check_cohort_scope(&row.cohort_scope)?;
+
+        // v18.1.0 (CIRISPersist#473 followup) — the `trace:*`
+        // Information-Type validator: self-emission polarity
+        // (`attesting_key_id` ∈ `subject_key_ids`) plus the inline-trace /
+        // manifest shape. No-op for every non-`trace:` dimension.
+        crate::federation::admission::check_trace_dimension_admission(
+            crate::federation::admission::envelope_dimension(&row.attestation_envelope),
+            &row.attesting_key_id,
+            &row.subject_key_ids,
+            &row.attestation_envelope,
+        )?;
+
+        // v21.3.0 (CIRISPersist#510 P1) — the closed consent-transfer
+        // grammar admission chokepoint (parity with sqlite + postgres). A
+        // `consent:replication:v1` grant's `payload` MUST parse through
+        // `consent_grammar::parse_grant_payload` (closed enums, strict
+        // `deny_unknown_fields`) — an unknown restriction op, an
+        // unrecognized payload field, a non-consentable `kinds` entry, a
+        // bad `grants` token, a bad `audience`, or an empty-string
+        // `attestation_prefixes` entry rejects the WHOLE grant. No-op for
+        // every other dimension (a `withdraws`/`recants` referencing a grant
+        // carries its OWN dimension, never GRANT_DIMENSION). Runs BEFORE
+        // persist — a rejected grant leaves no trace.
+        if crate::federation::admission::envelope_dimension(&row.attestation_envelope)
+            == Some(crate::federation::consent_grammar::GRANT_DIMENSION)
+        {
+            if let Err(reason) = crate::federation::consent_grammar::validate_grant_admission(
+                &row.attestation_envelope,
+            ) {
+                return Err(crate::federation::Error::InvalidArgument(format!(
+                    "consent grant rejected by the closed grammar (#510): {reason}"
+                )));
+            }
+        }
+
+        // ── AV-76 TIER 2 — the one unavoidable directory read ───────
+        // v2.4.0 (CIRISPersist#102 Ask 3) — admission gate. Look up the
+        // attesting key's `identity_type`; a missing key is the memory
+        // backend's stand-in for the FK violation the SQL backends surface,
+        // reported here as the same clearer-typed `InvalidArgument` sqlite +
+        // postgres return from THIS tier. The guard is block-scoped so it
+        // drops before the awaits below (a `MutexGuard` held across an await
+        // is not `Send`).
+        let attesting_identity_type = {
+            let state = self.state.lock().expect("memory backend lock");
+            match state.federation_keys.get(&row.attesting_key_id) {
+                Some(rec) => rec.identity_type.clone(),
+                None => {
+                    return Err(crate::federation::Error::InvalidArgument(format!(
+                        "attesting_key_id {} does not exist in federation_keys",
+                        row.attesting_key_id
+                    )));
+                }
+            }
+        };
+        // AV-76 D2 — the lookup above is a hard DATA dependency of the
+        // dimension policy here (`attesting_identity_type`); the pair moves
+        // as a unit and its internal order is fixed. The default policy
+        // enforces the `accord:*` × `accord_holder` rule and the four-test
+        // operational-language gate on `scores` attestations; structural
+        // primitives are exempt. See `src/federation/admission.rs`.
+        crate::federation::admission::DimensionAdmissionPolicy::default().check(
+            &row.attestation_type,
+            crate::federation::admission::envelope_dimension(&row.attestation_envelope),
+            &attesting_identity_type,
+        )?;
+
+        // v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — a `revoked`
+        // consent_record at local tier MAY *transit* the local write path
+        // only if its bound-hybrid signature verifies (accept on VALID crypto
+        // only). No-op for non-consent_record rows and durable (granted /
+        // federation) ones. Backend-symmetric with SQLite + Postgres.
+        //
+        // v22.0.0 (AV-76) — deliberately kept AHEAD of the §6.1 dedup. This
+        // is the one crypto gate that must NOT move behind it: `withdraws` is
+        // a structural composer, so a replayed subject-side revocation would
+        // short-circuit at the dedup and never prove its bound-hybrid
+        // signature.
+        crate::federation::admission::verify_consent_record_transit_ingest(self, &row).await?;
+
+        // ── AV-76 TIER 3 — CRYPTO ───────────────────────────────────
+        // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
+        // hybrid-verify at the federation-tier bulk store/replicate
+        // ingest gate (parity with the postgres + sqlite backends). A
+        // no-op for local-tier rows (CC 5.3.2.2 deferred signature); for
+        // a federation-tier row it hybrid-verifies the envelope signature
+        // (Ed25519 + ML-DSA-65, Strict) against the attester's REGISTERED
+        // pubkeys. Composes with — does not replace — the trust-threshold
+        // check_federation + the node-agency gate. Runs BEFORE persist — a
+        // rejected row leaves no trace (verify-before-mutation, AV-9;
+        // store-then-quarantine is non-conformant per CC 5.3.2.4.3.1).
+        //
+        // v22.0.0 (CIRISPersist#543 finding 4, AV-76) — MOVED here from
+        // behind the whole authority walk. The ML-DSA-65 verify is the single
+        // most expensive step in the stack, but a row whose signature can
+        // never verify must not buy a single directory walk with it — and no
+        // authority gate may run on an unverified row. The move is
+        // correctness-safe because the verdict is position-independent: the
+        // gate reads only attestation_envelope / attesting_key_id /
+        // scrub_signature_* / original_content_hash / tier, and NO gate in the
+        // stack writes any of them (the sole field-stamping gate,
+        // `check_withdraws_admission`, writes `withdraws_admission_rule`,
+        // which this never reads).
+        crate::federation::verify_federation_tier_ingest(self, &row).await?;
+
+        // ── AV-76 TIER 4 — the DB-WALK authority gates ──────────────
+        // Everything below walks the directory (delegation chains, family /
+        // community membership, moderator sets, trust charters) — on this
+        // backend by re-entering `self`, which takes the state lock itself, so
+        // none of it may run under a held guard. All of it now runs only for a
+        // row that has already proven its envelope is admissible in shape AND
+        // that its signature verifies.
+
         // v4.0 (CIRISPersist#160 comment 4, FSD §4.6) — AV-45 write-path
-        // cohort_scope admission gate. Runs BEFORE the state lock is
-        // taken (the resolution fan-out acquires the lock itself; holding
-        // it across the await would not be `Send`). The writer
-        // (`attesting_key_id`) must be a member of the target cohort they
-        // stamp. `self` + broad tiers pass with no read; family/community
-        // (no `cohort_target_id` field on attestations) are refused as a
-        // downgrade with no provable membership. A refusal returns before
-        // any row is pushed (verify-then-gate-then-persist).
+        // cohort_scope admission gate. The writer (`attesting_key_id`) must be
+        // a MEMBER of the target cohort they stamp. `self` + broad tiers pass
+        // with no read; family/community (no `cohort_target_id` field on
+        // attestations) are refused as a downgrade with no provable
+        // membership. Runs AFTER the closed-set value validation in tier 1 and
+        // BEFORE persist (verify-then-gate-then-persist, MISSION §1.6).
         crate::federation::FederationDirectory::check_write_cohort_scope_for(
             self,
             &row.attesting_key_id,
@@ -1877,15 +2258,83 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         )
         .await?;
 
+        // v2.5.0 (CIRISPersist#102 Ask 4) — envelope-schema admission hook.
+        // Same shape and same tier position as the sqlite + postgres backends;
+        // see `src/store/sqlite.rs` put_attestation for the architectural
+        // commentary. Skipped on the default `NoOpSchemaResolver` (which
+        // answers `None`), so nothing that passes today starts failing.
+        // AV-76 D4 — recomputes the dimension rather than carrying a binding
+        // across the reordered stack; `envelope_dimension` is pure.
+        //
+        // v22.0.0 (CIRISPersist#543) — the memory backend had no resolver field
+        // and no call site, so this gate did not exist here. Latent, not live,
+        // because the default resolver is a no-op — but a host installing a
+        // REAL resolver got enforcement on two backends and silence on the
+        // third.
+        if row.attestation_type == crate::federation::types::attestation_type::SCORES {
+            if let Some(dim_str) =
+                crate::federation::admission::envelope_dimension(&row.attestation_envelope)
+            {
+                let resolver = self.schema_resolver();
+                let resolved = resolver.resolve(dim_str).await.map_err(|e| {
+                    crate::federation::Error::Backend(format!(
+                        "schema resolver: {} ({})",
+                        e,
+                        e.kind()
+                    ))
+                })?;
+                if let Some(schema) = resolved {
+                    if let Err(violations) =
+                        crate::federation::schema_resolver::validate_envelope_against_schema(
+                            &schema.document,
+                            &row.attestation_envelope,
+                        )
+                    {
+                        let axis = crate::federation::axis_from_dimension(dim_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        return Err(crate::federation::Error::EnvelopeSchemaViolation {
+                            dimension: dim_str.to_string(),
+                            axis,
+                            violations,
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── AV-76 TIER 4b — the §6.1 idempotent-replay short-circuit ──
+        // v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer dedup
+        // on `(references_attestation_id, attestation_type,
+        // attesting_key_id)`. A duplicate composer is a typed `Ok(())` no-op;
+        // the audit chain stays complete without accumulating replayed rows.
+        // Non-composers (scores, delegates_to) skip this branch.
+        //
+        // v22.0.0 (CIRISPersist#543 / AV-76 D3) — the short-circuit sits HERE,
+        // after crypto AND after the AV-45 write-scope gate, because **a dedup
+        // short-circuit may return early to REFUSE, never to ACCEPT**: a
+        // replay must still prove the properties of its own bytes and its
+        // writer's standing before it earns an `Ok`. Ahead of them it is a
+        // fail-open hole. See `src/store/sqlite.rs` put_attestation, AV-76
+        // TIER 4b, for the full rationale and the shrunk counterexample.
+        if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
+            let state = self.state.lock().expect("memory backend lock");
+            for existing in &state.federation_attestations {
+                if crate::federation::precedence::is_dedup_match(existing, &row) {
+                    return Ok(());
+                }
+            }
+        }
+
         // v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — broadened
-        // `withdraws` admission gate (parity with sqlite + postgres).
-        // Runs BEFORE the state lock is taken: the delegation walk +
-        // target-T lookup call `get_attestation` / `list_attestations_by`
-        // on `self`, which acquire the lock themselves — holding it
-        // across those awaits would deadlock (and not be `Send`). A
-        // no-op for non-`withdraws` rows; for a `withdraws` it stamps
-        // the admitting rule (1–4) onto the row. A refused withdraws
-        // returns before any row is pushed.
+        // `withdraws` admission gate (parity with sqlite + postgres). A
+        // no-op for non-`withdraws` rows; for a `withdraws` it loads the
+        // target T (by the envelope's `references_attestation_id`), resolves
+        // WHICH of the 4 admission rules authorizes the issuer, and stamps
+        // the rule number onto the row for the per-rule audit metadata. Runs
+        // AFTER the §6.1 dedup (an idempotent replay short-circuits before
+        // the walk) and BEFORE persist_row_hash, so a refused withdraws
+        // leaves no trace and the recorded rule is covered by the row hash.
         if let Some(rule) =
             crate::federation::admission::check_withdraws_admission(self, &row).await?
         {
@@ -1898,9 +2347,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // it admits IFF the signer IS a duty-holder over the target (the
         // row's subject_key_ids ∪ the envelope community_id's named
         // moderators) or is reached by an steward-bound duty-holder via a live
-        // scoped delegates_to chain. Absence ⇒ REJECT. Runs BEFORE the state
-        // lock for the same deadlock reason as the withdraws gate (the walk
-        // calls list_attestations_by on self).
+        // scoped delegates_to chain. Absence ⇒ REJECT.
         crate::federation::admission::check_delegated_duty_scores_admission(self, &row).await?;
 
         // v8.9.0 (CIRISPersist#236, CC 4.4.3.4.3 / CC 1.13.5) — reject-agency-
@@ -1909,9 +2356,6 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // node-ONLY identity it REJECTS any scope set that is not
         // `infra:*`-only (agency:* / legacy unprefixed agency / empty /
         // other) — "infrastructure must not have agency" made cryptographic.
-        // Runs BEFORE the state lock (it calls lookup_public_key on self,
-        // which acquires the lock itself) and BEFORE persist — a rejected
-        // emission leaves no trace.
         crate::federation::admission::check_node_agency_admission(self, &row).await?;
 
         // v11.5.0 (CIRISPersist#306, CC 3.2 / CC 1.15.6) — the user-target
@@ -1929,16 +2373,8 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // with SQLite + Postgres; verify-before-mutation.
         crate::federation::admission::check_single_node_owner_admission(self, &row).await?;
 
-        // v10.3.0 (CIRISPersist#288, CC 3.4.1/3.4.3/3.4.5) — reserved-prefix
-        // admission on the attestation_TYPE namespace, keyed on the attesting
-        // key's identity_type. Backend-symmetric with SQLite + Postgres.
-        crate::federation::admission::check_envelope_size_admission(&row.attestation_envelope)?;
-        crate::federation::admission::check_trace_dimension_admission(
-            crate::federation::admission::envelope_dimension(&row.attestation_envelope),
-            &row.attesting_key_id,
-            &row.subject_key_ids,
-            &row.attestation_envelope,
-        )?;
+        // v18.2.0 — trust-charter admission (the charter walk). AV-76: a
+        // directory walk, so it stays in tier 4.
         crate::federation::trust_root::check_trust_charter_admission(
             self,
             &row.attestation_type,
@@ -1947,118 +2383,115 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             &row.attestation_envelope,
         )
         .await?;
+
+        // v10.3.0 (CIRISPersist#288, CC 3.4.1/3.4.3/3.4.5) — reserved-prefix
+        // admission on the attestation_TYPE namespace, keyed on the attesting
+        // key's identity_type (a directory read), plus the #543 finding-2
+        // dimension-keyed `capacity:*` self-emission arm. Backend-symmetric
+        // with SQLite + Postgres.
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
-        // v21.3.0 (CIRISPersist#510 P1) — the closed consent-transfer
-        // grammar admission chokepoint (parity with sqlite + postgres). A
-        // `consent:replication:v1` grant's `payload` MUST parse through
-        // `consent_grammar::parse_grant_payload` (closed enums, strict
-        // `deny_unknown_fields`) — an unknown restriction op, an
-        // unrecognized payload field, a non-consentable `kinds` entry, a
-        // bad `grants` token, a bad `audience`, or an empty-string
-        // `attestation_prefixes` entry rejects the WHOLE grant. No-op for
-        // every other dimension. Pure function over the envelope — no
-        // directory access needed — so it runs here BEFORE the state lock
-        // for the same reason the other pre-lock gates do, and BEFORE
-        // persist — a rejected grant leaves no trace.
-        if crate::federation::admission::envelope_dimension(&row.attestation_envelope)
-            == Some(crate::federation::consent_grammar::GRANT_DIMENSION)
-        {
-            if let Err(reason) = crate::federation::consent_grammar::validate_grant_admission(
-                &row.attestation_envelope,
-            ) {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "consent grant rejected by the closed grammar (#510): {reason}"
-                )));
-            }
+        // v22.0.0 (CIRISConstitution#46) — CONSENT BEFORE SCORING. A
+        // federation-tier `capacity:*` claim about subject S from attester P is
+        // refused unless a live `analyze` consent from S covering P exists in
+        // this node's verified corpus. AV-76 TIER 4: it reads the directory
+        // (the scoped consent fold), so it must never run ahead of crypto.
+        // Placed IMMEDIATELY after the reserved-prefix gate — which carries
+        // AV-62/74's dimension-keyed self-emission arm — so a SELF-attested
+        // capacity row is still reported as self-emission rather than shadowed
+        // by "no consent". Backend-symmetric across memory / sqlite / postgres.
+        crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
+
+        // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
+        // this node has de-admitted gets its writes refused here. No-op when
+        // the host installed no `self_key_id`: a node that has declared no
+        // identity has authored no de-admissions, so the set is empty.
+        //
+        // v22.0.0 (CIRISPersist#543): absent on this backend entirely — the
+        // gate, its `self_key_id` field and its accessor all shipped on sqlite
+        // + postgres only, which made the CHANGELOG's "all five closed on all
+        // three backends" false for AV-77. Same tier position as the SQL
+        // backends so a refusal is named by the same gate everywhere.
+        if let Some(me) = self.self_key_id() {
+            crate::federation::admission::check_peer_deadmission(self, &row, &me).await?;
         }
 
         // v12.5.0 (CIRISPersist#238, CC 4.5.4 / §11.11) — no-moderator-no-
         // federate FEDERATION-APPLY re-check (point ii). A federation-tier row
-        // keyed on a community is a federation
-        // apply step keyed on C; it is refused if C has lost its last live
-        // `moderate`-holder (so a moderator-less community cannot continue at
-        // moderated capability). #369 broadened the keying: C is referenced
-        // via envelope `community_id`/`community_key_id`/`cohort_key_id`, OR
-        // a row endpoint / subject_key_ids entry resolving as a stored
-        // community (the membership shape). No-op for local-tier rows and
-        // rows referencing no locally-known community. Resolves the
-        // community + steward-binding via the directory (locks state itself),
-        // so it runs before the state lock. Backend-symmetric.
+        // keyed on a community is a federation apply step keyed on C; it is
+        // refused if C has lost its last live `moderate`-holder (so a
+        // moderator-less community cannot continue at moderated capability).
+        // #369 broadened the keying: C is referenced via envelope
+        // `community_id`/`community_key_id`/`cohort_key_id`, OR a row endpoint
+        // / subject_key_ids entry resolving as a stored community (the
+        // membership shape). No-op for local-tier rows and rows referencing no
+        // locally-known community. Backend-symmetric.
         crate::federation::admission::check_no_moderator_federate_apply(self, &row).await?;
 
-        // v9.0.0 (CIRISPersist#237, CC 5.3.2.4.3.1) — PQC-mandatory
-        // hybrid-verify at the federation-tier bulk store/replicate
-        // ingest gate (parity with the postgres + sqlite backends). A
-        // no-op for local-tier rows (CC 5.3.2.2 deferred signature); for
-        // a federation-tier row it hybrid-verifies the envelope signature
-        // (Ed25519 + ML-DSA-65, Strict) against the attester's REGISTERED
-        // pubkeys. Composes with — does not replace — the trust-threshold
-        // check_federation + the node-agency gate. Runs BEFORE the state
-        // lock (it calls lookup_public_key on self, which acquires the
-        // lock itself) and BEFORE persist — a rejected row leaves no trace
-        // (verify-before-mutation, AV-9; store-then-quarantine is
-        // non-conformant per CC 5.3.2.4.3.1).
-        crate::federation::verify_federation_tier_ingest(self, &row).await?;
-
+        // ── AV-76 TIER 5 — hash + insert ────────────────────────────
+        // D1: `check_withdraws_admission` above STAMPS
+        // `row.withdraws_admission_rule`, and the row hash covers it — so that
+        // gate must precede this block. It does.
         // v21.0.0 (#501) — capture the inbound trace projection while `row`
-        // is still owned (before the write closure consumes it).
+        // is still owned (before the push consumes it).
         let projected_trace =
             crate::ingest::project_trace_events_from_attestation(&row.attestation_envelope);
 
-        // v12.6.0 (CIRISPersist#171, §10.1.3 transit-not-rest) — a `revoked`
-        // consent_record at local tier MAY *transit* the local write path
-        // only if its bound-hybrid signature verifies (accept on VALID crypto
-        // only). Runs BEFORE the state lock (it resolves pubkeys via the
-        // directory, which locks itself) and BEFORE persist. No-op for
-        // non-consent_record rows and durable (granted / federation) ones.
-        // Backend-symmetric with SQLite + Postgres.
-        crate::federation::admission::verify_consent_record_transit_ingest(self, &row).await?;
-
         {
             let mut state = self.state.lock().expect("memory backend lock");
-            // FK enforcement parity with postgres: both attesting_key_id
-            // and attested_key_id must exist in federation_keys.
-            let attesting_identity_type = match state.federation_keys.get(&row.attesting_key_id) {
-                Some(rec) => rec.identity_type.clone(),
-                None => {
-                    return Err(crate::federation::Error::InvalidArgument(format!(
-                        "attesting_key_id {} does not exist in federation_keys",
-                        row.attesting_key_id
-                    )));
-                }
-            };
+            // v22.0.0 (CIRISPersist#543 / AV-79) — PRIMARY-KEY UNIQUENESS on
+            // `attestation_id`, which this backend simply did not have.
+            // `federation_attestations.attestation_id` is `TEXT PRIMARY KEY` on
+            // both SQL backends (`migrations/sqlite/lens/V004__federation_directory.sql`,
+            // `migrations/postgres/lens/V071__ceg_rc2_operational_data.sql`);
+            // memory kept a `Vec` and pushed unconditionally, so two DIFFERENT
+            // rows sharing one id both landed. That is worse than a missing
+            // constraint, because the two read paths then disagree:
+            // `get_attestation` answers with the FIRST row — so the second write
+            // was accepted and then SHADOWED, and its writer believes it landed
+            // when it did not — while `list_attestations_by` returns both, so
+            // the same duplicate double-counts on every read that does not go
+            // through `get_attestation`. Silent write loss on one path and
+            // double-counting on the other, from one defect. Found by the
+            // substrate state machine.
+            //
+            // Placement is TIER 5, at the insert point and AHEAD of the FK
+            // emulation below, because that is where and in what order the SQL
+            // engines enforce it: a row violating BOTH constraints reports
+            // `UNIQUE constraint failed`, not `FOREIGN KEY constraint failed`
+            // (SQLite inserts the PK index entry before the FK check). Hoisting
+            // it above the tier-4 authority gates would change which gate names
+            // a refusal and break the AV-76 cross-backend refusal-kind parity.
+            //
+            // The error MATCHES sqlite's byte for byte — same `Error::Backend`
+            // variant (kind `federation_backend`), same message — because the
+            // SQL backends map every non-FK insert failure through
+            // `Backend(format!("insert attestation: {msg}"))`, and `assert_parity`
+            // hard-asserts `error_kind` equality across backends. §6.1 replay is
+            // unaffected: a structural composer replaying an existing triple
+            // short-circuits at tier 4b and never reaches this line.
+            if state
+                .federation_attestations
+                .iter()
+                .any(|existing| existing.attestation_id == row.attestation_id)
+            {
+                return Err(crate::federation::Error::Backend(
+                    "insert attestation: UNIQUE constraint failed: \
+                     federation_attestations.attestation_id"
+                        .to_string(),
+                ));
+            }
+
+            // FK enforcement parity with sqlite + postgres, where
+            // `federation_attestations.attested_key_id REFERENCES
+            // federation_keys(key_id)` is enforced by the engine AT THE INSERT
+            // — so the emulation belongs in tier 5, at the same point in the
+            // stack, not ahead of the gates the SQL backends run first.
             if !state.federation_keys.contains_key(&row.attested_key_id) {
                 return Err(crate::federation::Error::InvalidArgument(format!(
                     "attested_key_id {} does not exist in federation_keys",
                     row.attested_key_id
                 )));
-            }
-
-            // v2.4.0 (CIRISPersist#102 Ask 3) — admission gate. Default
-            // policy enforces the `accord:*` × `accord_holder` rule and
-            // the four-test operational-language gate on `scores`
-            // attestations; structural primitives are exempt. See
-            // `src/federation/admission.rs`.
-            let dim = crate::federation::admission::envelope_dimension(&row.attestation_envelope);
-            crate::federation::admission::DimensionAdmissionPolicy::default().check(
-                &row.attestation_type,
-                dim,
-                &attesting_identity_type,
-            )?;
-
-            // v3.0.0 (CIRISPersist#116, CEG 0.2 §6.1) — structural-composer
-            // dedup on `(references_attestation_id, attestation_type,
-            // attesting_key_id)`. A duplicate composer is a typed
-            // `Ok(())` no-op; the audit chain stays complete without
-            // accumulating replayed rows. Non-composers (scores,
-            // delegates_to) skip this branch.
-            if crate::federation::precedence::is_structural_composer(&row.attestation_type) {
-                for existing in &state.federation_attestations {
-                    if crate::federation::precedence::is_dedup_match(existing, &row) {
-                        return Ok(());
-                    }
-                }
             }
 
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
@@ -2618,6 +3051,15 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         revocation: crate::federation::SignedRevocation,
     ) -> Result<(), crate::federation::Error> {
         let mut row = revocation.revocation;
+        // v3.4.0 (CIRISPersist#123) — trust gate first; the revoking key is
+        // the attester. v22.0.0 (CIRISPersist#543 finding 4): backend-
+        // symmetric with sqlite + postgres, which have gated this path
+        // since v3.4.0 while memory silently did not.
+        if !row.revoking_key_id.is_empty() {
+            if let Some(gate) = self.admission_gate() {
+                gate.check_federation(&row.revoking_key_id).await?;
+            }
+        }
         // v21.0.0 (CIRISPersist#502 E1) — mechanistic authorship BEFORE the
         // state lock (the verify resolves keys via the directory, which
         // locks itself). Hybrid-Strict vs the revoking key's registered
@@ -6971,6 +7413,169 @@ mod accord_tests {
         .await;
     }
 
+    /// #543 AV-77 — de-admission stops an abuser and is revocable, on memory.
+    ///
+    /// The memory arm of the `{gate} × {backend}` matrix; the SAME shared
+    /// exercise body the sqlite (`bootstrap_peer_deadmission_sqlite_543`) and
+    /// postgres arms run, which is what makes it a parity proof rather than
+    /// three tests that happen to agree today.
+    #[tokio::test]
+    async fn bootstrap_peer_deadmission_memory_543() {
+        let backend = MemoryBackend::new();
+        backend.set_self_key_id(Some("mem543d-self".to_string()));
+        crate::federation::bootstrap_admission::test_support::exercise_peer_deadmission(
+            &backend,
+            "mem543d-self",
+            "mem543d",
+        )
+        .await;
+    }
+
+    /// v22.0.0 (CIRISPersist#543) — the `scores` ENVELOPE-SCHEMA gate, which
+    /// the memory backend did not have: no resolver field, no accessor, no
+    /// call site. It was latent rather than live only because the default
+    /// [`crate::federation::NoOpSchemaResolver`] answers `None` — a host that
+    /// installed a REAL resolver got enforcement on sqlite + postgres and
+    /// silence here.
+    ///
+    /// Written as a DIFFERENTIAL rather than two independent assertions: the
+    /// same stub resolver and the same violating envelope go through both
+    /// backends and the two `error_kind`s must be equal. That drives sqlite's
+    /// answer instead of hard-coding a guess at it, which is what
+    /// `assert_parity`'s hard `error_kind` equality now demands of every gate.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn envelope_schema_gate_matches_sqlite_memory_543() {
+        use crate::federation::{
+            AxisSchema, FederationDirectory as _, SchemaResolver, SchemaResolverError,
+            SignedAttestation,
+        };
+        use crate::store::backend::Backend as _;
+
+        /// Resolver that always yields a schema requiring `evidence_refs`.
+        struct AlwaysRequiresEvidence;
+        impl SchemaResolver for AlwaysRequiresEvidence {
+            fn resolve<'a>(
+                &'a self,
+                _dimension: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<Option<AxisSchema>, SchemaResolverError>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(Some(AxisSchema {
+                        sha256: [0u8; 32],
+                        document: serde_json::json!({
+                            "type": "object",
+                            "required": ["evidence_refs"],
+                        }),
+                    }))
+                })
+            }
+        }
+
+        // A neutral dimension: `detection:*` and friends are reserved-prefix
+        // gated to specific identity types, and a row that bounces off THAT
+        // gate would prove nothing about this one. `trust:demo:v1` is the
+        // dimension the shared AV-77 exercise already drives through every
+        // other gate on all three backends.
+        const DIM: &str = "trust:demo:v1";
+        // `scores_row`'s envelope carries dimension/score/confidence and NO
+        // `evidence_refs`, so it violates the schema above.
+        let row = |id: &str| {
+            crate::federation::bootstrap_admission::test_support::scores_row(
+                id, "sch543", "sch543", DIM,
+            )
+        };
+
+        // (a) DEFAULT resolver is still a no-op — nothing that passes today
+        // starts failing. This is the half that protects every other test.
+        let plain = MemoryBackend::new();
+        crate::federation::tier_ingest::test_support::register_hybrid_key(&plain, "sch543").await;
+        plain
+            .put_attestation(SignedAttestation {
+                attestation: row(&uuid::Uuid::new_v4().to_string()),
+            })
+            .await
+            .expect("the default NoOpSchemaResolver must leave the gate a no-op");
+
+        // (b) THE DIFFERENTIAL — same resolver, same row, both backends.
+        let mem = MemoryBackend::new();
+        crate::federation::tier_ingest::test_support::register_hybrid_key(&mem, "sch543").await;
+        mem.set_schema_resolver(std::sync::Arc::new(AlwaysRequiresEvidence));
+        let mem_err = mem
+            .put_attestation(SignedAttestation {
+                attestation: row(&uuid::Uuid::new_v4().to_string()),
+            })
+            .await
+            .expect_err("memory must refuse an envelope that violates its axis schema");
+
+        let sq = crate::store::sqlite::SqliteBackend::open_in_memory()
+            .await
+            .expect("open sqlite");
+        sq.run_migrations().await.expect("migrations");
+        crate::federation::tier_ingest::test_support::register_hybrid_key(&sq, "sch543").await;
+        sq.set_schema_resolver(std::sync::Arc::new(AlwaysRequiresEvidence));
+        let sq_err = sq
+            .put_attestation(SignedAttestation {
+                attestation: row(&uuid::Uuid::new_v4().to_string()),
+            })
+            .await
+            .expect_err("sqlite refuses the same row");
+
+        assert_eq!(
+            mem_err.kind(),
+            sq_err.kind(),
+            "the two backends must refuse at the same gate KIND — a gate that refuses \
+             correctly but reports differently is still a failing divergence under \
+             `assert_parity` (memory {mem_err:?} vs sqlite {sq_err:?})"
+        );
+        // And the shared kind is the typed schema violation, not a generic backend error.
+        assert!(
+            matches!(
+                &mem_err,
+                crate::federation::Error::EnvelopeSchemaViolation { dimension, .. }
+                    if dimension == DIM
+            ),
+            "and it names the violating dimension: {mem_err:?}"
+        );
+    }
+
+    /// CIRISEdge#428 B6 — delivery_mode closed vocabulary on memory.
+    #[tokio::test]
+    async fn bootstrap_delivery_mode_vocabulary_memory_428() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_delivery_mode_vocabulary_gate(
+            &backend, "mem428",
+        )
+        .await;
+    }
+
+    /// #543 B1 — capacity self-emission gate on memory (both wire shapes).
+    #[tokio::test]
+    async fn bootstrap_capacity_self_emission_gate_memory_543() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_capacity_self_emission_gate(
+            &backend, "mem543",
+        )
+        .await;
+    }
+
+    /// #543 B5 / CIRISConstitution#46 — consent-before-scoring for `capacity:*`
+    /// on memory. Same shared exercise body as the sqlite + postgres arms.
+    #[tokio::test]
+    async fn bootstrap_capacity_consent_gate_memory_46() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_capacity_consent_gate(
+            &backend, "mem46",
+        )
+        .await;
+    }
+
     /// #541 — the signed-row-survives-unsigned-write invariant on memory.
     #[tokio::test]
     async fn signed_row_survives_local_write_memory_541() {
@@ -8256,21 +8861,25 @@ mod tests {
     #[tokio::test]
     async fn put_attestation_requires_both_keys_exist() {
         let backend = MemoryBackend::new();
-        // Neither key exists yet — should be rejected. v9.0.0
-        // (CC 5.3.2.4.3.1): the federation-tier ingest gate fires first
-        // and rejects the UNREGISTERED attester (no pubkeys to verify the
-        // hybrid signature against) as FederationTierUnverified, before
-        // the FK-existence InvalidArgument check inside the lock. Either
-        // way the row is not stored.
+        // Neither key exists yet — should be rejected. v22.0.0
+        // (CIRISPersist#543 / AV-76): the ATTESTER lookup is tier 2, the one
+        // unavoidable directory read, so an unregistered attester is refused
+        // there with the clearer-typed `InvalidArgument` — ahead of the tier-3
+        // hybrid verify, which would only have reported the same key as
+        // unresolvable in less specific words. This is the sqlite + postgres
+        // answer too (both hoist the same lookup to tier 2 rather than let the
+        // FK violation surface at INSERT); before the re-tiering memory alone
+        // returned `FederationTierUnverified` here. Either way, no row stored.
         let att = fix_attestation("a-1", "registry-steward", "primitive-a", "registry-steward");
         let err = backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::federation::Error::FederationTierUnverified { .. }
-        ));
+        assert!(
+            matches!(&err, crate::federation::Error::InvalidArgument(m)
+                if m.contains("attesting_key_id") && m.contains("does not exist")),
+            "expected the tier-2 attester-lookup refusal, got {err:?}"
+        );
 
         // Add the keys; retry succeeds.
         backend
@@ -8290,6 +8899,388 @@ mod tests {
             .put_attestation(SignedAttestation { attestation: att })
             .await
             .unwrap();
+    }
+
+    // ─── v22.0.0 (CIRISPersist#543) memory-backend parity witnesses ──
+    //
+    // Two gates sqlite + postgres both enforce were missing on the memory
+    // backend. Memory is the backend every unit test reaches for first, so a
+    // gate absent HERE is a gate the whole test suite proves nothing about —
+    // the #518/#534/#536/#541 "tested on one backend, used on the other"
+    // shape, arriving from the opposite direction.
+
+    /// Fresh, well-formed Android-Strongbox hardware evidence (the shape the
+    /// sqlite witnesses use, so the two backends are proven against the SAME
+    /// artifact). `captured_at` is a parameter so the stale-nonce arm can
+    /// reach back past `max_nonce_age`.
+    fn strongbox_evidence(captured_at: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+        serde_json::json!({
+            "platform_attestation": {
+                "Android": {
+                    "key_attestation_chain": [
+                        vec![0x30u8, 0x82, 0x01, 0x00],
+                        vec![0x30u8, 0x82, 0x02, 0x00],
+                    ],
+                    "play_integrity_token": "eyJhbGciOiJIUzI1NiJ9.fake.token",
+                    "strongbox_backed": true,
+                }
+            },
+            "nonce_captured_at": captured_at.to_rfc3339(),
+        })
+    }
+
+    /// v22.0.0 (CIRISPersist#543) — WITNESS for hole 1: an `accord_holder`
+    /// claim on the MEMORY backend is gated by the hardware-attestation
+    /// policy, identically to sqlite (`sqlite_put_public_key_rejects_accord_
+    /// holder_without_evidence` + siblings) and postgres.
+    ///
+    /// Before the fix `MemoryBackend::put_public_key` ran ZERO of this — the
+    /// `hardware_attestation_policy` field did not exist on the backend — so
+    /// an evidence-less `accord_holder`, the STRONGEST claim in the identity
+    /// grammar (`ConferralMode::HardwareAttested`), was admitted for free.
+    /// That is not a cosmetic gap: `check_privileged_identity_type_admission`
+    /// deliberately DELEGATES `accord_holder` to this policy (it skips every
+    /// non-`AccordCoScrubbed` mode), so with the policy absent nothing at all
+    /// stood behind the claim, and a memory-backed node would seat a forged
+    /// holder into the very roster the accord quorum is tallied from.
+    ///
+    /// All four policy outcomes are exercised, plus the two negative controls
+    /// (non-holder needs no evidence; a rejected row leaves NO trace).
+    #[tokio::test]
+    async fn memory_put_public_key_gates_accord_holder_on_hardware_attestation_543() {
+        use crate::federation::types::identity_type::ACCORD_HOLDER;
+        let backend = MemoryBackend::new();
+
+        // (a) scalar `identity_type = accord_holder`, NO evidence → REJECT.
+        let mut k = fix_key("mem-ah-no-ev", "humanity-accord-x", "mem-ah-no-ev");
+        k.identity_type = ACCORD_HOLDER.into();
+        let err = backend
+            .put_public_key(SignedKeyRecord { record: k })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_accord_holder_requires_attestation_evidence",
+            "evidence-less accord_holder must be refused on memory too, got {err:?}"
+        );
+        // …and verify-before-mutation: the refused row left no trace.
+        assert!(
+            FederationDirectory::lookup_public_key(&backend, "mem-ah-no-ev")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused accord_holder must not be stored"
+        );
+
+        // (b) #441 SET form ("agent,accord_holder") hits the same gate as the
+        //     scalar — `claims_role`, not string equality.
+        let mut k = fix_key("mem-ah-setform", "humanity-accord-x", "mem-ah-setform");
+        k.identity_type = format!("agent,{ACCORD_HOLDER}");
+        let err = backend
+            .put_public_key(SignedKeyRecord { record: k })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_accord_holder_requires_attestation_evidence",
+            "set-form accord_holder claim must hit the gate, got {err:?}"
+        );
+
+        // (c) #441 ROLES-vector form hits it too.
+        let mut k = fix_key("mem-ah-roles", "humanity-accord-x", "mem-ah-roles");
+        k.roles = vec![ACCORD_HOLDER.to_string()];
+        let err = backend
+            .put_public_key(SignedKeyRecord { record: k })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_accord_holder_requires_attestation_evidence",
+            "roles-vector accord_holder claim must hit the gate, got {err:?}"
+        );
+
+        // (d) the gate is the POLICY, not a presence check: a stale nonce is
+        //     refused even though the evidence is structurally perfect.
+        let stale = chrono::Utc::now() - chrono::Duration::days(30);
+        let mut k = fix_key("mem-ah-stale", "humanity-accord-x", "mem-ah-stale");
+        k.identity_type = ACCORD_HOLDER.into();
+        k.attestation_evidence = Some(strongbox_evidence(stale));
+        let err = backend
+            .put_public_key(SignedKeyRecord { record: k })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_attestation_evidence_stale",
+            "a months-old nonce must be refused on memory too, got {err:?}"
+        );
+
+        // (e) software-only custody is refused (the one structural floor
+        //     Verify draws). Same evidence body as the sqlite twin.
+        let mut k = fix_key("mem-ah-sw", "humanity-accord-x", "mem-ah-sw");
+        k.identity_type = ACCORD_HOLDER.into();
+        k.attestation_evidence = Some(serde_json::json!({
+            "platform_attestation": {
+                "Software": {
+                    "key_derivation": "random",
+                    "storage": "memory",
+                    "security_warning": "test"
+                }
+            },
+            "nonce_captured_at": chrono::Utc::now().to_rfc3339(),
+        }));
+        let err = backend
+            .put_public_key(SignedKeyRecord { record: k })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_hardware_type_not_accepted",
+            "SoftwareOnly custody must not seat an accord holder, got {err:?}"
+        );
+
+        // (f) POSITIVE control — fresh Strongbox evidence ADMITS. The gate
+        //     tightens, it does not close the door on a real holder.
+        let mut k = fix_key("mem-ah-ok", "humanity-accord-x", "mem-ah-ok");
+        k.identity_type = ACCORD_HOLDER.into();
+        k.attestation_evidence = Some(strongbox_evidence(chrono::Utc::now()));
+        backend
+            .put_public_key(SignedKeyRecord { record: k })
+            .await
+            .expect("a hardware-attested accord_holder must admit");
+        let read = FederationDirectory::lookup_public_key(&backend, "mem-ah-ok")
+            .await
+            .unwrap()
+            .expect("admitted holder is readable");
+        assert_eq!(read.identity_type, ACCORD_HOLDER);
+
+        // (g) NEGATIVE control — a non-holder still needs no evidence.
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: fix_key("mem-plain", "plain", "mem-plain"),
+            })
+            .await
+            .expect("a non-accord_holder row must not require hardware evidence");
+    }
+
+    /// v22.0.0 (CIRISPersist#543) — WITNESS for hole 1's second half: the
+    /// `validate_registration_pubkey` write-path invariant (#275) now runs on
+    /// memory too. Before the fix a wrong-curve / wrong-length
+    /// `pubkey_ed25519_base64` that sqlite and postgres BOTH refuse was
+    /// admitted by memory, so the row a memory-backed test proved "registers
+    /// fine" could not be replicated to either SQL backend.
+    #[tokio::test]
+    async fn memory_put_public_key_validates_registration_pubkey_543() {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+        let backend = MemoryBackend::new();
+        // A 65-byte uncompressed P-256 point — the exact wrong-curve shape
+        // the #275 saga produced. Not a 32-byte Ed25519 key.
+        let mut k = fix_key("mem-badcurve", "badcurve", "mem-badcurve");
+        k.pubkey_ed25519_base64 = BASE64.encode([0x04u8; 65]);
+        let err = backend
+            .put_public_key(SignedKeyRecord { record: k })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::federation::Error::InvalidArgument(_)),
+            "a 65-byte non-Ed25519 pubkey must be refused at admission, got {err:?}"
+        );
+        assert!(
+            FederationDirectory::lookup_public_key(&backend, "mem-badcurve")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused malformed-pubkey row must not be stored"
+        );
+    }
+
+    /// v22.0.0 (CIRISPersist#543) — WITNESS for hole 2: `put_attestation` on
+    /// memory runs the closed-set `check_cohort_scope` VALUE gate, so an
+    /// out-of-set `cohort_scope` fails with the SAME typed error sqlite
+    /// (`sqlite.rs`) and postgres raise.
+    ///
+    /// Scope note, stated honestly: memory did not *store* a `global` row
+    /// before this fix either — the AV-45 membership gate
+    /// (`check_write_cohort_scope_for`) falls through to
+    /// `ScopeRefusalReason::InvalidCohortScope` for any out-of-set value, so
+    /// the ACCEPT/REJECT sets already matched. What did NOT match is the
+    /// typed rejection: memory raised `WriteScopeRefused`
+    /// (`federation_write_scope_refused`) where both SQL backends raise
+    /// `CohortScopeRejected` (`federation_cohort_scope_rejected`) — and that
+    /// kind string is the documented machine-readable contract consumers
+    /// pattern-match on. A backend that refuses the right rows under the
+    /// wrong error kind still breaks every caller that branches on the kind,
+    /// which is why this asserts the kind and not merely `is_err()`.
+    #[tokio::test]
+    async fn memory_put_attestation_rejects_out_of_set_cohort_scope_543() {
+        let backend = MemoryBackend::new();
+        for k in ["cs-attester", "cs-attested"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fix_key(k, k, k),
+                })
+                .await
+                .unwrap();
+        }
+
+        // `global` is a §8.1.8 FEED name aggregating {species, biosphere,
+        // federation} — never a wire value.
+        let mut att = fix_attestation("cs-global", "cs-attester", "cs-attested", "cs-attester");
+        att.cohort_scope = "global".to_string();
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_cohort_scope_rejected",
+            "memory must raise the same typed cohort_scope rejection as sqlite/postgres, got {err:?}"
+        );
+        assert!(
+            backend
+                .get_attestation("cs-global")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused cohort_scope row must leave no trace"
+        );
+
+        // Empty string — same closed-set refusal, same kind.
+        let mut att = fix_attestation("cs-empty", "cs-attester", "cs-attested", "cs-attester");
+        att.cohort_scope = String::new();
+        let err = backend
+            .put_attestation(SignedAttestation { attestation: att })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            "federation_cohort_scope_rejected",
+            "an empty cohort_scope is out-of-set too, got {err:?}"
+        );
+
+        // POSITIVE control — every closed-set value that needs no membership
+        // target still admits (the gate validates the VALUE, nothing more).
+        for (i, scope) in ["self", "affiliations", "species", "biosphere", "federation"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut att = fix_attestation(
+                &format!("cs-ok-{i}"),
+                "cs-attester",
+                "cs-attested",
+                "cs-attester",
+            );
+            att.cohort_scope = scope.to_string();
+            backend
+                .put_attestation(SignedAttestation { attestation: att })
+                .await
+                .unwrap_or_else(|e| panic!("closed-set cohort_scope {scope} must admit: {e:?}"));
+        }
+    }
+
+    /// v22.0.0 (CIRISPersist#543 finding 4, AV-76) — WITNESS: the per-peer
+    /// write quota is charged on the FIRST gate of `put_attestation` on the
+    /// memory backend, exactly as on sqlite
+    /// (`av76_per_peer_write_quota_is_wired_sqlite`) and postgres
+    /// (`av76_per_peer_write_quota_is_wired_postgres`).
+    ///
+    /// This calls the SAME shared assertion body those two call — the whole
+    /// point of `gate_order_test_support` is that the ordering claim lives
+    /// once and every backend re-runs it, so a divergence is a test failure
+    /// rather than a silent third-backend gap. Memory shipping without the
+    /// quota would have been AV-76 existing on two backends out of three:
+    /// the #541 recurrence class the shared helper exists to prevent.
+    #[tokio::test]
+    async fn av76_per_peer_write_quota_is_wired_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::replication::admission::gate_order_test_support::
+            assert_per_peer_write_quota_is_wired(&backend, "mem").await;
+    }
+
+    /// v22.0.0 (CIRISPersist#543 finding 4) — WITNESS: the v3.4.0
+    /// trust-weighted [`crate::federation::AdmissionGate`] now actually RUNS
+    /// on the memory backend.
+    ///
+    /// `MemoryBackend` had no `admission_gate` field, no accessor and no
+    /// call site, so `check_federation` had never executed on this backend
+    /// on ANY write path since v3.4.0 — an installed gate was silently a
+    /// no-op. Both directions are asserted: a below-threshold peer is
+    /// REFUSED (`federation_trust_below_threshold`), and the same write
+    /// from an above-threshold peer gets past the gate (it then fails
+    /// further down the stack, which is the proof it was not stopped here).
+    #[tokio::test]
+    async fn admission_gate_is_wired_on_memory_543() {
+        struct FixedTrustScoring(std::collections::HashMap<String, f64>);
+        #[async_trait::async_trait]
+        impl crate::federation::TrustScoring for FixedTrustScoring {
+            async fn trust_score(
+                &self,
+                key_id: &str,
+                _recursion_depth: u8,
+            ) -> Result<f64, crate::federation::TrustScoringError> {
+                match self.0.get(key_id) {
+                    Some(s) => Ok(*s),
+                    None => Err(crate::federation::TrustScoringError::KeyNotFound(
+                        key_id.into(),
+                    )),
+                }
+            }
+        }
+        let gate_for = |pairs: &[(&str, f64)], threshold: f64| {
+            let mut map = std::collections::HashMap::new();
+            for (k, v) in pairs {
+                map.insert((*k).to_owned(), *v);
+            }
+            crate::federation::AdmissionGate::new(
+                std::sync::Arc::new(FixedTrustScoring(map)),
+                threshold,
+                0,
+            )
+        };
+
+        // Default state: NO gate installed — bootstrap-permissive.
+        let backend = MemoryBackend::new();
+        assert!(
+            backend.admission_gate().is_none(),
+            "a fresh memory backend must be bootstrap-permissive"
+        );
+
+        // Below threshold ⇒ the gate refuses, and it refuses FIRST: the
+        // attesting key is not even registered, so any later gate would
+        // have produced a different (more informative) error.
+        backend.set_admission_gate(Some(gate_for(&[("ag-lo", 0.1)], 0.5)));
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_attestation("ag-1", "ag-lo", "ag-lo", "ag-lo"),
+            })
+            .await
+            .expect_err("a below-threshold peer must be refused");
+        assert_eq!(
+            err.kind(),
+            "federation_trust_below_threshold",
+            "the trust gate must run on memory and reject first — got {err:?}"
+        );
+
+        // Above threshold ⇒ NOT stopped here. The write still fails (the
+        // key is unregistered), but on a LATER gate — which is what proves
+        // the gate admitted rather than that it is inert.
+        backend.set_admission_gate(Some(gate_for(&[("ag-hi", 0.9)], 0.5)));
+        let err = backend
+            .put_attestation(SignedAttestation {
+                attestation: fix_attestation("ag-2", "ag-hi", "ag-hi", "ag-hi"),
+            })
+            .await
+            .expect_err("unregistered attester still fails downstream");
+        assert_ne!(
+            err.kind(),
+            "federation_trust_below_threshold",
+            "an above-threshold peer must pass the trust gate — got {err:?}"
+        );
+
+        // Clearing restores bootstrap-permissive.
+        backend.set_admission_gate(None);
+        assert!(backend.admission_gate().is_none(), "gate cleared");
     }
 
     #[tokio::test]
@@ -9330,6 +10321,13 @@ mod tests {
         ] {
             let mut rec = fix_key(k, "ref", k);
             rec.identity_type = it.to_owned();
+            // v22.0.0 (CIRISPersist#543) — the memory backend now runs the
+            // same `accord_holder` hardware gate sqlite/postgres do, so an
+            // `accord_holder` fixture must carry real evidence. No-op for
+            // every other identity_type.
+            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+                &mut rec,
+            );
             backend
                 .put_public_key(SignedKeyRecord { record: rec })
                 .await
@@ -9448,12 +10446,20 @@ mod tests {
         let backend = MemoryBackend::new();
 
         // Seed the REAL baked genesis state: the A1/B1/C1 holder roster…
-        for rec in crate::federation::genesis::effective_accord_holder_records().iter() {
-            backend
-                .put_public_key(rec.clone())
-                .await
-                .expect("seed accord holder");
-        }
+        // v22.0.0 (CIRISPersist#543) — through `seed_genesis_accord_holders`,
+        // the same door the sqlite + postgres genesis paths use, NOT bare
+        // `put_public_key`. The baked ceremony evidence is a #268 custody
+        // attestation with a stale-by-design nonce; re-checking it at every
+        // boot is a category error, which is exactly why the SQL backends
+        // have a dedicated seed entry point. Memory reaching for
+        // `put_public_key` here was the tell that it had no hardware gate to
+        // need seeding around.
+        backend
+            .seed_genesis_accord_holders(
+                &crate::federation::genesis::effective_accord_holder_records(),
+            )
+            .await
+            .expect("seed accord holder roster");
         // …and the PRIOR canonical anchor — the PRE-CEREMONY roles-less
         // record (kept as a fixture: the live baked seed is now the
         // re-blessed one, so the field-refusal state must be seeded
@@ -9655,6 +10661,13 @@ mod tests {
         ] {
             let mut rec = fix_key(k, "ref", k);
             rec.identity_type = it.to_owned();
+            // v22.0.0 (CIRISPersist#543) — the memory backend now runs the
+            // same `accord_holder` hardware gate sqlite/postgres do, so an
+            // `accord_holder` fixture must carry real evidence. No-op for
+            // every other identity_type.
+            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+                &mut rec,
+            );
             backend
                 .put_public_key(SignedKeyRecord { record: rec })
                 .await
@@ -9727,6 +10740,13 @@ mod tests {
         ] {
             let mut rec = fix_key(k, "ref", k);
             rec.identity_type = it.to_owned();
+            // v22.0.0 (CIRISPersist#543) — the memory backend now runs the
+            // same `accord_holder` hardware gate sqlite/postgres do, so an
+            // `accord_holder` fixture must carry real evidence. No-op for
+            // every other identity_type.
+            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+                &mut rec,
+            );
             backend
                 .put_public_key(SignedKeyRecord { record: rec })
                 .await
@@ -9928,6 +10948,13 @@ mod tests {
         ] {
             let mut rec = fix_key(k, "ref", k);
             rec.identity_type = it.to_owned();
+            // v22.0.0 (CIRISPersist#543) — the memory backend now runs the
+            // same `accord_holder` hardware gate sqlite/postgres do, so an
+            // `accord_holder` fixture must carry real evidence. No-op for
+            // every other identity_type.
+            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+                &mut rec,
+            );
             backend
                 .put_public_key(SignedKeyRecord { record: rec })
                 .await
@@ -14050,8 +15077,16 @@ mod tests {
         );
 
         // A differing record for the same key_id — Refused, original kept.
+        // v22.0.0 (CIRISPersist#543): a REAL, structurally-valid 32-byte
+        // Ed25519 key that merely differs. The old `"AAAA-different-pubkey"`
+        // placeholder is not even base64, so with #275's
+        // `validate_registration_pubkey` now running on memory it would fail
+        // admission instead of reaching the first-seen-wins decision this
+        // test is about — and it would never have reached it on sqlite or
+        // postgres either.
         let mut differing = fix_key("node-x", "primitive", "A1");
-        differing.pubkey_ed25519_base64 = "AAAA-different-pubkey".into();
+        differing.pubkey_ed25519_base64 =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys("node-x-other").0;
         assert_eq!(
             dir.apply_replicated_key_record(SignedKeyRecord { record: differing })
                 .await
@@ -14221,6 +15256,13 @@ mod tests {
         ] {
             let mut rec = fix_key(k, "ref", k);
             rec.identity_type = it.to_owned();
+            // v22.0.0 (CIRISPersist#543) — the memory backend now runs the
+            // same `accord_holder` hardware gate sqlite/postgres do, so an
+            // `accord_holder` fixture must carry real evidence. No-op for
+            // every other identity_type.
+            crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+                &mut rec,
+            );
             backend
                 .put_public_key(SignedKeyRecord { record: rec })
                 .await

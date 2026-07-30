@@ -314,13 +314,27 @@ def test_register_self_then_put_blob_signing_275() -> None:
     import pytest
 
     ciris_persist.reset_engine()
-    seed = os.path.join(tempfile.mkdtemp(), "seed")
+    d = tempfile.mkdtemp()
+    seed = os.path.join(d, "seed")
+    pqc_seed = os.path.join(d, "pqc.seed")
     with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    with open(pqc_seed, "wb") as fh:
         fh.write(secrets.token_bytes(32))
     alias = "node-" + secrets.token_hex(8)
     try:
+        # v21.3.0 (#513) — the FIPS floor made the self-signed authority path
+        # hybrid-mandatory, so the node needs a PQC key too. This test predates
+        # that cut and CI never re-ran it (the `pyo3` wheel has no sqlite, so it
+        # SKIPS there) — the classical-only Engine it used to build now fails
+        # the hybrid-Strict verify at put_community.
         eng = ciris_persist.Engine(
-            "sqlite::memory:", alias, local_key_id=alias, local_key_path=seed
+            "sqlite::memory:",
+            alias,
+            local_key_id=alias,
+            local_key_path=seed,
+            local_pqc_key_id=alias + "-pqc",
+            local_pqc_key_path=pqc_seed,
         )
     except ValueError as exc:
         if "sqlite" in str(exc) and "feature" in str(exc):
@@ -376,13 +390,27 @@ def test_local_derived_key_id_pyo3_295():
     import pytest
 
     ciris_persist.reset_engine()
-    seed = os.path.join(tempfile.mkdtemp(), "seed")
+    d = tempfile.mkdtemp()
+    seed = os.path.join(d, "seed")
+    pqc_seed = os.path.join(d, "pqc.seed")
     with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    with open(pqc_seed, "wb") as fh:
         fh.write(secrets.token_bytes(32))
     alias = "node-" + secrets.token_hex(8)
     try:
+        # v21.3.0 (#513) — the FIPS floor made the self-signed authority path
+        # hybrid-mandatory, so the node needs a PQC key too. This test predates
+        # that cut and CI never re-ran it (the `pyo3` wheel has no sqlite, so it
+        # SKIPS there) — the classical-only Engine it used to build now fails
+        # the hybrid-Strict verify at put_community.
         eng = ciris_persist.Engine(
-            "sqlite::memory:", alias, local_key_id=alias, local_key_path=seed
+            "sqlite::memory:",
+            alias,
+            local_key_id=alias,
+            local_key_path=seed,
+            local_pqc_key_id=alias + "-pqc",
+            local_pqc_key_path=pqc_seed,
         )
     except ValueError as exc:
         if "sqlite" in str(exc) and "feature" in str(exc):
@@ -417,13 +445,27 @@ def test_put_community_json_round_trip_290() -> None:
     import pytest
 
     ciris_persist.reset_engine()
-    seed = os.path.join(tempfile.mkdtemp(), "seed")
+    d = tempfile.mkdtemp()
+    seed = os.path.join(d, "seed")
+    pqc_seed = os.path.join(d, "pqc.seed")
     with open(seed, "wb") as fh:
+        fh.write(secrets.token_bytes(32))
+    with open(pqc_seed, "wb") as fh:
         fh.write(secrets.token_bytes(32))
     alias = "node-" + secrets.token_hex(8)
     try:
+        # v21.3.0 (#513) — the FIPS floor made the self-signed authority path
+        # hybrid-mandatory, so the node needs a PQC key too. This test predates
+        # that cut and CI never re-ran it (the `pyo3` wheel has no sqlite, so it
+        # SKIPS there) — the classical-only Engine it used to build now fails
+        # the hybrid-Strict verify at put_community.
         eng = ciris_persist.Engine(
-            "sqlite::memory:", alias, local_key_id=alias, local_key_path=seed
+            "sqlite::memory:",
+            alias,
+            local_key_id=alias,
+            local_key_path=seed,
+            local_pqc_key_id=alias + "-pqc",
+            local_pqc_key_path=pqc_seed,
         )
     except ValueError as exc:
         if "sqlite" in str(exc) and "feature" in str(exc):
@@ -780,6 +822,57 @@ def test_local_sign_hybrid_matches_hand_composition_470() -> None:
         # proves the verb's bound preimage verifies under HybridPolicy::Strict
         # and that a raw-preimage signature is rejected.
         assert len(hand_pqc) == len(pqc) == 3309
+    finally:
+        eng.close(force=True)
+    ciris_persist.reset_engine()
+
+
+def test_deletion_window_watch_reachable_from_python_543() -> None:
+    """v22.0.0 (CIRISPersist#543 / ciris.ai/contextual-integrity) — the
+    deletion-window breach sweep is reachable THROUGH the FFI.
+
+    ciris.ai publishes that "if subjects revoke and the window expires
+    without deletion proof, the network itself raises a breach signal".
+    CIRISEdge and CIRISServer reach persist through this wheel, so a sweep
+    they cannot call is a signal the network cannot raise — the same
+    unreachability that made the AV-77 de-admission gate a sanction nobody
+    could enable. The judgment + emission are proven per-backend on the Rust
+    side; this pins that a HOST can drive a pass and read the report.
+    Skips on a non-sqlite wheel (see test_register_consumer_validation)."""
+    import json
+
+    import pytest
+
+    ciris_persist.reset_engine()
+    try:
+        eng = ciris_persist.Engine(dsn="sqlite://:memory:", signing_key_id="dw-543")
+    except ValueError as exc:
+        if "sqlite" in str(exc) and "feature" in str(exc):
+            pytest.skip("wheel built without the sqlite feature")
+        raise
+    try:
+        report = json.loads(eng.run_deletion_window_watch_json())
+        assert set(report.keys()) == {
+            "rows_scanned",
+            "windows_seen",
+            "within_window",
+            "deleted_in_time",
+            "breaches",
+            "malformed",
+            "scan_truncated",
+        }
+        # An empty substrate owes nobody a breach signal.
+        assert report["breaches"] == 0
+        assert report["scan_truncated"] is False
+
+        # `now_iso` makes a pass replayable; a bad one is a caller error, not
+        # a silent wall-clock fallback.
+        replay = json.loads(
+            eng.run_deletion_window_watch_json(now_iso="2026-07-27T00:00:00Z")
+        )
+        assert replay == report
+        with pytest.raises(ValueError):
+            eng.run_deletion_window_watch_json(now_iso="not-a-timestamp")
     finally:
         eng.close(force=True)
     ciris_persist.reset_engine()

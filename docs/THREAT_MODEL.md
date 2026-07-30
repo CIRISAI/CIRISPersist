@@ -2231,6 +2231,325 @@ the same reserved governance role that already owns `system:` /
 
 ---
 
+### 3.16 Bootstrap / Sybil — the mesh receive path (v22.0.0, CIRISPersist#543)
+
+This section is the **safe-mesh-genesis** posture: what an *admitted but
+untrusted* peer can do, and what stops it.
+
+#### The structural premise — why the put-gates are load-bearing
+
+Canonical servers exist to bootstrap strangers, so admission is
+deliberately cheap: `register_federation_key` requires a **self-signed
+hybrid proof-of-possession and nothing else**. That proves key *custody* —
+not identity, not authorization. Key material is free, so the model must
+assume **unlimited admitted identities**.
+
+Three layers that look like they bound this do not, on the receive path:
+
+- **Edge's consent plane is SEND-only.** `apply_envelope_bytes(kind, bytes)`
+  never receives the peer id, `on_deliver` applies every delivered envelope
+  with no consent check, and the responder auto-factory builds a Responder
+  for any admitted peer ("no additional consent is required").
+  (CIRISEdge#426.)
+- **The server's HTTP admission IS owner-gated** (`/v1/federation/peering`
+  `require_owner`, "owner-authored consent ONLY") — and the mesh receive
+  path bypasses it entirely.
+- **Consent withdrawal is send-side**, so it cannot stop inbound injection.
+
+Net: a Sybil PUSHes an unsolicited `Deliver` of its self-signed KeyRecord →
+`apply_key` → auto-registration on the self-signature alone → then
+attestation rows → `put_attestation`. **persist's put-gates are the entire
+defence.** A gate that leaks here is not "defence-in-depth reduced"; it is
+the only depth. The v22.0.0 audit found three leaking.
+
+#### AV-73: Third-party reputation forgery via ungated `scores`
+
+**Attack**: `check_delegated_duty_scores_admission` resolved a governing
+duty only for `moderation:*` and `reconsideration:*`, returning `Ok(())`
+for **every other** `scores` dimension. `compose_verdict` counts *distinct
+attesting keys* (`witness_diversity: None`), so ≥3 Sybils fabricate a
+`WellEstablished` or `Refuted` verdict about any subject Y — with Y having
+no involvement whatsoever.
+
+**Severity**: highest of this cut. It is not resource abuse; it is
+**trust-graph poisoning that corrupts a third party's walk**. And it fans
+out: the bulk read `list_attestations_since` is tier-only and unscoped, and
+edge advertises third-party `Global`/`Cohort` rows, so a canonical relays
+forged reputation onward to its honest consented recipients.
+
+**Mitigation**: the emitter's standing must bound what it can assert about
+a third party. See the mitigation matrix row for the shipped state — the
+per-dimension authority model is the substantive policy half of this cut,
+and where a dimension family has a *named* authority (reserved-prefix
+rules, duty-holders, witness-target walks) that authority is now the gate.
+
+**Residual**: a dimension family with no declared authority still admits
+third-party scores from any registered key. The verdict *composition* layer
+(`witness_diversity`) remains the second line, and is the correct long-term
+home for "N distinct keys are not N distinct people" — distinctness of keys
+is not distinctness of principals, and no put-gate can establish the latter.
+
+#### AV-74: Capacity self-inflation behind a dead guard (dimension-vs-type shape)
+
+**Attack**: The CC 3.4.5 self-emission arm in
+`check_reserved_prefix_admission` keys on the **`attestation_type`**
+namespace (`capacity:*` as a type). Reputation actually rides
+`attestation_type = scores` with `dimension = capacity:*`. On the real wire
+shape the arm never fired — so a Sybil scored *itself*, and combined with
+AV-73 a Sybil cluster could both inflate itself and score others.
+
+**Compounding defect — evidence-registry unsoundness**: the
+dimension-keyed guard written for exactly this case
+(`check_capacity_not_self_attested`, v4.4.0 / AV-62) had **zero callers**,
+while the vendored `namespace_supersets.json` cited it as a live processor
+("confirms scope-away"). #519's premise is that a mechanically-cited
+processor corresponds to code that *runs*; a citation naming dead code
+asserts an enforcement that does not exist. **A dead citation is worse than
+a missing one** — a missing processor is visible to the completeness gate,
+whereas a dead one reads as discharged.
+
+**Mitigation**: the guard is wired at the `check_reserved_prefix_admission`
+chokepoint (all three backends, pure/no-lookup so it stays in the cheap
+tier), and BOTH shapes are now refused — type-keyed and dimension-keyed —
+while a genuine third-party capacity score still admits. Pinned by the
+`{gate} × {backend}` matrix in `federation::bootstrap_admission`
+(invariant **B1**), verified in both directions.
+
+**Structural mitigation**: `every_cited_processor_has_a_non_test_caller`
+(`federation::namespace::supersets`) makes the evidence registry
+*mechanically sound*: every `path#symbol` the manifest cites as a processor
+must resolve to a function with **at least one non-test caller**. The bar is
+"non-test" deliberately — a function called only from tests enforces nothing
+on the live write path, which is precisely this failure mode. The gate found
+one further dead citation on landing (`duty_holders_from_signed_subjects`,
+labelled in the manifest's own words "the drift site"), which was **deleted**
+rather than merely un-cited: a `pub` helper that computes an authority set
+from caller-declared data is a loaded gun regardless of who calls it today.
+
+**Residual**: the gate covers repo-local citations naming functions; types,
+consts and cross-repo citations are classified explicitly
+(`NON_FUNCTION_CITATIONS`, `EXPORTED_API_CITATIONS`,
+`DELETED_PENDING_REVENDOR`) so each exemption is a reviewable claim rather
+than a silent skip.
+
+#### AV-75: Self-asserted privileged `identity_type` / roles
+
+**Attack**: `verify_key_registration` checks only the PoP self-signature.
+Four privileged claims were gated at `put_public_key` — `accord_holder`
+(hardware attestation), `canonical` (anchor-scrub), `infra:attest` (#422
+co-scrub), co-steward `registry`/`verify` (#440) — **each noticed
+individually, as its own incident**. Everything else in `identity_type` /
+`roles` was self-assertable, including types that reserve whole dimension
+families: `substrate_persist` (`system:`, `audit_chain:`, `corpus_health:`,
+`identity_continuity:`, `federation_directory:`), `witness`
+(`age_assurance:`, `capacity_assurance:`, `transparency_log:cosigned:`),
+`trusted_publisher` (`content_rating:`), `lenscore_detector`
+(`detection:*`). A Sybil could thereby assert age, capacity, system or
+detection authority **about a third party**.
+
+**Mitigation**: the rule is now **closed-set rather than incident-driven**.
+`identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES` enumerates every claim
+that unlocks a decision anywhere in the codebase, and
+`authority_conferring_set_covers_every_reserved_prefix_rule` proves the set
+is a **superset of every identity type any reserved-prefix rule requires** —
+so adding a rule that reserves a family to a new type without gating that
+type *fails the build*. The enumeration can no longer fall behind the rule
+table.
+
+**The conferral-mode distinction (why one gate was not enough)**: these
+privileges have genuinely different roots, and a gate demanding the wrong
+ceremony is as broken as no gate — it fails **closed on legitimate
+operators**. `identity_type::conferral_mode` states the mechanism per claim,
+exhaustively:
+
+| Mode | Claims | Root |
+|---|---|---|
+| `HardwareAttested` | `accord_holder` | secure-element custody proof |
+| `AnchorScrubbed` | `canonical` | pinned HUMANITY_ACCORD anchor scrub |
+| `AccordCoScrubbed` | `trusted_publisher`, `lenscore_detector` | accord family m-of-n co-scrub |
+| `DerivedFromVerifiedState` | `witness`, `steward`, `partner`, `wise_authority`, `substrate_persist` | authority re-derived from persist's own verified state at each use |
+
+`check_privileged_identity_type_admission` enforces the `AccordCoScrubbed`
+tier at all eight `federation_keys` write chokepoints, riding the
+role-generic core `check_accord_role_admission_over_roster` that was written
+to be parameterized so "every FUTURE accord-conferred role rides it with
+zero new gate code" — this is that future.
+
+**Why `substrate_persist` is `DerivedFromVerifiedState`**: it is a node's
+identity **for itself**. The families it unlocks are the node's own
+operational telemetry about its own substrate, and nothing consumes them as
+authority over a third party — a Sybil calling itself "the substrate" gains
+standing over nobody. Requiring a co-scrub would also be unsatisfiable by
+construction: a node registers this identity at its own bootstrap, before
+any accord family exists to co-scrub it. *If a `system:*` row ever becomes
+an input to a decision about another party, this must move to
+`AccordCoScrubbed`.*
+
+**Residual**: `DerivedFromVerifiedState` claims remain self-assertable at
+registration by design — the claim is descriptive and every use site
+re-derives the authority. That safety property is therefore only as good as
+the use-site walks (see `feedback_authority_from_own_verified_state`:
+caller-supplied authority is forgeable authority). Each such walk is
+separately tested, but the invariant is distributed rather than enforced at
+one chokepoint, and a future use site that trusts the *claim* instead of
+re-deriving would silently reopen this.
+
+#### AV-76: Bootstrap amplification via verify ordering + absent write quota
+
+**Attack**: the ML-DSA-65 hybrid verify — the expensive operation — runs
+**last**, after roughly eight DB-walking gates. A row that fails at the
+final step still pays for every preceding gate, and no per-peer write quota
+exists anywhere on the write path. At bootstrap, where admission is cheap by
+design, that is a straightforward amplification vector.
+
+**Mitigation**: see the matrix row for shipped state. The corrective shape is
+cheapest-first ordering (pure predicates → single lookups → crypto → DB
+walks) and/or a per-peer token bucket ahead of the gate stack.
+
+**Ordering constraint (why this is not a free reorder)**: the gate stack is
+not a pure filter — at least one gate *stamps a field a later gate reads*
+(`withdraws_admission_rule` is resolved by the withdraws gate and persisted
+on the row). Any reordering must preserve those dependencies; a reorder that
+"just" moves crypto earlier while breaking a stamp ordering would trade a
+DoS vector for a correctness bug.
+
+**Residual**: cost asymmetry at admission is inherent to open bootstrap —
+the goal is to make the adversary's cost scale with *their* work, not the
+defender's. A quota bounds volume, not per-row cost.
+
+**What the reorder cost, and how it was caught (v22.0.0)**: the warning
+above was correct and we tripped over it anyway — in a variant we had not
+enumerated. The re-tiering placed the CEG §6.1 idempotent-replay dedup
+short-circuit at **tier 2b, ahead of crypto**. That short-circuit ends in a
+bare `return Ok(())`, so it did not merely reorder gates — it *skipped* every
+gate below it: the PQC-mandatory hybrid verify (tier 3) **and** the AV-45
+write-path `cohort_scope` gate. A writer who could name an
+already-referenced `(attestation_type, attesting_key_id,
+references_attestation_id)` triple received an unverified, unauthorized
+`Ok`. Present on sqlite **and** postgres; memory was the correct one.
+
+The stamp dependency we *had* enumerated held fine. The one we missed was of
+a different kind, and it generalizes:
+
+> **A dedup short-circuit may return early to REFUSE, never to ACCEPT.**
+> Idempotence is a promise about the *effect* of a replay (no second row) —
+> never a licence to skip the proof that the replay was admissible at all.
+
+The dedup now runs at **tier 4b**: after everything that is a property of the
+row's own bytes and the writer's standing (both of which a replay must still
+prove), and before the DB-walk authority gates — which is the property the
+§6.1 short-circuit actually wanted all along (a replayed `withdraws` whose
+authority has since been revoked stays a silent no-op rather than flipping to
+a hard reject).
+
+It was found by [`substrate_machine`](../src/federation/substrate_machine.rs),
+which shrank it to **one op** with a *valid* signature (`Withdraw`,
+family=`Reserved`, `cohort_scope=Community` → memory refused on write-scope,
+sqlite returned `Ok`). No hand-written fixture in the ~1,460-test suite could
+express it: every one of them exercised one writer against a fresh row, and
+this needs a replay against an existing triple. The postgres twin was found
+by *reading* postgres for the sqlite fix — the harness drives memory-vs-sqlite
+only, which is its own recorded blind spot (see AV-78) and the reason
+extending it to postgres is the next thing it learns.
+
+**Reachability (v22.0.0)**: the gate shipped wired at all three backends, proven by a
+`{gate} × {backend}` matrix, and **unreachable by any host** — `set_self_key_id`
+lived only on the concrete backend types and had no caller outside the tests,
+so an embedder holding an `Engine`, or reaching persist through the PyO3 FFI
+as CIRISEdge and CIRISServer both do, could not enable it. The witnesses were
+green because each of them reached *past* the Engine to configure the backend
+directly. A sanction nobody can enable is not a sanction. Now exposed as
+`Engine::set_self_key_id` / `self_key_id` plus PyO3 bindings, with a test that
+drives the lifecycle through the Engine handle.
+
+**The class, stated generally**: a mitigation is not shipped when its code path
+exists and passes tests. It is shipped when a **host can reach it and observe
+that it is on**. Persist has hit this before (v17.0.0 / CIRISPersist#444 — the
+signed route table was admitted correctly and never surfaced), which is why it
+belongs in the threat model and not just the changelog: *"accepted but not
+projected"* is a recurring failure mode of this codebase, and a witness matrix
+that configures the substrate directly cannot detect it. **Test-support
+fixtures that bypass the host API will certify an unreachable feature as
+shipped.**
+
+#### AV-78: The tier column was never written — every local-tier row stored as `federation`
+
+**Defect** (not an adversary-driven attack; a substrate correctness failure
+with security consequences). `put_attestation`'s `INSERT` omitted the `tier`
+and `promoted_at` columns on **both** sqlite and postgres. The schema
+`DEFAULT 'federation'` therefore overrode every `Tier::Local` row: the
+backend could not store a local-tier row at all, and silently relabelled it.
+
+**Why it is in the threat model and not just the changelog**: `tier` is a
+*trust* label, and the promotion plane (#509, #519) is defined as a
+projection of consent state onto it. A row minted local — deferred signature
+per CC 5.3.2.2, consent-scoped, never intended to leave the node — was
+persisted claiming federation tier. Reads keyed on tier, the promotion
+sweep, and the signed since-cursor planes all consume that column. A label
+nobody wrote is a label nobody can trust.
+
+**Shipped**: both backends now bind `tier` and `promoted_at`. Memory was
+correct throughout, which is exactly why the divergence was detectable.
+
+**How it was caught, and the honest limitation**: the differential oracle in
+[`substrate_machine`](../src/federation/substrate_machine.rs) — memory stored
+`local` for the identical submitted row, sqlite stored `federation`, and the
+disagreement *is* the finding; no expected-value table was needed. That
+property only works across backends the harness actually drives, and it
+drives memory and sqlite. Postgres carried the identical bug and was found
+by reading, not by the oracle. **A differential oracle is exactly as wide as
+its backend set** — this is the parity-trio doctrine restated as a limit on our own tooling, and
+the pending work is to bring postgres under the harness.
+
+#### AV-77: No in-band response to a bootstrap abuser
+
+**Attack**: not an injection vector but the **absence of a response
+surface**. The requirement is that responses to abuse are themselves CEG
+attestations, not out-of-band state. Today the only mechanism that actually
+stops an abuser is the **whole-node accord kill-switch** — a sledgehammer
+requiring hardware-attested accord holders, with nothing between "ignore it"
+and "halt the node".
+
+What exists and what does not:
+
+- **Encodable, partly wired**: `moderation:{allegation_type}` (duty-gated,
+  can target a peer — but records an *event*, not a *sanction*);
+  `slashing:{outcome}` (verdict shape + evidence floor wired server-side, but
+  **no emit and no act**); `watchlist:{id}` (config wired, matcher deferred);
+  `consent:*` withdrawal (the only actually-wired cutoff — and it is
+  send-side, so it cannot stop inbound injection).
+- **No family exists at all** for: evicting/de-admitting a key
+  (`revocation:{entity_type}` has no key/node type and is advisory), bulk
+  row-slashing, quarantine/probation, or rate-limit/quota.
+- `capacity:*` is advisory — no code path denies serve on a low score.
+
+**Mitigation**: persist owns the registry-of-record under #519, so the
+families mint here. The smallest coherent set, in dependency order:
+**de-admit/evict a key** (the one that actually stops injection),
+**row-slashing** (undo AV-73 poison), then **quarantine/probation** and
+**quota** as the graduated middle.
+
+**Residual**: minting the families is necessary but not sufficient — a
+family with no emit path and no consumer is the `slashing:*` state today
+(wired shape, no act). Each family needs its emitter, its authority model,
+and a consumer that *changes behaviour*, or it is documentation.
+
+#### What is SOUND at bootstrap (bounding the work)
+
+Audited and holding, stated because a threat model that only lists holes
+misrepresents the posture:
+
+- `delegates_to` is author-bound and tier-verified.
+- Cross-author revocation folds are author-bound.
+- Lifecycle / kill-switch require `accord_holder` — hardware-attested, with
+  software keys dropped.
+- The trace plane is fail-closed behind the dual #379/#386 serve gate.
+- Consent prefix-independence (one grant opening the whole non-trace plane)
+  is real, but requires an operator to grant *to* the Sybil — it ranks below
+  the injection path.
+
+---
+
 ## 4. Mitigation Matrix
 
 | AV | Attack | Primary Mitigation (v0.1.1) | Secondary | Status | Fix Tracker |
@@ -2307,6 +2626,15 @@ the same reserved governance role that already owns `system:` /
 | AV-70 | Community-DEK not rotated on member removal — removed member decrypts NEW community content (CC 4.4.3.2.2 forward secrecy; community-DEK is content's SOLE confidentiality boundary, CC 4.4.3.2.1) | v9.0.0 `put_community_membership_revocation` bumps the community DEK epoch (`community_dek_bump_epoch`, 3 backends) as part of the revocation write; next emission mints a FRESH DEK wrapped only to remaining members (active roster = `lookup_community` ∖ effective revocations); removed member can't unwrap. **Exposure window = zero.** All wraps `wrap_algorithm: v2` (FIPS-203 hybrid) — NEVER v1 (CC 4.4.3.4.1 / CC 5.2 HNDL); keyless member fail-secure EXCLUDED + `hard_case:recipient_excluded` (V087 CHECK makes v1 unrepresentable). | Forward-only (old-epoch blobs keep grants); flat per-member re-wrap, deliberately NOT MLS TreeKEM (CC 5.1, RET-layer OQ). Infra communities opt OUT (Commons plaintext, no DEK — trust root publicly auditable). | **✓ Mitigated v9.0.0** (see AV-72/F4 future-dated `effective_at`, AV-72/F5 atomicity) | CIRISPersist (CC 4.4.3.2.2) |
 | AV-71 | Node-agency gate (AV-68) bypass via duplicate `identity_type` token `"node,node"` (CC 1.13.5 / CC 4.4.3.4.3) | v9.0.0 (adversarial review F1) the gate now tests the identity_type **set** via `HashSet<&str>` (`len()==1 && contains(NODE)`), robust to duplicate/whitespace/order — `"node,node"` no longer evades node-only detection. | `node,agent` hybrid still ADMITTED (no over-reject); regression-tested on 3 backends (`"node,node"`/`"node, node"` + `agency:*` → REJECTED + not stored). | **✓ Mitigated v9.0.0** | CIRISPersist#237 (F1) |
 | AV-72 | Authority/forward-secrecy bypasses in the new v9.0.0 community gates (CC 3.2 / CC 4.4.3.2.1 / CC 3.4.7.1 / CC 4.4.3.2.2) | v9.0.0 (adversarial review F2–F5): **F2** self-labeled `cohort_subkind: infrastructure` skipped steward-binding + forced plaintext → `is_authorized_infrastructure_community` honors the carve-out ONLY if `community_key_id` is `substrate_persist`-roled (fail-secure to the stricter path). **F3** `is_steward_bound` honored revoked/expired delegations → edge skipped on `withdraws`/`recants` against `k` (§11.10) or `expires_at <= now`. **F4** future-dated `effective_at` kept wrapping a "removed" member → community revocation now immediate (future-dated beyond 60s skew REJECTED before write). **F5** non-atomic revoke+hard_case+bump → ONE transaction per backend. | Each fix has a fails-without/passes-with test on all backends where the path runs; no new substrate authority (`substrate_persist` is the existing reserved governance role, §3.7). | **✓ Mitigated v9.0.0** | CIRISPersist#237 (F2–F5) |
+| AV-73 | Third-party reputation forgery: `check_delegated_duty_scores_admission` gated only `moderation:*`/`reconsideration:*`, so ≥3 Sybils fabricate a `WellEstablished`/`Refuted` verdict about an uninvolved subject (`compose_verdict` counts distinct attesting KEYS, `witness_diversity: None`) — and it fans out via the tier-only/unscoped `list_attestations_since` + edge's third-party `Global`/`Cohort` advertisement | v22.0.0 — emitter standing bounds third-party assertion; where a family declares a named authority (reserved-prefix rule, duty-holders, witness-target walk) that authority is the gate | `witness_diversity` at the composition layer is the second line — distinctness of keys is not distinctness of principals, which no put-gate can establish | ⚠ **Partial** — see §3.16 AV-73 | CIRISPersist#543 (1) |
+| AV-74 | Capacity self-inflation: the CC 3.4.5 self-emission arm keys on `attestation_type` while reputation rides `scores` + `dimension = capacity:*`, so it never fired on the real shape — behind a manifest citation naming a guard with ZERO callers (evidence-registry unsoundness) | v22.0.0 `check_capacity_not_self_attested` WIRED at the `check_reserved_prefix_admission` chokepoint (3 backends, pure/no-lookup); BOTH wire shapes refused, genuine third-party capacity scores still admitted | `every_cited_processor_has_a_non_test_caller` makes the evidence registry mechanically sound (non-test caller required); found + deleted a second dead citation (`duty_holders_from_signed_subjects`, "the drift site") | **✓ Mitigated v22.0.0** (B1, `{gate}×{backend}`, both directions) | CIRISPersist#543 (2) |
+| AV-75 | Self-asserted privileged `identity_type`/roles: only 4 claims were gated (each an individual incident), leaving `substrate_persist`/`witness`/`trusted_publisher`/`lenscore_detector` — every one of which reserves a dimension family — self-assertable at registration | v22.0.0 CLOSED SET `AUTHORITY_CONFERRING_IDENTITY_TYPES` + `conferral_mode` per claim; `check_privileged_identity_type_admission` enforces the `AccordCoScrubbed` tier at all 8 `federation_keys` chokepoints via the role-generic core | `authority_conferring_set_covers_every_reserved_prefix_rule` proves the set is a superset of every reserved-prefix requirement — a new rule without a gate FAILS THE BUILD | **✓ Mitigated v22.0.0** — CLOSED SET `AUTHORITY_CONFERRING_IDENTITY_TYPES` + a `conferral_mode` per claim, each enforced on the plane that actually confers it: **ceremony** (accord 2-of-3 co-scrub) for root IDENTITY (`canonical`), **delegation** (`delegates_to` from a trust root, resolved at use by `capability_roots_to_trusted_root`) for operational CAPABILITY (`trusted_publisher`, `lenscore_detector`), and **derived-at-use** for the graph-conferred set (`witness`/`steward`/`partner`/`wise_authority`/`substrate_persist`). `authority_conferring_set_covers_every_reserved_prefix_rule` proves the set is a superset of every reserved-prefix requirement — a new rule without a gate FAILS THE BUILD. | CIRISPersist#543 (3) · CIRISConstitution#40 |
+| AV-76 | Bootstrap amplification: ML-DSA-65 hybrid verify runs LAST after ~8 DB-walking gates, so a row failing at the final step still pays for all preceding work; no per-peer write quota anywhere | v22.0.0 — SHIPPED: cheapest-first tiering (tier 0 prologue → 1 pure envelope → 2 single directory read → 3 crypto → 4 DB-walk authority → 4b §6.1 dedup → 5 hash+INSERT) on all three backends, plus a per-peer write quota ahead of the stack | **The reorder introduced a hole and we shipped it before catching it**: the §6.1 dedup short-circuit landed at tier 2b, ahead of crypto, and its bare `return Ok(())` skipped hybrid verify AND the AV-45 write-scope gate on sqlite AND postgres. RULE: a dedup short-circuit may return early to REFUSE, never to ACCEPT. Now at tier 4b. See §3.16 AV-76 | ✅ **Shipped** — reorder, quota, and the tier-4b correction; witness `known_divergence_dedup_before_verify` RETIRED | CIRISPersist#543 (4) |
+| AV-77 | No in-band response to an abuser: the only mechanism that stops one today is the whole-node accord kill-switch — nothing between "ignore it" and "halt the node". No family exists for de-admitting a key, row-slashing, quarantine, or quota; `consent:*` withdrawal is send-side so it cannot stop inbound injection | v22.0.0 — persist owns the registry-of-record (#519), so the families mint here: de-admit/evict (stops injection) → row-slashing (undoes AV-73 poison) → quarantine/probation + quota (graduated middle) | `moderation:*` records an event not a sanction; `slashing:*` has verdict shape but no emit and no act; `capacity:*` is advisory (no path denies serve) | ⚠ **Partial** — see §3.16 AV-77 | CIRISPersist#543 (5) |
+| AV-78 | The `tier`/`promoted_at` columns were omitted from `put_attestation`'s INSERT on sqlite AND postgres, so the schema `DEFAULT 'federation'` silently overrode every `Tier::Local` row — a *trust* label nobody wrote, consumed by the promotion plane (#509/#519), tier-keyed reads, and the signed since-cursor planes | v22.0.0 — SHIPPED: both backends bind `tier` and `promoted_at` | Found by the `substrate_machine` differential oracle (memory stored `local`, sqlite stored `federation`; the disagreement IS the finding). The postgres twin was found by READING, not by the oracle — **a differential oracle is exactly as wide as its backend set**, and ours drives memory+sqlite only | ✅ **Shipped** — witness `known_divergence_put_at_local_tier` RETIRED; extending the harness to postgres is tracked | CIRISPersist#543 / substrate_machine |
+| AV-79 | Nonconsensual third-party reputation: RC2's entire `capacity:*` emitter rule was attester≠attested, so ANY registered key could publish a capacity score about ANY third party — and bootstrap admission is deliberately cheap, so "any registered key" means "anyone" | v22.0.0 — SHIPPED (build-assuming-ratification, CIRISConstitution#46): `check_capacity_consent_admission` at AV-76 tier 4 on all three backends — a federation-tier `capacity:*` claim about S from P is refused without S's live `consent:scope:analyze` covering P (#510 grammar, resolved via `resolve_scoped_consent`; absent record = `Unspecified` = refused, fail-secure) | Genesis goes dark DELIBERATELY: with no consent edges, third-party capacity scoring is refused everywhere — a bootstrap bypass would be a permanent hole with a temporary name. Local-tier rows exempt (un-replicated working state; capacity:* is local-ineligible anyway). Gate bites the node's OWN emit surface (`emit_attestation` → `put_attestation`) — proven by the engine test needing a consent fixture | ✅ **Shipped** — B5 `{gate} × {backend}` matrix | CIRISConstitution#46 |
+| AV-80 | Deletion-window breach unobserved: the pure breach judgment existed (v21.9.0) but nothing drove it — no sweep, no signal, so "the network itself raises a breach signal" (ciris.ai/contextual-integrity) was false; a producer could outlive its own deletion deadline invisibly | v22.0.0 — SHIPPED: `run_deletion_window_watch` sweep feeding the single-sourced classifier, emitting `hard_case:deletion_window_breach` local-tier evidence; replay-idempotent (keyed on the DEADLINE, not the tick); Engine + PyO3 reachable, with the Engine-handle test | EVIDENCE, not a verdict: persist observes; `slashing:*` stays with the WA quorum (a substrate flag can never be sole slashing evidence). Malformed windows are FLAGGED, not skipped | ✅ **Shipped** — ratification asks filed as CIRISConstitution#47 R1–R4 | CIRISConstitution#47 |
+| AV-81 | `delivery_mode` silent demotion: the field was typed and byte-faithfully carried with its VALUE never validated; edge recognizes only `"mandatory"` and demotes everything else — including typos — to may-drop BestEffort, so a producer could believe they demanded delivery while the network quietly stopped promising it ("accepted but not projected", delivery flavor) | v22.0.0 — SHIPPED: closed-vocabulary check at AV-76 tier 1 on all three backends; unknown or non-string values refused at the wire naming the field, the value, and the legal set {absent, "mandatory"} | Vocabulary assumed to match edge's implemented semantics exactly; ratification + future-value reservation asked in CIRISEdge#428. Future values become an additive two-sided contract change, never a silent semantics change | ✅ **Shipped** — B6 `{gate} × {backend}` matrix | CIRISEdge#428 |
 
 ---
 

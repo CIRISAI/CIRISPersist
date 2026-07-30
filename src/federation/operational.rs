@@ -1086,6 +1086,17 @@ pub mod test_support {
     /// resolution in `verify_accord_family_coscrub` only needs the pubkeys,
     /// not the HW attestation. The exported analogue of admission's
     /// previously-private `register_founder`.
+    ///
+    /// v22.0.0 (CIRISPersist#543) — **fully deterministic**: `valid_from` /
+    /// `scrub_timestamp` are the same FIXED instant `Identity::steward_key_record`
+    /// pins, not `Utc::now()`. Combined with `Identity::new`'s deterministic
+    /// seeding (#502 E9) and the timestamp-free `registration_envelope`, a given
+    /// `holder` now produces a BYTE-IDENTICAL record on every call — so
+    /// re-registering the same holder against a shared postgres test DB is a
+    /// true no-op instead of a differing-content write under a fixed `key_id`.
+    /// That matters as of [`register_genesis_accord_roster`], which registers
+    /// the FIXED genesis ids (`A1`/`B1`/`C1`) rather than per-test unique ones,
+    /// and is called once per conferred key.
     pub async fn register_accord_holder(
         directory: &dyn crate::federation::FederationDirectory,
         holder: &Identity,
@@ -1093,6 +1104,11 @@ pub mod test_support {
         use sha2::{Digest, Sha256};
         let m = holder.member();
         let registration_envelope = json!({ "key_id": holder.key_id });
+        // The pinned instant — see the determinism note above. Well in the past,
+        // so the row is live for every gate that reads `valid_from`.
+        let pinned: chrono::DateTime<chrono::Utc> = "2020-01-01T00:00:00Z"
+            .parse()
+            .expect("pinned holder timestamp is valid RFC-3339");
         // v21.14.0 (CIRISPersist#534) — self-scrub the holder registration for
         // real: canonicalize the envelope, hash it to a VALID-HEX
         // `original_content_hash`, and sign those exact bytes with the holder's
@@ -1115,14 +1131,14 @@ pub mod test_support {
             algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
             identity_type: crate::federation::types::identity_type::NODE.to_owned(),
             identity_ref: holder.key_id.clone(),
-            valid_from: chrono::Utc::now(),
+            valid_from: pinned,
             valid_until: None,
             registration_envelope,
             original_content_hash: hex::encode(Sha256::digest(&bytes)),
             scrub_signature_classical: ed,
             scrub_signature_pqc: Some(pqc),
             scrub_key_id: holder.key_id.clone(),
-            scrub_timestamp: chrono::Utc::now(),
+            scrub_timestamp: pinned,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             roles: Vec::new(),
@@ -1198,6 +1214,145 @@ pub mod test_support {
             .put_public_key(crate::federation::types::SignedKeyRecord { record })
             .await?;
         Ok(roster)
+    }
+
+    /// v22.0.0 (CIRISPersist#543) — register the **GENESIS accord roster**
+    /// (`A1`/`B1`/`C1`, or the synthesized test-anchor holders when that mode
+    /// is armed) as directory rows carrying DETERMINISTIC test keypairs, and
+    /// return those identities so a fixture can co-scrub with them.
+    ///
+    /// # Why this exists alongside [`confer_roles`]
+    ///
+    /// `confer_roles` mints its OWN `{family_tag}-h*` holders and hands the
+    /// caller their roster, which is exactly right for the READ side
+    /// ([`has_effective_role_over_roster`](crate::federation::admission)) — the
+    /// caller passes the roster back in. The WRITE-side gates that run inside
+    /// `put_public_key` take no roster argument: `check_canonical_role_admission`
+    /// / `check_infra_attest_role_admission` /
+    /// `check_privileged_identity_type_admission` all resolve the roster from
+    /// `accord_holder_roster_key_ids()`, i.e. the GENESIS holder `key_id`s. So a
+    /// record that must survive a chokepoint gate has to be co-scrubbed by keys
+    /// sitting at *those* `key_id`s, and a bare test backend has none — the
+    /// quorum resolves to 0 members and every conferral fails
+    /// "accord quorum unreachable".
+    ///
+    /// This helper stands the trust root up in the test directory: the roster
+    /// ids are the real genesis ones, and the KEY MATERIAL under them is
+    /// test-held (nobody has the #268 ceremony's private halves). That is the
+    /// only injectable seam, and it is fixture setup — the gate itself is
+    /// untouched and runs for real: roster resolution, per-scrub hybrid
+    /// signature verification, and the m-of-n quorum policy all execute against
+    /// these rows exactly as they do in production. Same shape as the
+    /// long-standing `adopt_scrub_upgrade_gate_sqlite` fixture, which seeds
+    /// `A1`/`B1` directly "mirrors the real seed where A1/B1 are genesis rows".
+    ///
+    /// Holders register as `node` (not `accord_holder`) — the quorum core only
+    /// needs their PINNED directory pubkeys, and `node` skips the #513
+    /// hardware-attestation gate on sqlite/postgres. Deterministic and
+    /// idempotent (see [`register_accord_holder`]'s pinned timestamps), so a
+    /// fixture conferring several keys may call it once per key.
+    ///
+    /// # HARD LIMIT: only works on a directory with NO genesis seed
+    ///
+    /// This writes the genesis `key_id`s with TEST key material, so it requires
+    /// that those rows do not already exist. On a **genesis-seeded** directory
+    /// they do — carrying the REAL #268 ceremony pubkeys — and `put_public_key`
+    /// correctly refuses to replace them
+    /// (`Conflict("key_id A1 already exists with different content")`). That is
+    /// the substrate protecting its trust root and MUST NOT be worked around:
+    /// on such a directory nobody can produce the co-scrub, because the genesis
+    /// private halves live in hardware.
+    ///
+    /// So this helper serves fixtures on a **bare** backend
+    /// (`SqliteBackend::open_in_memory` + `run_migrations`, `MemoryBackend::new`,
+    /// a fresh unseeded pg schema) — NOT `Engine::with_signer`, which seeds
+    /// genesis, and NOT a shared pg test database that any engine test has
+    /// touched. A fixture needing an accord-conferred `identity_type` against a
+    /// genesis-seeded directory has to move the whole roster instead, via the
+    /// `test-anchor` seam (CIRISPersist#449/#451): with that feature compiled
+    /// and `CIRIS_TESTING_MODE` + `CIRIS_TEST_TRUST_ROOT*` armed,
+    /// `effective_accord_holder_records` returns `test-accord-holder-{i}` and
+    /// this helper follows it automatically — no code change here.
+    pub async fn register_genesis_accord_roster(
+        directory: &dyn crate::federation::FederationDirectory,
+    ) -> Result<Vec<Identity>, crate::federation::Error> {
+        let mut holders = Vec::new();
+        for rec in crate::federation::genesis::effective_accord_holder_records().iter() {
+            let holder = Identity::new(&rec.record.key_id);
+            register_accord_holder(directory, &holder).await?;
+            holders.push(holder);
+        }
+        Ok(holders)
+    }
+
+    /// v22.0.0 (CIRISPersist#543) — turn a self-scrubbed fixture `KeyRecord`
+    /// into an accord-**CONFERRED** one: replace the placeholder scrub columns
+    /// with REAL hybrid signatures by each of `scrubbers` over
+    /// `JCS(registration_envelope)` — the identical bytes
+    /// `verify_accord_family_coscrub` re-canonicalizes and verifies. Scrub #1
+    /// fills the base `scrub_key_id`/`scrub_signature_*` fields, #2..N ride
+    /// `additional_scrubs`, and `original_content_hash` is recomputed over the
+    /// same bytes.
+    ///
+    /// Everything else on the record is preserved — notably its `key_id`,
+    /// `identity_type` and (deterministic) pubkeys — so a fixture keeps
+    /// testing what it always tested and only the CONFERRAL changes: the key
+    /// stops asserting its own privileged type and starts being granted it.
+    /// Pass 2 distinct [`register_genesis_accord_roster`] holders for a
+    /// 2-of-3 admit.
+    pub fn accord_conferred(
+        mut record: crate::federation::types::KeyRecord,
+        scrubbers: &[&Identity],
+    ) -> crate::federation::types::KeyRecord {
+        use crate::federation::types::ScrubSig;
+        use sha2::{Digest, Sha256};
+        assert!(!scrubbers.is_empty(), "at least one scrubber required");
+        let bytes =
+            crate::verify::canonical::ceg_produce_canonicalize(&record.registration_envelope)
+                .expect("canonicalize registration_envelope");
+        let scrubs: Vec<ScrubSig> = scrubbers
+            .iter()
+            .map(|s| {
+                let (ed, pqc) = s.sign_bytes(&bytes);
+                ScrubSig {
+                    scrub_key_id: s.key_id.clone(),
+                    scrub_signature_classical: ed,
+                    scrub_signature_pqc: Some(pqc),
+                }
+            })
+            .collect();
+        record.original_content_hash = hex::encode(Sha256::digest(&bytes));
+        record.scrub_key_id = scrubs[0].scrub_key_id.clone();
+        record.scrub_signature_classical = scrubs[0].scrub_signature_classical.clone();
+        record.scrub_signature_pqc = scrubs[0].scrub_signature_pqc.clone();
+        record.additional_scrubs = scrubs[1..].to_vec();
+        record
+    }
+
+    /// v22.0.0 (CIRISPersist#543) — the one-call fixture path for "this key
+    /// legitimately holds a privileged `identity_type`": stand up the genesis
+    /// accord roster ([`register_genesis_accord_roster`]), co-scrub `record`
+    /// to the family m-of-n ([`accord_conferred`]), and write it.
+    ///
+    /// Use wherever a fixture previously SELF-ASSERTED a member of
+    /// `identity_type::AUTHORITY_CONFERRING_IDENTITY_TYPES` whose
+    /// `ConferralMode` is `AccordCoScrubbed` (`trusted_publisher` /
+    /// `lenscore_detector`) — types that assert about a THIRD PARTY and so are
+    /// refused fail-closed at every `federation_keys` write chokepoint when
+    /// self-declared (`Error::RoleNotAccordConferred`).
+    pub async fn put_accord_conferred_key(
+        directory: &dyn crate::federation::FederationDirectory,
+        record: crate::federation::types::KeyRecord,
+    ) -> Result<(), crate::federation::Error> {
+        let holders = register_genesis_accord_roster(directory).await?;
+        assert!(
+            holders.len() >= 2,
+            "the genesis accord roster must have at least 2 holders to reach a 2-of-3 quorum"
+        );
+        let record = accord_conferred(record, &[&holders[0], &holders[1]]);
+        directory
+            .put_public_key(crate::federation::types::SignedKeyRecord { record })
+            .await
     }
 
     /// v21.15.0 (CIRISPersist#536) — register `key_id` with a chosen

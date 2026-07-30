@@ -258,7 +258,7 @@ mod tests {
     fn fix_key(key_id: &str, identity_type_value: &str) -> KeyRecord {
         let (ed_pk, mldsa_pk) =
             crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
-        KeyRecord {
+        let mut row = KeyRecord {
             key_id: key_id.into(),
             pubkey_ed25519_base64: ed_pk,
             pubkey_ml_dsa_65_base64: mldsa_pk,
@@ -279,7 +279,15 @@ mod tests {
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
-        }
+        };
+        // v22.0.0 (CIRISPersist#543) — an `accord_holder` claim is
+        // `ConferralMode::HardwareAttested`, so it needs real evidence on
+        // EVERY backend (memory included, as of #543). Satisfy the gate, do
+        // not bypass it.
+        crate::federation::hardware_attestation::test_support::attach_accord_holder_evidence(
+            &mut row,
+        );
+        row
     }
 
     fn fix_attestation(id: &str, attn_type: &str, attesting: &str, attested: &str) -> Attestation {
@@ -312,13 +320,33 @@ mod tests {
         }
     }
 
+    /// Register `key_id` carrying `identity_type_value`.
+    ///
+    /// v22.0.0 (CIRISPersist#543) — an `identity_type` whose `ConferralMode` is
+    /// `AccordCoScrubbed` (`trusted_publisher` / `lenscore_detector`: claims
+    /// ABOUT A THIRD PARTY) may not be self-asserted at any `federation_keys`
+    /// write chokepoint, so the fixture confers it for real — a genesis accord
+    /// roster standing in the test directory co-scrubs the record to the family
+    /// m-of-n. Every other type still registers self-scrubbed, which is what
+    /// the gate permits.
     async fn register(backend: &MemoryBackend, key_id: &str, identity_type_value: &str) {
-        backend
-            .put_public_key(SignedKeyRecord {
-                record: fix_key(key_id, identity_type_value),
-            })
-            .await
-            .unwrap();
+        let record = fix_key(key_id, identity_type_value);
+        let accord_conferred = identity_type::parse_set(identity_type_value)
+            .iter()
+            .any(|t| {
+                identity_type::conferral_mode(t)
+                    == Some(identity_type::ConferralMode::AccordCoScrubbed)
+            });
+        if accord_conferred {
+            crate::federation::operational::test_support::put_accord_conferred_key(backend, record)
+                .await
+                .unwrap();
+        } else {
+            backend
+                .put_public_key(SignedKeyRecord { record })
+                .await
+                .unwrap();
+        }
     }
 
     // ── §1 typed reader + classifier ────────────────────────────────────

@@ -219,6 +219,172 @@ pub mod identity_type {
     /// in canonical order. Every member is accord-conferred.
     pub const CO_STEWARD_ROLES: [&str; 2] = [REGISTRY, VERIFY];
 
+    /// v22.0.0 (CIRISPersist#543 finding 3) — **THE AUTHORITY-CONFERRING
+    /// CLAIM SET**: every `identity_type` value that unlocks a decision
+    /// somewhere in this codebase, and therefore MUST NOT be self-assertable
+    /// at registration.
+    ///
+    /// # Why this list exists
+    ///
+    /// `register_federation_key` requires a self-signed hybrid
+    /// proof-of-possession and nothing else — by design, because canonical
+    /// servers exist to bootstrap strangers. That proves key CUSTODY, not
+    /// identity and not authorization. So any privilege attached to an
+    /// `identity_type` a peer writes into its own registration is a privilege
+    /// the peer grants itself.
+    ///
+    /// Before #543 exactly four claims were gated — [`ACCORD_HOLDER`]
+    /// (hardware attestation), [`CANONICAL`] (anchor-scrub), `infra:attest`
+    /// and the [`CO_STEWARD_ROLES`] (accord co-scrub) — each noticed
+    /// individually as its own incident. The audit found the rest of the
+    /// privileged set still self-assertable: a Sybil could register as
+    /// [`SUBSTRATE_PERSIST`], [`WITNESS`], [`TRUSTED_PUBLISHER`] or
+    /// [`LENSCORE_DETECTOR`] and thereby emit under reserved dimension
+    /// families reserved to exactly those types (`system:`, `audit_chain:`,
+    /// `age_assurance:`, `capacity_assurance:`, `content_rating:`,
+    /// `detection:*`, …) — i.e. assert system, age, capacity or detection
+    /// authority **about a third party**.
+    ///
+    /// The rule is now closed-set rather than incident-driven: a claim is
+    /// gated **iff** it appears here, and
+    /// `admission::tests::authority_conferring_set_covers_every_reserved_prefix_rule`
+    /// proves this list is a superset of every `identity_type` any
+    /// reserved-prefix rule requires. Adding a rule that reserves a family to
+    /// a new type without adding that type here fails the build.
+    ///
+    /// [`AGENT`] / [`USER`] / [`NODE`] / [`PRIMITIVE`] are deliberately absent:
+    /// they are *descriptive* — they unlock no decision, so self-assertion
+    /// costs nothing. [`STEWARD`], [`PARTNER`] and [`WISE_AUTHORITY`] ARE
+    /// present: each is read as authority (steward-binding, partner licensure,
+    /// WA adjudication) somewhere in the write path.
+    pub const AUTHORITY_CONFERRING_IDENTITY_TYPES: [&str; 9] = [
+        ACCORD_HOLDER,
+        CANONICAL,
+        SUBSTRATE_PERSIST,
+        WITNESS,
+        TRUSTED_PUBLISHER,
+        LENSCORE_DETECTOR,
+        STEWARD,
+        PARTNER,
+        WISE_AUTHORITY,
+    ];
+
+    /// v22.0.0 (CIRISPersist#543 finding 3) — HOW each member of
+    /// [`AUTHORITY_CONFERRING_IDENTITY_TYPES`] is conferred. Naming the
+    /// mechanism per claim is the point: the pre-#543 bug was not "we forgot a
+    /// gate", it was "we assumed one ceremony fits every privilege". These
+    /// privileges have genuinely different roots, and a gate that demands the
+    /// wrong ceremony is as broken as no gate — it fails CLOSED on legitimate
+    /// operators (a witness cannot produce an accord co-scrub, and at bootstrap
+    /// there is no roster to produce one from).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ConferralMode {
+        /// Hardware attestation ([`ACCORD_HOLDER`]) — the strongest root; the
+        /// key must prove secure-element custody. Gated by
+        /// `hardware_attestation_policy().check`.
+        HardwareAttested,
+        /// Pinned-anchor scrub ([`CANONICAL`]) — signed by a key in the pinned
+        /// HUMANITY_ACCORD anchor set. Gated by
+        /// `check_canonical_role_admission`.
+        AnchorScrubbed,
+        /// Accord family m-of-n co-scrub (`infra:attest`, the
+        /// [`CO_STEWARD_ROLES`], and the substrate/detector types). Gated by
+        /// `check_accord_role_admission_over_roster`.
+        AccordCoScrubbed,
+        /// Conferred by an EXISTING holder of the corresponding authority
+        /// through a graph edge that persist already verifies elsewhere
+        /// (steward-binding, partner licensure, WA adjudication). The
+        /// registration-time claim is descriptive; the AUTHORITY is re-derived
+        /// from persist's own verified state at each use, so a self-asserted
+        /// claim buys nothing. **Not gated at registration by design** — see
+        /// the note on `check_privileged_identity_type_admission`.
+        DerivedFromVerifiedState,
+        /// v22.0.0 (CIRISPersist#543 / AV-75) — conferred on the **delegation
+        /// plane**: a trust root (or a canonical it granted) issues a
+        /// `delegates_to(root → key, [scope])`, and the authority is resolved at
+        /// USE by [`capability_roots_to_trusted_root`](crate::federation::trust_root)
+        /// — the claim must root to a trust root *the asking node itself trusts*.
+        ///
+        /// This is the plane the portable trust root already uses for
+        /// operational capability. A minted root is five objects: three accord
+        /// holders, a `canonical` blessed by their 2-of-3 co-scrub, a
+        /// self-referential charter `delegates_to(root → root, [infra:*])`, a
+        /// grant `delegates_to(root → canonical, [infra:serve])`, and the user's
+        /// own `delegates_to(user → root)` trust edge. Note the split: **root
+        /// IDENTITY** is conferred by ceremony (co-scrub); **operational
+        /// CAPABILITY** flows by delegation. Roles that are capabilities belong
+        /// here, not on the ceremony.
+        ///
+        /// Why this and not `AccordCoScrubbed` for such roles: the co-scrub
+        /// roster resolves to the accord holders, whose private halves live in
+        /// hardware (the #268 ceremony). Demanding it for a routine operational
+        /// role fails closed on every legitimate operator. Delegation is
+        /// satisfiable by any root, which is what keeps the root **portable** —
+        /// anyone with three hardware keys mints their own, and ours is merely
+        /// the shipped default (CC 3.2: "a default-plus-re-root is a
+        /// federation"). Ratification: CIRISConstitution#40.
+        DelegatedFromTrustRoot,
+    }
+
+    /// The conferral mode for every authority-conferring claim. Exhaustive over
+    /// [`AUTHORITY_CONFERRING_IDENTITY_TYPES`] (proven by
+    /// `admission::tests::every_authority_claim_declares_a_conferral_mode`).
+    pub fn conferral_mode(identity_type: &str) -> Option<ConferralMode> {
+        Some(match identity_type {
+            ACCORD_HOLDER => ConferralMode::HardwareAttested,
+            CANONICAL => ConferralMode::AnchorScrubbed,
+
+            // v22.0.0 (CIRISPersist#543 / AV-75) — CAPABILITIES, so they ride
+            // the DELEGATION plane.
+            //
+            // Both assert about a THIRD PARTY — `trusted_publisher` signs
+            // `content_rating:*` about others' content (and seeds
+            // `lookup_trusted_publisher_chain`); `lenscore_detector` owns the
+            // entire `detection:*` wildcard — so self-assertion IS the #543
+            // attack and they must be conferred, not claimed.
+            //
+            // The gate was briefly `AccordCoScrubbed`. That was wrong: the
+            // co-scrub roster resolves to the accord holders, whose private
+            // halves live in the #268 hardware ceremony, so registering a
+            // routine detector would have required 2-of-3 named humans with
+            // hardware tokens. A gate that fails closed on every legitimate
+            // operator is not a gate, it is an outage — and it would have made
+            // the root LESS portable, since every minted root would owe the
+            // ceremony for each operational role it wants to stand up.
+            //
+            // The portable trust root already shows the right split: root
+            // IDENTITY (`canonical`) is conferred by the accord's 2-of-3
+            // co-scrub, while operational CAPABILITY (`infra:serve`,
+            // `infra:attest`, `infra:store`, `infra:transport`) flows by
+            // `delegates_to` from the root. These two roles are capabilities.
+            // They belong on the delegation plane, resolved at USE against a
+            // root the asking node itself trusts.
+            TRUSTED_PUBLISHER | LENSCORE_DETECTOR => ConferralMode::DelegatedFromTrustRoot,
+
+            // SELF-DESCRIPTIVE. `substrate_persist` is a node's identity FOR
+            // ITSELF — the families it unlocks (`system:`, `audit_chain:`,
+            // `corpus_health:`, `identity_continuity:`, `federation_directory:`)
+            // are the node's own operational telemetry about its own substrate,
+            // and nothing consumes them as authority over a third party. A
+            // Sybil calling itself "the substrate" gains standing over nobody:
+            // its `system:` rows describe its own node, which it is free to
+            // describe. Requiring an accord co-scrub here would also be
+            // unsatisfiable by construction — a node registers this identity at
+            // its OWN bootstrap, before any accord family exists to co-scrub it.
+            // (If a `system:*` row ever becomes an input to a decision ABOUT
+            // ANOTHER PARTY, this must move to AccordCoScrubbed.)
+            SUBSTRATE_PERSIST => ConferralMode::DerivedFromVerifiedState,
+
+            // Conferred by graph edges persist already verifies at each USE:
+            // steward-binding, licensure quorum, WA adjudication, and the
+            // witness-target walks. The registration claim is descriptive; the
+            // authority is re-derived from persist's own verified state, so a
+            // self-asserted claim buys nothing.
+            WITNESS | STEWARD | PARTNER | WISE_AUTHORITY => ConferralMode::DerivedFromVerifiedState,
+            _ => return None,
+        })
+    }
+
     /// v6.5.0 (CEG §7.0.1) — join an `identity_type` **set** into the
     /// single TEXT column representation: sorted, de-duplicated,
     /// comma-joined (no whitespace), so the stored string is canonical
