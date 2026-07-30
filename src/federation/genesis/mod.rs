@@ -1011,6 +1011,46 @@ mod test_anchor_tests {
     /// seeded and verified (present == live anchor at n=1), the family's
     /// founder seats follow the test roster, and the unseedable baked 2-of-3
     /// canonical is skipped instead of bricking the boot.
+    /// **CIRISPersist#545 — the synthesizer's own output must round-trip
+    /// through `put_public_key`.** The v22.0.0 regression: the test-anchor
+    /// genesis emits the honest `SoftwareOnly_TEST` custody marker, and the
+    /// hardware-attestation policy's serde gate required a non-optional
+    /// `platform_attestation` — so persist refused its OWN synthesized accord
+    /// holders with `malformed: missing field platform_attestation`, before
+    /// any tier logic could honour the marker.
+    ///
+    /// Nothing here caught it because the genesis tests seed through
+    /// `seed_genesis_accord_holders` — a privileged path — while every HOST
+    /// feeds the roster to `put_public_key`. A fixture that reaches past the
+    /// real gate certifies nothing about it (the AV-77 lesson, again). This
+    /// is the "does our own output satisfy our own gate?" property, the #541
+    /// preserve-set≡verified-set check in roster form — and it is the test
+    /// CIRISServer asked for in #545, verbatim.
+    #[serial_test::serial(test_anchor_env)]
+    #[tokio::test]
+    async fn synthesized_accord_holders_round_trip_through_put_public_key_545() {
+        let _pk = arm_test_anchor();
+
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        let dir: &dyn crate::federation::FederationDirectory = &backend;
+
+        let records = effective_accord_holder_records();
+        assert!(
+            !records.is_empty(),
+            "#545: a live test anchor must synthesize a non-empty roster"
+        );
+        for rec in records.iter().cloned() {
+            let key_id = rec.record.key_id.clone();
+            dir.put_public_key(rec).await.unwrap_or_else(|e| {
+                panic!(
+                    "#545: put_public_key must ADMIT the synthesizer's own \
+                     accord holder {key_id}: {e}"
+                )
+            });
+        }
+    }
+
     #[serial_test::serial(test_anchor_env)]
     #[tokio::test]
     async fn test_anchor_boot_seeds_swapped_roster_sqlite() {
@@ -1205,9 +1245,15 @@ mod test_anchor_tests {
             .expect("#451: the SW-root hybrid scrub must admit under Strict");
 
         // (5) persist-side rooting CONFIRMS through the verifying terminus.
+        // Refutable only when the postgres variant is compiled in — the two
+        // cfg arms keep clippy clean in BOTH feature configs (irrefutable-let
+        // with postgres off, let-else with it on).
+        #[cfg(feature = "postgres")]
         let crate::engine::BackendDispatch::Sqlite(sq) = engine.backend() else {
             panic!("sqlite engine expected");
         };
+        #[cfg(not(feature = "postgres"))]
+        let crate::engine::BackendDispatch::Sqlite(sq) = engine.backend();
         let verdict = crate::federation::rooting::root_binding(
             &**sq,
             "test-node-1",

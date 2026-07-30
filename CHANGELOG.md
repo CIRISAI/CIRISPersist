@@ -5,6 +5,30 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [22.0.1] — 2026-07-30 — #545: persist no longer refuses its own synthesized accord holders
+
+**Regression fix (found by CIRISServer adopting v22.0.0).** The test-anchor genesis synthesizer
+emits the honest `SoftwareOnly_TEST` custody marker; the hardware-attestation policy's serde
+shape required a non-optional `platform_attestation` — so the marker failed deserialization
+before any tier logic ran, and `put_public_key` refused the synthesizer's own roster with
+`malformed`. Two parts of v22 disagreeing about one shape.
+
+`AttestationEvidence` is now an **enum** — `Hardware(Box<HardwareCustodyEvidence>)` (the
+pre-#545 wire shape, byte-compatible) | `SoftwareOnlyTest(SoftwareOnlyTestMarker)` (exactly the
+two-field marker, `deny_unknown_fields`) — so the honest test marker is representable **by
+construction**. Admissibility is a policy decision, never a parse: the marker admits ONLY under
+a live test anchor, and its production refusal is typed and names the tier — a custody decision,
+not a parser bug. Fabricating a `platform_attestation` in downstream fixtures (the workaround
+CIRISServer correctly refused) would have quietly certified the hardware path: the AV-77 class.
+
+Adds the gate #545 asked for verbatim: `synthesized_accord_holders_round_trip_through_put_public_key_545`
+— the genesis roster fed through the REAL `put_public_key`, not the privileged seeding path the
+old tests used (which is why nothing here caught it). Plus the security half: marker refused
+loud+typed without a live anchor, `test_anchor:false` refused, padded markers stay malformed.
+
+Certified: sqlite 1514/1514; sqlite+test-anchor 1519/1519; clippy `-D warnings` clean on
+`sqlite`, `sqlite test-anchor`, and `sqlite postgres test-anchor`.
+
 ## [22.0.0] — 2026-07-29 — #543: the safe mesh genesis cut
 
 **The bootstrap/Sybil admission audit, closed end to end — plus the harness that found the
