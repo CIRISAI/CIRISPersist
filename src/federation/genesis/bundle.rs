@@ -105,6 +105,45 @@ pub fn authorization_digest(bundle: &GenesisBundle) -> Result<Vec<u8>, Error> {
         .map_err(|e| Error::InvalidArgument(format!("genesis digest canonicalize: {e}")))
 }
 
+/// v23.0.0 (CIRISPersist#551 item 1) — the **single door** every genesis
+/// bundle enters through, whether it arrives as an operator artifact
+/// ([`bake_assembled_genesis`]) or as the compiled-in seed asset
+/// ([`super::canonical_genesis_bundle`]). One predicate, one impl: the
+/// embedded seed cannot drift into a shape a hand-passed artifact would be
+/// refused for.
+///
+/// The bare `[{record}]` seed list is DELETED, not deprecated. A record list
+/// carries the identity plane ONLY — no charter, no conferral, no liveness
+/// witness — so a node seeded from one roots, reports healthy, and can never
+/// satisfy the delegation plane. That failure was silent, which is why the
+/// legacy shape must fail *loudly* here rather than parse into an inert node:
+/// the refusal NAMES the shape it got, because a raw serde type error
+/// ("invalid type: map, expected u32") teaches an operator nothing about
+/// what their file is or what to do about it.
+pub fn parse_genesis_bundle(json: &str) -> Result<GenesisBundle, Error> {
+    match serde_json::from_str::<GenesisBundle>(json) {
+        Ok(bundle) => Ok(bundle),
+        Err(e) => {
+            // Sniff the legacy shape so the refusal can name it. A bare JSON
+            // array at the top level is the pre-v23 `[{record}]` seed.
+            let detail = match serde_json::from_str::<Vec<serde_json::Value>>(json) {
+                Ok(list) => format!(
+                    "expected a genesis bundle object, got a bare JSON array of {} element(s) — \
+                     the `[{{record}}]` seed shape was DELETED in v23.0.0 (CIRISPersist#551 \
+                     item 1). A record list carries identity only: no charter, no conferral, \
+                     no liveness witness, so a node seeded from it roots, looks healthy, and \
+                     withholds every trace. Re-emit this seed as the bundle a ceremony \
+                     produces (version, family_key_id, holders, serve_nodes, \
+                     consensus_protocol, attestations, authorizations, produced_at)",
+                    list.len()
+                ),
+                Err(_) => format!("bundle parse: {e}"),
+            };
+            Err(Error::GenesisBundleInvalid { detail })
+        }
+    }
+}
+
 /// Parse `quorum:M/N` → `(M, N)`.
 fn parse_quorum(s: &str) -> Option<(usize, usize)> {
     let rest = s.strip_prefix("quorum:")?;
@@ -251,10 +290,7 @@ pub async fn bake_assembled_genesis<D>(
 where
     D: FederationDirectory + ?Sized,
 {
-    let bundle: GenesisBundle =
-        serde_json::from_str(bundle_json).map_err(|e| Error::GenesisBundleInvalid {
-            detail: format!("bundle parse: {e}"),
-        })?;
+    let bundle = parse_genesis_bundle(bundle_json)?;
 
     // Fail-closed FIRST: no write before the quorum verifies against our
     // own roster + pinned keys.

@@ -73,7 +73,7 @@ pub mod operational;
 /// surface: `Identity`, `signed_canonical_record[_with_roles]`, and
 /// `register_accord_holder`. Behind `test-anchor` (persist's test-only,
 /// never-in-a-published-wheel fence) so a DOWNSTREAM consumer gating a real
-/// plane on `has_effective_role` can mint a genuinely co-scrubbed record and
+/// plane on `has_accord_conferred_role` can mint a genuinely co-scrubbed record and
 /// test the ALLOW path — not just the deny path.
 #[cfg(any(test, feature = "test-anchor"))]
 pub use operational::test_support as accord_test_support;
@@ -223,10 +223,10 @@ pub use admission::{
     check_co_steward_role_admission, check_co_steward_role_admission_over_roster,
     check_cohort_scope, check_consensus_protocol_form, check_device_class,
     check_encryption_pubkeys, check_infra_attest_role_admission,
-    check_infra_attest_role_admission_over_roster, check_observed_region, has_effective_role,
-    has_effective_role_over_roster, is_canonical, is_canonical_effective, is_infra_attest,
-    is_infra_attest_effective, op_withdraw_role, supersede_canonical,
-    verify_canonical_supersede_authority, verify_canonical_withdraw_authority,
+    check_infra_attest_role_admission_over_roster, check_observed_region,
+    has_accord_conferred_role, has_accord_conferred_role_over_roster, is_canonical,
+    is_canonical_effective, is_infra_attest, is_infra_attest_effective, op_withdraw_role,
+    supersede_canonical, verify_canonical_supersede_authority, verify_canonical_withdraw_authority,
     verify_signed_identity_occurrence_revocation, verify_signed_touch_claim,
     verify_signed_transport_destination, verify_touch_claim_admission, withdraw_accord_role,
     withdraw_accord_role_over_roster, withdraw_canonical_role, withdraw_infra_attest_role,

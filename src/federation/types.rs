@@ -900,16 +900,35 @@ pub struct KeyRecord {
     /// compare; they don't reproduce the canonicalizer. Closes the
     /// shortest-round-trip drift class of cache-divergence bugs.
     pub persist_row_hash: String,
-    /// v1.3.0 (CIRISPersist#46) — Per-row role tags. Determines what
-    /// the key is authorized to do at the persist API boundary:
-    /// `cirislens_pipeline_writer` gates `POST /api/v1/pipeline/ingest`;
-    /// `cirislens_secrets_reader` / `_writer` / `_admin` gate the
-    /// secrets routes. Empty default — pre-V020 rows + new rows that
-    /// didn't declare roles deserialize to `vec![]`. The `#[serde(default)]`
-    /// keeps the wire shape backward-compatible with v1.2.x writers
-    /// that don't know about the field yet.
-    #[serde(default)]
-    pub roles: Vec<String>,
+    /// v1.3.0 (CIRISPersist#46) — Per-row **capability** role tags.
+    /// Determines what the key is authorized to DO at the persist API
+    /// boundary: `cirislens_pipeline_writer` gates
+    /// `POST /api/v1/pipeline/ingest`; `cirislens_secrets_reader` /
+    /// `_writer` / `_admin` gate the secrets routes. Empty default —
+    /// pre-V020 rows + new rows that didn't declare roles deserialize to
+    /// `vec![]`. The `#[serde(default)]` keeps the wire shape
+    /// backward-compatible with v1.2.x writers that don't know the field.
+    ///
+    /// v23.0.0 (CIRISPersist#551 item 6) — renamed from `roles` because
+    /// prose kept reading it as the thing reserved-prefix admission gates
+    /// on. It is NOT: reserved dimension prefixes (`age_assurance:`,
+    /// `system:`, `detection:`, …) gate on [`KeyRecord::identity_type`] via
+    /// `required_identity_types`, and never on this field. #551 records the
+    /// cost of that confusion — persist asserted in #543 that a Sybil could
+    /// not mint reserved-prefix rows "without roles", which is false, and
+    /// false in the direction that matters: `identity_type` is
+    /// self-assertable, which is hole 3 of that very issue. Two names that
+    /// read as synonyms for two different gates is how a correct
+    /// implementation gets described wrongly by the people maintaining it.
+    ///
+    /// **The wire name is FROZEN at `roles`.** Every stored row and every
+    /// signed `registration_envelope` carries `roles`; renaming the serde
+    /// name would desync stored rows from the signatures over them — the
+    /// #541 preserve-set≢verified-set class — silently invalidating every
+    /// record in every deployment. The Rust name is free to be accurate;
+    /// the wire name is load-bearing and stays.
+    #[serde(default, rename = "roles")]
+    pub capability_roles: Vec<String>,
     /// v2.5.0 (CIRISPersist#102 Ask 8) — Hardware-attestation evidence
     /// captured at key-binding time. REQUIRED for `identity_type =
     /// 'accord_holder'` rows (FSD-002 §7.3 + FEDERATION_ANNOUNCEMENT
@@ -1073,7 +1092,7 @@ impl KeyRecord {
     /// backdoor — held only by the accident that `roles` was decorative).
     pub fn claims_role(&self, role: &str) -> bool {
         identity_type::set_contains(&self.identity_type, role)
-            || self.roles.iter().any(|r| r == role)
+            || self.capability_roles.iter().any(|r| r == role)
     }
 
     /// True iff both PQC components have been attached. Consumers
@@ -3090,6 +3109,64 @@ pub fn compute_persist_row_hash<T: Serialize>(row: &T) -> Result<String, super::
 mod tests {
     use super::*;
 
+    /// v23.0.0 (CIRISPersist#551 item 6) — the Rust field is
+    /// `capability_roles`; the WIRE name is still `roles`.
+    ///
+    /// This is the guard on the rename, not a restatement of it. The field
+    /// rides inside `registration_envelope`s that were signed with the key
+    /// spelled `roles` and inside rows whose `persist_row_hash` was computed
+    /// over that spelling. Emitting `capability_roles` would desync every
+    /// stored row from the signature over it — #541's
+    /// preserve-set≢verified-set class, at the scale of every deployment.
+    /// So: both directions are asserted (a v22 row still parses; a v23 row
+    /// still emits the v22 bytes), and the row hash is asserted UNCHANGED,
+    /// which is the property that actually protects the signatures.
+    #[test]
+    fn capability_roles_keeps_the_frozen_wire_name_551() {
+        let json = serde_json::json!({
+            "key_id": "k1",
+            "pubkey_ed25519_base64": "AAAA",
+            "algorithm": "hybrid",
+            "identity_ref": "k1",
+            "identity_type": "node",
+            "valid_from": "2026-05-01T00:00:00Z",
+            "registration_envelope": {"id": "k1"},
+            "original_content_hash": "de",
+            "scrub_signature_classical": "c2ln",
+            "scrub_key_id": "k1",
+            "scrub_timestamp": "2026-05-01T00:00:00Z",
+            "persist_row_hash": "",
+            "roles": ["cirislens_secrets_reader"],
+        });
+        // A pre-v23 row deserializes into the renamed field.
+        let rec: KeyRecord = serde_json::from_value(json.clone()).expect("v22 wire parses");
+        assert_eq!(rec.capability_roles, vec!["cirislens_secrets_reader"]);
+
+        // …and re-serializes to the SAME key. `capability_roles` must not
+        // appear on the wire anywhere.
+        let out = serde_json::to_value(&rec).expect("serialize");
+        assert_eq!(
+            out.get("roles").and_then(|v| v.as_array()).map(Vec::len),
+            Some(1),
+            "the wire name `roles` is frozen: {out}"
+        );
+        assert!(
+            out.get("capability_roles").is_none(),
+            "the Rust name must never reach the wire: {out}"
+        );
+
+        // The signature-bearing property: the row hash is computed over the
+        // frozen spelling, so it is unchanged by the rename.
+        let hashed = compute_persist_row_hash(&rec).expect("row hash");
+        let from_wire: serde_json::Value = serde_json::from_value(json).expect("value");
+        assert_eq!(
+            hashed,
+            compute_persist_row_hash(&from_wire).expect("row hash of raw wire"),
+            "persist_row_hash must be identical whether computed from the typed row or the \
+             raw v22 wire bytes — this is what keeps stored rows bound to their signatures"
+        );
+    }
+
     /// v21.3.0 (CIRISPersist#512) — `project_route` normalizes the projected
     /// row's `destination` to the column's ONE canonical encoding (lowercase
     /// hex of the raw dest hash — the #393 item-2 gate's probe dialect),
@@ -3168,7 +3245,7 @@ mod tests {
             scrub_timestamp: "2026-07-05T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -3190,13 +3267,13 @@ mod tests {
         // v17.0.0 (#441) — `claims_role` evaluates BOTH role surfaces: the
         // identity_type set (scalar or comma-joined) and the roles vector.
         r.identity_type = "node".into();
-        r.roles = Vec::new();
+        r.capability_roles = Vec::new();
         assert!(r.claims_role("node"));
         assert!(!r.claims_role("canonical"));
         r.identity_type = "canonical,node".into();
         assert!(r.claims_role("canonical"), "comma-set membership claims");
         r.identity_type = "node".into();
-        r.roles = vec!["agent".into(), "canonical".into()];
+        r.capability_roles = vec!["agent".into(), "canonical".into()];
         assert!(r.claims_role("canonical"), "roles-vector membership claims");
         assert!(r.claims_role("agent"));
         assert!(!r.claims_role("registry"));
@@ -3227,7 +3304,7 @@ mod tests {
             scrub_timestamp: "2026-07-05T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -3383,7 +3460,7 @@ mod tests {
                     .into(),
             ),
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),

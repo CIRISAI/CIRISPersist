@@ -717,10 +717,10 @@ fn partner_wins(a: &PartnerRecord, b: &PartnerRecord) -> bool {
 /// exercise the pure resolvers and don't need the signed-envelope helpers.
 // v18.3.0 (CIRISPersist#484) — the gate widened from `#[cfg(test)]` to
 // `#[cfg(any(test, feature = "test-anchor"))]` so DOWNSTREAM test builds can
-// mint a genuinely accord-co-scrubbed record and test the `has_effective_role`
+// mint a genuinely accord-co-scrubbed record and test the `has_accord_conferred_role`
 // ALLOW path. Under `#[cfg(test)]` alone these were unreachable to a consumer
 // (a dependency's test items never compile into the dependent), so consumers
-// gating real planes on `has_effective_role` (edge trace-serve) could only
+// gating real planes on `has_accord_conferred_role` (edge trace-serve) could only
 // test the DENY path — the exact blindness that shipped CIRISEdge#379's gate
 // fail-closed-dead in the field. `test-anchor` is persist's established
 // "test-only, NEVER in a published wheel" fence (see Cargo.toml), so the
@@ -803,7 +803,7 @@ pub mod test_support {
                 scrub_timestamp: "2020-01-01T00:00:00Z".parse().unwrap(),
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
-                roles: Vec::new(),
+                capability_roles: Vec::new(),
                 attestation_evidence: None,
                 consent_role: None,
                 additional_scrubs: Vec::new(),
@@ -1047,7 +1047,7 @@ pub mod test_support {
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: scrub_sigs[1..].to_vec(),
@@ -1055,7 +1055,7 @@ pub mod test_support {
     }
 
     /// v18.3.0 (CIRISPersist#484) — a co-scrubbed record that carries
-    /// `roles`, so a consumer can test the `has_effective_role` **ALLOW**
+    /// `roles`, so a consumer can test the `has_accord_conferred_role` **ALLOW**
     /// path (not just the deny path).
     ///
     /// Identical to [`signed_canonical_record`] but stamps `roles` onto the
@@ -1065,7 +1065,7 @@ pub mod test_support {
     /// re-verified co-scrub against the accord roster). Pass 2 distinct
     /// accord-holder `Identity`s (a 2-of-3 admit) as `scrubbers`, register
     /// them with [`register_accord_holder`], then read back with
-    /// [`crate::federation::admission::has_effective_role_over_roster`] over
+    /// [`crate::federation::admission::has_accord_conferred_role_over_roster`] over
     /// their key_ids.
     pub fn signed_canonical_record_with_roles(
         key_id: &str,
@@ -1075,7 +1075,7 @@ pub mod test_support {
         scrubbers: &[&Identity],
     ) -> crate::federation::types::KeyRecord {
         let mut rec = signed_canonical_record(key_id, identity_type, envelope, scrubbers);
-        rec.roles = roles;
+        rec.capability_roles = roles;
         rec
     }
 
@@ -1141,7 +1141,7 @@ pub mod test_support {
             scrub_timestamp: pinned,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -1157,7 +1157,7 @@ pub mod test_support {
     /// primitive: stand up a fresh 2-of-3 accord family, register its pinned
     /// pubkeys, and write a `key_id` canonical record whose `roles` are
     /// genuinely co-scrubbed by two distinct holders — so
-    /// [`crate::federation::admission::has_effective_role_over_roster`] (over
+    /// [`crate::federation::admission::has_accord_conferred_role_over_roster`] (over
     /// the returned roster) reads the conferred roles TRUE on any backend
     /// (sqlite / postgres / memory).
     ///
@@ -1167,7 +1167,7 @@ pub mod test_support {
     /// shaped, real engines/bridges, no docker) call this instead of
     /// reassembling an accord family by hand (which every consumer got subtly
     /// wrong — CIRISPersist#534). Returns the holder roster (their `key_id`s)
-    /// to pass to `has_effective_role_over_roster` / admission.
+    /// to pass to `has_accord_conferred_role_over_roster` / admission.
     ///
     /// The `family_tag` scopes the generated holder ids so repeated calls (and
     /// a shared postgres test DB) do not collide.
@@ -1227,7 +1227,7 @@ pub mod test_support {
     ///
     /// `confer_roles` mints its OWN `{family_tag}-h*` holders and hands the
     /// caller their roster, which is exactly right for the READ side
-    /// ([`has_effective_role_over_roster`](crate::federation::admission)) — the
+    /// ([`has_accord_conferred_role_over_roster`](crate::federation::admission)) — the
     /// caller passes the roster back in. The WRITE-side gates that run inside
     /// `put_public_key` take no roster argument: `check_canonical_role_admission`
     /// / `check_infra_attest_role_admission` /
@@ -1398,7 +1398,7 @@ pub mod test_support {
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -1515,7 +1515,14 @@ pub mod test_support {
             root_key_id,
             subject_key_id,
             crate::federation::types::attestation_type::DELEGATES_TO,
-            json!({ "references_attestation_id": id, "scope": [scope] }),
+            // v23.0.0 (CIRISPersist#551 item 2) — R → subject: this is the
+            // CONFERRAL, the one that points the opposite way from the trust
+            // edge it is otherwise indistinguishable from.
+            json!({
+                "references_attestation_id": id,
+                "dimension": crate::federation::trust_root::TRUST_CONFERS_DIMENSION,
+                "scope": [scope],
+            }),
         );
         directory
             .put_attestation(crate::federation::SignedAttestation { attestation: edge })
@@ -1526,7 +1533,9 @@ pub mod test_support {
     /// conferral the capability walk must see.** The genesis seed carries the
     /// canonical's `infra:serve` as roles INSIDE its 2-of-3 co-scrubbed
     /// `registration_envelope`, with ZERO `delegates_to` rows — the ceremony
-    /// encoding. Leg A (`has_effective_role`) reads it; leg B
+    /// encoding. The `ConferralPlane::AccordCoScrub` read
+    /// (`has_accord_conferred_role`) sees it; the
+    /// `ConferralPlane::Delegation` walk
     /// (`capability_roots_to_trusted_root`) read only the delegation plane,
     /// so a fully accord-blessed canonical could not receive traces:
     /// `trace attestation withheld — recipient's infra:serve roots to no
@@ -1534,7 +1543,7 @@ pub mod test_support {
     ///
     /// Exercises the corrected #548 ask: the co-scrub yields a CANDIDATE
     /// (half 1), while the asking node's own trust chain — edge, charter,
-    /// lifecycle, halt — is still required in full (half 2, untouched).
+    /// heartbeat, halt — is still required in full (half 2, untouched).
     /// Then the property the correction exists to protect: **delete the one
     /// `delegates_to(user → root)` edge and trust collapses** — the
     /// operator's un-trust lever, emergent, nothing special-cased.
@@ -1606,13 +1615,17 @@ pub mod test_support {
                     attestation_type::DELEGATES_TO,
                     json!({
                         "references_attestation_id": charter_id,
+                        // v23.0.0 (CIRISPersist#551 item 2) — NAME the job:
+                        // this delegates_to is a charter (R → R), not the
+                        // conferral or the trust edge it is shaped like.
+                        "dimension": crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
                         "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
                         "pre_rotation_commitment": commitment,
                     }),
                 ),
             })
             .await?;
-        // — a fresh accord:lifecycle witness (the reserved-family leg). The
+        // — a fresh heartbeat / liveness witness (the reserved-family leg). The
         //   attester must be a REGISTERED accord_holder identity — the
         //   reserved-prefix gate refuses the dimension from anyone else —
         //   mirroring establish_trust_root_side's `-la` witness exactly.
@@ -1634,7 +1647,7 @@ pub mod test_support {
                     attestation_type::SCORES,
                     json!({
                         "id": lc_id,
-                        "dimension": crate::federation::trust_root::ACCORD_LIFECYCLE_DIMENSION,
+                        "dimension": crate::federation::trust_root::ACCORD_HEARTBEAT_DIMENSION,
                         "score": 1.0,
                         "confidence": 0.9,
                     }),
@@ -1652,6 +1665,9 @@ pub mod test_support {
                     attestation_type::DELEGATES_TO,
                     json!({
                         "id": edge_id,
+                        // v23.0.0 (CIRISPersist#551 item 2) — the deletable
+                        // un-trust lever, named so an operator can find it.
+                        "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
                         "scope": [INFRA_SERVE_SCOPE],
                     }),
                 ),
@@ -1685,8 +1701,73 @@ pub mod test_support {
             "({tag}) #548: the plane is named, not fused into the grant id"
         );
 
+        // THE DRILL IS A SIGNAL, NOT A GATE (v23.0.0, CIRISPersist#551 item
+        // 4) — pinned BOTH ways on every backend this parity body runs on.
+        //
+        // With the fresh drill this helper minted: valid, and the signal
+        // reads Green.
+        let drilled =
+            crate::federation::trust_root::trust_root_valid(directory, &user, &canonical).await?;
+        assert!(
+            drilled.valid
+                && drilled.drill_freshness == crate::federation::trust_root::DrillFreshness::Green,
+            "({tag}) #551: a freshly-drilled root is valid and reads Green: {drilled:?}"
+        );
+
+        // Now REMOVE the drill (tombstone it — a withdrawn drill is not a
+        // drill) and walk again. Before v23 this made `valid` go false and
+        // took the whole mesh dark 90 days after any mint. It must now leave
+        // service completely untouched and move only the SIGNAL.
+        let drill_wd = uuid::Uuid::new_v4().to_string();
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: signed_trust_attestation(
+                    &drill_wd,
+                    &la,
+                    &canonical,
+                    attestation_type::WITHDRAWS,
+                    json!({
+                        "references_attestation_id": lc_id,
+                        "withdrawal_reason": "#551 item 4: prove the drill does not gate",
+                    }),
+                ),
+            })
+            .await?;
+        let undrilled =
+            crate::federation::trust_root::trust_root_valid(directory, &user, &canonical).await?;
+        assert!(
+            undrilled.valid,
+            "({tag}) #551 item 4: an UNDRILLED root must still serve — a root is valid until \
+             revoked, halted, or un-trusted, and the deadman is gone: {undrilled:?}"
+        );
+        assert_eq!(
+            undrilled.drill_freshness,
+            crate::federation::trust_root::DrillFreshness::Red,
+            "({tag}) #551 item 4: …and the signal says so — Red: {undrilled:?}"
+        );
+        assert_eq!(
+            undrilled.last_drill_at, None,
+            "({tag}) #551 item 4: never/no-longer drilled is carried by last_drill_at, which is \
+             why Red needs no fourth variant: {undrilled:?}"
+        );
+        // The capability walk agrees: an undrilled root still confers.
+        assert!(
+            capability_roots_to_trusted_root_over_roster(
+                directory,
+                &user,
+                &canonical,
+                INFRA_SERVE_SCOPE,
+                &roster,
+            )
+            .await?
+            .is_some(),
+            "({tag}) #551 item 4: the serve gate must not consult the drill"
+        );
+
         // THE LEVER — withdraw the user's one edge; trust must collapse,
-        // emergent, with the co-scrub still fully valid.
+        // emergent, with the co-scrub still fully valid. This is what a real
+        // gate looks like, and it is the contrast the drill assertions above
+        // exist to draw.
         let wd_id = uuid::Uuid::new_v4().to_string();
         directory
             .put_attestation(crate::federation::SignedAttestation {
@@ -1774,7 +1855,7 @@ pub mod test_support {
     /// 2. `delegates_to(root → root)` carrying BOTH `infra:attest` AND
     ///    `infra:serve` AND a well-formed `pre_rotation_commitment` — the root's
     ///    self-declaration + the recovery leg (#488);
-    /// 3. a fresh `accord:lifecycle:v1` `scores` row ABOUT `root`, emitted by a
+    /// 3. a fresh heartbeat (`accord:lifecycle:v1`) `scores` row ABOUT `root`, emitted by a
     ///    helper-created `accord_holder` — **the leg a consumer cannot stand up
     ///    itself**: `accord:*` is reserved to `accord_holder` (CC 3.4.1) and a
     ///    test engine signs as itself, so the ordinary emit path cannot produce
@@ -1853,7 +1934,7 @@ pub mod test_support {
     /// v21.16.0 (CIRISPersist#536 follow-up) — the ROOT-SIDE legs of a valid
     /// trust root, all signable by the helper's own synthetic actors (nobody
     /// needs the root's or the accord-holder's private halves): the root
-    /// self-declaration charter, the reserved `accord:lifecycle` witness, and
+    /// self-declaration charter, the reserved heartbeat witness, and
     /// the `delegates_to(root → subject)` scope edge. This is the part
     /// [`establish_trust_root`] does that a consumer genuinely cannot do itself
     /// (the `accord:*` reservation). The user→root TRUST edge is deliberately
@@ -1895,6 +1976,8 @@ pub mod test_support {
             attestation_type::DELEGATES_TO,
             json!({
                 "references_attestation_id": charter_id,
+                // v23.0.0 (CIRISPersist#551 item 2) — R → R: the charter.
+                "dimension": crate::federation::trust_root::TRUST_CHARTER_DIMENSION,
                 "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
                 "pre_rotation_commitment": commitment,
             }),
@@ -1905,7 +1988,7 @@ pub mod test_support {
             })
             .await?;
 
-        // Leg 3 — the fresh accord:lifecycle row ABOUT the root, from the
+        // Leg 3 — the fresh heartbeat row ABOUT the root, from the
         // accord_holder (the reserved-family leg a consumer cannot produce).
         let lc_id = uuid::Uuid::new_v4().to_string();
         let lifecycle = signed_trust_attestation(
@@ -1915,7 +1998,7 @@ pub mod test_support {
             attestation_type::SCORES,
             json!({
                 "id": lc_id,
-                "dimension": crate::federation::trust_root::ACCORD_LIFECYCLE_DIMENSION,
+                "dimension": crate::federation::trust_root::ACCORD_HEARTBEAT_DIMENSION,
                 "score": 1.0,
                 "confidence": 0.9,
             }),
@@ -1930,22 +2013,29 @@ pub mod test_support {
         grant_scope(directory, root_key_id, subject_key_id, scope).await?;
 
         // POSTCONDITION (CIRISPersist#536) — the root side is GENUINELY up: the
-        // root self-declares AND its accord:lifecycle is live/fresh. (edge_exists
-        // is legitimately false here — leg 1 is the caller's to emit — so we
-        // probe the root-only legs with a throwaway user id.) A helper that
-        // returns Ok must have actually done what it claims.
+        // root self-declares AND the drill it just minted landed GREEN.
+        // (edge_exists is legitimately false here — leg 1 is the caller's to
+        // emit — so we probe the root-only legs with a throwaway user id.) A
+        // helper that returns Ok must have actually done what it claims.
+        //
+        // v23.0.0 (CIRISPersist#551 item 4) — the drill check here is now an
+        // assertion about THIS HELPER's emission, not about the root's
+        // validity: a red-drilled root is perfectly valid (the deadman is
+        // gone), but a helper that promised to mint a fresh drill and did
+        // not has failed its contract, and that must still surface.
         let probe = crate::federation::trust_root::trust_root_valid(
             directory,
             "__side_probe__",
             root_key_id,
         )
         .await?;
-        if !(probe.root_self_declares && probe.lifecycle_active) {
+        let drilled = probe.drill_freshness == crate::federation::trust_root::DrillFreshness::Green;
+        if !(probe.root_self_declares && drilled) {
             return Err(crate::federation::Error::Backend(format!(
                 "establish_trust_root_side postcondition NOT met for root={root_key_id}: \
-                 root_self_declares={} lifecycle_active={} — the charter or accord:lifecycle did \
-                 not admit",
-                probe.root_self_declares, probe.lifecycle_active
+                 root_self_declares={} drill_freshness={:?} — the charter or the drill this \
+                 helper mints did not admit",
+                probe.root_self_declares, probe.drill_freshness
             )));
         }
         Ok(())
@@ -1973,6 +2063,9 @@ pub mod test_support {
             attestation_type::DELEGATES_TO,
             json!({
                 "references_attestation_id": edge_id,
+                // v23.0.0 (CIRISPersist#551 item 2) — node → R: the trust
+                // edge, named.
+                "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
                 "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
             }),
         );
@@ -2004,7 +2097,7 @@ pub mod test_support {
         directory: &dyn crate::federation::FederationDirectory,
         tag: &str,
     ) {
-        use crate::federation::admission::has_effective_role_over_roster;
+        use crate::federation::admission::has_accord_conferred_role_over_roster;
 
         let canon = format!("{tag}-canon");
         // ALLOW: the honest 2-of-3 dance confers infra:serve.
@@ -2012,9 +2105,9 @@ pub mod test_support {
             .await
             .expect("confer_roles admits the co-scrubbed canonical");
         assert!(
-            has_effective_role_over_roster(directory, &canon, "infra:serve", &roster)
+            has_accord_conferred_role_over_roster(directory, &canon, "infra:serve", &roster)
                 .await
-                .expect("has_effective_role read"),
+                .expect("has_accord_conferred_role read"),
             "({tag}) genuinely accord-conferred infra:serve reads TRUE on this backend"
         );
 
@@ -2042,9 +2135,9 @@ pub mod test_support {
             .await
             .expect("self-scrubbed record still stores");
         assert!(
-            !has_effective_role_over_roster(directory, &self_id, "infra:serve", &roster)
+            !has_accord_conferred_role_over_roster(directory, &self_id, "infra:serve", &roster)
                 .await
-                .expect("has_effective_role read"),
+                .expect("has_accord_conferred_role read"),
             "({tag}) self-asserted infra:serve with no accord co-scrub reads FALSE"
         );
     }
@@ -2055,7 +2148,7 @@ pub mod test_support {
     /// legs) AND that the subject's `infra:serve` roots to it via
     /// [`crate::federation::trust_root::capability_roots_to_trusted_root`] (leg
     /// B). Run from the memory, sqlite AND postgres backend tests — the leg 3
-    /// (`accord:lifecycle`) reserved-family emission and the federation-tier
+    /// (the `accord:lifecycle:v1` heartbeat) reserved-family emission and the federation-tier
     /// hybrid-verify of every leg must round-trip on each backend, not just the
     /// tolerant one (the #534/#536 discipline).
     pub async fn exercise_trust_root(
@@ -2093,7 +2186,8 @@ pub mod test_support {
             "({tag}) establish_trust_root ⇒ trust_root_valid: {v:?}"
         );
 
-        // Leg B: the subject's infra:serve roots to a root THIS user trusts.
+        // `ConferralPlane::Delegation`: the subject's infra:serve roots to a
+        // root THIS user trusts.
         let grant = capability_roots_to_trusted_root(directory, &user, &subject, INFRA_SERVE_SCOPE)
             .await
             .expect("capability walk")
@@ -2125,7 +2219,7 @@ pub mod test_support {
         tag: &str,
     ) {
         use crate::federation::trust_root::{
-            capability_roots_to_trusted_root, trust_root_valid, INFRA_ATTEST_SCOPE,
+            capability_roots_to_trusted_root, trust_root_valid, DrillFreshness, INFRA_ATTEST_SCOPE,
             INFRA_SERVE_SCOPE,
         };
         use crate::federation::types::{attestation_type, identity_type};
@@ -2161,7 +2255,7 @@ pub mod test_support {
             .await
             .expect("walk A");
         assert!(
-            !va.edge_exists && va.root_self_declares && va.lifecycle_active,
+            !va.edge_exists && va.root_self_declares && va.drill_freshness == DrillFreshness::Green,
             "({tag}) root side up + synthetic edge skipped (not forged): {va:?}"
         );
 
@@ -2174,8 +2268,13 @@ pub mod test_support {
             .await
             .expect("walk B0");
         assert!(
-            !vb0.valid && vb0.root_self_declares && vb0.lifecycle_active && !vb0.edge_exists,
-            "({tag}) root side up, not yet valid without the user's edge: {vb0:?}"
+            !vb0.valid
+                && vb0.root_self_declares
+                && vb0.drill_freshness == DrillFreshness::Green
+                && !vb0.edge_exists,
+            "({tag}) root side up, not yet valid without the user's edge — the missing leg is \
+             the EDGE, a hard gate; the drill is green and would not have gated either way: \
+             {vb0:?}"
         );
 
         // The real user emits its OWN honest trust edge, signed by its real key.
@@ -2187,6 +2286,8 @@ pub mod test_support {
             attestation_type::DELEGATES_TO,
             json!({
                 "references_attestation_id": edge_id,
+                // v23.0.0 (CIRISPersist#551 item 2) — node → R.
+                "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
                 "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
             }),
             &user_real_key,

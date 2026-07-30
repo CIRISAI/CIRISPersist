@@ -195,13 +195,13 @@ where
         }
     };
     let has_writer_role = edge_record
-        .roles
+        .capability_roles
         .iter()
         .any(|r| r == ROLE_PIPELINE_WRITER || r == ROLE_SECRETS_WRITER);
     if !has_writer_role {
         tracing::warn!(
             edge_key_id = %envelope.edge_key_id,
-            roles = ?edge_record.roles,
+            roles = ?edge_record.capability_roles,
             "pipeline ingest rejected: edge key has no writer role tag"
         );
         return (

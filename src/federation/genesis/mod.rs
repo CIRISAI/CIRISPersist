@@ -27,8 +27,8 @@
 
 pub mod bundle;
 pub use bundle::{
-    bake_assembled_genesis, verify_bundle_quorum, BakeItemOutcome, GenesisAuthorization,
-    GenesisBakeReport, GenesisBundle,
+    bake_assembled_genesis, parse_genesis_bundle, verify_bundle_quorum, BakeItemOutcome,
+    GenesisAuthorization, GenesisBakeReport, GenesisBundle,
 };
 
 use super::SignedKeyRecord;
@@ -92,6 +92,29 @@ pub fn accord_holder_genesis_records() -> &'static [SignedKeyRecord] {
 ///   verify-side anchor-membership rooting still work, but persist-side
 ///   `root_binding` will NOT confirm through this terminus (the pinned
 ///   contract the #451 e2e documents).
+///
+/// # Which `CIRIS_TEST_TRUST_ROOT*` variable is which
+///
+/// v23.0.0 (CIRISPersist#551 item 7) — #551 reports an hour lost to this
+/// prefix, because one name family spans three different kinds of thing and
+/// two different owners. Persist reads ONLY public material, and every
+/// variable it reads is listed above:
+///
+/// | variable | carries | owner |
+/// |---|---|---|
+/// | `CIRIS_TEST_TRUST_ROOT` | Ed25519 **pubkeys** (the 1-of-N anchor) | CIRISVerify (`test_trust_root_override`) |
+/// | `CIRIS_TEST_TRUST_ROOT_PQC` | ML-DSA-65 **pubkeys** | persist (here) |
+/// | `CIRIS_TEST_TRUST_ROOT_SCRUB[_PQC]` | scrub **signatures** | persist (here) |
+/// | `CIRIS_TEST_TRUST_ROOT_SEED` | 32 bytes of **private key** material | **CIRISServer** (`src/test_bless.rs`) |
+///
+/// The last row is the one that burned the hour, and it is **not persist's**:
+/// persist never reads `..._SEED`, never holds the test root's private half,
+/// and cannot mint with it — the harness signs and hands us the signatures.
+/// Renaming it (to `..._PRIVATE_KEY`, per #551) is CIRISServer's to make in
+/// the crate that reads it; persist renaming its own public-material slots to
+/// match would break the very harness that sets both families
+/// (`CIRISServer/harness/mesh-repro/docker-compose.yml` sets all five) while
+/// fixing nothing, so the boundary is documented here instead.
 #[cfg(feature = "test-anchor")]
 pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
     use base64::engine::general_purpose::STANDARD as B64;
@@ -143,7 +166,7 @@ pub fn test_anchor_genesis_records() -> Option<Vec<SignedKeyRecord>> {
                 scrub_key_id: key_id.clone(),
                 scrub_timestamp: ts,
                 persist_row_hash: String::new(),
-                roles: Vec::new(),
+                capability_roles: Vec::new(),
                 // The V-schema requires accord_holder rows to CARRY evidence;
                 // this is the SoftwareOnly_TEST custody marker (the tier
                 // verify's accord_custody_attestation admits under the same
@@ -371,28 +394,49 @@ where
     Ok(())
 }
 
-/// The baked **canonical genesis server** record — the operator's
-/// `ciris-canonical-1-d7bdeu223k` node, now **2-of-3 accord-co-scrubbed** (A1
+/// The baked **canonical genesis seed** — the operator's
+/// `ciris-canonical-1-d7bdeu223k` node, **2-of-3 accord-co-scrubbed** (A1
 /// primary + B1 in `additional_scrubs`, over a byte-identical envelope)
 /// (CIRISPersist#390, v13.4.0). This REPLACES the 1-of-N record #383 removed:
 /// with canonical ADD requiring a 2-of-3 accord co-scrub, a single-anchor
 /// founding record was a first-strike weakness. Bake-what-was-conferred (live
 /// YubiKey scrub sigs), the same trust model as [`accord_holder_genesis_records`]
 /// — NOT a constant-derived artifact.
+///
+/// v23.0.0 (CIRISPersist#551 item 1) — the asset is now a [`GenesisBundle`],
+/// the same artifact shape a genesis ceremony emits, so "is this node seeded?"
+/// is answered by a TYPE rather than a judgement call. The record inside
+/// `serve_nodes` is byte-identical to the pre-v23 bare-list content (the row
+/// this seeds, its envelope, and its scrub signatures are untouched — the
+/// wire is sacred, only the container changed).
+///
+/// What this bundle carries and what it does NOT is the point of the change,
+/// so read it off the fields: `serve_nodes` (the identity plane) is populated;
+/// `attestations` and `authorizations` are EMPTY — this artifact carries no
+/// delegation plane and no holder quorum, which is exactly the condition
+/// CIRISPersist#551 says must stop being invisible. `holders` is empty on
+/// purpose: this node's roster is the separately-baked
+/// [`accord_holder_genesis_records`], and a second copy here would be two
+/// lists that can disagree (the #541 class). Consequently this bundle is NOT
+/// bakeable via [`bake_assembled_genesis`] — it has no authorizations, so the
+/// quorum gate refuses it, loudly and correctly.
 const CANONICAL_SEED_JSON: &str = include_str!("canonical_seed.json");
 
-/// Parse-once accessor for the baked 2-of-3 canonical genesis record(s).
+/// Parse-once accessor for the baked canonical genesis **bundle**
+/// (v23.0.0, CIRISPersist#551 item 1 — replaces `canonical_genesis_records`;
+/// the bare `[{record}]` parse path is deleted, see [`parse_genesis_bundle`]).
+/// Callers wanting the seeded records read [`GenesisBundle::serve_nodes`].
 ///
 /// # Panics
 ///
-/// Panics if the embedded JSON is malformed (build-time-checked constant;
-/// caught by [`tests::canonical_seed_parses_and_is_2of3_accord_conferred`]).
-pub fn canonical_genesis_records() -> &'static [SignedKeyRecord] {
+/// Panics if the embedded JSON is not a valid bundle (build-time-checked
+/// constant; caught by [`tests::canonical_seed_is_a_bundle_and_is_2of3_accord_conferred`]).
+pub fn canonical_genesis_bundle() -> &'static GenesisBundle {
     use std::sync::OnceLock;
-    static PARSED: OnceLock<Vec<SignedKeyRecord>> = OnceLock::new();
+    static PARSED: OnceLock<GenesisBundle> = OnceLock::new();
     PARSED.get_or_init(|| {
-        serde_json::from_str(CANONICAL_SEED_JSON)
-            .expect("embedded canonical_seed.json must be valid [SignedKeyRecord]")
+        parse_genesis_bundle(CANONICAL_SEED_JSON)
+            .expect("embedded canonical_seed.json must be a valid GenesisBundle")
     })
 }
 
@@ -413,7 +457,7 @@ pub async fn seed_canonical_servers<D>(dir: &D) -> Result<(), String>
 where
     D: super::FederationDirectory + ?Sized,
 {
-    for sr in canonical_genesis_records() {
+    for sr in &canonical_genesis_bundle().serve_nodes {
         let kid = &sr.record.key_id;
         // Branch on the EXISTING row's shape (CIRISPersist#394 + #410):
         //  - absent (a FRESH node) → `put_public_key`: insert through the m-of-n
@@ -474,7 +518,7 @@ where
     D: super::FederationDirectory + ?Sized,
 {
     use crate::federation::types::identity_type;
-    for sr in canonical_genesis_records() {
+    for sr in &canonical_genesis_bundle().serve_nodes {
         let r = &sr.record;
         let row = dir
             .lookup_public_key(&r.key_id)
@@ -640,12 +684,72 @@ mod tests {
             .all(|m| m.role.as_deref() == Some("founder")));
     }
 
+    /// v23.0.0 (CIRISPersist#551 item 1) — the embedded seed asset round-trips
+    /// as a `GenesisBundle` through the SAME door an operator artifact enters
+    /// ([`parse_genesis_bundle`]), and its declared identity is the accord
+    /// family it seeds. The bundle's emptiness is asserted, not incidental:
+    /// this artifact carries the identity plane ONLY, and #551 exists because
+    /// that condition used to be invisible.
+    #[test]
+    fn embedded_seed_is_a_genesis_bundle_551() {
+        let b = canonical_genesis_bundle();
+        assert_eq!(b.family_key_id, "humanity-accord");
+        assert_eq!(b.consensus_protocol, "quorum:2/3");
+        assert_eq!(b.serve_nodes.len(), 1, "the identity plane is carried");
+        assert!(
+            b.attestations.is_empty() && b.authorizations.is_empty(),
+            "the baked seed carries NO delegation plane and NO holder quorum — \
+             if this ever becomes non-empty the seeding path must grow a step \
+             to land it, not silently ignore it"
+        );
+        // Byte-faithfulness of the wrapped record: the seeded row is the one
+        // the ceremony blessed, container change notwithstanding.
+        assert_eq!(
+            b.serve_nodes[0].record.key_id,
+            "ciris-canonical-1-d7bdeu223k"
+        );
+        assert_eq!(
+            b.serve_nodes[0].record.valid_from.to_rfc3339(),
+            "2026-07-23T02:00:39.533577+00:00"
+        );
+    }
+
+    /// v23.0.0 (CIRISPersist#551 item 1) — a legacy bare `[{record}]` seed is
+    /// REFUSED with the typed `GenesisBundleInvalid`, by a message that names
+    /// the shape it got. The pre-v23 failure mode was the opposite of loud: a
+    /// record list seeded an inert node that rooted and reported healthy.
+    #[tokio::test]
+    async fn legacy_bare_record_list_seed_is_refused_loudly_551() {
+        let legacy = r#"[{"record":{"key_id":"ciris-canonical-1-d7bdeu223k"}}]"#;
+        let err = parse_genesis_bundle(legacy).expect_err("a bare record list is not a seed");
+        assert!(
+            matches!(err, crate::federation::Error::GenesisBundleInvalid { .. }),
+            "must be the TYPED refusal, got {err:?}"
+        );
+        let msg = err.to_string();
+        for want in [
+            "bare JSON array of 1 element(s)",
+            "DELETED in v23.0.0 (CIRISPersist#551 item 1)",
+            "no charter, no conferral, no liveness witness",
+        ] {
+            assert!(msg.contains(want), "refusal must say {want:?}, got: {msg}");
+        }
+
+        // The same refusal through the operator-facing door — one parse door,
+        // one message, so an artifact and the seed asset cannot disagree.
+        let backend = crate::store::memory::MemoryBackend::new();
+        let baked = super::bake_assembled_genesis(&backend, legacy)
+            .await
+            .expect_err("bake must refuse the legacy shape identically");
+        assert!(baked.to_string().contains("bare JSON array"));
+    }
+
     /// v13.4.0 (CIRISPersist#390) — the baked canonical seed parses, is
     /// `canonical`, and is **2-of-3 accord-conferred**: primary scrub A1 + a
     /// distinct additional anchor scrub (B1), ≥2 distinct scrubbers.
     #[test]
-    fn canonical_seed_parses_and_is_2of3_accord_conferred() {
-        let recs = canonical_genesis_records();
+    fn canonical_seed_is_a_bundle_and_is_2of3_accord_conferred() {
+        let recs = &canonical_genesis_bundle().serve_nodes;
         assert_eq!(recs.len(), 1, "the founding canonical server");
         let r = &recs[0].record;
         assert_eq!(r.key_id, "ciris-canonical-1-d7bdeu223k");
@@ -691,7 +795,7 @@ mod tests {
             .await
             .expect("canonical live");
 
-        let node = &canonical_genesis_records()[0].record;
+        let node = &canonical_genesis_bundle().serve_nodes[0].record;
         assert!(
             crate::federation::is_canonical(&backend, &node.key_id)
                 .await
@@ -734,12 +838,12 @@ mod tests {
 
         // Pre-seed ciris-canonical-1 as the node's OWN self-signed `node` row —
         // same pubkeys as the baked record, but self-signed and not canonical.
-        let baked = &canonical_genesis_records()[0].record;
+        let baked = &canonical_genesis_bundle().serve_nodes[0].record;
         let mut own = baked.clone();
         own.scrub_key_id = own.key_id.clone(); // self-signed
         own.identity_type = identity_type::NODE.to_owned();
         own.additional_scrubs.clear();
-        own.roles.clear();
+        own.capability_roles.clear();
         backend
             .put_public_key(SignedKeyRecord { record: own })
             .await
@@ -796,12 +900,12 @@ mod tests {
         // but a `node` row (so put_public_key's canonical gate doesn't re-verify
         // the now-stale scrubs) whose envelope `valid_from` is strictly OLDER
         // than the baked record's — i.e. "the address before the re-bake".
-        let baked = &canonical_genesis_records()[0].record;
+        let baked = &canonical_genesis_bundle().serve_nodes[0].record;
         assert_ne!(baked.scrub_key_id, baked.key_id, "baked is anchor-scrubbed");
         let mut old = baked.clone();
         old.identity_type = identity_type::NODE.to_owned();
         old.additional_scrubs.clear();
-        old.roles.clear();
+        old.capability_roles.clear();
         let mut env = old.registration_envelope.clone();
         env["valid_from"] = serde_json::json!("2026-06-01T00:00:00+00:00");
         old.registration_envelope = env.clone();

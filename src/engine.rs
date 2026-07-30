@@ -2258,7 +2258,7 @@ impl Engine {
             scrub_timestamp: now,
             pqc_completed_at,
             persist_row_hash: String::new(),
-            roles,
+            capability_roles: roles,
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -6456,7 +6456,7 @@ mod tests {
             scrub_timestamp: chrono::Utc::now(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -6665,7 +6665,7 @@ mod tests {
         let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
             .await
             .expect("construct engine");
-        let node = &crate::federation::genesis::canonical_genesis_records()[0].record;
+        let node = &crate::federation::genesis::canonical_genesis_bundle().serve_nodes[0].record;
         assert_eq!(node.key_id, "ciris-canonical-1-d7bdeu223k");
         assert!(
             engine
@@ -7969,7 +7969,7 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -8325,7 +8325,7 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -8989,7 +8989,7 @@ mod tests {
             scrub_timestamp: chrono::Utc::now(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -9081,7 +9081,7 @@ mod tests {
                 scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
-                roles: Vec::new(),
+                capability_roles: Vec::new(),
                 attestation_evidence: None,
                 consent_role: None,
                 additional_scrubs: Vec::new(),
@@ -10230,7 +10230,7 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -10493,7 +10493,7 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -11929,7 +11929,7 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -14615,7 +14615,7 @@ mod tests {
                 scrub_timestamp: "2026-01-01T00:00:00Z".parse().unwrap(),
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
-                roles: Vec::new(),
+                capability_roles: Vec::new(),
                 attestation_evidence: None,
                 consent_role: None,
                 additional_scrubs: Vec::new(),

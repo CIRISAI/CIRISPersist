@@ -2518,10 +2518,10 @@ impl PostgresBackend {
                     "original_content_hash hex decode: {e}"
                 ))
             })?;
-            let roles_param: Option<&Vec<String>> = if row.roles.is_empty() {
+            let roles_param: Option<&Vec<String>> = if row.capability_roles.is_empty() {
                 None
             } else {
-                Some(&row.roles)
+                Some(&row.capability_roles)
             };
             // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — wire None ⇔ the
             // stored V020 'unregistered' default (column is NOT NULL).
@@ -2651,10 +2651,10 @@ impl PostgresBackend {
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
-        let roles_param: Option<&Vec<String>> = if row.roles.is_empty() {
+        let roles_param: Option<&Vec<String>> = if row.capability_roles.is_empty() {
             None
         } else {
-            Some(&row.roles)
+            Some(&row.capability_roles)
         };
         let client = self
             .get_client()
@@ -2782,10 +2782,10 @@ impl PostgresBackend {
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
-        let roles_param: Option<&Vec<String>> = if row.roles.is_empty() {
+        let roles_param: Option<&Vec<String>> = if row.capability_roles.is_empty() {
             None
         } else {
-            Some(&row.roles)
+            Some(&row.capability_roles)
         };
         let client = self
             .get_client()
@@ -3032,10 +3032,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
 
         let original_content_hash = hex::decode(&row.original_content_hash)
             .map_err(|e| Error::InvalidArgument(format!("original_content_hash hex: {e}")))?;
-        let roles_param: Option<&Vec<String>> = if row.roles.is_empty() {
+        let roles_param: Option<&Vec<String>> = if row.capability_roles.is_empty() {
             None
         } else {
-            Some(&row.roles)
+            Some(&row.capability_roles)
         };
         let client = self
             .get_client()
@@ -3168,10 +3168,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         //
         // v1.3.0 (CIRISPersist#46): write the roles list to the TEXT[]
         // column. Empty Vec maps to NULL via Option<&Vec<String>>.
-        let roles_param: Option<&Vec<String>> = if row.roles.is_empty() {
+        let roles_param: Option<&Vec<String>> = if row.capability_roles.is_empty() {
             None
         } else {
-            Some(&row.roles)
+            Some(&row.capability_roles)
         };
         // v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — admission-gate the
         // token (Rust-level, so PG's V020 CHECK and CHECK-less SQLite
@@ -9529,7 +9529,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -13468,7 +13468,7 @@ fn pg_row_to_key_record(
         scrub_timestamp: row.safe_get_with("scrub_timestamp", mk_err)?,
         pqc_completed_at: row.safe_get_with("pqc_completed_at", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
-        roles,
+        capability_roles: roles,
         attestation_evidence,
         consent_role,
         additional_scrubs,
@@ -19188,7 +19188,7 @@ mod tests {
 
     /// v21.15.0 (CIRISPersist#536) — the trust-root fixture on POSTGRES: the
     /// same body sqlite + memory run, so `establish_trust_root` (incl. the
-    /// reserved accord:lifecycle leg + the #513 accord-holder HW-attestation
+    /// reserved heartbeat leg + the #513 accord-holder HW-attestation
     /// gate) is proven usable on every backend a round test might open.
     #[tokio::test]
     #[serial_test::serial(postgres)]
@@ -22304,7 +22304,7 @@ mod tests {
                 None
             },
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -23438,7 +23438,7 @@ mod tests {
             // #442: the pg SELECT once omitted `roles` and the tolerant
             // decoder silently returned [] — populate the set so the
             // page assertions below catch a dropped column.
-            key.roles = vec!["agent".into(), "substrate_persist".into()];
+            key.capability_roles = vec!["agent".into(), "substrate_persist".into()];
             backend
                 .put_public_key(crate::federation::SignedKeyRecord { record: key })
                 .await
@@ -23467,7 +23467,7 @@ mod tests {
         assert_eq!(p1.items[1].key_id, key_ids[1]);
         for k in &p1.items {
             assert_eq!(
-                k.roles,
+                k.capability_roles,
                 vec!["agent".to_string(), "substrate_persist".to_string()],
                 "#442: list_federation_keys must project the stored roles set"
             );
@@ -31646,7 +31646,7 @@ mod tests {
             scrub_timestamp: now,
             pqc_completed_at: Some(now),
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -32505,7 +32505,7 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),

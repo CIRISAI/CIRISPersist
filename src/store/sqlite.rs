@@ -2135,11 +2135,11 @@ impl SqliteBackend {
                     })?),
                     None => None,
                 };
-            let roles_text: Option<String> = if row.roles.is_empty() {
+            let roles_text: Option<String> = if row.capability_roles.is_empty() {
                 None
             } else {
                 Some(
-                    serde_json::to_string(&row.roles)
+                    serde_json::to_string(&row.capability_roles)
                         .map_err(|e| crate::federation::Error::Backend(format!("roles: {e}")))?,
                 )
             };
@@ -2308,11 +2308,11 @@ impl SqliteBackend {
             ),
             None => None,
         };
-        let roles_text: Option<String> = if row.roles.is_empty() {
+        let roles_text: Option<String> = if row.capability_roles.is_empty() {
             None
         } else {
             Some(
-                serde_json::to_string(&row.roles)
+                serde_json::to_string(&row.capability_roles)
                     .map_err(|e| crate::federation::Error::Backend(format!("roles: {e}")))?,
             )
         };
@@ -2475,11 +2475,11 @@ impl SqliteBackend {
             ),
             None => None,
         };
-        let roles_text: Option<String> = if row.roles.is_empty() {
+        let roles_text: Option<String> = if row.capability_roles.is_empty() {
             None
         } else {
             Some(
-                serde_json::to_string(&row.roles)
+                serde_json::to_string(&row.capability_roles)
                     .map_err(|e| crate::federation::Error::Backend(format!("roles: {e}")))?,
             )
         };
@@ -2734,11 +2734,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ),
             None => None,
         };
-        let roles_text: Option<String> = if row.roles.is_empty() {
+        let roles_text: Option<String> = if row.capability_roles.is_empty() {
             None
         } else {
             Some(
-                serde_json::to_string(&row.roles)
+                serde_json::to_string(&row.capability_roles)
                     .map_err(|e| Error::Backend(format!("roles: {e}")))?,
             )
         };
@@ -2910,10 +2910,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // JSON-array TEXT for the column. Empty Vec → NULL so the
         // column matches the pre-V020 "no roles declared" semantics.
         let roles_text: Option<String> =
-            if row.roles.is_empty() {
+            if row.capability_roles.is_empty() {
                 None
             } else {
-                Some(serde_json::to_string(&row.roles).map_err(|e| {
+                Some(serde_json::to_string(&row.capability_roles).map_err(|e| {
                     crate::federation::Error::Backend(format!("roles serialize: {e}"))
                 })?)
             };
@@ -9236,7 +9236,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             scrub_timestamp: now,
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -13377,7 +13377,7 @@ fn sqlite_row_to_key_record(
         scrub_timestamp: parse_rfc3339(&scrub_timestamp),
         pqc_completed_at: pqc_completed_at.as_deref().map(parse_rfc3339),
         persist_row_hash: row.get("persist_row_hash")?,
-        roles,
+        capability_roles: roles,
         attestation_evidence,
         consent_role,
         additional_scrubs,
@@ -18879,7 +18879,7 @@ mod accord_tests {
 
     /// v21.15.0 (CIRISPersist#536) — the trust-root fixture (`establish_trust_root`,
     /// the leg-B counterpart to `confer_roles`) must work on SQLITE: the reserved
-    /// `accord:lifecycle` leg and the federation-tier hybrid-verify of every leg
+    /// heartbeat leg and the federation-tier hybrid-verify of every leg
     /// round-trip here, so an in-process round test downstream (CIRISServer#327)
     /// can stand up a genuinely valid trust root without hand-assembling five rows.
     #[tokio::test]
@@ -19232,7 +19232,7 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
@@ -30333,7 +30333,7 @@ mod tests {
     async fn roles_round_trip_via_put_lookup() {
         let backend = trust_test_backend().await;
         let mut key = fed_key("k-roles", "primitive-roles", "registry-steward");
-        key.roles = vec![
+        key.capability_roles = vec![
             "cirislens_pipeline_writer".to_owned(),
             "cirislens_secrets_reader".to_owned(),
         ];
@@ -30345,9 +30345,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(got.roles.len(), 2);
-        assert!(got.roles.contains(&"cirislens_pipeline_writer".to_owned()));
-        assert!(got.roles.contains(&"cirislens_secrets_reader".to_owned()));
+        assert_eq!(got.capability_roles.len(), 2);
+        assert!(got
+            .capability_roles
+            .contains(&"cirislens_pipeline_writer".to_owned()));
+        assert!(got
+            .capability_roles
+            .contains(&"cirislens_secrets_reader".to_owned()));
     }
 
     /// v12.7.0 (CIRISPersist#365, CC 3.4.7.2) — consent_role round-trips
@@ -31356,7 +31360,7 @@ mod tests {
         // #442: populate the roles set on one key so the list projection
         // is asserted on both backends (the pg SELECT once dropped it).
         let mut key_a = fed_key("k-a", "agent-a", "k-a");
-        key_a.roles = vec!["agent".into(), "substrate_persist".into()];
+        key_a.capability_roles = vec!["agent".into(), "substrate_persist".into()];
         backend
             .put_public_key(SignedKeyRecord { record: key_a })
             .await
@@ -31392,7 +31396,7 @@ mod tests {
         assert_eq!(keys.items.len(), 2);
         let k_a = keys.items.iter().find(|k| k.key_id == "k-a").unwrap();
         assert_eq!(
-            k_a.roles,
+            k_a.capability_roles,
             vec!["agent".to_string(), "substrate_persist".to_string()],
             "#442: list_federation_keys must project the stored roles set"
         );
@@ -36663,7 +36667,7 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            roles: Vec::new(),
+            capability_roles: Vec::new(),
             attestation_evidence: None,
             consent_role: None,
             additional_scrubs: Vec::new(),
