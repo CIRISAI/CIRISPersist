@@ -410,16 +410,30 @@ where
 /// this seeds, its envelope, and its scrub signatures are untouched — the
 /// wire is sacred, only the container changed).
 ///
-/// What this bundle carries and what it does NOT is the point of the change,
-/// so read it off the fields: `serve_nodes` (the identity plane) is populated;
-/// `attestations` and `authorizations` are EMPTY — this artifact carries no
-/// delegation plane and no holder quorum, which is exactly the condition
-/// CIRISPersist#551 says must stop being invisible. `holders` is empty on
-/// purpose: this node's roster is the separately-baked
-/// [`accord_holder_genesis_records`], and a second copy here would be two
-/// lists that can disagree (the #541 class). Consequently this bundle is NOT
-/// bakeable via [`bake_assembled_genesis`] — it has no authorizations, so the
-/// quorum gate refuses it, loudly and correctly.
+/// v23.1.0 (CIRISPersist#554) — **this is the mesh's first production trust
+/// root.** The June 2026 hardware ceremony (A1/B1/C1 on FIPS YubiKeys, 2-of-3
+/// co-scrub) chartering `ciris-canonical-1-d7bdeu223k` with `infra:serve`.
+/// It replaces the bundle-shaped PLACEHOLDER v23.0.0 shipped — `holders 0,
+/// attestations 0, authorizations 0` — which had the right type and no
+/// content.
+///
+/// Read what it carries off the fields, all four planes now populated:
+/// `holders` (A1/B1/C1, each with real YubiKey PIV custody evidence — the
+/// shape #554 made representable), `serve_nodes` (the re-blessed canonical),
+/// `attestations` (charter + serve grant + lifecycle — the delegation plane),
+/// and `authorizations` (A1 + B1 hybrid, the 2-of-3 quorum).
+///
+/// The carried `holders` are cross-check input, NOT this node's roster: the
+/// roster remains the separately-baked [`accord_holder_genesis_records`], and
+/// bundle-carried holder records are never the verification authority (the
+/// #377 lesson — a forged bundle carrying attacker "holders" proves nothing).
+/// The two lists agree here because they are the same ceremony's output, and
+/// [`verify_bundle_quorum`] re-derives authority from persist's own state
+/// regardless.
+///
+/// Unlike the placeholder, this artifact IS bakeable via
+/// [`bake_assembled_genesis`]: it carries the authorizations the quorum gate
+/// requires.
 const CANONICAL_SEED_JSON: &str = include_str!("canonical_seed.json");
 
 /// Parse-once accessor for the baked canonical genesis **bundle**
@@ -686,24 +700,76 @@ mod tests {
 
     /// v23.0.0 (CIRISPersist#551 item 1) — the embedded seed asset round-trips
     /// as a `GenesisBundle` through the SAME door an operator artifact enters
-    /// ([`parse_genesis_bundle`]), and its declared identity is the accord
-    /// family it seeds. The bundle's emptiness is asserted, not incidental:
-    /// this artifact carries the identity plane ONLY, and #551 exists because
-    /// that condition used to be invisible.
+    /// ([`parse_genesis_bundle`]).
+    ///
+    /// v23.1.0 (CIRISPersist#554) — **the seed is now the real production
+    /// trust root**, so this test asserts its CONTENT, not merely its shape.
+    /// Until this cut the asset was a bundle-shaped placeholder — `holders 0,
+    /// attestations 0, authorizations 0` — and every assertion here was
+    /// satisfied by emptiness. A test that passes on a placeholder cannot tell
+    /// you the bake happened. Each field below is pinned to what the June 2026
+    /// hardware ceremony actually produced, so a regression to a placeholder
+    /// (or a silently swapped artifact) fails loudly rather than returning
+    /// green on nothing.
     #[test]
     fn embedded_seed_is_a_genesis_bundle_551() {
         let b = canonical_genesis_bundle();
+        assert_eq!(b.version, 2);
         assert_eq!(b.family_key_id, "humanity-accord");
         assert_eq!(b.consensus_protocol, "quorum:2/3");
-        assert_eq!(b.serve_nodes.len(), 1, "the identity plane is carried");
-        assert!(
-            b.attestations.is_empty() && b.authorizations.is_empty(),
-            "the baked seed carries NO delegation plane and NO holder quorum — \
-             if this ever becomes non-empty the seeding path must grow a step \
-             to land it, not silently ignore it"
+
+        // The holder roster: A1/B1/C1 on YubiKeys, each carrying REAL custody
+        // evidence (#554 — the arm that made these representable).
+        let holders: Vec<&str> = b.holders.iter().map(|h| h.record.key_id.as_str()).collect();
+        assert_eq!(holders, ["A1", "B1", "C1"], "the accord holder roster");
+        for h in &b.holders {
+            assert!(
+                h.record.claims_role(identity_type::ACCORD_HOLDER),
+                "{} must claim accord_holder",
+                h.record.key_id
+            );
+            assert!(
+                h.record.attestation_evidence.is_some(),
+                "{} must carry custody evidence — a holder without it is the \
+                 unrepresentable case #554 fixed",
+                h.record.key_id
+            );
+        }
+
+        // The delegation plane and the holder quorum are PRESENT — this is the
+        // condition #551 said must stop being invisible, now satisfied rather
+        // than merely observable.
+        let atts: Vec<&str> = b
+            .attestations
+            .iter()
+            .map(|a| a.attestation.attestation_id.as_str())
+            .collect();
+        assert_eq!(
+            atts,
+            [
+                "genesis-charter",
+                "genesis-grant-serve:ciris-canonical-1-d7bdeu223k",
+                "genesis-lifecycle",
+            ],
+            "charter + serve grant + lifecycle — the delegation plane"
         );
+        let auths: Vec<&str> = b
+            .authorizations
+            .iter()
+            .map(|a| a.holder_key_id.as_str())
+            .collect();
+        assert_eq!(auths, ["A1", "B1"], "2-of-3 holder authorizations");
+        for a in &b.authorizations {
+            assert!(
+                !a.signature_classical.is_empty() && !a.signature_pqc.is_empty(),
+                "{} must authorize with BOTH halves — hybrid, not classical-only",
+                a.holder_key_id
+            );
+        }
+
         // Byte-faithfulness of the wrapped record: the seeded row is the one
         // the ceremony blessed, container change notwithstanding.
+        assert_eq!(b.serve_nodes.len(), 1, "the canonical serve node");
         assert_eq!(
             b.serve_nodes[0].record.key_id,
             "ciris-canonical-1-d7bdeu223k"

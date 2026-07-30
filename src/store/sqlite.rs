@@ -2653,6 +2653,17 @@ impl SqliteBackend {
 
 #[async_trait::async_trait]
 impl crate::federation::FederationDirectory for SqliteBackend {
+    // v23.1.0 (CIRISPersist#554) — surface THIS backend's configured policy on
+    // the trait so `genesis::verify_bundle_quorum` gates holder evidence with
+    // the same predicate `put_public_key` uses. Delegates to the inherent
+    // method (the single source of truth); a tightened deployment tightens
+    // both validators at once.
+    fn hardware_attestation_policy(
+        &self,
+    ) -> std::sync::Arc<crate::federation::HardwareAttestationPolicy> {
+        SqliteBackend::hardware_attestation_policy(self)
+    }
+
     // v13.0.1 (CIRISPersist#375) — expose the #371 upgrade-aware apply on
     // the trait so `Arc<dyn FederationDirectory>` holders (CIRISEdge's
     // anti-entropy bridge) reach the real path, not `put_public_key`'s

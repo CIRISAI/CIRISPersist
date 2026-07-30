@@ -465,6 +465,25 @@ pub trait FederationDirectory: Send + Sync {
     /// differing content.
     async fn put_public_key(&self, record: SignedKeyRecord) -> Result<(), Error>;
 
+    /// v23.1.0 (CIRISPersist#554) — the hardware-attestation policy THIS
+    /// directory admits `accord_holder` rows under.
+    ///
+    /// Exists so a validator other than the put path can run the *same*
+    /// predicate: `genesis::verify_bundle_quorum` checks holder-evidence
+    /// admissibility through this, so **a bundle that verifies is a bundle
+    /// that installs**. #554 was the two of them disagreeing about the same
+    /// bytes — the verifier passed the production bundle while
+    /// [`Self::put_public_key`] refused every holder it carried.
+    ///
+    /// Reaching the configured policy (rather than `default()`) is the point:
+    /// a deployment that tightened its accepted set must have the verifier
+    /// tighten with it, or the disagreement simply returns in another form.
+    /// The default body is the default policy — a directory impl that has no
+    /// configuration surface needs no override.
+    fn hardware_attestation_policy(&self) -> std::sync::Arc<HardwareAttestationPolicy> {
+        std::sync::Arc::new(HardwareAttestationPolicy::default())
+    }
+
     /// v13.0.1 (CIRISPersist#375) — the **upgrade-aware, `owner_of`-gated
     /// Key-plane apply** for anti-entropy replication, dyn-dispatchable.
     ///
