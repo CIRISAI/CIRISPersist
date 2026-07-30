@@ -135,14 +135,66 @@ impl Default for HardwareAttestationPolicy {
 ///   "nonce_captured_at": "<RFC3339>"}`. PlatformAttestation's serde
 /// shape is whatever ciris-keyring emits; persist treats the body as
 /// opaque-via-derive.
+/// v22.0.1 (CIRISPersist#545) — **the evidence is an ENUM so the honest
+/// software-test custody marker is representable by construction.** v22.0.0
+/// had two parts disagreeing about one shape: the test-anchor genesis
+/// synthesizer emits `{"tier":"SoftwareOnly_TEST","test_anchor":true}` —
+/// "honest about what it is, never a fabricated hardware claim" — while this
+/// type required a non-optional `platform_attestation`, so the marker failed
+/// SERDE before any tier logic could honour it and persist refused its own
+/// synthesized accord holders. CIRISServer caught it on adoption and,
+/// correctly, refused to work around it by fabricating hardware evidence in
+/// a fixture (which would have quietly certified the hardware path — the
+/// AV-77 class).
+///
+/// Untagged: a hardware body deserializes as [`Self::Hardware`]; the exact
+/// two-field marker (and nothing else — `deny_unknown_fields`) as
+/// [`Self::SoftwareOnlyTest`]. The marker's ADMISSIBILITY is decided in
+/// [`HardwareAttestationPolicy::check`], never by parsing: it admits ONLY
+/// under a live test anchor, and its production refusal is typed and loud —
+/// "honest about what it is" is now a type, not a convention.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttestationEvidence {
+#[serde(untagged)]
+pub enum AttestationEvidence {
+    /// Real platform custody evidence — the only production-admissible arm.
+    Hardware(Box<HardwareCustodyEvidence>),
+    /// The test-anchor genesis marker (CIRISVerify#202's
+    /// `accord_custody_attestation` admits the same tier under the same
+    /// condition). Never admissible without a live test anchor.
+    SoftwareOnlyTest(SoftwareOnlyTestMarker),
+}
+
+/// The hardware arm's body — the pre-#545 `AttestationEvidence` shape,
+/// byte-compatible on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HardwareCustodyEvidence {
     /// The platform attestation Verify produced via
     /// `HardwareSigner::attestation_with_nonce(challenge)`.
     pub platform_attestation: PlatformAttestation,
     /// When Verify captured the nonce challenge. Persist checks
     /// freshness against [`HardwareAttestationPolicy::max_nonce_age`].
     pub nonce_captured_at: DateTime<Utc>,
+}
+
+/// Exactly `{"tier":"SoftwareOnly_TEST","test_anchor":true}` — the genesis
+/// synthesizer's marker (`src/federation/genesis/mod.rs`). `deny_unknown_fields`
+/// so no hardware-shaped body can fall through to this arm.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoftwareOnlyTestMarker {
+    /// The single legal value; any other string fails deserialization.
+    pub tier: SoftwareOnlyTestTier,
+    /// Must be literally `true` — checked in policy, not parsing, so the
+    /// refusal is typed rather than "malformed".
+    pub test_anchor: bool,
+}
+
+/// One variant, spelled exactly as the synthesizer emits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SoftwareOnlyTestTier {
+    /// `"SoftwareOnly_TEST"`.
+    #[serde(rename = "SoftwareOnly_TEST")]
+    SoftwareOnlyTest,
 }
 
 impl HardwareAttestationPolicy {
@@ -188,13 +240,44 @@ impl HardwareAttestationPolicy {
             Some(v) => v,
         };
 
-        // 2. Deserialize.
+        // 2. Deserialize. Untagged: hardware body → Hardware, the exact
+        // two-field marker → SoftwareOnlyTest, anything else → malformed.
         let evidence: AttestationEvidence = serde_json::from_value(value.clone()).map_err(|e| {
             Error::AccordHolderRequiresAttestationEvidence {
                 key_id: key_id.to_owned(),
                 detail: format!("malformed: {e}"),
             }
         })?;
+
+        // 2b. The SoftwareOnly_TEST marker (CIRISPersist#545): admissible
+        // ONLY under a live test anchor — the same condition under which the
+        // genesis synthesizer that emits it exists at all. In production the
+        // refusal is TYPED and names the tier, never "malformed": a peer
+        // presenting the marker on a real mesh is making a claim this node
+        // must refuse loudly, and a mis-shapen refusal reads as a parser bug
+        // instead of a custody decision. Verify's accord_custody_attestation
+        // admits the same tier under the same gate (CIRISVerify#202).
+        let evidence = match evidence {
+            AttestationEvidence::SoftwareOnlyTest(marker) => {
+                if !marker.test_anchor {
+                    return Err(Error::AccordHolderRequiresAttestationEvidence {
+                        key_id: key_id.to_owned(),
+                        detail: "SoftwareOnly_TEST marker without test_anchor:true".into(),
+                    });
+                }
+                if crate::federation::genesis::test_anchor_override_active() {
+                    return Ok(());
+                }
+                return Err(Error::AccordHolderRequiresAttestationEvidence {
+                    key_id: key_id.to_owned(),
+                    detail: "SoftwareOnly_TEST custody marker refused: test anchor not live — \
+                             production accord custody requires platform_attestation \
+                             (CIRISPersist#545)"
+                        .into(),
+                });
+            }
+            AttestationEvidence::Hardware(hw) => *hw,
+        };
 
         // 3. Variant → HardwareType.
         let hw_type = platform_to_hardware_type(&evidence.platform_attestation);
@@ -556,13 +639,72 @@ mod tests {
         ));
     }
 
+    /// #545 — the SoftwareOnly_TEST marker WITHOUT a live test anchor is a
+    /// TYPED, loud refusal naming the tier — never "malformed". This is the
+    /// security half of the #545 fix: making the marker representable must
+    /// not make it admissible; a peer presenting it on a real mesh is making
+    /// a custody claim this node refuses as a DECISION, not a parse error.
+    #[serial_test::serial(test_anchor_env)]
+    #[test]
+    fn software_only_test_marker_refused_when_anchor_not_live_545() {
+        // Ensure the anchor is genuinely dark for this process.
+        std::env::remove_var("CIRIS_TEST_TRUST_ROOT");
+        let p = HardwareAttestationPolicy::default();
+        let v = serde_json::json!({"tier": "SoftwareOnly_TEST", "test_anchor": true});
+        let err = p.check("mesh-peer", Some(&v), Utc::now()).unwrap_err();
+        match err {
+            Error::AccordHolderRequiresAttestationEvidence { ref detail, .. } => {
+                assert!(
+                    detail.contains("test anchor not live"),
+                    "#545: the refusal must say WHY: {detail}"
+                );
+                assert!(
+                    !detail.starts_with("malformed"),
+                    "#545: a custody decision must not read as a parser bug: {detail}"
+                );
+            }
+            other => panic!("#545: expected the typed evidence refusal, got {other:?}"),
+        }
+    }
+
+    /// #545 — `test_anchor: false` on the marker is refused even if an anchor
+    /// were live: the marker's own honesty bit must be set.
+    #[test]
+    fn software_only_test_marker_requires_test_anchor_true_545() {
+        let p = HardwareAttestationPolicy::default();
+        let v = serde_json::json!({"tier": "SoftwareOnly_TEST", "test_anchor": false});
+        let err = p.check("k", Some(&v), Utc::now()).unwrap_err();
+        assert!(
+            format!("{err}").contains("test_anchor:true"),
+            "#545: names the missing honesty bit: {err}"
+        );
+    }
+
+    /// #545 — `deny_unknown_fields` keeps anything hardware-shaped (or
+    /// padded) out of the marker arm: a marker with extra fields is
+    /// MALFORMED, not a software-test claim.
+    #[test]
+    fn software_only_test_marker_with_extra_fields_is_malformed_545() {
+        let p = HardwareAttestationPolicy::default();
+        let v = serde_json::json!({
+            "tier": "SoftwareOnly_TEST",
+            "test_anchor": true,
+            "platform_attestation": {"smuggled": true}
+        });
+        let err = p.check("k", Some(&v), Utc::now()).unwrap_err();
+        assert!(
+            format!("{err}").contains("malformed"),
+            "#545: a padded marker must fail deserialization: {err}"
+        );
+    }
+
     #[test]
     fn check_rejects_software_only_variant() {
         let p = HardwareAttestationPolicy::default();
-        let ev = AttestationEvidence {
+        let ev = AttestationEvidence::Hardware(Box::new(HardwareCustodyEvidence {
             platform_attestation: software_only(),
             nonce_captured_at: Utc::now(),
-        };
+        }));
         let v = serde_json::to_value(&ev).unwrap();
         let err = p.check("k1", Some(&v), Utc::now()).unwrap_err();
         match err {
@@ -576,10 +718,10 @@ mod tests {
     #[test]
     fn check_reports_missing_pcr_values_for_tpm() {
         let p = HardwareAttestationPolicy::default();
-        let ev = AttestationEvidence {
+        let ev = AttestationEvidence::Hardware(Box::new(HardwareCustodyEvidence {
             platform_attestation: tpm_missing_pcr(),
             nonce_captured_at: Utc::now(),
-        };
+        }));
         let v = serde_json::to_value(&ev).unwrap();
         let err = p.check("k1", Some(&v), Utc::now()).unwrap_err();
         match err {
@@ -598,10 +740,10 @@ mod tests {
     fn check_rejects_stale_nonce() {
         let p = HardwareAttestationPolicy::default();
         let captured = Utc::now() - chrono::Duration::hours(48);
-        let ev = AttestationEvidence {
+        let ev = AttestationEvidence::Hardware(Box::new(HardwareCustodyEvidence {
             platform_attestation: android_full(),
             nonce_captured_at: captured,
-        };
+        }));
         let v = serde_json::to_value(&ev).unwrap();
         let err = p.check("k1", Some(&v), Utc::now()).unwrap_err();
         match err {
@@ -615,10 +757,10 @@ mod tests {
     #[test]
     fn check_accepts_full_android_strongbox() {
         let p = HardwareAttestationPolicy::default();
-        let ev = AttestationEvidence {
+        let ev = AttestationEvidence::Hardware(Box::new(HardwareCustodyEvidence {
             platform_attestation: android_full(),
             nonce_captured_at: Utc::now(),
-        };
+        }));
         let v = serde_json::to_value(&ev).unwrap();
         p.check("k1", Some(&v), Utc::now()).unwrap();
     }
@@ -626,10 +768,10 @@ mod tests {
     #[test]
     fn check_accepts_full_ios() {
         let p = HardwareAttestationPolicy::default();
-        let ev = AttestationEvidence {
+        let ev = AttestationEvidence::Hardware(Box::new(HardwareCustodyEvidence {
             platform_attestation: ios_full(),
             nonce_captured_at: Utc::now(),
-        };
+        }));
         let v = serde_json::to_value(&ev).unwrap();
         p.check("k1", Some(&v), Utc::now()).unwrap();
     }
@@ -655,10 +797,10 @@ mod tests {
     #[test]
     fn check_accepts_full_yubikey_piv() {
         let p = HardwareAttestationPolicy::default();
-        let ev = AttestationEvidence {
+        let ev = AttestationEvidence::Hardware(Box::new(HardwareCustodyEvidence {
             platform_attestation: external_se_yubikey_full(),
             nonce_captured_at: Utc::now(),
-        };
+        }));
         let v = serde_json::to_value(&ev).unwrap();
         p.check("k1", Some(&v), Utc::now()).unwrap();
     }
@@ -671,10 +813,10 @@ mod tests {
             e.attestation_cert_der.clear();
             e.attestation_chain_der.clear();
         }
-        let ev = AttestationEvidence {
+        let ev = AttestationEvidence::Hardware(Box::new(HardwareCustodyEvidence {
             platform_attestation: att,
             nonce_captured_at: Utc::now(),
-        };
+        }));
         let v = serde_json::to_value(&ev).unwrap();
         let err = p.check("k1", Some(&v), Utc::now()).unwrap_err();
         match err {
@@ -693,10 +835,10 @@ mod tests {
     #[test]
     fn check_accepts_full_tpm_discrete() {
         let p = HardwareAttestationPolicy::default();
-        let ev = AttestationEvidence {
+        let ev = AttestationEvidence::Hardware(Box::new(HardwareCustodyEvidence {
             platform_attestation: tpm_discrete_full(),
             nonce_captured_at: Utc::now(),
-        };
+        }));
         let v = serde_json::to_value(&ev).unwrap();
         p.check("k1", Some(&v), Utc::now()).unwrap();
     }
