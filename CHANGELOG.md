@@ -31,7 +31,7 @@ the real captured artifact, on memory, sqlite and postgres.
 
 A third arm for devices that attest when the key is created rather than per nonce. Named for what
 it is, not for the vendor: YubiKey PIV today, the same shape for anything with the same custody
-story. The wire shape is CIRISVerify#202's `accord_custody_attestation` — a signed CEG object
+story. The wire shape is CIRISVerify's `accord_custody_attestation` (#91, implemented and released) — a signed CEG object
 carrying the holder-signed envelope plus the hash-bound certificate chain.
 
 No `deny_unknown_fields`: the ceremony format is CIRISVerify's and may grow, and refusing a valid

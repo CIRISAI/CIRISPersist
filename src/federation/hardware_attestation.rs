@@ -231,9 +231,13 @@ pub struct HardwareCustodyEvidence {
 }
 
 /// v23.1.0 (CIRISPersist#554) — the attestation-at-generation arm's body: the
-/// signed CEG object a custody ceremony emits (CIRISVerify#202's
-/// `accord_custody_attestation`, produced by
-/// `produce_accord_custody_attestation`).
+/// signed CEG object a custody ceremony emits — CIRISVerify's
+/// `accord_custody_attestation` (implemented and released; the custody
+/// attestation + PIV chain verifier is CIRISVerify#91, produced by
+/// `produce_accord_custody_attestation`). NOT #202 — that is the test-mode
+/// single-key trust-root override, a different mechanism; citing it here
+/// would send a reader chasing chain verification into the test-anchor
+/// feature.
 ///
 /// # Why no `deny_unknown_fields`
 ///
@@ -388,7 +392,9 @@ impl HardwareAttestationPolicy {
         // presenting the marker on a real mesh is making a claim this node
         // must refuse loudly, and a mis-shapen refusal reads as a parser bug
         // instead of a custody decision. Verify's accord_custody_attestation
-        // admits the same tier under the same gate (CIRISVerify#202).
+        // (CIRISVerify#91) admits the same SoftwareOnly_TEST tier when its
+        // test-anchor override (CIRISVerify#202) is live — the two issues are
+        // different mechanisms and both cites matter.
         let evidence = match evidence {
             AttestationEvidence::SoftwareOnlyTest(marker) => {
                 if !marker.test_anchor {
@@ -487,6 +493,8 @@ impl HardwareAttestationPolicy {
     /// holder's federation Ed25519 key, and the FIPS / touch-policy floor.
     ///
     /// `ciris_verify_core::accord_custody_attestation::verify_accord_custody_attestation`
+    /// (CIRISVerify#91 — implemented and released; the chain walk is
+    /// `verify_yubikey_piv_attestation`, 9c → f9 → pinned Yubico root)
     /// does all four — but it requires two inputs this call site does not have:
     /// the holder's **directory-resolved** `ThresholdMember` pubkeys, and a
     /// **pinned Yubico attestation root**. Verify deliberately does not ship
