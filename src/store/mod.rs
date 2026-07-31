@@ -118,6 +118,39 @@ pub enum Error {
         /// brackets when present; safe for tracing logs.
         detail: String,
     },
+
+    /// v24.1.0 (CIRISPersist#559) — the migration phase gave up waiting for
+    /// the **global migration advisory lock**.
+    ///
+    /// Distinct from [`Error::Migration`] on purpose. `Migration` means "the
+    /// DDL itself failed"; this means "we never got to run any DDL, because
+    /// another occurrence is holding the lock" — a different operator action
+    /// (find the holder, or wait) and, critically, a SAFE state: nothing was
+    /// written, and re-running is the whole remedy.
+    ///
+    /// It exists because before this cut the wait was `pg_advisory_lock`, which
+    /// blocks forever. CIRISAgent (CIRISAI/CIRISAgent#937) measured a boot
+    /// stalled **15 minutes** with no timeout, no progress signal reachable
+    /// from the FFI, and nothing that would ever have fired. A refusal that
+    /// names the lock and the elapsed budget is what turns that into an
+    /// operator-actionable event.
+    #[error(
+        "migration advisory lock {lock_id:#x} not acquired after {waited_secs}s \
+         (another occurrence is migrating this database, or a holder is stuck); \
+         nothing was written — retry, or find the holder with \
+         `SELECT * FROM pg_locks WHERE locktype = 'advisory' AND objid = {lock_id_low}`"
+    )]
+    MigrationLockTimeout {
+        /// The advisory-lock id waited on — greppable in `pg_locks` /
+        /// `pg_stat_activity`, which is why it is IN the message.
+        lock_id: i64,
+        /// The low 32 bits of `lock_id`, which is what `pg_locks.objid`
+        /// actually shows for a bigint advisory lock — quoted so the operator
+        /// can paste the query rather than derive it.
+        lock_id_low: u32,
+        /// How long this process waited before giving up.
+        waited_secs: u64,
+    },
 }
 
 // Bridge schema errors into the store layer.
@@ -138,6 +171,7 @@ impl Error {
             Error::NotImplemented(_) => "store_not_implemented",
             Error::Backend(_) => "store_backend",
             Error::Migration { .. } => "store_migration",
+            Error::MigrationLockTimeout { .. } => "store_migration_lock_timeout",
             Error::FountainAdmit(e) => e.kind(),
             Error::FountainIntegrity(_) => "fountain_integrity",
             Error::AggregationMetaRejected(e) => e.kind(),

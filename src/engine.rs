@@ -883,6 +883,33 @@ impl Engine {
         crate::federation::deletion_window::run_deletion_window_watch(&*dir, now).await
     }
 
+    /// v24.1.0 (CIRISPersist#561) — **may `peer_key_id` carry our relay
+    /// traffic, and for how long may that answer be cached?**
+    ///
+    /// The host handle for
+    /// [`crate::federation::trust_root::resolve_transit_eligibility`]. A
+    /// candidate-assembly integrator calls it once per candidate, caches
+    /// `(eligible, valid_until)`, drops the entry on a withdrawal event, and
+    /// feeds only-eligible candidates to a pure planner — so the A/V hop
+    /// selection hot path stays crypto-free (CIRISEdge#430).
+    ///
+    /// It exists on [`Engine`] for the reason [`Self::set_self_key_id`] does:
+    /// a capability no host can call is not shipped. Edge and server reach
+    /// persist as an `Engine` (or through the PyO3 surface over one), and a
+    /// transport gate they cannot invoke is a gate that does not exist.
+    ///
+    /// Fail-closed: any resolution error reads `eligible: false`.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn resolve_transit_eligibility(
+        &self,
+        user_key_id: &str,
+        peer_key_id: &str,
+    ) -> Result<crate::federation::trust_root::TransitEligibility, crate::federation::Error> {
+        let dir = self.federation_directory();
+        crate::federation::trust_root::resolve_transit_eligibility(&*dir, user_key_id, peer_key_id)
+            .await
+    }
+
     /// v3.4.0 (CIRISPersist#123) — install / clear the trust-weighted
     /// admission gate on the Engine's underlying storage backend. The
     /// four write paths consult this gate BEFORE any DB work.
@@ -7546,6 +7573,74 @@ mod tests {
             None,
             "AV-77: clearing must be honoured"
         );
+    }
+
+    /// **CIRISPersist#561 — the transport gate is reachable from a HOST.**
+    ///
+    /// The A/B/C/D rule and its TTL are proven on all three backends by
+    /// [`crate::federation::operational::test_support::exercise_transit_eligibility`],
+    /// and every one of those witnesses calls the free function directly. The
+    /// consumer (CIRISEdge#430) holds an `Engine` — or reaches it through the
+    /// PyO3 surface over one — so this drives the SAME scenario through
+    /// [`Engine::resolve_transit_eligibility`] and asserts it agrees.
+    ///
+    /// Same reason as [`Self::set_self_key_id`]'s witness above: a gate is not
+    /// shipped when its code path exists, it is shipped when a host can reach
+    /// it. A transport gate nobody can call would fail open by simply never
+    /// being consulted.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn resolve_transit_eligibility_is_reachable_through_the_engine_561() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct engine");
+        let backend = match engine.backend() {
+            #[cfg(feature = "postgres")]
+            BackendDispatch::Postgres(_) => {
+                panic!("sqlite::memory: DSN must yield the sqlite backend")
+            }
+            BackendDispatch::Sqlite(b) => b.clone(),
+        };
+
+        // The full scenario, stood up beneath the Engine.
+        crate::federation::operational::test_support::exercise_transit_eligibility(
+            backend.as_ref(),
+            "eng561",
+        )
+        .await
+        .expect("561 transit eligibility exercise");
+
+        // Now the host handle, over the state that exercise left behind: the
+        // user withdrew its trust edge in the last witness, so the peer is NOT
+        // eligible — and the Engine must say so rather than erroring or
+        // reporting something a free-function caller would not see.
+        let verdict = engine
+            .resolve_transit_eligibility("eng561-user", "eng561-peer")
+            .await
+            .expect("the Engine handle resolves");
+        assert!(
+            !verdict.eligible,
+            "the Engine sees the SAME withdrawn-edge state the free function does: {verdict:?}"
+        );
+        assert_eq!(
+            verdict,
+            crate::federation::trust_root::resolve_transit_eligibility(
+                backend.as_ref(),
+                "eng561-user",
+                "eng561-peer",
+            )
+            .await
+            .expect("free function resolves"),
+            "the Engine handle is a pass-through, not a second policy"
+        );
+
+        // And an unknown peer through the Engine is a DENIAL, not an Err the
+        // host might be tempted to treat as 'unknown, proceed'.
+        let ghost = engine
+            .resolve_transit_eligibility("eng561-user", "eng561-nobody")
+            .await
+            .expect("fail-closed, not fail-hard");
+        assert!(!ghost.eligible && ghost.via_root.is_none());
     }
 
     /// `from_shared` constructs an Engine without a LocalSigner;

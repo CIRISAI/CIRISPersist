@@ -82,6 +82,155 @@ const MIGRATION_LOCK_ID: i64 = 0x6369_7269_7370_7372_i64;
 /// `MIGRATION_LOCK_ID`; the low bytes spell `"rllup"` for greppability.
 const ROLLUP_REFRESH_LOCK_ID: i64 = 0x7263_6972_736c_7570_i64;
 
+/// v24.1.0 (CIRISPersist#559) — **the migration phase runs once per process,
+/// per database, and every wait in it is bounded.**
+///
+/// # The operational story (CIRISAI/CIRISAgent#937)
+///
+/// Two agents shared one `ciris_db`. Agent A ran a 35-minute
+/// `DELETE FROM graph_edges` holding `RowExclusiveLock`. Agent B booted and
+/// blocked **15 minutes** on an ungranted `ShareLock`, acquiring it for a
+/// `CREATE INDEX IF NOT EXISTS` that was a **no-op — the index already
+/// existed**. `IF NOT EXISTS` takes its lock BEFORE the catalog check, so it
+/// reads as free and is not. Nothing in that path would ever have timed out:
+/// `pg_advisory_lock` blocks forever, and `dedicated_connect` set no GUCs, so
+/// every DDL statement refinery ran waited indefinitely too. B recovered only
+/// when the unrelated `DELETE` finished.
+///
+/// That specific DDL was agent-side and is gone. The failure CLASS moved into
+/// persist, where it now applies to every consumer of the wheel. This module is
+/// the substrate half: three bounds, each closing one link of that chain.
+///
+/// # Why a once-guard is the biggest of the three
+///
+/// `Engine(...)` runs `connect + run_migrations + genesis seed` on EVERY
+/// construction. Even when refinery applies nothing, each construction took the
+/// global lock, ran the shard-key backfill and re-seeded genesis. The cheapest
+/// bound available is simply not to do it twice: a process migrates a given
+/// database ONCE, and every later construction against the same DSN skips
+/// straight past the lock.
+///
+/// # Scoped to Postgres, deliberately
+///
+/// SQLite gets no guard and must not: `sqlite::memory:` is one DSN string
+/// naming a DIFFERENT database on every open, so a DSN-keyed guard there would
+/// make the second in-memory database silently unmigrated. The hazard this
+/// closes — many occurrences sharing one live database — is Postgres-shaped.
+mod migration_guard {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    /// DSNs this process has already migrated to completion.
+    fn migrated() -> &'static Mutex<HashSet<String>> {
+        static MIGRATED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        MIGRATED.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    /// How many times this process has actually ENTERED the migration phase
+    /// (taken the advisory lock and run refinery), as opposed to skipping it.
+    ///
+    /// The observable the once-guard is tested through: a second Engine
+    /// construction against the same DSN must not advance it. A counter rather
+    /// than a bool because "ran twice" and "ran once" are the two states the
+    /// test needs to tell apart.
+    static PHASES_ENTERED: AtomicU64 = AtomicU64::new(0);
+
+    /// Has `dsn` already been migrated by this process?
+    ///
+    /// `true` ⇒ the caller must run the phase; `false` ⇒ skip it entirely.
+    /// Deliberately NOT a claim/lease: two threads racing here both migrate,
+    /// and the Postgres advisory lock is what serializes them — the same
+    /// v0.1.5 AV-26 protection, unchanged. This guard removes the *steady-state*
+    /// repetition; it is not, and must not be mistaken for, the mutual
+    /// exclusion.
+    pub(super) fn needs_migration(dsn: &str) -> bool {
+        !migrated()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(dsn)
+    }
+
+    /// Record that `dsn` migrated successfully. Called ONLY on the success
+    /// path: a failed migration must be retried by the next construction, not
+    /// silently marked done — an unmigrated database that reports itself
+    /// migrated is strictly worse than the stampede this guard exists to stop.
+    pub(super) fn mark_migrated(dsn: &str) {
+        migrated()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(dsn.to_owned());
+    }
+
+    /// Count one entry into the migration phase.
+    pub(super) fn note_phase_entered() {
+        PHASES_ENTERED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many migration phases this process has entered. See
+    /// [`PHASES_ENTERED`].
+    #[must_use]
+    pub fn phases_entered() -> u64 {
+        PHASES_ENTERED.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: forget `dsn`, so the next `run_migrations` re-enters the
+    /// phase. Exists so a test can drive BOTH sides of the guard in one
+    /// process; production has no reason to un-migrate a database.
+    #[cfg(test)]
+    pub(super) fn forget(dsn: &str) {
+        migrated()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(dsn);
+    }
+}
+
+pub use migration_guard::phases_entered as migration_phases_entered;
+
+/// v24.1.0 (CIRISPersist#559) — how long a single migration STATEMENT may wait
+/// for a table lock before erroring with SQLSTATE 55P03 (`lock_not_available`),
+/// which `migration_error` / `extract_sqlstate` already surface distinctly.
+///
+/// This is the bound on "a DDL statement waiting on a FOREIGN tenant's lock" —
+/// the #937 shape, where the blocker had nothing to do with the booting node.
+/// Two minutes is generous for real DDL on a live database and still finite,
+/// which is the entire difference from the previous value (none).
+///
+/// Override with `CIRIS_PERSIST_MIGRATION_LOCK_TIMEOUT` (a Postgres interval
+/// string, e.g. `"30s"`, `"5min"`; `"0"` restores the unbounded pre-#559
+/// behaviour for an operator who knowingly wants it).
+const DEFAULT_MIGRATION_LOCK_TIMEOUT: &str = "120s";
+
+/// v24.1.0 (CIRISPersist#559) — how long this process waits to ACQUIRE the
+/// global migration advisory lock before refusing with
+/// [`Error::MigrationLockTimeout`].
+///
+/// Deliberately far more patient than [`DEFAULT_MIGRATION_LOCK_TIMEOUT`], and
+/// that asymmetry is the point (#559 suggestion 2): a follower waiting on a
+/// legitimate cold-start migration by a sibling occurrence should wait a long
+/// time — the leader really is doing necessary work — while a DDL statement
+/// waiting on an unrelated tenant's lock should not. One budget could not
+/// express both.
+///
+/// Override with `CIRIS_PERSIST_MIGRATION_LOCK_WAIT_SECS` (`0` ⇒ wait forever,
+/// the pre-#559 behaviour).
+const DEFAULT_MIGRATION_LOCK_WAIT_SECS: u64 = 600;
+
+/// How often the follower logs that it is still waiting. A boot that "did not
+/// advance by a single line for 15 minutes" (#937) is indistinguishable from a
+/// hang; saying WHY it is waiting, periodically, is the difference.
+const MIGRATION_LOCK_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Read a `u64` env override, falling back to `default` when unset or
+/// unparseable (a typo must not silently disable a bound).
+fn env_u64(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 /// Postgres-backed [`Backend`] impl.
 pub struct PostgresBackend {
     pool: Pool,
@@ -600,6 +749,124 @@ impl PostgresBackend {
             existing.as_deref(),
             public_key_base64,
         ))
+    }
+
+    /// v24.1.0 (CIRISPersist#559) — give the migration session a `lock_timeout`
+    /// if, and only if, it does not already have one.
+    ///
+    /// `SHOW lock_timeout` returns `"0"` when disabled, which is what the
+    /// pre-#559 session always had. A non-`"0"` value means the DSN's
+    /// `options=-c lock_timeout=…` reached this session (the CIRISAgent 2.9.7
+    /// workaround), and it WINS: a first-class default that clobbered the seam
+    /// a consumer is already reaching through would break the very deployment
+    /// this issue came from.
+    ///
+    /// The chosen value converts an unbounded hang into a SQLSTATE-carrying
+    /// `55P03` that `extract_sqlstate` already surfaces distinctly.
+    async fn apply_migration_lock_timeout(
+        &self,
+        client: &tokio_postgres::Client,
+    ) -> Result<(), Error> {
+        let current: String = client
+            .query_one("SHOW lock_timeout", &[])
+            .await
+            .map_err(|e| migration_error("read lock_timeout", e))?
+            .try_get(0)
+            .map_err(|e| Error::Migration {
+                sqlstate: None,
+                detail: format!("read lock_timeout column: {e}"),
+            })?;
+        if current.trim() != "0" {
+            tracing::info!(
+                lock_timeout = %current,
+                "ciris-persist: migration session inherited lock_timeout from the DSN — honoured"
+            );
+            return Ok(());
+        }
+        let configured = std::env::var("CIRIS_PERSIST_MIGRATION_LOCK_TIMEOUT")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_MIGRATION_LOCK_TIMEOUT.to_owned());
+        if configured.trim() == "0" {
+            tracing::warn!(
+                "ciris-persist: migration lock_timeout explicitly disabled — DDL will wait \
+                 indefinitely for table locks (the pre-CIRISPersist#559 behaviour)"
+            );
+            return Ok(());
+        }
+        // The value is an operator-supplied interval, so it is bound as a
+        // PARAMETER through `set_config` rather than interpolated into SQL —
+        // `SET` does not take parameters, and building the statement by
+        // formatting would put an env var into a query string.
+        client
+            .execute(
+                "SELECT set_config('lock_timeout', $1, false)",
+                &[&configured],
+            )
+            .await
+            .map_err(|e| migration_error("set lock_timeout", e))?;
+        tracing::info!(
+            lock_timeout = %configured,
+            "ciris-persist: migration session lock_timeout set (CIRISPersist#559)"
+        );
+        Ok(())
+    }
+
+    /// v24.1.0 (CIRISPersist#559) — acquire [`MIGRATION_LOCK_ID`] with a
+    /// deadline and a progress signal, instead of blocking forever.
+    ///
+    /// `pg_try_advisory_lock` in a loop rather than `pg_advisory_lock`, for two
+    /// reasons the issue names: a follower gets to bound its OWN wait, and it
+    /// gets to say what it is waiting FOR. #937's report reads "the log did not
+    /// advance by a single line for 15 minutes" — a boot that is legitimately
+    /// waiting on a sibling's cold-start migration is indistinguishable from a
+    /// hang unless it says so.
+    ///
+    /// The budget is separate from (and far more generous than) the statement
+    /// `lock_timeout`: waiting on a peer doing necessary work and waiting on a
+    /// foreign tenant's `DELETE` deserve different patience.
+    async fn acquire_migration_lock(&self, client: &tokio_postgres::Client) -> Result<(), Error> {
+        let budget_secs = env_u64(
+            "CIRIS_PERSIST_MIGRATION_LOCK_WAIT_SECS",
+            DEFAULT_MIGRATION_LOCK_WAIT_SECS,
+        );
+        let started = std::time::Instant::now();
+        let mut last_progress = started;
+        loop {
+            let acquired: bool = client
+                .query_one("SELECT pg_try_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
+                .await
+                .map_err(|e| migration_error("acquire advisory lock", e))?
+                .try_get(0)
+                .map_err(|e| Error::Migration {
+                    sqlstate: None,
+                    detail: format!("read pg_try_advisory_lock result: {e}"),
+                })?;
+            if acquired {
+                return Ok(());
+            }
+            let waited = started.elapsed();
+            // `0` means the operator asked for the pre-#559 unbounded wait.
+            if budget_secs > 0 && waited.as_secs() >= budget_secs {
+                return Err(Error::MigrationLockTimeout {
+                    lock_id: MIGRATION_LOCK_ID,
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    lock_id_low: MIGRATION_LOCK_ID as u32,
+                    waited_secs: waited.as_secs(),
+                });
+            }
+            if last_progress.elapsed() >= MIGRATION_LOCK_PROGRESS_EVERY {
+                last_progress = std::time::Instant::now();
+                tracing::info!(
+                    lock_id = MIGRATION_LOCK_ID,
+                    waited_secs = waited.as_secs(),
+                    budget_secs,
+                    "ciris-persist: waiting for the migration advisory lock — another \
+                     occurrence is migrating this database"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
     }
 
     /// Open a one-shot non-pooled connection. Used by
@@ -1151,6 +1418,26 @@ impl Backend for PostgresBackend {
     }
 
     async fn run_migrations(&self) -> Result<(), Error> {
+        // v24.1.0 (CIRISPersist#559) — THE DDL RUNS ONCE PER PROCESS, PER
+        // DATABASE. `Engine(...)` re-enters this on every construction, and
+        // even a steady-state boot took the global advisory lock and re-ran
+        // refinery. See `migration_guard` for the #937 story and for why this
+        // is NOT the mutual exclusion (the advisory lock below still is).
+        //
+        // The guard covers the DDL and ONLY the DDL — the shard-key backfill
+        // at the tail is a data-repair sweep and runs on every call, including
+        // through the early return just below.
+        if !migration_guard::needs_migration(&self.dsn) {
+            tracing::debug!(
+                "ciris-persist: migration phase already completed in this process for this \
+                 database — skipping the DDL (CIRISPersist#559)"
+            );
+            // The shard-key backfill still runs — see the comment at the tail
+            // of this function for why it is NOT under the guard.
+            return self.backfill_trace_dedup_shard_keys().await;
+        }
+        migration_guard::note_phase_entered();
+
         // v0.1.5 — multi-worker boot race fix. Before this, two
         // workers calling `run_migrations` concurrently against the
         // same DB would race on Postgres's catalog (`pg_type` insert
@@ -1168,15 +1455,27 @@ impl Backend for PostgresBackend {
         // AV-26.
         let mut lock_client = self.dedicated_connect().await?;
 
-        // Block until the lock is held. First worker through wins
-        // immediately; later workers wake up when the first worker's
-        // connection closes (after migrations complete or panic).
-        // Lens-side readiness probe should be at least the
-        // observed migration runtime + a small buffer.
-        lock_client
-            .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
-            .await
-            .map_err(|e| migration_error("acquire advisory lock", e))?;
+        // v24.1.0 (CIRISPersist#559) — bound every DDL statement's LOCK wait
+        // before taking the advisory lock, so the bound also covers the
+        // acquisition below. Without this, `dedicated_connect` opened a session
+        // with no GUCs and every statement refinery ran waited forever for its
+        // table lock — which is literally what #937's `pg_stat_activity` shows.
+        //
+        // The DSN is still honoured VERBATIM (`dedicated_connect` passes
+        // `&self.dsn` straight through), and a consumer that already set
+        // `lock_timeout` there — CIRISAgent 2.9.7 appends
+        // `options=-c%20lock_timeout%3D120s` — KEEPS its value: we only supply
+        // a default when the session has none. A first-class field that
+        // silently overrode the seam the consumer is currently reaching through
+        // would break the workaround this is meant to replace.
+        self.apply_migration_lock_timeout(&lock_client).await?;
+
+        // v24.1.0 (CIRISPersist#559) — a BOUNDED acquisition. This was
+        // `pg_advisory_lock`, which blocks forever; a follower could not bound
+        // its own wait and, with no output, looked hung rather than patient.
+        // The try-loop carries its own (much more generous) budget and says
+        // WHY it is waiting while it does.
+        self.acquire_migration_lock(&lock_client).await?;
 
         tracing::info!(
             lock_id = MIGRATION_LOCK_ID,
@@ -1245,14 +1544,31 @@ impl Backend for PostgresBackend {
 
         migration_result?;
 
+        // v24.1.0 (CIRISPersist#559) — marked ONLY here, on the success path,
+        // and BEFORE the backfill because the backfill is not part of what the
+        // guard covers. Every early `?` above leaves the DSN unmarked so the
+        // next construction retries: a database that failed to migrate but
+        // reports itself migrated is strictly worse than the stampede.
+        migration_guard::mark_migrated(&self.dsn);
+        tracing::info!("ciris-persist: migration phase complete");
+
         // #226 (V094) — backfill shard_key for legacy rows, before the
         // engine serves any write. See `backfill_trace_dedup_shard_keys`.
         // Run on a pooled connection (the lock connection is already
         // dropped); the UPDATE is idempotent + safe under a concurrent
         // second worker (a row it sets no longer matches `IS NULL`).
+        //
+        // v24.1.0 (CIRISPersist#559) — DELIBERATELY OUTSIDE the once-guard,
+        // and reached by the early-return above too. This is a DATA REPAIR
+        // sweep, not DDL: it takes no lock, creates nothing, and fixes rows a
+        // legacy writer left with a NULL shard_key. #559 is about DDL
+        // stampeding a shared database; silently retiring a repair pass after
+        // the first construction is a different change, and not one the issue
+        // asks for. The first draft did put it under the guard, and
+        // `dedup_shard::postgres_legacy_backfill_and_reingest_dedup` — which
+        // nulls a shard key and re-runs migrations expecting it filled —
+        // caught it. Cheap when there is nothing to do (one indexed SELECT).
         self.backfill_trace_dedup_shard_keys().await?;
-
-        tracing::info!("ciris-persist: migration phase complete");
         Ok(())
     }
 
@@ -2711,6 +3027,13 @@ impl PostgresBackend {
                 row.key_id
             )));
         }
+        // v24.1.0 (CIRISPersist#547) — the Key-plane wire index must follow the
+        // row. Without this a scrub-upgraded node advertises its new content
+        // hash (`list_signed_key_records_since` re-serializes the CURRENT row)
+        // while the index still points at the pre-adopt one, so the ref it just
+        // advertised point-reads to `None`. See `wire_index::key_entry`.
+        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
+        pg_upsert_wire_index(&**client, "Key", &wire_index_hash, &wire_index_key).await?;
         Ok(AdoptScrubOutcome::Upgraded)
     }
 
@@ -2839,6 +3162,10 @@ impl PostgresBackend {
                 row.key_id
             )));
         }
+        // v24.1.0 (CIRISPersist#547) — index the successor; a canonical rotation
+        // that skipped this advertised the rotated record and could not serve it.
+        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
+        pg_upsert_wire_index(&**client, "Key", &wire_index_hash, &wire_index_key).await?;
         Ok(ReplicatedKeyOutcome::Superseded)
     }
 
@@ -3093,6 +3420,10 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 row.key_id
             )));
         }
+        // v24.1.0 (CIRISPersist#547) — index the re-anchored row; see
+        // `wire_index::key_entry`.
+        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
+        pg_upsert_wire_index(&**client, "Key", &wire_index_hash, &wire_index_key).await?;
         Ok(())
     }
 
@@ -3259,11 +3590,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // v21.1.0 (CIRISPersist#507b) — reached only on a fresh insert or an
         // idempotent identical-content replay; `SignedKeyRecord` wraps the
         // exact `row` the read surface re-serializes.
-        let wire_index_key = crate::federation::wire_index::record_key(&[("key_id", &row.key_id)]);
-        let wire_index_hash =
-            crate::federation::wire_index::content_hash_of(&crate::federation::SignedKeyRecord {
-                record: row,
-            })?;
+        // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
+        // path and the four mutators cannot compute the entry differently.
+        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
         pg_upsert_wire_index(&**client, "Key", &wire_index_hash, &wire_index_key).await?;
         Ok(())
     }
@@ -3354,6 +3683,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     /// to the stored `'unregistered'` default (revoke). No chain — a
     /// subsequent call overwrites. Excluded from `persist_row_hash`, so
     /// this does not touch the signed row.
+    ///
+    /// v24.1.0 (CIRISPersist#547) — it DOES move the **wire** content hash,
+    /// though, and those are two different hashes. `persist_row_hash` is the
+    /// row-integrity digest and deliberately omits this column; the
+    /// `signed_wire_index` hash is `sha256` over the bytes the read surface
+    /// returns, and `KeyRecord::consent_role` IS in those bytes. So this write
+    /// re-indexes like every other Key-plane mutator — otherwise assigning a
+    /// consent role silently unserves the record's advertised ref.
     async fn set_consent_role(
         &self,
         key_id: &str,
@@ -3362,6 +3699,20 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         crate::federation::types::consent_role::check_admissible(consent_role)?;
         let stored =
             crate::federation::types::consent_role::stored_from_wire(consent_role).to_owned();
+        // The post-write row, from this node's own state — never a guess about
+        // what the rest of the columns hold.
+        let indexed =
+            match <Self as crate::federation::FederationDirectory>::lookup_public_key(self, key_id)
+                .await?
+            {
+                Some(mut r) => {
+                    r.consent_role =
+                        crate::federation::types::consent_role::wire_from_stored(&stored)
+                            .map(str::to_owned);
+                    Some(crate::federation::wire_index::key_entry(&r)?)
+                }
+                None => None,
+            };
         let client = self
             .get_client()
             .await
@@ -3379,6 +3730,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             return Err(crate::federation::Error::InvalidArgument(format!(
                 "set_consent_role: no federation_keys row for {key_id}"
             )));
+        }
+        if let Some((wire_index_hash, wire_index_key)) = &indexed {
+            pg_upsert_wire_index(&**client, "Key", wire_index_hash, wire_index_key).await?;
         }
         Ok(())
     }
@@ -8307,6 +8661,25 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             return Err(crate::federation::Error::Conflict(format!(
                 "federation_keys row {key_id} was concurrently completed"
             )));
+        }
+        // v24.1.0 (CIRISPersist#547) — the hybrid-completion write moves FOUR
+        // serialized columns, so it moves the wire content hash exactly like the
+        // anchor mutators do. Indexed from the row AS STORED, by re-reading it:
+        // `pqc_completed_at` is generated HERE at nanosecond precision and
+        // TIMESTAMPTZ keeps only microseconds, so hashing the value we SENT
+        // indexes a hash this backend's read surface never produces — the same
+        // advertise-vs-serve desync #547 is about, in the other direction. The
+        // first draft did exactly that and the pg witness caught it while the
+        // sqlite twin stayed green (sqlite stores RFC-3339 text and round-trips
+        // the nanoseconds). Re-reading makes the index agree with the read
+        // surface by construction, whatever a backend rounds.
+        if let Some(stored) =
+            <Self as crate::federation::FederationDirectory>::lookup_public_key(self, key_id)
+                .await?
+        {
+            let (wire_index_hash, wire_index_key) =
+                crate::federation::wire_index::key_entry(&stored)?;
+            pg_upsert_wire_index(&**client, "Key", &wire_index_hash, &wire_index_key).await?;
         }
         Ok(())
     }
@@ -19212,6 +19585,241 @@ mod tests {
         env::var("CIRIS_PERSIST_TEST_PG_URL").ok()
     }
 
+    // ── v24.1.0 (CIRISPersist#559) — startup DDL composes with a shared PG ──
+
+    /// The once-guard's state machine, with no database in sight — because the
+    /// property is about the PROCESS, not the server. Two Engine constructions
+    /// against one DSN must enter the migration phase once; two DSNs are two
+    /// databases; and a FAILED phase must leave the DSN unmarked so the next
+    /// construction retries it.
+    #[test]
+    fn migration_once_guard_is_per_process_per_dsn_559() {
+        let a = format!("postgres://a/{}", uuid::Uuid::new_v4().simple());
+        let b = format!("postgres://b/{}", uuid::Uuid::new_v4().simple());
+
+        assert!(
+            migration_guard::needs_migration(&a),
+            "a DSN this process has never migrated needs the phase"
+        );
+        // Not marked yet — a construction that has entered the phase but not
+        // finished must NOT let a sibling skip it (mark is on success only).
+        assert!(
+            migration_guard::needs_migration(&a),
+            "asking twice does not mark; only completion does"
+        );
+
+        migration_guard::mark_migrated(&a);
+        assert!(
+            !migration_guard::needs_migration(&a),
+            "the SECOND Engine construction against the same DSN skips the phase — no \
+             advisory lock, no refinery, no backfill (CIRISPersist#559)"
+        );
+        assert!(
+            migration_guard::needs_migration(&b),
+            "a DIFFERENT database is not covered by another's completion"
+        );
+
+        migration_guard::forget(&a);
+        assert!(
+            migration_guard::needs_migration(&a),
+            "an unmarked DSN is migrated again — the failure path, where marking early \
+             would leave a database unmigrated while reporting it done"
+        );
+    }
+
+    /// The same property against a REAL shared Postgres: the second
+    /// `run_migrations()` performs no DDL.
+    ///
+    /// Observed through `migration_phases_entered()`, the counter the guard
+    /// bumps when it actually takes the advisory lock and runs refinery — so
+    /// "did DDL happen" is answered by the code path, not by timing.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn second_engine_construction_runs_no_ddl_postgres_559() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        // Whatever earlier tests in this binary did, start from "not yet
+        // migrated in this process" so BOTH sides of the guard are driven here.
+        migration_guard::forget(&dsn);
+
+        let before = migration_phases_entered();
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("first migrate");
+        let after_first = migration_phases_entered();
+        assert_eq!(
+            after_first,
+            before + 1,
+            "the first construction against an unmigrated DSN enters the phase"
+        );
+
+        // A SECOND backend — a second `Engine(...)`, the shape CIRISAgent runs
+        // N of against one `ciris_db`.
+        let second = PostgresBackend::connect(&dsn).await.expect("connect twice");
+        second
+            .run_migrations()
+            .await
+            .expect("second migrate is a no-op");
+        assert_eq!(
+            migration_phases_entered(),
+            after_first,
+            "the second construction against the SAME DSN must perform NO DDL: no advisory \
+             lock, no refinery run, no shard-key backfill. Before CIRISPersist#559 every \
+             occurrence's every boot re-entered this, which is how a no-op \
+             `CREATE INDEX IF NOT EXISTS` blocked a boot for 15 minutes behind a foreign \
+             tenant's DELETE (CIRISAI/CIRISAgent#937)."
+        );
+
+        // And the database really is migrated as seen through the second
+        // handle — the skip is a skip, not a silent failure to set the schema
+        // up. Read the history table the phase writes.
+        let applied: i64 = second
+            .get_client()
+            .await
+            .expect("pooled client")
+            .query_one("SELECT count(*) FROM ciris_persist_schema_history", &[])
+            .await
+            .expect("schema history is readable through the skipping handle")
+            .get(0);
+        assert!(
+            applied > 0,
+            "the second handle serves the same migrated database ({applied} migrations applied)"
+        );
+    }
+
+    /// v24.1.0 (CIRISPersist#559) — the migration session gets a bounded
+    /// `lock_timeout`, and a DSN that already carries one KEEPS it.
+    ///
+    /// The second half is the load-bearing one: CIRISAgent 2.9.7 appends
+    /// `options=-c%20lock_timeout%3D120s` to the DSN and depends on
+    /// `dedicated_connect` passing it through verbatim. A first-class default
+    /// that clobbered that seam would break the deployment this issue came from.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn migration_session_lock_timeout_is_bounded_and_dsn_wins_559() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+
+        // (a) a plain session starts UNBOUNDED (the pre-#559 state) and our
+        //     default bounds it.
+        let plain = backend
+            .dedicated_connect()
+            .await
+            .expect("dedicated connect");
+        let before: String = plain
+            .query_one("SHOW lock_timeout", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            before, "0",
+            "a bare migration session has NO lock_timeout — every DDL statement waits \
+             forever for its table lock, which is exactly what #937 measured"
+        );
+        backend
+            .apply_migration_lock_timeout(&plain)
+            .await
+            .expect("apply default");
+        let after: String = plain
+            .query_one("SHOW lock_timeout", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_ne!(after, "0", "the migration session is now bounded: {after}");
+
+        // (b) a session that ALREADY has one keeps its own value.
+        let preset = backend
+            .dedicated_connect()
+            .await
+            .expect("dedicated connect");
+        preset
+            .execute("SELECT set_config('lock_timeout', '7s', false)", &[])
+            .await
+            .unwrap();
+        backend
+            .apply_migration_lock_timeout(&preset)
+            .await
+            .expect("honour the inherited value");
+        let kept: String = preset
+            .query_one("SHOW lock_timeout", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            kept, "7s",
+            "a lock_timeout the DSN supplied WINS — the consumer's workaround must keep \
+             working while the first-class field lands"
+        );
+    }
+
+    /// v24.1.0 (CIRISPersist#559) — the advisory-lock wait is BOUNDED, and the
+    /// refusal names the lock.
+    ///
+    /// Drives the real contention: one session holds `MIGRATION_LOCK_ID`, a
+    /// second runs the acquisition with a 1-second budget. Before this cut that
+    /// second wait was `pg_advisory_lock` and would simply never return.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn advisory_lock_wait_is_bounded_and_names_the_lock_559() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+
+        // The incumbent: a session-scoped hold, exactly like a leader mid-migration.
+        let holder = backend.dedicated_connect().await.expect("holder connect");
+        let held: bool = holder
+            .query_one("SELECT pg_try_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(held, "the test must actually hold the migration lock");
+
+        let follower = backend.dedicated_connect().await.expect("follower connect");
+        // SAFETY of this env write: the pg tests are `serial(postgres)`, so no
+        // sibling is reading the budget concurrently.
+        std::env::set_var("CIRIS_PERSIST_MIGRATION_LOCK_WAIT_SECS", "1");
+        let outcome = backend.acquire_migration_lock(&follower).await;
+        std::env::remove_var("CIRIS_PERSIST_MIGRATION_LOCK_WAIT_SECS");
+
+        let err = outcome.expect_err("a held lock must time the follower out, not hang it");
+        assert_eq!(
+            err.kind(),
+            "store_migration_lock_timeout",
+            "the refusal is TYPED and distinct from a DDL failure — nothing was written, \
+             and re-running is the remedy: {err}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&format!("{MIGRATION_LOCK_ID:#x}")),
+            "the refusal NAMES the lock so an operator can find the holder: {rendered}"
+        );
+        assert!(
+            rendered.contains("pg_locks"),
+            "…and hands them the query to find it with: {rendered}"
+        );
+
+        // Release, and the very same call now succeeds — the follower was
+        // patient, not broken.
+        holder
+            .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_ID])
+            .await
+            .unwrap();
+        backend
+            .acquire_migration_lock(&follower)
+            .await
+            .expect("acquires once the incumbent releases");
+        follower
+            .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_ID])
+            .await
+            .unwrap();
+    }
+
     // ── v22.0.0 (CIRISPersist#543 finding 4, AV-76) — gate ORDER ─────
     // The SAME assertion bodies the sqlite twins run
     // (`federation::replication::admission::gate_order_test_support`), so
@@ -19366,6 +19974,54 @@ mod tests {
         )
         .await
         .expect("557 family trust root exercise");
+    }
+
+    /// **CIRISPersist#561 — transport-hop eligibility.** The A/B/C/D rule, its
+    /// authoritative TTL, the anti-inflation bound and the withdrawal contract,
+    /// on POSTGRES — the backend the CIRISEdge#430 consumer actually deploys on.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn transit_eligibility_works_on_postgres_561() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::operational::test_support::exercise_transit_eligibility(
+            &backend,
+            &format!("pg561-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("561 transit eligibility exercise");
+        crate::federation::operational::test_support::exercise_transit_eligibility_family_root(
+            &backend,
+            &format!("pg561f-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("561 family-root transit eligibility exercise");
+    }
+
+    /// **CIRISPersist#547 — a scrub-upgraded node must be able to serve the Key
+    /// ref it advertises.** Every `federation_keys` mutator maintains
+    /// `signed_wire_index`, on POSTGRES — where the defect was symmetric with
+    /// sqlite (three UPDATEs, one upsert) and where the CIRISServer deployment
+    /// that measured it actually runs.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn key_wire_index_follows_every_mutator_postgres_547() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::operational::test_support::exercise_key_wire_index_follows_every_mutator(
+            &backend,
+            &format!("pg547-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("547 wire-index-follows-mutators exercise");
     }
 
     /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on postgres.

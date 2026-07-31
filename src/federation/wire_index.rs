@@ -89,6 +89,41 @@ pub fn content_hash_of_bytes(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
+/// v24.1.0 (CIRISPersist#547) — the `("Key", content_hash) → record_key` entry
+/// for one `federation_keys` row, as `(content_hash, record_key)`.
+///
+/// # Why this is a function and not two lines at each write site
+///
+/// `signed_wire_index` is a SECOND list that must agree with `federation_keys`,
+/// and #547 is what happens when it does not. Three `UPDATE federation_keys`
+/// paths — `adopt_scrub_upgrade`, `supersede_canonical_record`,
+/// `adopt_genesis_reanchor` — mutated the row and left the index holding the
+/// PRE-mutation hash. `put_public_key` was the only writer that maintained it.
+/// So a node scrub-upgraded while running advertised the hash of its NEW row
+/// (`list_signed_key_records_since` re-serializes the current row) while the
+/// index still pointed at the old one: the peer asked for exactly the ref we
+/// had just advertised and `lookup_signed_record_by_content_hash` returned
+/// `None`. Measured in CIRISServer adopting v22.0.1 — advertise and reload were
+/// byte-identical, so it was never a serialization drift; it was index KEY
+/// COVERAGE, which is why `rebuild_signed_wire_index()` cured it.
+///
+/// That is the same shape as #541's preserve-set ≢ verified-set: two lists,
+/// maintained separately, free to disagree. The remedy is the same — make the
+/// agreement come from ONE derivation. Every `federation_keys` write that
+/// changes a **serialized** column ends here, so the hash the index carries is
+/// computed from the exact value the read surface re-serializes, by one
+/// function, from the one row the writer is about to store.
+///
+/// Callers hold the pair across a `move` closure (the SQL backends compute it
+/// before the row is consumed by the statement, exactly as `put_public_key`
+/// already did) and upsert it with their own dialect-specific statement.
+pub(crate) fn key_entry(row: &crate::federation::KeyRecord) -> Result<(String, String), Error> {
+    let content_hash = content_hash_of(&crate::federation::SignedKeyRecord {
+        record: row.clone(),
+    })?;
+    Ok((content_hash, record_key(&[("key_id", &row.key_id)])))
+}
+
 /// v21.1.0 (CIRISPersist#507b) — the shared per-kind reload dispatcher every
 /// backend's `lookup_signed_record_by_content_hash` calls after its own
 /// `SELECT record_key FROM signed_wire_index WHERE (kind, content_hash) = ...`

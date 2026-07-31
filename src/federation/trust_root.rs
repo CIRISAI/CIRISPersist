@@ -387,6 +387,71 @@ pub struct TrustRootVerdict {
     /// is why [`Self::root_self_declares`] is false beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub charter_quorum: Option<CharterQuorum>,
+    /// v24.1.0 (CIRISPersist#561) — **the instant this verdict can first stop
+    /// holding on time alone**, or `None` when nothing it counted is
+    /// time-bounded.
+    ///
+    /// The earliest moment at which some leg of [`Self::valid`] expires: the
+    /// user's trust edge and the root's live recovery-carrying charter(s) each
+    /// survive while ANY of their rows is live, so each leg contributes its
+    /// LATEST expiry (`None` = never, and never dominates), and the verdict
+    /// contributes the EARLIEST of those legs.
+    ///
+    /// It exists because [`resolve_transit_eligibility`] must return an
+    /// authoritative cache TTL, and the only code that knows WHICH rows counted
+    /// is the walk that counted them. Re-deriving the charter set at the caller
+    /// would fork [`job_dimension_admits`], the tombstone fold, the tier filter
+    /// and the family-quorum count — four predicates whose whole design rule is
+    /// that they exist once (#483). Reported here so the consumer's TTL cannot
+    /// drift from the authority that produced the verdict.
+    ///
+    /// **Not a gate.** A verdict is `valid` or it is not; this says when to ask
+    /// again. `#[serde(default)]` = `None`, so payloads from pre-v24.1
+    /// producers deserialize unchanged, and an unbounded verdict serializes
+    /// byte-identically to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// v24.1.0 (CIRISPersist#561) — the EARLIER of two expiry bounds, treating
+/// `None` as "never expires".
+///
+/// The min-fold behind every TTL in this module: a conjunction dies when its
+/// first conjunct dies, and a conjunct with no expiry cannot be the one that
+/// kills it. Folding from `None` therefore yields `None` only when nothing
+/// walked was time-bounded, which is exactly the contract
+/// [`TransitEligibility::valid_until`] documents.
+fn earlier_bound(
+    a: Option<chrono::DateTime<chrono::Utc>>,
+    b: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) => Some(x),
+        (None, other) => other,
+    }
+}
+
+/// v24.1.0 (CIRISPersist#561) — the LATEST expiry across a set of
+/// INTERCHANGEABLE live rows, treating `None` as "never expires".
+///
+/// A leg backed by several rows (two live trust edges, two live charters)
+/// survives while ANY one of them does, so the leg's bound is the latest — and
+/// a single never-expiring row makes the whole leg unbounded. An EMPTY set
+/// returns `None`, which is safe because an empty set means the leg did not
+/// hold at all and no TTL is being reported for it.
+fn latest_bound<'a, I>(rows: I) -> Option<chrono::DateTime<chrono::Utc>>
+where
+    I: IntoIterator<Item = &'a Attestation>,
+{
+    let mut best: Option<chrono::DateTime<chrono::Utc>> = None;
+    for row in rows {
+        // One unbounded row makes the leg unbounded, whatever else is here —
+        // so a `None` short-circuits the whole fold to `None`.
+        let t = row.expires_at?;
+        best = Some(best.map_or(t, |b: chrono::DateTime<chrono::Utc>| b.max(t)));
+    }
+    best
 }
 
 /// v19.0.0 (#488 delta 3, the OCSP/CRLite lesson) — a row is LIVE only if
@@ -648,6 +713,7 @@ where
             valid: false,
             root_kind: RootKind::Key,
             charter_quorum: None,
+            bounded_until: None,
         });
     }
 
@@ -675,14 +741,22 @@ where
     // claiming a different job is refused here (see `job_dimension_admits`).
     let user_refs: Vec<&Attestation> = by_user.iter().collect();
     let user_dead = tombstoned_ids(&user_refs);
-    let edge_exists = by_user.iter().any(|a| {
-        a.attestation_type == attestation_type::DELEGATES_TO
-            && a.attested_key_id == root_ref
-            && !user_dead.contains(&a.attestation_id)
-            && !is_expired(a, now)
-            && counts_in_capability_walk(a)
-            && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
-    });
+    // v24.1.0 (CIRISPersist#561) — collected rather than `.any()`-ed, so the
+    // SAME predicate that decides `edge_exists` also supplies the edge leg's
+    // expiry bound. One predicate, one pass; a second filter written to compute
+    // the TTL is a second answer free to disagree with the first.
+    let live_edges: Vec<&Attestation> = by_user
+        .iter()
+        .filter(|a| {
+            a.attestation_type == attestation_type::DELEGATES_TO
+                && a.attested_key_id == root_ref
+                && !user_dead.contains(&a.attestation_id)
+                && !is_expired(a, now)
+                && counts_in_capability_walk(a)
+                && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
+        })
+        .collect();
+    let edge_exists = !live_edges.is_empty();
 
     // 2. Charter.
     //
@@ -764,9 +838,16 @@ where
             }
         };
     let root_self_declares = !live_charters.is_empty();
-    let charter_has_recovery = live_charters
+    // v24.1.0 (CIRISPersist#561) — the recovery-carrying subset, collected for
+    // the same reason `live_edges` is: `valid` needs BOTH charter legs, so the
+    // set that actually holds the conjunction up is this one, and it is the one
+    // whose expiry bounds the verdict.
+    let recovery_charters: Vec<&Attestation> = live_charters
         .iter()
-        .any(|a| charter_commitment_well_formed(&a.attestation_envelope));
+        .copied()
+        .filter(|a| charter_commitment_well_formed(&a.attestation_envelope))
+        .collect();
+    let charter_has_recovery = !recovery_charters.is_empty();
 
     // 3. Drill SIGNAL (v23.0.0, #551 item 4 — no longer a gate): the NEWEST
     // live drill about the root, reported with its age banded. No freshness
@@ -817,6 +898,19 @@ where
     let valid =
         edge_exists && root_self_declares && charter_has_recovery && halt_latched != Some(true);
 
+    // v24.1.0 (CIRISPersist#561) — when this verdict can first lapse on time.
+    // Each leg survives while ANY of its rows is live (latest expiry wins,
+    // `None` = never); the VERDICT lapses when its first leg does (earliest
+    // wins). Reported only for a verdict that currently holds: "when does this
+    // stop being true" is not a question about something already false, and a
+    // TTL attached to a refusal would invite a caller to cache it.
+    let bounded_until = valid.then(|| {
+        earlier_bound(
+            latest_bound(live_edges.iter().copied()),
+            latest_bound(recovery_charters.iter().copied()),
+        )
+    });
+
     Ok(TrustRootVerdict {
         edge_exists,
         root_self_declares,
@@ -827,6 +921,7 @@ where
         valid,
         root_kind,
         charter_quorum,
+        bounded_until: bounded_until.flatten(),
     })
 }
 
@@ -1114,6 +1209,359 @@ pub async fn capability_roots_to_trusted_root_over_roster(
         }
     }
     Ok(None)
+}
+
+/// v24.1.0 (CIRISPersist#561) — the verdict of
+/// [`resolve_transit_eligibility`]: may this peer carry our relay traffic, and
+/// for how long may the answer be cached?
+///
+/// Shaped for a hot path. CIRISEdge#430 gates A/V relay HOP SELECTION on this,
+/// and selection happens on peer churn and per-substream in MDC — so edge
+/// resolves trust ONCE per candidate, caches `(eligible, valid_until)`, and
+/// keeps `AlmJoinPlanner::plan` crypto-free. Everything expensive is on this
+/// side of the call.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TransitEligibility {
+    /// The gate. All four conjuncts held — see
+    /// [`resolve_transit_eligibility`].
+    pub eligible: bool,
+    /// Min expiry across every attestation the walk COUNTED: the peer's
+    /// `KeyRecord::valid_until`, and each side's satisfying trust edge and
+    /// root charter (via [`TrustRootVerdict::bounded_until`], so the bound is
+    /// computed by the walk that chose the rows, at persist's own
+    /// [`is_expired`] reference time — the caller's TTL cannot drift from the
+    /// authority).
+    ///
+    /// `None` = nothing walked is time-bounded ⇒ cache until a withdrawal
+    /// event. A denied verdict carries `None`: "when does this stop being
+    /// true" is not a question about something already false, and a TTL on a
+    /// refusal would invite a caller to cache the refusal.
+    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// The shared root that satisfied conjunct (D) — observability, and the
+    /// cache-invalidation key. A tombstone naming this root (or the peer)
+    /// drops the cached verdict on the caller's replication apply path;
+    /// [`Self::valid_until`] is the backstop if such an event is ever missed.
+    ///
+    /// May name a KEY root or a keyless constitutional FAMILY — a shared
+    /// family root satisfies (D) exactly as a key root does, and which kind it
+    /// is falls out of [`trust_root_valid`]'s own arm selection rather than
+    /// being decided again here.
+    pub via_root: Option<String>,
+}
+
+impl TransitEligibility {
+    /// The fail-closed verdict: not eligible, no TTL, no root.
+    ///
+    /// The ONE value every refusal path returns, so "what does a denied
+    /// transport gate look like" has a single answer rather than one per
+    /// early exit.
+    #[must_use]
+    fn denied() -> Self {
+        Self {
+            eligible: false,
+            valid_until: None,
+            via_root: None,
+        }
+    }
+}
+
+/// v24.1.0 (CIRISPersist#561) — one candidate shared root, drawn from the
+/// USER's own live `trust:accepts` edges.
+///
+/// A named type rather than a bare `String` because the candidate SET is the
+/// thing the anti-inflation property is about: its size is bounded by the
+/// asking node's own record count, and [`transit_candidate_roots`] is where
+/// that is enforced and can be asserted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransitCandidateRoot {
+    /// The root the user's edge names (a key id or a family id).
+    pub root_ref: String,
+}
+
+/// v24.1.0 (CIRISPersist#561) — the candidate shared roots for conjunct (D):
+/// the distinct targets of the USER's own live `delegates_to(user → R)`
+/// accepts-edges.
+///
+/// # This is the anti-inflation boundary
+///
+/// The candidate set is drawn from the ASKING NODE's records and never from
+/// the peer's. A hostile peer can author fifty `delegates_to` rows naming
+/// fifty roots; none of them lands here, so neither the set nor the work grows
+/// — the walk runs `trust_root_valid` at most once per root the user itself
+/// chose to trust. Enumerating from the peer instead (or from the union) would
+/// let any peer set the cost of evaluating it, on a hot path, for free.
+///
+/// The same liveness rules as [`trust_root_valid`]'s edge leg, by construction:
+/// non-tombstoned, non-expired at `now`, federation-tier, and not claiming a
+/// different `delegates_to` job. Self-edges are excluded — a self-root is the
+/// immutable base, never a SHARED external root.
+///
+/// `pub(crate)` so the parity harness can assert the bound directly rather
+/// than inferring it from timings.
+pub(crate) fn transit_candidate_roots(
+    by_user: &[Attestation],
+    user_key_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<TransitCandidateRoot> {
+    let refs: Vec<&Attestation> = by_user.iter().collect();
+    let dead = tombstoned_ids(&refs);
+    let mut seen = std::collections::HashSet::new();
+    by_user
+        .iter()
+        .filter(|a| {
+            a.attestation_type == attestation_type::DELEGATES_TO
+                && a.attested_key_id != user_key_id
+                && !dead.contains(&a.attestation_id)
+                && !is_expired(a, now)
+                && counts_in_capability_walk(a)
+                && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
+        })
+        .filter(|a| seen.insert(a.attested_key_id.clone()))
+        .map(|a| TransitCandidateRoot {
+            root_ref: a.attested_key_id.clone(),
+        })
+        .collect()
+}
+
+/// v24.1.0 (CIRISPersist#561) — **may `peer_key_id` carry our relay traffic?**
+///
+/// The substrate half of CIRISEdge#430's A/V hop-selection gate. Persist owns
+/// the whole resolution — the shared-root composition AND the expiry — so edge
+/// holds zero trust logic: call once per candidate, cache
+/// `(eligible, valid_until)`, drop the entry on a withdrawal event.
+///
+/// # `eligible` = all four
+///
+/// | | conjunct | why |
+/// |---|---|---|
+/// | A | present in the federation directory | we have a record of it at all |
+/// | B | its `identity_type` set contains `node` | the verifiable recast of "proxy/server mode", which is not remotely attestable |
+/// | C | it self-offers `infra:transport` | the peer says it relays |
+/// | D | it validly trusts a root WE validly trust | the actual bar |
+///
+/// # Deliberately weaker than the `infra:serve` conferral walk
+///
+/// A relay carries only ciphertext — no `EpochDek` is reachable from a hop —
+/// so what a bad hop gets is POSITION, not content. Shared-root anchoring is
+/// the proportionate bar for that, and it is what keeps relaying
+/// DECENTRALIZED: any trust-anchored node offering transport can serve as a
+/// hop, not only the ones our own root has blessed. Requiring
+/// [`capability_roots_to_trusted_root`] here would have made the mesh's relay
+/// topology a function of one root's grants.
+///
+/// (A)–(C) are self-claims and are meant to be. The AV-75 property holds
+/// because (D) is not: registering the string `infra:transport` buys nothing
+/// without a shared root, which is a property this function has a test for.
+///
+/// # Fail-closed, always
+///
+/// Any directory error, an unregistered `user_key_id`, an unresolvable read —
+/// every one returns [`TransitEligibility::denied`]. A transport gate never
+/// fails open, so the failure of a read is never the reason a peer becomes
+/// usable. The `Result` is retained for API stability and because a future leg
+/// may need to distinguish an infrastructure fault from a refusal; today every
+/// resolution path returns `Ok`.
+///
+/// # Withdrawal
+///
+/// No new API. A revocation or tombstone for the peer or for
+/// [`TransitEligibility::via_root`] invalidates the cached verdict — the
+/// caller drops the entry on its replication apply path, and
+/// [`TransitEligibility::valid_until`] is the backstop if an event is missed.
+/// The substrate half is emergent: withdraw the edge and the very next
+/// resolution reads `false`, because (D) re-derives from live graph state
+/// every time.
+pub async fn resolve_transit_eligibility(
+    directory: &dyn FederationDirectory,
+    user_key_id: &str,
+    peer_key_id: &str,
+) -> Result<TransitEligibility, Error> {
+    resolve_transit_eligibility_over_roster(
+        directory,
+        user_key_id,
+        peer_key_id,
+        &super::admission::accord_holder_roster_key_ids(),
+    )
+    .await
+}
+
+/// v24.1.0 (CIRISPersist#561) — the roster-parameterized
+/// [`resolve_transit_eligibility`], mirroring the
+/// [`capability_roots_to_trusted_root`] /
+/// [`capability_roots_to_trusted_root_over_roster`] split.
+///
+/// # What the roster does here, stated plainly
+///
+/// **Nothing, today, and that is a fact about the RULE rather than about this
+/// function.** The sibling walks take a roster because they end in a CEREMONY
+/// arm — `has_accord_conferred_role_over_roster` verifies a 2-of-3 accord
+/// co-scrub, and the production roster's private halves live in the #268
+/// hardware ceremony, so a test can only drive that arm with an injected
+/// roster. Transit eligibility has no such arm: conjuncts (A)–(C) read the
+/// peer's own `KeyRecord`, and (D) is `trust_root_valid` on both sides, whose
+/// family arm re-derives its threshold from `active_family_members` — the
+/// FAMILY's roster, resolved from this node's own state, not the accord-holder
+/// constant.
+///
+/// It is kept, and kept honest by this paragraph rather than by being quietly
+/// threaded somewhere it would not matter, for two reasons. The transport gate
+/// should carry the same signature as the two walks a reader will compare it
+/// to; and if a ceremony leg is ever added — a peer whose relationship to the
+/// shared root is carried by an accord co-scrub rather than a `trust:accepts`
+/// edge, which is the #548 shape one plane over — it must be addable without a
+/// breaking signature change, because the version where that leg exists and
+/// cannot be tested is the version that ships fail-closed-dead (CIRISEdge#379).
+///
+/// **Widening (D) to accept that ceremony encoding was considered and NOT
+/// done**: it would make more peers eligible than the rule as written, and a
+/// transport gate is not the place to widen on inference.
+pub async fn resolve_transit_eligibility_over_roster(
+    directory: &dyn FederationDirectory,
+    user_key_id: &str,
+    peer_key_id: &str,
+    accord_roster_key_ids: &[String],
+) -> Result<TransitEligibility, Error> {
+    // See the doc above: the roster reaches no verifier in this walk, because
+    // none of the four conjuncts reads the ceremony plane.
+    let _ = accord_roster_key_ids;
+    match transit_eligibility_walk(directory, user_key_id, peer_key_id).await {
+        Ok((verdict, _roots_walked)) => Ok(verdict),
+        Err(e) => {
+            // The fail-closed clause, and the only place it fires. A read that
+            // failed tells us nothing about the peer, and "nothing" is not a
+            // reason to route traffic through it.
+            tracing::warn!(
+                user_key_id,
+                peer_key_id,
+                error = %e,
+                "resolve_transit_eligibility: read failed — DENYING (a transport gate \
+                 never fails open)"
+            );
+            Ok(TransitEligibility::denied())
+        }
+    }
+}
+
+/// v24.1.0 (CIRISPersist#561) — [`resolve_transit_eligibility`], plus **how
+/// many candidate roots the walk actually evaluated**.
+///
+/// The anti-inflation property is about COST, not just about the verdict: a
+/// hostile peer authoring fifty `delegates_to` rows must not be able to make
+/// this walk do fifty times the crypto on a hot path. That is only assertable
+/// if the work is observable, and the honest way to observe the REAL walk's
+/// work is to have the real walk report it — not a process-global counter (racy
+/// under a threaded runner, and a second thing to keep in sync) and not a test
+/// re-derivation of the candidate set (which would pass even if the walk
+/// ignored the boundary entirely — the first draft of this witness did exactly
+/// that and stayed green under a deliberately inflated walk).
+///
+/// `pub(crate)` and returning the count is why the parity harness can assert
+/// `roots_walked` is unchanged across a 50-row flood. Gated exactly like
+/// [`super::operational::test_support`], its only consumer — the count is an
+/// observability hook for the witness, not surface a production caller needs.
+#[cfg(any(test, feature = "test-anchor"))]
+pub(crate) async fn resolve_transit_eligibility_counting_roots(
+    directory: &dyn FederationDirectory,
+    user_key_id: &str,
+    peer_key_id: &str,
+) -> Result<(TransitEligibility, usize), Error> {
+    match transit_eligibility_walk(directory, user_key_id, peer_key_id).await {
+        Ok(out) => Ok(out),
+        // Same fail-closed clause as the public entry point; a denied verdict
+        // walked nothing.
+        Err(_) => Ok((TransitEligibility::denied(), 0)),
+    }
+}
+
+/// The fallible core of [`resolve_transit_eligibility`]. Every `?` here becomes
+/// a DENY at the boundary above; nothing in this body may return a permissive
+/// value on an error path.
+///
+/// Returns the verdict and the number of candidate roots evaluated — see
+/// [`resolve_transit_eligibility_counting_roots`].
+async fn transit_eligibility_walk(
+    directory: &dyn FederationDirectory,
+    user_key_id: &str,
+    peer_key_id: &str,
+) -> Result<(TransitEligibility, usize), Error> {
+    use super::types::{delegation_scope, identity_type};
+
+    // A node is not its own hop. Short-circuited before any read: the
+    // shared-root rule needs two parties, and `trust_root_valid` already
+    // refuses a self-root as the immutable base rather than an external root.
+    if user_key_id == peer_key_id {
+        return Ok((TransitEligibility::denied(), 0));
+    }
+
+    // (A) directory presence.
+    let Some(peer) = directory.lookup_public_key(peer_key_id).await? else {
+        return Ok((TransitEligibility::denied(), 0));
+    };
+
+    // (B) it is a NODE.
+    //
+    // Read as SET MEMBERSHIP, not string equality. `identity_type` is a
+    // scalar-or-comma-joined set (#441 — `claims_role` reads it the same way),
+    // and the canonical serve node in the genesis bake carries
+    // `identity_type = "canonical,node"`. `== "node"` would deny exactly the
+    // production nodes most likely to be asked to relay, which is a denial
+    // with no security content: (B) is a self-claim either way, and the bar
+    // that does the work is (D).
+    if !identity_type::set_contains(&peer.identity_type, identity_type::NODE) {
+        return Ok((TransitEligibility::denied(), 0));
+    }
+
+    // (C) it self-offers transport.
+    if !peer.claims_role(delegation_scope::INFRA_TRANSPORT) {
+        return Ok((TransitEligibility::denied(), 0));
+    }
+
+    // (D) shared root. Candidates come from the USER's own edges — see
+    // `transit_candidate_roots` for why that boundary is the anti-inflation
+    // property and not merely an optimization.
+    let now = chrono::Utc::now();
+    let by_user = directory.list_attestations_by(user_key_id).await?;
+    let mut roots_walked = 0usize;
+    for candidate in transit_candidate_roots(&by_user, user_key_id, now) {
+        roots_walked += 1;
+        let ours = trust_root_valid(directory, user_key_id, &candidate.root_ref).await?;
+        if !ours.valid {
+            continue;
+        }
+        // Only now is the peer's side worth reading: a root WE do not validly
+        // trust cannot be a SHARED root however the peer feels about it, and
+        // checking us first keeps the per-candidate cost on our own records.
+        let theirs = trust_root_valid(directory, peer_key_id, &candidate.root_ref).await?;
+        if !theirs.valid {
+            continue;
+        }
+
+        // The TTL: the earliest bound across everything the walk counted. Each
+        // verdict's `bounded_until` already folds that side's trust edge and
+        // charter at persist's own `is_expired` reference time; the peer's key
+        // record contributes its own validity window.
+        let valid_until = earlier_bound(
+            earlier_bound(peer.valid_until, ours.bounded_until),
+            theirs.bounded_until,
+        );
+        // A bound already in the past means the walk counted something whose
+        // window has closed — in practice the peer's own `valid_until`, since
+        // every graph row the legs counted was liveness-filtered at `now`. An
+        // expired key is not an eligible hop, and reporting `eligible: true`
+        // beside an elapsed TTL would be a fail-OPEN dressed as a fresh answer.
+        if valid_until.is_some_and(|t| t <= now) {
+            return Ok((TransitEligibility::denied(), roots_walked));
+        }
+        return Ok((
+            TransitEligibility {
+                eligible: true,
+                valid_until,
+                via_root: Some(candidate.root_ref),
+            },
+            roots_walked,
+        ));
+    }
+    Ok((TransitEligibility::denied(), roots_walked))
 }
 
 /// v24.0.0 (CIRISPersist#557) — the FAMILY-charter admission gate: a charter
