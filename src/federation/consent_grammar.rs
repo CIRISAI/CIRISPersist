@@ -542,6 +542,7 @@ pub(crate) mod test_support {
             cohort_scope: "federation".to_owned(),
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 

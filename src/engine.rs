@@ -3396,6 +3396,7 @@ impl Engine {
             cohort_scope,
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         let attestation_id = row.attestation_id.clone();
         // v21.2.0 (CIRISPersist#509 FLOOR) — chokepoint (c): capture what
@@ -14661,6 +14662,7 @@ mod tests {
                 cohort_scope: "federation".to_string(),
                 tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
                 promoted_at: None,
+                additional_scrubs: Vec::new(),
             },
         })
         .await

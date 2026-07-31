@@ -676,6 +676,7 @@ pub(crate) mod watch_witness {
             cohort_scope: "federation".to_owned(),
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 

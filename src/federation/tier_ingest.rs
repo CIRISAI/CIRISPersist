@@ -177,6 +177,51 @@ where
             row.original_content_hash
         )));
     }
+
+    // v24.0.0 (CIRISPersist#556) — EVERY scrub, not just the first.
+    //
+    // **The preserve set must equal the verified set** (#541). `additional_scrubs`
+    // is the evidence a family trust root's charter is quorum-signed; if the
+    // verifier looked only at scrub #1, the co-signatures would be
+    // stored-but-unverified — a writer could append garbage or drop the real
+    // ones and the row would still verify, silently downgrading a 2-of-3
+    // charter to one seat. That is the exact class this substrate keeps
+    // re-learning, so the extra scrubs are verified HERE, at the same
+    // admission boundary, over the SAME canonical bytes.
+    //
+    // Fail-secure, and no new denial-of-service surface: an unverifiable
+    // co-signature refuses the row exactly as an unverifiable BASE signature
+    // already does, and anyone able to mangle the co-signatures in flight could
+    // equally mangle the base one. An unresolvable co-signer is likewise a
+    // refusal, for the same reason `attesting_key_id` must resolve — a verifier
+    // that cannot check a signature must not pretend the signature is absent.
+    //
+    // Consequence, stated rather than discovered later: a co-signed row
+    // replicates only to peers that know its co-signers. For accord holders —
+    // the co-signers this field exists for — that is every node, because the
+    // holder records are baked into the genesis seed.
+    for (i, scrub) in row.additional_scrubs.iter().enumerate() {
+        let scrub_hash = verify_envelope_hybrid_signature(
+            directory,
+            &scrub.scrub_key_id,
+            &row.attestation_envelope,
+            &scrub.scrub_signature_classical,
+            scrub.scrub_signature_pqc.as_deref(),
+        )
+        .await
+        .map_err(|e| match e {
+            Error::FederationTierUnverified { reason, .. } => reject(format!(
+                "additional_scrubs[{i}] by {}: {reason}",
+                scrub.scrub_key_id
+            )),
+            other => other,
+        })?;
+        // Every scrub is over the SAME preimage — the rule `ScrubSig` is
+        // documented with. Re-asserted rather than assumed: the helper
+        // canonicalizes the envelope we handed it, so a mismatch here would
+        // mean the canonicalizer disagreed with itself.
+        debug_assert_eq!(scrub_hash, computed_hash);
+    }
     Ok(())
 }
 
@@ -842,6 +887,7 @@ pub(crate) mod test_support {
             cohort_scope: "federation".to_owned(),
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 }
@@ -955,6 +1001,7 @@ mod tests {
             },
             tier: tier.to_owned(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 

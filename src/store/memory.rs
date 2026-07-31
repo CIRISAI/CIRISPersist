@@ -778,6 +778,18 @@ impl MemoryBackend {
         )
         .await?;
 
+        // v24.0.0 (CIRISPersist#557) — the attested SUBJECT rule, shared with
+        // sqlite + postgres and with the federation write path. BEFORE the state
+        // lock: the predicate reads the directory, which locks itself.
+        crate::federation::admission::check_attested_subject_admission(
+            self,
+            input
+                .attested_key_id
+                .as_deref()
+                .unwrap_or(&input.attesting_key_id),
+        )
+        .await?;
+
         let mut state = self.state.lock().expect("memory backend lock");
         let identity_type = match state.federation_keys.get(&input.attesting_key_id) {
             Some(rec) => rec.identity_type.clone(),
@@ -794,16 +806,9 @@ impl MemoryBackend {
             dim,
             &identity_type,
         )?;
-        // attested_key_id (defaults to attesting) must exist too.
-        let attested = input
-            .attested_key_id
-            .clone()
-            .unwrap_or_else(|| input.attesting_key_id.clone());
-        if !state.federation_keys.contains_key(&attested) {
-            return Err(Error::InvalidArgument(format!(
-                "attested_key_id {attested} does not exist in federation_keys"
-            )));
-        }
+        // attested_key_id (defaults to attesting) was checked above by
+        // `check_attested_subject_admission` — one predicate, one impl (v24.0.0,
+        // CIRISPersist#557).
 
         // v18.0.0 (#473) — caller-supplied deterministic id (replay-idempotent
         // trace ingest) or the classic fresh v4.
@@ -2394,6 +2399,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             &row.attestation_envelope,
         )
         .await?;
+        // v24.0.0 (CIRISPersist#557) — a charter naming a constitutional family
+        // must be signed by that family's QUORUM. Sits beside the key-charter
+        // gate above and refuses the same class of row for the same reason: a
+        // root that one seat can declare is not a threshold.
+        crate::federation::trust_root::check_family_charter_admission(self, &row).await?;
 
         // v10.3.0 (CIRISPersist#288, CC 3.4.1/3.4.3/3.4.5) — reserved-prefix
         // admission on the attestation_TYPE namespace, keyed on the attesting
@@ -2438,6 +2448,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // membership shape). No-op for local-tier rows and rows referencing no
         // locally-known community. Backend-symmetric.
         crate::federation::admission::check_no_moderator_federate_apply(self, &row).await?;
+        // v24.0.0 (CIRISPersist#557) — the attested SUBJECT must resolve as a
+        // key this node knows OR as a constitutional family it has stored. V114
+        // lifted this rule out of the SQLite schema FK (which cannot express the
+        // keyless-family exception a family trust root needs) into ONE predicate
+        // every backend runs at this same point — so postgres, which never had
+        // the rule at all, now enforces it too.
+        crate::federation::admission::check_attested_subject_admission(self, &row.attested_key_id)
+            .await?;
 
         // ── AV-76 TIER 5 — hash + insert ────────────────────────────
         // D1: `check_withdraws_admission` above STAMPS
@@ -2493,17 +2511,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 ));
             }
 
-            // FK enforcement parity with sqlite + postgres, where
-            // `federation_attestations.attested_key_id REFERENCES
-            // federation_keys(key_id)` is enforced by the engine AT THE INSERT
-            // — so the emulation belongs in tier 5, at the same point in the
-            // stack, not ahead of the gates the SQL backends run first.
-            if !state.federation_keys.contains_key(&row.attested_key_id) {
-                return Err(crate::federation::Error::InvalidArgument(format!(
-                    "attested_key_id {} does not exist in federation_keys",
-                    row.attested_key_id
-                )));
-            }
+            // v24.0.0 (CIRISPersist#557) — the attested-subject rule moved to
+            // the shared `check_attested_subject_admission` predicate (run at
+            // tier 4b, above, on all three backends) so the keyless-family
+            // exception a family trust root needs is expressible. What used to
+            // be here was a hand-rolled emulation of the SQLite FK; the
+            // emulation and the FK are now the same predicate.
 
             row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
             // v17.4.0 (V106) — maintain the subject-index mirror.
@@ -3655,13 +3668,16 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // v13.3.0 (CIRISPersist#386) — the real invariant (replaces the dropped
         // family_key_id FK): every member key_id must be a registered key.
         crate::federation::admission::validate_family_members(self, &row).await?;
+        // v24.0.0 (CIRISPersist#557) — the `family_key_id ∈ federation_keys`
+        // check that used to sit here is GONE, four cuts after it should have
+        // been. v13.3.0 (#386) dropped that FK on sqlite and postgres precisely
+        // because **a constitutional family is KEYLESS** — the family_key_id is
+        // an identifier, not a key — and replaced it with the member-validation
+        // above; the memory backend kept enforcing the dropped constraint, with
+        // the comment on the line above already describing the replacement. It
+        // went unnoticed because nothing seeds genesis on memory, and it surfaced
+        // here as "the one backend where a family trust root cannot exist".
         let mut state = self.state.lock().expect("memory backend lock");
-        if !state.federation_keys.contains_key(&row.family_key_id) {
-            return Err(crate::federation::Error::InvalidArgument(format!(
-                "family_key_id {} does not exist in federation_keys",
-                row.family_key_id
-            )));
-        }
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
         state
             .federation_families
@@ -5751,6 +5767,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         row.pqc_completed_at = scrub_signature_pqc.map(|_| now);
         row.tier = attestation_tier::FEDERATION.to_string();
         row.promoted_at = Some(now);
+        // v24.0.0 (CIRISPersist#557/#556) — PROMOTION CLEARS THE CO-SIGNATURES.
+        // A local-tier row defers its signature, so any `additional_scrubs` it
+        // carried were STORED WITHOUT EVER BEING VERIFIED. Promotion re-signs
+        // the row with this node's key and moves it into the federation plane,
+        // where the ingest verifier DOES check every scrub — so carrying the
+        // unverified set across would either launder it into the signed plane or
+        // (once corrupt) make the promoted row unverifiable at every peer with
+        // no error at the promote site. That is the #541 shape: the preserve set
+        // must equal the verified set. Co-signatures are earned at the ceremony
+        // that mints a federation-tier row, never inherited by a promotion.
+        row.additional_scrubs.clear();
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
@@ -5800,6 +5827,17 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         row.pqc_completed_at = scrub_signature_pqc.map(|_| now);
         row.tier = attestation_tier::FEDERATION.to_string();
         row.promoted_at = Some(now);
+        // v24.0.0 (CIRISPersist#557/#556) — PROMOTION CLEARS THE CO-SIGNATURES.
+        // A local-tier row defers its signature, so any `additional_scrubs` it
+        // carried were STORED WITHOUT EVER BEING VERIFIED. Promotion re-signs
+        // the row with this node's key and moves it into the federation plane,
+        // where the ingest verifier DOES check every scrub — so carrying the
+        // unverified set across would either launder it into the signed plane or
+        // (once corrupt) make the promoted row unverifiable at every peer with
+        // no error at the promote site. That is the #541 shape: the preserve set
+        // must equal the verified set. Co-signatures are earned at the ceremony
+        // that mints a federation-tier row, never inherited by a promotion.
+        row.additional_scrubs.clear();
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
@@ -8087,6 +8125,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         // v9.0.0 — sign the as-built envelope (CC 5.3.2.4.3.1).
         resign_fix(&mut row);
@@ -10069,6 +10108,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         resign_fix(&mut row); // v9.0.0 — sign the envelope (CC 5.3.2.4.3.1)
         row
@@ -11447,6 +11487,23 @@ mod tests {
     async fn trust_root_helper_works_on_memory_536() {
         let backend = MemoryBackend::new();
         crate::federation::operational::test_support::exercise_trust_root(&backend, "mem536").await;
+    }
+
+    /// **CIRISPersist#557 — the root is a THRESHOLD, not a seat.** The family
+    /// trust-root parity body: a 1-of-3 charter REFUSED naming its shortfall, a
+    /// 2-of-3 charter + grant + node edge rooting the subject's `infra:serve` to
+    /// the ACCORD, the A1-compromise scenario (one seat cannot re-root, re-grant
+    /// or buy a quorum), the family halt latch gating the family root, and the
+    /// threshold re-derived from THIS node's roster rather than the carried
+    /// policy string.
+    #[tokio::test]
+    async fn family_trust_root_works_on_memory_557() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_family_trust_root(
+            &backend, "mem557",
+        )
+        .await
+        .expect("557 family trust root exercise");
     }
 
     /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on memory.

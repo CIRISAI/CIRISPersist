@@ -1220,6 +1220,76 @@ pub struct Attestation {
     /// in the canonical bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promoted_at: Option<DateTime<Utc>>,
+    /// v24.0.0 (CIRISPersist#556) — the **2nd..Nth scrub signatures** over the
+    /// SAME canonical `attestation_envelope` (scrub #1 is the base
+    /// `scrub_key_id` / `scrub_signature_*` fields above). The attestation-plane
+    /// twin of [`KeyRecord::additional_scrubs`]: same type, same "every scrub is
+    /// over the same preimage" rule, same wire encoding.
+    ///
+    /// # What it makes provable
+    ///
+    /// One genesis ceremony used to produce two planes with two different
+    /// outcomes: the serve-node KEY RECORD carried `scrub A1 +
+    /// additional_scrubs [B1]` and proved 2-of-n, while the `genesis-charter`
+    /// ATTESTATION that makes A1 a trust root carried one `scrub_key_id` and
+    /// proved 1-of-n. The 2-of-3 that authorized it was real, checked at
+    /// `verify_bundle`, and then unrecoverable — a peer receiving the charter by
+    /// replication could only ever answer *"A1 asserted it"*. With this field a
+    /// replicated row proves its own m-of-n, which is what the family trust root
+    /// ([`trust_root_valid`](crate::federation::trust_root::trust_root_valid))
+    /// re-derives at read time.
+    ///
+    /// # Byte-stability, and why the preserve set must equal the verified set
+    ///
+    /// Empty ⇒ wire-absent (`skip_serializing_if`), so an ordinary single-scrub
+    /// row is byte-identical to its pre-v24 shape and its `persist_row_hash` and
+    /// signature are untouched. A NON-empty set is covered by
+    /// [`compute_persist_row_hash`] **and** re-verified at federation-tier
+    /// ingest by
+    /// [`verify_row_hybrid_signature`](crate::federation::verify_row_hybrid_signature)
+    /// — deliberately, because a field that a writer may drop while the verifier
+    /// never looks at it is exactly the #541 preserve-set≢verified-set class,
+    /// and here dropping it would silently downgrade a quorum-chartered root to
+    /// a single seat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_scrubs: Vec<ScrubSig>,
+}
+
+impl Attestation {
+    /// v24.0.0 (CIRISPersist#556) — the **full ordered scrub set**: scrub #1
+    /// reconstructed from the base `scrub_key_id` / `scrub_signature_*` fields,
+    /// followed by every [`Self::additional_scrubs`] entry. Each is a signature
+    /// over the SAME canonical `attestation_envelope` bytes.
+    ///
+    /// The attestation-plane twin of [`KeyRecord::scrubs`] — one shape, so the
+    /// quorum core that counts distinct valid holders never has to know which
+    /// kind of row it was handed.
+    #[must_use]
+    pub fn scrubs(&self) -> Vec<ScrubSig> {
+        let mut out = Vec::with_capacity(1 + self.additional_scrubs.len());
+        out.push(ScrubSig {
+            scrub_key_id: self.scrub_key_id.clone(),
+            scrub_signature_classical: self.scrub_signature_classical.clone(),
+            scrub_signature_pqc: self.scrub_signature_pqc.clone(),
+        });
+        out.extend(self.additional_scrubs.iter().cloned());
+        out
+    }
+
+    /// v24.0.0 (CIRISPersist#556) — count of **distinct** `scrub_key_id`s
+    /// across the whole scrub set. A coarse pre-check only: the family-charter
+    /// quorum leg additionally requires each counted scrub to be a seated roster
+    /// holder with a VALID hybrid signature. Twin of
+    /// [`KeyRecord::distinct_scrub_count`].
+    #[must_use]
+    pub fn distinct_scrub_count(&self) -> usize {
+        let mut ids = std::collections::BTreeSet::new();
+        ids.insert(self.scrub_key_id.as_str());
+        for s in &self.additional_scrubs {
+            ids.insert(s.scrub_key_id.as_str());
+        }
+        ids.len()
+    }
 }
 
 /// v4.4.0 (CIRISPersist#171) — attestation tier wire constants.
@@ -1354,6 +1424,7 @@ impl LocalAttestationInput {
             cohort_scope: self.cohort_scope,
             tier: attestation_tier::LOCAL.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
@@ -1401,6 +1472,7 @@ impl LocalAttestationInput {
             cohort_scope: self.cohort_scope,
             tier: attestation_tier::LOCAL.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 }

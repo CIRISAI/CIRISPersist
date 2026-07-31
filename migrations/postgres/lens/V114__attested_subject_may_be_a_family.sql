@@ -1,0 +1,27 @@
+-- V114 — the attested subject may be a KEYLESS constitutional family
+-- v24.0.0 (CIRISPersist#557)
+--
+-- SQLITE PARITY: migrations/sqlite/lens/V114__attested_subject_may_be_a_family.sql
+--
+-- NO SCHEMA CHANGE HERE, BY CONSTRUCTION. `cirislens.federation_attestations`
+-- never declared `attested_key_id REFERENCES federation_keys(key_id)`; SQLite
+-- did (V004) and the memory backend emulated it in code. So postgres was the
+-- one backend that would already have stored a family-addressed attestation —
+-- and the one backend with NO rule at all.
+--
+-- v24.0.0 resolves that three-way disagreement in the direction that keeps the
+-- rule and gains the exception: `check_attested_subject_admission`
+-- (src/federation/admission.rs) refuses any `attested_key_id` resolving as
+-- NEITHER a registered `federation_keys` row NOR a constitutional family this
+-- node already knows, and it runs on memory, sqlite AND postgres. Postgres
+-- therefore TIGHTENS in this cut; SQLite moves the same rule from the schema
+-- (which cannot express the keyless-family exception #557 needs) to the shared
+-- predicate.
+--
+-- This file exists so the V-number means the same thing on both backends and a
+-- reader diffing the two migration trees finds the decision written down rather
+-- than an unexplained gap.
+
+-- Intentionally empty (a comment-only migration). Recorded so the postgres and
+-- sqlite migration sequences stay aligned at V114.
+SELECT 1;

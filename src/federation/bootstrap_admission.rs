@@ -81,6 +81,7 @@ pub mod test_support {
             cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
@@ -217,6 +218,7 @@ pub mod test_support {
             cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
@@ -396,6 +398,7 @@ pub mod test_support {
                 cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
                 tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
                 promoted_at: None,
+                additional_scrubs: Vec::new(),
             }
         };
 

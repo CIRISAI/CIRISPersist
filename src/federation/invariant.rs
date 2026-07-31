@@ -317,6 +317,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 

@@ -3669,6 +3669,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             &row.attestation_envelope,
         )
         .await?;
+        // v24.0.0 (CIRISPersist#557) — a charter naming a constitutional family
+        // must be signed by that family's QUORUM. Sits beside the key-charter
+        // gate above and refuses the same class of row for the same reason: a
+        // root that one seat can declare is not a threshold.
+        crate::federation::trust_root::check_family_charter_admission(self, &row).await?;
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
         // v22.0.0 (CIRISConstitution#46) — CONSENT BEFORE SCORING. A
@@ -3701,6 +3706,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // `moderate`-holder. No-op for local-tier rows, rows referencing no
         // known community. Backend-symmetric.
         crate::federation::admission::check_no_moderator_federate_apply(self, &row).await?;
+        // v24.0.0 (CIRISPersist#557) — the attested SUBJECT must resolve as a
+        // key this node knows OR as a constitutional family it has stored. V114
+        // lifted this rule out of the SQLite schema FK (which cannot express the
+        // keyless-family exception a family trust root needs) into ONE predicate
+        // every backend runs at this same point — so postgres, which never had
+        // the rule at all, now enforces it too.
+        crate::federation::admission::check_attested_subject_admission(self, &row.attested_key_id)
+            .await?;
 
         // ── AV-76 TIER 5 — hash + INSERT ────────────────────────────
         // D1: `check_withdraws_admission` above STAMPS
@@ -3727,6 +3740,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let subject_key_ids_json = serde_json::to_string(&row.subject_key_ids).map_err(|e| {
             crate::federation::Error::Backend(format!("subject_key_ids serialize: {e}"))
         })?;
+        // v24.0.0 (CIRISPersist#556) — the V113 `additional_scrubs` JSON-array
+        // TEXT column (same encoding as V096's on `federation_keys`, and the
+        // same on postgres). Empty vec → "[]", so an ordinary single-scrub row
+        // is stored exactly as it was before this cut.
+        let additional_scrubs_json =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
         let withdraws_admission_rule: Option<i64> = row.withdraws_admission_rule.map(|v| v as i64);
         // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation-tier
         // only, the E5 invariant — `put_attestation` is the federation write
@@ -3756,8 +3777,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
                     subject_key_ids, withdraws_admission_rule, cohort_scope, \
-                    tier, promoted_at\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                    tier, promoted_at, additional_scrubs\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 rusqlite::params![
                     row.attestation_id,
                     row.attesting_key_id,
@@ -3786,6 +3807,10 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     // what ruled out any harness explanation.
                     row.tier,
                     row.promoted_at.map(|t| t.to_rfc3339()),
+                    // v24.0.0 (CIRISPersist#556) — the co-signature set rides
+                    // the SAME write as the base scrub. A row whose scrubs
+                    // landed in two different statements could be half-written.
+                    additional_scrubs_json,
                 ],
             )?;
             // v17.4.0 (V106) — maintain the subject projection (federation
@@ -3866,7 +3891,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                      FROM federation_attestations \
                      WHERE attested_key_id = ?1 AND tier = 'federation' \
                      ORDER BY asserted_at DESC",
@@ -3890,7 +3915,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                      FROM federation_attestations \
                      WHERE attesting_key_id = ?1 AND tier = 'federation' \
                      ORDER BY asserted_at DESC",
@@ -3945,7 +3970,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
                         subject_key_ids, withdraws_admission_rule, cohort_scope, tier, \
-                        promoted_at \
+                        promoted_at, additional_scrubs \
                      FROM federation_attestations \
                      WHERE attesting_key_id = ?1 \
                        AND EXISTS (SELECT 1 FROM consent_peer_set \
@@ -3986,7 +4011,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM federation_attestations \
                  WHERE tier = 'local' AND (?1 IS NULL OR attestation_id > ?1) \
                  ORDER BY attestation_id ASC LIMIT ?2",
@@ -4022,7 +4047,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM federation_attestations \
                  WHERE tier = 'federation' AND cohort_scope IN ('self', 'family') \
                    AND (?1 IS NULL OR attestation_id > ?1) \
@@ -4107,7 +4132,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                        subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                        subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                      FROM federation_attestations \
                      WHERE attestation_type = 'scores' AND tier = 'federation' \
                         AND attestation_envelope LIKE ?1 \
@@ -7034,7 +7059,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM federation_attestations \
                  WHERE ((attestation_type = 'withdraws' AND withdraws_admission_rule IN (2, 3, 4)) \
                         OR json_extract(attestation_envelope, '$.{dim}') LIKE '{rev}%')",
@@ -7723,7 +7748,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM federation_attestations \
                  WHERE (?1 IS NULL OR COALESCE(promoted_at, asserted_at) > ?1) \
                    AND tier = 'federation' \
@@ -7898,7 +7923,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     "SELECT attestation_id, attesting_key_id, attested_key_id, attestation_type, \
                         weight, asserted_at, expires_at, attestation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                        scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                      FROM federation_attestations WHERE attestation_id = ?1",
                     [&id],
                     sqlite_row_to_attestation,
@@ -7960,7 +7985,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM federation_attestations WHERE attestation_id = ?1",
                 [&id],
                 sqlite_row_to_attestation,
@@ -8002,6 +8027,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         row.pqc_completed_at = scrub_signature_pqc.map(|_| now);
         row.tier = attestation_tier::FEDERATION.to_string();
         row.promoted_at = Some(now);
+        // v24.0.0 (CIRISPersist#557/#556) — PROMOTION CLEARS THE CO-SIGNATURES.
+        // A local-tier row defers its signature, so any `additional_scrubs` it
+        // carried were STORED WITHOUT EVER BEING VERIFIED. Promotion re-signs
+        // the row with this node's key and moves it into the federation plane,
+        // where the ingest verifier DOES check every scrub — so carrying the
+        // unverified set across would either launder it into the signed plane or
+        // (once corrupt) make the promoted row unverifiable at every peer with
+        // no error at the promote site. That is the #541 shape: the preserve set
+        // must equal the verified set. Co-signatures are earned at the ceremony
+        // that mints a federation-tier row, never inherited by a promotion.
+        row.additional_scrubs.clear();
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
@@ -8021,7 +8057,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                  SET original_content_hash = ?1, scrub_signature_classical = ?2, \
                      scrub_signature_pqc = ?3, scrub_key_id = ?4, scrub_timestamp = ?5, \
                      pqc_completed_at = ?6, persist_row_hash = ?7, tier = 'federation', \
-                     promoted_at = ?5 \
+                     promoted_at = ?5, additional_scrubs = '[]' \
                  WHERE attestation_id = ?8 AND tier = 'local'",
                 rusqlite::params![
                     och,
@@ -8117,6 +8153,17 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         row.pqc_completed_at = scrub_signature_pqc.map(|_| now);
         row.tier = attestation_tier::FEDERATION.to_string();
         row.promoted_at = Some(now);
+        // v24.0.0 (CIRISPersist#557/#556) — PROMOTION CLEARS THE CO-SIGNATURES.
+        // A local-tier row defers its signature, so any `additional_scrubs` it
+        // carried were STORED WITHOUT EVER BEING VERIFIED. Promotion re-signs
+        // the row with this node's key and moves it into the federation plane,
+        // where the ingest verifier DOES check every scrub — so carrying the
+        // unverified set across would either launder it into the signed plane or
+        // (once corrupt) make the promoted row unverifiable at every peer with
+        // no error at the promote site. That is the #541 shape: the preserve set
+        // must equal the verified set. Co-signatures are earned at the ceremony
+        // that mints a federation-tier row, never inherited by a promotion.
+        row.additional_scrubs.clear();
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
@@ -8141,7 +8188,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                  SET attestation_envelope = ?1, original_content_hash = ?2, \
                      scrub_signature_classical = ?3, scrub_signature_pqc = ?4, \
                      scrub_key_id = ?5, scrub_timestamp = ?6, pqc_completed_at = ?7, \
-                     persist_row_hash = ?8, tier = 'federation', promoted_at = ?6 \
+                     persist_row_hash = ?8, tier = 'federation', promoted_at = ?6, \
+                     additional_scrubs = '[]' \
                  WHERE attestation_id = ?9 AND tier = 'local'",
                 rusqlite::params![
                     envelope_text,
@@ -10035,6 +10083,7 @@ impl crate::federation::BlobStorage for SqliteBackend {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation_row)
             .map_err(|e| crate::federation::BlobError::Backend(format!("persist_row_hash: {e}")))?;
@@ -13433,6 +13482,19 @@ impl SqliteBackend {
             &envelope_value,
         )
         .await?;
+        // v24.0.0 (CIRISPersist#557) — the attested SUBJECT rule, shared with the
+        // federation write path and with the other two backends. V114 removed
+        // the SQLite `attested_key_id` FK that used to catch this at INSERT, so
+        // the local writer must run the predicate explicitly or the two write
+        // paths would enforce different rules.
+        crate::federation::admission::check_attested_subject_admission(
+            self,
+            input
+                .attested_key_id
+                .as_deref()
+                .unwrap_or(&input.attesting_key_id),
+        )
+        .await?;
 
         // The (occurrence, dimension) key + the gate axis. Required.
         let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
@@ -13523,6 +13585,9 @@ impl SqliteBackend {
             .map_err(|e| Error::Backend(format!("envelope serialize: {e}")))?;
         let subject_key_ids_json = serde_json::to_string(&row.subject_key_ids)
             .map_err(|e| Error::Backend(format!("subject_key_ids serialize: {e}")))?;
+        // v24.0.0 (CIRISPersist#556) — see the `put_attestation` twin.
+        let additional_scrubs_json = serde_json::to_string(&row.additional_scrubs)
+            .map_err(|e| Error::Backend(format!("additional_scrubs serialize: {e}")))?;
         // BLOB bytes: durable row hex "" → []; transit row = SHA-256 digest.
         let original_content_hash: Vec<u8> = hex::decode(&row.original_content_hash)
             .map_err(|e| Error::Backend(format!("original_content_hash hex decode: {e}")))?;
@@ -13553,9 +13618,10 @@ impl SqliteBackend {
                     weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at\
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+                    additional_scrubs\
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                           ?16, ?17, ?18, 'local', NULL)",
+                           ?16, ?17, ?18, 'local', NULL, ?19)",
                 rusqlite::params![
                     row.attestation_id,
                     row.attesting_key_id,
@@ -13575,6 +13641,11 @@ impl SqliteBackend {
                     subject_key_ids_json,
                     None::<i64>,
                     row.cohort_scope,
+                    // v24.0.0 (CIRISPersist#556) — a local-tier row defers its
+                    // signature, so this is `[]` in practice; bound anyway so
+                    // the local and federation writers cover the SAME column
+                    // set (a preserve set that differs by writer is #541).
+                    additional_scrubs_json,
                 ],
             )?;
             // v17.4.0 (V106) — maintain the subject projection at `local` tier.
@@ -13613,7 +13684,7 @@ const SCORES_FA_COLS: &str = "fa.attestation_id, fa.attesting_key_id, fa.atteste
      fa.attestation_envelope, fa.original_content_hash, fa.scrub_signature_classical, \
      fa.scrub_signature_pqc, fa.scrub_key_id, fa.scrub_timestamp, fa.pqc_completed_at, \
      fa.persist_row_hash, fa.subject_key_ids, fa.withdraws_admission_rule, fa.cohort_scope, \
-     fa.tier, fa.promoted_at";
+     fa.tier, fa.promoted_at, fa.additional_scrubs";
 
 /// v17.4.0 — shared WHERE predicate builder for the sqlite `scores` read
 /// handles. Emits the subject / dimension(exact+prefix) / type / attester /
@@ -13818,6 +13889,23 @@ fn sqlite_row_to_attestation(
             )
         })?;
     let withdraws_admission_rule: Option<i64> = row.get("withdraws_admission_rule")?;
+    // v24.0.0 (CIRISPersist#556) — the V113 `additional_scrubs` JSON-array TEXT
+    // column. Read STRICTLY (`row.get(..)?`, like every other column in this
+    // mapper, and unlike the tolerant `KeyRecord` reader): a SELECT that forgets
+    // the column must fail LOUDLY here rather than hydrate a row whose scrub set
+    // silently shrank. A silently-shrunk set would then be re-hashed by
+    // `promote` / `attach_pqc` / `set_cohort_scope` and the stored
+    // `persist_row_hash` would no longer describe the stored row — the #541
+    // preserve-set≢verified-set class, reintroduced through a read path.
+    let additional_scrubs_text: String = row.get("additional_scrubs")?;
+    let additional_scrubs: Vec<crate::federation::types::ScrubSig> =
+        serde_json::from_str(&additional_scrubs_text).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            )
+        })?;
     Ok(crate::federation::Attestation {
         attestation_id: row.get("attestation_id")?,
         attesting_key_id: row.get("attesting_key_id")?,
@@ -13845,6 +13933,7 @@ fn sqlite_row_to_attestation(
             let p: Option<String> = row.get("promoted_at")?;
             p.as_deref().map(parse_rfc3339)
         },
+        additional_scrubs,
     })
 }
 
@@ -16625,7 +16714,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                     attestation_type, weight, asserted_at, expires_at, \
                     attestation_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
              FROM federation_attestations {where_sql} \
              ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
         );
@@ -16714,7 +16803,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                     attestation_type, weight, asserted_at, expires_at, \
                     attestation_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, \
-                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
              FROM federation_attestations {where_sql} \
              ORDER BY asserted_at DESC, attestation_id DESC LIMIT ?{p_limit}"
         );
@@ -18903,6 +18992,22 @@ mod accord_tests {
     /// v21.16.0 (CIRISPersist#536 follow-up) — the REAL engine-backed user path
     /// on sqlite: establish_trust_root skips the synthetic user edge (real key ≠
     /// derived) and the user's own signer completes leg 1.
+    /// **CIRISPersist#557 — the root is a THRESHOLD, not a seat.** The family
+    /// trust-root parity body: a 1-of-3 charter REFUSED naming its shortfall, a
+    /// 2-of-3 charter + grant + node edge rooting the subject's `infra:serve` to
+    /// the ACCORD, the A1-compromise scenario (one seat cannot re-root, re-grant
+    /// or buy a quorum), the family halt latch gating the family root, and the
+    /// threshold re-derived from THIS node's roster rather than the carried
+    /// policy string.
+    #[tokio::test]
+    async fn family_trust_root_works_on_sqlite_557() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_family_trust_root(&backend, "sq557")
+            .await
+            .expect("557 family trust root exercise");
+    }
+
     /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on sqlite.
     #[tokio::test]
     async fn ceremony_plane_capability_walk_sqlite_548() {
@@ -19678,6 +19783,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         // v9.0.0 — sign the as-built envelope so the federation-tier
         // ingest gate (CC 5.3.2.4.3.1) admits it. Tests that mutate the
@@ -27734,10 +27840,10 @@ mod tests {
                     weight, asserted_at, expires_at, attestation_envelope, original_content_hash, \
                     scrub_signature_classical, scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
                     pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, \
-                    cohort_scope, tier, promoted_at\
+                    cohort_scope, tier, promoted_at, additional_scrubs\
                  ) VALUES (?1, 'occ', 'occ', 'scores', ?2, '2026-05-01T00:00:00Z', ?3, ?4, x'', \
                           'sig', NULL, 'occ', '2026-05-01T00:00:00Z', NULL, '0', ?5, NULL, \
-                          'federation', 'federation', NULL)",
+                          'federation', 'federation', NULL, '[]')",
                 rusqlite::params![id, weight, expires, env, subj],
             )
             .unwrap();
@@ -28749,6 +28855,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         resign_fed(&mut row); // v9.0.0 — sign the envelope (CC 5.3.2.4.3.1)
         row
@@ -33609,6 +33716,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         // v9.0.0 (CC 5.3.2.4.3.1) — sign the as-built envelope so the
         // mandatory federation-tier ingest gate admits it. Callers that
@@ -37191,6 +37299,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
