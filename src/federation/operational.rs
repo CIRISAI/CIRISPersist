@@ -2356,6 +2356,79 @@ pub mod test_support {
              {refusal}"
         );
 
+        // ── (a2) a CO-SIGNATURE THE VERIFIER DOES NOT CHECK IS A CO-SIGNATURE
+        // A WRITER MAY FORGE (CIRISPersist#556, the #541 class). A charter
+        // carrying a corrupt second scrub must be refused at the SAME admission
+        // boundary a corrupt BASE scrub is — otherwise `additional_scrubs` would
+        // be stored-but-unverified and the quorum evidence would be free to
+        // invent.
+        let forged_id = uuid::Uuid::new_v4().to_string();
+        let mut forged = co_signed_trust_attestation(
+            &forged_id,
+            &holders[0],
+            &accord,
+            attestation_type::DELEGATES_TO,
+            charter_envelope(&forged_id),
+            &[&holders[1]],
+        );
+        forged.additional_scrubs[0].scrub_signature_classical = {
+            use base64::Engine as _;
+            let mut raw = b64()
+                .decode(&forged.additional_scrubs[0].scrub_signature_classical)
+                .expect("our own co-signature is base64");
+            raw[0] ^= 0xff;
+            b64().encode(&raw)
+        };
+        let forged_err = directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: forged,
+            })
+            .await
+            .expect_err("(a2) a corrupt co-signature must be REFUSED at ingest");
+        assert_eq!(
+            forged_err.kind(),
+            "federation_federation_tier_unverified",
+            "({tag}) (a2) every scrub is verified, not just the first: {forged_err}"
+        );
+
+        // …and on an ORDINARY row, where no charter gate stands behind the
+        // verifier. This is the one that goes green-but-wrong if the ingest gate
+        // ever stops walking the whole scrub set: the row would be STORED,
+        // carrying a co-signature nobody checked, and every later reader that
+        // counted scrubs would count a forgery.
+        let plain_id = uuid::Uuid::new_v4().to_string();
+        let mut plain = co_signed_trust_attestation(
+            &plain_id,
+            &holders[0],
+            &subject,
+            attestation_type::SCORES,
+            json!({
+                "id": plain_id,
+                "dimension": "reputation:general:v1",
+                "score": 0.5,
+                "confidence": 0.9,
+            }),
+            &[&holders[1]],
+        );
+        plain.additional_scrubs[0].scrub_signature_classical = {
+            use base64::Engine as _;
+            let mut raw = b64()
+                .decode(&plain.additional_scrubs[0].scrub_signature_classical)
+                .expect("our own co-signature is base64");
+            raw[0] ^= 0xff;
+            b64().encode(&raw)
+        };
+        let plain_err = directory
+            .put_attestation(crate::federation::SignedAttestation { attestation: plain })
+            .await
+            .expect_err("(a2) a corrupt co-signature is refused on ANY federation-tier row");
+        assert_eq!(
+            plain_err.kind(),
+            "federation_federation_tier_unverified",
+            "({tag}) (a2) the ingest verifier — not some downstream gate — is what covers \
+             additional_scrubs: {plain_err}"
+        );
+
         // ── (d) GREEN — the accord charters itself at 2-of-3 ─────────────
         let charter_id = uuid::Uuid::new_v4().to_string();
         directory
@@ -2370,6 +2443,29 @@ pub mod test_support {
                 ),
             })
             .await?;
+
+        // #556 STORAGE ROUND-TRIP, on whatever column encoding this backend
+        // applies: the co-signature must come BACK, or the row proves 1-of-n
+        // again the moment it is re-read (and every re-hashing write path would
+        // then stamp a hash that disagrees with the stored row).
+        let stored = directory
+            .get_attestation(&charter_id)
+            .await?
+            .expect("(#556) the charter is readable");
+        assert_eq!(
+            stored.additional_scrubs.len(),
+            1,
+            "({tag}) #556: the 2nd scrub round-trips through this backend's storage"
+        );
+        assert_eq!(
+            stored.additional_scrubs[0].scrub_key_id, holders[1],
+            "({tag}) #556: …and it is the holder who actually co-signed"
+        );
+        assert_eq!(
+            stored.distinct_scrub_count(),
+            2,
+            "({tag}) #556: the stored row proves its own 2-of-n"
+        );
 
         // The conferral, ALSO at 2-of-3: a grant one seat could sign alone would
         // hand that seat the accord's granting pen, which is the asymmetry #557

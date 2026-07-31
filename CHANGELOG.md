@@ -5,6 +5,197 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [24.0.0] — 2026-07-30 — #557/#556: the root is a THRESHOLD, not a seat
+
+**We required two humans to halt the mesh and one to legitimize all of it.**
+
+CIRISServer filed #557 while holding a genesis re-mint, and it cites our own invariant back at us.
+Persist's recorded accord-ops rule is *"m-of-n OR reverse quorum, never 1-of-N capability-grant"*.
+The kill switch practices it: the accord is a trio under `quorum:2/3`, deliberately, so no single
+holder can stop the mesh. The **root that legitimizes everything the mesh does** was 1-of-1 —
+`trust_root_valid` took a `root_key_id`, a charter was a key's self-loop, `accept_trust_root` wrote
+`delegates_to(node → that one key)`, and grepping `trust_root.rs` for *family* or *quorum* returned
+nothing.
+
+Losing A1 was an extinction event. Compromising A1 handed an attacker the authority that grants
+everything, and — #556's half of the same finding — a forged charter would have been
+**byte-indistinguishable at the row level from the genuine one**, because the genuine one was also
+just A1-signed.
+
+There is no deliberate reason to write down. Single-key rooting was inherited from the portable
+root's self-charter shape and never decided. This is **the one place the design did not practice
+its own threshold discipline**, and this cut closes it.
+
+### The asymmetry, and the two halves that fix it
+
+| | before | after |
+|---|---|---|
+| halt the mesh | 2-of-3 | 2-of-3 |
+| **be** the root | 1-of-1 | m-of-n, re-derived from the node's own roster |
+| prove m-of-n from a replicated row | impossible (attestations carried one scrub) | `Attestation.additional_scrubs` |
+
+#557 predicted a fix for it would subsume #556, and it does: a family charter's authority IS its
+scrub set, so the row has to be able to carry one.
+
+### 1 — `Attestation.additional_scrubs` (#556) — the row proves its own m-of-n
+
+`Vec<ScrubSig>`, mirroring `KeyRecord.additional_scrubs` (V096) exactly: same type, same "every
+scrub is over the same preimage" rule, same TEXT-JSON column on sqlite AND postgres (V113), same
+whole-struct storage on memory. `Attestation::scrubs()` / `distinct_scrub_count()` are the twins of
+the `KeyRecord` methods, so the quorum core never has to know which kind of row it was handed.
+
+One ceremony used to produce two planes with two outcomes: the serve-node key record carried
+`scrub A1 + additional_scrubs [B1]` and proved 2-of-n, while `genesis-charter` proved 1-of-n. The
+2-of-3 was real, checked at `verify_bundle`, and then unrecoverable — a peer receiving the charter
+by replication could only ever answer *"A1 asserted it"*.
+
+**Empty vec is wire-absent** (`skip_serializing_if = "Vec::is_empty"`), so every existing row is
+byte-identical, its `persist_row_hash` unchanged and its signature still valid. The DEFAULT `'[]'`
+on both backends says the same thing in SQL.
+
+**The #541 trap, and how it was closed rather than avoided.** A field a writer may drop while the
+verifier never looks at it IS the preserve-set≢verified-set class, and here dropping it silently
+downgrades a quorum-chartered root to a single seat. So:
+
+- `verify_row_hybrid_signature` now walks the WHOLE scrub set at federation-tier ingest — every
+  co-signature hybrid-Strict verified against DIRECTORY-pinned pubkeys, over the same canonical
+  envelope. A corrupt or unresolvable co-signature refuses the row exactly as a corrupt BASE
+  signature already does. No new DoS surface: an attacker who can mangle the co-signatures in
+  flight can equally mangle the base one. Stated consequence: a co-signed row replicates only to
+  peers that know its co-signers — for accord holders, every node, because they are baked.
+- **promotion CLEARS the set** on all three backends. A local-tier row defers its signature, so any
+  co-signatures it carried were stored without ever being verified; promoting must not launder them
+  into the signed plane. The harness found the first draft of this within one run: the clear was
+  applied in memory but not written to the column, so the stored row and its own hash disagreed and
+  a replayed promote produced a different `persist_row_hash` (I3, memory-vs-sqlite).
+- the sqlite / postgres row mappers read the column **strictly**. A SELECT that forgets it fails
+  loudly instead of hydrating a row whose scrub set silently shrank and then gets re-hashed by
+  `promote` / `attach_pqc` / `set_cohort_scope`.
+- the substrate state machine grew a **`CoSign` op axis** (`None` / `One` / `Two` / `Corrupt`), so
+  signed rows now sometimes carry co-signatures through the storage round-trip, the memory-vs-sqlite
+  differential, and I1's re-run of the REAL verifier. Meta-coverage asserts every variant is drawn:
+  a field the generator never populates is a field nothing guards.
+
+### 2 — the family arm of `trust_root_valid` (#557)
+
+`trust_root_valid(directory, user_key_id, root_ref)` — when `root_ref` resolves to a **keyless
+constitutional family** this node has stored, the same three legs are evaluated against the family:
+
+| leg | key root | family root |
+|---|---|---|
+| edge | `delegates_to(user → root_key)` | `delegates_to(user → family_id)`, `trust:accepts:v1` |
+| charter | `delegates_to(root → root)`, self-signed | `delegates_to(holder → family)` whose FULL scrub set reaches the family's threshold |
+| recovery | pre-rotation commitment | unchanged — the family survives losing a seat, the seats still rotate |
+| drill | rows about the root | rows about the family |
+| halt | `get_active_halt(root_key)` | `get_active_halt(family_id)` |
+
+That halt row is worth saying out loud: `accord_active_halt` has always had `family_key_id` as its
+PRIMARY KEY, and `trust_root_valid` had always passed it a KEY id. **The accord's 2-of-3 kill switch
+could not reach the root it was built to stop.** On the family arm the argument is finally the kind
+of id the table is keyed by.
+
+**Authority is re-derived, never asserted** (the #377 rule). The threshold comes from the family
+row's own `consensus_protocol`, **floored at a strict majority of the node's OWN revocation-folded
+roster** — the identical defense `verify_bundle_quorum` applies to a carried policy string, reusing
+the same parser rather than growing a second one. Because it is re-derived at READ time, growing the
+accord from three seats to five retroactively un-charters a root that only reached the old
+threshold: no write, nothing revoked, and the carried string still says `quorum:2/3` while the node
+requires 3. Non-`quorum:M/N` policies read fail-secure (`unanimous`, and anything unrecognised,
+demand the whole roster).
+
+`TrustRootVerdict` gains `root_kind: {Key, Family}` and `charter_quorum: Option<CharterQuorum>` —
+both `#[serde(default)]`, so pre-v24 payloads deserialize unchanged. The quorum accounting is
+reported **whether or not it held**, because the shortfall is the finding: *"1 of 2 required distinct
+holders (roster of 3)"*.
+
+**The walk's granter semantic, decided and written down.** #557 asks whether
+`capability_roots_to_trusted_root` should accept a grant whose granter is the family id or one from a
+quorum-covered holder acting for it. It is the second, and the code leaves no real choice: a
+constitutional family is KEYLESS by doctrine, so `attesting_key_id = <family id>` could never be
+signed and could never pass federation-tier ingest. A grant that merely NAMED the family while
+carrying one seat's signature would be worse than the status quo — it would let A1 alone re-grant
+under the accord's name, which is exactly the authority this cut removes. So the family a grant acts
+for is **derived from the grant's own verified signer set** against this node's own rosters: there is
+no `on_behalf_of` field to forge, and one more seat's signature buys nothing until the threshold is
+met. It is its own named plane, `ConferralPlane::FamilyQuorum`, ordered after the cheap key-delegation
+loop and before the ceremony arm.
+
+`check_family_charter_admission` refuses a below-quorum family charter at every write chokepoint,
+typed (`CharterInvalid`) and naming the shortfall. A `trust:charter:v1` row pointed at somebody's KEY
+is deliberately NOT refused there: #551 item 2 settled that a mislabeled row still writes and the
+WALK refuses it, and moving that decision to the write side would break the contract that cut pinned.
+
+### 3 — the attested subject may be a keyless family (V114)
+
+`delegates_to(node → humanity-accord)` was not merely unimplemented, it was **unstorable**: sqlite
+declared `attested_key_id REFERENCES federation_keys(key_id)` (V004) and memory emulated the same FK
+in code, while postgres had NEITHER — three backends, two rules, and the permissive one is where
+production runs.
+
+The rule is right and is KEPT; what a schema FK cannot express is the one legitimate exception. A
+constitutional family is keyless by doctrine — v13.3.0 dropped `families.family_key_id`'s FK for
+exactly this reason, because the family id is an identifier, not a key, and having no seat is
+precisely what makes it a durable name for a root. So V114 rebuilds the sqlite table without that one
+FK (keeping `attesting_key_id` and `scrub_key_id`, which identify SIGNERS) and the rule moves up into
+`check_attested_subject_admission`, run at the same point in `put_attestation` and in the local
+writers on all three backends. Net: sqlite keeps the rule and gains the exception, memory the same,
+**postgres tightens — it gains a rule it never had**.
+
+The sqlite rebuild stages `attestation_subjects` and `identity_canonical_binding` across the drop,
+because `PRAGMA foreign_keys` is a no-op inside refinery's transaction and the implicit delete would
+otherwise CASCADE the subject projection away. Nothing observable changes but the schema.
+
+Two stale FK emulations died with it: memory's `put_family_local` still enforced the
+`family_key_id ∈ federation_keys` check that v13.3.0 dropped four cuts ago — with the comment
+directly above it already describing the replacement. It went unnoticed because nothing seeds genesis
+on memory, and it surfaced here as *"the one backend where a family trust root cannot exist"*.
+
+### 4 — portability is UNCHANGED, and the current bake is still valid
+
+**A single-key root remains fully valid.** 1-of-1 is a legitimate quorum for a root you alone own,
+and a solo operator's portable mesh works exactly as before — `RootKind::Key` is the default arm and
+the pre-existing trust-root tests pass untouched, which IS the witness. The family arm is
+*additional* expressiveness, not a replacement.
+
+**`canonical_seed.json` is deliberately not touched.** The re-mint is CIRISServer's hardware
+ceremony, and the currently-baked single-key genesis root stays valid under the unchanged key arm —
+the tree is not in a broken state between cuts. The NEXT ceremony mints quorum-rooted, with the full
+`infra:attest` / `store` / `transport` grant set (#557's other reason for holding the mint), and
+persist is ready for it now rather than after it.
+
+Recovery vs resilience, adopted as CIRISServer framed it: pre-rotation stays and still protects
+individual seats; the family root additionally survives any single seat loss **without a ceremony at
+all**.
+
+### Witnesses (red-first, all three backends)
+
+`exercise_family_trust_root` is one backend-agnostic body, run on memory + sqlite + postgres:
+
+- a **1-of-3-signed charter REFUSED** under `quorum:2/3`, typed, naming *"1 of 2 required distinct
+  holders"*. Red first: with the quorum check disabled, `put_attestation` returns `Ok(())`.
+- a **corrupt co-signature refused at ingest**, on a charter AND on an ordinary `scores` row where no
+  charter gate stands behind the verifier. Red first: with the scrub-set loop skipped, the forged row
+  is ADMITTED.
+- the **A1-compromise scenario** — one seat cannot re-root (a charter for a second accord it controls
+  is refused), cannot re-grant (a lone-signed conferral is stored and roots to nothing), and cannot
+  buy a quorum with a registered non-seat's signature.
+- the **full family-rooted serve walk green**: seeded roster + 2-of-3 charter + 2-of-3 grant + the
+  node's edge naming the accord ⇒ `capability_roots_to_trusted_root` returns the FAMILY as root, on
+  the `FamilyQuorum` plane.
+- **drill and halt on the family**: the drill reports and (v23.0.0) still does not gate; the family
+  halt latch stops the family root and the walk agrees; a resume un-fires it.
+- the **#556 storage round-trip** on each backend's own column encoding, asserting the stored row
+  proves its own 2-of-n.
+
+### Breaking
+
+- `trust_root_valid`'s third parameter is `root_ref`, not `root_key_id` — it may name a family.
+- `TrustRootVerdict` gains two fields; `ConferralPlane` gains `FamilyQuorum`; `Attestation` gains
+  `additional_scrubs`. Exhaustive matches and struct literals need updating.
+- `federation_attestations` gains a column on both SQL backends (V113) and sqlite's
+  `attested_key_id` FK moves into the shared admission predicate (V114).
+- postgres now refuses an attestation whose `attested_key_id` resolves to neither a key nor a family.
+
 ## [23.1.0] — 2026-07-30 — #554: the mesh's first production trust root is in the tree
 
 **The genesis ceremony ran on hardware, and persist refused its own accord holders.**
