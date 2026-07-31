@@ -2,17 +2,19 @@
 -- v24.0.0 (CIRISPersist#557)
 --
 -- POSTGRES PARITY: migrations/postgres/lens/V114__attested_subject_may_be_a_family.sql
--- (a no-op there: `cirislens.federation_attestations` never declared this FK.
--- The rule now lives in ONE place — the shared admission predicate — and runs
--- identically on all three backends, so postgres GAINS the check it never had
--- while sqlite loses only the schema clause, not the rule.)
+-- (same constraint removed there — postgres declared the identical FK in its own
+-- V004 — but Postgres has DROP CONSTRAINT, so its twin is six lines and this one
+-- is a table rebuild. The rule now lives in ONE place, the shared admission
+-- predicate, and runs identically on all three backends.)
 --
 -- WHAT MOVES, AND WHY IT IS NOT A LOOSENING
 -- -----------------------------------------
 -- `federation_attestations.attested_key_id` carried
--- `REFERENCES federation_keys(key_id)`. The rule it encodes — "you may not
--- attest ABOUT an identifier this node has never heard of" — is right and is
--- KEPT. What the schema cannot express is the one legitimate exception:
+-- `REFERENCES federation_keys(key_id)` — as did postgres, with the memory
+-- backend emulating it in code, so ALL THREE backends enforced it. The rule it
+-- encodes — "you may not attest ABOUT an identifier this node has never heard
+-- of" — is right and is KEPT. What the schema cannot express is the one
+-- legitimate exception:
 --
 --   a CONSTITUTIONAL FAMILY is KEYLESS by doctrine (v13.3.0 dropped
 --   `families.family_key_id`'s FK for exactly this reason — the family id is

@@ -3710,8 +3710,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // key this node knows OR as a constitutional family it has stored. V114
         // lifted this rule out of the SQLite schema FK (which cannot express the
         // keyless-family exception a family trust root needs) into ONE predicate
-        // every backend runs at this same point — so postgres, which never had
-        // the rule at all, now enforces it too.
+        // every backend runs at this same point. All three DID enforce the rule
+        // before (sqlite + postgres by FK, memory by emulation); what none of
+        // them could express is the keyless-family exception.
         crate::federation::admission::check_attested_subject_admission(self, &row.attested_key_id)
             .await?;
 

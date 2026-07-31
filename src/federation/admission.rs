@@ -3965,11 +3965,11 @@ pub async fn owner_of(
 ///
 /// # What moved, and why this is not a loosening
 ///
-/// SQLite encoded this rule as
-/// `attested_key_id TEXT NOT NULL REFERENCES federation_keys(key_id)` (V004) and
-/// the memory backend emulated the same FK in code. Postgres had NEITHER — so
-/// the three backends disagreed about the same submitted row, in the permissive
-/// direction on the one backend production runs.
+/// **All three backends enforced this rule** and none could express the
+/// exception: sqlite declared
+/// `attested_key_id TEXT NOT NULL REFERENCES federation_keys(key_id)` (V004),
+/// postgres declared the same FK (its V004 puts the `REFERENCES` clause on the
+/// following line), and the memory backend emulated it in code.
 ///
 /// The rule is right and is KEPT. What a schema FK cannot express is the one
 /// legitimate exception: a constitutional family is **keyless by doctrine**
@@ -3981,11 +3981,11 @@ pub async fn owner_of(
 /// plus that family's charter and drill rows. Under the FK those rows were not
 /// merely unimplemented, they were **unstorable**.
 ///
-/// So V114 lifts the constraint out of the SQLite schema and into this
-/// predicate, which runs at the same point in `put_attestation` on **memory,
-/// sqlite and postgres**. Net effect: sqlite keeps the rule and gains the
-/// exception; memory keeps the rule and gains the exception; postgres TIGHTENS,
-/// gaining a rule it never had. One predicate, one impl.
+/// So V114 lifts the constraint out of BOTH SQL schemas and into this predicate,
+/// which runs at the same point in `put_attestation` on **memory, sqlite and
+/// postgres**. Net effect: every backend keeps the rule and gains the exception,
+/// and the rule now lives somewhere it can be read, tested and reasoned about
+/// instead of in three separate places. One predicate, one impl.
 ///
 /// The FKs on `attesting_key_id` and `scrub_key_id` are deliberately untouched:
 /// those identify SIGNERS, and a signer with no key record could not have signed.

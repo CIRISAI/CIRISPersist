@@ -4029,8 +4029,9 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // key this node knows OR as a constitutional family it has stored. V114
         // lifted this rule out of the SQLite schema FK (which cannot express the
         // keyless-family exception a family trust root needs) into ONE predicate
-        // every backend runs at this same point — so postgres, which never had
-        // the rule at all, now enforces it too.
+        // every backend runs at this same point. All three DID enforce the rule
+        // before (sqlite + postgres by FK, memory by emulation); what none of
+        // them could express is the keyless-family exception.
         crate::federation::admission::check_attested_subject_admission(self, &row.attested_key_id)
             .await?;
 
@@ -4143,17 +4144,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 ],
             )
             .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                // FK violation → InvalidArgument (matches memory shape).
-                if msg.contains("foreign key") {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "FK constraint violated on attestation insert: {msg}"
-                    ))
-                } else {
-                    crate::federation::Error::Backend(format!("insert attestation: {msg}"))
-                }
-            })?;
+            .map_err(map_attestation_pg_err("insert attestation"))?;
         // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation-tier
         // only, the E5 invariant; `put_attestation` is the federation write
         // path so this always holds in practice). `Attestation` IS its own
@@ -13724,17 +13715,7 @@ impl PostgresBackend {
             ],
         )
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("foreign key") || msg.contains("violates foreign key") {
-                Error::InvalidArgument(format!(
-                    "FK constraint violated on local attestation insert \
-                     (attesting/attested/scrub key must exist in federation_keys): {msg}"
-                ))
-            } else {
-                Error::Backend(format!("insert local attestation: {msg}"))
-            }
-        })?;
+        .map_err(map_attestation_pg_err("insert local attestation"))?;
         // v17.4.0 (V106) — subject projection at `local` tier. On the
         // upsert-replace path the prior projection rows were dropped by the
         // DELETE above (FK ON DELETE CASCADE), so no stale rows survive.
@@ -14194,6 +14175,68 @@ fn pg_row_to_community(
 
 // ─── v4.8.0 (CIRISPersist#161) — membership-revocation row decoders +
 //     a shared FK-aware error mapper for the three revocation inserts.
+
+/// v24.0.0 (CIRISPersist#557) — render a `tokio_postgres::Error` with the
+/// payload the server actually sent.
+///
+/// **`tokio_postgres`'s `Display` is the two-word string `"db error"`.** Every
+/// fact that identifies the failure — SQLSTATE, message, the offending
+/// constraint, column and table — lives in the structured `DbError` behind
+/// `as_db_error()`, and is dropped on the floor by `e.to_string()`. A refusal
+/// that names nothing is a diagnostics failure by house rule (#545: a refusal
+/// must name the failing thing), and this one cost a full debugging cycle: the
+/// v24.0.0 pg witness failed with `Backend("insert attestation: db error")` and
+/// there was nothing in it to act on.
+///
+/// Used by every attestation write path. Falls back to `Display` for the
+/// non-database errors (connection closed, TLS, serialization) where there is
+/// no `DbError` to unpack.
+fn pg_error_detail(e: &tokio_postgres::Error) -> String {
+    let Some(db) = e.as_db_error() else {
+        return e.to_string();
+    };
+    let mut out = format!("SQLSTATE {}: {}", db.code().code(), db.message());
+    for (label, value) in [
+        ("detail", db.detail()),
+        ("hint", db.hint()),
+        ("constraint", db.constraint()),
+        ("column", db.column()),
+        ("table", db.table()),
+    ] {
+        if let Some(v) = value {
+            out.push_str(&format!(" [{label}: {v}]"));
+        }
+    }
+    out
+}
+
+/// v24.0.0 (CIRISPersist#557) — the shared attestation-insert error mapper: a
+/// FK violation → `InvalidArgument` (matching the memory backend's shape), any
+/// other database error → `Backend`, both carrying [`pg_error_detail`].
+///
+/// The FK classification keys on **SQLSTATE 23503**, not on a substring of the
+/// message. The previous `msg.contains("foreign key")` test ran against
+/// `"db error"` and therefore never fired — so a genuine FK violation on this
+/// path had been reported as an opaque `Backend` for as long as the check had
+/// existed, diverging from memory's `InvalidArgument` in a way the differential
+/// harness could not see (it never reaches pg).
+fn map_attestation_pg_err(
+    op: &'static str,
+) -> impl FnOnce(tokio_postgres::Error) -> crate::federation::Error {
+    move |e| {
+        let detail = pg_error_detail(&e);
+        let is_fk = e
+            .as_db_error()
+            .is_some_and(|db| *db.code() == tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION);
+        if is_fk {
+            crate::federation::Error::InvalidArgument(format!(
+                "FK constraint violated on {op}: {detail}"
+            ))
+        } else {
+            crate::federation::Error::Backend(format!("{op}: {detail}"))
+        }
+    }
+}
 
 /// Map a Postgres revocation-insert error: a FK violation (subject/
 /// removed key absent from federation_keys) → `InvalidArgument`, else

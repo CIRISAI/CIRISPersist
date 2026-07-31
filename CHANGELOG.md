@@ -127,23 +127,33 @@ WALK refuses it, and moving that decision to the write side would break the cont
 
 ### 3 — the attested subject may be a keyless family (V114)
 
-`delegates_to(node → humanity-accord)` was not merely unimplemented, it was **unstorable**: sqlite
-declared `attested_key_id REFERENCES federation_keys(key_id)` (V004) and memory emulated the same FK
-in code, while postgres had NEITHER — three backends, two rules, and the permissive one is where
-production runs.
+`delegates_to(node → humanity-accord)` was not merely unimplemented, it was **unstorable**. All three
+backends enforced the same rule and none could express the exception: sqlite declared
+`attested_key_id REFERENCES federation_keys(key_id)` (V004), postgres declared the identical FK in
+its own V004, and memory emulated it in code.
 
 The rule is right and is KEPT; what a schema FK cannot express is the one legitimate exception. A
 constitutional family is keyless by doctrine — v13.3.0 dropped `families.family_key_id`'s FK for
 exactly this reason, because the family id is an identifier, not a key, and having no seat is
-precisely what makes it a durable name for a root. So V114 rebuilds the sqlite table without that one
-FK (keeping `attesting_key_id` and `scrub_key_id`, which identify SIGNERS) and the rule moves up into
+precisely what makes it a durable name for a root. So V114 removes that one FK on both SQL backends
+(keeping `attesting_key_id` and `scrub_key_id`, which identify SIGNERS) and the rule moves up into
 `check_attested_subject_admission`, run at the same point in `put_attestation` and in the local
-writers on all three backends. Net: sqlite keeps the rule and gains the exception, memory the same,
-**postgres tightens — it gains a rule it never had**.
+writers on all three backends. Every backend keeps the rule and gains the exception, and the rule now
+lives somewhere it can be read and tested instead of in three separate places.
 
-The sqlite rebuild stages `attestation_subjects` and `identity_canonical_binding` across the drop,
-because `PRAGMA foreign_keys` is a no-op inside refinery's transaction and the implicit delete would
-otherwise CASCADE the subject projection away. Nothing observable changes but the schema.
+Postgres has `DROP CONSTRAINT`, so its twin is six lines — dropping by **discovery** rather than by
+name, since V004 declares the FK inline and its name is whatever Postgres generated. SQLite has no
+`ALTER TABLE DROP CONSTRAINT`, so its side is a table rebuild that stages `attestation_subjects` and
+`identity_canonical_binding` across the drop: `PRAGMA foreign_keys` is a no-op inside refinery's
+transaction, so the implicit delete would otherwise CASCADE the subject projection away. Nothing
+observable changes but the schema.
+
+**This is where the cut got its own medicine.** The first draft of the postgres twin was a
+comment-only no-op asserting postgres never had the FK, on the strength of a single-line grep for
+`attested_key_id.*REFERENCES` — and postgres puts the `REFERENCES` clause on the *next* line. A
+one-line grep answering a multi-line question produced a confident, wrong, written-down premise that
+then propagated into four source comments and this changelog. The pg witness caught it; the loud
+error (below) named it in one run.
 
 Two stale FK emulations died with it: memory's `put_family_local` still enforced the
 `family_key_id ∈ federation_keys` check that v13.3.0 dropped four cuts ago — with the comment
