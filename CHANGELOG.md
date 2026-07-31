@@ -5,6 +5,212 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [24.1.0] — 2026-07-30 — #561/#560/#559/#547: what a hop is, and three things that were quietly untrue
+
+Four consumer-filed issues, and three of them are the same admission in different words: **a fact
+this substrate publishes was maintained separately from the fact it was supposed to agree with.**
+An advertised Key ref the node could not serve. A ticket status that meant two things. A migration
+phase that told a booting agent nothing for fifteen minutes. The fourth, #561, is new surface — and
+it is written so it cannot join them.
+
+### 1 — `resolve_transit_eligibility` (#561) — one call, an authoritative TTL, no trust logic in edge
+
+CIRISEdge#430 gates A/V relay **hop selection** on transport eligibility, and selection is a hot
+path: reparent on peer churn, per-substream in MDC. Edge must resolve trust **once** and cache.
+The alternative — edge reimplementing the shared-root composition and re-deriving expiry — is a
+drift class we have paid for before: two implementations of "is this still valid" that disagree
+about `is_expired` or about what a withdrawal does.
+
+So persist owns the whole resolution and returns the cache bound with the verdict:
+
+```rust
+pub struct TransitEligibility { eligible: bool, valid_until: Option<DateTime<Utc>>, via_root: Option<String> }
+
+pub async fn resolve_transit_eligibility(dir, user_key_id, peer_key_id) -> Result<TransitEligibility, Error>;
+pub async fn resolve_transit_eligibility_over_roster(dir, user_key_id, peer_key_id, accord_roster) -> …;
+```
+
+A peer is a usable hop iff it is **(A)** in the federation directory, **(B)** a `node`, **(C)**
+self-offering `infra:transport`, and **(D)** validly trusting a trust root **we** also validly
+trust. Reachable from `Engine::resolve_transit_eligibility`, the PyO3
+`resolve_transit_eligibility_json`, and the directory capsule's `ResolveTransitEligibility` op —
+because a capability no host can call is not shipped (the AV-77 lesson, paid for twice).
+
+**Deliberately weaker than the `infra:serve` conferral walk.** A relay carries only ciphertext; no
+`EpochDek` is reachable from a hop, so what a bad hop gets is POSITION, not content. Shared-root
+anchoring is the proportionate bar, and it keeps relaying decentralized: any trust-anchored node
+offering transport can be a hop, not only the ones our own root has blessed. Requiring the
+conferral walk would have made the mesh's relay topology a function of one root's grants.
+
+(A)–(C) are self-claims and are meant to be. The AV-75 property holds because (D) is not, and there
+is a witness for exactly that: **both sides registering the string `infra:transport`, with no shared
+root, is `false`.**
+
+**The candidate roots come from the USER's own live `trust:accepts` edges, never the peer's.** That
+boundary is not an optimization, it is the anti-inflation property: a hostile peer authoring fifty
+`delegates_to` rows must not be able to set the cost of evaluating it, on a per-substream hot path,
+for free. The witness measures the REAL walk's own count of candidate roots evaluated, against an
+INELIGIBLE peer so the loop exhausts rather than short-circuiting, with the flood authored by the
+peer being measured — three conditions, each of which an earlier draft of that test got wrong and
+stayed green for. Under a walk deliberately rewritten to enumerate the peer's edges too, it now
+reads 51 where it must read 1.
+
+`valid_until` is the min-fold across everything the walk counted: the peer's `KeyRecord.valid_until`
+and each side's satisfying trust edge and root charter. It is computed by the walk that CHOSE those
+rows, at persist's own `is_expired` reference time — which is why `TrustRootVerdict` grew
+`bounded_until` (additive, `#[serde(default)]`, byte-identical when unbounded) rather than the
+caller re-deriving a charter set and forking four predicates that exist once by design. `None`
+means nothing walked is time-bounded: cache until a withdrawal event.
+
+**Fail-closed, everywhere.** Any directory error, an unregistered `user_key_id`, an unresolvable
+read — every one returns `eligible: false`. The capsule op has no error arm to route, because the
+resolver never hands one out. A transport gate never fails open.
+
+Withdrawal needs no new API and gets none: withdraw the one `delegates_to(user → root)` edge and
+the very next resolution reads `false`, because (D) re-derives from live graph state every time.
+
+A **shared FAMILY root satisfies (D)** exactly as a key root does, and nothing in the transit walk
+is arm-aware — `trust_root_valid` picks its own arm from stored state and `via_root` carries the
+family id. Its own witness proves the threshold reaches this plane: grow the accord's roster so a
+2-of-3 charter stops being a majority, and the hop it anchored goes ineligible with nothing written
+on the transport plane at all.
+
+Two judgement calls, recorded rather than buried:
+
+- **(B) reads `identity_type` as a SET, not with `==`.** The column is scalar-or-comma-joined
+  (#441), and the canonical serve node in the genesis bake carries `identity_type = "canonical,node"`
+  — `== "node"` would deny exactly the production nodes most likely to be asked to relay, for no
+  security gain, since (B) is a self-claim either way.
+- **The `_over_roster` roster reaches no verifier, and the doc says so.** The sibling walks take one
+  because they end in a ceremony arm; transit eligibility has none — (D) is `trust_root_valid` on
+  both sides, whose family arm re-derives its threshold from `active_family_members`, not the
+  accord-holder constant. Widening (D) to also accept the co-scrub encoding was considered and NOT
+  done: it makes more peers eligible than the rule as written, and a transport gate is not the place
+  to widen on inference. The variant stays so the signature matches its siblings and so that leg
+  could never land untestable.
+
+### 2 — `proposed` (#560) — an unapproved proposal is not stuck work
+
+`ticket_upsert` refused `proposed` with `unknown variant`, so CIRISAgent shipped
+`status = 'blocked'` plus a `__proposal__` metadata marker. It works. It is also wrong in the way
+that matters operationally: `blocked` means *work that is stuck*, and this means *work that is not
+authorized*. An operator reading a blocked-ticket queue could not tell them apart.
+
+The vocabulary gains a ninth value and stays **closed** — the consumer offered an open validated
+string as an alternative, and a closed set is what makes an unknown status a refusal instead of a
+silently stored typo. Authorization is exactly the kind of state that must not be expressible by
+accident.
+
+`proposed` is not terminal (a terminal proposal could never be approved) and `TicketStatus` grew
+`is_authorized()`, false for exactly that one status — so a consumer excluding proposals from work
+discovery asks the substrate rather than re-deriving a status list. Approval is therefore an
+ordinary `update_ticket_status` transition, one auditable write, not a metadata edit. V115 widens
+the CHECK on both backends: four lines on Postgres (dropping the old constraint **by discovery**,
+the V114 lesson, so a renamed constraint migrates instead of silently rejecting), a table rebuild on
+SQLite. No value is removed and no row changes.
+
+### 3 — startup DDL that composes with a shared Postgres (#559)
+
+CIRISAgent measured this in production: two agents on one `ciris_db`, agent A running a 35-minute
+`DELETE FROM graph_edges`, agent B blocked **15 minutes** acquiring a `ShareLock` for a
+`CREATE INDEX IF NOT EXISTS` that was a **no-op** — the index already existed. `IF NOT EXISTS` takes
+its lock before the catalog check. Nothing in that path would ever have timed out.
+
+That DDL was agent-side and is gone. The failure class moved into persist, where it applies to every
+consumer of the wheel. Three bounds, one per link:
+
+- **A once-guard.** `Engine(...)` re-entered `run_migrations` on every construction; even a
+  steady-state boot took the global advisory lock and ran refinery. A process now migrates a given
+  DSN once. Marked on the **success path only** — a database that failed to migrate but reports
+  itself migrated is strictly worse than the stampede. Scoped to Postgres deliberately:
+  `sqlite::memory:` is one DSN string naming a different database on every open, so a DSN-keyed
+  guard there would silently leave the second in-memory database unmigrated. And scoped to the
+  **DDL** only: the shard-key backfill still runs on every call, because it is a data-repair sweep
+  that takes no lock and creates nothing, and silently retiring it after the first construction is a
+  different change than the one #559 asks for. The first draft did put it under the guard, and
+  `dedup_shard::postgres_legacy_backfill_and_reingest_dedup` — which nulls a shard key and re-runs
+  migrations expecting it filled — caught that in the full serialized pg pass.
+- **`lock_timeout` on the migration session**, defaulting to 120s, converting the hang into a
+  SQLSTATE-carrying `55P03` that `extract_sqlstate` already surfaces distinctly. Applied **only when
+  the session has none**: CIRISAgent 2.9.7 appends `options=-c lock_timeout=120s` to the DSN and that
+  value WINS. A first-class default that clobbered the seam a consumer is currently reaching through
+  would break the deployment this issue came from.
+- **A bounded advisory-lock wait.** `pg_try_advisory_lock` in a loop with its own budget (600s,
+  far more patient than the statement timeout — waiting on a sibling's legitimate cold start and
+  waiting on a foreign tenant's `DELETE` deserve different patience), a progress log every 15s
+  saying WHY it is waiting, and a new typed `Error::MigrationLockTimeout` that names the lock id and
+  hands the operator the `pg_locks` query to find the holder. #937 reads "the log did not advance by
+  a single line for 15 minutes"; a boot that is legitimately waiting is now distinguishable from a
+  hang.
+
+The red witness for the last one is that the test suite **had to be killed at 240 seconds** with the
+old `pg_advisory_lock` restored. Migration CONTENT is untouched.
+
+### 4 — the advertised Key ref you cannot serve (#547)
+
+Found adopting v22.0.1 + edge v15.4.2 in CIRISServer. After `adopt_scrub_upgrade`, the node
+advertises the current row's content hash while `signed_wire_index` still holds the pre-adopt one.
+`lookup_signed_record_by_content_hash` misses, and the peer cannot serve the ref it just advertised
+— silently, because edge's fetch is a `let … else { continue }`.
+
+Not a serialization drift: advertise and reload were byte-identical. It was index **key coverage**,
+which `rebuild_signed_wire_index()` curing it proves. **The defect is old and latent** — edge
+v14.1.0 replaced an in-memory cache with a point-read, and that cache had been masking a real
+invariant violation.
+
+The shape is #541's preserve-set ≢ verified-set, one plane over: two lists, maintained separately,
+free to disagree. `put_public_key` maintained the index; every `UPDATE federation_keys` path did not.
+The remedy is the same — make the agreement come from ONE derivation. `wire_index::key_entry` is now
+the single place the `(content_hash, record_key)` pair is computed, and **five** mutators call it —
+on sqlite and postgres, and on memory for the three it implements:
+
+| mutator | named in #547 | why it moves the wire hash |
+|---|---|---|
+| `adopt_scrub_upgrade` | yes | rewrites the whole registration row |
+| `supersede_canonical_record` | yes | canonical rotation |
+| `adopt_genesis_reanchor` | yes | authenticated re-anchor |
+| `attach_key_pqc_signature` | **no — found here** | four serialized columns at once |
+| `set_consent_role` | **no — found here** | see below |
+
+The last two are the same class and were found by taking the issue's own suggestion seriously: a
+test that drives *every* public write path and asserts the advertised hash point-reads. `set_consent_role`
+is the interesting one — its own doc said it "does not touch the signed row", which is true of
+`persist_row_hash` (the column is excluded from it) and false of the **wire** content hash, which is
+`sha256` over the bytes the read surface returns, and `KeyRecord::consent_role` is in those bytes.
+Two hashes, one of them moved. Extending past the three named mutators rather than shipping a
+structural witness that would have gone red on them.
+
+`attach_key_pqc_signature` indexes the row **as stored**, by re-reading it after the write, and that
+is not fussiness: it generates `pqc_completed_at` itself at nanosecond precision, TIMESTAMPTZ keeps
+microseconds, so hashing the value we SENT indexes a hash Postgres's read surface never produces —
+the same advertise-vs-serve desync, in the other direction. The first draft did exactly that; the pg
+witness caught it while the sqlite twin stayed green, because sqlite stores RFC-3339 text and
+round-trips the nanoseconds. That is the {backend}-parity rule earning its keep — one backend cannot
+witness for another.
+
+Red-first, with the index writes neutralized: sqlite fails at `adopt_scrub_upgrade` (the exact
+symptom CIRISServer measured), memory at `set_consent_role`. The postgres twin runs the same body.
+
+`supersede_canonical_record` and `adopt_genesis_reanchor` are fixed identically but are **not**
+covered end-to-end by a witness, and this is the honest limit of this cut: both re-verify their
+authority against the BAKED accord roster (`verify_canonical_supersede` / `verify_bundle_quorum`),
+whose private halves live in the #268 hardware ceremony, so no test can drive them. They call the
+same one-line helper as the three that are covered.
+
+### Compatibility
+
+Additive throughout. `TrustRootVerdict::bounded_until` is `#[serde(default)]` +
+`skip_serializing_if`, so an unbounded verdict serializes byte-identically and the capsule's JSON
+payload stays readable by an older consumer — the same additive move `root_kind` and
+`charter_quorum` made in v24.0.0. `TicketStatus` gains a value and loses none. The two capsule enums
+gained APPEND-ONLY variants at the END. V115 widens a CHECK without removing a value. No stored row,
+hash or signature changes on any backend.
+
+Not done, and worth naming: the `.pyi` stub is untouched. It does not currently carry
+`set_self_key_id`, `run_deletion_window_watch_json` or the trust-root surface either, so adding one
+method would have been an inconsistency rather than a fix; closing that gap is its own piece of
+work.
+
 ## [24.0.0] — 2026-07-30 — #557/#556: the root is a THRESHOLD, not a seat
 
 **We required two humans to halt the mesh and one to legitimize all of it.**

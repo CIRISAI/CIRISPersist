@@ -774,6 +774,19 @@ pub enum DirectoryOp {
     /// CIRISPersist#507b) — full backfill/rebuild of `signed_wire_index`.
     /// Result rides `U64` (rows indexed). APPEND-ONLY.
     RebuildSignedWireIndex,
+    /// [`crate::federation::trust_root::resolve_transit_eligibility`]
+    /// (v24.1.0, CIRISPersist#561) — may `peer_key_id` carry our relay
+    /// traffic, and for how long may the answer be cached? The substrate half
+    /// of CIRISEdge#430's A/V hop-selection gate: edge resolves ONCE per
+    /// candidate through this op, caches `(eligible, valid_until)`, and keeps
+    /// the selection hot path crypto-free. Result rides
+    /// `TransitEligibility`. APPEND-ONLY.
+    ResolveTransitEligibility {
+        /// "Us" — the selecting node.
+        user_key_id: String,
+        /// The candidate hop.
+        peer_key_id: String,
+    },
 }
 
 /// The mirror of each [`DirectoryOp`]'s return, plus the flattened error.
@@ -921,6 +934,10 @@ pub enum DirectoryOpResult {
     /// the re-serialized record bytes, or `None` on a miss/index-mismatch.
     /// APPEND-ONLY.
     OptionalBytes(Option<Vec<u8>>),
+    /// `resolve_transit_eligibility` (v24.1.0, CIRISPersist#561) — the
+    /// transport-hop verdict plus its authoritative cache TTL and the shared
+    /// root that satisfied it. APPEND-ONLY.
+    TransitEligibility(crate::federation::trust_root::TransitEligibility),
 }
 
 /// Run one [`DirectoryOp`] against `dir` and wrap the outcome.
@@ -1172,6 +1189,24 @@ pub async fn dispatch_directory_op(
         .await
         {
             Ok(g) => DirectoryOpResult::TrustedGrant(g),
+            Err(e) => DirectoryOpResult::Err(e.to_string()),
+        },
+        // v24.1.0 (CIRISPersist#561) — the transport-hop gate. Note it has no
+        // `Err` arm to route: `resolve_transit_eligibility` is fail-CLOSED and
+        // folds every read failure into `eligible: false` itself, so a capsule
+        // caller can never receive an error it might be tempted to treat as
+        // "unknown, proceed".
+        DirectoryOp::ResolveTransitEligibility {
+            user_key_id,
+            peer_key_id,
+        } => match crate::federation::trust_root::resolve_transit_eligibility(
+            dir,
+            &user_key_id,
+            &peer_key_id,
+        )
+        .await
+        {
+            Ok(v) => DirectoryOpResult::TransitEligibility(v),
             Err(e) => DirectoryOpResult::Err(e.to_string()),
         },
         DirectoryOp::PutLocationProof { proof } => match dir.put_location_proof(proof).await {

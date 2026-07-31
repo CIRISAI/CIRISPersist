@@ -2073,6 +2073,82 @@ impl PyEngine {
         })
     }
 
+    /// v24.1.0 (CIRISPersist#561) — **may `peer_key_id` carry our
+    /// relay traffic?** Returns the verdict as JSON
+    /// (`{eligible, valid_until, via_root}`).
+    ///
+    /// CIRISEdge#430 gates A/V relay HOP SELECTION on this, and
+    /// selection is a hot path (reparent on peer churn, per-substream
+    /// in MDC). So the contract is: call ONCE per candidate, cache
+    /// `(eligible, valid_until)`, drop the entry on the replication
+    /// apply path when a revocation names the peer or `via_root`, and
+    /// keep the planner itself crypto-free. `valid_until` is
+    /// authoritative — persist computes it from the same rows the
+    /// verdict counted, at persist's own expiry semantics, so the
+    /// caller's TTL cannot drift from the authority. `null` means
+    /// nothing walked is time-bounded: cache until a withdrawal event.
+    ///
+    /// A peer is eligible iff it is (A) in the federation directory,
+    /// (B) a `node`, (C) self-offering `infra:transport`, and (D)
+    /// validly trusting a trust root THIS node also validly trusts.
+    /// Deliberately weaker than the `infra:serve` conferral walk: a
+    /// relay carries only ciphertext, so the exposure is POSITION, and
+    /// shared-root anchoring keeps relaying decentralized.
+    ///
+    /// **Fail-closed**: any resolution error returns
+    /// `{"eligible": false, …}`. A transport gate never fails open.
+    ///
+    /// Exposed here because edge and server reach persist through this
+    /// FFI — the same unreachability that made the AV-77 de-admission
+    /// gate a sanction nobody could enable (see
+    /// [`Self::set_self_key_id`]).
+    fn resolve_transit_eligibility_json(
+        &self,
+        py: Python<'_>,
+        user_key_id: &str,
+        peer_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let user = user_key_id.to_owned();
+        let peer = peer_key_id.to_owned();
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let verdict = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::trust_root::resolve_transit_eligibility(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &user,
+                                &peer,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::trust_root::resolve_transit_eligibility(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &user,
+                                &peer,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&verdict).map_err(|e| {
+                    PyValueError::new_err(format!("resolve_transit_eligibility serialize: {e}"))
+                })
+            })
+        })
+    }
+
     /// v3.4.0 (CIRISPersist#123) — set the local
     /// `federation_blobs` storage budget in bytes. Above
     /// `budget × steady_state_utilization` the eviction sweeper
@@ -26341,9 +26417,16 @@ fn fountain_store_err_to_py(e: crate::store::Error) -> PyErr {
         | Error::AggregationMetaRejected(_)
         | Error::StorageContention(_)
         | Error::Schema(_) => PyValueError::new_err(e.kind()),
-        Error::NotImplemented(_) | Error::Backend(_) | Error::Migration { .. } => {
-            PyRuntimeError::new_err(format!("{e}"))
-        }
+        // v24.1.0 (CIRISPersist#559) — `MigrationLockTimeout` joins the
+        // transient-shaped arm: nothing was written and re-running IS the
+        // remedy, which is precisely what `RuntimeError` signals here. Its
+        // Display names the lock id and the elapsed budget, so the Python
+        // consumer that #937 reported from finally gets a message instead of
+        // fifteen silent minutes.
+        Error::NotImplemented(_)
+        | Error::Backend(_)
+        | Error::Migration { .. }
+        | Error::MigrationLockTimeout { .. } => PyRuntimeError::new_err(format!("{e}")),
     }
 }
 

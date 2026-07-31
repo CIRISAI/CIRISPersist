@@ -607,6 +607,57 @@ mod tests {
         assert!(submitted_drift <= 1);
     }
 
+    /// v24.1.0 (CIRISPersist#560) — a PROPOSED ticket stores, reads back as
+    /// `proposed`, and is filterable — on sqlite, where the V028 CHECK
+    /// (rebuilt by V115) is the gate that would otherwise reject it.
+    ///
+    /// Then the property the status exists for: approval is a STATUS
+    /// TRANSITION, not a metadata edit. `update_ticket_status` carries the
+    /// proposal into executable work in one auditable write.
+    #[tokio::test]
+    async fn proposed_status_round_trips_and_is_approvable_sqlite_560() {
+        let (_b, svc) = fresh_backend().await;
+        let id = format!("ticket-{}", Uuid::new_v4().simple());
+        let mut t = mk_ticket(&id, "occ-560");
+        t.status = TicketStatus::Proposed;
+        svc.upsert_ticket(t).await.expect(
+            "a `proposed` ticket must STORE — before V115 the V028 CHECK \
+             rejected it and the consumer had to overload `blocked`",
+        );
+        let got = svc.get_ticket(&id).await.unwrap().expect("present");
+        assert_eq!(got.status, TicketStatus::Proposed);
+        assert!(
+            !got.status.is_authorized(),
+            "an unapproved proposal is not work a discovery query may hand out"
+        );
+
+        // Filterable as its own state — the operator-visible half of the ask:
+        // a blocked-ticket queue no longer contains proposals.
+        let page = svc
+            .list_tickets(
+                TicketFilter {
+                    status: Some(TicketStatus::Proposed),
+                    agent_occurrence_id: Some("occ-560".into()),
+                    ..Default::default()
+                },
+                None,
+                50,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1, "the proposal is findable BY STATUS");
+        assert_eq!(page.items[0].ticket_id, id);
+
+        // Approval: one status write, no metadata edit.
+        assert!(svc
+            .update_ticket_status(&id, TicketStatus::Pending, None, None)
+            .await
+            .unwrap());
+        let approved = svc.get_ticket(&id).await.unwrap().expect("present");
+        assert_eq!(approved.status, TicketStatus::Pending);
+        assert!(approved.status.is_authorized(), "approval grants authority");
+    }
+
     #[tokio::test]
     async fn status_check_constraint_rejects_unknown_value() {
         let (b, _svc) = fresh_backend().await;

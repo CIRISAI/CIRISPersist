@@ -11,19 +11,44 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Ticket lifecycle status. **LOWERCASE 8-value on the wire and in
+/// Ticket lifecycle status. **LOWERCASE 9-value on the wire and in
 /// SQL.** Distinct from `scheduled_tasks` (UPPERCASE 4-value); the
 /// `tasks` substrate uses a 6-value lowercase set that overlaps
 /// partially. The agent's `tickets.status` column declares the
-/// 8-value lowercase set verbatim; persist follows it. Note the
+/// lowercase set verbatim; persist follows it. Note the
 /// mixed snake_case form `in_progress`.
 ///
 /// Wire format (JSON via serde) is `rename_all = "snake_case"` so
 /// `InProgress` serializes to `"in_progress"` — matching the SQL
 /// string directly.
+///
+/// # v24.1.0 (CIRISPersist#560) — `proposed`
+///
+/// The set was 8-value and had no way to say "an agent asked for this
+/// and no human has authorized it yet". CIRISAgent shipped
+/// `status = "blocked"` plus a `__proposal__` metadata marker as a
+/// workaround; it works, but `blocked` means *work that is stuck* and
+/// this means *work that is not authorized*. Those are different
+/// operational states, and an operator reading a blocked-ticket queue
+/// could not tell them apart.
+///
+/// The substrate models the state rather than widening the vocabulary
+/// to an open string (the alternative the consumer offered): a closed
+/// enum is what makes an unknown status a REFUSAL instead of a silently
+/// stored typo, and authorization is exactly the kind of state that
+/// must not be expressible by accident.
+///
+/// `proposed` is **not** terminal and is **not** executable. Approval is
+/// therefore an ordinary status transition (`proposed → pending`) through
+/// `update_ticket_status`, not a metadata edit — which is the property
+/// the consumer needs: a proposal cannot become work without a human act,
+/// and that act is one auditable status write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TicketStatus {
+    /// v24.1.0 (CIRISPersist#560) — an agent has PROPOSED this work and
+    /// no human has approved it. Not executable; see the type-level doc.
+    Proposed,
     #[default]
     Pending,
     Assigned,
@@ -40,6 +65,7 @@ impl TicketStatus {
     /// `in_progress`).
     pub fn as_sql_str(self) -> &'static str {
         match self {
+            TicketStatus::Proposed => "proposed",
             TicketStatus::Pending => "pending",
             TicketStatus::Assigned => "assigned",
             TicketStatus::InProgress => "in_progress",
@@ -55,6 +81,7 @@ impl TicketStatus {
     /// SQL vocabulary.
     pub fn parse_str(s: &str) -> Option<Self> {
         match s {
+            "proposed" => Some(Self::Proposed),
             "pending" => Some(Self::Pending),
             "assigned" => Some(Self::Assigned),
             "in_progress" => Some(Self::InProgress),
@@ -69,11 +96,33 @@ impl TicketStatus {
 
     /// `true` for terminal states (`completed`, `cancelled`,
     /// `failed`). Helper for callers driving the state machine.
+    ///
+    /// `proposed` is deliberately NOT terminal: an unapproved proposal is
+    /// the state a ticket is in BEFORE the lifecycle starts, not after it
+    /// ends, and calling it terminal would tell a caller the work is
+    /// settled when nobody has decided anything (CIRISPersist#560).
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
             TicketStatus::Completed | TicketStatus::Cancelled | TicketStatus::Failed
         )
+    }
+
+    /// v24.1.0 (CIRISPersist#560) — is this ticket AUTHORIZED to be worked?
+    ///
+    /// False for exactly one status today, `proposed`, and it is the whole
+    /// point of that status: a work-discovery query must exclude it by
+    /// default the way it already excludes `blocked`, and a consumer should
+    /// not have to know WHICH statuses those are. Naming the predicate here
+    /// means the substrate answers "may this be picked up" in one place
+    /// instead of every caller re-deriving a status list.
+    ///
+    /// This is about AUTHORIZATION, not readiness — `blocked` and
+    /// `deferred` are authorized work that is currently stuck or shelved,
+    /// which is precisely the distinction the `__proposal__` metadata
+    /// workaround could not draw.
+    pub fn is_authorized(self) -> bool {
+        !matches!(self, TicketStatus::Proposed)
     }
 }
 
@@ -205,6 +254,7 @@ mod tests {
     #[test]
     fn status_sql_round_trip() {
         for s in [
+            TicketStatus::Proposed,
             TicketStatus::Pending,
             TicketStatus::Assigned,
             TicketStatus::InProgress,
@@ -223,6 +273,7 @@ mod tests {
 
     #[test]
     fn status_sql_strings_are_lowercase_snake_case() {
+        assert_eq!(TicketStatus::Proposed.as_sql_str(), "proposed");
         assert_eq!(TicketStatus::Pending.as_sql_str(), "pending");
         assert_eq!(TicketStatus::Assigned.as_sql_str(), "assigned");
         assert_eq!(TicketStatus::InProgress.as_sql_str(), "in_progress");
@@ -231,6 +282,48 @@ mod tests {
         assert_eq!(TicketStatus::Completed.as_sql_str(), "completed");
         assert_eq!(TicketStatus::Cancelled.as_sql_str(), "cancelled");
         assert_eq!(TicketStatus::Failed.as_sql_str(), "failed");
+    }
+
+    /// v24.1.0 (CIRISPersist#560) — `proposed` deserializes from the wire and
+    /// round-trips as the snake_case token the SQL CHECK admits. Before this
+    /// cut `ticket_upsert` refused it with `unknown variant`, which is why the
+    /// consumer had to overload `blocked`.
+    #[test]
+    fn proposed_is_on_the_wire_560() {
+        let parsed: TicketStatus =
+            serde_json::from_str("\"proposed\"").expect("`proposed` is a known variant");
+        assert_eq!(parsed, TicketStatus::Proposed);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), "\"proposed\"");
+        assert_eq!(TicketStatus::Proposed.as_sql_str(), "proposed");
+    }
+
+    /// v24.1.0 (CIRISPersist#560) — the two properties the consumer asked for,
+    /// stated as assertions rather than prose.
+    #[test]
+    fn proposed_is_unauthorized_but_not_terminal_560() {
+        // (1) excluded from work discovery by default…
+        assert!(
+            !TicketStatus::Proposed.is_authorized(),
+            "an unapproved proposal is not work a discovery query may hand out"
+        );
+        // …and it is the ONLY status that is, because `blocked`/`deferred` are
+        // authorized work that is merely stuck — the distinction the
+        // `__proposal__` metadata workaround could not draw.
+        for s in [
+            TicketStatus::Pending,
+            TicketStatus::Assigned,
+            TicketStatus::InProgress,
+            TicketStatus::Blocked,
+            TicketStatus::Deferred,
+            TicketStatus::Completed,
+            TicketStatus::Cancelled,
+            TicketStatus::Failed,
+        ] {
+            assert!(s.is_authorized(), "{s:?} is authorized work");
+        }
+        // (2) approval is a STATUS transition, so `proposed` must not read as
+        // settled — a terminal proposal could never be approved.
+        assert!(!TicketStatus::Proposed.is_terminal());
     }
 
     #[test]

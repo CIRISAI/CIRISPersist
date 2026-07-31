@@ -463,6 +463,57 @@ mod tests {
         }
     }
 
+    /// v24.1.0 (CIRISPersist#560) — the `proposed` witness on POSTGRES, where
+    /// the V115 twin drops the V028 CHECK **by discovery** and re-adds the
+    /// 9-value one. Same body as the sqlite test: store, read back, filter by
+    /// status, then approve as a status TRANSITION.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn proposed_status_round_trips_and_is_approvable_postgres_560() {
+        use crate::store::backend::Backend;
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let id = format!("ticket-{}", Uuid::new_v4().simple());
+        let occurrence = format!("occ-560-{}", Uuid::new_v4().simple());
+        let mut t = mk_ticket(&id, &occurrence);
+        t.status = TicketStatus::Proposed;
+        TicketService::upsert_ticket(&backend, t).await.expect(
+            "a `proposed` ticket must STORE — before V115 the V028 CHECK \
+             rejected it with 23514 and the consumer had to overload `blocked`",
+        );
+        let got = backend.get_ticket(&id).await.unwrap().expect("present");
+        assert_eq!(got.status, TicketStatus::Proposed);
+        assert!(!got.status.is_authorized());
+
+        let page = backend
+            .list_tickets(
+                TicketFilter {
+                    status: Some(TicketStatus::Proposed),
+                    agent_occurrence_id: Some(occurrence),
+                    ..Default::default()
+                },
+                None,
+                50,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1, "the proposal is findable BY STATUS");
+        assert_eq!(page.items[0].ticket_id, id);
+
+        assert!(backend
+            .update_ticket_status(&id, TicketStatus::Pending, None, None)
+            .await
+            .unwrap());
+        let approved = backend.get_ticket(&id).await.unwrap().expect("present");
+        assert_eq!(approved.status, TicketStatus::Pending);
+        assert!(approved.status.is_authorized(), "approval grants authority");
+    }
+
     #[tokio::test]
     #[serial_test::serial(postgres)]
     async fn tickets_pg_upsert_get_full_columns_round_trip() {

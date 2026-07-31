@@ -2321,6 +2321,13 @@ impl SqliteBackend {
         })?;
         let conn = self.conn.clone();
         let kid = row.key_id.clone();
+        // v24.1.0 (CIRISPersist#547) — the Key-plane wire-index entry for the row
+        // this UPDATE is about to store, computed BEFORE `row` moves into the
+        // closure (the shape `put_public_key` already used) and upserted under the
+        // SAME connection lock as the write. Without it a scrub-upgraded node
+        // advertises its new content hash while the index still carries the
+        // pre-adopt one, and the ref it just advertised point-reads to `None`.
+        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
         let n = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
             // The WHERE re-asserts the guards atomically: self-signed + same
@@ -2331,7 +2338,7 @@ impl SqliteBackend {
             // marker (its OQ-1 overwrite surface is `set_consent_role`),
             // not registration content; an anchor-scrub upgrade must not
             // clobber an assigned role.
-            conn.execute(
+            let n = conn.execute(
                 "UPDATE federation_keys SET \
                     pubkey_ml_dsa_65_base64 = ?2, algorithm = ?3, identity_type = ?4, \
                     identity_ref = ?5, valid_from = ?6, valid_until = ?7, \
@@ -2360,7 +2367,11 @@ impl SqliteBackend {
                     attestation_text,
                     row.pubkey_ed25519_base64,
                 ],
-            )
+            )?;
+            if n > 0 {
+                sqlite_upsert_wire_index(&conn, "Key", &wire_index_hash, &wire_index_key)?;
+            }
+            Ok(n)
         })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("adopt_scrub_upgrade {kid}: {e}"))
@@ -2489,13 +2500,17 @@ impl SqliteBackend {
         let expected_prior_hash = existing.persist_row_hash.clone();
         let conn = self.conn.clone();
         let kid = row.key_id.clone();
+        // v24.1.0 (CIRISPersist#547) — the successor's wire-index entry; see
+        // `wire_index::key_entry`. A canonical rotation that skipped this
+        // advertised the rotated record and could not serve it.
+        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
         let n = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
             // Atomic swap: replace the EXACT version the policy was verified
             // against (persist_row_hash guard) — a concurrent supersede to a
             // different version matches 0 rows and fails closed. `consent_role`
             // stays out of the SET (operational marker, not registration).
-            conn.execute(
+            let n = conn.execute(
                 "UPDATE federation_keys SET \
                     pubkey_ml_dsa_65_base64 = ?2, algorithm = ?3, identity_type = ?4, \
                     identity_ref = ?5, valid_from = ?6, valid_until = ?7, \
@@ -2526,7 +2541,11 @@ impl SqliteBackend {
                     row.pubkey_ed25519_base64,
                     expected_prior_hash,
                 ],
-            )
+            )?;
+            if n > 0 {
+                sqlite_upsert_wire_index(&conn, "Key", &wire_index_hash, &wire_index_key)?;
+            }
+            Ok(n)
         })()
         .map_err(|e| {
             crate::federation::Error::Backend(format!("supersede_canonical_record {kid}: {e}"))
@@ -2757,13 +2776,16 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             .map_err(|e| Error::InvalidArgument(format!("original_content_hash hex: {e}")))?;
         let conn = self.conn.clone();
         let kid = row.key_id.clone();
+        // v24.1.0 (CIRISPersist#547) — the re-anchored row's wire-index entry;
+        // see `wire_index::key_entry`.
+        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
         let n = tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
             // WHERE re-asserts the identity guard atomically. Unlike
             // adopt_scrub_upgrade there is NO `scrub_key_id = key_id`
             // condition — this path replaces an ANCHORED row, under the
             // bundle-quorum authority verified above.
-            conn.execute(
+            let n = conn.execute(
                 "UPDATE federation_keys SET \
                     pubkey_ml_dsa_65_base64 = ?2, algorithm = ?3, identity_type = ?4, \
                     identity_ref = ?5, valid_from = ?6, valid_until = ?7, \
@@ -2792,7 +2814,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     attestation_text,
                     row.pubkey_ed25519_base64,
                 ],
-            )
+            )?;
+            if n > 0 {
+                sqlite_upsert_wire_index(&conn, "Key", &wire_index_hash, &wire_index_key)?;
+            }
+            Ok(n)
         })
         .await
         .map_err(|e| Error::Backend(format!("join: {e}")))?
@@ -2946,11 +2972,9 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // v21.1.0 (CIRISPersist#507b) — compute the wire-index entry from
         // `row` BEFORE it moves into the INSERT closure below (`row` is the
         // exact value `SignedKeyRecord` wraps for the read surface).
-        let wire_index_key = crate::federation::wire_index::record_key(&[("key_id", &row.key_id)]);
-        let wire_index_hash =
-            crate::federation::wire_index::content_hash_of(&crate::federation::SignedKeyRecord {
-                record: row.clone(),
-            })?;
+        // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
+        // path and the four mutators cannot compute the entry differently.
+        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
         let conn = self.conn.clone();
         (move || -> Result<(), rusqlite::Error> {
             let conn = conn.lock();
@@ -3074,6 +3098,14 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     /// to the stored `'unregistered'` default (revoke). No chain — a
     /// subsequent call overwrites. Excluded from `persist_row_hash`, so
     /// this does not touch the signed row.
+    ///
+    /// v24.1.0 (CIRISPersist#547) — it DOES move the **wire** content hash,
+    /// though, and those are two different hashes. `persist_row_hash` is the
+    /// row-integrity digest and deliberately omits this column; the
+    /// `signed_wire_index` hash is `sha256` over the bytes the read surface
+    /// returns, and `KeyRecord::consent_role` IS in those bytes. So this write
+    /// re-indexes like every other Key-plane mutator — otherwise assigning a
+    /// consent role silently unserves the record's advertised ref.
     async fn set_consent_role(
         &self,
         key_id: &str,
@@ -3082,15 +3114,35 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         crate::federation::types::consent_role::check_admissible(consent_role)?;
         let stored =
             crate::federation::types::consent_role::stored_from_wire(consent_role).to_owned();
+        // The post-write row, from this node's own state — never a guess about
+        // what the rest of the columns hold.
+        let indexed =
+            match <Self as crate::federation::FederationDirectory>::lookup_public_key(self, key_id)
+                .await?
+            {
+                Some(mut r) => {
+                    r.consent_role =
+                        crate::federation::types::consent_role::wire_from_stored(&stored)
+                            .map(str::to_owned);
+                    Some(crate::federation::wire_index::key_entry(&r)?)
+                }
+                None => None,
+            };
         let conn = self.conn.clone();
         let key_id = key_id.to_owned();
         let key_id_for_exec = key_id.clone();
         let n = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
-            conn.execute(
+            let n = conn.execute(
                 "UPDATE federation_keys SET consent_role = ?2 WHERE key_id = ?1",
                 rusqlite::params![key_id_for_exec, stored],
-            )
+            )?;
+            if n > 0 {
+                if let Some((hash, record_key)) = &indexed {
+                    sqlite_upsert_wire_index(&conn, "Key", hash, record_key)?;
+                }
+            }
+            Ok(n)
         })()
         .map_err(|e| crate::federation::Error::Backend(format!("set_consent_role: {e}")))?;
         if n == 0 {
@@ -7884,20 +7936,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
-
+        // v24.1.0 (CIRISPersist#547) — the hybrid-completion write changes FOUR
+        // serialized columns, so it moves the record's content hash exactly like
+        // the anchor mutators do. `row` is already the post-write value bar the
+        // hash; stamp that and index the result. See `wire_index::key_entry`.
         let conn = self.conn.clone();
         let key_id = key_id.to_owned();
+        let key_id_for_exec = key_id.clone();
         let mldsa = pubkey_ml_dsa_65_base64.to_owned();
         let pqc_sig = scrub_signature_pqc.to_owned();
         let now_str = now.to_rfc3339();
         let n = (move || -> Result<usize, rusqlite::Error> {
-            let conn = conn.lock();
-            conn.execute(
+            conn.lock().execute(
                 "UPDATE federation_keys \
                  SET pubkey_ml_dsa_65_base64 = ?1, scrub_signature_pqc = ?2, \
                      pqc_completed_at = ?3, persist_row_hash = ?4 \
                  WHERE key_id = ?5 AND pqc_completed_at IS NULL",
-                rusqlite::params![mldsa, pqc_sig, now_str, new_hash, key_id],
+                rusqlite::params![mldsa, pqc_sig, now_str, new_hash, key_id_for_exec],
             )
         })()
         .map_err(|e| crate::federation::Error::Backend(format!("attach_key_pqc_signature: {e}")))?;
@@ -7905,6 +7960,32 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             return Err(crate::federation::Error::Conflict(
                 "federation_keys row was concurrently completed".to_string(),
             ));
+        }
+        // v24.1.0 (CIRISPersist#547) — the hybrid-completion write moves FOUR
+        // serialized columns, so it moves the wire content hash exactly like the
+        // anchor mutators do. Indexed from the row AS STORED, by re-reading it:
+        // `pqc_completed_at` is generated HERE at nanosecond precision, and a
+        // backend that rounds it (postgres TIMESTAMPTZ keeps microseconds) would
+        // otherwise be handed the hash of a value its read surface never
+        // returns — the same advertise-vs-serve desync in the other direction.
+        // The postgres twin failed exactly that way before this re-read landed.
+        // Re-reading makes the index agree with the read surface by
+        // construction, on any backend, whatever it rounds.
+        if let Some(stored) =
+            <Self as crate::federation::FederationDirectory>::lookup_public_key(self, &key_id)
+                .await?
+        {
+            let (wire_index_hash, wire_index_key) =
+                crate::federation::wire_index::key_entry(&stored)?;
+            let conn = self.conn.clone();
+            (move || {
+                sqlite_upsert_wire_index(&conn.lock(), "Key", &wire_index_hash, &wire_index_key)
+            })()
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!(
+                    "attach_key_pqc_signature signed_wire_index: {e}"
+                ))
+            })?;
         }
         Ok(())
     }
@@ -19007,6 +19088,39 @@ mod accord_tests {
         crate::federation::operational::test_support::exercise_family_trust_root(&backend, "sq557")
             .await
             .expect("557 family trust root exercise");
+    }
+
+    /// **CIRISPersist#561 — transport-hop eligibility.** The A/B/C/D rule, its
+    /// authoritative TTL, the anti-inflation bound and the withdrawal contract,
+    /// on sqlite.
+    #[tokio::test]
+    async fn transit_eligibility_works_on_sqlite_561() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_transit_eligibility(
+            &backend, "sq561",
+        )
+        .await
+        .expect("561 transit eligibility exercise");
+        crate::federation::operational::test_support::exercise_transit_eligibility_family_root(
+            &backend, "sq561f",
+        )
+        .await
+        .expect("561 family-root transit eligibility exercise");
+    }
+
+    /// **CIRISPersist#547 — a scrub-upgraded node must be able to serve the Key
+    /// ref it advertises.** Every `federation_keys` mutator maintains
+    /// `signed_wire_index`, on sqlite.
+    #[tokio::test]
+    async fn key_wire_index_follows_every_mutator_sqlite_547() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::operational::test_support::exercise_key_wire_index_follows_every_mutator(
+            &backend, "sq547",
+        )
+        .await
+        .expect("547 wire-index-follows-mutators exercise");
     }
 
     /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on sqlite.

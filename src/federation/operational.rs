@@ -2836,6 +2836,635 @@ pub mod test_support {
             });
         assert_eq!(grant.root_key_id, root_b);
     }
+
+    /// v24.1.0 (CIRISPersist#561) — register `key_id` as a NODE that
+    /// self-offers `infra:transport`, on any backend.
+    ///
+    /// The self-claim conjuncts (B) and (C) of the transit gate, and NOTHING
+    /// else — which is the point of the AV-75 witness below: this alone must
+    /// buy a peer nothing.
+    async fn register_transport_node(
+        directory: &dyn crate::federation::FederationDirectory,
+        key_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::types::{delegation_scope, identity_type};
+        let mut record = crate::federation::tier_ingest::test_support::replicated_key_record(
+            key_id,
+            identity_type::NODE,
+            key_id,
+            key_id,
+            "transit",
+        );
+        record.capability_roles = vec![delegation_scope::INFRA_TRANSPORT.to_owned()];
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord { record })
+            .await
+    }
+
+    /// v24.1.0 (CIRISPersist#561) — emit a live `delegates_to(from → root)`
+    /// `trust:accepts:v1` edge, really signed by `from`, optionally expiring.
+    ///
+    /// The un-trust lever and the TTL contributor in one row: this is the edge
+    /// a withdrawal tombstones and the edge whose `expires_at` bounds the
+    /// cached verdict.
+    async fn emit_trust_edge(
+        directory: &dyn crate::federation::FederationDirectory,
+        from: &str,
+        root: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<String, crate::federation::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut edge = signed_trust_attestation(
+            &id,
+            from,
+            root,
+            crate::federation::types::attestation_type::DELEGATES_TO,
+            json!({
+                "references_attestation_id": id,
+                "dimension": crate::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
+                "scope": [crate::federation::trust_root::INFRA_SERVE_SCOPE],
+            }),
+        );
+        edge.expires_at = expires_at;
+        directory
+            .put_attestation(crate::federation::SignedAttestation { attestation: edge })
+            .await?;
+        Ok(id)
+    }
+
+    /// v24.1.0 (CIRISPersist#561) — tombstone `attestation_id` with a
+    /// `withdraws` composer authored by `attester` (the CEG un-trust act).
+    async fn withdraw_attestation(
+        directory: &dyn crate::federation::FederationDirectory,
+        attester: &str,
+        subject: &str,
+        attestation_id: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let row = signed_trust_attestation(
+            &id,
+            attester,
+            subject,
+            crate::federation::types::attestation_type::WITHDRAWS,
+            json!({
+                "id": id,
+                "references_attestation_id": attestation_id,
+            }),
+        );
+        directory
+            .put_attestation(crate::federation::SignedAttestation { attestation: row })
+            .await
+    }
+
+    /// **CIRISPersist#561 — transport-hop eligibility, end to end, on any
+    /// backend.**
+    ///
+    /// The scenario is CIRISEdge#430's: a selecting node, a candidate relay,
+    /// and a shared trust root neither of them owns. Each witness pins one
+    /// clause of the rule.
+    ///
+    /// | # | witness | what it pins |
+    /// |---|---|---|
+    /// | a | unregistered user ⇒ `false` | fail-closed on the ASKING side, not just the peer's |
+    /// | b | self-claimed `infra:transport`, no shared root ⇒ `false` | the AV-75 property: registering the string buys nothing |
+    /// | c | all four legs ⇒ `true`, `via_root` names the root, TTL min-folds | the gate, and its authoritative cache bound |
+    /// | d | each leg removed individually ⇒ `false` | every conjunct is load-bearing |
+    /// | e | a hostile peer's 50 `delegates_to` rows change neither the verdict NOR the candidate set | the anti-inflation property |
+    /// | f | withdraw the user's edge ⇒ `false` on the very next call | the event-driven invalidation contract's substrate half |
+    /// | g | the `_over_roster` arm agrees with the default arm | the ceremony-parity entry point |
+    pub async fn exercise_transit_eligibility(
+        directory: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::trust_root::{
+            resolve_transit_eligibility, resolve_transit_eligibility_over_roster, INFRA_SERVE_SCOPE,
+        };
+        use crate::federation::types::identity_type;
+
+        let user = format!("{tag}-user");
+        let peer = format!("{tag}-peer");
+        let root = format!("{tag}-root");
+        let sink = format!("{tag}-sink");
+
+        // ── (a) RED — an unregistered USER cannot be eligible for anything.
+        // The peer does not exist yet either; what is pinned is that the walk
+        // DENIES rather than erroring out of the caller's hands.
+        let unknown = resolve_transit_eligibility(directory, &user, &peer).await?;
+        assert!(
+            !unknown.eligible && unknown.via_root.is_none() && unknown.valid_until.is_none(),
+            "({tag}) (a) an unresolvable walk DENIES — a transport gate never fails open: \
+             {unknown:?}"
+        );
+
+        register_transport_node(directory, &user).await?;
+        register_transport_node(directory, &peer).await?;
+        register_transport_node(directory, &sink).await?;
+
+        // ── (b) THE AV-75 PROPERTY. Both sides now register the string
+        // `infra:transport` and both are `node`s — conjuncts (A)(B)(C) all
+        // hold — and there is still no shared root. Eligibility must be false,
+        // or the gate is a self-declaration.
+        let self_claimed = resolve_transit_eligibility(directory, &user, &peer).await?;
+        assert!(
+            !self_claimed.eligible,
+            "({tag}) (b) self-claimed infra:transport with NO shared root buys NOTHING \
+             (AV-75): {self_claimed:?}"
+        );
+
+        // The shared root: a real charter + drill, plus each side's own
+        // `trust:accepts` edge. `establish_trust_root_side` stands up the root
+        // half (the accord-reserved drill a consumer cannot mint itself).
+        establish_trust_root_side(directory, &root, &sink, INFRA_SERVE_SCOPE).await?;
+        let user_edge = emit_trust_edge(directory, &user, &root, None).await?;
+        let peer_edge = emit_trust_edge(directory, &peer, &root, None).await?;
+
+        // ── (c) GREEN — all four legs.
+        let ok = resolve_transit_eligibility(directory, &user, &peer).await?;
+        assert!(
+            ok.eligible,
+            "({tag}) (c) node + infra:transport + a shared valid root ⇒ eligible: {ok:?}"
+        );
+        assert_eq!(
+            ok.via_root.as_deref(),
+            Some(root.as_str()),
+            "({tag}) (c) via_root NAMES the shared root — the caller's cache key"
+        );
+        assert!(
+            ok.valid_until.is_none(),
+            "({tag}) (c) nothing walked is time-bounded here, so the TTL is None (cache \
+             until a withdrawal event) — NOT a fabricated finite value: {ok:?}"
+        );
+
+        // ── (g) the `_over_roster` arm. Driven with a roster the test HOLDS,
+        // and it must agree with the default arm exactly — the entry point is
+        // parity, not a second policy.
+        let holders: Vec<String> = (0..3).map(|i| format!("{tag}-rh{i}")).collect();
+        let over =
+            resolve_transit_eligibility_over_roster(directory, &user, &peer, &holders).await?;
+        assert_eq!(
+            over, ok,
+            "({tag}) (g) the _over_roster arm returns the SAME verdict — none of the four \
+             conjuncts reads the ceremony plane, and the entry point must not invent one"
+        );
+
+        // ── (c2) TTL MIN-FOLD, from BOTH sides.
+        //
+        // Both edges must be finite for this to say anything: with one side
+        // unbounded, min and max agree and a fold written the wrong way round
+        // passes. (The first draft left the peer's original unbounded edge in
+        // place and stayed green under a deliberate `min`→`max` swap.) So the
+        // unbounded edges are withdrawn first, and the earliest bound is then
+        // moved from one side to the other — a fold that always returned "our"
+        // side, or "the first" side, fails the second half.
+        let near = chrono::Utc::now() + chrono::Duration::hours(2);
+        let far = chrono::Utc::now() + chrono::Duration::hours(9);
+        withdraw_attestation(directory, &peer, &root, &peer_edge).await?;
+        withdraw_attestation(directory, &user, &root, &user_edge).await?;
+        let peer_far = emit_trust_edge(directory, &peer, &root, Some(far)).await?;
+        let mut bounded_user_edge = emit_trust_edge(directory, &user, &root, Some(near)).await?;
+
+        // OUR side is the earlier one.
+        let bounded = resolve_transit_eligibility(directory, &user, &peer).await?;
+        assert!(bounded.eligible, "({tag}) (c2) still eligible: {bounded:?}");
+        let ttl = bounded
+            .valid_until
+            .unwrap_or_else(|| panic!("({tag}) (c2) a bounded edge MUST produce a bounded TTL"));
+        assert!(
+            (ttl - near).num_seconds().abs() <= 1,
+            "({tag}) (c2) the EARLIEST bound wins: expected ~{near}, got {ttl}. The peer's \
+             own edge expires at {far} and must not be what the caller caches to."
+        );
+
+        // THEIR side is the earlier one — same rule, other direction.
+        withdraw_attestation(directory, &peer, &root, &peer_far).await?;
+        withdraw_attestation(directory, &user, &root, &bounded_user_edge).await?;
+        emit_trust_edge(directory, &peer, &root, Some(near)).await?;
+        bounded_user_edge = emit_trust_edge(directory, &user, &root, Some(far)).await?;
+        let flipped = resolve_transit_eligibility(directory, &user, &peer).await?;
+        let flipped_ttl = flipped
+            .valid_until
+            .unwrap_or_else(|| panic!("({tag}) (c2) the flipped case is bounded too"));
+        assert!(
+            (flipped_ttl - near).num_seconds().abs() <= 1,
+            "({tag}) (c2) the earliest bound wins whichever SIDE carries it: expected \
+             ~{near} (the peer's), got {flipped_ttl}"
+        );
+
+        // ── (e) ANTI-INFLATION. A hostile peer authors fifty `trust:accepts`
+        // edges to fifty roots we have never heard of, and neither the verdict
+        // nor the WORK may grow.
+        //
+        // Three deliberate choices, each of which the first draft got wrong and
+        // stayed green for:
+        //
+        // 1. The work is read from the REAL walk's own count of candidate roots
+        //    evaluated. Re-deriving `transit_candidate_roots` in the test
+        //    asserts the boundary's DEFINITION and says nothing about whether
+        //    the walk honours it — that draft stayed green under a walk
+        //    deliberately rewritten to enumerate the peer's edges too.
+        // 2. The probe peer is INELIGIBLE, so the candidate loop runs to
+        //    exhaustion. Against an eligible peer the walk short-circuits on
+        //    the first matching root and the count is 1 no matter how inflated
+        //    the set is — which is exactly the case an attacker would not
+        //    bother with. The DoS shape is a candidate that never matches.
+        // 3. The flood is authored by the peer being MEASURED. Inflation is
+        //    peer-specific; flooding one peer and measuring another proves
+        //    nothing.
+        let flooded = format!("{tag}-flooded");
+        register_transport_node(directory, &flooded).await?;
+        let (before_verdict, walked_before) =
+            crate::federation::trust_root::resolve_transit_eligibility_counting_roots(
+                directory, &user, &flooded,
+            )
+            .await?;
+        assert!(
+            !before_verdict.eligible,
+            "({tag}) (e) the probe peer shares no root, so the loop EXHAUSTS the candidate \
+             set rather than short-circuiting: {before_verdict:?}"
+        );
+        assert_eq!(
+            walked_before, 1,
+            "({tag}) (e) the user trusts exactly one root, so exactly one candidate is walked"
+        );
+        for i in 0..50 {
+            let bogus = format!("{tag}-bogus{i}");
+            register_transport_node(directory, &bogus).await?;
+            emit_trust_edge(directory, &flooded, &bogus, None).await?;
+        }
+        let (after_verdict, walked_after) =
+            crate::federation::trust_root::resolve_transit_eligibility_counting_roots(
+                directory, &user, &flooded,
+            )
+            .await?;
+        assert_eq!(
+            walked_after, walked_before,
+            "({tag}) (e) 50 peer-authored edges did not add ONE unit of work (still \
+             {walked_before}, not 51). The candidate set is bounded by the ASKING node's \
+             own records; enumerating from the peer would let any peer set the cost of \
+             evaluating it — on a per-substream hot path — for free."
+        );
+        assert!(
+            !after_verdict.eligible,
+            "({tag}) (e) …and fifty self-authored roots still buy the peer nothing: \
+             {after_verdict:?}"
+        );
+        // The eligible peer's verdict is untouched by a sibling's flood.
+        let after_flood = resolve_transit_eligibility(directory, &user, &peer).await?;
+        assert_eq!(
+            after_flood.via_root.as_deref(),
+            Some(root.as_str()),
+            "({tag}) (e) the real peer still roots through OUR root, not one of theirs"
+        );
+
+        // ── (d) EVERY CONJUNCT IS LOAD-BEARING.
+        //
+        // (d/A) a peer that is not in the directory at all.
+        let absent = resolve_transit_eligibility(directory, &user, &format!("{tag}-ghost")).await?;
+        assert!(
+            !absent.eligible,
+            "({tag}) (d/A) directory presence is required: {absent:?}"
+        );
+
+        // (d/B) a peer that is NOT a node — same trust root, same transport
+        // claim, wrong identity_type.
+        let agent = format!("{tag}-agent");
+        let mut agent_rec = crate::federation::tier_ingest::test_support::replicated_key_record(
+            &agent,
+            identity_type::AGENT,
+            &agent,
+            &agent,
+            "transit",
+        );
+        agent_rec.capability_roles =
+            vec![crate::federation::types::delegation_scope::INFRA_TRANSPORT.to_owned()];
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord { record: agent_rec })
+            .await?;
+        emit_trust_edge(directory, &agent, &root, None).await?;
+        let not_a_node = resolve_transit_eligibility(directory, &user, &agent).await?;
+        assert!(
+            !not_a_node.eligible,
+            "({tag}) (d/B) a non-`node` identity is not a hop, however it is rooted — node \
+             mode is the verifiable recast of proxy/server mode: {not_a_node:?}"
+        );
+
+        // (d/C) a NODE, validly sharing our root, that never offered transport.
+        let quiet = format!("{tag}-quiet");
+        crate::federation::tier_ingest::test_support::register_identity_key(
+            directory,
+            &quiet,
+            identity_type::NODE,
+        )
+        .await;
+        emit_trust_edge(directory, &quiet, &root, None).await?;
+        let no_offer = resolve_transit_eligibility(directory, &user, &quiet).await?;
+        assert!(
+            !no_offer.eligible,
+            "({tag}) (d/C) a node that does not offer infra:transport is not a hop: \
+             {no_offer:?}"
+        );
+
+        // (d/D) a peer with NO trust root of its own: its side of the overlap
+        // is missing and eligibility goes with it, with no write on our side.
+        let solo = format!("{tag}-solo");
+        register_transport_node(directory, &solo).await?;
+        let solo_ineligible = resolve_transit_eligibility(directory, &user, &solo).await?;
+        assert!(
+            !solo_ineligible.eligible,
+            "({tag}) (d/D) a rooted-to-nothing peer shares no root with us: \
+             {solo_ineligible:?}"
+        );
+
+        // ── (f) WITHDRAWAL — the invalidation contract's substrate half.
+        // Delete the ONE `delegates_to(user → root)` edge and the very next
+        // resolution reads false. Nothing is special-cased: (D) re-derives from
+        // live graph state on every call, so the tombstone IS the mechanism.
+        withdraw_attestation(directory, &user, &root, &bounded_user_edge).await?;
+        let after_withdrawal = resolve_transit_eligibility(directory, &user, &peer).await?;
+        assert!(
+            !after_withdrawal.eligible,
+            "({tag}) (f) withdrawing our own trust edge un-elects the peer on the NEXT \
+             call — the operator's un-trust lever reaches the transport plane too: \
+             {after_withdrawal:?}"
+        );
+        assert!(
+            after_withdrawal.via_root.is_none() && after_withdrawal.valid_until.is_none(),
+            "({tag}) (f) a denied verdict carries no root and no TTL — there is nothing for \
+             a caller to cache: {after_withdrawal:?}"
+        );
+
+        // ── (e2) EXPIRY IS HONORED without any tombstone: an edge whose
+        // `expires_at` has PASSED is as dead to the walk as a withdrawn one
+        // (#488 delta 3), so a peer cannot ride a stale grant.
+        let stale_root = format!("{tag}-stale-root");
+        establish_trust_root_side(directory, &stale_root, &sink, INFRA_SERVE_SCOPE).await?;
+        let past = chrono::Utc::now() - chrono::Duration::minutes(5);
+        emit_trust_edge(directory, &user, &stale_root, Some(past)).await?;
+        emit_trust_edge(directory, &peer, &stale_root, None).await?;
+        let expired = resolve_transit_eligibility(directory, &user, &peer).await?;
+        assert!(
+            !expired.eligible,
+            "({tag}) (e2) an EXPIRED shared-root edge is not a shared root — stale grants \
+             die of age, no tombstone required: {expired:?}"
+        );
+        Ok(())
+    }
+
+    /// **CIRISPersist#561 — a shared FAMILY root satisfies (D) too.**
+    ///
+    /// The v24.0.0 finding was that the mesh's root authority is a THRESHOLD,
+    /// not a seat, and the transport gate inherits that for free: conjunct (D)
+    /// is `trust_root_valid` on both sides, and that predicate already chooses
+    /// its own arm from the node's stored state. A relay hop can therefore be
+    /// anchored on the ACCORD rather than on whichever holder happened to sign
+    /// — which is the shape a production mesh actually has.
+    ///
+    /// Kept as its own body rather than a ninth witness inside
+    /// [`exercise_transit_eligibility`]: the cast is different (three seated
+    /// holders and a keyless family instead of one key root), and the point is
+    /// precisely that NOTHING in the transit walk is arm-aware. If this needed
+    /// special-casing to pass, that would be the finding.
+    pub async fn exercise_transit_eligibility_family_root(
+        directory: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::trust_root::{
+            resolve_transit_eligibility, trust_root_valid, RootKind, INFRA_ATTEST_SCOPE,
+            INFRA_SERVE_SCOPE, TRUST_CHARTER_DIMENSION,
+        };
+        use crate::federation::types::{attestation_type, identity_type};
+
+        let accord = format!("{tag}-accord");
+        let user = format!("{tag}-user");
+        let peer = format!("{tag}-peer");
+        let holders: Vec<String> = (0..3).map(|i| format!("{tag}-h{i}")).collect();
+
+        for who in &holders {
+            register_typed_key(directory, who, identity_type::NODE).await?;
+        }
+        register_transport_node(directory, &user).await?;
+        register_transport_node(directory, &peer).await?;
+        seed_test_family(directory, &accord, &holders, "quorum:2/3").await?;
+
+        // The accord charters ITSELF at 2-of-3 — no seat can do it alone.
+        let successors = vec![format!("{accord}-succ-a"), format!("{accord}-succ-b")];
+        let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("#561 pre_rotation_commitment: {e}"))
+            })?;
+        let charter_id = uuid::Uuid::new_v4().to_string();
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: co_signed_trust_attestation(
+                    &charter_id,
+                    &holders[0],
+                    &accord,
+                    attestation_type::DELEGATES_TO,
+                    json!({
+                        "references_attestation_id": charter_id,
+                        "dimension": TRUST_CHARTER_DIMENSION,
+                        "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+                        "pre_rotation_commitment": commitment,
+                    }),
+                    &[&holders[1]],
+                ),
+            })
+            .await?;
+
+        // Each side names THE ACCORD, not a holder.
+        emit_trust_edge(directory, &user, &accord, None).await?;
+        emit_trust_edge(directory, &peer, &accord, None).await?;
+
+        let verdict = trust_root_valid(directory, &user, &accord).await?;
+        assert_eq!(
+            verdict.root_kind,
+            RootKind::Family,
+            "({tag}) the shared root really is the keyless family arm: {verdict:?}"
+        );
+        assert!(verdict.valid, "({tag}) …and it is valid: {verdict:?}");
+
+        let eligible = resolve_transit_eligibility(directory, &user, &peer).await?;
+        assert!(
+            eligible.eligible,
+            "({tag}) a shared FAMILY root satisfies (D) exactly as a key root does — the \
+             transit walk is not arm-aware, and must not need to be: {eligible:?}"
+        );
+        assert_eq!(
+            eligible.via_root.as_deref(),
+            Some(accord.as_str()),
+            "({tag}) via_root names the FAMILY — the cache key an accord-wide revocation \
+             would invalidate"
+        );
+
+        // The THRESHOLD is still the gate underneath, and it is re-derived on
+        // every call. Grow the accord to five seats: the family row still says
+        // `quorum:2/3`, but the node floors that at a strict majority of the
+        // roster it actually holds, so the 2-of-3 charter stops being quorate —
+        // with no write to the charter, nothing revoked, and nothing at all
+        // written on the transit plane. The hop goes ineligible because (D)
+        // re-derives, which is the same mechanism as the withdrawal contract.
+        for i in 3..5 {
+            let extra = format!("{tag}-h{i}");
+            register_typed_key(directory, &extra, identity_type::NODE).await?;
+            directory
+                .add_family_member(
+                    &accord,
+                    crate::federation::types::FamilyMember {
+                        key_id: extra,
+                        joined_at: chrono::Utc::now(),
+                        role: Some("founder".to_owned()),
+                    },
+                )
+                .await?;
+        }
+        let after_growth = resolve_transit_eligibility(directory, &user, &peer).await?;
+        assert!(
+            !after_growth.eligible,
+            "({tag}) two of five seats is not a majority, so the family root is no longer \
+             chartered — and the hop it anchored goes with it. The threshold reaches the \
+             transport plane, with nothing written there: {after_growth:?}"
+        );
+        Ok(())
+    }
+
+    /// v24.1.0 (CIRISPersist#547) — **whatever this node ADVERTISES, it can
+    /// SERVE.**
+    ///
+    /// The advertised ref is `sha256` over the bytes
+    /// `list_signed_key_records_since` returns for the CURRENT row, and the peer
+    /// fetches it with `lookup_signed_record_by_content_hash("Key", <that
+    /// hash>)`. Those two facts are maintained by different code — the read
+    /// surface re-serializes, `signed_wire_index` is written at each put path —
+    /// so they are free to disagree, which is exactly the #541
+    /// preserve-set ≢ verified-set class. #547 is the Key plane's instance:
+    /// `put_public_key` maintained the index and every `UPDATE
+    /// federation_keys` path did not, so a node scrub-upgraded while running
+    /// advertised a ref it could not serve, and the miss was SILENT (edge's
+    /// fetch is a `let … else { continue }`).
+    ///
+    /// This asserts the round trip after EVERY mutator the backend exposes, so
+    /// the property does not care how many write paths get added later. Backends
+    /// that do not implement a mutator (memory has no `adopt_scrub_upgrade`) skip
+    /// that leg and still run the rest.
+    pub async fn exercise_key_wire_index_follows_every_mutator(
+        directory: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::tier_ingest::test_support as ts;
+        use crate::federation::types::identity_type;
+
+        let anchor = format!("{tag}-anchor");
+        let node = format!("{tag}-node");
+        ts::register_hybrid_key(directory, &anchor).await;
+
+        // (0) the self-signed boot row — `put_public_key`, the one writer that
+        // always maintained the index. The GREEN control: if this leg fails the
+        // harness itself is wrong, not the mutators.
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord {
+                record: ts::replicated_key_record(&node, identity_type::NODE, &node, &node, "boot"),
+            })
+            .await?;
+        assert_advertised_key_ref_is_servable(directory, &node, tag, "put_public_key").await?;
+
+        // (1) adopt_scrub_upgrade — the mutator CIRISServer measured. Live
+        // production code (the admit-node / rooting loop), and the row it
+        // rewrites is the node's OWN, advertised the instant it lands.
+        match directory
+            .adopt_scrub_upgrade(crate::federation::SignedKeyRecord {
+                record: ts::replicated_key_record(
+                    &node,
+                    identity_type::NODE,
+                    &anchor,
+                    &anchor,
+                    "boot",
+                ),
+            })
+            .await
+        {
+            Ok(_) => {
+                assert_advertised_key_ref_is_servable(directory, &node, tag, "adopt_scrub_upgrade")
+                    .await?;
+            }
+            // The trait default — this backend does not implement the upgrade
+            // (memory). Reported, not silently passed.
+            Err(crate::federation::Error::InvalidArgument(detail))
+                if detail.contains("not supported on this backend") => {}
+            Err(e) => return Err(e),
+        }
+
+        // (2) set_consent_role — NOT one of the three the issue names, and the
+        // reason it is here: `consent_role` is excluded from `persist_row_hash`
+        // (so its own doc said it "does not touch the signed row") but it IS in
+        // the bytes the read surface returns. Two hashes, one of them moved.
+        directory.set_consent_role(&node, Some("peer")).await?;
+        assert_advertised_key_ref_is_servable(directory, &node, tag, "set_consent_role").await?;
+
+        // (3) attach_key_pqc_signature — four serialized columns at once.
+        // A fresh hybrid-pending row, since the one above is already complete.
+        let pending = format!("{tag}-pending");
+        let mut rec =
+            ts::replicated_key_record(&pending, identity_type::NODE, &pending, &pending, "boot");
+        let (pqc_pubkey, pqc_sig) = (
+            rec.pubkey_ml_dsa_65_base64
+                .take()
+                .expect("the deterministic record carries a PQC pubkey"),
+            rec.scrub_signature_pqc
+                .take()
+                .expect("the deterministic record carries a PQC signature"),
+        );
+        rec.pqc_completed_at = None;
+        directory
+            .put_public_key(crate::federation::SignedKeyRecord { record: rec })
+            .await?;
+        assert_advertised_key_ref_is_servable(directory, &pending, tag, "put_public_key (pending)")
+            .await?;
+        directory
+            .attach_key_pqc_signature(&pending, &pqc_pubkey, &pqc_sig)
+            .await?;
+        assert_advertised_key_ref_is_servable(directory, &pending, tag, "attach_key_pqc_signature")
+            .await?;
+        Ok(())
+    }
+
+    /// v24.1.0 (CIRISPersist#547) — the round trip itself: hash what this node
+    /// ADVERTISES for `key_id` and demand the point-read serve it, byte-exact.
+    ///
+    /// Deliberately hashes the ADVERTISE surface
+    /// ([`FederationDirectory::list_signed_key_records_since`](crate::federation::FederationDirectory::list_signed_key_records_since))
+    /// rather than a re-serialized `lookup_public_key`, because the advertised
+    /// bytes are what a peer actually asks for — the measured symptom was
+    /// `ADVERTISED hash ⇒ POINT-READ None`.
+    async fn assert_advertised_key_ref_is_servable(
+        directory: &dyn crate::federation::FederationDirectory,
+        key_id: &str,
+        tag: &str,
+        after: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let advertised = directory
+            .list_signed_key_records_since(None, 10_000)
+            .await?
+            .into_iter()
+            .find(|r| r.record.key_id == key_id)
+            .unwrap_or_else(|| panic!("({tag}) {key_id} is advertised after {after}"));
+        let hash = crate::federation::wire_index::content_hash_of(&advertised)?;
+        let served = directory
+            .lookup_signed_record_by_content_hash("Key", &hash)
+            .await?;
+        let served = served.unwrap_or_else(|| {
+            panic!(
+                "({tag}) after {after}: {key_id} advertises (Key, {hash}) and CANNOT SERVE IT. \
+                 The row moved and `signed_wire_index` did not follow, so the peer asks for \
+                 exactly the ref we published and gets None — silently (CIRISPersist#547)."
+            )
+        });
+        assert_eq!(
+            served,
+            serde_json::to_vec(&advertised).expect("advertised record re-serializes"),
+            "({tag}) after {after}: the served bytes must be the advertised bytes"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]

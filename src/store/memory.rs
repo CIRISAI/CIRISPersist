@@ -1838,11 +1838,9 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         }
         // v21.1.0 (CIRISPersist#507b) — `SignedKeyRecord` wraps the exact
         // `row` the read surface re-serializes.
-        let wire_index_key = crate::federation::wire_index::record_key(&[("key_id", &row.key_id)]);
-        let wire_index_hash =
-            crate::federation::wire_index::content_hash_of(&crate::federation::SignedKeyRecord {
-                record: row.clone(),
-            })?;
+        // v24.1.0 (CIRISPersist#547) — through the SHARED derivation, so this
+        // path and the mutators cannot compute the entry differently.
+        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
         state.federation_keys.insert(row.key_id.clone(), row);
         state
             .signed_wire_index
@@ -1906,7 +1904,14 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                 ),
             });
         }
+        // v24.1.0 (CIRISPersist#547) — the Key-plane wire index must follow the
+        // row through EVERY mutator, not only `put_public_key`. See
+        // `wire_index::key_entry`.
+        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(&row)?;
         state.federation_keys.insert(row.key_id.clone(), row);
+        state
+            .signed_wire_index
+            .insert(("Key".to_string(), wire_index_hash), wire_index_key);
         Ok(())
     }
 
@@ -1965,15 +1970,20 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             .and_then(crate::federation::types::consent_role::wire_from_stored)
             .map(str::to_owned);
         let mut state = self.state.lock().expect("memory backend lock");
-        match state.federation_keys.get_mut(key_id) {
-            Some(row) => {
-                row.consent_role = normalized;
-                Ok(())
-            }
-            None => Err(crate::federation::Error::InvalidArgument(format!(
+        let Some(row) = state.federation_keys.get_mut(key_id) else {
+            return Err(crate::federation::Error::InvalidArgument(format!(
                 "set_consent_role: no federation_keys row for {key_id}"
-            ))),
-        }
+            )));
+        };
+        row.consent_role = normalized;
+        // v24.1.0 (CIRISPersist#547) — `consent_role` is excluded from
+        // `persist_row_hash` but IS in the bytes the read surface returns, so
+        // the WIRE content hash moves here. Re-index.
+        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(row)?;
+        state
+            .signed_wire_index
+            .insert(("Key".to_string(), wire_index_hash), wire_index_key);
+        Ok(())
     }
 
     /// v13.1.0 (CIRISPersist#377) — record a canonical-role WITHDRAW/SUPERSEDE
@@ -5693,6 +5703,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
+        // v24.1.0 (CIRISPersist#547) — four serialized columns just moved, so
+        // the wire content hash moved with them. See `wire_index::key_entry`.
+        let (wire_index_hash, wire_index_key) = crate::federation::wire_index::key_entry(row)?;
+        state
+            .signed_wire_index
+            .insert(("Key".to_string(), wire_index_hash), wire_index_key);
         Ok(())
     }
 
@@ -11505,6 +11521,39 @@ mod tests {
         )
         .await
         .expect("557 family trust root exercise");
+    }
+
+    /// **CIRISPersist#561 — transport-hop eligibility.** The A/B/C/D rule, its
+    /// authoritative TTL, the anti-inflation bound and the withdrawal contract,
+    /// on MemoryBackend.
+    #[tokio::test]
+    async fn transit_eligibility_works_on_memory_561() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_transit_eligibility(
+            &backend, "mem561",
+        )
+        .await
+        .expect("561 transit eligibility exercise");
+        crate::federation::operational::test_support::exercise_transit_eligibility_family_root(
+            &backend, "mem561f",
+        )
+        .await
+        .expect("561 family-root transit eligibility exercise");
+    }
+
+    /// **CIRISPersist#547 — a mutated row must be able to serve the Key ref it
+    /// advertises.** Memory has no `adopt_scrub_upgrade` (that leg skips), but it
+    /// DOES carry the index and it DOES have `set_consent_role` /
+    /// `attach_key_pqc_signature` / `adopt_genesis_reanchor` — every one of which
+    /// moved the row without moving the index before this cut.
+    #[tokio::test]
+    async fn key_wire_index_follows_every_mutator_memory_547() {
+        let backend = MemoryBackend::new();
+        crate::federation::operational::test_support::exercise_key_wire_index_follows_every_mutator(
+            &backend, "mem547",
+        )
+        .await
+        .expect("547 wire-index-follows-mutators exercise");
     }
 
     /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on memory.
