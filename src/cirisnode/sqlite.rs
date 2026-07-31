@@ -3739,6 +3739,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         backend
             .put_attestation(crate::federation::types::SignedAttestation { attestation: att })
@@ -3787,6 +3788,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         backend
             .put_attestation(crate::federation::types::SignedAttestation { attestation: att })
@@ -3880,6 +3882,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         backend
             .put_attestation(crate::federation::types::SignedAttestation { attestation: att })

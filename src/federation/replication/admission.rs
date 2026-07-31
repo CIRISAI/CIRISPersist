@@ -359,6 +359,7 @@ pub mod gate_order_test_support {
             cohort_scope: cohort_scope.into(),
             tier: tier.into(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 

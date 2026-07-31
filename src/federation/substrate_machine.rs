@@ -500,6 +500,58 @@ pub mod test_support {
         pub const ALL: [SigState; 3] = [SigState::Valid, SigState::Corrupt, SigState::Absent];
     }
 
+    /// v24.0.0 (CIRISPersist#556) — how many CO-SIGNATURES a signed-plane row
+    /// carries in `additional_scrubs`, and whether they are real.
+    ///
+    /// This axis exists because a field the harness never populates is a field
+    /// the harness cannot guard. `additional_scrubs` is the evidence a family
+    /// trust root's charter is quorum-signed; the moment it entered the row it
+    /// entered the #541 blast radius — a writer that preserves the base scrub
+    /// while dropping or mangling the co-signatures desyncs the row from its own
+    /// signature. With this axis, I1 (the REAL ingest verifier, re-run on every
+    /// federation row after every op) and the memory-vs-sqlite differential
+    /// cover the new field forever, instead of covering only the shape it had
+    /// on the day it was added.
+    ///
+    /// Local paths ignore it: a local-tier write defers its signature, so
+    /// `LocalAttestationInput` carries no scrub set at all.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum CoSign {
+        /// No co-signatures — the pre-v24 shape, and the shrink target.
+        None,
+        /// One REAL hybrid co-signature over the SAME canonical envelope, by a
+        /// different registered principal.
+        One,
+        /// Two REAL co-signatures, by the other two principals — a row whose
+        /// scrub set is a genuine 3-of-3.
+        Two,
+        /// One co-signature with a flipped byte. Must be REFUSED at
+        /// federation-tier ingest exactly as a corrupt BASE signature is: a
+        /// co-signature the verifier does not check is a co-signature a writer
+        /// may forge.
+        Corrupt,
+    }
+
+    impl CoSign {
+        /// Every variant, in shrink order. Read by the meta-coverage assertion,
+        /// so adding a variant without teaching the generator fails loudly
+        /// instead of silently under-testing.
+        pub const ALL: [CoSign; 4] = [CoSign::None, CoSign::One, CoSign::Two, CoSign::Corrupt];
+
+        /// The extra principals that co-sign, given the row's base attester.
+        fn co_signers(self, attester: Principal) -> Vec<Principal> {
+            let others: Vec<Principal> = Principal::ALL
+                .into_iter()
+                .filter(|p| *p != attester)
+                .collect();
+            match self {
+                CoSign::None => Vec::new(),
+                CoSign::One | CoSign::Corrupt => others.into_iter().take(1).collect(),
+                CoSign::Two => others,
+            }
+        }
+    }
+
     /// How the model clock moves before an op. **Advancing is the default**
     /// (CIRISPersist#541): a monotonic write guard turns an equal-clock write
     /// into a no-op, so a harness that reuses timestamps cannot express the
@@ -606,6 +658,10 @@ pub mod test_support {
         pub cohort_scope: Scope,
         /// The signature state (meaningful for the signed-plane kinds).
         pub signature: SigState,
+        /// v24.0.0 (CIRISPersist#556) — the `additional_scrubs` co-signature set
+        /// (meaningful for the signed-plane kinds; local writes defer signatures
+        /// and carry none). See [`CoSign`].
+        pub cosign: CoSign,
         /// How the model clock moves before this op.
         pub clock: ClockStep,
         /// Selector into the model's minted-row / occupied-coordinate lists,
@@ -1190,6 +1246,28 @@ pub mod test_support {
             }
             let (hash, classical, pqc) =
                 signature_for_key(op.signature, &self.kid(attester), &envelope);
+            // v24.0.0 (CIRISPersist#556) — the co-signature set, over the SAME
+            // canonical envelope bytes the base scrub signed. Built in the ONE
+            // row builder so every signed-plane op can carry it and I1 re-runs
+            // the real verifier over it.
+            let additional_scrubs: Vec<crate::federation::types::ScrubSig> = op
+                .cosign
+                .co_signers(attester)
+                .into_iter()
+                .map(|p| {
+                    let state = if op.cosign == CoSign::Corrupt {
+                        SigState::Corrupt
+                    } else {
+                        SigState::Valid
+                    };
+                    let (_, c, q) = signature_for_key(state, &self.kid(p), &envelope);
+                    crate::federation::types::ScrubSig {
+                        scrub_key_id: self.kid(p),
+                        scrub_signature_classical: c,
+                        scrub_signature_pqc: q,
+                    }
+                })
+                .collect();
             Attestation {
                 attestation_id: id,
                 attesting_key_id: self.kid(attester),
@@ -1222,6 +1300,7 @@ pub mod test_support {
                 cohort_scope: op.cohort_scope.as_str().to_owned(),
                 tier: tier.as_str().to_owned(),
                 promoted_at: None,
+                additional_scrubs,
             }
         }
 
@@ -1819,6 +1898,7 @@ pub mod test_support {
             tier: Tier::Federation,
             cohort_scope: Scope::Federation,
             signature: SigState::Valid,
+            cosign: CoSign::None,
             clock: ClockStep::Advance(1),
             // `target = 0` keeps `att_type_str` on `scores` (see
             // `AttType::ALL[target % 2]`); a `delegates_to` here would be a
@@ -2570,7 +2650,7 @@ mod proptests {
 
     use super::test_support::{
         assert_deadmission_lifecycle, assert_parity, deadmission_lifecycle_ops, run_sequence,
-        self_key_id_for, ClockStep, Family, Op, OpKind, Principal, Scope, SigState, Tier,
+        self_key_id_for, ClockStep, CoSign, Family, Op, OpKind, Principal, Scope, SigState, Tier,
         Transcript,
     };
     use crate::store::{Backend as _, MemoryBackend, SqliteBackend};
@@ -2640,6 +2720,21 @@ mod proptests {
         ]
     }
 
+    /// **The #556 axis.** `None` dominates so the ordinary single-scrub shape
+    /// stays the common case (and the shrink target), while every sequence still
+    /// has a real chance of putting a co-signed row through the storage
+    /// round-trip, the differential and I1's real verifier. `Corrupt` is drawn
+    /// as often as `Two` because "a co-signature the verifier does not check"
+    /// is the failure this axis exists to make impossible.
+    fn arb_cosign() -> impl Strategy<Value = CoSign> {
+        prop_oneof![
+            6 => Just(CoSign::None),
+            2 => Just(CoSign::One),
+            1 => Just(CoSign::Two),
+            1 => Just(CoSign::Corrupt),
+        ]
+    }
+
     fn arb_kind() -> impl Strategy<Value = OpKind> {
         prop_oneof![
             2 => Just(OpKind::InsertLocal),
@@ -2674,6 +2769,7 @@ mod proptests {
             arb_tier(),
             arb_scope(),
             arb_sig(),
+            arb_cosign(),
             arb_clock(),
             any::<u8>(),
         )
@@ -2686,6 +2782,7 @@ mod proptests {
                     tier,
                     cohort_scope,
                     signature,
+                    cosign,
                     clock,
                     target,
                 )| {
@@ -2697,6 +2794,7 @@ mod proptests {
                         tier,
                         cohort_scope,
                         signature,
+                        cosign,
                         clock,
                         target,
                     }
@@ -3021,6 +3119,7 @@ mod proptests {
             cohort_scope: cohort.to_owned(),
             tier: tier.to_owned(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
@@ -3456,6 +3555,7 @@ mod proptests {
                 tier: Tier::Federation,
                 cohort_scope: Scope::Federation,
                 signature: SigState::Valid,
+                cosign: CoSign::None,
                 clock: ClockStep::Advance(1),
                 target: 0,
             },
@@ -3467,6 +3567,7 @@ mod proptests {
                 tier: Tier::Federation,
                 cohort_scope: Scope::Federation,
                 signature: SigState::Valid,
+                cosign: CoSign::None,
                 clock: ClockStep::Advance(1),
                 target: 0,
             },
@@ -3573,6 +3674,7 @@ mod proptests {
 
         // Claim 1 — variant coverage, no execution needed.
         let mut seen_kinds: BTreeSet<OpKind> = BTreeSet::new();
+        let mut seen_cosign: BTreeSet<CoSign> = BTreeSet::new();
         let mut sequences: Vec<Vec<Op>> = Vec::new();
         for _ in 0..DRAWS {
             let seq = arb_sequence()
@@ -3581,6 +3683,7 @@ mod proptests {
                 .current();
             for op in &seq {
                 seen_kinds.insert(op.kind);
+                seen_cosign.insert(op.cosign);
             }
             sequences.push(seq);
         }
@@ -3590,6 +3693,18 @@ mod proptests {
                 "META-COVERAGE: `{kind:?}` was never emitted in {DRAWS} draws — the op \
                  alphabet and the generator have drifted apart, so every invariant is being \
                  checked against a strictly smaller machine than the one documented"
+            );
+        }
+        // v24.0.0 (CIRISPersist#556) — the co-signature axis, held to the same
+        // standard. A field the generator never populates is a field I1 and the
+        // differential never guard, which is precisely how `additional_scrubs`
+        // could re-acquire the #541 shape without any test going red.
+        for cs in CoSign::ALL {
+            assert!(
+                seen_cosign.contains(&cs),
+                "META-COVERAGE: `CoSign::{cs:?}` was never emitted in {DRAWS} draws — signed \
+                 rows are no longer reaching the substrate with that co-signature shape, so \
+                 `additional_scrubs` is being carried by the type and guarded by nothing"
             );
         }
 

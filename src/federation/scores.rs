@@ -509,6 +509,7 @@ mod tests {
             cohort_scope: "federation".into(),
             tier: attestation_type_tier_federation(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 

@@ -492,6 +492,7 @@ mod tests {
             cohort_scope: "federation".to_owned(),
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
@@ -607,6 +608,7 @@ mod tests {
             cohort_scope: "federation".to_owned(),
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         dir.put_attestation(SignedAttestation {
             attestation: non_owner_target.clone(),

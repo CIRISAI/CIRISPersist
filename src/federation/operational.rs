@@ -1492,6 +1492,7 @@ pub mod test_support {
             cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
@@ -2198,6 +2199,527 @@ pub mod test_support {
             grant.root_key_id, root,
             "({tag}) the winning root is the one we established"
         );
+    }
+
+    /// v24.0.0 (CIRISPersist#556) — a federation-tier attestation really signed
+    /// by `attester` AND co-signed by each of `cosigners` over the **same**
+    /// canonical envelope bytes.
+    ///
+    /// Scrub #1 fills the base `scrub_key_id`/`scrub_signature_*` fields; scrubs
+    /// #2..N ride `additional_scrubs`. Every co-signer must be registered with
+    /// its deterministic `sign_envelope` pubkeys ([`register_typed_key`]), since
+    /// both federation-tier ingest and the family-quorum count resolve each
+    /// scrub key from the DIRECTORY.
+    fn co_signed_trust_attestation(
+        id: &str,
+        attester: &str,
+        attested: &str,
+        attestation_type: &str,
+        envelope: serde_json::Value,
+        cosigners: &[&str],
+    ) -> crate::federation::Attestation {
+        let mut row =
+            signed_trust_attestation(id, attester, attested, attestation_type, envelope.clone());
+        row.additional_scrubs = cosigners
+            .iter()
+            .map(|k| {
+                let (_, classical, pqc) =
+                    crate::federation::tier_ingest::test_support::sign_envelope(k, &envelope);
+                crate::federation::types::ScrubSig {
+                    scrub_key_id: (*k).to_owned(),
+                    scrub_signature_classical: classical,
+                    scrub_signature_pqc: pqc,
+                }
+            })
+            .collect();
+        row
+    }
+
+    /// v24.0.0 (CIRISPersist#557) — seed a KEYLESS constitutional family with
+    /// `holders` seated as founders under `consensus_protocol`, on any backend.
+    ///
+    /// Written through `put_family_local` because a family has no key and
+    /// therefore cannot sign its own declaration — the same door
+    /// [`crate::federation::genesis::seed_accord_family`] uses for
+    /// `humanity-accord`. The holders must already be registered.
+    pub async fn seed_test_family(
+        directory: &dyn crate::federation::FederationDirectory,
+        family_key_id: &str,
+        holders: &[String],
+        consensus_protocol: &str,
+    ) -> Result<(), crate::federation::Error> {
+        let founded_at: chrono::DateTime<chrono::Utc> = "2020-01-01T00:00:00Z"
+            .parse()
+            .expect("pinned family founding instant is valid RFC-3339");
+        let family = crate::federation::types::Family {
+            family_key_id: family_key_id.to_owned(),
+            family_name: family_key_id.to_owned(),
+            members: holders
+                .iter()
+                .map(|k| crate::federation::types::FamilyMember {
+                    key_id: k.clone(),
+                    joined_at: founded_at,
+                    role: Some("founder".to_owned()),
+                })
+                .collect(),
+            founded_at,
+            consensus_protocol: consensus_protocol.to_owned(),
+            consensus_protocol_entrenched: true,
+            persist_row_hash: String::new(),
+        };
+        directory.put_family_local(family).await
+    }
+
+    /// v24.0.0 (CIRISPersist#557) — **the family trust root, end to end, on any
+    /// backend.** The mesh's root authority is a THRESHOLD, and this body is the
+    /// proof.
+    ///
+    /// The scenario is the accord's own shape: three seated holders under
+    /// `quorum:2/3`, a family that holds no key, and a node that trusts the
+    /// FAMILY rather than whichever holder happened to sign.
+    ///
+    /// | # | witness | what it pins |
+    /// |---|---|---|
+    /// | a | a 1-of-3-signed charter is REFUSED, naming "1 of 2 required distinct holders" | the shortfall is loud and countable, not a silent downgrade |
+    /// | d | 2-of-3 charter + 2-of-3 grant + the node's edge ⇒ the walk returns the FAMILY as root | the family root actually confers |
+    /// | b | one seat alone cannot re-root, cannot re-grant, and cannot hold the charter leg once its co-signer leaves the roster | the A1-compromise scenario, which is the whole issue |
+    /// | e | the family's drill reports, and the family's HALT LATCH gates | kill switch and root are finally the same object |
+    ///
+    /// Witness (c) — a solo 1-of-1 key root still valid end to end — is
+    /// [`exercise_trust_root`], deliberately left untouched: it passing
+    /// unchanged IS the portability witness.
+    pub async fn exercise_family_trust_root(
+        directory: &dyn crate::federation::FederationDirectory,
+        tag: &str,
+    ) -> Result<(), crate::federation::Error> {
+        use crate::federation::trust_root::{
+            capability_roots_to_trusted_root, trust_root_valid, ConferralPlane, DrillFreshness,
+            RootKind, INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE, TRUST_ACCEPTS_DIMENSION,
+            TRUST_CHARTER_DIMENSION, TRUST_CONFERS_DIMENSION,
+        };
+        use crate::federation::types::{attestation_type, identity_type};
+
+        let accord = format!("{tag}-accord");
+        let user = format!("{tag}-user");
+        let subject = format!("{tag}-subject");
+        let holders: Vec<String> = (0..3).map(|i| format!("{tag}-h{i}")).collect();
+
+        // The cast, registered with their deterministic `sign_envelope` pubkeys
+        // so every signature below resolves at the ingest gate on EVERY backend.
+        for who in holders.iter().chain([&user, &subject]) {
+            register_typed_key(directory, who, identity_type::NODE).await?;
+        }
+        seed_test_family(directory, &accord, &holders, "quorum:2/3").await?;
+
+        let successors = vec![format!("{accord}-succ-a"), format!("{accord}-succ-b")];
+        let commitment = crate::federation::trust_root::pre_rotation_commitment(&successors)
+            .map_err(|e| {
+                crate::federation::Error::Backend(format!("#557 pre_rotation_commitment: {e}"))
+            })?;
+        let charter_envelope = |id: &str| {
+            json!({
+                "references_attestation_id": id,
+                "dimension": TRUST_CHARTER_DIMENSION,
+                "scope": [INFRA_ATTEST_SCOPE, INFRA_SERVE_SCOPE],
+                "pre_rotation_commitment": commitment,
+            })
+        };
+
+        // ── (a) RED — one seat cannot charter the accord ─────────────────
+        // The row is well-formed, really signed, and names the family. It is
+        // refused for the ONE reason that matters: it is a seat pretending to be
+        // a threshold.
+        let lone_id = uuid::Uuid::new_v4().to_string();
+        let lone = co_signed_trust_attestation(
+            &lone_id,
+            &holders[0],
+            &accord,
+            attestation_type::DELEGATES_TO,
+            charter_envelope(&lone_id),
+            &[],
+        );
+        let refusal = directory
+            .put_attestation(crate::federation::SignedAttestation { attestation: lone })
+            .await
+            .expect_err("(a) a 1-of-3-signed family charter must be REFUSED");
+        assert_eq!(
+            refusal.kind(),
+            "federation_charter_invalid",
+            "({tag}) (a) the refusal is TYPED, naming the failing leg: {refusal}"
+        );
+        assert!(
+            refusal
+                .to_string()
+                .contains("1 of 2 required distinct holders"),
+            "({tag}) (a) the refusal must NAME the shortfall — a ceremony operator has to \
+             know whether they are one signature short or looking at the wrong family. Got: \
+             {refusal}"
+        );
+
+        // ── (a2) a CO-SIGNATURE THE VERIFIER DOES NOT CHECK IS A CO-SIGNATURE
+        // A WRITER MAY FORGE (CIRISPersist#556, the #541 class). A charter
+        // carrying a corrupt second scrub must be refused at the SAME admission
+        // boundary a corrupt BASE scrub is — otherwise `additional_scrubs` would
+        // be stored-but-unverified and the quorum evidence would be free to
+        // invent.
+        let forged_id = uuid::Uuid::new_v4().to_string();
+        let mut forged = co_signed_trust_attestation(
+            &forged_id,
+            &holders[0],
+            &accord,
+            attestation_type::DELEGATES_TO,
+            charter_envelope(&forged_id),
+            &[&holders[1]],
+        );
+        forged.additional_scrubs[0].scrub_signature_classical = {
+            use base64::Engine as _;
+            let mut raw = b64()
+                .decode(&forged.additional_scrubs[0].scrub_signature_classical)
+                .expect("our own co-signature is base64");
+            raw[0] ^= 0xff;
+            b64().encode(&raw)
+        };
+        let forged_err = directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: forged,
+            })
+            .await
+            .expect_err("(a2) a corrupt co-signature must be REFUSED at ingest");
+        assert_eq!(
+            forged_err.kind(),
+            "federation_federation_tier_unverified",
+            "({tag}) (a2) every scrub is verified, not just the first: {forged_err}"
+        );
+
+        // …and on an ORDINARY row, where no charter gate stands behind the
+        // verifier. This is the one that goes green-but-wrong if the ingest gate
+        // ever stops walking the whole scrub set: the row would be STORED,
+        // carrying a co-signature nobody checked, and every later reader that
+        // counted scrubs would count a forgery.
+        let plain_id = uuid::Uuid::new_v4().to_string();
+        let mut plain = co_signed_trust_attestation(
+            &plain_id,
+            &holders[0],
+            &subject,
+            attestation_type::SCORES,
+            json!({
+                "id": plain_id,
+                "dimension": "reputation:general:v1",
+                "score": 0.5,
+                "confidence": 0.9,
+            }),
+            &[&holders[1]],
+        );
+        plain.additional_scrubs[0].scrub_signature_classical = {
+            use base64::Engine as _;
+            let mut raw = b64()
+                .decode(&plain.additional_scrubs[0].scrub_signature_classical)
+                .expect("our own co-signature is base64");
+            raw[0] ^= 0xff;
+            b64().encode(&raw)
+        };
+        let plain_err = directory
+            .put_attestation(crate::federation::SignedAttestation { attestation: plain })
+            .await
+            .expect_err("(a2) a corrupt co-signature is refused on ANY federation-tier row");
+        assert_eq!(
+            plain_err.kind(),
+            "federation_federation_tier_unverified",
+            "({tag}) (a2) the ingest verifier — not some downstream gate — is what covers \
+             additional_scrubs: {plain_err}"
+        );
+
+        // ── (d) GREEN — the accord charters itself at 2-of-3 ─────────────
+        let charter_id = uuid::Uuid::new_v4().to_string();
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: co_signed_trust_attestation(
+                    &charter_id,
+                    &holders[0],
+                    &accord,
+                    attestation_type::DELEGATES_TO,
+                    charter_envelope(&charter_id),
+                    &[&holders[1]],
+                ),
+            })
+            .await?;
+
+        // #556 STORAGE ROUND-TRIP, on whatever column encoding this backend
+        // applies: the co-signature must come BACK, or the row proves 1-of-n
+        // again the moment it is re-read (and every re-hashing write path would
+        // then stamp a hash that disagrees with the stored row).
+        let stored = directory
+            .get_attestation(&charter_id)
+            .await?
+            .expect("(#556) the charter is readable");
+        assert_eq!(
+            stored.additional_scrubs.len(),
+            1,
+            "({tag}) #556: the 2nd scrub round-trips through this backend's storage"
+        );
+        assert_eq!(
+            stored.additional_scrubs[0].scrub_key_id, holders[1],
+            "({tag}) #556: …and it is the holder who actually co-signed"
+        );
+        assert_eq!(
+            stored.distinct_scrub_count(),
+            2,
+            "({tag}) #556: the stored row proves its own 2-of-n"
+        );
+
+        // The conferral, ALSO at 2-of-3: a grant one seat could sign alone would
+        // hand that seat the accord's granting pen, which is the asymmetry #557
+        // exists to remove.
+        let grant_id = uuid::Uuid::new_v4().to_string();
+        let grant_envelope = json!({
+            "references_attestation_id": grant_id,
+            "dimension": TRUST_CONFERS_DIMENSION,
+            "scope": [INFRA_SERVE_SCOPE],
+        });
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: co_signed_trust_attestation(
+                    &grant_id,
+                    &holders[0],
+                    &subject,
+                    attestation_type::DELEGATES_TO,
+                    grant_envelope,
+                    &[&holders[1]],
+                ),
+            })
+            .await?;
+
+        // The node's own trust edge — naming the ACCORD, not a holder. This is
+        // the row #557 is about, and the one an operator deletes to un-trust.
+        let edge_id = uuid::Uuid::new_v4().to_string();
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: signed_trust_attestation(
+                    &edge_id,
+                    &user,
+                    &accord,
+                    attestation_type::DELEGATES_TO,
+                    json!({
+                        "references_attestation_id": edge_id,
+                        "dimension": TRUST_ACCEPTS_DIMENSION,
+                        "scope": [INFRA_SERVE_SCOPE],
+                    }),
+                ),
+            })
+            .await?;
+
+        let verdict = trust_root_valid(directory, &user, &accord).await?;
+        assert!(
+            verdict.valid && verdict.root_kind == RootKind::Family,
+            "({tag}) (d) a quorum-chartered family the node has accepted IS a valid trust \
+             root: {verdict:?}"
+        );
+        let q = verdict
+            .charter_quorum
+            .expect("(d) a family verdict carries its quorum accounting");
+        assert!(
+            q.met() && q.distinct_holders == 2 && q.required == 2 && q.roster_size == 3,
+            "({tag}) (d) the accounting is open, not a bare bool: {}",
+            q.describe()
+        );
+
+        let grant = capability_roots_to_trusted_root(directory, &user, &subject, INFRA_SERVE_SCOPE)
+            .await?
+            .unwrap_or_else(|| {
+                panic!(
+                    "({tag}) (d) the subject's {INFRA_SERVE_SCOPE} must root to the ACCORD — a \
+                     2-of-3 grant from a seated holder is a grant by the family"
+                )
+            });
+        assert_eq!(
+            grant.root_key_id, accord,
+            "({tag}) (d) the winning root is the FAMILY, not the holder who signed"
+        );
+        assert_eq!(
+            grant.conferral_plane,
+            ConferralPlane::FamilyQuorum,
+            "({tag}) (d) the plane is NAMED — one field with two silent value spaces is the \
+             class this substrate keeps re-learning"
+        );
+
+        // ── (e) the drill reports; the family HALT LATCH gates ───────────
+        let la = format!("{tag}-la");
+        register_typed_key(directory, &la, identity_type::ACCORD_HOLDER).await?;
+        let drill_id = uuid::Uuid::new_v4().to_string();
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: signed_trust_attestation(
+                    &drill_id,
+                    &la,
+                    &accord,
+                    attestation_type::SCORES,
+                    json!({
+                        "id": drill_id,
+                        "dimension": crate::federation::trust_root::ACCORD_HEARTBEAT_DIMENSION,
+                        "score": 1.0,
+                        "confidence": 0.9,
+                    }),
+                ),
+            })
+            .await?;
+        let drilled = trust_root_valid(directory, &user, &accord).await?;
+        assert!(
+            drilled.last_drill_at.is_some()
+                && drilled.drill_freshness == DrillFreshness::Green
+                && drilled.valid,
+            "({tag}) (e) a drill ABOUT the family reports on the family root, and — v23.0.0 — \
+             still does not gate: {drilled:?}"
+        );
+
+        // The kill switch and the root are finally the same object: before this
+        // cut `get_active_halt` was handed a KEY id while the table is keyed by
+        // FAMILY, so the accord's 2-of-3 brake could never reach the root it was
+        // built to stop.
+        let halt_id = format!("{tag}-halt-1");
+        directory.set_active_halt(&accord, &halt_id).await?;
+        let halted = trust_root_valid(directory, &user, &accord).await?;
+        assert!(
+            halted.halt_latched == Some(true) && !halted.valid,
+            "({tag}) (e) the FAMILY halt latch stops the FAMILY root: {halted:?}"
+        );
+        assert!(
+            capability_roots_to_trusted_root(directory, &user, &subject, INFRA_SERVE_SCOPE)
+                .await?
+                .is_none(),
+            "({tag}) (e) …and the capability walk agrees — a halted root confers nothing"
+        );
+        directory.clear_active_halt(&accord, &halt_id).await?;
+        assert!(
+            trust_root_valid(directory, &user, &accord).await?.valid,
+            "({tag}) (e) a resume un-fires the halt — the brake is a lever, not a door"
+        );
+
+        // ── (b) THE A1-COMPROMISE SCENARIO ───────────────────────────────
+        // Assume holders[0]'s seat is fully owned by an attacker. It holds a real
+        // key, it is genuinely seated, and it can sign anything it likes.
+        //
+        // (b1) it cannot RE-ROOT: a charter for a second "accord" it controls is
+        // refused by the same quorum rule.
+        let rogue = format!("{tag}-rogue-accord");
+        seed_test_family(directory, &rogue, &holders, "quorum:2/3").await?;
+        let rogue_charter_id = uuid::Uuid::new_v4().to_string();
+        let rogue_err = directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: co_signed_trust_attestation(
+                    &rogue_charter_id,
+                    &holders[0],
+                    &rogue,
+                    attestation_type::DELEGATES_TO,
+                    charter_envelope(&rogue_charter_id),
+                    &[],
+                ),
+            })
+            .await
+            .expect_err("(b1) one compromised seat must not be able to charter a root");
+        assert_eq!(rogue_err.kind(), "federation_charter_invalid");
+
+        // (b2) it cannot RE-GRANT under the accord's name: a lone-signed
+        // conferral onto a fresh subject yields no family candidate at all.
+        let victim = format!("{tag}-victim");
+        register_typed_key(directory, &victim, identity_type::NODE).await?;
+        let lone_grant_id = uuid::Uuid::new_v4().to_string();
+        directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: co_signed_trust_attestation(
+                    &lone_grant_id,
+                    &holders[0],
+                    &victim,
+                    attestation_type::DELEGATES_TO,
+                    json!({
+                        "references_attestation_id": lone_grant_id,
+                        "dimension": TRUST_CONFERS_DIMENSION,
+                        "scope": [INFRA_SERVE_SCOPE],
+                    }),
+                    &[],
+                ),
+            })
+            .await?;
+        assert!(
+            capability_roots_to_trusted_root(directory, &user, &victim, INFRA_SERVE_SCOPE)
+                .await?
+                .is_none(),
+            "({tag}) (b2) a conferral carrying ONE seat's signature roots to nothing — the \
+             grant is stored, and it grants nothing"
+        );
+
+        // (b3) it cannot buy a quorum with signatures from OUTSIDE the roster.
+        // A co-signature by a registered non-seat is a real signature over the
+        // real bytes; it simply is not a HOLDER, so it counts toward nothing.
+        let outsider = format!("{tag}-outsider");
+        register_typed_key(directory, &outsider, identity_type::NODE).await?;
+        let bought = format!("{tag}-bought-accord");
+        seed_test_family(directory, &bought, &holders, "quorum:2/3").await?;
+        let bought_id = uuid::Uuid::new_v4().to_string();
+        let bought_err = directory
+            .put_attestation(crate::federation::SignedAttestation {
+                attestation: co_signed_trust_attestation(
+                    &bought_id,
+                    &holders[0],
+                    &bought,
+                    attestation_type::DELEGATES_TO,
+                    charter_envelope(&bought_id),
+                    &[&outsider],
+                ),
+            })
+            .await
+            .expect_err("(b3) a co-signature from outside the roster must not make a quorum");
+        assert!(
+            bought_err
+                .to_string()
+                .contains("1 of 2 required distinct holders"),
+            "({tag}) (b3) the outsider's signature verifies and still counts for nothing: \
+             {bought_err}"
+        );
+
+        // (b4) THE THRESHOLD IS RE-DERIVED AT READ TIME, FROM THIS NODE'S OWN
+        // STATE — and it cannot be talked down. Grow the accord to five seats.
+        // The family row still SAYS `quorum:2/3`; the node floors that at a
+        // strict majority of the roster it actually holds, so the charter that
+        // was quorate a moment ago stops being quorate — with no write to the
+        // charter row, and nothing revoked.
+        for i in 3..5 {
+            let extra = format!("{tag}-h{i}");
+            register_typed_key(directory, &extra, identity_type::NODE).await?;
+            directory
+                .add_family_member(
+                    &accord,
+                    crate::federation::types::FamilyMember {
+                        key_id: extra,
+                        joined_at: chrono::Utc::now(),
+                        role: Some("founder".to_owned()),
+                    },
+                )
+                .await?;
+        }
+
+        let after = trust_root_valid(directory, &user, &accord).await?;
+        let aq = after
+            .charter_quorum
+            .expect("(b4) the family verdict still accounts for its quorum");
+        assert!(
+            !after.valid && !after.root_self_declares && !aq.met(),
+            "({tag}) (b4) two of five seats is not a majority of the accord, so the root is \
+             not chartered — re-derived, not frozen at admission: {after:?}"
+        );
+        assert!(
+            aq.distinct_holders == 2 && aq.required == 3 && aq.roster_size == 5,
+            "({tag}) (b4) the carried consensus_protocol still says quorum:2/3 and the node \
+             requires 3 anyway — a tampered policy string cannot talk the threshold down: {}",
+            aq.describe()
+        );
+        assert!(
+            capability_roots_to_trusted_root(directory, &user, &subject, INFRA_SERVE_SCOPE)
+                .await?
+                .is_none(),
+            "({tag}) (b4) …and the capability walk agrees — an un-chartered family confers \
+             nothing"
+        );
+        Ok(())
     }
 
     /// v21.17.0 (CIRISPersist#536 follow-up) — the REAL engine-backed user path,

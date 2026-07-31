@@ -145,7 +145,11 @@ pub fn parse_genesis_bundle(json: &str) -> Result<GenesisBundle, Error> {
 }
 
 /// Parse `quorum:M/N` → `(M, N)`.
-fn parse_quorum(s: &str) -> Option<(usize, usize)> {
+///
+/// v24.0.0 (CIRISPersist#557) — `pub(crate)` so the family trust root reads the
+/// threshold through the SAME parser the bundle verifier does. Two parsers for
+/// one wire form is how the two answers start to disagree.
+pub(crate) fn parse_quorum(s: &str) -> Option<(usize, usize)> {
     let rest = s.strip_prefix("quorum:")?;
     let (m, n) = rest.split_once('/')?;
     Some((m.parse().ok()?, n.parse().ok()?))

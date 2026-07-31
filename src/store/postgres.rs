@@ -3988,6 +3988,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             &row.attestation_envelope,
         )
         .await?;
+        // v24.0.0 (CIRISPersist#557) — a charter naming a constitutional family
+        // must be signed by that family's QUORUM. Sits beside the key-charter
+        // gate above and refuses the same class of row for the same reason: a
+        // root that one seat can declare is not a threshold.
+        crate::federation::trust_root::check_family_charter_admission(self, &row).await?;
         crate::federation::admission::check_reserved_prefix_admission(self, &row).await?;
 
         // v22.0.0 (CIRISConstitution#46) — CONSENT BEFORE SCORING. A
@@ -4020,6 +4025,15 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // `moderate`-holder. No-op for local-tier rows, rows referencing no
         // known community. Backend-symmetric.
         crate::federation::admission::check_no_moderator_federate_apply(self, &row).await?;
+        // v24.0.0 (CIRISPersist#557) — the attested SUBJECT must resolve as a
+        // key this node knows OR as a constitutional family it has stored. V114
+        // lifted this rule out of the SQLite schema FK (which cannot express the
+        // keyless-family exception a family trust root needs) into ONE predicate
+        // every backend runs at this same point. All three DID enforce the rule
+        // before (sqlite + postgres by FK, memory by emulation); what none of
+        // them could express is the keyless-family exception.
+        crate::federation::admission::check_attested_subject_admission(self, &row.attested_key_id)
+            .await?;
 
         // ── AV-76 TIER 5 — hash + INSERT ────────────────────────────
         // D1: `check_withdraws_admission` above STAMPS
@@ -4069,6 +4083,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // then PG widens to NUMERIC for storage.
         // v3.7.0 (CIRISPersist#146, CEG 0.6) — subject_key_ids JSONB +
         // withdraws_admission_rule SMALLINT (NULL on non-withdraws).
+        // v24.0.0 (CIRISPersist#556) — the V113 `additional_scrubs` JSON-array
+        // TEXT column (TEXT, not JSONB — V096 parity with `federation_keys`).
+        // Empty vec → "[]", so an ordinary single-scrub row is stored exactly as
+        // it was before this cut.
+        let additional_scrubs_json =
+            serde_json::to_string(&row.additional_scrubs).map_err(|e| {
+                crate::federation::Error::Backend(format!("additional_scrubs serialize: {e}"))
+            })?;
         let subject_key_ids_jsonb = serde_json::Value::Array(
             row.subject_key_ids
                 .iter()
@@ -4084,8 +4106,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
                     subject_key_ids, withdraws_admission_rule, cohort_scope, \
-                    tier, promoted_at\
-                 ) VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
+                    tier, promoted_at, additional_scrubs\
+                 ) VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
                 &[
                     &attestation_uuid,
                     &row.attesting_key_id,
@@ -4115,20 +4137,14 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     // parity trio's whole point.
                     &row.tier,
                     &row.promoted_at,
+                    // v24.0.0 (CIRISPersist#556) — the co-signature set rides
+                    // the SAME write as the base scrub. A row whose scrubs
+                    // landed in two different statements could be half-written.
+                    &additional_scrubs_json,
                 ],
             )
             .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                // FK violation → InvalidArgument (matches memory shape).
-                if msg.contains("foreign key") {
-                    crate::federation::Error::InvalidArgument(format!(
-                        "FK constraint violated on attestation insert: {msg}"
-                    ))
-                } else {
-                    crate::federation::Error::Backend(format!("insert attestation: {msg}"))
-                }
-            })?;
+            .map_err(map_attestation_pg_err("insert attestation"))?;
         // v21.1.0 (CIRISPersist#507b) — wire-index this row (federation-tier
         // only, the E5 invariant; `put_attestation` is the federation write
         // path so this always holds in practice). `Attestation` IS its own
@@ -4218,7 +4234,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
                     weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM cirislens.federation_attestations \
                  WHERE attested_key_id = $1 AND tier = 'federation' \
                  ORDER BY asserted_at DESC",
@@ -4245,7 +4261,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
                     weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM cirislens.federation_attestations \
                  WHERE attesting_key_id = $1 AND tier = 'federation' \
                  ORDER BY asserted_at DESC",
@@ -4306,7 +4322,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     fa.scrub_signature_classical, fa.scrub_signature_pqc, fa.scrub_key_id, \
                     fa.scrub_timestamp, fa.pqc_completed_at, fa.persist_row_hash, \
                     fa.subject_key_ids, fa.withdraws_admission_rule, fa.cohort_scope, fa.tier, \
-                    fa.promoted_at \
+                    fa.promoted_at, fa.additional_scrubs \
                  FROM cirislens.federation_attestations fa \
                  WHERE fa.attesting_key_id = $1 \
                    AND EXISTS (SELECT 1 FROM cirislens.consent_peer_set cps \
@@ -4354,7 +4370,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     attestation_envelope, original_content_hash, scrub_signature_classical, \
                     scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
                     persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, \
-                    tier, promoted_at \
+                    tier, promoted_at, additional_scrubs \
                  FROM cirislens.federation_attestations \
                  WHERE tier = 'local' \
                    AND ($1::text IS NULL OR attestation_id::text > $1) \
@@ -4390,7 +4406,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     attestation_envelope, original_content_hash, scrub_signature_classical, \
                     scrub_signature_pqc, scrub_key_id, scrub_timestamp, pqc_completed_at, \
                     persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, \
-                    tier, promoted_at \
+                    tier, promoted_at, additional_scrubs \
                  FROM cirislens.federation_attestations \
                  WHERE tier = 'federation' AND cohort_scope IN ('self', 'family') \
                    AND ($1::text IS NULL OR attestation_id::text > $1) \
@@ -4480,7 +4496,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
                     weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM cirislens.federation_attestations \
                  WHERE attestation_type = 'scores' AND tier = 'federation' \
                     AND attestation_envelope -> 'evidence_refs' @> $1 \
@@ -7388,7 +7404,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
             original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
             scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, \
-            withdraws_admission_rule, cohort_scope, tier, promoted_at";
+            withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs";
         // v20.0.0 (#495 C3) — dimension path + revoked prefix from the ONE
         // constants (drift meant list_consent_revocations silently empty).
         let pred = format!(
@@ -8126,7 +8142,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM cirislens.federation_attestations \
                  WHERE ($1::timestamptz IS NULL OR COALESCE(promoted_at, asserted_at) > $1) \
                    AND tier = 'federation' \
@@ -8316,7 +8332,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
                     weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM cirislens.federation_attestations WHERE attestation_id = $1",
                 &[&att_uuid],
             )
@@ -8379,7 +8395,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT attestation_id::text, attesting_key_id, attested_key_id, attestation_type, \
                     weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
                  FROM cirislens.federation_attestations WHERE attestation_id = $1",
                 &[&att_uuid],
             )
@@ -8419,6 +8435,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         row.pqc_completed_at = pqc_owned.as_ref().map(|_| now);
         row.tier = attestation_tier::FEDERATION.to_string();
         row.promoted_at = Some(now);
+        // v24.0.0 (CIRISPersist#557/#556) — PROMOTION CLEARS THE CO-SIGNATURES.
+        // A local-tier row defers its signature, so any `additional_scrubs` it
+        // carried were STORED WITHOUT EVER BEING VERIFIED. Promotion re-signs
+        // the row with this node's key and moves it into the federation plane,
+        // where the ingest verifier DOES check every scrub — so carrying the
+        // unverified set across would either launder it into the signed plane or
+        // (once corrupt) make the promoted row unverifiable at every peer with
+        // no error at the promote site. That is the #541 shape: the preserve set
+        // must equal the verified set. Co-signatures are earned at the ceremony
+        // that mints a federation-tier row, never inherited by a promotion.
+        row.additional_scrubs.clear();
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
@@ -8438,7 +8465,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                  SET original_content_hash = $1, scrub_signature_classical = $2, \
                      scrub_signature_pqc = $3, scrub_key_id = $4, scrub_timestamp = $5, \
                      pqc_completed_at = $6, persist_row_hash = $7, tier = 'federation', \
-                     promoted_at = $5 \
+                     promoted_at = $5, additional_scrubs = '[]' \
                  WHERE attestation_id = $8 AND tier = 'local'",
                 &[
                     &och,
@@ -8514,6 +8541,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         row.pqc_completed_at = pqc_owned.as_ref().map(|_| now);
         row.tier = attestation_tier::FEDERATION.to_string();
         row.promoted_at = Some(now);
+        // v24.0.0 (CIRISPersist#557/#556) — PROMOTION CLEARS THE CO-SIGNATURES.
+        // A local-tier row defers its signature, so any `additional_scrubs` it
+        // carried were STORED WITHOUT EVER BEING VERIFIED. Promotion re-signs
+        // the row with this node's key and moves it into the federation plane,
+        // where the ingest verifier DOES check every scrub — so carrying the
+        // unverified set across would either launder it into the signed plane or
+        // (once corrupt) make the promoted row unverifiable at every peer with
+        // no error at the promote site. That is the #541 shape: the preserve set
+        // must equal the verified set. Co-signatures are earned at the ceremony
+        // that mints a federation-tier row, never inherited by a promotion.
+        row.additional_scrubs.clear();
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
@@ -8532,7 +8570,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                  SET attestation_envelope = $1, original_content_hash = $2, \
                      scrub_signature_classical = $3, scrub_signature_pqc = $4, \
                      scrub_key_id = $5, scrub_timestamp = $6, pqc_completed_at = $7, \
-                     persist_row_hash = $8, tier = 'federation', promoted_at = $6 \
+                     persist_row_hash = $8, tier = 'federation', promoted_at = $6, \
+                     additional_scrubs = '[]' \
                  WHERE attestation_id = $9 AND tier = 'local'",
                 &[
                     &row.attestation_envelope,
@@ -10290,6 +10329,7 @@ impl crate::federation::BlobStorage for PostgresBackend {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         let attestation_envelope_jsonb = attestation_row.attestation_envelope.clone();
         let persist_row_hash = crate::federation::types::compute_persist_row_hash(&attestation_row)
@@ -13522,6 +13562,19 @@ impl PostgresBackend {
             &envelope_value,
         )
         .await?;
+        // v24.0.0 (CIRISPersist#557) — the attested SUBJECT rule, shared with the
+        // federation write path and with the other two backends. V114 removed
+        // the SQLite `attested_key_id` FK that used to catch this at INSERT, so
+        // the local writer must run the predicate explicitly or the two write
+        // paths would enforce different rules.
+        crate::federation::admission::check_attested_subject_admission(
+            self,
+            input
+                .attested_key_id
+                .as_deref()
+                .unwrap_or(&input.attesting_key_id),
+        )
+        .await?;
 
         let dimension = input.dimension().map(|s| s.to_string()).ok_or_else(|| {
             Error::InvalidArgument(
@@ -13599,6 +13652,9 @@ impl PostgresBackend {
             None => input.into_local_row(attestation_id.clone(), now),
         };
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
+        // v24.0.0 (CIRISPersist#556) — see the `put_attestation` twin.
+        let additional_scrubs_json = serde_json::to_string(&row.additional_scrubs)
+            .map_err(|e| Error::Backend(format!("additional_scrubs serialize: {e}")))?;
         let subject_key_ids_json = serde_json::to_value(&row.subject_key_ids)
             .map_err(|e| Error::Backend(format!("subject_key_ids serialize: {e}")))?;
         // bytea: durable row hex "" → []; transit row = SHA-256 digest bytes.
@@ -13627,9 +13683,11 @@ impl PostgresBackend {
                 weight, asserted_at, expires_at, attestation_envelope, \
                 original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                 scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, \
-                subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at\
+                subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, \
+                additional_scrubs\
              ) VALUES ($1, $2, $3, $4, $5::float8::numeric, $6, $7, $8, $9, $10, $11, $12, \
-                       $13, $14, $15, $16, $17, $18, 'local', NULL) ON CONFLICT (attestation_id) DO NOTHING",
+                       $13, $14, $15, $16, $17, $18, 'local', NULL, $19) \
+             ON CONFLICT (attestation_id) DO NOTHING",
             &[
                 &attestation_uuid,
                 &row.attesting_key_id,
@@ -13649,20 +13707,15 @@ impl PostgresBackend {
                 &subject_key_ids_json,
                 &None::<i16>,
                 &row.cohort_scope,
+                // v24.0.0 (CIRISPersist#556) — a local-tier row defers its
+                // signature, so this is `[]` in practice; bound anyway so the
+                // local and federation writers cover the SAME column set (a
+                // preserve set that differs by writer is #541).
+                &additional_scrubs_json,
             ],
         )
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("foreign key") || msg.contains("violates foreign key") {
-                Error::InvalidArgument(format!(
-                    "FK constraint violated on local attestation insert \
-                     (attesting/attested/scrub key must exist in federation_keys): {msg}"
-                ))
-            } else {
-                Error::Backend(format!("insert local attestation: {msg}"))
-            }
-        })?;
+        .map_err(map_attestation_pg_err("insert local attestation"))?;
         // v17.4.0 (V106) — subject projection at `local` tier. On the
         // upsert-replace path the prior projection rows were dropped by the
         // DELETE above (FK ON DELETE CASCADE), so no stale rows survive.
@@ -13691,7 +13744,7 @@ const PG_SCORES_FA_COLS: &str = "fa.attestation_id::text AS attestation_id, fa.a
      fa.expires_at, fa.attestation_envelope, fa.original_content_hash, \
      fa.scrub_signature_classical, fa.scrub_signature_pqc, fa.scrub_key_id, fa.scrub_timestamp, \
      fa.pqc_completed_at, fa.persist_row_hash, fa.subject_key_ids, fa.withdraws_admission_rule, \
-     fa.cohort_scope, fa.tier, fa.promoted_at";
+     fa.cohort_scope, fa.tier, fa.promoted_at, fa.additional_scrubs";
 
 /// v17.4.0 — shared WHERE predicate builder for the postgres `scores` read
 /// handles. Emits the subject / dimension(exact+prefix) / type / attester /
@@ -13896,6 +13949,18 @@ fn pg_row_to_attestation(
         .map_err(|e| crate::federation::Error::Backend(format!("subject_key_ids decode: {e}")))?;
     let withdraws_admission_rule: Option<i16> =
         row.safe_get_with("withdraws_admission_rule", mk_err)?;
+    // v24.0.0 (CIRISPersist#556) — the V113 `additional_scrubs` JSON-array TEXT
+    // column (TEXT, not JSONB — V096 parity, so sqlite and postgres round-trip
+    // byte-identical scrub sets). Read STRICTLY, like every other column here:
+    // a SELECT that forgets it must fail LOUDLY rather than hydrate a row whose
+    // scrub set silently shrank and then get re-hashed by promote / attach_pqc
+    // / set_cohort_scope (the #541 preserve-set≢verified-set class through a
+    // read path).
+    let additional_scrubs_text: String = row.safe_get_with("additional_scrubs", mk_err)?;
+    let additional_scrubs: Vec<crate::federation::types::ScrubSig> =
+        serde_json::from_str(&additional_scrubs_text).map_err(|e| {
+            crate::federation::Error::Backend(format!("additional_scrubs decode: {e}"))
+        })?;
     Ok(crate::federation::Attestation {
         attestation_id: row.safe_get_with("attestation_id", mk_err)?,
         attesting_key_id: row.safe_get_with("attesting_key_id", mk_err)?,
@@ -13919,6 +13984,7 @@ fn pg_row_to_attestation(
         // pre-V066 rows) + promoted_at.
         tier: row.safe_get_with("tier", mk_err)?,
         promoted_at: row.safe_get_with("promoted_at", mk_err)?,
+        additional_scrubs,
     })
 }
 
@@ -14109,6 +14175,68 @@ fn pg_row_to_community(
 
 // ─── v4.8.0 (CIRISPersist#161) — membership-revocation row decoders +
 //     a shared FK-aware error mapper for the three revocation inserts.
+
+/// v24.0.0 (CIRISPersist#557) — render a `tokio_postgres::Error` with the
+/// payload the server actually sent.
+///
+/// **`tokio_postgres`'s `Display` is the two-word string `"db error"`.** Every
+/// fact that identifies the failure — SQLSTATE, message, the offending
+/// constraint, column and table — lives in the structured `DbError` behind
+/// `as_db_error()`, and is dropped on the floor by `e.to_string()`. A refusal
+/// that names nothing is a diagnostics failure by house rule (#545: a refusal
+/// must name the failing thing), and this one cost a full debugging cycle: the
+/// v24.0.0 pg witness failed with `Backend("insert attestation: db error")` and
+/// there was nothing in it to act on.
+///
+/// Used by every attestation write path. Falls back to `Display` for the
+/// non-database errors (connection closed, TLS, serialization) where there is
+/// no `DbError` to unpack.
+fn pg_error_detail(e: &tokio_postgres::Error) -> String {
+    let Some(db) = e.as_db_error() else {
+        return e.to_string();
+    };
+    let mut out = format!("SQLSTATE {}: {}", db.code().code(), db.message());
+    for (label, value) in [
+        ("detail", db.detail()),
+        ("hint", db.hint()),
+        ("constraint", db.constraint()),
+        ("column", db.column()),
+        ("table", db.table()),
+    ] {
+        if let Some(v) = value {
+            out.push_str(&format!(" [{label}: {v}]"));
+        }
+    }
+    out
+}
+
+/// v24.0.0 (CIRISPersist#557) — the shared attestation-insert error mapper: a
+/// FK violation → `InvalidArgument` (matching the memory backend's shape), any
+/// other database error → `Backend`, both carrying [`pg_error_detail`].
+///
+/// The FK classification keys on **SQLSTATE 23503**, not on a substring of the
+/// message. The previous `msg.contains("foreign key")` test ran against
+/// `"db error"` and therefore never fired — so a genuine FK violation on this
+/// path had been reported as an opaque `Backend` for as long as the check had
+/// existed, diverging from memory's `InvalidArgument` in a way the differential
+/// harness could not see (it never reaches pg).
+fn map_attestation_pg_err(
+    op: &'static str,
+) -> impl FnOnce(tokio_postgres::Error) -> crate::federation::Error {
+    move |e| {
+        let detail = pg_error_detail(&e);
+        let is_fk = e
+            .as_db_error()
+            .is_some_and(|db| *db.code() == tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION);
+        if is_fk {
+            crate::federation::Error::InvalidArgument(format!(
+                "FK constraint violated on {op}: {detail}"
+            ))
+        } else {
+            crate::federation::Error::Backend(format!("{op}: {detail}"))
+        }
+    }
+}
 
 /// Map a Postgres revocation-insert error: a FK violation (subject/
 /// removed key absent from federation_keys) → `InvalidArgument`, else
@@ -16593,7 +16721,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             "SELECT attestation_id::text AS attestation_id, attesting_key_id, attested_key_id, \
                     attestation_type, weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
              FROM cirislens.federation_attestations \
              {where_sql} \
              ORDER BY asserted_at DESC, attestation_id DESC \
@@ -16691,7 +16819,7 @@ impl crate::read::ReadEngine for PostgresBackend {
             "SELECT attestation_id::text AS attestation_id, attesting_key_id, attested_key_id, \
                     attestation_type, weight::float8 AS weight, asserted_at, expires_at, attestation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, cohort_scope, tier, promoted_at, additional_scrubs \
              FROM cirislens.federation_attestations \
              {where_sql} \
              ORDER BY asserted_at DESC, attestation_id DESC \
@@ -19216,6 +19344,30 @@ mod tests {
 
     /// v21.16.0 (CIRISPersist#536 follow-up) — the REAL engine-backed user path
     /// on postgres.
+    /// **CIRISPersist#557 — the root is a THRESHOLD, not a seat.** The family
+    /// trust-root parity body: a 1-of-3 charter REFUSED naming its shortfall, a
+    /// 2-of-3 charter + grant + node edge rooting the subject's `infra:serve` to
+    /// the ACCORD, the A1-compromise scenario (one seat cannot re-root, re-grant
+    /// or buy a quorum), the family halt latch gating the family root, and the
+    /// threshold re-derived from THIS node's roster rather than the carried
+    /// policy string.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn family_trust_root_works_on_postgres_557() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        crate::federation::operational::test_support::exercise_family_trust_root(
+            &backend,
+            &format!("pg557-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("557 family trust root exercise");
+    }
+
     /// CIRISPersist#548 — ceremony-plane conferral (the baked-seed shape) on postgres.
     #[tokio::test]
     #[serial_test::serial(postgres)]
@@ -26246,6 +26398,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         // v9.0.0 — sign the as-built envelope (CC 5.3.2.4.3.1).
         pg_resign(&mut row);
@@ -28290,6 +28443,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         pg_resign(&mut row); // v9.0.0 — sign the envelope (CC 5.3.2.4.3.1)
         row
@@ -29482,6 +29636,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         // v9.0.0 — sign the as-built envelope (CC 5.3.2.4.3.1). Callers
         // mutating the envelope afterward must call `pg_resign`.
@@ -32555,6 +32710,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         };
         pg_resign(&mut row); // v9.0.0 — sign the envelope (CC 5.3.2.4.3.1)
         row
@@ -33332,9 +33488,9 @@ mod tests {
                         weight, asserted_at, expires_at, attestation_envelope, original_content_hash, \
                         scrub_signature_classical, scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
                         pqc_completed_at, persist_row_hash, subject_key_ids, withdraws_admission_rule, \
-                        cohort_scope, tier, promoted_at\
+                        cohort_scope, tier, promoted_at, additional_scrubs\
                      ) VALUES ($1, $2, $2, 'scores', $3::float8::numeric, $4, $5, $6, $7, \
-                              'sig', NULL, $2, $4, NULL, '0', $8, NULL, 'federation', 'federation', NULL)",
+                              'sig', NULL, $2, $4, NULL, '0', $8, NULL, 'federation', 'federation', NULL, '[]')",
                     &[&id, &occ, &weight, &asserted, &expires, &env, &empty, &subjects],
                 ).await.unwrap();
             }

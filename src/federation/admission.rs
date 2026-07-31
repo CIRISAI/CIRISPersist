@@ -3959,6 +3959,68 @@ pub async fn owner_of(
 /// per CC 4.5.13) are untouched. A no-op for any non-`delegates_to` row or any
 /// `delegates_to` lacking the ownership dimension.
 ///
+/// v24.0.0 (CIRISPersist#557) — **the attested subject must be something this
+/// node already knows**: either a registered `federation_keys` row, or a
+/// CONSTITUTIONAL FAMILY it has stored.
+///
+/// # What moved, and why this is not a loosening
+///
+/// **All three backends enforced this rule** and none could express the
+/// exception: sqlite declared
+/// `attested_key_id TEXT NOT NULL REFERENCES federation_keys(key_id)` (V004),
+/// postgres declared the same FK (its V004 puts the `REFERENCES` clause on the
+/// following line), and the memory backend emulated it in code.
+///
+/// The rule is right and is KEPT. What a schema FK cannot express is the one
+/// legitimate exception: a constitutional family is **keyless by doctrine**
+/// (v13.3.0 dropped `families.family_key_id`'s FK for exactly this reason — the
+/// family id is an identifier, not a key, and having no seat is precisely what
+/// makes it a durable name for a trust root). CIRISPersist#557's whole ask is
+/// that a node's `trust:accepts` edge NAME THE ACCORD rather than whichever
+/// holder happened to sign the charter — `delegates_to(node → humanity-accord)`,
+/// plus that family's charter and drill rows. Under the FK those rows were not
+/// merely unimplemented, they were **unstorable**.
+///
+/// So V114 lifts the constraint out of BOTH SQL schemas and into this predicate,
+/// which runs at the same point in `put_attestation` on **memory, sqlite and
+/// postgres**. Net effect: every backend keeps the rule and gains the exception,
+/// and the rule now lives somewhere it can be read, tested and reasoned about
+/// instead of in three separate places. One predicate, one impl.
+///
+/// The FKs on `attesting_key_id` and `scrub_key_id` are deliberately untouched:
+/// those identify SIGNERS, and a signer with no key record could not have signed.
+///
+/// A backend that cannot answer the family question (the FFI directory capsule
+/// reports [`Error::Unsupported`] for `lookup_family`) degrades to the
+/// key-only rule — the pre-v24 behaviour — rather than guessing.
+pub async fn check_attested_subject_admission<F>(
+    directory: &F,
+    attested_key_id: &str,
+) -> Result<(), Error>
+where
+    F: super::FederationDirectory + ?Sized,
+{
+    if directory
+        .lookup_public_key(attested_key_id)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    match directory.lookup_family(attested_key_id).await {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => {}
+        // Honestly unknown, never guessed — mirrors how `trust_root_valid`
+        // treats a backend that cannot answer the halt question.
+        Err(Error::Unsupported { .. }) => {}
+        Err(e) => return Err(e),
+    }
+    Err(Error::InvalidArgument(format!(
+        "attested_key_id {attested_key_id} resolves as neither a registered \
+         federation_keys row nor a constitutional family known to this node"
+    )))
+}
+
 /// Verify-before-mutation (AV-9): wired into every backend's `put_attestation`
 /// immediately AFTER [`check_user_target_steward_binding_admission`], so a
 /// rejected second-owner emission leaves no trace. Backend-agnostic.

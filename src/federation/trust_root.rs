@@ -20,6 +20,24 @@
 //!
 //! # The two trust planes (do not conflate)
 //!
+//! # v24.0.0 (CIRISPersist#557) — the root is a THRESHOLD, not a seat
+//!
+//! Until this cut a trust root was always exactly one key: `trust_root_valid`
+//! took a `root_key_id`, a charter was a key's self-loop, and a node's
+//! `trust:accepts` edge named whichever holder happened to sign. The accord is a
+//! trio under `quorum:2/3` and its KILL SWITCH is deliberately 2-of-3 — so we
+//! required two humans to halt the mesh and one to legitimize all of it. That
+//! asymmetry was never decided; it was inherited from the portable root's
+//! self-charter shape.
+//!
+//! [`trust_root_valid`] now also accepts a **keyless constitutional family** as
+//! the root ([`RootKind::Family`]): the trust edge names the accord, and the
+//! charter leg demands signatures from ≥m distinct SEATED holders, with m
+//! re-derived from the node's own stored `consensus_protocol` and floored at a
+//! strict majority of its own roster. Single-key roots are untouched and remain
+//! fully valid — 1-of-1 is a legitimate quorum for a root you alone own, and
+//! portability is the reason that arm exists.
+//!
 //! `infra:attest` here is a **delegation SCOPE token inside a
 //! `delegates_to` envelope** — the user's consensual choice of what a root
 //! may do for them. It is NOT the accord-conferred `infra:attest` **role**
@@ -255,6 +273,66 @@ pub fn pre_rotation_commitment(successor_keys: &[String]) -> Result<String, Erro
     Ok(hex::encode(sha2::Sha256::digest(&canonical)))
 }
 
+/// v24.0.0 (CIRISPersist#557) — WHAT KIND of thing the root reference names.
+///
+/// The two arms of [`trust_root_valid`] answer the same question about
+/// structurally different objects, and naming the axis is what keeps this from
+/// becoming one verdict with two silent value spaces (the #532 fusion class —
+/// compare [`ConferralPlane`], added for the same reason).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RootKind {
+    /// A single `federation_keys` key id — the root that chartered itself.
+    /// **Still fully valid**: 1-of-1 is a legitimate quorum for a root you
+    /// alone own, and a solo operator's personal mesh has exactly one seat.
+    /// Portability is unchanged by #557; the family arm is *additional*
+    /// expressiveness, not a replacement.
+    #[default]
+    Key,
+    /// A KEYLESS constitutional family id (`humanity-accord` in the bake). The
+    /// family holds no key — which is the point: there is no seat to
+    /// compromise, so the identifier can be the durable name of the root while
+    /// the AUTHORITY is re-derived from the family's roster and threshold.
+    Family,
+}
+
+/// v24.0.0 (CIRISPersist#557) — the charter-quorum accounting for a
+/// [`RootKind::Family`] root: how many DISTINCT seated holders actually
+/// hybrid-verified over the charter, against how many this node's OWN stored
+/// policy requires.
+///
+/// Reported whether the quorum held or not, because the interesting case is the
+/// shortfall: "1 of 2 required distinct holders" is the whole finding of
+/// CIRISPersist#557 rendered as a number a human can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CharterQuorum {
+    /// Distinct seated holders whose scrub over the charter envelope verified
+    /// against this node's DIRECTORY-pinned pubkeys.
+    pub distinct_holders: usize,
+    /// The threshold, re-derived from the node's OWN state: the family row's
+    /// `consensus_protocol`, floored at a strict majority of the node's OWN
+    /// active roster so a tampered policy string cannot talk it down.
+    pub required: usize,
+    /// The node's OWN active roster size (revocation-folded), for context.
+    pub roster_size: usize,
+}
+
+impl CharterQuorum {
+    /// Did the charter reach the threshold?
+    #[must_use]
+    pub fn met(&self) -> bool {
+        self.distinct_holders >= self.required
+    }
+
+    /// One line naming the shortfall — the phrasing a refusal quotes.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!(
+            "{} of {} required distinct holders (roster of {})",
+            self.distinct_holders, self.required, self.roster_size
+        )
+    }
+}
+
 /// The typed, per-check verdict of [`trust_root_valid`].
 ///
 /// Open accounting, not a bare bool (the derivation-trace discipline): a
@@ -298,6 +376,17 @@ pub struct TrustRootVerdict {
     /// The gate: every leg holds (including charter recovery) and no halt
     /// is latched.
     pub valid: bool,
+    /// v24.0.0 (CIRISPersist#557) — which arm produced this verdict. `#[serde(default)]`
+    /// = [`RootKind::Key`], so payloads from pre-v24 producers deserialize unchanged.
+    #[serde(default)]
+    pub root_kind: RootKind,
+    /// v24.0.0 (CIRISPersist#557) — the charter-quorum accounting, present only
+    /// for a [`RootKind::Family`] root. `Some` with
+    /// [`CharterQuorum::met`] false is the #557 refusal: a charter signed by
+    /// fewer distinct seated holders than this node's own policy requires, which
+    /// is why [`Self::root_self_declares`] is false beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charter_quorum: Option<CharterQuorum>,
 }
 
 /// v19.0.0 (#488 delta 3, the OCSP/CRLite lesson) — a row is LIVE only if
@@ -378,6 +467,118 @@ pub(crate) fn tombstoned_ids(rows: &[&Attestation]) -> std::collections::HashSet
     dead
 }
 
+/// v24.0.0 (CIRISPersist#557) — does `root_ref` name a constitutional family
+/// this node has stored?
+///
+/// The ONE place the two arms of [`trust_root_valid`] are chosen between, so
+/// they can never be selected by two different rules. A backend that cannot
+/// answer (the FFI directory capsule reports [`Error::Unsupported`] for
+/// `lookup_family`) reads as "no family" — the pre-v24 key-only behaviour —
+/// rather than guessing, exactly as the halt leg already does.
+async fn resolve_family_root<F>(
+    directory: &F,
+    root_ref: &str,
+) -> Result<Option<super::types::Family>, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    match directory.lookup_family(root_ref).await {
+        Ok(found) => Ok(found),
+        Err(Error::Unsupported { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// v24.0.0 (CIRISPersist#557) — the threshold this node's OWN state demands of
+/// a family, given its stored `consensus_protocol` and its OWN active roster.
+///
+/// **Floored at a strict majority of the node's own roster**, the identical
+/// defense [`super::genesis::bundle::verify_bundle_quorum`] applies to a carried
+/// `consensus_protocol`: a tampered policy string cannot talk the threshold
+/// down. Reused rather than re-derived — one rule, two call sites.
+///
+/// The non-`quorum:M/N` members of the closed
+/// [`consensus_protocol`](super::types::consensus_protocol) vocabulary are read
+/// FAIL-SECURE: `unanimous` (and any form this function does not recognise)
+/// demands the whole roster rather than a guess, because under-counting a
+/// threshold is the failure mode #557 exists to close.
+fn family_charter_threshold(family: &super::types::Family, roster_size: usize) -> usize {
+    let floor = ciris_verify_core::accord_genesis::strict_majority(roster_size);
+    let policy = match family.consensus_protocol.as_str() {
+        "founder_only" | "majority" => floor,
+        "unanimous" => roster_size,
+        other => super::genesis::bundle::parse_quorum(other).map_or(
+            // Unrecognised policy ⇒ unanimity, never a guessed-low number.
+            roster_size,
+            |(m, _)| m,
+        ),
+    };
+    policy.max(floor)
+}
+
+/// v24.0.0 (CIRISPersist#557) — how many DISTINCT seated holders of `family`
+/// really signed `row`?
+///
+/// The row's FULL scrub set ([`Attestation::scrubs`] — the base
+/// `scrub_key_id`/`scrub_signature_*` plus every `additional_scrubs` entry, all
+/// over the SAME canonical envelope) is intersected with the family's OWN active
+/// roster, and each survivor is hybrid-verified through
+/// [`verify_envelope_hybrid_signature`](super::verify_envelope_hybrid_signature)
+/// — the same primitive federation-tier ingest runs, against pubkeys resolved
+/// from THIS node's directory. Never the roster a caller passed, never pubkeys
+/// carried on the row: authority is re-derived from the node's own verified
+/// state (the #377 rule).
+///
+/// A scrub that is not a seated holder, or that does not verify, simply does not
+/// COUNT — it is not an error. That is the m-of-n discipline the key plane
+/// already uses (`verify_quorum_policy` counts valid founder signatures and
+/// ignores the rest), and it means a stray co-signature degrades the evidence
+/// rather than destroying the row.
+async fn family_quorum_over<F>(
+    directory: &F,
+    row: &Attestation,
+    family: &super::types::Family,
+) -> Result<CharterQuorum, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    // The roster is the REVOCATION-FOLDED active seat set, not the raw member
+    // list: a holder removed from the family stops counting toward its quorum
+    // immediately, and a charter that once reached the threshold stops reaching
+    // it — which is exactly why the count is re-derived at READ time instead of
+    // being frozen at admission.
+    let roster: Vec<String> = match directory.active_family_members(&family.family_key_id).await {
+        Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
+        Err(Error::Unsupported { .. }) => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let required = family_charter_threshold(family, roster.len());
+
+    let mut counted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for scrub in row.scrubs() {
+        if counted.contains(&scrub.scrub_key_id) || !roster.contains(&scrub.scrub_key_id) {
+            continue;
+        }
+        if super::verify_envelope_hybrid_signature(
+            directory,
+            &scrub.scrub_key_id,
+            &row.attestation_envelope,
+            &scrub.scrub_signature_classical,
+            scrub.scrub_signature_pqc.as_deref(),
+        )
+        .await
+        .is_ok()
+        {
+            counted.insert(scrub.scrub_key_id);
+        }
+    }
+    Ok(CharterQuorum {
+        distinct_holders: counted.len(),
+        required,
+        roster_size: roster.len(),
+    })
+}
+
 /// v18.2.0 (CIRISPersist#481) — the trust-root graph predicate.
 ///
 /// Evaluates, purely from graph state (FSD `TRUST_ROOT_CAPABILITY_GATE.md`
@@ -387,6 +588,30 @@ pub(crate) fn tombstoned_ids(rows: &[&Attestation]) -> std::collections::HashSet
 ///    `infra:attest` / `infra:serve` scope), live, carrying a recovery
 ///    pre-commitment;
 /// 3. no accord halt is latched for `root`.
+///
+/// # v24.0.0 (CIRISPersist#557) — `root_ref` may name a FAMILY
+///
+/// The mesh's root authority is a THRESHOLD, not a seat. When `root_ref`
+/// resolves to a constitutional family this node has stored, the same three
+/// legs are evaluated against the family instead of a key:
+///
+/// | leg | key root | family root |
+/// |---|---|---|
+/// | edge | `delegates_to(user → root_key)` | `delegates_to(user → family_id)` |
+/// | charter | `delegates_to(root → root)`, self-signed | `delegates_to(holder → family)` whose FULL scrub set reaches the family's own threshold |
+/// | halt | `get_active_halt(root_key)` (always misses — the table is family-keyed) | `get_active_halt(family_id)` — the accord's real 2-of-3 kill switch |
+///
+/// The threshold is re-derived from the node's OWN stored state — the family
+/// row's `consensus_protocol`, floored at a strict majority of its OWN
+/// revocation-folded roster — never from anything the caller or the row says
+/// (the #377 rule). Because it is re-derived at READ time, revoking a seat from
+/// the family retroactively un-charters a root that only reached the threshold
+/// with that seat's signature, with no write anywhere.
+///
+/// **The key arm is unchanged and stays fully valid.** 1-of-1 is a legitimate
+/// quorum for a root you alone own; a solo operator's portable mesh keeps
+/// working exactly as before, and the currently-baked single-key genesis root
+/// remains valid under it. See [`RootKind`].
 ///
 /// It ALSO reports, without gating on it, when `root` was last drilled
 /// ([`TrustRootVerdict::last_drill_at`] /
@@ -402,14 +627,14 @@ pub(crate) fn tombstoned_ids(rows: &[&Attestation]) -> std::collections::HashSet
 pub async fn trust_root_valid<F>(
     directory: &F,
     user_key_id: &str,
-    root_key_id: &str,
+    root_ref: &str,
 ) -> Result<TrustRootVerdict, Error>
 where
     F: FederationDirectory + ?Sized,
 {
     // A self-root is the immutable BASE, never a valid EXTERNAL root (the
     // FSD's gate demands a SHARED external root).
-    if user_key_id == root_key_id {
+    if user_key_id == root_ref {
         return Ok(TrustRootVerdict {
             edge_exists: false,
             root_self_declares: false,
@@ -421,16 +646,27 @@ where
             drill_freshness: DrillFreshness::Red,
             halt_latched: None,
             valid: false,
+            root_kind: RootKind::Key,
+            charter_quorum: None,
         });
     }
+
+    // v24.0.0 (CIRISPersist#557) — WHICH ARM. Resolved once, from the node's own
+    // stored state, before any leg is evaluated.
+    let family = resolve_family_root(directory, root_ref).await?;
+    let root_kind = if family.is_some() {
+        RootKind::Family
+    } else {
+        RootKind::Key
+    };
 
     // One read per authority: everything the user attested (edges + their
     // tombstones — a withdraws on your own edge is attested by YOU), and
     // everything attested about/by the root (self-declaration + its
     // tombstones + lifecycle rows).
     let by_user = directory.list_attestations_by(user_key_id).await?;
-    let by_root = directory.list_attestations_by(root_key_id).await?;
-    let about_root = directory.list_attestations_for(root_key_id).await?;
+    let by_root = directory.list_attestations_by(root_ref).await?;
+    let about_root = directory.list_attestations_for(root_ref).await?;
 
     let now = chrono::Utc::now();
 
@@ -441,33 +677,92 @@ where
     let user_dead = tombstoned_ids(&user_refs);
     let edge_exists = by_user.iter().any(|a| {
         a.attestation_type == attestation_type::DELEGATES_TO
-            && a.attested_key_id == root_key_id
+            && a.attested_key_id == root_ref
             && !user_dead.contains(&a.attestation_id)
             && !is_expired(a, now)
             && counts_in_capability_walk(a)
             && job_dimension_admits(&a.attestation_envelope, TRUST_ACCEPTS_DIMENSION)
     });
 
-    // 2. Charter: live delegates_to(root → root) carrying BOTH
-    // infra:serve AND infra:attest (v19.0.0 #488 — the RC3 AND-minimum;
-    // extra charter scopes tolerated). The recovery leg (delta 1) reads
-    // the SAME live charter rows: any live charter with a well-formed
-    // pre-rotation commitment satisfies it.
+    // 2. Charter.
+    //
+    // KEY ROOT — live delegates_to(root → root) carrying BOTH infra:serve AND
+    // infra:attest (v19.0.0 #488 — the RC3 AND-minimum; extra charter scopes
+    // tolerated). The self-loop IS what makes a key a root.
+    //
+    // FAMILY ROOT (v24.0.0, CIRISPersist#557) — a family is KEYLESS, so it
+    // cannot sign a self-loop and the self-loop shape is structurally
+    // unavailable. Its analogue is `delegates_to(holder → family)` labelled
+    // `trust:charter:v1`, carried in the ABOUT set rather than the BY set, and
+    // it counts as a charter only when its FULL scrub set reaches the family's
+    // own threshold. That is the whole of #557: *the roster charters the
+    // family*, so no single seat can declare itself the mesh's root.
+    //
+    // The recovery leg (#488 delta 1) reads the SAME live charter rows on both
+    // arms: any live charter with a well-formed pre-rotation commitment
+    // satisfies it. Pre-rotation still protects individual SEATS; the family
+    // root additionally survives losing one without any ceremony at all.
     let root_refs: Vec<&Attestation> = by_root.iter().collect();
     let root_dead = tombstoned_ids(&root_refs);
-    let live_charters: Vec<&Attestation> = by_root
-        .iter()
-        .filter(|a| {
-            a.attestation_type == attestation_type::DELEGATES_TO
-                && a.attested_key_id == root_key_id
-                && !root_dead.contains(&a.attestation_id)
-                && !is_expired(a, now)
-                && counts_in_capability_walk(a)
-                && job_dimension_admits(&a.attestation_envelope, TRUST_CHARTER_DIMENSION)
-                && scope_contains(&a.attestation_envelope, INFRA_SERVE_SCOPE)
-                && scope_contains(&a.attestation_envelope, INFRA_ATTEST_SCOPE)
-        })
-        .collect();
+    let about_refs: Vec<&Attestation> = about_root.iter().collect();
+    let about_dead = tombstoned_ids(&about_refs);
+
+    let charter_shaped = |a: &&Attestation, dead: &std::collections::HashSet<String>| {
+        a.attestation_type == attestation_type::DELEGATES_TO
+            && a.attested_key_id == root_ref
+            && !dead.contains(&a.attestation_id)
+            && !is_expired(a, now)
+            && counts_in_capability_walk(a)
+            && job_dimension_admits(&a.attestation_envelope, TRUST_CHARTER_DIMENSION)
+            && scope_contains(&a.attestation_envelope, INFRA_SERVE_SCOPE)
+            && scope_contains(&a.attestation_envelope, INFRA_ATTEST_SCOPE)
+    };
+
+    let (live_charters, charter_quorum): (Vec<&Attestation>, Option<CharterQuorum>) =
+        match family.as_ref() {
+            None => (
+                by_root
+                    .iter()
+                    .filter(|a| charter_shaped(a, &root_dead) && a.attesting_key_id == root_ref)
+                    .collect(),
+                None,
+            ),
+            Some(fam) => {
+                let mut quorate: Vec<&Attestation> = Vec::new();
+                // Reported even when nothing reaches the bar: the SHORTFALL is
+                // the finding a human acts on ("1 of 2 required distinct
+                // holders"), so the best candidate's count is carried out.
+                let mut best: Option<CharterQuorum> = None;
+                for candidate in about_root.iter().filter(|a| charter_shaped(a, &about_dead)) {
+                    let q = family_quorum_over(directory, candidate, fam).await?;
+                    if q.met() {
+                        quorate.push(candidate);
+                    }
+                    if best.is_none_or(|b| q.distinct_holders > b.distinct_holders) {
+                        best = Some(q);
+                    }
+                }
+                // No charter-shaped row at all still deserves an honest number:
+                // 0 of whatever this node requires.
+                let reported = match best {
+                    Some(q) => q,
+                    None => {
+                        let roster_size =
+                            match directory.active_family_members(&fam.family_key_id).await {
+                                Ok(m) => m.len(),
+                                Err(Error::Unsupported { .. }) => 0,
+                                Err(e) => return Err(e),
+                            };
+                        CharterQuorum {
+                            distinct_holders: 0,
+                            required: family_charter_threshold(fam, roster_size),
+                            roster_size,
+                        }
+                    }
+                };
+                (quorate, Some(reported))
+            }
+        };
     let root_self_declares = !live_charters.is_empty();
     let charter_has_recovery = live_charters
         .iter()
@@ -481,8 +776,12 @@ where
     // about-set (composers reference the target id and carry the same
     // attested key). A tombstoned / expired / local-tier row is still not a
     // drill: those legs are unchanged.
-    let about_refs: Vec<&Attestation> = about_root.iter().collect();
-    let about_dead = tombstoned_ids(&about_refs);
+    //
+    // v24.0.0 (CIRISPersist#557) — unchanged for a FAMILY root too, and
+    // deliberately so: `list_attestations_for(family_id)` is already "drills
+    // about the family", which is the only shape the drill can take once the
+    // root is the family rather than a seat. A drill naming an individual
+    // holder is a drill about that holder, not about the accord.
     let last_drill_at = about_root
         .iter()
         .filter(|a| {
@@ -499,7 +798,12 @@ where
 
     // 4. Halt latch (kill-switch state). Unsupported backends report None
     // — honestly unknown, never guessed.
-    let halt_latched = match directory.get_active_halt(root_key_id).await {
+    // v24.0.0 (CIRISPersist#557) — on the FAMILY arm this argument is finally
+    // the kind of id the halt table is keyed by (`accord_active_halt` has
+    // `family_key_id` as its PRIMARY KEY), so the accord's 2-of-3 kill switch
+    // now latches against the root it was always meant to stop. On the key arm
+    // it stays a key id and, as before, resolves to "no halt".
+    let halt_latched = match directory.get_active_halt(root_ref).await {
         Ok(v) => Some(v.is_some()),
         Err(Error::Unsupported { .. }) => None,
         Err(e) => return Err(e),
@@ -521,6 +825,8 @@ where
         drill_freshness,
         halt_latched,
         valid,
+        root_kind,
+        charter_quorum,
     })
 }
 
@@ -533,6 +839,13 @@ pub struct TrustedGrant {
     /// The root that both (a) conferred `scope` on the subject (see
     /// [`Self::conferral_plane`] for HOW) and (b) passes
     /// [`trust_root_valid`] from the asking user's records.
+    ///
+    /// v24.0.0 (CIRISPersist#557) — for a [`ConferralPlane::FamilyQuorum`] grant
+    /// this carries the FAMILY id, which is not a key. The wire name is kept
+    /// (renaming it would break every downstream deserializer for a cosmetic
+    /// gain); what disambiguates it is [`TrustRootVerdict::root_kind`] on
+    /// [`Self::verdict`], which NAMES the axis rather than leaving one field
+    /// with two silent value spaces.
     pub root_key_id: String,
     /// Which row carried the conferral. Its meaning is keyed by
     /// [`Self::conferral_plane`] — the two planes confer through different
@@ -574,6 +887,29 @@ pub enum ConferralPlane {
     /// asking user's own trust chain to it (edge, charter, heartbeat, halt)
     /// is still required in full via [`trust_root_valid`].
     AccordCoScrub,
+    /// v24.0.0 (CIRISPersist#557) — a live `delegates_to(holder → subject)`
+    /// grant carried the scope AND its own scrub set reached the QUORUM of a
+    /// constitutional family the granter sits in. The candidate root is that
+    /// FAMILY, not the holder who signed.
+    ///
+    /// # The granter semantic, chosen and written down
+    ///
+    /// #557 asks whether the walk should accept a grant whose granter is the
+    /// family id itself, or one from a quorum-covered holder acting for it.
+    /// **It is the second, and the code leaves no real choice**: a
+    /// constitutional family is KEYLESS by doctrine, so a row with
+    /// `attesting_key_id = <family id>` could never be signed and could never
+    /// pass federation-tier ingest, which verifies the attester's REGISTERED
+    /// pubkeys. A grant that merely *named* the family in its envelope while
+    /// carrying one seat's signature would be worse than the status quo — it
+    /// would let A1 alone re-grant under the accord's name, which is exactly
+    /// the authority #557 exists to take away from any single seat.
+    ///
+    /// So the family a grant acts for is **derived, never asserted**: from the
+    /// grant's own verified signer set, intersected with the node's OWN family
+    /// rosters. There is no `on_behalf_of` field to forge, and adding one seat's
+    /// signature to a grant buys nothing until the threshold is met.
+    FamilyQuorum,
 }
 
 /// v18.3.0 (CIRISPersist#483) — the composed capability walk: does
@@ -640,22 +976,24 @@ pub async fn capability_roots_to_trusted_root_over_roster(
     // non-expired — #488 delta 3) scoped delegates_to edge to the subject
     // (excluding a self-grant). Dedup so a root that granted twice is
     // walked once.
+    let conferral_shaped = |a: &&Attestation| {
+        a.attestation_type == attestation_type::DELEGATES_TO
+            && a.attested_key_id == subject_key_id
+            && a.attesting_key_id != subject_key_id
+            && !dead.contains(&a.attestation_id)
+            && !is_expired(a, now)
+            && counts_in_capability_walk(a)
+            // v23.0.0 (#551 item 2) — this loop reads CONFERRALS
+            // (R → subject); a row here labeled charter or trust-edge is
+            // pointing the other way and does not confer.
+            && job_dimension_admits(&a.attestation_envelope, TRUST_CONFERS_DIMENSION)
+            && scope_contains(&a.attestation_envelope, scope)
+    };
+
     let mut seen = std::collections::HashSet::new();
     let candidates: Vec<(&str, &str)> = about_subject
         .iter()
-        .filter(|a| {
-            a.attestation_type == attestation_type::DELEGATES_TO
-                && a.attested_key_id == subject_key_id
-                && a.attesting_key_id != subject_key_id
-                && !dead.contains(&a.attestation_id)
-                && !is_expired(a, now)
-                && counts_in_capability_walk(a)
-                // v23.0.0 (#551 item 2) — this loop reads CONFERRALS
-                // (R → subject); a row here labeled charter or trust-edge is
-                // pointing the other way and does not confer.
-                && job_dimension_admits(&a.attestation_envelope, TRUST_CONFERS_DIMENSION)
-                && scope_contains(&a.attestation_envelope, scope)
-        })
+        .filter(conferral_shaped)
         .filter(|a| seen.insert(a.attesting_key_id.clone()))
         .map(|a| (a.attesting_key_id.as_str(), a.attestation_id.as_str()))
         .collect();
@@ -670,6 +1008,52 @@ pub async fn capability_roots_to_trusted_root_over_roster(
                 verdict,
                 conferral_plane: ConferralPlane::Delegation,
             }));
+        }
+    }
+
+    // ── FAMILY-QUORUM plane (v24.0.0 / CIRISPersist#557) ─────────────────
+    // The same conferral rows, read for a different root: a grant signed by
+    // ENOUGH distinct seated holders of a family is a grant BY THAT FAMILY, and
+    // the candidate root is the family id.
+    //
+    // The family is DERIVED from the grant's own verified signer set against
+    // this node's OWN rosters — see [`ConferralPlane::FamilyQuorum`] for why
+    // that, and not a granter field naming the family, is the only safe reading.
+    // Runs AFTER the plain delegation loop (a single-key root costs no quorum
+    // crypto) and BEFORE the ceremony arm, matching the cheapest-first ordering
+    // this walk has always used.
+    let mut family_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for grant in about_subject.iter().filter(conferral_shaped) {
+        let families = match directory
+            .list_families_for_member(&grant.attesting_key_id)
+            .await
+        {
+            Ok(f) => f,
+            // Honestly unknown, never guessed — same treatment the halt leg
+            // gives a backend that cannot answer.
+            Err(Error::Unsupported { .. }) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        for family in families {
+            if !family_seen.insert(format!(
+                "{}\u{1f}{}",
+                family.family_key_id, grant.attestation_id
+            )) {
+                continue;
+            }
+            let quorum = family_quorum_over(directory, grant, &family).await?;
+            if !quorum.met() {
+                continue;
+            }
+            let verdict = trust_root_valid(directory, user_key_id, &family.family_key_id).await?;
+            if verdict.valid {
+                return Ok(Some(TrustedGrant {
+                    root_key_id: family.family_key_id,
+                    grant_attestation_id: grant.attestation_id.clone(),
+                    verdict,
+                    conferral_plane: ConferralPlane::FamilyQuorum,
+                }));
+            }
         }
     }
     // ── CEREMONY-PLANE fallback (v22.1.0 / CIRISPersist#548) ─────────────
@@ -730,6 +1114,94 @@ pub async fn capability_roots_to_trusted_root_over_roster(
         }
     }
     Ok(None)
+}
+
+/// v24.0.0 (CIRISPersist#557) — the FAMILY-charter admission gate: a charter
+/// that names a constitutional family must be signed by that family's QUORUM,
+/// and it is refused at the write chokepoint if it is not.
+///
+/// # Why a second gate rather than a wider first one
+///
+/// [`check_trust_charter_admission`] is handed an envelope, not a row, because
+/// the local-tier writers call it before any row exists. A family charter's
+/// authority lives in its SCRUB SET, which only a row carries — so this gate
+/// takes the row and runs at `put_attestation` only. That is not a hole: a
+/// local-tier row defers its signature and is ignored by
+/// [`counts_in_capability_walk`], and a promote re-signs with the promoting
+/// node's single key, so neither path can manufacture a quorum.
+///
+/// # What it refuses, and what it deliberately does not
+///
+/// Fires only on a `delegates_to` carrying [`TRUST_CHARTER_DIMENSION`] whose
+/// attester is not its own subject AND whose subject resolves as a family this
+/// node knows — the shape a family charter has and a key self-charter never has.
+/// Then:
+///
+/// 1. the pre-rotation commitment rule applies unchanged (#488 delta 1) — the
+///    family root survives losing a seat, but the SEATS still rotate;
+/// 2. the row's full scrub set must reach the family's own threshold, re-derived
+///    from this node's stored roster and `consensus_protocol`. The refusal NAMES
+///    the shortfall ("1 of 2 required distinct holders"), because "quorum not
+///    met" without the numbers tells a ceremony operator nothing about whether
+///    they are one signature short or looking at the wrong family.
+///
+/// A `trust:charter:v1` row whose subject is somebody else's KEY is deliberately
+/// NOT refused here. It is mislabeled — on the key arm a root charters ITSELF —
+/// but #551 item 2 settled where that gets caught: **a mislabeled row still
+/// writes, and the WALK refuses it** ([`job_dimension_admits`] returns false for
+/// a row whose two self-descriptions disagree). Refusing it at ingest as well
+/// would move a deliberate read-side decision to the write side and break the
+/// contract that cut pinned. What is judged here is the one thing only the
+/// writer can be judged for: a charter that names a real family and does not
+/// carry that family's quorum.
+///
+/// A backend that cannot answer the family question degrades to a no-op, the
+/// pre-v24 behaviour, rather than refusing rows it cannot judge.
+pub async fn check_family_charter_admission<F>(
+    directory: &F,
+    row: &Attestation,
+) -> Result<(), Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    if row.attestation_type != attestation_type::DELEGATES_TO
+        || row.attesting_key_id == row.attested_key_id
+        || super::admission::envelope_dimension(&row.attestation_envelope)
+            != Some(TRUST_CHARTER_DIMENSION)
+    {
+        return Ok(());
+    }
+    let refuse = |detail: String| Err(Error::CharterInvalid { detail });
+
+    // Not a family ⇒ a MISLABELED key-plane row. Stored and inert, per #551
+    // item 2 — see the type-level doc.
+    let Some(family) = resolve_family_root(directory, &row.attested_key_id).await? else {
+        return Ok(());
+    };
+
+    if !charter_commitment_well_formed(&row.attestation_envelope) {
+        return refuse(format!(
+            "family charter for {} must carry a well-formed \
+             \"{CHARTER_PRE_ROTATION_FIELD}\" (64 lowercase hex — sha256 of the \
+             pre-committed successor key set); a quorum-rooted family survives losing \
+             a seat, but the seats themselves still rotate",
+            family.family_key_id
+        ));
+    }
+
+    let quorum = family_quorum_over(directory, row, &family).await?;
+    if !quorum.met() {
+        return refuse(format!(
+            "family charter for {} is signed by {} — the accord's own \
+             consensus_protocol {:?} makes this root a threshold, not a seat, and a \
+             charter below it would hand one holder the authority that grants \
+             everything",
+            family.family_key_id,
+            quorum.describe(),
+            family.consensus_protocol
+        ));
+    }
+    Ok(())
 }
 
 /// v19.0.0 (CIRISPersist#488 delta 1, CRITICAL — the KERI lesson) — the

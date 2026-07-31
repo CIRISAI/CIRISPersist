@@ -114,6 +114,7 @@ pub(crate) mod test_support {
             cohort_scope: "federation".to_owned(),
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
@@ -146,6 +147,7 @@ pub(crate) mod test_support {
             cohort_scope: "federation".to_owned(),
             tier: attestation_tier::FEDERATION.to_owned(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
@@ -387,6 +389,7 @@ mod tests {
             cohort_scope: "federation".to_string(),
             tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
             promoted_at: None,
+            additional_scrubs: Vec::new(),
         }
     }
 
