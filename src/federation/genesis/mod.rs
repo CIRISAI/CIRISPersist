@@ -602,6 +602,158 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// **CIRISPersist#557 — the CEREMONY DRY RUN.** Installs a candidate
+    /// re-mint bundle through the REAL gates and asserts it roots to the
+    /// FAMILY under quorum — the validation promised on #557 before any
+    /// bundle is treated as the root ("one dry session is far cheaper than
+    /// discovering the grant shape was wrong after baking").
+    ///
+    /// Skips cleanly when no candidate is present, so it lives in the suite
+    /// as the permanent ceremony harness: point `GENESIS3` at the next
+    /// bundle and the same assertions run.
+    ///
+    /// The three assertions the ceremony hangs on, and why each:
+    /// - `root_kind == Family` — a subtly-wrong family shape otherwise
+    ///   DEGRADES to a working single-key root (CIRISServer's transition-risk
+    ///   flag: silent success is how this reaches production);
+    /// - `conferral_plane == FamilyQuorum` — the grant was attributed by
+    ///   SIGNATURE (2 seated holders), never by a granter field naming a
+    ///   keyless family;
+    /// - all four `infra:*` scopes — the v23.1.0 bake conferred `serve` alone.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn genesis_candidate_bundle_roots_to_the_family_under_quorum_557() {
+        use crate::federation::trust_root::{
+            capability_roots_to_trusted_root, trust_root_valid, ConferralPlane, RootKind,
+            TRUST_ACCEPTS_DIMENSION,
+        };
+        use crate::federation::{FederationDirectory, SignedAttestation};
+        use crate::store::{Backend as _, SqliteBackend};
+
+        let path =
+            std::env::var("GENESIS3").unwrap_or_else(|_| "/home/emoore/genesis_3.json".into());
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            eprintln!("skipping #557 dry run: no candidate bundle at {path}");
+            return;
+        };
+        let b: GenesisBundle =
+            serde_json::from_str(&raw).expect("candidate parses as GenesisBundle");
+        const CANONICAL: &str = "ciris-canonical-1-d7bdeu223k";
+        const FAMILY: &str = "humanity-accord";
+
+        let sq = SqliteBackend::open_in_memory().await.expect("open");
+        sq.run_migrations().await.expect("migrations");
+
+        // Holders FIRST: verify_bundle_quorum re-derives the roster from THIS
+        // node's directory (the #377 rule — never the roster the bundle
+        // carries), so the seats must be seeded before the quorum can be
+        // re-tallied against them.
+        sq.seed_genesis_accord_holders(&b.holders)
+            .await
+            .expect("holders seed");
+        let n = verify_bundle_quorum(&sq, &b)
+            .await
+            .expect("bundle quorum verifies");
+        eprintln!("DRYRUN quorum: {n} authorizations verified");
+        seed_accord_family(&sq).await.expect("family row");
+        for rec in &b.serve_nodes {
+            sq.put_public_key(rec.clone())
+                .await
+                .expect("serve node admits");
+        }
+        for att in &b.attestations {
+            sq.put_attestation(SignedAttestation {
+                attestation: att.attestation.clone(),
+            })
+            .await
+            .unwrap_or_else(|e| {
+                panic!("attestation {} admits: {e}", att.attestation.attestation_id)
+            });
+        }
+        eprintln!(
+            "DRYRUN install: holders + family + serve + {} attestations",
+            b.attestations.len()
+        );
+
+        // A fresh node's own trust:accepts -> the FAMILY (what first boot writes).
+        let node = "dryrun-fresh-node";
+        crate::federation::tier_ingest::test_support::register_hybrid_key(&sq, node).await;
+        let edge_id = uuid::Uuid::new_v4().to_string();
+        let envelope = serde_json::json!({
+            "id": edge_id,
+            "dimension": TRUST_ACCEPTS_DIMENSION,
+            "scope": ["infra:serve", "infra:attest", "infra:store", "infra:transport"],
+        });
+        let (och, sc, sp) =
+            crate::federation::tier_ingest::test_support::sign_envelope(node, &envelope);
+        let now = chrono::Utc::now();
+        sq.put_attestation(SignedAttestation {
+            attestation: crate::federation::Attestation {
+                attestation_id: edge_id.clone(),
+                attesting_key_id: node.to_owned(),
+                attested_key_id: FAMILY.to_owned(),
+                attestation_type: crate::federation::types::attestation_type::DELEGATES_TO
+                    .to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: och,
+                scrub_signature_classical: sc,
+                scrub_signature_pqc: sp,
+                scrub_key_id: node.to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: crate::federation::types::cohort_scope::FEDERATION.to_owned(),
+                tier: crate::federation::types::attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .expect("node trust:accepts -> family admits");
+
+        let verdict = trust_root_valid(&sq, node, FAMILY).await.expect("verdict");
+        eprintln!("DRYRUN verdict: {verdict:?}");
+        assert_eq!(
+            verdict.root_kind,
+            RootKind::Family,
+            "#557: the root is the FAMILY, not a seat"
+        );
+        assert!(
+            verdict.valid,
+            "#557: family root must be VALID: {verdict:?}"
+        );
+
+        for scope in [
+            "infra:serve",
+            "infra:attest",
+            "infra:store",
+            "infra:transport",
+        ] {
+            let grant = capability_roots_to_trusted_root(&sq, node, CANONICAL, scope)
+                .await
+                .expect("walk")
+                .unwrap_or_else(|| {
+                    panic!("#557: canonical must hold {scope} under the family root")
+                });
+            eprintln!(
+                "DRYRUN {scope}: root={} plane={:?}",
+                grant.root_key_id, grant.conferral_plane
+            );
+            assert_eq!(grant.root_key_id, FAMILY, "{scope}: roots to the FAMILY");
+            assert_eq!(
+                grant.conferral_plane,
+                ConferralPlane::FamilyQuorum,
+                "{scope}: quorum plane"
+            );
+        }
+        eprintln!("DRYRUN: PASS — quorum-rooted, all four infra scopes, no single seat");
+    }
+
     use super::*;
     use crate::federation::types::identity_type;
 
@@ -744,11 +896,15 @@ mod tests {
             .iter()
             .map(|a| a.attestation.attestation_id.as_str())
             .collect();
+        // v24.1.0 (CIRISPersist#557) — the QUORUM-ROOTED bake. The grant id
+        // lost its `-serve` qualifier when the ceremony started conferring the
+        // full infra set (the v23.1.0 bundle granted `infra:serve` alone), and
+        // the charter/lifecycle rows now name the FAMILY rather than a seat.
         assert_eq!(
             atts,
             [
                 "genesis-charter",
-                "genesis-grant-serve:ciris-canonical-1-d7bdeu223k",
+                "genesis-grant:ciris-canonical-1-d7bdeu223k",
                 "genesis-lifecycle",
             ],
             "charter + serve grant + lifecycle — the delegation plane"
@@ -774,9 +930,11 @@ mod tests {
             b.serve_nodes[0].record.key_id,
             "ciris-canonical-1-d7bdeu223k"
         );
+        // v24.1.0 — the quorum-rooted ceremony's own instant. Pinned so a
+        // re-bake is a DELIBERATE edit here, never a silent artifact swap.
         assert_eq!(
             b.serve_nodes[0].record.valid_from.to_rfc3339(),
-            "2026-07-23T02:00:39.533577+00:00"
+            "2026-07-31T13:58:22.147317128+00:00"
         );
     }
 
@@ -910,6 +1068,18 @@ mod tests {
         own.identity_type = identity_type::NODE.to_owned();
         own.additional_scrubs.clear();
         own.capability_roles.clear();
+        // v24.1.0 (CIRISPersist#557) — strip the roles from the SIGNED
+        // ENVELOPE too, not just the column. `claims_role` reads BOTH
+        // surfaces, and from the quorum-rooted bake the envelope carries
+        // `infra:attest` — which `check_infra_attest_role_admission` refuses
+        // without accord co-scrub. That refusal is CORRECT and is exactly
+        // what this fixture simulates the absence of: a node that registered
+        // ITSELF cannot claim an accord-conferred role. Clearing only the
+        // column left the envelope claiming it, so the pre-seed was refused
+        // by the very gate the seed upgrade exists to satisfy.
+        if let Some(obj) = own.registration_envelope.as_object_mut() {
+            obj.insert("roles".into(), serde_json::json!([]));
+        }
         backend
             .put_public_key(SignedKeyRecord { record: own })
             .await
@@ -973,6 +1143,10 @@ mod tests {
         old.additional_scrubs.clear();
         old.capability_roles.clear();
         let mut env = old.registration_envelope.clone();
+        // v24.1.0 (CIRISPersist#557) — see the sibling fixture: the SIGNED
+        // ENVELOPE'S roles must go too, or this "prior" row still claims the
+        // accord-conferred `infra:attest` the quorum-rooted bake introduced.
+        env["roles"] = serde_json::json!([]);
         env["valid_from"] = serde_json::json!("2026-06-01T00:00:00+00:00");
         old.registration_envelope = env.clone();
         old.original_content_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
