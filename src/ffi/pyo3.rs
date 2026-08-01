@@ -2149,6 +2149,89 @@ impl PyEngine {
         })
     }
 
+    /// v24.2.0 (CIRISPersist#564 stage 1) — **is this CEG object
+    /// load-bearing on THIS node?** Returns the verdict as JSON:
+    /// `{"yes":{"because":[…]}}` / `"no"` /
+    /// `{"unknown":{"family":…,"reason":…}}`.
+    ///
+    /// An object is load-bearing iff removing our copy would change an
+    /// answer this node can give. A `consent:replication` grant
+    /// authorizes our HOLDING of something; hold nothing that needs it
+    /// and it does no work here — regardless of its age or its author's
+    /// fate, which is why this needs no clock and scores no principal.
+    ///
+    /// `object_kind` is `"attestation"` or `"key_record"`; `object_id`
+    /// is the `attestation_id` / `key_id`.
+    ///
+    /// **Fail-secure**: a family with no declared load-bearing predicate
+    /// resolves `unknown`, which is TREATED AS load-bearing. An
+    /// undeclared family is a manifest gap, never a licence to collect.
+    ///
+    /// **Read-only.** This releases, evicts and mutates NOTHING, and a
+    /// `"no"` is not permission to drop anything: release additionally
+    /// requires the anti-entropy conjunct (#564 stage 2), which does not
+    /// exist yet. Dropping a copy that has nowhere else to live is data
+    /// loss wearing a GC costume.
+    ///
+    /// Exposed here because edge and server reach persist through this
+    /// FFI — a predicate no host can call is not shipped (AV-77).
+    fn is_load_bearing_json(
+        &self,
+        py: Python<'_>,
+        object_kind: &str,
+        object_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let object = match object_kind {
+            "attestation" => crate::federation::load_bearing::ObjectRef::Attestation {
+                attestation_id: object_id.to_owned(),
+            },
+            "key_record" => crate::federation::load_bearing::ObjectRef::KeyRecord {
+                key_id: object_id.to_owned(),
+            },
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "is_load_bearing object_kind must be \"attestation\" or \"key_record\", got \
+                     {other:?}"
+                )))
+            }
+        };
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let object = object.clone();
+            py.detach(move || {
+                let verdict = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::load_bearing::is_load_bearing(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                object,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::load_bearing::is_load_bearing(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                object,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&verdict)
+                    .map_err(|e| PyValueError::new_err(format!("is_load_bearing serialize: {e}")))
+            })
+        })
+    }
+
     /// v3.4.0 (CIRISPersist#123) — set the local
     /// `federation_blobs` storage budget in bytes. Above
     /// `budget × steady_state_utilization` the eviction sweeper

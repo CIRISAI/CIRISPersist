@@ -2582,11 +2582,19 @@ impl SqliteBackend {
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
         use crate::federation::register::{
-            plan_replicated_key_apply, AdoptScrubOutcome, ReplicatedKeyOutcome, ReplicatedKeyPlan,
+            plan_replicated_key_apply, AdoptScrubOutcome, KeyRefusalReason, ReplicatedKeyOutcome,
+            ReplicatedKeyPlan,
+        };
+        /// v24.2.0 (CIRISPersist#565) — a `Conflict` from the store step: the
+        /// row present at WRITE time is not the row the plan was made against.
+        const RACED: ReplicatedKeyOutcome = ReplicatedKeyOutcome::Refused {
+            reason: KeyRefusalReason::StoreConflict,
         };
         match plan_replicated_key_apply(self, &record.record).await? {
             ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
-            ReplicatedKeyPlan::Refused => Ok(ReplicatedKeyOutcome::Refused),
+            // The plan produced the reason at the branch that fired; carry it
+            // through rather than re-deriving it here (#565).
+            ReplicatedKeyPlan::Refused { reason } => Ok(ReplicatedKeyOutcome::Refused { reason }),
             ReplicatedKeyPlan::Insert => {
                 // v21.0.0 (CIRISPersist#502 E2) — the fresh-key insert path
                 // ran NO proof-of-possession: a replicated first-sight
@@ -2603,7 +2611,7 @@ impl SqliteBackend {
                     Ok(()) => Ok(ReplicatedKeyOutcome::Inserted),
                     // A row appeared between plan and act with different
                     // content — first-seen wins on the replication plane.
-                    Err(crate::federation::Error::Conflict(_)) => Ok(ReplicatedKeyOutcome::Refused),
+                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
                     Err(e) => Err(e),
                 }
             }
@@ -2612,7 +2620,7 @@ impl SqliteBackend {
                 Ok(AdoptScrubOutcome::AlreadyAdopted) => Ok(ReplicatedKeyOutcome::Unchanged),
                 // The atomic WHERE (or its Rust pre-checks) saw different
                 // state than the plan — a concurrent mutation. Fail-closed.
-                Err(crate::federation::Error::Conflict(_)) => Ok(ReplicatedKeyOutcome::Refused),
+                Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
                 Err(e) => Err(e),
             },
             // #405 — existing canonical → strictly-newer, m-of-n-re-verified
@@ -2620,7 +2628,7 @@ impl SqliteBackend {
             // holds Conflict is fail-closed + re-offerable.
             ReplicatedKeyPlan::Supersede => match self.supersede_canonical_record(record).await {
                 Ok(outcome) => Ok(outcome),
-                Err(crate::federation::Error::Conflict(_)) => Ok(ReplicatedKeyOutcome::Refused),
+                Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
                 Err(e) => Err(e),
             },
         }
@@ -19800,7 +19808,13 @@ mod tests {
                 .apply_replicated_key_record(SignedKeyRecord { record: scrubbed })
                 .await
                 .unwrap(),
-            ReplicatedKeyOutcome::Refused
+            // v24.2.0 (CIRISPersist#565) — `OwnerAmbiguous`, distinctly from
+            // `OwnerAbsent`: this key has TWO owners, and the operator's next
+            // move (resolve a duplicate ownership claim) is not the unowned
+            // key's next move (register an owner binding).
+            ReplicatedKeyOutcome::Refused {
+                reason: crate::federation::register::KeyRefusalReason::OwnerAmbiguous
+            }
         );
         let row = FederationDirectory::lookup_public_key(&backend, "apply-amb-node")
             .await
@@ -20054,6 +20068,21 @@ mod tests {
         crate::federation::consent_peer_set::test_support::exercise_consent_peer_set_fold(
             &backend,
             "sqlite-parity",
+        )
+        .await;
+    }
+
+    /// v24.2.0 (CIRISPersist#564 stage 1) — the sqlite leg of the shared
+    /// `is_load_bearing` witness (see the postgres + memory legs); all three
+    /// call the SAME `load_bearing::test_support::exercise_load_bearing_predicate`
+    /// body, so no backend can silently disagree about which objects are inert.
+    #[tokio::test]
+    async fn load_bearing_predicate_parity_sqlite_564() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::load_bearing::test_support::exercise_load_bearing_predicate(
+            &backend,
+            "sqlite-lb",
         )
         .await;
     }

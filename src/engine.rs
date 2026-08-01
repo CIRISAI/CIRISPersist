@@ -883,6 +883,33 @@ impl Engine {
         crate::federation::deletion_window::run_deletion_window_watch(&*dir, now).await
     }
 
+    /// v24.2.0 (CIRISPersist#564 stage 1) — **is this CEG object load-bearing
+    /// on THIS node?**
+    ///
+    /// The host handle for
+    /// [`crate::federation::load_bearing::is_load_bearing`]. An object is load
+    /// bearing iff removing our copy would change an answer this node can give;
+    /// the verdict is a derivation trace, never a bare bool, and an undeclared
+    /// family resolves fail-secure
+    /// [`Unknown`](crate::federation::load_bearing::LoadBearing::Unknown).
+    ///
+    /// Exposed here because a capability no host can call is not shipped —
+    /// the AV-77 lesson, and the reason #563's three unwired primitives
+    /// (`sweep_consent_decay_once`, `seed_accord_family`,
+    /// `repair_stranded_scope_backlog`) were worth filing on their own.
+    ///
+    /// **Read-only.** It releases, evicts and mutates NOTHING, and a `No` is
+    /// not a licence to drop anything: release needs #564 stage 2's
+    /// `anti_entropy_satisfied` conjunct, which does not exist yet.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn is_load_bearing(
+        &self,
+        object: crate::federation::load_bearing::ObjectRef,
+    ) -> Result<crate::federation::load_bearing::LoadBearing, crate::federation::Error> {
+        let dir = self.federation_directory();
+        crate::federation::load_bearing::is_load_bearing(&*dir, object).await
+    }
+
     /// v24.1.0 (CIRISPersist#561) — **may `peer_key_id` carry our relay
     /// traffic, and for how long may that answer be cached?**
     ///
@@ -14193,6 +14220,52 @@ mod tests {
                 .any(|e| e.target_key_id.as_deref() == Some(breached_id.as_str())),
             "and the host can observe the evidence it raised"
         );
+    }
+
+    /// v24.2.0 (CIRISPersist#564 stage 1) — **the host-reachability witness**
+    /// for `is_load_bearing`.
+    ///
+    /// The predicate itself is proven backend-by-backend against
+    /// `&dyn FederationDirectory` in
+    /// [`crate::federation::load_bearing::test_support`]. This proves the other
+    /// half: a host holding an [`Engine`] can ASK the question and READ the
+    /// derivation, without reaching past the handle into a concrete backend
+    /// type. #563's own finding was three primitives with zero callers — a
+    /// capability nobody can invoke is not shipped, whatever the tests say.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn is_load_bearing_runs_through_the_engine_handle_sqlite() {
+        use crate::federation::load_bearing::{LoadBearing, ObjectRef};
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("lb-engine");
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+
+        // THROUGH the handle — no `engine.sqlite_backend()`, no concrete type.
+        // An object this node does not hold: nothing here depends on it.
+        let verdict = engine
+            .is_load_bearing(ObjectRef::Attestation {
+                attestation_id: uuid::Uuid::new_v4().to_string(),
+            })
+            .await
+            .expect("is_load_bearing is reachable from an Engine");
+        assert_eq!(verdict, LoadBearing::No);
+
+        // And a key the corpus knows nothing about is fail-secure Unknown,
+        // NOT `No` — the direction that matters, asserted at the host handle
+        // because that is where a caller would act on it.
+        let verdict = engine
+            .is_load_bearing(ObjectRef::KeyRecord {
+                key_id: "lb-engine-unknown-key".to_string(),
+            })
+            .await
+            .expect("key-record arm is reachable from an Engine");
+        assert!(
+            matches!(verdict, LoadBearing::Unknown { .. }),
+            "unproven must read Unknown at the host handle, got {verdict:?}"
+        );
+        assert!(verdict.treated_as_load_bearing());
     }
 
     /// #249 — `file_moderation` stores a `moderation:{allegation}` scores

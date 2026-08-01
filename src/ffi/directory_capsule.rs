@@ -849,10 +849,14 @@ pub enum DirectoryOpResult {
     /// `build_delegation_graph`.
     DelegationGraph(crate::federation::topology::DelegationGraph),
     /// `apply_replicated_key_record` (#375) — the upgrade-aware apply
-    /// OUTCOME (`Inserted` / `Upgraded` / `Unchanged` / `Refused`). A
-    /// `Refused` is a *policy* outcome carried HERE, NOT flattened to the
-    /// top-level [`DirectoryOpResult::Err`] (which is reserved for a real
-    /// backend error that means the apply could not run). APPEND-ONLY.
+    /// OUTCOME (`Inserted` / `Upgraded` / `Unchanged` / `Superseded` /
+    /// `Refused{reason}`). A `Refused` is a *policy* outcome carried HERE,
+    /// NOT flattened to the top-level [`DirectoryOpResult::Err`] (which is
+    /// reserved for a real backend error that means the apply could not run).
+    /// v24.2.0 (CIRISPersist#565): the refusal carries a typed
+    /// [`KeyRefusalReason`](crate::federation::register::KeyRefusalReason)
+    /// across this boundary — same struct-variant wire shape as the sibling
+    /// [`Self::TransportDestinationApplyOutcome`]. APPEND-ONLY.
     ReplicatedKeyOutcome(crate::federation::register::ReplicatedKeyOutcome),
     /// `lookup_identity_for_occurrence` (#397) — the reverse occurrence→identity
     /// row (`None` ⇒ the key is not bound as an occurrence). APPEND-ONLY.
@@ -3674,6 +3678,37 @@ mod tests {
             .expect("lookup")
             .expect("row");
         assert_eq!(row.scrub_key_id, "cap-anchor");
+
+        // v24.2.0 (CIRISPersist#565) — a REFUSAL crosses the C-ABI
+        // serialized-op boundary carrying its reason. This is the requirement
+        // that makes the taxonomy worth owning: the capsule serializes the
+        // whole `DirectoryOpResult` to JSON and back, so if the reason did not
+        // survive that trip, the consumer that actually needs it (edge's
+        // replication bridge, which holds an `Arc<dyn FederationDirectory>`
+        // across the capsule) would be back to guessing from a message string.
+        let downgrade = ts::replicated_key_record(
+            "cap-node",
+            identity_type::NODE,
+            "cap-node",
+            "cap-node",
+            "v1",
+        );
+        let res = run_op(
+            &rt,
+            &directory,
+            &DirectoryOp::ApplyReplicatedKeyRecord {
+                record: SignedKeyRecord { record: downgrade },
+            },
+        );
+        assert!(
+            matches!(
+                res,
+                DirectoryOpResult::ReplicatedKeyOutcome(O::Refused {
+                    reason: crate::federation::register::KeyRefusalReason::Downgrade
+                })
+            ),
+            "capsule must carry the refusal REASON across the boundary, got {res:?}"
+        );
 
         // SAFETY: single-drop, matched vtable.
         unsafe { (directory.vtable.drop)(directory.data) };

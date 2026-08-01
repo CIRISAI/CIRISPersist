@@ -101,6 +101,10 @@ pub mod envelope;
 // `freshness_floor`.
 pub mod deletion_window;
 pub mod freshness;
+// v24.2.0 (CIRISPersist#564 stage 1) — the reachability primitive: is a CEG
+// object load-bearing on THIS node? Read-only, fail-secure, and gated for
+// exhaustiveness against the #519 manifest. Releases nothing.
+pub mod load_bearing;
 
 /// v20.1.0 (CIRISPersist#478) — the trace-attestation backfill report:
 /// what minted (incl. idempotent already-present no-ops — the funnels'
@@ -514,7 +518,14 @@ pub trait FederationDirectory: Send + Sync {
             Ok(()) => Ok(register::ReplicatedKeyOutcome::Inserted),
             // First-seen wins on the replication plane: a differing row
             // already present ⇒ not applied, but safe to re-offer.
-            Err(Error::Conflict(_)) => Ok(register::ReplicatedKeyOutcome::Refused),
+            // v24.2.0 (CIRISPersist#565) — named `StoreConflict`, not one of
+            // the plan's policy reasons: this body has no plan, so all it can
+            // honestly report is that the store step found a different row.
+            // Claiming a policy branch it never evaluated would be the
+            // mislabelled-refusal failure #565 exists to end.
+            Err(Error::Conflict(_)) => Ok(register::ReplicatedKeyOutcome::Refused {
+                reason: register::KeyRefusalReason::StoreConflict,
+            }),
             Err(e) => Err(e),
         }
     }

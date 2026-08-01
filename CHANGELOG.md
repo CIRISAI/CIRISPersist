@@ -5,6 +5,156 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [24.2.0] — 2026-07-31 — #565/#564: a refusal that names its branch, and an object that names its dependents
+
+Two asks, one shape: **a verdict without its evidence sends the reader to the wrong layer.** #565 is
+that lesson billed to a downstream team — a day inside a five-way disjunction on a production
+canonical. #564 is the same discipline applied before the fact, to a question we have not started
+answering yet.
+
+### 1 — `ReplicatedKeyOutcome::Refused` carries the branch that fired (#565)
+
+`Refused` was a unit variant. Five distinct policy branches produced it, so the most honest thing a
+receiver could print was all five:
+
+```
+Key: admission refused (content_hash=…; pubkey swap / downgrade / re-scrub / ambiguous owner /
+                        unverifiable sig)
+```
+
+Edge was not discarding a reason — **`apply_replicated_key_record` never gave it one.** `Error::kind()`
+already did the right thing on the `Err` path, so the *expected* outcome carried strictly less
+information than the unexpected one. Twenty refusals of one content hash, and a day spent inside the
+disjunction.
+
+Now:
+
+```rust
+pub enum KeyRefusalReason {
+    PubkeySwap, Downgrade, ConflictingVersion, ReScrub, AlreadyAnchoredIdentical,
+    UnverifiableSignature, OwnerAbsent, OwnerAmbiguous, StoreConflict,
+}
+pub enum ReplicatedKeyOutcome { Inserted, Upgraded, Unchanged, Superseded, Refused { reason: KeyRefusalReason } }
+```
+
+`KeyRefusalReason::as_str()` returns the same token serde does, so a consumer keys on a **program
+constant** and never on our prose — which was the actual ask. There is deliberately no `Other`
+catch-all: a catch-all is the disjunction again, one name deeper.
+
+**Nine variants, not the six the issue proposed**, because the set is derived from the code's
+branches rather than from the prose that summarized them:
+
+- **`ConflictingVersion` split from `Downgrade`.** One `return` site served both: an incoming
+  self-signed record over an *anchored* row is a downgrade; over another *self-signed* row it is a
+  conflicting second version, first-seen wins. Different remedies, so different names. (The doc
+  comment already listed both — the issue's list collapsed them.)
+- **`OwnerAbsent` split from `OwnerAmbiguous`.** Two `match` arms, two facts. Unowned is the common
+  case and needs an owner-binding attestation; ambiguous is an anomaly and needs a duplicate claim
+  resolved. Reporting the common case as "ambiguous" would be a *mislabelled* refusal, which is
+  worse than a bare one.
+- **`StoreConflict` is new.** Four sites — three backend arms plus the plan-free default trait body —
+  turned a store-step `Conflict` into `Refused` without ever consulting the policy plan. They may not
+  borrow a policy name for a branch they never evaluated.
+
+**`AlreadyAnchoredIdentical` was needed — and the mechanism is now pinned against the REAL baked
+seed, not reasoned about.** `Unchanged` does *not* cover the production case. Re-offering the
+vendored `canonical_seed.json` record through a real genesis boot lands in a **refusal** branch, on
+both SQL backends, because:
+
+`lift_envelope_attested_roles` runs at write time (`put_public_key` / `adopt_scrub_upgrade`) and
+lifts the envelope's attested roles into the STORED row's `capability_roles` *before*
+`persist_row_hash` is computed. The pristine record on the wire carries them only inside the
+envelope. So the stored row and the record it was built from hash differently
+(`["infra:serve","infra:attest","infra:store","infra:transport"]` vs `[]`), the byte-identical fast
+path misses, and the record falls through to the anchor→anchor arm — while `original_content_hash`,
+taken over the envelope, is unchanged. That is exactly the reported symptom: **many refusals of a
+single content hash.**
+
+Byte-identical re-offers still resolve `Unchanged`; that path was correct and is untouched. What was
+not correct is that a record asserting the *same* anchoring (same `registration_envelope`, same
+`scrub_key_id`) reported as a re-scrub **hijack**, sending readers hunting an attack that was not
+there. `genesis::seed_canonical_servers` walks this path on every boot after the first, so a fleet
+running the baked seed has been logging a duplicity-shaped warning forever, benignly. The verdict is
+unchanged (still not applied, row untouched); only its name is now true.
+
+The witness (`baked_seed_reoffer_reads_as_duplicate_{sqlite,postgres}`) drives the production seed
+through the real boot rather than a fixture — a fixture is precisely what would have let this stay
+wrong (#545/#554: evidence written to pass your own gate proves nothing).
+
+`Refused` crosses the directory capsule as `{"refused":{"reason":"<token>"}}` — the same
+externally-tagged shape the sibling route plane's `TransportDestinationApplyOutcome::Refused` already
+puts across that boundary. **This is a source-breaking change** for Rust consumers matching
+`ReplicatedKeyOutcome::Refused` as a unit variant, and a wire-shape change from the bare `"refused"`
+token. Clean break, no alias.
+
+**The token set is the downstream contract and `as_str` is APPEND-ONLY from here.** Consumers key on
+the constant, never on our prose, so a re-spelling costs them a release — which is the cost this
+release exists to stop paying. Add variants; never rename one.
+
+The deliverable is the witness set, not the enum: **every variant has a test driving the real path
+that produces it** and asserting the exact variant — the #371 matrix rows retyped one by one, the
+ambiguous-owner raw-SQL sibling on both SQL backends, the plan-free default body on memory, and a
+capsule round-trip proving the reason survives the C-ABI. A matrix that only checks "Refused" is
+precisely the instrument that let five branches share one indistinguishable verdict all the way out
+to a production canonical.
+
+### 2 — `is_load_bearing(X)` — stage 1 only: the predicate, the manifest axis, the gate (#564)
+
+#563 found 234 inert `consent:replication` grants that nothing reduces, and proposed decay. The
+operator's reframe replaced the mechanism: **not decay, not liveness — reference counting with a
+rigorous definition of reachability.** An object is load-bearing iff removing our copy would change
+an answer this node can give. A grant authorizes *our holding of something*; hold nothing that needs
+it and it does no work here — no clock required, and no principal scored.
+
+```rust
+pub enum LoadBearing {
+    Yes { because: Vec<Dependency> },
+    No,
+    Unknown { family: String, reason: String },   // FAIL-SECURE: treated as load-bearing
+}
+pub async fn is_load_bearing(dir: &dyn FederationDirectory, object: ObjectRef) -> Result<LoadBearing, Error>;
+```
+
+Never a bare bool — `Yes` names WHICH dependency, `Unknown` names WHICH family and WHY (the
+`TrustRootVerdict` / `TrustedGrant` discipline). Reachable from `Engine::is_load_bearing` and the
+PyO3 `is_load_bearing_json`, because a predicate no host can call is not shipped; #563's own finding
+was three primitives with zero callers.
+
+**This stage releases, evicts and mutates NOTHING.** A `No` is not a licence to drop anything:
+release additionally needs the `anti_entropy_satisfied` conjunct (stage 2), and dropping a copy that
+has nowhere else to live is data loss wearing a GC costume. Compaction is stage 4 and may prove
+unnecessary entirely.
+
+**Exhaustiveness is the hard requirement, so it lives in the manifest.** #519's Registry-of-Record
+gains a load-bearing-predicate axis under the #532 gate discipline: the trigger set is *derived in
+code* from two facts the vendored manifest already carries — `affects_routing`, and the CI axis that
+IS the consent norm (`transmission_principle.usage == "family_specific"`) — never copied into a
+column that could drift. Nineteen families trigger; a family on either side of that equality that
+lacks its counterpart **fails the build**.
+
+Persist declares what it can answer honestly and no more:
+
+- **`consent:*` → `retained_replication`.** A `consent:replication:v1` grant is load-bearing iff we
+  still hold a row authored by a peer it names. This is the 234: they become legible as `No`.
+- **`trust:*` → `always`.** Declared, never inferred. `trust:accepts:v1` is the operator's un-trust
+  lever — delete that one row and the verdict collapses — and a lever that can be reference-counted
+  away is a lever that can go missing. A gate binds the declaration to the live dimension constants.
+- **Seventeen families → `undeclared`**, each with the read persist would need. That is the correct
+  outcome, not a shortfall: `trace:*` is retained data whose release is the retention plane's
+  question and would be a second schedule; `accord:*` is quorum evidence with no reverse index of
+  open tallies; `prohibited:*` and `watchlist:*` are *negative* authorizations whose absence of
+  dependents is not absence of duty, and reference-counting them would be exactly backwards.
+
+The key-record arm can prove `Yes` from targeted reads and cannot yet prove `No` — "which rows name
+this key as scrub or co-scrub" has no index — so it answers `Unknown`, which is the fail-secure
+direction and the honest one.
+
+The behavioural witness runs the same body on **sqlite, postgres and memory**: N inert grants read
+`No`; the same grant with a retained trace under it reads `Yes` **naming the trace**; unrelated data
+does not change an inert grant's verdict; `trust:accepts:v1` reads `Yes` with nothing else present
+at all; a declared-`undeclared` family and an unresolvable dimension both read `Unknown`, never `No`
+by omission.
+
 ## [24.1.0] — 2026-07-30 — #561/#560/#559/#547: what a hop is, and three things that were quietly untrue
 
 Four consumer-filed issues, and three of them are the same admission in different words: **a fact
