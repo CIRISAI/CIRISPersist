@@ -504,11 +504,18 @@ where
                     Ok(O::Superseded | O::Unchanged | O::Upgraded | O::Inserted) => Ok(()),
                     // Existing is same-or-newer (or not admissible against the
                     // baked record): do NOT downgrade the node, do NOT brick.
-                    Ok(O::Refused) => {
+                    // v24.2.0 (CIRISPersist#565) — the warning names the branch
+                    // that fired. `already_anchored_identical` here is a boot
+                    // NORMALITY on a baked-seed fleet (the node already holds
+                    // exactly this anchoring), which is precisely what the old
+                    // "existing is same-or-newer" prose could not tell an
+                    // operator apart from a real re-scrub refusal.
+                    Ok(O::Refused { reason }) => {
                         tracing::warn!(
                             key_id = %kid,
+                            refusal_reason = reason.as_str(),
                             "genesis canonical seed: baked record REFUSED over the existing \
-                             anchor-scrubbed row (existing is same-or-newer) — skipping"
+                             anchor-scrubbed row — skipping"
                         );
                         Ok(())
                     }

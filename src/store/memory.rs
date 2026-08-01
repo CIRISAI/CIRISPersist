@@ -15483,6 +15483,22 @@ mod tests {
         .unwrap());
     }
 
+    /// v24.2.0 (CIRISPersist#564 stage 1) — the MEMORY leg of the shared
+    /// `is_load_bearing` witness. The predicate composes trait methods over
+    /// `&dyn FederationDirectory`, so "it works on memory too" is not a bonus
+    /// — it is the claim, and the recurring lesson is that memory is the
+    /// backend where an untested divergence hides (v21.11–17.1, seven times).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn load_bearing_predicate_parity_memory_564() {
+        let backend = MemoryBackend::new();
+        crate::federation::load_bearing::test_support::exercise_load_bearing_predicate(
+            &backend,
+            "memory-lb",
+        )
+        .await;
+    }
+
     /// v13.0.1 (#375) — the DEFAULT `FederationDirectory::apply_replicated_key_record`
     /// trait body (memory/mock backends, no scrub-upgrade plane): a new
     /// key_id is a first-seen Inserted; a differing record for an existing
@@ -15520,7 +15536,14 @@ mod tests {
             dir.apply_replicated_key_record(SignedKeyRecord { record: differing })
                 .await
                 .unwrap(),
-            ReplicatedKeyOutcome::Refused
+            // v24.2.0 (CIRISPersist#565) — `StoreConflict` is the only honest
+            // reason this body can give: it runs no plan, so the single fact
+            // it observed is that the store step found a different row. It
+            // must NOT borrow one of the plan's policy names for a branch it
+            // never evaluated.
+            ReplicatedKeyOutcome::Refused {
+                reason: crate::federation::register::KeyRefusalReason::StoreConflict
+            }
         );
         let row = dir.lookup_public_key("node-x").await.unwrap().unwrap();
         assert_eq!(row.scrub_key_id, "node-x", "original self-signed row kept");

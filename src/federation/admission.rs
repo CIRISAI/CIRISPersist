@@ -10289,10 +10289,18 @@ mod canonical_withdrawal_tests {
             .await;
         match outcome {
             Err(e) => assert_eq!(e.kind(), "canonical_role_withdrawn"),
-            Ok(o) => assert_eq!(
-                o,
-                super::super::register::ReplicatedKeyOutcome::Refused,
-                "a withdrawn canonical must not be re-conferred over anti-entropy"
+            // The assertion here is "not admitted", whichever way the store
+            // says so — this corpus has no row for `repl`, so the withdrawal
+            // normally surfaces as the typed `Err`. Left deliberately
+            // reason-agnostic (v24.2.0, CIRISPersist#565): pinning a
+            // [`KeyRefusalReason`] on a branch this test does not actually
+            // drive would assert a fact it has not established.
+            Ok(o) => assert!(
+                matches!(
+                    o,
+                    super::super::register::ReplicatedKeyOutcome::Refused { .. }
+                ),
+                "a withdrawn canonical must not be re-conferred over anti-entropy, got {o:?}"
             ),
         }
         assert!(!is_canonical_effective(dir, &repl).await.unwrap());

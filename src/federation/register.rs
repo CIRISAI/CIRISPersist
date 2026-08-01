@@ -107,11 +107,137 @@ pub enum AdoptScrubOutcome {
     AlreadyAdopted,
 }
 
+/// v24.2.0 (CIRISPersist#565) — **WHICH policy branch refused** a replicated
+/// Key-plane apply.
+///
+/// Before this existed, [`ReplicatedKeyOutcome::Refused`] was a unit variant,
+/// so the most a receiver could honestly print was the whole disjunction —
+/// *"pubkey swap / downgrade / re-scrub / ambiguous owner / unverifiable
+/// sig"*. #565 is the bill for that: a day spent inside that disjunction on a
+/// production canonical, over twenty refusals of one content hash. A refusal
+/// is a verdict, and a verdict without its evidence sends the reader to the
+/// wrong layer.
+///
+/// **Closed**, and every variant corresponds to exactly ONE condition in the
+/// code — there is deliberately no `Other`/`Unspecified` catch-all, because a
+/// catch-all reintroduces the disjunction one name deeper. Serde tokens are
+/// snake_case and [`Self::as_str`] returns the SAME token, so a consumer keys
+/// on a program constant and never on a message string (the explicit ask in
+/// #565: persist owns this taxonomy, and a second copy of it downstream is the
+/// two-lists-that-disagree class).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyRefusalReason {
+    /// A hybrid pubkey half (Ed25519 OR ML-DSA-65) differs from the stored
+    /// row's. A different pubkey is a different identity, whatever the scrub
+    /// says — replication may never swap an identity's keys.
+    PubkeySwap,
+    /// The stored row is **anchor-scrubbed** and the incoming record is
+    /// **self-signed**: a downgrade. Monotonic — never demote an anchored row.
+    Downgrade,
+    /// The stored row and the incoming record are BOTH self-signed for the
+    /// same identity but are not the same record: a conflicting second
+    /// version. First-seen wins.
+    ConflictingVersion,
+    /// Both rows are anchor-scrubbed and the incoming one is not an admissible
+    /// **canonical supersede** (not canonical-scoped, or its SIGNED envelope
+    /// `valid_from` is not strictly newer, or the m-of-n quorum re-verify /
+    /// withdrawal-wins check failed). The historical anchor-A→anchor-B
+    /// re-scrub hijack guard.
+    ReScrub,
+    /// Both rows are anchor-scrubbed and the incoming record asserts the
+    /// **anchoring this node already holds** — same `registration_envelope`,
+    /// same `scrub_key_id` — differing only in unsigned decoration or
+    /// signature bytes.
+    ///
+    /// This is a *duplicate*, not a rejection: the receiver already has
+    /// exactly what was offered. It exists because every node now ships the
+    /// baked genesis seed, so a canonical replicating its own record meets a
+    /// receiver that already holds it; reporting that as a re-scrub hijack
+    /// sends the reader hunting for an attack that is not there. A
+    /// BYTE-identical re-offer never reaches here — it resolves
+    /// [`ReplicatedKeyOutcome::Unchanged`] at the `persist_row_hash`
+    /// comparison, which is the correct outcome and stays unchanged.
+    AlreadyAnchoredIdentical,
+    /// The incoming record's scrub-signature did not clear the Strict
+    /// [`verify_key_registration`] gate (malformed record, canonicalizer
+    /// disagreement, unregistered signer, or a bad hybrid signature).
+    UnverifiableSignature,
+    /// [`owner_of`](super::admission::owner_of) resolved **no** owner for the
+    /// key: the row is not inside any single-owner node set, so replication
+    /// may not auto-upgrade it (fail-closed).
+    OwnerAbsent,
+    /// [`owner_of`](super::admission::owner_of) resolved **more than one**
+    /// owner ([`Error::AmbiguousNodeOwner`]): the owner scope is not
+    /// well-defined, so replication may not auto-upgrade it (fail-closed).
+    OwnerAmbiguous,
+    /// The store step returned [`Error::Conflict`]: the row present at WRITE
+    /// time is not the row the decision was made against. On a planning
+    /// backend that is a lost race between plan and act; on a plan-free
+    /// backend (the default [`FederationDirectory::apply_replicated_key_record`]
+    /// body) it is a differing row already held. Either way: fail-closed, the
+    /// existing row is untouched, and the record is safe to re-offer.
+    StoreConflict,
+}
+
+impl KeyRefusalReason {
+    /// The **stable program token** for this reason — identical to the serde
+    /// token, so a consumer that reads the wire and a consumer that holds the
+    /// typed value key on the same constant.
+    ///
+    /// This is the half of #565 that makes string-matching unnecessary rather
+    /// than merely discouraged. [`tests::refusal_reason_tokens_match_serde`]
+    /// binds the two spellings together so they cannot drift.
+    ///
+    /// **The token set is the downstream contract, and this mapping is
+    /// APPEND-ONLY.** CIRISEdge keys its apply seam on these constants, so a
+    /// rename here costs them a release — which is the whole cost #565 exists
+    /// to stop paying. Add variants; never re-spell one.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::PubkeySwap => "pubkey_swap",
+            Self::Downgrade => "downgrade",
+            Self::ConflictingVersion => "conflicting_version",
+            Self::ReScrub => "re_scrub",
+            Self::AlreadyAnchoredIdentical => "already_anchored_identical",
+            Self::UnverifiableSignature => "unverifiable_signature",
+            Self::OwnerAbsent => "owner_absent",
+            Self::OwnerAmbiguous => "owner_ambiguous",
+            Self::StoreConflict => "store_conflict",
+        }
+    }
+
+    /// Every variant, in declaration order — the closed set, for exhaustive
+    /// gates and for a consumer enumerating the taxonomy it must handle.
+    pub const ALL: &'static [Self] = &[
+        Self::PubkeySwap,
+        Self::Downgrade,
+        Self::ConflictingVersion,
+        Self::ReScrub,
+        Self::AlreadyAnchoredIdentical,
+        Self::UnverifiableSignature,
+        Self::OwnerAbsent,
+        Self::OwnerAmbiguous,
+        Self::StoreConflict,
+    ];
+}
+
+impl std::fmt::Display for KeyRefusalReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// v12.7.0 (CIRISPersist#371) — outcome of an
 /// [`apply_replicated_key_record`](crate::engine::Engine::apply_replicated_key_record),
 /// the **upgrade-aware replicated Key-plane apply**. Serde tokens are
 /// snake_case strings (`"inserted"` / `"upgraded"` / `"unchanged"` /
-/// `"refused"`), mirroring [`AdoptScrubOutcome`]'s wire shape.
+/// `"superseded"`), mirroring [`AdoptScrubOutcome`]'s wire shape;
+/// `Refused` carries its reason as `{"refused":{"reason":"<token>"}}`, the
+/// same shape the sibling route plane's
+/// [`TransportDestinationApplyOutcome`](crate::federation::self_at_login::TransportDestinationApplyOutcome)
+/// already uses.
 ///
 /// A `Refused` is a *policy* outcome, not an error: the anti-entropy Key
 /// plane receives unsolicited records, so every gate failure that means
@@ -130,11 +256,15 @@ pub enum ReplicatedKeyOutcome {
     Upgraded,
     /// The row already carries this exact record — idempotent no-op.
     Unchanged,
-    /// The record was NOT applied: pubkey swap, anchored→self downgrade,
-    /// anchor-A→anchor-B re-scrub, conflicting second version (first-seen
-    /// wins), unverifiable scrub-signature, or an absent/ambiguous node
-    /// owner (`owner_of` fail-closed). The existing row is untouched.
-    Refused,
+    /// The record was NOT applied and the existing row is untouched.
+    ///
+    /// v24.2.0 (CIRISPersist#565): `reason` names the branch that fired. It
+    /// used to be a bare variant, which forced every receiver to print the
+    /// whole disjunction — see [`KeyRefusalReason`] for why that cost a day.
+    Refused {
+        /// WHICH policy branch refused. A closed enum, not a message string.
+        reason: KeyRefusalReason,
+    },
     /// v13.7.0 (CIRISPersist#405) — an existing **canonical** (anchor-scrubbed)
     /// row was replaced in place by a **strictly-newer, same-pubkey, m-of-n
     /// quorum-re-verified** record — the CEG-native runtime address move (a
@@ -163,7 +293,16 @@ pub(crate) enum ReplicatedKeyPlan {
     /// Byte-identical re-apply — no-op.
     Unchanged,
     /// Not admitted; leave the row untouched (fail-closed).
-    Refused,
+    ///
+    /// v24.2.0 (CIRISPersist#565) — carries the SAME [`KeyRefusalReason`] the
+    /// outcome does. The plan is where the policy branches actually are, so
+    /// this is where the reason is *produced*; the backends carry it through
+    /// to [`ReplicatedKeyOutcome::Refused`] rather than re-deriving it (one
+    /// predicate, one implementation).
+    Refused {
+        /// WHICH policy branch refused.
+        reason: KeyRefusalReason,
+    },
 }
 
 /// v12.7.0 (CIRISPersist#371) — decide what an **upgrade-aware replicated
@@ -231,15 +370,22 @@ pub(crate) async fn plan_replicated_key_apply(
     if existing.pubkey_ed25519_base64 != record.pubkey_ed25519_base64
         || existing.pubkey_ml_dsa_65_base64 != record.pubkey_ml_dsa_65_base64
     {
-        return Ok(ReplicatedKeyPlan::Refused);
+        return Ok(refused(KeyRefusalReason::PubkeySwap));
     }
 
     let existing_self_signed = existing.scrub_key_id == existing.key_id;
     let incoming_anchor_scrubbed = record.scrub_key_id != record.key_id;
     if !incoming_anchor_scrubbed {
-        // anchored→self downgrade or a conflicting second self-signed version:
-        // first-seen/duplicity. Never demote an anchored row to self-signed.
-        return Ok(ReplicatedKeyPlan::Refused);
+        // v24.2.0 (CIRISPersist#565) — ONE site, TWO policies, and they were
+        // fused behind one bare `Refused`. Split them: an incoming self-signed
+        // record over an ANCHORED row is a downgrade (never demote); over
+        // another SELF-SIGNED row it is a conflicting second version
+        // (first-seen wins). The remedies differ, so the names must.
+        return Ok(refused(if existing_self_signed {
+            KeyRefusalReason::ConflictingVersion
+        } else {
+            KeyRefusalReason::Downgrade
+        }));
     }
     if !existing_self_signed {
         // Existing is ALREADY anchor-scrubbed + incoming is anchor-scrubbed,
@@ -259,7 +405,7 @@ pub(crate) async fn plan_replicated_key_apply(
     if let Err(e) = verify_key_registration(directory, record).await {
         return match e {
             Error::SignatureInvalid(_) | Error::InvalidArgument(_) => {
-                Ok(ReplicatedKeyPlan::Refused)
+                Ok(refused(KeyRefusalReason::UnverifiableSignature))
             }
             other => Err(other),
         };
@@ -267,12 +413,25 @@ pub(crate) async fn plan_replicated_key_apply(
 
     // Gate 2 — the row must sit inside a single owner's node set
     // (v12.6.0 `owner_of`). Unowned or ambiguous ⇒ fail-closed.
+    //
+    // v24.2.0 (CIRISPersist#565) — "absent" and "ambiguous" were one line of
+    // prose and two lines of code. They stay two: an unowned key needs an
+    // owner-binding attestation, a doubly-owned one needs a duplicate
+    // ownership claim resolved. Collapsing them would mislabel the common
+    // case (unowned) as the anomaly.
     match super::admission::owner_of(directory, &record.key_id).await {
         Ok(Some(_)) => Ok(ReplicatedKeyPlan::Upgrade),
-        Ok(None) => Ok(ReplicatedKeyPlan::Refused),
-        Err(Error::AmbiguousNodeOwner { .. }) => Ok(ReplicatedKeyPlan::Refused),
+        Ok(None) => Ok(refused(KeyRefusalReason::OwnerAbsent)),
+        Err(Error::AmbiguousNodeOwner { .. }) => Ok(refused(KeyRefusalReason::OwnerAmbiguous)),
         Err(e) => Err(e),
     }
+}
+
+/// v24.2.0 (CIRISPersist#565) — the one constructor for a refused plan, so a
+/// site cannot forget the reason (there is no reason-less way to build one).
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+const fn refused(reason: KeyRefusalReason) -> ReplicatedKeyPlan {
+    ReplicatedKeyPlan::Refused { reason }
 }
 
 /// v13.7.0 (CIRISPersist#405) — plan a **canonical supersede**: an existing
@@ -308,10 +467,39 @@ async fn plan_canonical_supersede(
     record: &KeyRecord,
 ) -> Result<ReplicatedKeyPlan, Error> {
     if verify_canonical_supersede(directory, existing, record).await? {
-        Ok(ReplicatedKeyPlan::Supersede)
-    } else {
-        Ok(ReplicatedKeyPlan::Refused)
+        return Ok(ReplicatedKeyPlan::Supersede);
     }
+    // v24.2.0 (CIRISPersist#565) — the verdict is already decided (refuse);
+    // this only chooses its NAME, and only from state already in hand. It is
+    // deliberately NOT a second admission predicate:
+    // `verify_canonical_supersede` stays the single shared decision the
+    // backends' mutation chokepoints also run, so there is no second validator
+    // to disagree with it.
+    Ok(refused(if asserts_the_same_anchoring(existing, record) {
+        KeyRefusalReason::AlreadyAnchoredIdentical
+    } else {
+        KeyRefusalReason::ReScrub
+    }))
+}
+
+/// v24.2.0 (CIRISPersist#565) — does `record` assert the **anchoring the
+/// stored row already carries**?
+///
+/// True iff the two rows carry the SAME `registration_envelope` (the bytes the
+/// scrubs actually cover — `JCS(registration_envelope)`, which is also where
+/// the co-scrub set lives) under the SAME `scrub_key_id`. The caller has
+/// already established same `key_id` and same hybrid pubkeys, so what remains
+/// different is unsigned decoration (`valid_until`, the top-level unsigned
+/// `valid_from`) or the signature bytes themselves — never the assertion.
+///
+/// A BYTE-identical record never reaches here: it resolves `Unchanged` at the
+/// `persist_row_hash` comparison in [`plan_replicated_key_apply`]. This names
+/// the near-miss — which is the case a baked-seed fleet actually produces, and
+/// the one that read as an anchor-A→anchor-B hijack until #565.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn asserts_the_same_anchoring(existing: &KeyRecord, record: &KeyRecord) -> bool {
+    existing.scrub_key_id == record.scrub_key_id
+        && existing.registration_envelope == record.registration_envelope
 }
 
 /// v13.7.0 (CIRISPersist#405) — the CANONICAL-SUPERSEDE policy core, shared by
@@ -1048,8 +1236,15 @@ mod tests {
     /// anchor-scrubbed); idempotent re-apply; conflicting second version;
     /// unverifiable scrub; pubkey swap (Ed25519 AND ML-DSA-65 halves);
     /// absent owner; self→anchored upgrade happy path; anchored→self
-    /// downgrade; anchor-A→anchor-B re-scrub.
+    /// downgrade; anchor-A→anchor-B re-scrub; already-anchored-identical.
+    ///
+    /// v24.2.0 (CIRISPersist#565) — every refusal row now asserts the EXACT
+    /// [`KeyRefusalReason`], not merely that something refused. That is the
+    /// deliverable: a matrix that only checks "Refused" is precisely the
+    /// instrument that let five distinct branches share one indistinguishable
+    /// verdict all the way out to a production canonical.
     async fn run_apply_replicated_matrix(engine: &Engine, tag: &str) {
+        use crate::federation::register::KeyRefusalReason as R;
         use crate::federation::register::ReplicatedKeyOutcome as O;
         use crate::federation::tier_ingest::test_support as ts;
         let directory = engine.federation_directory();
@@ -1088,7 +1283,9 @@ mod tests {
         let self_v2 = ts::replicated_key_record(&node, identity_type::NODE, &node, &node, "v2");
         assert_eq!(
             apply_one(engine, self_v2).await,
-            O::Refused,
+            O::Refused {
+                reason: R::ConflictingVersion
+            },
             "(3) conflicting version"
         );
 
@@ -1099,7 +1296,9 @@ mod tests {
             ts::replicated_key_record(&node, identity_type::NODE, &scrubber, &scrubber, "v1");
         assert_eq!(
             apply_one(engine, scrubbed.clone()).await,
-            O::Refused,
+            O::Refused {
+                reason: R::OwnerAbsent
+            },
             "(4) absent owner"
         );
         assert_eq!(
@@ -1127,7 +1326,9 @@ mod tests {
             ts::replicated_key_record(&node, identity_type::NODE, &scrubber, &scrubber_b, "v1");
         assert_eq!(
             apply_one(engine, bad_sig).await,
-            O::Refused,
+            O::Refused {
+                reason: R::UnverifiableSignature
+            },
             "(5) unverifiable scrub"
         );
         assert_eq!(row_scrub(engine, &node).await, node, "(5) row untouched");
@@ -1139,14 +1340,18 @@ mod tests {
         ed_swap.pubkey_ed25519_base64 = other_ed;
         assert_eq!(
             apply_one(engine, ed_swap).await,
-            O::Refused,
+            O::Refused {
+                reason: R::PubkeySwap
+            },
             "(6) Ed25519 swap"
         );
         let mut mldsa_swap = scrubbed.clone();
         mldsa_swap.pubkey_ml_dsa_65_base64 = other_mldsa;
         assert_eq!(
             apply_one(engine, mldsa_swap).await,
-            O::Refused,
+            O::Refused {
+                reason: R::PubkeySwap
+            },
             "(6) ML-DSA-65 swap"
         );
         assert_eq!(row_scrub(engine, &node).await, node, "(6) row untouched");
@@ -1176,7 +1381,9 @@ mod tests {
         // (9) anchored→self downgrade ⇒ Refused (monotonic).
         assert_eq!(
             apply_one(engine, self_rec).await,
-            O::Refused,
+            O::Refused {
+                reason: R::Downgrade
+            },
             "(9) downgrade"
         );
         assert_eq!(
@@ -1191,7 +1398,7 @@ mod tests {
             ts::replicated_key_record(&node, identity_type::NODE, &scrubber_b, &scrubber_b, "v1");
         assert_eq!(
             apply_one(engine, rescrub).await,
-            O::Refused,
+            O::Refused { reason: R::ReScrub },
             "(10) re-scrub hijack"
         );
         assert_eq!(
@@ -1212,6 +1419,184 @@ mod tests {
             "(11) fresh scrubbed insert"
         );
         assert_eq!(row_scrub(engine, &node2).await, scrubber);
+
+        // (12) v24.2.0 (CIRISPersist#565) — the DUPLICATE, not a rejection.
+        // Same anchoring the node already holds (identical
+        // `registration_envelope`, identical `scrub_key_id`) but not
+        // byte-identical: only the unsigned `valid_until` differs, so the
+        // `persist_row_hash` fast-path misses and the record falls through to
+        // the anchor→anchor arm. Before #565 this reported as a re-scrub
+        // hijack — the shape a baked-seed fleet produces every time the
+        // canonical replicates the record every node already ships.
+        let mut same_anchoring = scrubbed.clone();
+        same_anchoring.valid_until = Some("2030-01-01T00:00:00Z".parse().expect("valid_until"));
+        assert_eq!(
+            apply_one(engine, same_anchoring).await,
+            O::Refused {
+                reason: R::AlreadyAnchoredIdentical
+            },
+            "(12) already anchored to this exact assertion"
+        );
+        assert_eq!(
+            row_scrub(engine, &node).await,
+            scrubber,
+            "(12) duplicate leaves the row untouched"
+        );
+    }
+
+    /// v24.2.0 (CIRISPersist#565) — the two spellings of a reason are ONE
+    /// spelling.
+    ///
+    /// [`KeyRefusalReason::as_str`] is the token a Rust consumer keys on; the
+    /// serde token is what a consumer across the FFI capsule sees. #565's whole
+    /// point is that a consumer never has to parse a message — so if these two
+    /// could drift, the guarantee would be worth nothing to whichever half read
+    /// the other spelling. Asserted over [`KeyRefusalReason::ALL`], so a NEW
+    /// variant is covered the moment it is declared rather than the moment
+    /// someone remembers to extend a list.
+    #[test]
+    fn refusal_reason_tokens_match_serde() {
+        for reason in KeyRefusalReason::ALL {
+            let json = serde_json::to_string(reason).expect("serialize reason");
+            assert_eq!(
+                json,
+                format!("\"{}\"", reason.as_str()),
+                "as_str() and the serde token must be the same program constant"
+            );
+            let back: KeyRefusalReason = serde_json::from_str(&json).expect("round-trip");
+            assert_eq!(back, *reason);
+            assert_eq!(reason.to_string(), reason.as_str(), "Display == as_str");
+        }
+        // The set is CLOSED and complete: a variant added without extending
+        // ALL would be invisible to every gate keyed on it.
+        let distinct: std::collections::BTreeSet<&str> =
+            KeyRefusalReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            distinct.len(),
+            KeyRefusalReason::ALL.len(),
+            "reason tokens must be distinct"
+        );
+    }
+
+    /// v24.2.0 (CIRISPersist#565) — the OUTCOME's wire shape, pinned.
+    ///
+    /// `Refused` carries `{"refused":{"reason":"<token>"}}` — the same
+    /// externally-tagged struct-variant shape the sibling route plane's
+    /// `TransportDestinationApplyOutcome::Refused { reason }` already puts
+    /// across the directory capsule, so a downstream deserializer meets a
+    /// shape it already implements. The non-refusal variants keep their bare
+    /// snake_case tokens exactly as before.
+    #[test]
+    fn replicated_key_outcome_wire_shape_is_pinned() {
+        assert_eq!(
+            serde_json::to_string(&ReplicatedKeyOutcome::Inserted).expect("inserted"),
+            "\"inserted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReplicatedKeyOutcome::Unchanged).expect("unchanged"),
+            "\"unchanged\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReplicatedKeyOutcome::Superseded).expect("superseded"),
+            "\"superseded\""
+        );
+        for reason in KeyRefusalReason::ALL {
+            let outcome = ReplicatedKeyOutcome::Refused { reason: *reason };
+            let json = serde_json::to_string(&outcome).expect("serialize outcome");
+            assert_eq!(
+                json,
+                format!("{{\"refused\":{{\"reason\":\"{}\"}}}}", reason.as_str())
+            );
+            assert_eq!(
+                serde_json::from_str::<ReplicatedKeyOutcome>(&json).expect("round-trip"),
+                outcome
+            );
+        }
+    }
+
+    /// v24.2.0 (CIRISPersist#565) — **THE PRODUCTION CASE, on the REAL baked
+    /// seed**: re-offering the canonical record every node already ships reads
+    /// `AlreadyAnchoredIdentical`, NOT a re-scrub hijack and NOT `Unchanged`.
+    ///
+    /// This is the one #565 was actually filed about, and it is asserted
+    /// against the vendored production `canonical_seed.json` through the real
+    /// genesis boot — no fixture, because a fixture is exactly what would have
+    /// let this stay wrong (the #545/#554 lesson: evidence written to pass your
+    /// own gate proves nothing).
+    ///
+    /// **Why it is not `Unchanged`.** `lift_envelope_attested_roles` runs at
+    /// write time (`put_public_key` / `adopt_scrub_upgrade`) and lifts the
+    /// envelope's attested roles into the STORED row's `capability_roles`
+    /// before `persist_row_hash` is computed. The pristine seed record on the
+    /// wire carries them only inside the envelope. So the stored row and the
+    /// record it was built from hash DIFFERENTLY, the byte-identical fast path
+    /// misses, and the record falls through to the anchor→anchor arm — while
+    /// `original_content_hash` (over the envelope) is unchanged, which is
+    /// precisely the reported symptom: many refusals of a SINGLE content hash.
+    ///
+    /// The verdict is correct and unchanged (not applied, row untouched); what
+    /// #565 fixes is that it used to report as duplicity. `genesis::
+    /// seed_canonical_servers` walks this exact path on every boot after the
+    /// first, so a fleet running the baked seed logged a hijack-shaped warning
+    /// forever, benignly.
+    async fn baked_seed_reoffer_reads_as_duplicate(engine: &Engine) {
+        let sr = crate::federation::genesis::canonical_genesis_bundle().serve_nodes[0].clone();
+        let dir = engine.federation_directory();
+        let existing = dir
+            .lookup_public_key(&sr.record.key_id)
+            .await
+            .expect("lookup")
+            .expect("the baked canonical row is present after the genesis seed");
+
+        // The precondition that makes this the interesting case rather than a
+        // trivial one: the SIGNED assertion is identical, the row bytes are not.
+        assert_eq!(
+            existing.registration_envelope, sr.record.registration_envelope,
+            "same signed envelope"
+        );
+        assert_eq!(existing.scrub_key_id, sr.record.scrub_key_id, "same anchor");
+        assert_eq!(
+            existing.original_content_hash, sr.record.original_content_hash,
+            "same content hash — the very thing the refusals were reported against"
+        );
+        assert_ne!(
+            existing.persist_row_hash,
+            super::super::types::compute_persist_row_hash(&sr.record).expect("row hash"),
+            "row bytes DIFFER (the write-time role lift), so `Unchanged` cannot catch this"
+        );
+
+        assert_eq!(
+            engine
+                .apply_replicated_key_record(sr.clone())
+                .await
+                .expect("apply"),
+            ReplicatedKeyOutcome::Refused {
+                reason: KeyRefusalReason::AlreadyAnchoredIdentical
+            },
+            "the canonical's own baked record must read as a DUPLICATE, not a re-scrub hijack"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn baked_seed_reoffer_reads_as_duplicate_sqlite() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct sqlite engine");
+        baked_seed_reoffer_reads_as_duplicate(&engine).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn baked_seed_reoffer_reads_as_duplicate_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!("skipping baked_seed_reoffer_reads_as_duplicate_postgres: DSN unset");
+            return;
+        };
+        let engine = Engine::with_signer(test_signer(), &dsn)
+            .await
+            .expect("construct postgres engine");
+        baked_seed_reoffer_reads_as_duplicate(&engine).await;
     }
 
     #[cfg(feature = "sqlite")]

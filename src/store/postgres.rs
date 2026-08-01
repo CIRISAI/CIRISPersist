@@ -3187,11 +3187,19 @@ impl PostgresBackend {
         record: crate::federation::SignedKeyRecord,
     ) -> Result<crate::federation::register::ReplicatedKeyOutcome, crate::federation::Error> {
         use crate::federation::register::{
-            plan_replicated_key_apply, AdoptScrubOutcome, ReplicatedKeyOutcome, ReplicatedKeyPlan,
+            plan_replicated_key_apply, AdoptScrubOutcome, KeyRefusalReason, ReplicatedKeyOutcome,
+            ReplicatedKeyPlan,
+        };
+        /// v24.2.0 (CIRISPersist#565) — a `Conflict` from the store step: the
+        /// row present at WRITE time is not the row the plan was made against.
+        const RACED: ReplicatedKeyOutcome = ReplicatedKeyOutcome::Refused {
+            reason: KeyRefusalReason::StoreConflict,
         };
         match plan_replicated_key_apply(self, &record.record).await? {
             ReplicatedKeyPlan::Unchanged => Ok(ReplicatedKeyOutcome::Unchanged),
-            ReplicatedKeyPlan::Refused => Ok(ReplicatedKeyOutcome::Refused),
+            // The plan produced the reason at the branch that fired; carry it
+            // through rather than re-deriving it here (#565).
+            ReplicatedKeyPlan::Refused { reason } => Ok(ReplicatedKeyOutcome::Refused { reason }),
             ReplicatedKeyPlan::Insert => {
                 // v21.0.0 (CIRISPersist#502 E2) — the fresh-key insert path
                 // ran NO proof-of-possession: a replicated first-sight
@@ -3208,7 +3216,7 @@ impl PostgresBackend {
                     Ok(()) => Ok(ReplicatedKeyOutcome::Inserted),
                     // A row appeared between plan and act with different
                     // content — first-seen wins on the replication plane.
-                    Err(crate::federation::Error::Conflict(_)) => Ok(ReplicatedKeyOutcome::Refused),
+                    Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
                     Err(e) => Err(e),
                 }
             }
@@ -3217,14 +3225,14 @@ impl PostgresBackend {
                 Ok(AdoptScrubOutcome::AlreadyAdopted) => Ok(ReplicatedKeyOutcome::Unchanged),
                 // The atomic WHERE (or its Rust pre-checks) saw different
                 // state than the plan — a concurrent mutation. Fail-closed.
-                Err(crate::federation::Error::Conflict(_)) => Ok(ReplicatedKeyOutcome::Refused),
+                Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
                 Err(e) => Err(e),
             },
             // #405 — existing canonical → strictly-newer, m-of-n-re-verified
             // re-scrub (runtime address move). Backend-symmetric with SQLite.
             ReplicatedKeyPlan::Supersede => match self.supersede_canonical_record(record).await {
                 Ok(outcome) => Ok(outcome),
-                Err(crate::federation::Error::Conflict(_)) => Ok(ReplicatedKeyOutcome::Refused),
+                Err(crate::federation::Error::Conflict(_)) => Ok(RACED),
                 Err(e) => Err(e),
             },
         }
@@ -20327,6 +20335,27 @@ mod tests {
         .await;
     }
 
+    /// v24.2.0 (CIRISPersist#564 stage 1) — the postgres leg of the shared
+    /// `is_load_bearing` witness (see `sqlite::tests::
+    /// load_bearing_predicate_parity_sqlite_564` and the memory leg); all
+    /// three call the SAME
+    /// `load_bearing::test_support::exercise_load_bearing_predicate` body.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn load_bearing_predicate_parity_postgres_564() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::load_bearing::test_support::exercise_load_bearing_predicate(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the postgres leg of the shared
     /// backend-parity witness for the three new #509 methods (see
     /// `sqlite::tests::consent_509_backend_methods_parity_sqlite`); both
@@ -35854,7 +35883,12 @@ mod tests {
                 })
                 .await
                 .unwrap(),
-            ReplicatedKeyOutcome::Refused
+            // v24.2.0 (CIRISPersist#565) — backend-symmetric with the sqlite
+            // sibling: an ambiguous owner names itself, distinctly from an
+            // absent one.
+            ReplicatedKeyOutcome::Refused {
+                reason: crate::federation::register::KeyRefusalReason::OwnerAmbiguous
+            }
         );
         let row = crate::federation::FederationDirectory::lookup_public_key(&backend, &node)
             .await
