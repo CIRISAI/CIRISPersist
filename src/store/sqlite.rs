@@ -3751,7 +3751,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // AV-62/74's dimension-keyed self-emission arm — so a SELF-attested
         // capacity row is still reported as self-emission rather than shadowed
         // by "no consent". Backend-symmetric across memory / sqlite / postgres.
-        crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
+        crate::federation::admission::check_consent_gated_admission(self, &row).await?;
 
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here, in the cheap
@@ -20272,7 +20272,7 @@ mod tests {
                         &agent,
                         &scorer,
                         "consent:state:granted:v1",
-                        &[crate::federation::admission::CAPACITY_CONSENT_SCOPE],
+                        &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
                         chrono::Utc::now() - chrono::Duration::seconds(60),
                     ),
             })
@@ -38804,6 +38804,18 @@ mod tests {
         backend.run_migrations().await.unwrap();
         crate::federation::bootstrap_admission::test_support::exercise_capacity_consent_gate(
             &backend, "sq46",
+        )
+        .await;
+    }
+
+    /// #569 B7 — the SAME consent rule over every verify-classified
+    /// consensual-reputation family, on sqlite. Shared exercise body.
+    #[tokio::test]
+    async fn bootstrap_verify_reputation_consent_gate_sqlite_569() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::bootstrap_admission::test_support::exercise_verify_reputation_consent_gate(
+            &backend, "sq569",
         )
         .await;
     }

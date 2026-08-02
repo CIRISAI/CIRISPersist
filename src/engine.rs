@@ -12444,7 +12444,7 @@ mod tests {
         // capacity:* emit below is a federation-tier claim ABOUT `subject`,
         // so it needs S's live `analyze` grant covering this engine's
         // emitting key. Without this row the emit is REFUSED by
-        // `check_capacity_consent_admission` — which is not a fixture
+        // `check_consent_gated_admission` — which is not a fixture
         // inconvenience but the gate biting on the node's OWN emit surface:
         // `emit_attestation` stores through `put_attestation`, and the local
         // surface gets no bypass (the inverted AV-77 lesson — a gate that
@@ -12462,7 +12462,7 @@ mod tests {
                             "{}:v1",
                             crate::federation::consent::consent_dimension::STATE_GRANTED_PREFIX
                         ),
-                        &[crate::federation::admission::CAPACITY_CONSENT_SCOPE],
+                        &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
                         chrono::Utc::now() - chrono::Duration::seconds(60),
                     ),
             },
@@ -12510,6 +12510,111 @@ mod tests {
             .expect("default emit");
         let p_row = sq.get_attestation(&p_id).await.unwrap().expect("row");
         assert_eq!(p_row.weight, None, "None ⇒ unchanged default");
+    }
+
+    /// v25.1.0 (CIRISPersist#569) — **THE GATE BITES THE NODE'S OWN EMIT
+    /// SURFACE.**
+    ///
+    /// A put-gate that exempted the local emit path would be unreachable from
+    /// the only side that matters: this node would happily publish about a
+    /// subject who never consented while refusing the identical row from a
+    /// peer. [`Engine::emit_attestation`] stores through `put_attestation`,
+    /// so it faces `check_consent_gated_admission` like anyone — and #569's
+    /// widening reaches it for the VERIFY-owned families too, not just
+    /// `capacity:*`.
+    ///
+    /// Witnesses the full arc on the emit API itself: refused with the typed
+    /// [`crate::federation::Error::ConsentGateRefused`], admitted after the
+    /// subject grants `analyze`.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn emit_attestation_consent_gate_bites_own_surface_569() {
+        use crate::federation::types::attestation_type::SCORES;
+        use crate::federation::FederationDirectory;
+        use ciris_verify_core::federation_provenance::dim::{self, ConsentClass};
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("ciris-569");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "ciris-569"))
+            .await
+            .expect("seed key");
+        let subject = "verify-signal-subject";
+        crate::federation::tier_ingest::test_support::register_hybrid_key(&*sq, subject).await;
+
+        // The probe dimension is DERIVED from verify's registry, like the gate
+        // and the B7 witness — never a string typed in by hand here.
+        let spec = dim::ALL
+            .iter()
+            .find(|d| d.consent_class == ConsentClass::ConsensualReputation && !d.parameterized)
+            .expect("verify declares an unparameterized consensual-reputation family");
+        let dimension = spec.prefix;
+
+        let emit = || {
+            let mut input = crate::federation::EmitAttestationInput::with_envelope(
+                SCORES,
+                crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "dimension": dimension,
+                    "score": 1.0,
+                    "confidence": 0.9,
+                }))
+                .unwrap(),
+                crate::federation::types::cohort_scope::FEDERATION,
+            );
+            // Someone ELSE's trust signal, not the emitter's own.
+            input.attested_key_id = Some(subject.to_owned());
+            input
+        };
+
+        // (a) The node's OWN emit is refused — no bypass for the local path.
+        let err = engine
+            .emit_attestation(&signer, emit())
+            .await
+            .expect_err("#569: this node's own unconsented verify-signal emit must be REFUSED");
+        assert!(
+            matches!(&err, crate::federation::Error::ConsentGateRefused(r)
+                if r.dimension == dimension
+                    && r.attester_key_id == derived
+                    && r.subject_key_id == subject),
+            "#569: the refusal is the typed consent gate, naming this node as the attester: \
+             {err:?}"
+        );
+
+        // (b) The subject opens the plane; the same emit then admits.
+        FederationDirectory::put_attestation(
+            &*sq,
+            crate::federation::SignedAttestation {
+                attestation:
+                    crate::federation::bootstrap_admission::test_support::consent_scope_row(
+                        &uuid::Uuid::new_v4().to_string(),
+                        subject,
+                        &derived,
+                        &format!(
+                            "{}:v1",
+                            crate::federation::consent::consent_dimension::STATE_GRANTED_PREFIX
+                        ),
+                        &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
+                        chrono::Utc::now() - chrono::Duration::seconds(60),
+                    ),
+            },
+        )
+        .await
+        .expect("seed S->P analyze consent");
+
+        let id = engine
+            .emit_attestation(&signer, emit())
+            .await
+            .expect("#569: with the subject's live analyze grant, the emit admits");
+        let row = sq.get_attestation(&id).await.unwrap().expect("row");
+        assert_eq!(
+            crate::federation::admission::envelope_dimension(&row.attestation_envelope),
+            Some(dimension),
+            "#569: and the stored row carries the gated dimension"
+        );
     }
 
     // ── #249 Cut C ── delegates_to / moderation emit ceremonies ───────
