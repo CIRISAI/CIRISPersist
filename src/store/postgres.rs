@@ -20356,6 +20356,24 @@ mod tests {
         .await;
     }
 
+    /// v24.3.0 (CIRISPersist#574) — the postgres leg of the shared
+    /// reverse-quorum witness (see `sqlite::tests::
+    /// reverse_quorum_parity_sqlite_574` and the memory leg); all three call
+    /// the SAME `reverse_quorum::test_support::exercise_reverse_quorum` body.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn reverse_quorum_parity_postgres_574() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(&backend, &suffix)
+            .await;
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the postgres leg of the shared
     /// backend-parity witness for the three new #509 methods (see
     /// `sqlite::tests::consent_509_backend_methods_parity_sqlite`); both

@@ -150,6 +150,9 @@ pub mod register;
 pub mod replication;
 pub mod replication_policy;
 pub mod rooting;
+// v24.3.0 (CIRISPersist#574) — reverse quorum: the commons' brake.
+// 1-of-N to protect, m-of-n to undo.
+pub mod reverse_quorum;
 pub mod schema_resolver;
 pub mod scores;
 pub mod trust_root;

@@ -15499,6 +15499,22 @@ mod tests {
         .await;
     }
 
+    /// v24.3.0 (CIRISPersist#574) — the MEMORY leg of the shared reverse-quorum
+    /// witness. The whole plane composes trait methods over
+    /// `&dyn FederationDirectory` (no new table, no migration), so memory is
+    /// not a bonus leg here — it is the backend where an untested divergence
+    /// hides, seven times over v21.11–17.1.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn reverse_quorum_parity_memory_574() {
+        let backend = MemoryBackend::new();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
+            &backend,
+            "memory-rq",
+        )
+        .await;
+    }
+
     /// v13.0.1 (#375) — the DEFAULT `FederationDirectory::apply_replicated_key_record`
     /// trait body (memory/mock backends, no scrub-upgrade plane): a new
     /// key_id is a first-seen Inserted; a differing record for an existing

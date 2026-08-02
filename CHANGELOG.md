@@ -5,6 +5,161 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [24.3.0] — unreleased — #574: reverse quorum, the commons' brake
+
+> Integration note: this section covers **#574 only**. The 24.3.0 cut bundles work from sibling
+> branches (#572, #575); the `Cargo.toml` version bump is deliberately left to the integrator so
+> three branches do not each move the same line.
+
+### The gap, stated precisely
+
+Consent protects the private plane structurally — no signed directed grant, no delivery. The
+**commons** (federation-scoped, publicly readable rows) gets nothing from it, because in the commons
+everyone has already consented to look. A community's only two available responses to a row it
+considered harmful were **one member acting unilaterally** (fast, illegitimate) or **assembling an
+approve-first quorum** (legitimate, and it lands after the harm).
+
+`consensus_protocol`'s six forms are ALL approve-to-act:
+
+```
+founder_only | unanimous | majority | quorum:{m}/{n} | weighted:{rubric} | custom:{id}
+```
+
+There was no objection, veto, or dissent form anywhere in the vocabulary — a grep for those terms
+across `src/federation/` returned only `optimization_veto_passed`, an unrelated trace-summary field.
+
+**A correction to #574's second claim.** The issue says "no engine reads it". It is read, in four
+places — `family_charter_threshold` (v24.0.0's trust-root charter threshold, a real m-of-n count),
+`genesis::bundle::verify_bundle_quorum`, `verify_membership_quorum` (the #249 Cut G3 membership-change
+gate), and `community_authority_set` (as a binary `founder_only`-vs-open switch). What is genuinely
+absent is narrower and sharper: **no reader anywhere counts a threshold over a community's
+`consensus_protocol` for a COMMONS ACTION.** Every existing reader governs the *group* — its charter,
+its roster, its genesis. None polices what the group publishes.
+
+### `reverse_quorum:{m}/{n}:{window_secs}`
+
+Act-unless-objected. The action lands on arrival; `m` distinct current members objecting inside the
+window reverse it. `federation::reverse_quorum` owns the parse, the two admission doors, and the fold.
+
+**The asymmetry is the design** — the repo's recorded accord-ops invariant (*m-of-n OR reverse quorum,
+never 1-of-N capability-grant*) in its reverse-quorum form:
+
+| side | threshold |
+|---|---|
+| raise an objection | `OBJECTION_THRESHOLD` = **1**, every roster, no count and no co-signature |
+| reverse the action | the declared `m`, **capped** at the live roster — never raised |
+| dismiss someone else's objection | the declared `m`, **floored at a strict majority** — never lowered |
+| retract your OWN objection | **1** — your own signature |
+
+One rule, two directions: the protective side is never made harder than declared; the undo side is
+never made easier than a strict majority. On a 5-member `reverse_quorum:2/5` commons that is 2 to pull
+the brake and 3 to lift it — and the two signatures that *would* have reversed the action are not
+enough to dismiss a single objection.
+
+The last row is the reading of "1-of-N to protect" that keeps the doctrine coherent rather than
+holing it: a member may retract their **own** objection with their own signature, because that takes
+nothing away from anyone else and a captured key can retract only what that same key raised. Both
+prices come from one function (`dismissal_required`), read by the admission door **and** the
+read-time re-derivation, so a stored dismissal means the same thing when it is read as when it was
+admitted. (It is also the only retraction path available: the ordinary `withdraws` grammar names a
+KEY, not a specific attestation, so it cannot single out one objection among several against the
+same actor.)
+
+### Markers, not commands
+
+An objection is a **`scores` attestation**, deliberately not a `withdraws`. A `withdraws` compels: the
+substrate acts on it at admission and the target is revoked. A `scores` row on `objection:raised:v1`
+asserts — durable, signed, attributable, and replicating on the ordinary attestation plane because it
+*is* an ordinary attestation. Nothing mutates on its arrival. So the marker travels (it does not die
+with the objector's node) and a peer partitioned through the whole window still counts it when it
+finally lands.
+
+### Evidence, not verdict
+
+`resolve_reverse_quorum` returns a `ReverseQuorumFold` — count, threshold, roster size, window bounds,
+and the **ids of the objections it counted**. Persist never deletes, tombstones, or rewrites the
+objected-to row. `ReverseQuorumStanding::Reversed` is a derived state in exactly the sense
+`ConsentState::Revoked` is: a pure function of held rows, recomputed at read time, converging on every
+node without coordination. The fold is `(action, objections, dismissals, roster, policy, now)` and
+nothing else — evaluated at read time rather than advanced at write time, precisely so a node that was
+partitioned during the window converges when the rows arrive.
+
+Roster drift is handled the way the charter plane handles it: the window is pinned to the **action's**
+`asserted_at`, and the roster and thresholds are re-derived at **read** time. A dismissal admitted
+against a 5-member roster stops clearing a grown roster's strict majority, and the protection it
+lifted comes back on its own — fail-safe, and witnessed.
+
+### Typed refusals (#565 style)
+
+`ObjectionRefusalReason` — closed, eleven variants, snake_case serde tokens identical to `as_str()`,
+no `Other` catch-all. A quorum-short dismissal refuses with `dismissal_quorum_short` **and** a
+`DismissalQuorum { counted, required, roster_size }`, so the caller learns how far short they were.
+
+One of the eleven exists because of a class this repo keeps rediscovering: `not_filed_against_actor`.
+Objections are found through the objected-to action's author, so a row filed against any other key
+would be stored, durable, signed — and never counted by anything. Admitted-but-inert is the failure
+mode that looks most like success, so it is a refusal.
+
+### Storage
+
+No new table, no new trait method, no `FederationDirectory` change. The whole plane composes existing
+reads (`lookup_group` / `active_members` / `list_attestations_for` / `get_attestation` /
+`put_attestation`), which is what makes the objection replicate for free.
+
+**V116 (both backends)** widens the `federation_communities.consensus_protocol` CHECK to admit the new
+form. The vocabulary turned out to be closed in **three** places, not the one the issue named: the
+Rust shape gate, the sqlite table CHECK, and the postgres regex CHECK. The Rust gate alone passed and
+sqlite raised a constraint violation on the first real `put_community`. Nothing is removed; the six
+existing forms remain admissible with identical meaning. `federation_families.consensus_protocol`
+carries no CHECK, so there was deliberately nothing to widen there.
+
+The sqlite side is a table rebuild (no `DROP CONSTRAINT` in SQLite), and the suite structurally
+cannot cover it: every test database runs its migrations before any row exists, so the
+`INSERT…SELECT` never sees data in CI. It was driven by hand against a populated post-V115 schema —
+row preserved byte-for-byte across all eleven columns, PRIMARY KEY intact, legacy forms still
+admissible, malformed `reverse_quorum:` strings still refused. A rebuild that dropped rows would
+have passed CI green.
+
+`consensus_protocol::is_canonical_form` now routes the new prefix through `ReverseQuorumPolicy::parse`
+— one parse door, so the shape gate can never admit a string the fold cannot read. The
+forward-threshold readers are unaffected and read the new form **fail-secure as unanimity**: a
+`reverse_quorum:2/9` brake must never be mistaken for a 2-of-9 charter quorum, and that is pinned by
+test.
+
+### Shared predicate
+
+`count_distinct_roster_scrubs` was **lifted out of** `trust_root::family_quorum_over` rather than
+copied, so the v24.0.0 charter plane and this m-of-n undo door run the same body. "A distinct verified
+co-signature" means one thing in this repo; a mutation of that function fails the trust-root witnesses
+and the reverse-quorum witness together.
+
+### Witnesses
+
+`reverse_quorum::test_support::exercise_reverse_quorum`, one body run by **memory / sqlite / postgres**:
+a single member's objection admitted and visible; a non-member's refused naming the branch; a
+quorum-short dismissal refused naming the shortfall and writing nothing; a non-member co-signature
+buying no quorum; an objection filed against the wrong key refused rather than stored-and-inert; a
+quorum-met dismissal lifting the objection; a member who helped lift the brake
+still able to pull it; two of five reversing the action *below* a strict majority; the objected-to row
+untouched throughout; the markers replicated verbatim to a peer that folds them to the same standing;
+a grown roster invalidating a dismissal and restoring the protection; an unadopted cohort refused
+`not_governed` rather than silently defaulted; and a member retracting their own objection with one
+signature on a roster of nine while everyone else's stands.
+
+Six mutations were run against the finished harness. Two initially survived — flooring the protective
+side at a strict majority, and skipping the read-time dismissal re-verify — and the witness was
+strengthened until all six fail. The 3-member roster the witness started with could not see the first
+of those, because at three the declared `m` and a strict majority coincide.
+
+### Follow-ups
+
+- **CC ratification:** the `objection:{state}` family (`objection:raised:v1` / `objection:dismissed:v1`)
+  is not in the vendored CC 1.0-rc2 registry. Unregistered dimensions resolve `ProducerSteward`, so the
+  plane works today; the ask is to make the authority explicit — CC §3.1.9.2, owning component `node`,
+  reserved rule **cohort-member-only**, which is the gate `record_objection` already enforces.
+- **PyO3 surface:** the plane is reachable from Rust (`federation::reverse_quorum::*` over any
+  `FederationDirectory`); no Python binding yet.
+
 ## [24.2.0] — 2026-07-31 — #565/#564: a refusal that names its branch, and an object that names its dependents
 
 Two asks, one shape: **a verdict without its evidence sends the reader to the wrong layer.** #565 is

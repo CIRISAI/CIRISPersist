@@ -20087,6 +20087,22 @@ mod tests {
         .await;
     }
 
+    /// v24.3.0 (CIRISPersist#574) — the sqlite leg of the shared reverse-quorum
+    /// witness (see the postgres + memory legs); all three call the SAME
+    /// `reverse_quorum::test_support::exercise_reverse_quorum` body, so no
+    /// backend can silently disagree about who may raise the brake alone and
+    /// what it costs to lift it.
+    #[tokio::test]
+    async fn reverse_quorum_parity_sqlite_574() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
+            &backend,
+            "sqlite-rq",
+        )
+        .await;
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the sqlite leg of the shared
     /// backend-parity witness for the three new #509 methods (see
     /// `postgres::tests::consent_509_backend_methods_parity_postgres`);
