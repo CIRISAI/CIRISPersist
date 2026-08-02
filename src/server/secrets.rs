@@ -159,10 +159,13 @@ where
         )
     })?;
     let allowed = tier.allowed_roles();
-    let has_role = record.roles.iter().any(|r| allowed.contains(&r.as_str()));
+    let has_role = record
+        .capability_roles
+        .iter()
+        .any(|r| allowed.contains(&r.as_str()));
     if !has_role {
         tracing::warn!(
-            key_id, roles = ?record.roles, tier = ?tier,
+            key_id, roles = ?record.capability_roles, tier = ?tier,
             "secrets route rejected: role-tag missing"
         );
         return Err(error_response(
@@ -964,7 +967,7 @@ mod tests {
             // v1.3.0 (CIRISPersist#46): grant the test steward all
             // three secrets role tiers so existing tests continue to
             // pass against routes now gated by `verify_and_authorize`.
-            roles: vec![
+            capability_roles: vec![
                 ROLE_SECRETS_READER.to_owned(),
                 ROLE_SECRETS_WRITER.to_owned(),
                 ROLE_SECRETS_ADMIN.to_owned(),
