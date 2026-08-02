@@ -3982,7 +3982,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             // never "that key exists" — strictly less leaky than the gate
             // it precedes, so the v3.4.0 information-leak boundary is
             // preserved rather than moved. Per-backend-instance state.
-            self.peer_write_quota.check(&row.attesting_key_id)?;
+            // v24.3.0 (CIRISPersist#575) — takes the ROW now, not the key:
+            // the budget a write is charged against is a pure function of
+            // the row (see `PeerWriteQuota::classify`), and that predicate
+            // lives in the quota so the three backends cannot hold three
+            // opinions of it.
+            self.peer_write_quota.check_write(&row)?;
 
             // v3.4.0 (CIRISPersist#123) — trust-threshold gate. Free at
             // the default threshold 0 (short-circuits without dispatching

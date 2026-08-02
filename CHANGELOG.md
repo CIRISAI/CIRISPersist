@@ -5,11 +5,86 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [24.3.0] — unreleased — #574: reverse quorum, the commons' brake
+## [24.3.0] — 2026-08-02 — #572 / #574 / #575: the wedge, the brake, and the budget
 
-> Integration note: this section covers **#574 only**. The 24.3.0 cut bundles work from sibling
-> branches (#572, #575); the `Cargo.toml` version bump is deliberately left to the integrator so
-> three branches do not each move the same line.
+Three issues, three agents, one cut. Each was verified in an isolated worktree against `main`
+plus only its own changes, then certified together by the integrator — the shared-checkout
+collision that produced that discipline is written up under *Process* at the end.
+
+### #572 — teardown that cannot hold the GIL while it waits
+
+`tokio::runtime::Runtime::drop` blocks until every already-STARTED `spawn_blocking` task
+finishes: no timeout, no cancellation. The last `Arc<Runtime>` reference was always released
+inside CPython's `Py_DECREF`, **and CPython holds the GIL across a whole deallocation** — so the
+wait did not stall a thread, it stalled the interpreter. pytest-timeout's thread-method timer
+never got the GIL, and the worker presented as a hang with zero Rust-side error. Root cause of
+the remaining CIRISAgent#956 flake.
+
+Three GIL boundaries released that last reference: `PyEngine`'s compiler-generated drop (the
+load-bearing one — it runs in the `gc.collect()` a fixture performs after `reset_engine()`,
+which is why `reset_engine` looked innocent: it never tore anything down while a Python `Engine`
+was alive), `EngineCell`'s drop inside `Engine.close()`, and `persist_drop` — a PyCapsule
+destructor, GIL-held by definition. Plus a fourth defect, the SIGBUS half: `EngineCell` and
+`PyEngine` both declared `backend` BEFORE `runtime`, and Rust drops fields in declaration order,
+so the SQLite connection could be freed while blocking tasks still held it.
+
+**The fix**: nothing that can block is ever dropped on a thread that might hold the GIL. The
+payload moves to a dedicated OS thread — created by us, never touching Python, provably
+GIL-free — and is dropped there. The caller pays `Arc::try_unwrap` + `thread::spawn`,
+microseconds, no lock held. The only blocking call, `wait_quiesced`, is reachable exclusively
+from inside `py.detach(...)`, is always bounded, and returns on expiry rather than continuing to
+wait; `teardown_timeout` clamps NaN/negative/zero to ZERO and infinity to one hour, so an
+unbounded wait is not a configuration this surface offers. `SharedRuntime` puts it on the type
+rather than in review: it replaces every bare `Arc<Runtime>` on the FFI, `Deref` keeps ~400
+`runtime.block_on(...)` call sites unchanged, and `Drop` hands off only when that holder owns the
+last reference.
+
+Deterministic repro, proven red before green: with `Drop for PyEngine` neutered,
+`pyengine_drop_under_the_gil_is_bounded` fails at **1.10 s of held GIL**; with the fix, under
+250 ms. (The first version of the probe armed itself before taking the GIL and was vacuous —
+it attached in 150 µs. Fixed, and worth recording: a GIL probe outside `Python::attach` measures
+nothing.)
+
+**One true leak, deliberate and loud**: if `thread::Builder::spawn` fails — thread/FD exhaustion,
+i.e. the process is already in trouble — the runtime's workers and a keepalive `Box` leak,
+bounded at one per failed teardown and reclaimed at process exit, `tracing::error!`-logged. At
+that moment we may hold the GIL, and blocking is the one thing we must not do: leaking a
+connection pool is survivable and observable; wedging the interpreter is neither.
+
+Backends differ materially. **SQLite** is the only one putting DB work on tokio's blocking pool
+(12 `spawn_blocking` sites; rusqlite is synchronous) — the sole source of an unbounded shutdown
+wait and the only backend whose connection could be freed under a live task. **Postgres** drops
+async tasks without waiting; its exposure was ordering only. **Memory** has no tokio coupling at
+all. No backend needed a `Drop` impl: the fix is that the runtime finishes winding down before
+any backend is released.
+
+New surface: `Engine.close_blocking(timeout_seconds, force)`, `reset_engine(timeout_seconds)`,
+`engine_teardown_wait(timeout_seconds)`, `engine_teardowns_in_flight()`, returning
+`drained` / `deferred` / `timed_out` / `no_engine`. `reset_engine()` now reports `deferred`
+instead of returning promptly and leaving teardown to the next GC pass — which is precisely how
+the wedge was reached. The fixture recipe that replaces a `time.sleep(0.2)` guess:
+`reset_engine(); del engine; gc.collect(); engine_teardown_wait()`.
+
+### #575 — a slot was a budget, and identity was free
+
+`PeerWriteQuota` existed, worked, and led the check chain — the issue verified that before
+filing, and said so. The gaps were specific: **864k rows/day/peer**, a counter that **reset on
+restart** (so an attacker who can cause a restart gets a fresh budget), and a **4096 batch cap
+that made a Sybil an amplifier**.
+
+The refusal now names WHICH budget refused and in which regime — `PeerQuotaRefusal` with a
+stable `as_str` token (`peer_burst`, `peer_sustained`, `untracked_tail_burst`, `node_burst`,
+`reserved_burst`, …), and `check_write` takes the ROW rather than the key because the budget a
+write is charged against is a pure function of the row.
+
+**The reason reaches the wire, not just the quota's API.** `Error::RateLimited` carries
+`reason: PeerQuotaRefusal`, the `#[error(...)]` display names it, and the type is re-exported at
+`federation::` so a public error variant does not force consumers to name a path into
+`replication::admission` — the `register::KeyRefusalReason` precedent from #565. A bare
+`federation_rate_limited` sends an operator hunting the wrong control at exactly the moment they
+need the right one; that gap is now closed on both refusal surfaces.
+
+### #574 — reverse quorum, the commons' brake
 
 ### The gap, stated precisely
 

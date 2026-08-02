@@ -2113,7 +2113,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // any threshold > 0. It answers "you are writing too fast",
             // never "that key exists" — strictly less leaky than the gate
             // it precedes. Per-backend-instance state.
-            self.peer_write_quota.check(&row.attesting_key_id)?;
+            // v24.3.0 (CIRISPersist#575) — takes the ROW now, not the key:
+            // the budget a write is charged against is a pure function of
+            // the row (see `PeerWriteQuota::classify`), and that predicate
+            // lives in the quota so the three backends cannot hold three
+            // opinions of it.
+            self.peer_write_quota.check_write(&row)?;
 
             // v3.4.0 (CIRISPersist#123) — trust-threshold gate. The
             // cheapest reject that consults state AND the one that leaks

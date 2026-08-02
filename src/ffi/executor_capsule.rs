@@ -299,10 +299,19 @@ fn panic_payload_msg(payload: &Box<dyn std::any::Any + Send>) -> String {
 unsafe extern "C" fn persist_drop(data: *mut c_void) {
     // SAFETY: per the vtable contract, `data` was produced by
     // `Arc::into_raw(Arc<Runtime>)`. Reconstruct to drop the Arc.
-    let _runtime: Arc<tokio::runtime::Runtime> =
+    let runtime: Arc<tokio::runtime::Runtime> =
         unsafe { Arc::from_raw(data as *const tokio::runtime::Runtime) };
-    // Drop runs here; if this was the last Arc, the runtime shuts
-    // down on the persist side.
+    // v24.3.0 (CIRISPersist#572) — this is a PyCapsule destructor, so
+    // it runs inside CPython's dealloc with the GIL held. If this were
+    // the last `Arc<Runtime>` (an engine torn down before the consumer
+    // released its capsule), dropping it here would run tokio's
+    // *blocking* shutdown under the GIL and stop the whole
+    // interpreter — the same wedge `PyEngine`'s own drop closes. Hand
+    // it to a teardown thread instead; when other holders remain this
+    // is just an atomic decrement, exactly as before.
+    if let Ok(rt) = Arc::try_unwrap(runtime) {
+        crate::engine::teardown::retire_runtime(rt, Box::new(()));
+    }
 }
 
 /// Construct an [`AsyncExecutor`] backed by `runtime`. The returned
