@@ -368,11 +368,163 @@ struct SubscriptionState {
 /// `publish_change` on any other.
 type SubscriptionRegistry = Arc<std::sync::Mutex<SubscriptionState>>;
 
+/// v24.3.0 (CIRISPersist#572) — the process runtime, wrapped so that
+/// **dropping the last reference can never block the dropping
+/// thread**.
+///
+/// Every holder of this type (the [`EngineCell`], every [`PyEngine`]
+/// handle, every short-lived clone a method makes) is a place the
+/// refcount can reach zero. Before #572 those were all bare
+/// `Arc<Runtime>`, and the last one to die ran tokio's blocking
+/// shutdown right there — usually inside CPython's `Py_DECREF` during
+/// a `gc.collect()`, with the GIL held, taking the whole interpreter
+/// down with it. See [`crate::engine::teardown`] for the full
+/// mechanism.
+///
+/// Behaviour: `Deref<Target = Runtime>` so every existing
+/// `runtime.block_on(...)` / `runtime.handle()` call site is
+/// unchanged; `Clone` clones the inner `Arc`; `Drop` hands the
+/// runtime to a teardown thread **only** when this holder owns the
+/// last reference, and is a plain atomic decrement otherwise.
+///
+/// Do NOT "simplify" this back to `Arc<Runtime>`. The type is the
+/// enforcement: it makes every drop site GIL-safe by construction
+/// rather than by review.
+struct SharedRuntime {
+    /// `None` only after [`SharedRuntime::retire`] has taken the
+    /// reference — i.e. inside `Drop`, or on a handle that
+    /// `Engine.close_blocking()` has deliberately disarmed.
+    rt: Option<Arc<Runtime>>,
+}
+
+/// Panic message for use-after-retire. Reaching this means a method
+/// touched the runtime after `close_blocking()` disarmed the handle,
+/// which `ensure_usable()` (the `closed` flag is always set first)
+/// is supposed to make unreachable.
+const RUNTIME_RETIRED: &str =
+    "ciris-persist (#572): Engine handle's runtime was retired by close_blocking()";
+
+impl SharedRuntime {
+    fn new(rt: Runtime) -> Self {
+        Self {
+            rt: Some(Arc::new(rt)),
+        }
+    }
+
+    /// A bare `Arc<Runtime>` for the two consumers that genuinely need
+    /// one (`TraceKeyDirectory`, the ABI-stable executor capsule).
+    fn arc(&self) -> Arc<Runtime> {
+        self.rt.as_ref().expect(RUNTIME_RETIRED).clone()
+    }
+
+    /// How many holders share this runtime. `1` means the caller owns
+    /// the last reference, so dropping it is what actually tears the
+    /// runtime down — the difference between a teardown that completes
+    /// now and one that completes whenever Python collects the last
+    /// `Engine` object.
+    fn holders(&self) -> usize {
+        self.rt.as_ref().map_or(0, Arc::strong_count)
+    }
+
+    /// Give up this holder's claim on the runtime, without blocking.
+    ///
+    /// `keepalive` is anything the runtime's in-flight tasks are still
+    /// touching (the backend handle) — it is released only after the
+    /// runtime has finished winding down, and only when this holder
+    /// was the last one. When other holders remain there is nothing to
+    /// wind down here, so the keepalive is simply dropped.
+    fn retire(&mut self, keepalive: Box<dyn std::any::Any + Send>) {
+        let Some(arc) = self.rt.take() else {
+            return;
+        };
+        match Arc::try_unwrap(arc) {
+            Ok(rt) => crate::engine::teardown::retire_runtime(rt, keepalive),
+            Err(_still_shared) => drop(keepalive),
+        }
+    }
+}
+
+impl Clone for SharedRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            rt: self.rt.clone(),
+        }
+    }
+}
+
+impl std::ops::Deref for SharedRuntime {
+    type Target = Runtime;
+    fn deref(&self) -> &Runtime {
+        self.rt.as_deref().expect(RUNTIME_RETIRED)
+    }
+}
+
+impl Drop for SharedRuntime {
+    fn drop(&mut self) {
+        self.retire(Box::new(()));
+    }
+}
+
+/// v24.3.0 (CIRISPersist#572) — default bound on every teardown wait
+/// exposed to Python. Generous next to a real teardown (milliseconds)
+/// and far below any CI watchdog, so a `"timed_out"` return is real
+/// news rather than an impatient default.
+const DEFAULT_TEARDOWN_TIMEOUT_SECS: f64 = 10.0;
+
+/// v24.3.0 (CIRISPersist#572) — what a teardown door actually did.
+///
+/// These are values, not exceptions, on purpose. The failure this
+/// replaces is a silent native hang; the replacement has to be
+/// something a fixture can read, assert on, and log — including the
+/// unhappy cases.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TeardownOutcome {
+    /// No engine was pinned — idempotent re-close.
+    NoEngine,
+    /// Runtime and pools are fully wound down.
+    Drained,
+    /// Released here, but other holders remain; completion happens
+    /// when they are collected.
+    Deferred,
+    /// Still winding down when the bound expired. Continues on its
+    /// own thread.
+    TimedOut,
+}
+
+impl TeardownOutcome {
+    fn token(self) -> &'static str {
+        match self {
+            TeardownOutcome::NoEngine => "no_engine",
+            TeardownOutcome::Drained => "drained",
+            TeardownOutcome::Deferred => "deferred",
+            TeardownOutcome::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Clamp a Python-supplied timeout into a sane `Duration`. NaN and
+/// negatives mean "don't wait" rather than "wait forever" — an
+/// unbounded wait is never an option on a teardown path (#572).
+fn teardown_timeout(seconds: f64) -> std::time::Duration {
+    if seconds.is_nan() || seconds <= 0.0 {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_secs_f64(seconds.min(3600.0))
+    }
+}
+
 /// Process-global canonical engine state. Built once; `PyEngine`
 /// handles clone Arc fields out of it.
+///
+/// **v24.3.0 (CIRISPersist#572) — field order is load-bearing.** Rust
+/// drops struct fields in declaration order, so `runtime` is declared
+/// FIRST: the runtime must finish winding down before `backend` frees
+/// the connection handle its in-flight `spawn_blocking` tasks are
+/// still using. Reversing these two reinstates the "Bus error"
+/// teardown crash. See [`crate::engine::teardown`].
 struct EngineCell {
+    runtime: SharedRuntime,
     backend: BackendDispatch,
-    runtime: Arc<Runtime>,
     scrubber: Arc<dyn Scrubber>,
     signer: Arc<dyn HardwareSigner>,
     signer_key_id: String,
@@ -551,6 +703,11 @@ fn build_disk_pressure_config(
 /// `EngineUsedAcrossFork`.
 #[pyclass(name = "Engine", module = "ciris_persist")]
 pub struct PyEngine {
+    /// v24.3.0 (CIRISPersist#572) — declared FIRST on purpose; see the
+    /// same note on [`EngineCell`]. Rust drops fields in declaration
+    /// order, and the runtime has to be wound down before `backend`
+    /// releases the connection its in-flight blocking tasks are using.
+    runtime: SharedRuntime,
     /// v1.0.0-scaffold (CIRISPersist#193) introduced; v1.5.1 finished
     /// the dispatch sweep. Every PyEngine method body reads this via
     /// `match &self.backend { Postgres(pg) => ..., Sqlite(sq) => ... }`
@@ -559,7 +716,6 @@ pub struct PyEngine {
     /// (lens-read + ratchet primitives, Postgres-only per the v0.5.0
     /// FSD) return a stable runtime error on the SQLite arm.
     backend: BackendDispatch,
-    runtime: Arc<Runtime>,
     scrubber: Arc<dyn Scrubber>,
     signer: Arc<dyn HardwareSigner>,
     signer_key_id: String,
@@ -644,6 +800,37 @@ pub struct PyEngine {
     executor_capsule_cache: std::sync::OnceLock<pyo3::Py<pyo3::types::PyCapsule>>,
 }
 
+/// v24.3.0 (CIRISPersist#572) — **the GIL-critical drop path.**
+///
+/// Python owns `Engine` objects, so this runs inside CPython's
+/// `tp_dealloc` — during a `gc.collect()`, at interpreter shutdown, or
+/// the moment the last name binding goes away — and CPython holds the
+/// GIL for all of it. Before #572 the compiler-generated drop released
+/// the last `Arc<Runtime>` here and tokio blocked the thread until
+/// every in-flight `spawn_blocking` task finished. With the GIL held
+/// that is not a slow drop, it is a stopped interpreter: no Python
+/// thread runs, so pytest-timeout's timer thread never fires and the
+/// worker hangs with no error anywhere (CIRISAgent#956).
+///
+/// The whole job here is to make that release non-blocking and
+/// correctly ordered:
+///
+/// * `retire` hands the runtime to a teardown thread when this handle
+///   holds the last reference, and is a plain atomic decrement when it
+///   does not — either way it returns in microseconds.
+/// * the backend handle rides along as the keepalive, so it is freed
+///   *after* the runtime has wound down rather than out from under a
+///   blocking task that is still using it. The remaining `self.backend`
+///   field drop is then only a refcount decrement.
+///
+/// Do not replace this with the derived drop "for simplicity". The
+/// derived drop is the deadlock.
+impl Drop for PyEngine {
+    fn drop(&mut self) {
+        self.runtime.retire(Box::new(self.backend.clone()));
+    }
+}
+
 /// #320 — build-once/cache a capsule on the engine so the boxed value its raw
 /// `data` points at outlives any consumer that extracted the pointer (the
 /// PyCapsule's GC destructor would otherwise free it while still in use). The
@@ -662,6 +849,81 @@ fn cached_capsule<'py>(
 }
 
 impl PyEngine {
+    /// v24.3.0 (CIRISPersist#572) — the logical half of teardown,
+    /// shared by [`close`](Self::close) and
+    /// [`close_blocking`](Self::close_blocking): refuse if consumers
+    /// are attached, flip the shared `closed` flag, stop the
+    /// background loops, and lift the cell out of the process slot.
+    ///
+    /// Returns the cell to whoever is going to release it. It
+    /// deliberately does NOT drop it: the drop is the part that can
+    /// block, and it has to happen with the GIL detached, which only
+    /// the caller (holding a `Python<'_>`) can arrange.
+    ///
+    /// `Ok(None)` means there was nothing to take — an idempotent
+    /// re-close, or a slot that has already been rebuilt by a fresh
+    /// `Engine(...)`.
+    fn detach_cell(&self, force: bool, door: &str) -> PyResult<Option<Arc<EngineCell>>> {
+        // Hold the consumer-registry lock across the empty-check AND
+        // the `closed` store: `register_consumer` re-checks `closed`
+        // under this same lock, so the pair is mutually exclusive —
+        // no consumer can attach into the close() window (#82 review,
+        // concurrency H2 / M1).
+        let registry = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
+        if !force && !registry.is_empty() {
+            let mut names: Vec<&str> = registry.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            return Err(PyRuntimeError::new_err(format!(
+                "{door} refused — {} consumer(s) still registered: [{}]. \
+                 Each adapter must deregister_consumer() on teardown, or \
+                 pass force=True to close anyway.",
+                names.len(),
+                names.join(", ")
+            )));
+        }
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        drop(registry);
+        let mut slot = engine_slot();
+        // Only clear the slot if it still points at *this* engine —
+        // guard against clearing a fresh post-close rebuild.
+        let matches = slot
+            .as_ref()
+            .is_some_and(|cell| Arc::ptr_eq(&cell.closed, &self.closed));
+        if !matches {
+            return Ok(None);
+        }
+        if let Some(cell) = slot.as_ref() {
+            // v3.4.0 (#123) — shut the sweeper down before dropping
+            // the cell. `stop()` consumes the EvictionSweeper and
+            // returns the JoinHandle; the task observes the Notify
+            // and exits at its next tokio::select! poll.
+            if let Some(sweeper) = cell
+                .sweeper
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                // Stop signals + returns the JoinHandle; explicit
+                // drop satisfies clippy::let_underscore_future.
+                std::mem::drop(sweeper.stop());
+            }
+            // v6.8.0 (#149) — stop the disk-pressure poll loop too.
+            if let Some(dp) = cell
+                .disk_pressure_handle
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                std::mem::drop(dp.stop());
+            }
+        }
+        // Take, don't drop — the slot lock is still held here and a
+        // blocking drop underneath it would wedge every concurrent
+        // constructor as well as this thread.
+        Ok(slot.take())
+    }
+
     /// Build a `PyEngine` handle from the process-singleton cell —
     /// every field is a cheap `Arc`/`String` clone. All handles
     /// share the cell's `closed` flag.
@@ -1223,7 +1485,10 @@ impl PyEngine {
         // multi-thread runtime exactly once for the process.
         let runtime =
             Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
-        let runtime = Arc::new(runtime);
+        // v24.3.0 (CIRISPersist#572) — wrapped, not a bare `Arc`, so
+        // that whichever holder happens to release the last reference
+        // does so without blocking. See [`SharedRuntime`].
+        let runtime = SharedRuntime::new(runtime);
 
         // v1.0.0-scaffold (CIRISPersist#193) — URL-sniff backend
         // construction. `dsn` retains its name for the Python kwarg
@@ -1848,62 +2113,87 @@ impl PyEngine {
     /// commits. `close()` guarantees that *subsequent* calls fail
     /// fast with `EngineClosed`, not that no call is in progress.
     /// Callers needing a hard drain must quiesce their own consumers
-    /// before calling `close()`.
+    /// before calling `close()` — or call
+    /// [`close_blocking`](Self::close_blocking), which waits with a
+    /// bound and reports what actually happened.
+    ///
+    /// **v24.3.0 (CIRISPersist#572)** — the cell is now released with
+    /// the GIL **detached**, and on a teardown thread. Dropping it
+    /// inline (as this did through v24.2.0) could run tokio's blocking
+    /// runtime shutdown while CPython held the GIL, which stops the
+    /// whole interpreter rather than just this thread. Non-waiting
+    /// semantics are unchanged.
     #[pyo3(signature = (force=false))]
-    fn close(&self, force: bool) -> PyResult<()> {
-        // Hold the consumer-registry lock across the empty-check AND
-        // the `closed` store: `register_consumer` re-checks `closed`
-        // under this same lock, so the pair is mutually exclusive —
-        // no consumer can attach into the close() window (#82 review,
-        // concurrency H2 / M1).
-        let registry = self.consumers.lock().unwrap_or_else(|e| e.into_inner());
-        if !force && !registry.is_empty() {
-            let mut names: Vec<&str> = registry.keys().map(String::as_str).collect();
-            names.sort_unstable();
-            return Err(PyRuntimeError::new_err(format!(
-                "close() refused — {} consumer(s) still registered: [{}]. \
-                 Each adapter must deregister_consumer() on teardown, or \
-                 pass force=True to close anyway.",
-                names.len(),
-                names.join(", ")
-            )));
-        }
-        self.closed
-            .store(true, std::sync::atomic::Ordering::Release);
-        drop(registry);
-        let mut slot = engine_slot();
-        // Only clear the slot if it still points at *this* engine —
-        // guard against clearing a fresh post-close rebuild.
-        if let Some(cell) = slot.as_ref() {
-            if Arc::ptr_eq(&cell.closed, &self.closed) {
-                // v3.4.0 (#123) — shut the sweeper down before
-                // dropping the cell. `stop()` consumes the
-                // EvictionSweeper and returns the JoinHandle; the
-                // task observes the Notify and exits at its next
-                // tokio::select! poll.
-                if let Some(sweeper) = cell
-                    .sweeper
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .take()
-                {
-                    // Stop signals + returns the JoinHandle; explicit
-                    // drop satisfies clippy::let_underscore_future.
-                    std::mem::drop(sweeper.stop());
-                }
-                // v6.8.0 (#149) — stop the disk-pressure poll loop too.
-                if let Some(dp) = cell
-                    .disk_pressure_handle
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .take()
-                {
-                    std::mem::drop(dp.stop());
-                }
-                *slot = None;
-            }
-        }
+    fn close(&self, py: Python<'_>, force: bool) -> PyResult<()> {
+        let Some(cell) = self.detach_cell(force, "close()")? else {
+            return Ok(());
+        };
+        // GIL released for the drop — see `SharedRuntime` / #572.
+        py.detach(move || crate::engine::teardown::retire_payload(Box::new(cell)));
         Ok(())
+    }
+
+    /// v24.3.0 (CIRISPersist#572) — `close()` plus a **bounded** wait
+    /// for the teardown to actually finish. The deterministic door
+    /// CIRISAgent#956's fixture needs in place of `gc.collect()` +
+    /// `time.sleep(0.2)`.
+    ///
+    /// Returns a token describing what happened — never raises for a
+    /// slow teardown, because a hang is the failure mode this whole
+    /// change exists to eliminate:
+    ///
+    /// * `"drained"` — the tokio runtime and the backend pool are
+    ///   fully wound down. A fresh `Engine(...)` cannot race them.
+    /// * `"deferred"` — other live `Engine` handles still reference
+    ///   the runtime, so teardown cannot complete here. It completes
+    ///   (GIL-safely) when Python collects the last of them; follow
+    ///   with `del engine; gc.collect(); engine_teardown_wait()`.
+    /// * `"timed_out"` — teardown is still running after
+    ///   `timeout_seconds`. It continues on its own thread; the
+    ///   caller gets its thread, and the interpreter, back.
+    /// * `"no_engine"` — nothing was pinned (idempotent re-close).
+    ///
+    /// This handle gives up its own claim on the runtime as part of
+    /// the call, which is what lets the wait mean anything — the
+    /// caller is the last holder in the common single-handle case.
+    /// The handle is already unusable at that point (`close()` set the
+    /// `closed` flag, and every method checks it), so nothing can
+    /// reach the retired runtime.
+    ///
+    /// The wait happens with the GIL detached. It is bounded, and on
+    /// expiry it returns a value instead of blocking — the two
+    /// properties that make it impossible to reproduce #572 through
+    /// this door.
+    #[pyo3(signature = (timeout_seconds=DEFAULT_TEARDOWN_TIMEOUT_SECS, force=false))]
+    fn close_blocking(
+        &mut self,
+        py: Python<'_>,
+        timeout_seconds: f64,
+        force: bool,
+    ) -> PyResult<&'static str> {
+        let Some(cell) = self.detach_cell(force, "close_blocking()")? else {
+            return Ok(TeardownOutcome::NoEngine.token());
+        };
+        // The cell holds one reference, this handle another; anything
+        // above that is another live handle (or an operation still in
+        // flight on another thread), and teardown genuinely cannot
+        // complete here. Read it BEFORE giving up our own claim.
+        let sole_owner = cell.runtime.holders() <= 2 && Arc::strong_count(&cell) == 1;
+        // Give up this handle's claim first, so the cell's release is
+        // the single hand-off the wait below is watching for.
+        self.runtime.retire(Box::new(self.backend.clone()));
+        let timeout = teardown_timeout(timeout_seconds);
+        let outcome = py.detach(move || {
+            crate::engine::teardown::retire_payload(Box::new(cell));
+            if !sole_owner {
+                TeardownOutcome::Deferred
+            } else if crate::engine::teardown::wait_quiesced(timeout) {
+                TeardownOutcome::Drained
+            } else {
+                TeardownOutcome::TimedOut
+            }
+        });
+        Ok(outcome.token())
     }
 
     /// v1.6.8 — `True` once `close()` has run on this engine (or any
@@ -25731,6 +26021,15 @@ impl PyEngine {
         &self,
         py: Python<'py>,
     ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        // v24.3.0 (CIRISPersist#572) — these two accessors are the
+        // only PyEngine methods that reach the runtime WITHOUT an
+        // `ensure_usable()` gate, and handing a runtime out of a
+        // closed engine was always wrong: the consumer's `spawn`
+        // lands on a runtime that is winding down and its task never
+        // runs (the #320 transport deadlock, one layer over). Since
+        // `close_blocking()` now retires this handle's claim
+        // outright, fail fast with `EngineClosed` instead.
+        self.ensure_usable()?;
         let handle: tokio::runtime::Handle = self.runtime.handle().clone();
         pyo3::types::PyCapsule::new_with_value(py, handle, c"ciris_persist::runtime_handle")
             .map_err(|e| PyErr::new::<LensQueryError, _>(format!("runtime_handle_capsule: {e}")))
@@ -25831,8 +26130,10 @@ impl PyEngine {
         // deadlock — a GC'd executor capsule frees the boxed runtime handle,
         // so edge's `spawn` lands the task on a torn-down runtime and it never
         // runs (the bring-up's `run_async` recv then blocks forever).
+        // v24.3.0 (CIRISPersist#572) — see `runtime_handle_capsule`.
+        self.ensure_usable()?;
         cached_capsule(&self.executor_capsule_cache, py, || {
-            crate::ffi::executor_capsule::build_capsule_with_destructor(py, self.runtime.clone())
+            crate::ffi::executor_capsule::build_capsule_with_destructor(py, self.runtime.arc())
                 .map_err(|e| PyErr::new::<LensQueryError, _>(format!("executor_capsule: {e}")))
         })
     }
@@ -26871,7 +27172,11 @@ where
     B: crate::store::Backend + Send + Sync + 'static,
 {
     backend: Arc<B>,
-    runtime: Arc<Runtime>,
+    /// v24.3.0 (CIRISPersist#572) — a [`SharedRuntime`], not a bare
+    /// `Arc<Runtime>`: this short-lived helper is one more place the
+    /// last reference could land, and every such place has to be
+    /// GIL-safe to drop.
+    runtime: SharedRuntime,
 }
 
 impl<B> crate::verify::PublicKeyDirectory for TraceKeyDirectory<B>
@@ -28667,7 +28972,7 @@ mod tests {
     fn install_test_sqlite_cell() -> Arc<SqliteBackend> {
         use crate::store::Backend;
 
-        let runtime = Arc::new(Runtime::new().expect("tokio runtime"));
+        let runtime = SharedRuntime::new(Runtime::new().expect("tokio runtime"));
         let sq = runtime.block_on(async {
             let sq = SqliteBackend::open_in_memory()
                 .await
@@ -28816,7 +29121,7 @@ mod tests {
             return;
         };
 
-        let runtime = Arc::new(Runtime::new().expect("tokio runtime"));
+        let runtime = SharedRuntime::new(Runtime::new().expect("tokio runtime"));
         let pg = runtime.block_on(async {
             let pg = PostgresBackend::connect(&dsn)
                 .await
@@ -28903,7 +29208,7 @@ mod tests {
     #[cfg(feature = "sqlite")]
     fn build_cell_for_cohab_test() -> (Arc<EngineCell>, Arc<SqliteBackend>) {
         use crate::store::Backend;
-        let runtime = Arc::new(Runtime::new().expect("tokio runtime"));
+        let runtime = SharedRuntime::new(Runtime::new().expect("tokio runtime"));
         let sq = runtime.block_on(async {
             let sq = SqliteBackend::open_in_memory()
                 .await
@@ -29492,6 +29797,419 @@ mod tests {
         assert_eq!(report.rows_evicted, 0);
         clear_singleton_slot();
     }
+
+    // ── v24.3.0 (CIRISPersist#572) — teardown-race witnesses ────────
+    //
+    // These are the RED-first repro for the native-level wedge behind
+    // CIRISAgent#956. They are deliberately *mechanism* tests: they
+    // hold the real GIL on one OS thread and probe for it from
+    // another, which is exactly what pytest-timeout's timer thread
+    // does when it fails to fire.
+
+    /// How long the forcing-function blocking task stays in flight.
+    /// Long enough that "did the GIL move?" is unambiguous, short
+    /// enough that the suite doesn't notice.
+    #[cfg(test)]
+    const WEDGE_HOLD: std::time::Duration = std::time::Duration::from_millis(1200);
+
+    /// Start a tokio runtime with ONE `spawn_blocking` task that has
+    /// **provably begun** and will not finish for [`WEDGE_HOLD`].
+    ///
+    /// The "has begun" handshake is what makes the repro deterministic
+    /// rather than probabilistic: `Runtime::drop` waits only for
+    /// blocking tasks that already started executing, so a test that
+    /// merely *queues* one races the blocking pool's dispatch. We
+    /// block on the start signal, so by the time this returns the
+    /// runtime is guaranteed to be un-droppable-without-waiting.
+    #[cfg(test)]
+    fn runtime_with_blocking_task_in_flight() -> Runtime {
+        let rt = Runtime::new().expect("tokio runtime");
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        rt.spawn_blocking(move || {
+            let _ = started_tx.send(());
+            // Stands in for a real in-flight sqlite `spawn_blocking`
+            // op (the SQLite backend runs every statement on the
+            // blocking pool) or a pool checkout that has not returned.
+            std::thread::sleep(WEDGE_HOLD);
+        });
+        started_rx.recv().expect("blocking task must start");
+        rt
+    }
+
+    /// Spawn an OS thread that models pytest-timeout's timer thread:
+    /// it wants the GIL, and reports the [`Instant`](std::time::Instant)
+    /// at which it actually got it.
+    ///
+    /// **MUST be called from inside a `Python::attach` scope** — the
+    /// whole point is that the probe finds the GIL already taken and
+    /// parks. Arming it on a free GIL measures nothing (the probe
+    /// attaches in microseconds and the test is vacuous).
+    #[cfg(test)]
+    fn arm_gil_probe() -> std::sync::mpsc::Receiver<std::time::Instant> {
+        let (tx, rx) = std::sync::mpsc::channel::<std::time::Instant>();
+        std::thread::spawn(move || {
+            Python::attach(|_py| {
+                let _ = tx.send(std::time::Instant::now());
+            });
+        });
+        // Give the probe thread time to reach the GIL acquire and park
+        // there. We are holding the GIL, so it cannot get past this.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        rx
+    }
+
+    /// v24.3.0 (CIRISPersist#572) — **the defect, isolated.**
+    ///
+    /// Dropping a bare `tokio::runtime::Runtime` while the GIL is held
+    /// blocks the dropping thread until every already-started
+    /// `spawn_blocking` task finishes, and because the GIL is held the
+    /// whole interpreter goes with it — no other thread can run
+    /// Python, so pytest-timeout's thread-method timer never fires and
+    /// the worker presents as wedged rather than failed.
+    ///
+    /// This test asserts the BAD behaviour on purpose: it is the
+    /// mechanism witness that
+    /// `pyengine_drop_under_the_gil_is_bounded` (below) is actually
+    /// fixing something. If tokio ever makes `Runtime::drop`
+    /// non-blocking this test fails loudly and #572's fix can be
+    /// re-evaluated — that is the intent.
+    #[test]
+    #[serial_test::serial(gil_teardown)]
+    fn bare_runtime_drop_under_the_gil_wedges_the_interpreter() {
+        Python::initialize();
+        let rt = runtime_with_blocking_task_in_flight();
+
+        let (held, t0, probe) = Python::attach(|_py| {
+            let probe = arm_gil_probe();
+            let t0 = std::time::Instant::now();
+            // This is `Py_DECREF(engine)` in production: the last
+            // `Arc<Runtime>` reference dying inside CPython's dealloc,
+            // with the GIL held by definition.
+            drop(rt);
+            // The probe cannot have run yet — we still hold the GIL.
+            assert!(
+                probe.try_recv().is_err(),
+                "probe attached while we still held the GIL"
+            );
+            (t0.elapsed(), t0, probe)
+        });
+
+        assert!(
+            held >= WEDGE_HOLD.mul_f64(0.7),
+            "bare Runtime::drop should have blocked for the in-flight \
+             blocking task; it returned after {held:?}"
+        );
+        let acquired = probe
+            .recv()
+            .expect("probe thread must eventually attach")
+            .duration_since(t0);
+        assert!(
+            acquired >= WEDGE_HOLD.mul_f64(0.7),
+            "the GIL probe should have been starved for the whole \
+             teardown; it attached {acquired:?} after teardown began"
+        );
+    }
+
+    /// The upper bound a teardown step is allowed to hold the GIL for.
+    /// Generous (a thread spawn is ~50µs); the failure mode we care
+    /// about is *seconds*, so this discriminates cleanly.
+    #[cfg(test)]
+    const GIL_BOUND: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// Install a cell, then hand back a lone `PyEngine` handle that
+    /// owns the LAST reference to the cell's runtime — the exact
+    /// post-`reset_engine()` state a pytest fixture is in when it
+    /// still holds a Python `Engine` object: the slot is cleared, the
+    /// cell is gone, and the final teardown is waiting for the GC.
+    ///
+    /// The returned runtime has one `spawn_blocking` task provably
+    /// in flight, so the teardown has something real to wait for.
+    /// Also returns a `Weak` to the backend, so a test can observe
+    /// WHEN the connection handle is actually freed relative to the
+    /// runtime's shutdown.
+    #[cfg(feature = "sqlite")]
+    #[cfg(test)]
+    fn lone_handle_over_a_busy_runtime() -> (PyEngine, std::sync::Weak<SqliteBackend>) {
+        clear_singleton_slot();
+        let sq = install_test_sqlite_cell();
+        let weak = Arc::downgrade(&sq);
+        let cell = engine_slot().as_ref().expect("cell installed").clone();
+        let handle = PyEngine::from_cell(&cell);
+
+        arm_blocking_task(&cell.runtime);
+
+        // `reset_engine()`-equivalent: slot cleared + cell dropped,
+        // one Python handle still alive.
+        clear_singleton_slot();
+        drop(cell);
+        drop(sq);
+        (handle, weak)
+    }
+
+    /// Put one `spawn_blocking` task on `runtime` and return only once
+    /// it has provably started — see
+    /// [`runtime_with_blocking_task_in_flight`] for why the handshake
+    /// is what makes these tests deterministic.
+    #[cfg(test)]
+    fn arm_blocking_task(runtime: &SharedRuntime) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        runtime.spawn_blocking(move || {
+            let _ = started_tx.send(());
+            // Shaped exactly like a real in-flight SQLite write: that
+            // backend runs every statement on the blocking pool.
+            std::thread::sleep(WEDGE_HOLD);
+        });
+        started_rx.recv().expect("blocking task must start");
+    }
+
+    /// v24.3.0 (CIRISPersist#572) — **the fix, at the production
+    /// path.** Dropping the last `Engine` handle is what CPython does
+    /// inside `Py_DECREF` during a `gc.collect()`, with the GIL held.
+    /// It must return promptly and must not starve any other thread of
+    /// the interpreter, even with backend I/O still in flight.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[serial_test::serial(engine_singleton, gil_teardown)]
+    fn pyengine_drop_under_the_gil_is_bounded() {
+        Python::initialize();
+        let (handle, _weak) = lone_handle_over_a_busy_runtime();
+
+        let (held, t0, probe) = Python::attach(|_py| {
+            let probe = arm_gil_probe();
+            let t0 = std::time::Instant::now();
+            drop(handle);
+            (t0.elapsed(), t0, probe)
+        });
+
+        assert!(
+            held < GIL_BOUND,
+            "dropping the last Engine handle held the GIL for {held:?} \
+             — teardown must never block while the GIL is held (#572)"
+        );
+        let acquired = probe
+            .recv()
+            .expect("probe thread must attach")
+            .duration_since(t0);
+        assert!(
+            acquired < GIL_BOUND,
+            "the GIL probe was starved for {acquired:?} by an Engine \
+             teardown (#572)"
+        );
+
+        // The teardown is deferred, not skipped: it really does finish,
+        // and it finishes only once the in-flight blocking task is done.
+        assert!(
+            crate::engine::teardown::wait_quiesced(WEDGE_HOLD * 4),
+            "the retired runtime never finished winding down"
+        );
+    }
+
+    /// v24.3.0 (CIRISPersist#572) — **the SIGBUS half.** The backend
+    /// connection handle must not be freed until the runtime has
+    /// finished winding down: a `spawn_blocking` task that is still
+    /// executing is still holding that connection, and pulling the
+    /// SQLite handle out from under it is the "Bus error" the
+    /// downstream fixture comment blames on "pending async I/O racing
+    /// the teardown".
+    ///
+    /// Asserts the ordering directly: mid-teardown the backend is
+    /// still alive, and it is gone once teardown completes.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[serial_test::serial(engine_singleton, gil_teardown)]
+    fn teardown_frees_the_backend_only_after_the_runtime() {
+        Python::initialize();
+        let (handle, weak) = lone_handle_over_a_busy_runtime();
+        assert!(weak.upgrade().is_some(), "backend alive before teardown");
+
+        Python::attach(|_py| drop(handle));
+
+        // We are back with microseconds to spare while the teardown
+        // thread is still inside tokio's shutdown — the keepalive is
+        // what is holding the connection open right now.
+        assert!(
+            weak.upgrade().is_some(),
+            "backend was freed while the runtime was still winding down \
+             — that is the #572 use-after-free"
+        );
+        assert!(crate::engine::teardown::wait_quiesced(WEDGE_HOLD * 4));
+        assert!(
+            weak.upgrade().is_none(),
+            "backend must be released once teardown completes"
+        );
+    }
+
+    /// v24.3.0 (CIRISPersist#572) — `reset_engine()` reports which of
+    /// the two situations it is in, instead of returning promptly and
+    /// leaving the caller to guess (and then sleep).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[serial_test::serial(engine_singleton, gil_teardown)]
+    fn reset_engine_reports_deferred_then_drains() {
+        Python::initialize();
+        clear_singleton_slot();
+        let sq = install_test_sqlite_cell();
+        let cell = engine_slot().as_ref().expect("cell installed").clone();
+        let handle = PyEngine::from_cell(&cell);
+        arm_blocking_task(&cell.runtime);
+        drop(cell);
+        drop(sq);
+
+        // A live Python `Engine` object still holds the runtime, so
+        // the teardown provably cannot complete here. Saying "drained"
+        // would be the lie that the 200 ms sleep was papering over.
+        let outcome = Python::attach(|py| reset_engine(py, 1.0));
+        assert_eq!(outcome, "deferred");
+
+        // Dropping the last handle is what completes it — GIL-safely.
+        Python::attach(|_py| drop(handle));
+        assert_eq!(
+            Python::attach(|py| engine_teardown_wait(py, 5.0)),
+            "drained"
+        );
+        assert_eq!(engine_teardowns_in_flight(), 0);
+    }
+
+    /// v24.3.0 (CIRISPersist#572) — with no handle outstanding,
+    /// `reset_engine()` owns the last reference and the wait is a real
+    /// one: it returns `"drained"` only after the in-flight blocking
+    /// task has finished, and it does that with the GIL detached.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[serial_test::serial(engine_singleton, gil_teardown)]
+    fn reset_engine_drains_when_it_owns_the_last_reference() {
+        Python::initialize();
+        clear_singleton_slot();
+        let sq = install_test_sqlite_cell();
+        let cell = engine_slot().as_ref().expect("cell installed").clone();
+        arm_blocking_task(&cell.runtime);
+        drop(cell);
+        drop(sq);
+
+        let (outcome, elapsed, probe, t0) = Python::attach(|py| {
+            let probe = arm_gil_probe();
+            let t0 = std::time::Instant::now();
+            let outcome = reset_engine(py, 10.0);
+            (outcome, t0.elapsed(), probe, t0)
+        });
+        assert_eq!(outcome, "drained");
+        assert!(
+            elapsed >= WEDGE_HOLD.mul_f64(0.5),
+            "the wait must actually wait for the in-flight task; it \
+             returned after {elapsed:?}"
+        );
+        // …and it waited with the GIL RELEASED. This is the property
+        // that distinguishes a bounded drain from the #572 wedge: a
+        // second thread ran Python throughout.
+        let acquired = probe
+            .recv()
+            .expect("probe thread must attach")
+            .duration_since(t0);
+        assert!(
+            acquired < GIL_BOUND,
+            "reset_engine held the GIL for {acquired:?} while draining"
+        );
+        assert_eq!(engine_teardowns_in_flight(), 0);
+    }
+
+    /// v24.3.0 (CIRISPersist#572) — `Engine.close_blocking()`: the
+    /// single-call door the downstream fixture asked for. It gives up
+    /// the calling handle's own claim, which is what lets a
+    /// single-handle process report `"drained"` rather than
+    /// `"deferred"`.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[serial_test::serial(engine_singleton, gil_teardown)]
+    fn close_blocking_drains_the_single_handle_case() {
+        Python::initialize();
+        clear_singleton_slot();
+        let sq = install_test_sqlite_cell();
+        let cell = engine_slot().as_ref().expect("cell installed").clone();
+        let mut handle = PyEngine::from_cell(&cell);
+        arm_blocking_task(&cell.runtime);
+        drop(cell);
+        drop(sq);
+
+        let outcome = Python::attach(|py| handle.close_blocking(py, 10.0, false))
+            .expect("close_blocking must not raise");
+        assert_eq!(outcome, "drained");
+        assert_eq!(engine_teardowns_in_flight(), 0);
+        // The handle is closed, so nothing can reach the retired
+        // runtime — every method checks `ensure_usable()` first,
+        // including the two capsule accessors that hand the runtime
+        // itself to a co-resident consumer.
+        assert!(handle.ensure_usable().is_err());
+        Python::attach(|py| {
+            assert!(
+                handle.runtime_handle_capsule_py(py).is_err(),
+                "a retired handle must refuse to hand out its runtime"
+            );
+            assert!(
+                handle.executor_capsule_py(py).is_err(),
+                "a retired handle must refuse to hand out its executor"
+            );
+        });
+        // A second call is a clean no-op, not a double-retire.
+        assert_eq!(
+            Python::attach(|py| handle.close_blocking(py, 1.0, false))
+                .expect("idempotent close_blocking"),
+            "no_engine"
+        );
+    }
+
+    /// v24.3.0 (CIRISPersist#572) — `close()` kept every bit of its
+    /// pre-#572 contract while the drop moved off the GIL: it clears
+    /// the process slot, flips `is_closed`, is idempotent, and leaves
+    /// the singleton free for a fresh construction. The teardown logic
+    /// now lives in the shared `detach_cell` helper, so this pins the
+    /// behaviour that refactor had to preserve.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    #[serial_test::serial(engine_singleton, gil_teardown)]
+    fn close_still_clears_the_slot_and_stays_idempotent() {
+        Python::initialize();
+        clear_singleton_slot();
+        let sq = install_test_sqlite_cell();
+        let cell = engine_slot().as_ref().expect("cell installed").clone();
+        let handle = PyEngine::from_cell(&cell);
+        drop(cell);
+        drop(sq);
+
+        assert!(!handle.is_closed());
+        Python::attach(|py| handle.close(py, false)).expect("close");
+        assert!(handle.is_closed());
+        assert!(engine_slot().is_none(), "close() must clear the slot");
+        // Idempotent — a second close finds nothing and does nothing.
+        Python::attach(|py| handle.close(py, false)).expect("second close");
+        assert!(engine_slot().is_none());
+
+        // The slot is free for a fresh engine straight away.
+        let sq2 = install_test_sqlite_cell();
+        assert!(engine_slot().is_some());
+        drop(sq2);
+        clear_singleton_slot();
+
+        Python::attach(|_py| drop(handle));
+        assert!(crate::engine::teardown::wait_quiesced(WEDGE_HOLD * 4));
+    }
+
+    /// v24.3.0 (CIRISPersist#572) — a zero/negative/NaN timeout means
+    /// "don't wait", never "wait forever". An unbounded wait is not a
+    /// configuration this surface offers.
+    #[test]
+    fn teardown_timeout_never_unbounded() {
+        assert_eq!(teardown_timeout(0.0), std::time::Duration::ZERO);
+        assert_eq!(teardown_timeout(-5.0), std::time::Duration::ZERO);
+        assert_eq!(teardown_timeout(f64::NAN), std::time::Duration::ZERO);
+        assert_eq!(
+            teardown_timeout(f64::INFINITY),
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(
+            teardown_timeout(2.5),
+            std::time::Duration::from_secs_f64(2.5)
+        );
+    }
 }
 
 /// v0.5.3 (CIRISPersist#27) — typed Python exception that PyO3's
@@ -29623,9 +30341,38 @@ fn encode_secret_claim_result(
 /// the deterministic teardown door for consumer test suites, and for
 /// the in-process cohabitation epic (CIRISPersist#85), that
 /// `close()`-needing-a-handle cannot provide.
+///
+/// # v24.3.0 (CIRISPersist#572) — bounded, and it tells you the truth
+///
+/// Through v24.2.0 this dropped the cell inline. That was already
+/// GIL-detached (good) but **unbounded** (bad), and — the part that
+/// actually bit — it only tore anything down when the cell held the
+/// last reference. A fixture that still holds a Python `Engine` object
+/// left the real teardown to the next `gc.collect()`, which runs the
+/// blocking runtime shutdown inside `Py_DECREF` **with the GIL held**.
+/// That is the wedge in CIRISAgent#956: `reset_engine()` returned
+/// promptly, the worker died in the GC pass afterwards, and the
+/// fixture's `time.sleep(0.2)` was a guess at how long it would take.
+///
+/// Now: the release happens on a teardown thread, the wait is bounded,
+/// and the return value distinguishes the two cases so the fixture can
+/// stop guessing. Returns one of `"drained"`, `"deferred"`,
+/// `"timed_out"`, `"no_engine"` — see
+/// [`PyEngine::close_blocking`] for what each means. Pass
+/// `timeout_seconds=0` for the old fire-and-forget behaviour.
+///
+/// The recommended fixture teardown is:
+///
+/// ```python
+/// reset_engine()          # -> "deferred" while an Engine object lives
+/// del engine; gc.collect()  # last handle dies; GIL is never blocked
+/// engine_teardown_wait()  # -> "drained"; replaces time.sleep(0.2)
+/// ```
 #[pyfunction]
-fn reset_engine(py: Python<'_>) {
-    py.detach(|| {
+#[pyo3(signature = (timeout_seconds=DEFAULT_TEARDOWN_TIMEOUT_SECS))]
+fn reset_engine(py: Python<'_>, timeout_seconds: f64) -> &'static str {
+    let timeout = teardown_timeout(timeout_seconds);
+    py.detach(move || {
         // Take the cell out under the slot lock — set the slot to
         // `None` and flip `closed` so a racing handle sees the
         // shutdown — then release the lock before the teardown drop.
@@ -29637,11 +30384,68 @@ fn reset_engine(py: Python<'_>) {
             }
             slot.take()
         };
-        // Drop outside the lock: if this is the last `Arc<EngineCell>`
-        // (the orphan / clean-teardown case), the runtime + pools tear
-        // down here. Blocking is fine — Python thread, GIL released.
-        drop(taken);
-    });
+        let Some(cell) = taken else {
+            return TeardownOutcome::NoEngine.token();
+        };
+        // Can this release actually complete the teardown? Only if
+        // nothing else holds the runtime (no live `Engine` handle, no
+        // operation in flight on another thread) and nothing else
+        // holds the cell.
+        let sole_owner = cell.runtime.holders() == 1 && Arc::strong_count(&cell) == 1;
+        // Release outside the slot lock and off this thread: even with
+        // the GIL detached, a blocking drop under the slot lock would
+        // stall every concurrent `Engine(...)` constructor.
+        crate::engine::teardown::retire_payload(Box::new(cell));
+        if !sole_owner {
+            TeardownOutcome::Deferred.token()
+        } else if crate::engine::teardown::wait_quiesced(timeout) {
+            TeardownOutcome::Drained.token()
+        } else {
+            TeardownOutcome::TimedOut.token()
+        }
+    })
+}
+
+/// v24.3.0 (CIRISPersist#572) — block, with a bound, until every
+/// engine teardown handed off in this process has finished.
+///
+/// This is the replacement for the `time.sleep(0.2)` that consumer
+/// test fixtures use to "let the Rust tokio runtime wind down"
+/// (CIRISAgent `tests/fixtures/database.py`). A sleep narrows the race
+/// and demonstrably still loses it; this waits for the actual event.
+///
+/// Call it after the last `Engine` handle is gone — typically
+/// `reset_engine(); del engine; gc.collect(); engine_teardown_wait()`.
+/// Returns `"drained"` (everything wound down) or `"timed_out"` (still
+/// winding down; it continues on its own thread and the caller is not
+/// blocked further). Never raises, and never waits with the GIL held.
+///
+/// A `"timed_out"` here is a genuine finding: something in the backend
+/// is refusing to finish. Surfacing it as a value is the whole point —
+/// the pre-#572 behaviour was to surface it as a hung process.
+#[pyfunction]
+#[pyo3(signature = (timeout_seconds=DEFAULT_TEARDOWN_TIMEOUT_SECS))]
+fn engine_teardown_wait(py: Python<'_>, timeout_seconds: f64) -> &'static str {
+    let timeout = teardown_timeout(timeout_seconds);
+    py.detach(move || {
+        if crate::engine::teardown::wait_quiesced(timeout) {
+            TeardownOutcome::Drained.token()
+        } else {
+            TeardownOutcome::TimedOut.token()
+        }
+    })
+}
+
+/// v24.3.0 (CIRISPersist#572) — how many engine teardowns are still
+/// winding down. `0` means the process is quiesced.
+///
+/// Diagnostic counterpart to [`engine_teardown_wait`]: it lets a test
+/// assert "teardown completed" without a wait, and lets a hung-shutdown
+/// investigation tell "nothing was ever handed off" from "the hand-off
+/// never finished".
+#[pyfunction]
+fn engine_teardowns_in_flight() -> usize {
+    crate::engine::teardown::in_flight()
 }
 
 impl EngineCell {
@@ -30060,6 +30864,13 @@ pub fn register(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // reset; the deterministic teardown door for consumer test
     // suites and the cohabitation epic.
     m.add_function(pyo3::wrap_pyfunction!(reset_engine, m)?)?;
+    // v24.3.0 (CIRISPersist#572) — bounded teardown observation. These
+    // are what a consumer fixture uses instead of sleeping and hoping:
+    // `engine_teardown_wait` blocks (GIL detached, with a bound) until
+    // the runtime + pools have actually wound down, and
+    // `engine_teardowns_in_flight` says whether anything still is.
+    m.add_function(pyo3::wrap_pyfunction!(engine_teardown_wait, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(engine_teardowns_in_flight, m)?)?;
     // v21.7.0 (CIRISPersist#519 / CIRISConformance#83) — the manifest-driven
     // field-conformance surface: a shared harness drives the real wheel
     // against the fields persist is tagged to own in the shared table.

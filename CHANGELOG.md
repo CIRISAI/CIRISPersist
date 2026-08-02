@@ -5,6 +5,236 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [24.3.0] — 2026-08-02 — #572 / #574 / #575: the wedge, the brake, and the budget
+
+Three issues, three agents, one cut. Each was verified in an isolated worktree against `main`
+plus only its own changes, then certified together by the integrator — the shared-checkout
+collision that produced that discipline is written up under *Process* at the end.
+
+### #572 — teardown that cannot hold the GIL while it waits
+
+`tokio::runtime::Runtime::drop` blocks until every already-STARTED `spawn_blocking` task
+finishes: no timeout, no cancellation. The last `Arc<Runtime>` reference was always released
+inside CPython's `Py_DECREF`, **and CPython holds the GIL across a whole deallocation** — so the
+wait did not stall a thread, it stalled the interpreter. pytest-timeout's thread-method timer
+never got the GIL, and the worker presented as a hang with zero Rust-side error. Root cause of
+the remaining CIRISAgent#956 flake.
+
+Three GIL boundaries released that last reference: `PyEngine`'s compiler-generated drop (the
+load-bearing one — it runs in the `gc.collect()` a fixture performs after `reset_engine()`,
+which is why `reset_engine` looked innocent: it never tore anything down while a Python `Engine`
+was alive), `EngineCell`'s drop inside `Engine.close()`, and `persist_drop` — a PyCapsule
+destructor, GIL-held by definition. Plus a fourth defect, the SIGBUS half: `EngineCell` and
+`PyEngine` both declared `backend` BEFORE `runtime`, and Rust drops fields in declaration order,
+so the SQLite connection could be freed while blocking tasks still held it.
+
+**The fix**: nothing that can block is ever dropped on a thread that might hold the GIL. The
+payload moves to a dedicated OS thread — created by us, never touching Python, provably
+GIL-free — and is dropped there. The caller pays `Arc::try_unwrap` + `thread::spawn`,
+microseconds, no lock held. The only blocking call, `wait_quiesced`, is reachable exclusively
+from inside `py.detach(...)`, is always bounded, and returns on expiry rather than continuing to
+wait; `teardown_timeout` clamps NaN/negative/zero to ZERO and infinity to one hour, so an
+unbounded wait is not a configuration this surface offers. `SharedRuntime` puts it on the type
+rather than in review: it replaces every bare `Arc<Runtime>` on the FFI, `Deref` keeps ~400
+`runtime.block_on(...)` call sites unchanged, and `Drop` hands off only when that holder owns the
+last reference.
+
+Deterministic repro, proven red before green: with `Drop for PyEngine` neutered,
+`pyengine_drop_under_the_gil_is_bounded` fails at **1.10 s of held GIL**; with the fix, under
+250 ms. (The first version of the probe armed itself before taking the GIL and was vacuous —
+it attached in 150 µs. Fixed, and worth recording: a GIL probe outside `Python::attach` measures
+nothing.)
+
+**One true leak, deliberate and loud**: if `thread::Builder::spawn` fails — thread/FD exhaustion,
+i.e. the process is already in trouble — the runtime's workers and a keepalive `Box` leak,
+bounded at one per failed teardown and reclaimed at process exit, `tracing::error!`-logged. At
+that moment we may hold the GIL, and blocking is the one thing we must not do: leaking a
+connection pool is survivable and observable; wedging the interpreter is neither.
+
+Backends differ materially. **SQLite** is the only one putting DB work on tokio's blocking pool
+(12 `spawn_blocking` sites; rusqlite is synchronous) — the sole source of an unbounded shutdown
+wait and the only backend whose connection could be freed under a live task. **Postgres** drops
+async tasks without waiting; its exposure was ordering only. **Memory** has no tokio coupling at
+all. No backend needed a `Drop` impl: the fix is that the runtime finishes winding down before
+any backend is released.
+
+New surface: `Engine.close_blocking(timeout_seconds, force)`, `reset_engine(timeout_seconds)`,
+`engine_teardown_wait(timeout_seconds)`, `engine_teardowns_in_flight()`, returning
+`drained` / `deferred` / `timed_out` / `no_engine`. `reset_engine()` now reports `deferred`
+instead of returning promptly and leaving teardown to the next GC pass — which is precisely how
+the wedge was reached. The fixture recipe that replaces a `time.sleep(0.2)` guess:
+`reset_engine(); del engine; gc.collect(); engine_teardown_wait()`.
+
+### #575 — a slot was a budget, and identity was free
+
+`PeerWriteQuota` existed, worked, and led the check chain — the issue verified that before
+filing, and said so. The gaps were specific: **864k rows/day/peer**, a counter that **reset on
+restart** (so an attacker who can cause a restart gets a fresh budget), and a **4096 batch cap
+that made a Sybil an amplifier**.
+
+The refusal now names WHICH budget refused and in which regime — `PeerQuotaRefusal` with a
+stable `as_str` token (`peer_burst`, `peer_sustained`, `untracked_tail_burst`, `node_burst`,
+`reserved_burst`, …), and `check_write` takes the ROW rather than the key because the budget a
+write is charged against is a pure function of the row.
+
+**The reason reaches the wire, not just the quota's API.** `Error::RateLimited` carries
+`reason: PeerQuotaRefusal`, the `#[error(...)]` display names it, and the type is re-exported at
+`federation::` so a public error variant does not force consumers to name a path into
+`replication::admission` — the `register::KeyRefusalReason` precedent from #565. A bare
+`federation_rate_limited` sends an operator hunting the wrong control at exactly the moment they
+need the right one; that gap is now closed on both refusal surfaces.
+
+### #574 — reverse quorum, the commons' brake
+
+### The gap, stated precisely
+
+Consent protects the private plane structurally — no signed directed grant, no delivery. The
+**commons** (federation-scoped, publicly readable rows) gets nothing from it, because in the commons
+everyone has already consented to look. A community's only two available responses to a row it
+considered harmful were **one member acting unilaterally** (fast, illegitimate) or **assembling an
+approve-first quorum** (legitimate, and it lands after the harm).
+
+`consensus_protocol`'s six forms are ALL approve-to-act:
+
+```
+founder_only | unanimous | majority | quorum:{m}/{n} | weighted:{rubric} | custom:{id}
+```
+
+There was no objection, veto, or dissent form anywhere in the vocabulary — a grep for those terms
+across `src/federation/` returned only `optimization_veto_passed`, an unrelated trace-summary field.
+
+**A correction to #574's second claim.** The issue says "no engine reads it". It is read, in four
+places — `family_charter_threshold` (v24.0.0's trust-root charter threshold, a real m-of-n count),
+`genesis::bundle::verify_bundle_quorum`, `verify_membership_quorum` (the #249 Cut G3 membership-change
+gate), and `community_authority_set` (as a binary `founder_only`-vs-open switch). What is genuinely
+absent is narrower and sharper: **no reader anywhere counts a threshold over a community's
+`consensus_protocol` for a COMMONS ACTION.** Every existing reader governs the *group* — its charter,
+its roster, its genesis. None polices what the group publishes.
+
+### `reverse_quorum:{m}/{n}:{window_secs}`
+
+Act-unless-objected. The action lands on arrival; `m` distinct current members objecting inside the
+window reverse it. `federation::reverse_quorum` owns the parse, the two admission doors, and the fold.
+
+**The asymmetry is the design** — the repo's recorded accord-ops invariant (*m-of-n OR reverse quorum,
+never 1-of-N capability-grant*) in its reverse-quorum form:
+
+| side | threshold |
+|---|---|
+| raise an objection | `OBJECTION_THRESHOLD` = **1**, every roster, no count and no co-signature |
+| reverse the action | the declared `m`, **capped** at the live roster — never raised |
+| dismiss someone else's objection | the declared `m`, **floored at a strict majority** — never lowered |
+| retract your OWN objection | **1** — your own signature |
+
+One rule, two directions: the protective side is never made harder than declared; the undo side is
+never made easier than a strict majority. On a 5-member `reverse_quorum:2/5` commons that is 2 to pull
+the brake and 3 to lift it — and the two signatures that *would* have reversed the action are not
+enough to dismiss a single objection.
+
+The last row is the reading of "1-of-N to protect" that keeps the doctrine coherent rather than
+holing it: a member may retract their **own** objection with their own signature, because that takes
+nothing away from anyone else and a captured key can retract only what that same key raised. Both
+prices come from one function (`dismissal_required`), read by the admission door **and** the
+read-time re-derivation, so a stored dismissal means the same thing when it is read as when it was
+admitted. (It is also the only retraction path available: the ordinary `withdraws` grammar names a
+KEY, not a specific attestation, so it cannot single out one objection among several against the
+same actor.)
+
+### Markers, not commands
+
+An objection is a **`scores` attestation**, deliberately not a `withdraws`. A `withdraws` compels: the
+substrate acts on it at admission and the target is revoked. A `scores` row on `objection:raised:v1`
+asserts — durable, signed, attributable, and replicating on the ordinary attestation plane because it
+*is* an ordinary attestation. Nothing mutates on its arrival. So the marker travels (it does not die
+with the objector's node) and a peer partitioned through the whole window still counts it when it
+finally lands.
+
+### Evidence, not verdict
+
+`resolve_reverse_quorum` returns a `ReverseQuorumFold` — count, threshold, roster size, window bounds,
+and the **ids of the objections it counted**. Persist never deletes, tombstones, or rewrites the
+objected-to row. `ReverseQuorumStanding::Reversed` is a derived state in exactly the sense
+`ConsentState::Revoked` is: a pure function of held rows, recomputed at read time, converging on every
+node without coordination. The fold is `(action, objections, dismissals, roster, policy, now)` and
+nothing else — evaluated at read time rather than advanced at write time, precisely so a node that was
+partitioned during the window converges when the rows arrive.
+
+Roster drift is handled the way the charter plane handles it: the window is pinned to the **action's**
+`asserted_at`, and the roster and thresholds are re-derived at **read** time. A dismissal admitted
+against a 5-member roster stops clearing a grown roster's strict majority, and the protection it
+lifted comes back on its own — fail-safe, and witnessed.
+
+### Typed refusals (#565 style)
+
+`ObjectionRefusalReason` — closed, eleven variants, snake_case serde tokens identical to `as_str()`,
+no `Other` catch-all. A quorum-short dismissal refuses with `dismissal_quorum_short` **and** a
+`DismissalQuorum { counted, required, roster_size }`, so the caller learns how far short they were.
+
+One of the eleven exists because of a class this repo keeps rediscovering: `not_filed_against_actor`.
+Objections are found through the objected-to action's author, so a row filed against any other key
+would be stored, durable, signed — and never counted by anything. Admitted-but-inert is the failure
+mode that looks most like success, so it is a refusal.
+
+### Storage
+
+No new table, no new trait method, no `FederationDirectory` change. The whole plane composes existing
+reads (`lookup_group` / `active_members` / `list_attestations_for` / `get_attestation` /
+`put_attestation`), which is what makes the objection replicate for free.
+
+**V116 (both backends)** widens the `federation_communities.consensus_protocol` CHECK to admit the new
+form. The vocabulary turned out to be closed in **three** places, not the one the issue named: the
+Rust shape gate, the sqlite table CHECK, and the postgres regex CHECK. The Rust gate alone passed and
+sqlite raised a constraint violation on the first real `put_community`. Nothing is removed; the six
+existing forms remain admissible with identical meaning. `federation_families.consensus_protocol`
+carries no CHECK, so there was deliberately nothing to widen there.
+
+The sqlite side is a table rebuild (no `DROP CONSTRAINT` in SQLite), and the suite structurally
+cannot cover it: every test database runs its migrations before any row exists, so the
+`INSERT…SELECT` never sees data in CI. It was driven by hand against a populated post-V115 schema —
+row preserved byte-for-byte across all eleven columns, PRIMARY KEY intact, legacy forms still
+admissible, malformed `reverse_quorum:` strings still refused. A rebuild that dropped rows would
+have passed CI green.
+
+`consensus_protocol::is_canonical_form` now routes the new prefix through `ReverseQuorumPolicy::parse`
+— one parse door, so the shape gate can never admit a string the fold cannot read. The
+forward-threshold readers are unaffected and read the new form **fail-secure as unanimity**: a
+`reverse_quorum:2/9` brake must never be mistaken for a 2-of-9 charter quorum, and that is pinned by
+test.
+
+### Shared predicate
+
+`count_distinct_roster_scrubs` was **lifted out of** `trust_root::family_quorum_over` rather than
+copied, so the v24.0.0 charter plane and this m-of-n undo door run the same body. "A distinct verified
+co-signature" means one thing in this repo; a mutation of that function fails the trust-root witnesses
+and the reverse-quorum witness together.
+
+### Witnesses
+
+`reverse_quorum::test_support::exercise_reverse_quorum`, one body run by **memory / sqlite / postgres**:
+a single member's objection admitted and visible; a non-member's refused naming the branch; a
+quorum-short dismissal refused naming the shortfall and writing nothing; a non-member co-signature
+buying no quorum; an objection filed against the wrong key refused rather than stored-and-inert; a
+quorum-met dismissal lifting the objection; a member who helped lift the brake
+still able to pull it; two of five reversing the action *below* a strict majority; the objected-to row
+untouched throughout; the markers replicated verbatim to a peer that folds them to the same standing;
+a grown roster invalidating a dismissal and restoring the protection; an unadopted cohort refused
+`not_governed` rather than silently defaulted; and a member retracting their own objection with one
+signature on a roster of nine while everyone else's stands.
+
+Six mutations were run against the finished harness. Two initially survived — flooring the protective
+side at a strict majority, and skipping the read-time dismissal re-verify — and the witness was
+strengthened until all six fail. The 3-member roster the witness started with could not see the first
+of those, because at three the declared `m` and a strict majority coincide.
+
+### Follow-ups
+
+- **CC ratification:** the `objection:{state}` family (`objection:raised:v1` / `objection:dismissed:v1`)
+  is not in the vendored CC 1.0-rc2 registry. Unregistered dimensions resolve `ProducerSteward`, so the
+  plane works today; the ask is to make the authority explicit — CC §3.1.9.2, owning component `node`,
+  reserved rule **cohort-member-only**, which is the gate `record_objection` already enforces.
+- **PyO3 surface:** the plane is reachable from Rust (`federation::reverse_quorum::*` over any
+  `FederationDirectory`); no Python binding yet.
+
 ## [24.2.0] — 2026-07-31 — #565/#564: a refusal that names its branch, and an object that names its dependents
 
 Two asks, one shape: **a verdict without its evidence sends the reader to the wrong layer.** #565 is

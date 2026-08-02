@@ -2113,7 +2113,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             // any threshold > 0. It answers "you are writing too fast",
             // never "that key exists" — strictly less leaky than the gate
             // it precedes. Per-backend-instance state.
-            self.peer_write_quota.check(&row.attesting_key_id)?;
+            // v24.3.0 (CIRISPersist#575) — takes the ROW now, not the key:
+            // the budget a write is charged against is a pure function of
+            // the row (see `PeerWriteQuota::classify`), and that predicate
+            // lives in the quota so the three backends cannot hold three
+            // opinions of it.
+            self.peer_write_quota.check_write(&row)?;
 
             // v3.4.0 (CIRISPersist#123) — trust-threshold gate. The
             // cheapest reject that consults state AND the one that leaks
@@ -15495,6 +15500,22 @@ mod tests {
         crate::federation::load_bearing::test_support::exercise_load_bearing_predicate(
             &backend,
             "memory-lb",
+        )
+        .await;
+    }
+
+    /// v24.3.0 (CIRISPersist#574) — the MEMORY leg of the shared reverse-quorum
+    /// witness. The whole plane composes trait methods over
+    /// `&dyn FederationDirectory` (no new table, no migration), so memory is
+    /// not a bonus leg here — it is the backend where an untested divergence
+    /// hides, seven times over v21.11–17.1.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn reverse_quorum_parity_memory_574() {
+        let backend = MemoryBackend::new();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
+            &backend,
+            "memory-rq",
         )
         .await;
     }

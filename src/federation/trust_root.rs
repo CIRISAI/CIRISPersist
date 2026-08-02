@@ -619,24 +619,19 @@ where
     };
     let required = family_charter_threshold(family, roster.len());
 
-    let mut counted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for scrub in row.scrubs() {
-        if counted.contains(&scrub.scrub_key_id) || !roster.contains(&scrub.scrub_key_id) {
-            continue;
-        }
-        if super::verify_envelope_hybrid_signature(
-            directory,
-            &scrub.scrub_key_id,
-            &row.attestation_envelope,
-            &scrub.scrub_signature_classical,
-            scrub.scrub_signature_pqc.as_deref(),
-        )
-        .await
-        .is_ok()
-        {
-            counted.insert(scrub.scrub_key_id);
-        }
-    }
+    // v24.3.0 (CIRISPersist#574) — the count itself lives in
+    // [`super::reverse_quorum::count_distinct_roster_scrubs`]. It was lifted
+    // out of this function so the charter plane and the commons' m-of-n undo
+    // door run the SAME body: "a distinct verified co-signature" must mean one
+    // thing in this repo, and two copies of it is the two-lists-that-disagree
+    // class (rule #9 — one predicate, one implementation).
+    let counted = super::reverse_quorum::count_distinct_roster_scrubs(
+        directory,
+        &row.attestation_envelope,
+        &row.scrubs(),
+        &roster,
+    )
+    .await;
     Ok(CharterQuorum {
         distinct_holders: counted.len(),
         required,

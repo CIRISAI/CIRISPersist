@@ -3982,7 +3982,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
             // never "that key exists" — strictly less leaky than the gate
             // it precedes, so the v3.4.0 information-leak boundary is
             // preserved rather than moved. Per-backend-instance state.
-            self.peer_write_quota.check(&row.attesting_key_id)?;
+            // v24.3.0 (CIRISPersist#575) — takes the ROW now, not the key:
+            // the budget a write is charged against is a pure function of
+            // the row (see `PeerWriteQuota::classify`), and that predicate
+            // lives in the quota so the three backends cannot hold three
+            // opinions of it.
+            self.peer_write_quota.check_write(&row)?;
 
             // v3.4.0 (CIRISPersist#123) — trust-threshold gate. Free at
             // the default threshold 0 (short-circuits without dispatching
@@ -20354,6 +20359,24 @@ mod tests {
             &backend, &suffix,
         )
         .await;
+    }
+
+    /// v24.3.0 (CIRISPersist#574) — the postgres leg of the shared
+    /// reverse-quorum witness (see `sqlite::tests::
+    /// reverse_quorum_parity_sqlite_574` and the memory leg); all three call
+    /// the SAME `reverse_quorum::test_support::exercise_reverse_quorum` body.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn reverse_quorum_parity_postgres_574() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(&backend, &suffix)
+            .await;
     }
 
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the postgres leg of the shared

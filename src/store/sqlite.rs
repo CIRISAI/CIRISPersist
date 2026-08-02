@@ -3365,7 +3365,13 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             // never "that key exists" — strictly less leaky than the gate
             // it precedes, so the v3.4.0 information-leak boundary is
             // preserved rather than moved. Per-backend-instance state.
-            self.peer_write_quota.check(&row.attesting_key_id)?;
+            //
+            // v24.3.0 (CIRISPersist#575) — takes the ROW now, not the key:
+            // the budget a write is charged against is a pure function of
+            // the row (see `PeerWriteQuota::classify`), and that predicate
+            // lives in the quota so the three backends cannot hold three
+            // opinions of it.
+            self.peer_write_quota.check_write(&row)?;
 
             // v3.4.0 (CIRISPersist#123) — trust-threshold gate. Trust is
             // the cheapest reject that consults state AND the one that
@@ -20083,6 +20089,22 @@ mod tests {
         crate::federation::load_bearing::test_support::exercise_load_bearing_predicate(
             &backend,
             "sqlite-lb",
+        )
+        .await;
+    }
+
+    /// v24.3.0 (CIRISPersist#574) — the sqlite leg of the shared reverse-quorum
+    /// witness (see the postgres + memory legs); all three call the SAME
+    /// `reverse_quorum::test_support::exercise_reverse_quorum` body, so no
+    /// backend can silently disagree about who may raise the brake alone and
+    /// what it costs to lift it.
+    #[tokio::test]
+    async fn reverse_quorum_parity_sqlite_574() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
+            &backend,
+            "sqlite-rq",
         )
         .await;
     }

@@ -1899,17 +1899,43 @@ pub mod consensus_protocol {
     pub const WEIGHTED_PREFIX: &str = "weighted:";
     /// Prefix for `custom:{family_specific_id}` shape.
     pub const CUSTOM_PREFIX: &str = "custom:";
+    /// v24.3.0 (CIRISPersist#574) — prefix for the **objection** form,
+    /// `reverse_quorum:{m}/{n}:{window_secs}` (e.g.
+    /// `reverse_quorum:2/5:86400`).
+    ///
+    /// Every other member of this vocabulary is **approve-to-act**: it names
+    /// who must sign BEFORE an action lands. This one is **act-unless-objected**
+    /// — the action lands on arrival and `m` of `n` current members may object
+    /// within `window_secs` to reverse it. That is the only shape that resolves
+    /// speed against legitimacy in the commons, where consent gives no
+    /// protection because everyone has already consented to look.
+    ///
+    /// Parsed and folded by [`crate::federation::reverse_quorum`]; the
+    /// forward-threshold readers of this vocabulary
+    /// ([`family_charter_threshold`](crate::federation::trust_root) and
+    /// verify's membership-change gate) read it FAIL-SECURE as unanimity,
+    /// because a reverse threshold is not a forward one and must never be
+    /// mistaken for a smaller number.
+    pub const REVERSE_QUORUM_PREFIX: &str = "reverse_quorum:";
 
     /// True iff `s` parses into one of the canonical-kinds shapes:
     /// the three bare forms (`founder_only`, `unanimous`, `majority`),
-    /// or one of the three prefixed forms with a non-empty tail
+    /// one of the three prefixed forms with a non-empty tail
     /// (`quorum:{m}/{n}` where m, n parse as integers; `weighted:rubric`;
-    /// `custom:id`). Returns false for empty strings, unprefixed
-    /// names not in the bare set, and `quorum:` strings whose tail
-    /// is not `{int}/{int}`.
+    /// `custom:id`), or the v24.3.0 objection form
+    /// (`reverse_quorum:{m}/{n}:{window_secs}`). Returns false for empty
+    /// strings, unprefixed names not in the bare set, and `quorum:` strings
+    /// whose tail is not `{int}/{int}`.
     pub fn is_canonical_form(s: &str) -> bool {
         if matches!(s, FOUNDER_ONLY | UNANIMOUS | MAJORITY) {
             return true;
+        }
+        if s.starts_with(REVERSE_QUORUM_PREFIX) {
+            // One parse door: the shape gate and the fold read the SAME
+            // parser, so a string this function admits is a string
+            // `reverse_quorum` can actually evaluate (rule #9 — one
+            // predicate, one implementation).
+            return crate::federation::reverse_quorum::ReverseQuorumPolicy::parse(s).is_some();
         }
         if let Some(tail) = s.strip_prefix(QUORUM_PREFIX) {
             // tail must be `{m}/{n}` with both as non-negative ints,

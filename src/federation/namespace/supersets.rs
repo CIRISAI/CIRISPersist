@@ -875,17 +875,109 @@ mod tests {
             let full = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), path);
             let src = std::fs::read_to_string(&full)
                 .unwrap_or_else(|e| panic!("evidence path {path} unreadable: {e}"));
-            // Resolve the bare symbol (strip any `Type::` prefix) as a word.
+            // v24.3.0 (CIRISPersist#577) — resolve against a DEFINITION, not a
+            // substring. The old check was `src.contains(sym)`, which matches
+            // anywhere in the file INCLUDING DOC COMMENTS — so a symbol that had
+            // been deleted still "resolved" as long as some `[\`Self::foo\`]`
+            // link still named it. That is exactly how
+            // `Engine::promote_attestation_with_transforms` sat in the registry
+            // as evidence for CLM-nsproc-restrictions-op-strip-field-trace while
+            // no such function existed anywhere in the crate: three doc comments
+            // kept it alive. A check that cannot distinguish a definition from a
+            // mention is not evidence, it is a spell-checker.
             let bare = sym.rsplit("::").next().unwrap_or(sym);
+            let defines = |needle: &str| {
+                src.lines()
+                    .map(str::trim_start)
+                    // Definitions only: doc comments (`///`), inner docs (`//!`)
+                    // and line comments cannot satisfy an evidence pointer.
+                    .filter(|l| {
+                        !l.starts_with("///") && !l.starts_with("//!") && !l.starts_with("//")
+                    })
+                    .any(|l| {
+                        [
+                            format!("fn {needle}"),
+                            format!("struct {needle}"),
+                            format!("enum {needle}"),
+                            format!("trait {needle}"),
+                            format!("type {needle}"),
+                            format!("const {needle}"),
+                            format!("static {needle}"),
+                            format!("mod {needle}"),
+                            // enum VARIANTS and struct fields: `Name {`, `Name(`,
+                            // `Name,` or `Name =` at the head of a trimmed line.
+                            format!("{needle} {{"),
+                            format!("{needle}("),
+                            format!("{needle},"),
+                            format!("{needle} ="),
+                        ]
+                        .iter()
+                        .any(|pat| l.contains(pat.as_str()))
+                    })
+            };
             assert!(
-                src.contains(sym) || src.contains(bare),
-                "evidence pointer {ps} does not resolve in {path} — a cited processor was \
-                 renamed/removed (re-materialize evidence/cc_impl.tsv)"
+                defines(sym) || defines(bare),
+                "evidence pointer {ps} has no DEFINITION in {path} — a cited processor was \
+                 renamed or removed (a doc-comment mention does not count; \
+                 re-materialize evidence/cc_impl.tsv)"
             );
         }
         assert!(
             rows >= 40,
             "expected persist's ~43 evidence rows, got {rows}"
+        );
+    }
+
+    /// v24.3.0 (CIRISPersist#577) — **the evidence registry cannot go stale
+    /// again.** Every `CIRISPersist` row must pin THIS crate's current version.
+    ///
+    /// # Why this test exists
+    ///
+    /// The file's own header says *"every `path#symbol` MUST resolve at the
+    /// pinned crate version"* — and every row sat at `ciris-persist@21.10.0`
+    /// while the crate shipped `24.2.0`. **Thirteen releases of drift**, in a
+    /// column nothing checked. The version was hand-maintained data claiming to
+    /// be a guarantee: the same two-representations-of-one-fact class this
+    /// repo keeps closing (#541 preserve-set≡verified-set, #532 axis fusion).
+    ///
+    /// The fix is not diligence, it is derivation: the pin is asserted against
+    /// `CARGO_PKG_VERSION`, so a release bump fails this test until the file is
+    /// re-stamped. Evergreen by construction — the only way to ship a stale
+    /// registry is to delete this test, which is a visible act.
+    ///
+    /// Cross-repo rows (`ciris-verify-core/...`) are deliberately exempt: they
+    /// pin the version of the crate that DEFINES the symbol, which is not ours
+    /// to stamp, and they resolve at their own build.
+    #[test]
+    fn evidence_cc_impl_rows_pin_the_current_crate_version() {
+        let tsv = include_str!("../../../evidence/cc_impl.tsv");
+        let expected = format!("ciris-persist@{}", env!("CARGO_PKG_VERSION"));
+        let mut checked = 0usize;
+        for line in tsv.lines() {
+            if line.starts_with('#') || line.starts_with("decimal_id") || line.trim().is_empty() {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() < 5 || cols[2] != "CIRISPersist" {
+                continue;
+            }
+            // Only rows citing OUR sources carry OUR version.
+            if !cols[3].starts_with("src/") {
+                continue;
+            }
+            assert_eq!(
+                cols[4], expected,
+                "evidence row {} pins {} but this crate is {expected} — re-stamp \
+                 evidence/cc_impl.tsv's crate@version column for every src/ row \
+                 (the registry promises its pointers resolve AT the pinned version)",
+                cols[0], cols[4]
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 40,
+            "expected ~43 version-pinned persist rows, checked {checked} — a parse \
+             change would silently empty this test"
         );
     }
 

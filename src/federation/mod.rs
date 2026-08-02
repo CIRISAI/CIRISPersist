@@ -150,6 +150,9 @@ pub mod register;
 pub mod replication;
 pub mod replication_policy;
 pub mod rooting;
+// v24.3.0 (CIRISPersist#574) — reverse quorum: the commons' brake.
+// 1-of-N to protect, m-of-n to undo.
+pub mod reverse_quorum;
 pub mod schema_resolver;
 pub mod scores;
 pub mod trust_root;
@@ -280,6 +283,12 @@ pub use replication::{
     PressureTier, ReplicationConfig, StatvfsFreeBytes, StubFreeBytes, SweepReport, TrustScoring,
     TrustScoringError, TrustTier, DEFAULT_SWEEP_BATCH, MIN_POLL_INTERVAL, MIN_SWEEP_INTERVAL,
 };
+// v24.3.0 (CIRISPersist#575) — re-exported at `federation::` because
+// `Error::RateLimited` carries it: a public error variant must not force every
+// consumer to name a path into `replication::admission`, and the error surface
+// must not be welded to an internal module layout. Definition stays beside the
+// logic that produces it (the `register::KeyRefusalReason` precedent from #565).
+pub use replication::admission::{PeerQuotaRefusal, PeerQuotaRefused};
 pub use rooting::{
     provenance_chain, root_binding, ProvenanceChain, ProvenanceLink, RootingRejection,
     RootingVerdict, MAX_PROVENANCE_DEPTH,
@@ -4523,13 +4532,22 @@ pub enum Error {
     #[error("scrub-signature verification failed: {0}")]
     SignatureInvalid(String),
 
-    /// Per-source-IP rate limit exceeded (default 60 writes/min/IP)
-    /// or per-primitive write quota exceeded (default 10 keys/day).
-    /// Caller should retry after `retry_after_seconds`.
-    #[error("rate limited: retry after {retry_after_seconds}s")]
+    /// A write quota refused this row. `reason` names WHICH budget —
+    /// per-peer, per-node, reserved-family, or the untracked tail — and in
+    /// which regime (burst vs sustained); see [`PeerQuotaRefusal`].
+    ///
+    /// v24.3.0 (CIRISPersist#575) — the reason reaches the WIRE, not just the
+    /// quota's own API. A bare `federation_rate_limited` sends an operator
+    /// looking for the wrong control at exactly the moment they need the right
+    /// one; that is the gap #565 closed for key refusals, and this closes it
+    /// for rate limits. Consumers key on [`PeerQuotaRefusal::as_str`] — a
+    /// program constant, never this message text.
+    #[error("rate limited ({reason}): retry after {retry_after_seconds}s")]
     RateLimited {
         /// Seconds the caller should wait before retrying.
         retry_after_seconds: u64,
+        /// WHICH quota refused, and in which regime.
+        reason: PeerQuotaRefusal,
     },
 
     /// Row would conflict with an existing row whose content differs.
