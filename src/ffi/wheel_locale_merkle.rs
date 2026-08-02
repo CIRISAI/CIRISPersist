@@ -33,7 +33,17 @@ use pyo3::prelude::*;
 pub fn locale_leaf_hash_hex(leaf_json: &str) -> PyResult<String> {
     let leaf: LocaleLeaf = serde_json::from_str(leaf_json)
         .map_err(|e| PyValueError::new_err(format!("LocaleLeaf decode: {e}")))?;
-    Ok(hex::encode(leaf.leaf_hash()))
+    // v25.0.0 (CIRISPersist#577 / CIRISVerify v11.0.0) — `leaf_hash` became
+    // FALLIBLE. CC 3.1.2.1 v2 moves the preimage from line-oriented
+    // `key=value\n` concatenation to `sha256(JCS({…}))`, and JCS
+    // canonicalization can fail — so the error is surfaced to the caller
+    // rather than unwrapped. v1's form carried attacker-influenceable free
+    // text with no newline guard (verify's AV-50), which is the injection
+    // class v2 closes; a panic here would trade that for a different one.
+    let hash = leaf
+        .leaf_hash()
+        .map_err(|e| PyValueError::new_err(format!("LocaleLeaf leaf_hash: {e}")))?;
+    Ok(hex::encode(hash))
 }
 
 /// Verify a `LocaleInclusionProof` against the expected per-target
@@ -78,7 +88,15 @@ pub fn locale_merkle_root_hex(leaves_json: &str) -> PyResult<String> {
             "leaves array must be non-empty (§3.2.1.2 forbids empty trees)",
         ));
     }
-    let leaf_hashes: Vec<[u8; 32]> = leaves.iter().map(|l| l.leaf_hash()).collect();
+    // v25.0.0 (CIRISPersist#577) — collect into a Result so ONE malformed
+    // leaf fails the whole root rather than silently contributing a wrong
+    // hash: a Merkle root computed over a partially-canonicalized set is a
+    // root nobody can reproduce.
+    let leaf_hashes: Vec<[u8; 32]> = leaves
+        .iter()
+        .map(ciris_verify_core::locale_merkle::LocaleLeaf::leaf_hash)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| PyValueError::new_err(format!("LocaleLeaf leaf_hash: {e}")))?;
     let root = ciris_verify_core::locale_merkle::merkle_root(&leaf_hashes)
         .map_err(|e| PyRuntimeError::new_err(format!("merkle_root: {e}")))?;
     Ok(hex::encode(root))
@@ -113,7 +131,7 @@ mod tests {
     #[test]
     fn leaf_hash_matches_native_computation() {
         let leaf = sample_leaf();
-        let want = hex::encode(leaf.leaf_hash());
+        let want = hex::encode(leaf.leaf_hash().expect("v2 canonicalization"));
         let leaf_json = serde_json::to_string(&leaf).unwrap();
         let got = locale_leaf_hash_hex(&leaf_json).unwrap();
         assert_eq!(got, want);
@@ -125,7 +143,10 @@ mod tests {
         let leaves_json = format!("[{}]", serde_json::to_string(&leaf).unwrap());
         let root_hex = locale_merkle_root_hex(&leaves_json).unwrap();
         // RFC 6962: single-leaf tree's root IS the leaf hash.
-        assert_eq!(root_hex, hex::encode(leaf.leaf_hash()));
+        assert_eq!(
+            root_hex,
+            hex::encode(leaf.leaf_hash().expect("v2 canonicalization"))
+        );
     }
 
     // PyErr message content isn't introspectable from `cargo test`

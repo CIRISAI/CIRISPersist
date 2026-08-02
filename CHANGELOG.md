@@ -5,6 +5,56 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [25.0.0] — 2026-08-02 — #577: the verify pin was a mesh-wide ceiling
+
+**MAJOR because the dependency graph moves under every consumer**, not because persist's own
+surface changed. Behaviour is unchanged: identical test counts before and after the re-pin.
+
+### The ceiling
+
+persist v24.3.0 and edge v15.9.1 both pinned `ciris-verify` at `tag = "v10.6.3"` while upstream
+was at v11.0.0. **A cargo git tag is part of the source id, not a semver range** — so a
+downstream that moves its own pin does not upgrade verify, it *forks* it: two `ciris_keyring`,
+two `ciris_verify_core`, and every type crossing the substrate seam (`HardwareType`,
+`PlatformAttestation`, `ThresholdMember`, `SignedCegObject`) becomes two incompatible types.
+CIRISServer measured it by trying: **19 lib errors + 24 lib-test errors**, no consumer-side
+escape.
+
+So no consumer in the mesh could adopt any verify past v10.6.3 until persist moved. All seven
+pins (`ciris-verify-core` / `ciris-crypto` / `ciris-keyring`, across the workspace and the three
+mobile target blocks) flip **in one commit** — they move together or the graph splits exactly as
+measured.
+
+### The v2 wire break, and where it actually landed
+
+CIRISVerify v11.0.0 moves CC 3.1.2.1 canonical bytes from line-oriented `key=value\n`
+concatenation to `sha256(JCS({…}))`, closing a delimiter-injection class (verify's AV-50): the
+v1 preimage carried attacker-influenceable free text with **no newline guard**, so a crafted
+value could forge field boundaries and make two logically different manifests produce ambiguous
+bytes.
+
+For persist that reached **four call sites in one file**. `LocaleLeaf::leaf_hash` became
+**fallible** — JCS canonicalization can fail where string concatenation could not — so:
+
+- the production single-leaf path surfaces the error to the caller rather than unwrapping.
+  Panicking there would trade an injection hazard for a liveness one;
+- `locale_merkle_root_hex` collects into a `Result`, so **one malformed leaf fails the whole
+  root**. A Merkle root computed over a partially-canonicalized set is a root nobody can
+  reproduce — worse than an error.
+
+`wheel_skill_import.rs` needed no change.
+
+### What consumers inherit
+
+Apple App Attest validation, the authoritative dimension registry (which #569 needs to enumerate
+its 14 trust-signal dimensions rather than counting them by hand), the v10.7.0
+`build_attestation_bundle` that #567/#415 consume, and the v10.8.0 Android chain validation that
+made #568's deferral doc stale.
+
+Certified: sqlite **1587/1587** · test-anchor **1592/1592** · postgres **1916/1916** · clippy
+`-D warnings` clean on `sqlite` and on full features. Identical counts to v24.3.0 — the adoption
+changed no behaviour.
+
 ## [24.3.0] — 2026-08-02 — #572 / #574 / #575: the wedge, the brake, and the budget
 
 Three issues, three agents, one cut. Each was verified in an isolated worktree against `main`
