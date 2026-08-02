@@ -567,7 +567,7 @@ where
 /// FAIL-SECURE: `unanimous` (and any form this function does not recognise)
 /// demands the whole roster rather than a guess, because under-counting a
 /// threshold is the failure mode #557 exists to close.
-fn family_charter_threshold(family: &super::types::Family, roster_size: usize) -> usize {
+pub(crate) fn family_charter_threshold(family: &super::types::Family, roster_size: usize) -> usize {
     let floor = ciris_verify_core::accord_genesis::strict_majority(roster_size);
     let policy = match family.consensus_protocol.as_str() {
         "founder_only" | "majority" => floor,

@@ -77,11 +77,12 @@ pub mod operational;
 /// test the ALLOW path — not just the deny path.
 #[cfg(any(test, feature = "test-anchor"))]
 pub use operational::test_support as accord_test_support;
-// (CIRISPersist#519) — the `ownership:*` ownerless-lock reclaim MECHANISM
-// (CC 3.2 "No permanent ownerless lock (MUST)"). Ships INERT: refuses
-// every reclaim until a `ReclaimPolicy` is injected; CIRISConstitution#43
-// ratifies the abandonment window + reclaim roster/threshold, not this
-// crate. See the module doc for the full mechanism.
+// (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — the `ownership:*`
+// ownerless-lock reclaim CEREMONY: petition → CC 4.3 Wise-Authority quorum
+// finding → gated `withdraws` leaving the node UNOWNED → fresh owner-binding
+// co-signed by the node. Refuses every reclaim until a deployment publishes a
+// WA body; the accord holder roster is explicitly NOT that body. See the
+// module doc for the full ceremony and the single-act wall.
 pub mod ownership_reclaim;
 pub mod perceptual_hash;
 pub mod precedence;
@@ -267,8 +268,9 @@ pub use operational::{
     SignedOrganization, SignedPartnerRecord, SubjectKind,
 };
 pub use ownership_reclaim::{
-    check_ownership_reclaim_admission, ReclaimPolicy, ReclaimQuorum, ReclaimVerdict,
-    OWNERSHIP_FRESHNESS_TARGET_KIND, RECLAIM_WITHDRAWS_ADMISSION_RULE,
+    check_ownership_reclaim_admission, check_post_reclaim_rebinding_admission, ReclaimPolicy,
+    ReclaimRefusal, ReclaimVerdict, WaFinding, WaQuorum, OWNERSHIP_FRESHNESS_TARGET_KIND,
+    RECLAIM_WITHDRAWS_ADMISSION_RULE,
 };
 pub use perceptual_hash::{
     HashDatabaseId, HashMatchError, HashMatchResult, MatcherUnreachablePolicy,
@@ -5183,6 +5185,33 @@ pub enum Error {
         owners: Vec<String>,
     },
 
+    /// v25.x (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — a step of the
+    /// **ownerless-lock reclaim ceremony** was refused, naming WHICH step.
+    ///
+    /// This is the write-path face of
+    /// [`ownership_reclaim::ReclaimVerdict::Refused`]: raised when a
+    /// `withdraws` against a live owner-binding fails the CC 3.2 recovery
+    /// gate, and when a post-reclaim owner-binding arrives without the node's
+    /// own co-signature (ceremony step 4). A bare refusal on a node-seizure
+    /// path is unacceptable — [`ownership_reclaim::ReclaimRefusal`] is the
+    /// stable typed surface, `detail` is diagnostic prose. Stable `kind()`
+    /// token `federation_ownership_reclaim_refused`.
+    #[error(
+        "ownerless-reclaim refused for node {node_key_id:?} against owner-binding \
+         {owner_binding_id:?} at {reason}: {detail}"
+    )]
+    OwnershipReclaimRefused {
+        /// The node whose ownership the ceremony concerns.
+        node_key_id: String,
+        /// The owner-binding `attestation_id` under adjudication (or, for a
+        /// step-4 refusal, the rejected fresh binding).
+        owner_binding_id: String,
+        /// WHICH ceremony step refused.
+        reason: ownership_reclaim::ReclaimRefusal,
+        /// Human-readable diagnostic. Never parsed.
+        detail: String,
+    },
+
     /// v12.7.0 (CIRISPersist#372, CC 3.4.7.1 set-membership) — a
     /// `federation_keys` row carrying the [`types::identity_type::CANONICAL`]
     /// role was REJECTED at admission because it is **not accord-conferred**.
@@ -5622,6 +5651,7 @@ impl Error {
             Error::NodeAgencyForbidden { .. } => "federation_node_agency_forbidden",
             Error::NodeAlreadyOwned { .. } => "federation_node_already_owned",
             Error::AmbiguousNodeOwner { .. } => "federation_ambiguous_node_owner",
+            Error::OwnershipReclaimRefused { .. } => "federation_ownership_reclaim_refused",
             Error::CanonicalRoleNotAccordConferred { .. } => "canonical_role_not_accord_conferred",
             Error::InfraAttestRoleNotAccordConferred { .. } => {
                 "infra_attest_role_not_accord_conferred"

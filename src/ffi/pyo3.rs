@@ -27416,6 +27416,15 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // ValueError (4xx / 409-shaped, like `Conflict`).
         crate::federation::Error::NodeAlreadyOwned { .. }
         | crate::federation::Error::AmbiguousNodeOwner { .. } => PyValueError::new_err(kind),
+        // v25.x (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — a refused
+        // step of the ownerless-reclaim ceremony is caller-side authorization
+        // failure; ValueError (4xx). The stable `kind()` token is the same for
+        // every step — the typed
+        // [`ReclaimRefusal`](crate::federation::ReclaimRefusal) naming WHICH
+        // step rides the message, since this boundary carries one token per
+        // error and widening it per-step would fork the FFI vocabulary on a
+        // path no Python caller drives today.
+        crate::federation::Error::OwnershipReclaimRefused { .. } => PyValueError::new_err(kind),
         // v12.7.0 (CIRISPersist#372, CC 3.4.7.1) — a rejected `canonical`
         // (founding-server) role that is not accord-conferred (self-claimed /
         // non-anchor-scrubbed) is a caller-side authorization failure;

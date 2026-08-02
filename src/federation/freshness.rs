@@ -89,8 +89,7 @@ use serde::{Deserialize, Serialize};
 /// v21.10.0 (CIRISPersist#519 b2) — the touch envelope's `extra` key carrying
 /// the co-signature set for a [`crate::federation::types::SignerForm::NOfMCosigned`]
 /// touch: a JCS array of
-/// [`ciris_verify_core::threshold::ThresholdSignature`] (wire-identical to the
-/// reclaim quorum's `ownership_reclaim::RECLAIM_QUORUM_SIGNATURES_FIELD`), each
+/// [`ciris_verify_core::threshold::ThresholdSignature`], each
 /// over the SAME `JCS(signed_envelope)` the primary attester signed. Rides in
 /// `extra` — CEG-native, not a universal envelope path — so `SelfTouch` /
 /// `WitnessTouch` touches are byte-unchanged.

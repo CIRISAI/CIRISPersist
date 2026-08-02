@@ -1,96 +1,148 @@
-//! (CIRISPersist#519) — the `ownership:*` ownerless-lock **reclaim
-//! MECHANISM** (CC 3.2 "No permanent ownerless lock (MUST)").
+//! (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — the `ownership:*`
+//! ownerless-lock **reclaim CEREMONY**: petition → WA quorum finding →
+//! gated `withdraws` (K becomes **unowned**) → fresh owner-binding
+//! co-signed by K.
 //!
 //! # The gap this closes
 //!
 //! Ownership is a `delegates_to(U → node)` on the owner-binding dimension
 //! ([`super::types::owner_binding::DIMENSION`]).
 //! [`super::admission::check_single_node_owner_admission`] enforces
-//! at-most-one live owner (CC 2.4.1.1): a node already owned rejects a
+//! at-most-one live owner (CC 3.2): a node already owned rejects a
 //! DIFFERENT granter's binding — the incumbent must `withdraws`/`recants`
-//! it, or it must lapse. Symmetrically,
-//! [`super::admission::check_withdraws_admission`]'s CEG §3.2.3 4-rule gate
-//! gives a THIRD PARTY no authority to withdraw a LIVE incumbent's
-//! owner-binding (rule 1 requires `issuer == target.attesting_key_id`).
-//! Put together: if the owner dies or loses custody, the live binding never
-//! withdraws and the node is locked **forever** — no seizure / reclaim /
-//! provably-dead path exists anywhere in this crate. That is CC 3.2's "no
-//! permanent ownerless lock" violated by omission.
+//! it, or it must lapse. So if the owner dies, loses custody, or *front-ran
+//! the legitimate owner*, the live binding never withdraws and the node is
+//! locked **forever**. That is CC 3.2's "no permanent ownerless lock"
+//! violated by omission.
 //!
-//! # The mechanism
+//! # What rc3 ratified (and what v21.8.0 got wrong)
 //!
-//! [`check_ownership_reclaim_admission`] is the sanctioned exception to
-//! rule 1: a THIRD PARTY's `withdraws` against a live owner-binding is
-//! admitted IFF **both**:
+//! v21.8.0 shipped a mechanism whose authority was the **HUMANITY_ACCORD
+//! holder roster** and whose evidence was an m-of-n co-signature carried
+//! *directly on the `withdraws`*. CIRISConstitution rc3 rules otherwise, and
+//! persist committed to implementing whatever CC ratifies:
 //!
-//! 1. **Provably-abandoned (FAIL-SAFE).** The incumbent owner's (and/or the
-//!    owned node's) signed freshness floor
-//!    ([`super::FederationDirectory::lookup_freshness_floor`], v21.6.0
-//!    CIRISPersist#519 item 2a-iii) is **PRESENT and** older than
-//!    `now - abandonment_window`. An ABSENT floor is NOT abandonment —
-//!    absence of a signed floor is absence of evidence, not evidence of
-//!    death. Only a floor that was demonstrably alive and then stopped
-//!    advancing is proof (v21.8.0 activation fix; this is what makes
-//!    activation safe before touch-claim producers exist — every node's
-//!    floor is absent today, so zero nodes are reclaimable). This is the
-//!    manifest's own "HIGHEST
-//!    VALUE" `demanded_by` entry for `ownership:*`
-//!    (`namespace_supersets.json` § `freshness_floor.demanded_by`):
-//!    distinguishing "owner alive but quiet" from "owner provably dead" is
-//!    exactly the missing input this reclaim needs — a stewardship
-//!    covenant made mechanical ("the work belongs to whoever keeps it
-//!    running").
-//! 2. **A VERIFIED m-of-n quorum** over [`ReclaimPolicy::reclaim_quorum`]'s
-//!    roster, real hybrid-signature-verified via
-//!    [`ciris_verify_core::threshold::verify_quorum_policy`] — the SAME
-//!    strict-majority (`2M > N`, no `M==1` escape) primitive
-//!    [`super::admission::verify_accord_family_coscrub`] uses for the
-//!    `canonical` / `infra:attest` / co-steward conferral ceremonies. Reuse,
-//!    not reinvention: a capability grant (reclaiming a node's stewardship
-//!    is exactly that) is m-of-n or reverse-quorum, never a caller-passed
-//!    boolean or a 1-of-N escape hatch — the accord-ops invariant this
-//!    codebase already enforces everywhere else a quorum is declared.
-//!    Authority is re-derived from persist's OWN registered
-//!    `federation_keys` rows (Registry-of-Record), never trusted from the
-//!    caller.
+//! 1. **Authority is the [CC 4.3](https://github.com/CIRISAI/CIRISConstitution)
+//!    Wise-Authority quorum, NOT the accord roster.** `ReclaimPolicy` now
+//!    names a **WA body** ([`ReclaimPolicy::wa_family_key_id`]) and
+//!    [`ReclaimRefusal::AccordRosterIsNotWaAuthority`] refuses, by name, a
+//!    deployment that points the pin back at the accord family.
+//! 2. **The gated `withdraws` MUST carry a `wa_adjudication_ref`**
+//!    ([`field::WA_ADJUDICATION_REF`]) resolving to the quorum finding. A
+//!    direct m-of-n on the `withdraws` carries none and is non-conformant:
+//!    *"The substrate records the finding; it never makes it — quorum
+//!    adjudicates, the substrate admits."*
+//! 3. **Four steps, never collapsed.** Petition (1), finding (2), gated
+//!    `withdraws` after which K is **unowned** (3), fresh owner-binding
+//!    co-signed by K (4). **Reclaim MUST NOT transfer incumbent → claimant
+//!    in one act** — see *the single-act wall* below.
+//! 4. The **180-day** [`ReclaimPolicy::DEFAULT_ABANDONMENT_WINDOW`] remains
+//!    compliant as a deployment value (CC pins a **90-day floor**, and the
+//!    window must be *published* — an unpublished window means no
+//!    abandonment finding is admissible, which is why
+//!    [`ReclaimPolicy::from_deployment_pin`] returns `None` rather than
+//!    guessing).
+//! 5. rc3 answers persist's open question 3 in-text: *"the owner-binding
+//!    attestation itself establishes the initial floor, so a binding is
+//!    never floorless"* — encoded in `initial_freshness_floor`, which
+//!    reads the binding's own `asserted_at` as the floor of last resort
+//!    instead of bolting on a separate floor.
 //!
-//! # Activated with a conservative default (v21.8.0)
+//! # The single-act wall (structural, not merely refused)
 //!
-//! Rather than ship inert, persist ACTIVATES the mechanism with a
-//! conservative default ([`ReclaimPolicy::humanity_accord_default`]) so the
-//! CC 3.2 MUST is satisfied *by mechanism* today: reclaim authority = the
-//! HUMANITY_ACCORD holder quorum (the body that already holds the
-//! kill-switch — the least-arbitrary reclaim authority, roster resolved from
-//! persist's OWN registered accord holders, strict-majority threshold) + a
-//! **180-day** abandonment window. **CIRISConstitution#43 ratifies/refines the
-//! two parameters (the window + the authority)** — persist ships a safe
-//! default, CC sets the ratified values. This is safe to activate ahead of
-//! ratification for two reasons: the abandonment test is fail-safe (an absent
-//! floor is never abandonment, §1 above), so the pre-producer mesh has ZERO
-//! reclaimable nodes; and an empty accord roster yields an unmeetable
-//! threshold ⇒ every reclaim still refused. [`check_ownership_reclaim_admission`]
-//! still accepts `Option<&ReclaimPolicy>` (`None` ⇒ the pre-v21.8.0 inert
-//! behaviour, for a caller that wants it); the chokepoint in
-//! [`super::admission::check_withdraws_admission`] passes the accord default.
+//! CC 3.2: *"Reclaim MUST NOT transfer incumbent → claimant in one act:
+//! passing through the unowned state is what keeps the single-owner
+//! invariant and the anti-landgrab rule intact."* This module makes the
+//! collapse impossible on **three independent levels**, so no single lapse
+//! re-opens it:
 //!
-//! Concretely, a reclaim is refused unless a node has DEMONSTRABLY emitted a
-//! signed freshness floor and then gone dark for 180 days AND a strict
-//! majority of the accord holders co-signs — so ordinary owner-binding
-//! admission (a live or never-touched owner) is unaffected, and the mesh's
-//! behaviour is unchanged for every node that has not been touched-then-dark.
+//! - **Unrepresentable in the type.** [`ReclaimVerdict::Admit`] carries a
+//!   [`WaFinding`] and a [`WaQuorum`] and *has no field that could name a
+//!   successor owner*. There is no value of this type that says "and give it
+//!   to X". The only thing an admitted reclaim can authorize is the
+//!   `withdraws`.
+//! - **Refused on the wire.** A `withdraws` envelope carrying any
+//!   successor-naming field ([`SUCCESSOR_OWNER_FIELDS`]) is refused with
+//!   [`ReclaimRefusal::SingleActTransferAttempted`] *before any authority is
+//!   even considered* — a producer that tries to express the collapse is
+//!   told exactly which rule it broke.
+//! - **Refused by the ownership gate.** Step 4 still runs through
+//!   [`super::admission::check_single_node_owner_admission`], which rejects a
+//!   different granter's binding while ANY live binding remains. The reclaim
+//!   `withdraws` must therefore have already landed and taken the incumbent
+//!   non-live — i.e. K really does pass through the unowned state — before a
+//!   claimant can bind.
+//!
+//! # Authority is re-derived from this node's own verified state (#377)
+//!
+//! Nothing here trusts a caller-supplied roster, threshold, or decision
+//! boolean (a caller-supplied `authorized` bool is a forgeable m-of-n
+//! bypass, and this repo has been bitten by exactly that). The WA quorum is
+//! re-derived at USE:
+//!
+//! - the **roster** is [`FederationDirectory::active_family_members`] of the
+//!   pinned WA body — revocation-folded, this node's own stored state, and
+//!   itself only changeable through the family's own m-of-n
+//!   ([`FederationDirectory::verify_membership_quorum`]);
+//! - the **threshold** is the family's OWN stored `consensus_protocol` read
+//!   through [`family_charter_threshold`](super::trust_root), floored at a
+//!   strict majority and fail-secure (`unanimous`/unrecognised ⇒ the whole
+//!   roster), so a tampered policy string cannot talk the threshold down;
+//! - the **count** is [`count_distinct_roster_scrubs`](super::reverse_quorum),
+//!   the SAME body the charter plane and the commons' undo door use — each
+//!   co-signature re-verified against pubkeys resolved from THIS node's
+//!   directory. One predicate, one implementation.
+//!
+//! CC 4.3's own normative heading is *"The Wise wear the same card"*, so a
+//! counted co-signer must additionally carry
+//! [`identity_type::WISE_AUTHORITY`]
+//! in its registered `identity_type` set. That is a **legibility** filter on
+//! the numerator, never a source of authority: the seat is the family
+//! membership (which a Sybil cannot grant itself), and the denominator stays
+//! the FULL roster — see `wa_quorum_over_body` for why the denominator is
+//! deliberately not shrunk to a live set.
 //!
 //! # What is NOT built here
 //!
-//! - **The abandonment window / reclaim roster / threshold values** —
-//!   CC#43's, not invented here (see above).
-//! - **Producing** the reclaim `withdraws` attestation or the freshness
-//!   touch-claims — edge/agent's job, documented for adoption (mirrors
-//!   [`super::freshness`]'s own "value production is an attestation, not
-//!   built here" scoping).
-//! - **Real `n_of_m_cosigned` freshness escalation** — this module reads
-//!   whatever freshness floor is stored (`self_touch` or otherwise); a
-//!   collusion-resistant multi-signer "death finding" touch needs the wire-
-//!   shape change [`super::freshness`] already documents as a follow-up.
+//! - **WA appointment.** CC 1.16.5 puts appointment, rotation, recusal and
+//!   appeals under the Governance Charter, *"external to this system's
+//!   control"*. Persist is handed a deployment-published family and
+//!   re-derives everything else from its own state.
+//! - **Making the finding.** The substrate records it; the quorum makes it.
+//! - **Producing** the petition / finding / `withdraws` rows — edge/agent's
+//!   job. [`build_reclaim_petition_envelope`],
+//!   [`build_wa_finding_envelope`] and [`build_reclaim_withdraws_envelope`]
+//!   publish the wire shapes so a producer never hand-rolls the JSON.
+//!
+//! # Two decisions CC leaves to the substrate — flagged, not buried
+//!
+//! rc3 pins the ceremony and the authority; it does not pin *how the
+//! substrate is told either one*. Both choices below fail CLOSED by
+//! default — an unpublished pin refuses everything, and an unrecognised
+//! dimension is simply not a finding — so neither can make a seizure
+//! easier than CC allows. Both nonetheless want confirmation from the
+//! ratification chain and byte-agreement from the producer side, because a
+//! wire shape only one repo knows is a shape nobody can use:
+//!
+//! 1. **How the WA body is named.** CC 1.16.5 puts appointment outside the
+//!    wire, so persist takes a deployment-published `family_key_id`
+//!    ([`ReclaimPolicy::WA_FAMILY_ENV`]) and re-derives roster + threshold
+//!    from its own stored family. This is the load-bearing pin: it decides
+//!    whose signatures can take a node.
+//! 2. **What the finding and petition look like.** CC says only *"minted as
+//!    an attestation"*. Persist mints them on [`NAMESPACE_FAMILY`] — a new
+//!    family, because CC 3.4 forecloses the obvious alternative. Ratification
+//!    ask tracked like [`objection:{state}`](super::reverse_quorum::NAMESPACE_FAMILY).
+//!
+//! Note also what the WA seat's strength actually rests on: the family
+//! plane's existing write posture. A REMOTE peer cannot seat itself —
+//! `put_family` is INSERT-only (an existing `family_key_id` collides on the
+//! primary key) and every roster change rides
+//! [`verify_membership_quorum`](FederationDirectory::verify_membership_quorum),
+//! i.e. the body's own m-of-n. The host-local roster APIs
+//! (`put_family_local` / `add_family_member`) are the node operator's own
+//! surface, the same trust boundary the accord family already sits behind.
+//! This module adds no new gate there, and does not pretend to.
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -98,12 +150,8 @@ use super::admission::is_owner_binding_envelope;
 use super::envelope::EnvelopeCore;
 use super::freshness::merge_floor;
 use super::precedence::references_attestation_id_from_envelope;
-use super::types::attestation_type;
+use super::types::{attestation_type, identity_type};
 use super::{Attestation, Error, FederationDirectory};
-use crate::verify::canonical::ceg_produce_canonicalize;
-use ciris_verify_core::threshold::{
-    verify_quorum_policy, QuorumPolicy, Role, ThresholdMember, ThresholdSignature,
-};
 
 /// This module's own consumer convention for the freshness floor's
 /// open-vocab `target_kind` ([`super::types::SignedTouchClaim::target_kind`])
@@ -113,162 +161,610 @@ use ciris_verify_core::threshold::{
 /// to touch under for an `ownership:*` liveness signal.
 pub const OWNERSHIP_FRESHNESS_TARGET_KIND: &str = "ownership_binding";
 
-/// The reclaim `withdraws` envelope's dimension-specific key carrying the
-/// embedded m-of-n co-signature set (a [`Vec<ThresholdSignature>`],
-/// wire-identical to [`ThresholdSignature`]'s own serde shape). Rides in
-/// [`EnvelopeCore::extra`] — CEG-native, not a universal envelope path.
-pub const RECLAIM_QUORUM_SIGNATURES_FIELD: &str = "reclaim_quorum_signatures";
-
 /// The per-row audit value [`super::admission::check_withdraws_admission`]
-/// stamps when the reclaim exception (not one of the 4 ordinary rules)
-/// admits a third-party withdraws — see
-/// [`super::types::Attestation::withdraws_admission_rule`]'s doc for rules
-/// 1-4; this is the reclaim mechanism's rule 5.
+/// stamps when the CC 3.2 recovery ceremony (not one of the 4 ordinary
+/// rules on their own) admits a `withdraws` against a live owner-binding —
+/// see [`super::types::Attestation::withdraws_admission_rule`]'s doc for
+/// rules 1-4; this is the recovery path's rule 5.
+///
+/// It is also how [`check_post_reclaim_rebinding_admission`] learns, from
+/// this node's own stored rows and nothing else, that K has been through a
+/// reclaim and therefore owes K's co-signature on its next binding.
 pub const RECLAIM_WITHDRAWS_ADMISSION_RULE: u8 = 5;
 
-/// A named roster of key_ids that may co-sign a reclaim, plus the
-/// threshold count required to sign off. **CC#43's to specify — no
-/// default exists.** Verified through
-/// [`ciris_verify_core::threshold::verify_quorum_policy`] (the SAME
-/// strict-majority `2M > N` primitive every other m-of-n gate in this
-/// codebase uses — see the module doc): even a misconfigured
-/// (non-strict-majority) `threshold` fails CLOSED at verification time
-/// rather than silently admitting on a weaker rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReclaimQuorum {
-    /// The `federation_keys.key_id`s eligible to co-sign a reclaim. Only
-    /// entries that resolve to a REGISTERED key count toward `N` (mirrors
-    /// [`super::admission::verify_accord_family_coscrub`]'s roster
-    /// resolution — an unresolvable roster member silently doesn't
-    /// count, it is never treated as a caller-supplied trust anchor).
-    pub roster_key_ids: Vec<String>,
-    /// The `M` distinct valid co-signatures required. Combined with the
-    /// LIVE resolved roster size as `N`, this MUST satisfy the federation's
-    /// one quorum rule (`2M > N`) or every reclaim under this policy fails
-    /// closed (never silently downgrades to a weaker rule).
-    pub threshold: usize,
+/// The CC 3.1 namespace family the petition and the two finding dimensions
+/// live under.
+///
+/// **Not yet in the vendored registry** ([`super::namespace::registry`]);
+/// like [`objection:{state}`](super::reverse_quorum::NAMESPACE_FAMILY) a
+/// dimension outside the manifest resolves
+/// [`AuthorityClass::ProducerSteward`](super::namespace::AuthorityClass::ProducerSteward),
+/// so these rows admit today and the ratification ask is about making the
+/// authority EXPLICIT rather than about unblocking the plane.
+///
+/// The finding deliberately does **not** live under `ownership:*`: CC 3.4
+/// reserves that family to the live owner and says the recovery path *"rides
+/// `withdraws` + `wa_adjudication_ref` and never a fresh `ownership:*`
+/// emission"*. A finding minted on `ownership:*` would be a seizure by
+/// attestation, which is the thing being adjudicated.
+pub const NAMESPACE_FAMILY: &str = "wa_adjudication:{finding}";
+
+/// Ceremony **step 1** — the petition naming K and the evidence. A `scores`
+/// row; anyone may file one (that is what a petition IS), and persist never
+/// reads its grounds.
+pub const DIMENSION_PETITION: &str = "wa_adjudication:petition:v1";
+
+/// Ceremony **step 2**, abandonment arm — the CC 4.3 quorum's finding that
+/// the incumbent owner is provably gone. Persist additionally re-checks the
+/// freshness predicate itself (see [`check_ownership_reclaim_admission`]);
+/// the quorum's word and the substrate's own evidence must BOTH hold.
+pub const DIMENSION_FINDING_ABANDONMENT: &str = "wa_adjudication:abandonment:v1";
+
+/// Ceremony **step 2**, seizure arm — the CC 4.3 quorum's finding that a
+/// **live** owner-binding was admitted by front-run or fraud. Deliberately
+/// NOT gated on the abandonment window: rc3 is explicit that the same
+/// recovery path *"also reaches a binding found to be a seizure — a live
+/// wrongful owner-binding … not only a dead one"*, so a front-run is
+/// reversible rather than permanent. The whole weight of this arm rests on
+/// the quorum, which is why the quorum is re-derived and never asserted.
+pub const DIMENSION_FINDING_SEIZURE: &str = "wa_adjudication:seizure:v1";
+
+/// CC 3.2's named recovery-delegation scope: the token a `delegates_to(K →
+/// R)` must carry for `R` to hold rule-(4) standing to file the gated
+/// `withdraws` on K's behalf. *"The key that is still being kept running is
+/// the subject with standing to say its owner is gone."*
+pub const DELEGATION_SCOPE_OWNER_BINDING_RECOVERY: &str = "owner_binding_recovery";
+
+/// Envelope field names shared by the producer side and this gate, so the
+/// two cannot disagree about where a reference lives.
+pub mod field {
+    /// On the gated `withdraws`: the [`attestation_id`] of the CC 4.3 quorum
+    /// finding. The manifest already carries this name on `ownership:*`
+    /// (`namespace_supersets.json` § `wa_adjudication_ref`, typing
+    /// `untyped_extra`) — it rides
+    /// [`EnvelopeCore::extra`](crate::federation::envelope::EnvelopeCore::extra), not a
+    /// universal envelope path.
+    ///
+    /// [`attestation_id`]: crate::federation::types::Attestation::attestation_id
+    pub const WA_ADJUDICATION_REF: &str = "wa_adjudication_ref";
+    /// On the finding: the `attestation_id` of the **petition** (step 1) it
+    /// answers. Required — a finding with no petition is a three-step
+    /// ceremony wearing a four-step name.
+    pub const PETITION_REF: &str = "petition_ref";
+    /// On the petition AND the finding: the `attestation_id` of the
+    /// owner-binding under adjudication. Binds the whole ceremony to ONE
+    /// binding, so a finding cannot be replayed against a different one.
+    pub const TARGET_OWNER_BINDING_ID: &str = "target_owner_binding_id";
+    /// Free-text evidence. Recorded, never interpreted — persist does not
+    /// adjudicate WHY a node is said to be abandoned or seized.
+    pub const GROUNDS: &str = "grounds";
 }
 
-/// The reclaim policy. As of v21.8.0 persist ships an ACTIVATED conservative
-/// DEFAULT ([`ReclaimPolicy::humanity_accord_default`]) rather than staying
-/// inert, so the CC 3.2 "no permanent ownerless lock" MUST is satisfied by
-/// mechanism today; **CIRISConstitution#43 ratifies/refines the two
-/// parameters** (the window and the reclaim authority). A caller wanting the
-/// pre-v21.8.0 INERT behavior still passes `None` to
-/// [`check_ownership_reclaim_admission`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReclaimPolicy {
-    /// An owner (and the node it stewards) whose signed freshness floor was
-    /// PRESENT and has not advanced within this window is provably-abandoned.
-    /// The default is [`Self::DEFAULT_ABANDONMENT_WINDOW`]; CC#43 refines it.
-    pub abandonment_window: Duration,
-    /// The m-of-n roster authorized to co-sign a reclaim. The default is the
-    /// HUMANITY_ACCORD holder quorum (the body that already holds the
-    /// kill-switch — the least-arbitrary reclaim authority); CC#43 refines it.
-    pub reclaim_quorum: ReclaimQuorum,
+/// Envelope keys that would name a successor owner on the gated
+/// `withdraws`, i.e. that would collapse ceremony steps 3 and 4 into one
+/// act. Their mere PRESENCE is refused with
+/// [`ReclaimRefusal::SingleActTransferAttempted`].
+///
+/// Listing the names rather than trusting their absence is the point: the
+/// collapse is the specific thing rc3 forbids, so a producer that reaches
+/// for it gets a refusal that says so instead of silently having the field
+/// ignored. (Ignoring it would be *safe* — persist would never act on it —
+/// but silence here trains producers to keep shipping the shape until some
+/// future reader honours it.)
+pub const SUCCESSOR_OWNER_FIELDS: [&str; 5] = [
+    "successor_owner_key_id",
+    "successor_owner",
+    "claimant_key_id",
+    "new_owner_key_id",
+    "replaces_owner_with",
+];
+
+/// Which CC 4.3 finding a `wa_adjudication_ref` resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaFinding {
+    /// The incumbent owner is provably gone (CC 3.2's abandonment
+    /// predicate). Persist re-checks the freshness floor itself.
+    Abandonment,
+    /// A live owner-binding was admitted by front-run or fraud. The
+    /// freshness predicate deliberately does NOT apply.
+    Seizure,
 }
 
-impl ReclaimPolicy {
-    /// The default abandonment window: **180 days**. A conservative
-    /// pre-ratification value — an owner whose signed freshness floor has not
-    /// advanced in half a year is plausibly gone. CC#43 sets the ratified value.
-    pub const DEFAULT_ABANDONMENT_WINDOW: Duration = Duration::days(180);
+impl WaFinding {
+    /// The finding a `scores` dimension names, or `None` for any other
+    /// dimension.
+    #[must_use]
+    pub fn from_dimension(dimension: &str) -> Option<Self> {
+        match dimension {
+            DIMENSION_FINDING_ABANDONMENT => Some(Self::Abandonment),
+            DIMENSION_FINDING_SEIZURE => Some(Self::Seizure),
+            _ => None,
+        }
+    }
 
-    /// v21.8.0 (CIRISPersist#519 activation) — the shipped conservative
-    /// default: reclaim authority = the HUMANITY_ACCORD holder quorum
-    /// (`roster_key_ids`, resolved by the caller from persist's OWN registered
-    /// accord holders — never caller-supplied), strict-majority threshold, and
-    /// [`Self::DEFAULT_ABANDONMENT_WINDOW`]. Combined with the fail-safe
-    /// abandonment test (an ABSENT floor is never abandonment), this is safe to
-    /// activate before touch-claim producers exist: no node is reclaimable
-    /// until it has demonstrably emitted freshness and then gone dark. CC#43
-    /// ratifies the window + authority.
-    pub fn humanity_accord_default(roster_key_ids: Vec<String>) -> Self {
-        let n = roster_key_ids.len();
-        Self {
-            abandonment_window: Self::DEFAULT_ABANDONMENT_WINDOW,
-            reclaim_quorum: ReclaimQuorum {
-                threshold: n / 2 + 1, // strict majority; verify_quorum_policy re-validates 2M > N
-                roster_key_ids,
-            },
+    /// The dimension this finding is minted on.
+    #[must_use]
+    pub const fn dimension(&self) -> &'static str {
+        match self {
+            Self::Abandonment => DIMENSION_FINDING_ABANDONMENT,
+            Self::Seizure => DIMENSION_FINDING_SEIZURE,
+        }
+    }
+
+    /// The stable program token.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Abandonment => "abandonment",
+            Self::Seizure => "seizure",
         }
     }
 }
 
+impl std::fmt::Display for WaFinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// **WHICH ceremony step refused.**
+///
+/// A bare refusal on a node-seizure path is unacceptable: the operator of a
+/// node someone just tried to take must be able to read, from the refusal
+/// alone, whether the ceremony was mis-built, under-signed, or aimed at the
+/// wrong binding. Same discipline as
+/// [`ObjectionRefusalReason`](super::reverse_quorum::ObjectionRefusalReason)
+/// (#574), [`KeyRefusalReason`](super::register::KeyRefusalReason) (#565)
+/// and [`PeerQuotaRefusal`](super::replication::admission::PeerQuotaRefusal)
+/// (#575).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReclaimRefusal {
+    // ── step 0: the deployment pin ──────────────────────────────────────
+    /// This deployment has published no WA body / abandonment window, so no
+    /// finding is admissible here at all (CC 3.2: *"A deployment MUST
+    /// publish its window; an unpublished window means no abandonment
+    /// finding is admissible there"*). The shipped default — persist does
+    /// not invent an authority.
+    NoDeploymentPolicy,
+    /// The pin names the **HUMANITY_ACCORD family**. rc3 moved reclaim
+    /// authority off the accord roster and onto the CC 4.3 WA quorum; a
+    /// deployment cannot quietly move it back by calling the accord a WA
+    /// body. This is the v21.8.0 non-conformance, named.
+    AccordRosterIsNotWaAuthority,
+    /// The published window is below CC 3.2's **90-day floor** (or
+    /// unparseable). Refused rather than clamped: a deployment that
+    /// published 7 days meant something, and quietly running it at 90 would
+    /// be a window nobody published.
+    AbandonmentWindowBelowFloor,
+    /// The pinned WA `family_key_id` resolves to no family this node holds,
+    /// so there is no roster to re-derive authority from. Fail-closed.
+    WaBodyUnknown,
+    /// The WA body resolves but its revocation-folded active roster is
+    /// empty — an unmeetable threshold, refused explicitly rather than
+    /// through a vacuous `0 >= 0`.
+    WaRosterEmpty,
+
+    // ── step 1: the petition ────────────────────────────────────────────
+    /// The finding carries no [`field::PETITION_REF`] — steps 1 and 2
+    /// collapsed.
+    PetitionMissing,
+    /// The petition ref resolves to nothing this node holds, to a row that
+    /// is not a [`DIMENSION_PETITION`] row, or to a petition against a
+    /// DIFFERENT owner-binding.
+    PetitionUnresolvable,
+
+    // ── step 2: the WA quorum finding ───────────────────────────────────
+    /// The gated `withdraws` carries no [`field::WA_ADJUDICATION_REF`].
+    /// This is the CC 3.2 recovery gate: *"Without this gate a compromised
+    /// node key withdraws its own owner and the single-owner invariant is
+    /// worthless."*
+    WaAdjudicationRefMissing,
+    /// The ref names an `attestation_id` this node does not hold. Authority
+    /// must be resolvable from local verified state, and there is none.
+    WaAdjudicationRefUnresolvable,
+    /// The referenced row exists but is not a CC 4.3 finding — wrong
+    /// `attestation_type` or a dimension outside
+    /// [`DIMENSION_FINDING_ABANDONMENT`] / [`DIMENSION_FINDING_SEIZURE`].
+    NotAWaFinding,
+    /// The finding does not adjudicate THIS binding (its
+    /// [`field::TARGET_OWNER_BINDING_ID`] or its `attested_key_id` names
+    /// something else) — a finding is not a bearer token for every node.
+    FindingNotAgainstThisBinding,
+    /// Fewer distinct, verified, card-carrying WA roster co-signatures than
+    /// the WA body's own threshold demands. The shortfall's numbers ride on
+    /// the accompanying [`WaQuorum`].
+    WaQuorumShort,
+
+    // ── step 3: the gated withdraws ─────────────────────────────────────
+    /// The issuer holds neither CC 2.4.1.1 rule-(2) standing (it IS the
+    /// node K, or a named subject of the binding) nor rule-(4) standing (a
+    /// live `delegates_to(K → issuer)` carrying
+    /// [`DELEGATION_SCOPE_OWNER_BINDING_RECOVERY`]). rc3's recovery path
+    /// rides those two rules and no other.
+    IssuerLacksRecoveryStanding,
+    /// The `withdraws` envelope names a successor owner
+    /// ([`SUCCESSOR_OWNER_FIELDS`]) — an attempt to transfer incumbent →
+    /// claimant in ONE act. Refused before authority is even considered.
+    SingleActTransferAttempted,
+    /// An **abandonment** finding, but the incumbent's freshness floor is
+    /// still inside the window — the owner is quiet, not gone. (A
+    /// **seizure** finding never reaches this test.)
+    NotAbandoned,
+
+    // ── step 4: the fresh owner-binding ─────────────────────────────────
+    /// K has been through a reclaim, and the fresh owner-binding is not
+    /// co-signed by K. CC 3.2 step 4 is *"a fresh owner-binding under the
+    /// genesis rule above, co-signed by K"* — the node's own key is what
+    /// makes a rebinding a claim rather than a landgrab.
+    FreshBindingNotCosignedByNode,
+}
+
+impl ReclaimRefusal {
+    /// The **stable program token** — identical to the serde token, so a
+    /// consumer reading the wire and a consumer holding the typed value key
+    /// on the same constant.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoDeploymentPolicy => "no_deployment_policy",
+            Self::AccordRosterIsNotWaAuthority => "accord_roster_is_not_wa_authority",
+            Self::AbandonmentWindowBelowFloor => "abandonment_window_below_floor",
+            Self::WaBodyUnknown => "wa_body_unknown",
+            Self::WaRosterEmpty => "wa_roster_empty",
+            Self::PetitionMissing => "petition_missing",
+            Self::PetitionUnresolvable => "petition_unresolvable",
+            Self::WaAdjudicationRefMissing => "wa_adjudication_ref_missing",
+            Self::WaAdjudicationRefUnresolvable => "wa_adjudication_ref_unresolvable",
+            Self::NotAWaFinding => "not_a_wa_finding",
+            Self::FindingNotAgainstThisBinding => "finding_not_against_this_binding",
+            Self::WaQuorumShort => "wa_quorum_short",
+            Self::IssuerLacksRecoveryStanding => "issuer_lacks_recovery_standing",
+            Self::SingleActTransferAttempted => "single_act_transfer_attempted",
+            Self::NotAbandoned => "not_abandoned",
+            Self::FreshBindingNotCosignedByNode => "fresh_binding_not_cosigned_by_node",
+        }
+    }
+
+    /// Which of the four CC 3.2 ceremony steps this refusal names (`0` for
+    /// the deployment pin, which precedes the ceremony).
+    #[must_use]
+    pub const fn ceremony_step(&self) -> u8 {
+        match self {
+            Self::NoDeploymentPolicy
+            | Self::AccordRosterIsNotWaAuthority
+            | Self::AbandonmentWindowBelowFloor
+            | Self::WaBodyUnknown
+            | Self::WaRosterEmpty => 0,
+            Self::PetitionMissing | Self::PetitionUnresolvable => 1,
+            Self::WaAdjudicationRefMissing
+            | Self::WaAdjudicationRefUnresolvable
+            | Self::NotAWaFinding
+            | Self::FindingNotAgainstThisBinding
+            | Self::WaQuorumShort => 2,
+            Self::IssuerLacksRecoveryStanding
+            | Self::SingleActTransferAttempted
+            | Self::NotAbandoned => 3,
+            Self::FreshBindingNotCosignedByNode => 4,
+        }
+    }
+
+    /// Every variant, in declaration order — the closed set.
+    pub const ALL: &'static [Self] = &[
+        Self::NoDeploymentPolicy,
+        Self::AccordRosterIsNotWaAuthority,
+        Self::AbandonmentWindowBelowFloor,
+        Self::WaBodyUnknown,
+        Self::WaRosterEmpty,
+        Self::PetitionMissing,
+        Self::PetitionUnresolvable,
+        Self::WaAdjudicationRefMissing,
+        Self::WaAdjudicationRefUnresolvable,
+        Self::NotAWaFinding,
+        Self::FindingNotAgainstThisBinding,
+        Self::WaQuorumShort,
+        Self::IssuerLacksRecoveryStanding,
+        Self::SingleActTransferAttempted,
+        Self::NotAbandoned,
+        Self::FreshBindingNotCosignedByNode,
+    ];
+}
+
+impl std::fmt::Display for ReclaimRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (ceremony step {})",
+            self.as_str(),
+            self.ceremony_step()
+        )
+    }
+}
+
+/// The re-derived WA quorum behind a finding: how many distinct, verified,
+/// card-carrying roster co-signatures were COUNTED, how many the body's own
+/// `consensus_protocol` REQUIRED, and how big the roster is.
+///
+/// Returned on refusal as well as on admission, so an under-signed finding
+/// tells its filer how far short it fell rather than merely that something
+/// said no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WaQuorum {
+    /// Distinct roster members whose co-signature over the finding envelope
+    /// re-verified against pubkeys resolved from THIS node's directory, and
+    /// who carry the `wise_authority` card.
+    pub counted: usize,
+    /// The WA body's own threshold, floored at a strict majority of
+    /// `roster_size`.
+    pub required: usize,
+    /// The revocation-folded active roster size — the denominator, never
+    /// shrunk.
+    pub roster_size: usize,
+}
+
+impl WaQuorum {
+    /// Did the finding meet its body's threshold?
+    #[must_use]
+    pub const fn met(&self) -> bool {
+        self.counted >= self.required && self.required > 0
+    }
+}
+
 /// The outcome of [`check_ownership_reclaim_admission`].
+///
+/// **Note what `Admit` cannot say.** It names the finding and the quorum
+/// that produced it, and nothing else. There is no successor field, no
+/// claimant field, and no constructor that could add one — so a caller
+/// holding an admitted verdict has been authorized to admit a `withdraws`
+/// and *has been handed no way to express who gets the node next*. That is
+/// the single-act wall's first level; see the module doc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReclaimVerdict {
-    /// `reclaim_row` is not a third-party reclaim of a live owner-binding
-    /// at all (wrong attestation_type, no resolvable target, target isn't
-    /// an owner-binding, or the "third party" is actually the incumbent
-    /// owner itself — ordinary self-revocation, rule 1's territory, never
-    /// this mechanism's). A pure no-op: callers should fall through to
-    /// their normal admission logic exactly as if this function did not
-    /// exist.
+    /// `reclaim_row` is not a recovery `withdraws` against a live
+    /// owner-binding at all (wrong `attestation_type`, no resolvable
+    /// target, target isn't an owner-binding, or the "third party" is the
+    /// incumbent owner itself — ordinary self-revocation, rule 1's
+    /// territory, never this mechanism's). A pure no-op: callers fall
+    /// through to their normal admission logic exactly as if this function
+    /// did not exist.
     NotAReclaim,
-    /// The reclaim is ADMITTED: the incumbent is provably-abandoned AND a
-    /// verified m-of-n quorum (per `policy.reclaim_quorum`) co-signed it.
-    Admit,
-    /// The reclaim is refused — including, ALWAYS, when `policy` is
-    /// `None` (the shipped default; see the module doc). `reason` is a
-    /// human-readable diagnostic, not a stable machine token (this
-    /// mechanism is inert in production today; no consumer parses it).
+    /// The ceremony holds: a petitioned, quorum-found, correctly-aimed
+    /// adjudication filed by an issuer with CC rule-(2)/(4) standing.
+    Admit {
+        /// Which finding admitted it.
+        finding: WaFinding,
+        /// The re-derived quorum behind that finding.
+        quorum: WaQuorum,
+    },
+    /// Refused — naming WHICH ceremony step failed.
     Refused {
-        /// Why the reclaim was refused.
-        reason: String,
+        /// The typed step-naming reason.
+        reason: ReclaimRefusal,
+        /// A human-readable diagnostic. Never parsed; [`ReclaimRefusal`] is
+        /// the stable surface.
+        detail: String,
+        /// The re-derived quorum, when the ceremony got far enough to
+        /// compute one.
+        quorum: Option<WaQuorum>,
     },
 }
 
-/// Build the canonical bytes a reclaim's m-of-n quorum co-signs: a small,
-/// independently-reconstructable "reclaim assertion" binding the target
-/// owner-binding attestation, its incumbent owner, the owned node, and the
-/// reclaiming issuer. Deliberately NOT the reclaim row's own
-/// `attestation_envelope` bytes — embedding co-signatures inside the very
-/// envelope they sign is a fixed-point problem; signing a derived object
-/// reconstructed from already-known fields (mirroring how
-/// [`super::types::SignedTouchClaim::signing_envelope`] separates the
-/// signed form from storage) sidesteps it entirely.
-fn reclaim_assertion_bytes(
-    target: &Attestation,
-    reclaimer_key_id: &str,
-) -> Result<Vec<u8>, String> {
-    let assertion = serde_json::json!({
-        "kind": "ownership_reclaim:v1",
-        "target_attestation_id": target.attestation_id,
-        "incumbent_owner_key_id": target.attesting_key_id,
-        "node_key_id": target.attested_key_id,
-        "reclaimer_key_id": reclaimer_key_id,
-    });
-    ceg_produce_canonicalize(&assertion)
-        .map_err(|e| format!("reclaim assertion canonicalize failed: {e}"))
+impl ReclaimVerdict {
+    /// The refusal reason, if this is a refusal.
+    #[must_use]
+    pub const fn refusal(&self) -> Option<ReclaimRefusal> {
+        match self {
+            Self::Refused { reason, .. } => Some(*reason),
+            _ => None,
+        }
+    }
+
+    /// Is this an admission?
+    #[must_use]
+    pub const fn is_admit(&self) -> bool {
+        matches!(self, Self::Admit { .. })
+    }
+
+    fn refuse(reason: ReclaimRefusal, detail: impl Into<String>) -> Self {
+        Self::Refused {
+            reason,
+            detail: detail.into(),
+            quorum: None,
+        }
+    }
 }
 
-/// Read the embedded m-of-n co-signature set from a reclaim row's
-/// envelope (see [`RECLAIM_QUORUM_SIGNATURES_FIELD`]). Absent/malformed
-/// → empty (never a hard error here — an empty/garbage set simply fails
-/// the quorum check like any other insufficient submission).
-fn reclaim_quorum_signatures_from_envelope(
-    envelope: &serde_json::Value,
-) -> Vec<ThresholdSignature> {
-    envelope
-        .get(RECLAIM_QUORUM_SIGNATURES_FIELD)
-        .and_then(|v| serde_json::from_value::<Vec<ThresholdSignature>>(v.clone()).ok())
-        .unwrap_or_default()
+/// The deployment-published reclaim policy: the CC 3.2 abandonment window
+/// and the CC 4.3 Wise-Authority body that adjudicates.
+///
+/// Both halves are **deployment-published**, not invented here. CC 1.16.5
+/// puts WA appointment outside this system's control, and CC 3.2 requires a
+/// deployment to publish its window — so persist is handed a family
+/// `key_id`, re-derives roster and threshold from its OWN stored state, and
+/// refuses when handed nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimPolicy {
+    /// An owner whose signed freshness floor has not advanced within this
+    /// window is provably-abandoned. Deployment value; CC pins the floor.
+    pub abandonment_window: Duration,
+    /// The `federation_families.family_key_id` of the CC 4.3 Wise-Authority
+    /// body. Its roster and its `consensus_protocol` are read from this
+    /// node's own stored state at every use.
+    pub wa_family_key_id: String,
 }
 
-/// Build a reclaim `withdraws` envelope carrying `quorum_sigs` — the
-/// producer-side counterpart [`reclaim_quorum_signatures_from_envelope`]
-/// reads. Exposed so a real producer (edge/agent) or a test fixture builds
-/// a wire-correct envelope without hand-rolling the JSON shape.
-#[must_use]
-pub fn build_reclaim_withdraws_envelope(
-    target_attestation_id: &str,
-    quorum_sigs: &[ThresholdSignature],
+impl ReclaimPolicy {
+    /// The shipped default abandonment window: **180 days** — twice CC's
+    /// floor. rc3 confirms this is compliant as a deployment value.
+    pub const DEFAULT_ABANDONMENT_WINDOW: Duration = Duration::days(180);
+
+    /// CC 3.2's ratified **floor** on `owner_abandonment_window`: 90 days.
+    /// A deployment may publish more, never less.
+    pub const CC_ABANDONMENT_WINDOW_FLOOR: Duration = Duration::days(90);
+
+    /// Environment variable publishing the CC 4.3 WA body's
+    /// `family_key_id`. Unset ⇒ [`from_deployment_pin`](Self::from_deployment_pin)
+    /// yields `None` ⇒ every reclaim refused.
+    pub const WA_FAMILY_ENV: &'static str = "CIRIS_PERSIST_WA_ADJUDICATION_FAMILY_KEY_ID";
+
+    /// Environment variable publishing `owner_abandonment_window` in whole
+    /// days. Unset ⇒ [`DEFAULT_ABANDONMENT_WINDOW`](Self::DEFAULT_ABANDONMENT_WINDOW).
+    pub const ABANDONMENT_WINDOW_DAYS_ENV: &'static str =
+        "CIRIS_PERSIST_OWNER_ABANDONMENT_WINDOW_DAYS";
+
+    /// A policy naming `wa_family_key_id` as the adjudicating WA body, at
+    /// the shipped 180-day window.
+    #[must_use]
+    pub fn wise_authority(wa_family_key_id: impl Into<String>) -> Self {
+        Self {
+            abandonment_window: Self::DEFAULT_ABANDONMENT_WINDOW,
+            wa_family_key_id: wa_family_key_id.into(),
+        }
+    }
+
+    /// The deployment's published pin, or `None` when it has published
+    /// none.
+    ///
+    /// `None` is the SHIPPED state and it is the safe one: with no
+    /// published WA body every reclaim is refused with
+    /// [`ReclaimRefusal::NoDeploymentPolicy`], so no node in the mesh is
+    /// seizable until an operator deliberately names an adjudicating body.
+    /// A malformed or below-floor window is likewise `None` rather than
+    /// clamped — running a window nobody published is exactly what CC 3.2
+    /// forbids.
+    #[must_use]
+    pub fn from_deployment_pin() -> Option<Self> {
+        let family = std::env::var(Self::WA_FAMILY_ENV).ok()?;
+        let family = family.trim();
+        if family.is_empty() {
+            return None;
+        }
+        let window = match std::env::var(Self::ABANDONMENT_WINDOW_DAYS_ENV) {
+            Ok(raw) => Duration::days(raw.trim().parse::<i64>().ok()?),
+            Err(_) => Self::DEFAULT_ABANDONMENT_WINDOW,
+        };
+        if window < Self::CC_ABANDONMENT_WINDOW_FLOOR {
+            return None;
+        }
+        Some(Self {
+            abandonment_window: window,
+            wa_family_key_id: family.to_owned(),
+        })
+    }
+
+    /// Is the pin structurally admissible at all? Returns the step-0
+    /// refusal when not.
+    fn pin_refusal(&self) -> Option<ReclaimRefusal> {
+        if self.wa_family_key_id.trim().is_empty() {
+            return Some(ReclaimRefusal::WaBodyUnknown);
+        }
+        if self.wa_family_key_id == ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID
+        {
+            return Some(ReclaimRefusal::AccordRosterIsNotWaAuthority);
+        }
+        if self.abandonment_window < Self::CC_ABANDONMENT_WINDOW_FLOOR {
+            return Some(ReclaimRefusal::AbandonmentWindowBelowFloor);
+        }
+        None
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  Producer-side envelope builders (the wire shapes, published once)
+// ─────────────────────────────────────────────────────────────────────────
+
+fn extra_envelope(
+    dimension: &str,
+    references: Option<&str>,
+    pairs: &[(&str, serde_json::Value)],
 ) -> serde_json::Value {
     let mut extra = serde_json::Map::new();
     extra.insert(
-        RECLAIM_QUORUM_SIGNATURES_FIELD.to_owned(),
-        serde_json::to_value(quorum_sigs).expect("ThresholdSignature serializes"),
+        crate::federation::envelope::paths::DIMENSION.to_owned(),
+        serde_json::Value::String(dimension.to_owned()),
+    );
+    for (k, v) in pairs {
+        extra.insert((*k).to_owned(), v.clone());
+    }
+    EnvelopeCore {
+        references_attestation_id: references.map(str::to_owned),
+        extra,
+        ..Default::default()
+    }
+    .to_value()
+}
+
+/// **Step 1.** Build the petition envelope naming the owner-binding under
+/// adjudication and the evidence.
+#[must_use]
+pub fn build_reclaim_petition_envelope(
+    target_owner_binding_id: &str,
+    grounds: &str,
+) -> serde_json::Value {
+    extra_envelope(
+        DIMENSION_PETITION,
+        None,
+        &[
+            (
+                field::TARGET_OWNER_BINDING_ID,
+                serde_json::Value::String(target_owner_binding_id.to_owned()),
+            ),
+            (
+                field::GROUNDS,
+                serde_json::Value::String(grounds.to_owned()),
+            ),
+        ],
+    )
+}
+
+/// **Step 2.** Build the CC 4.3 quorum-finding envelope. The WA body's
+/// members co-sign THIS envelope (base scrub + `additional_scrubs`); the
+/// count is re-derived at use.
+#[must_use]
+pub fn build_wa_finding_envelope(
+    finding: WaFinding,
+    target_owner_binding_id: &str,
+    petition_ref: &str,
+    grounds: &str,
+) -> serde_json::Value {
+    extra_envelope(
+        finding.dimension(),
+        None,
+        &[
+            (
+                field::TARGET_OWNER_BINDING_ID,
+                serde_json::Value::String(target_owner_binding_id.to_owned()),
+            ),
+            (
+                field::PETITION_REF,
+                serde_json::Value::String(petition_ref.to_owned()),
+            ),
+            (
+                field::GROUNDS,
+                serde_json::Value::String(grounds.to_owned()),
+            ),
+        ],
+    )
+}
+
+/// **Step 3.** Build the gated `withdraws` envelope: it references the
+/// owner-binding being withdrawn and carries the
+/// [`field::WA_ADJUDICATION_REF`] naming the finding.
+///
+/// There is deliberately **no parameter** here for a successor owner. The
+/// builder cannot express the single-act transfer, and a hand-rolled
+/// envelope that does is refused by
+/// [`ReclaimRefusal::SingleActTransferAttempted`].
+#[must_use]
+pub fn build_reclaim_withdraws_envelope(
+    target_attestation_id: &str,
+    wa_adjudication_ref: &str,
+) -> serde_json::Value {
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        field::WA_ADJUDICATION_REF.to_owned(),
+        serde_json::Value::String(wa_adjudication_ref.to_owned()),
     );
     EnvelopeCore {
         references_attestation_id: Some(target_attestation_id.to_owned()),
@@ -278,22 +774,200 @@ pub fn build_reclaim_withdraws_envelope(
     .to_value()
 }
 
-/// **The CC 3.2 "no permanent ownerless lock" reclaim admission gate.**
-/// See the module doc for the full mechanism + why it ships inert.
+// ─────────────────────────────────────────────────────────────────────────
+//  The re-derived WA quorum
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Read a non-empty string field. An EMPTY string is read as ABSENT, so a
+/// producer that ships `"wa_adjudication_ref": ""` is told the reference is
+/// MISSING (which it is) rather than that it failed to resolve — the refusal
+/// has to point at the actual mistake or it sends the operator hunting for a
+/// finding that was never named.
+fn envelope_str<'a>(envelope: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    envelope
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Re-derive the CC 4.3 WA quorum behind `finding` from THIS node's own
+/// verified state, and count it.
 ///
-/// `reclaim_row` is the candidate `withdraws` attestation (NOT YET
-/// admitted by the ordinary CEG §3.2.3 rules — this function is the
-/// EXCEPTION path a caller consults after the ordinary rules refuse it,
-/// see [`super::admission::check_withdraws_admission`]). `now` is the
-/// caller's wall-clock (threaded explicitly so tests are deterministic).
+/// - **Roster** — [`FederationDirectory::active_family_members`] of the
+///   pinned body (revocation-folded). Membership itself is governed by the
+///   family's own m-of-n, so a Sybil cannot seat itself.
+/// - **Threshold** — [`family_charter_threshold`](super::trust_root) over
+///   the body's own stored `consensus_protocol`, floored at a strict
+///   majority and fail-secure on anything it does not recognise.
+/// - **Count** — [`count_distinct_roster_scrubs`](super::reverse_quorum),
+///   re-verifying every co-signature against pubkeys from this node's
+///   directory, restricted to roster members that wear the CC 4.3
+///   `wise_authority` card.
+///
+/// # Why the denominator is the FULL roster
+///
+/// CC 4.3 rule 1 lets an unresponsive WA lapse out of a live set `L` so an
+/// absent WA cannot *block*. Persist deliberately does **not** shrink the
+/// denominator here, because on THIS path shrinking `L` lowers the
+/// threshold, and the threshold is what stands between an adversary and
+/// somebody else's node: an attacker who can silence WAs would otherwise be
+/// able to shrink the body down to the few seats it has captured. Counting
+/// against the full roster can only ever REFUSE more than CC requires,
+/// never admit more — the safe direction on a seizure path. (The blocking
+/// concern CC 4.3 addresses is real for *deferrals*, where the cost of
+/// absence is a frozen agent; here the cost of absence is that a node stays
+/// owned by its incumbent, which is the status quo, not a freeze.)
+async fn wa_quorum_over_body(
+    directory: &dyn FederationDirectory,
+    policy: &ReclaimPolicy,
+    finding: &Attestation,
+) -> Result<Result<WaQuorum, (ReclaimRefusal, String)>, Error> {
+    // A backend that cannot answer the family question (the FFI directory
+    // capsule reports `Unsupported` for `lookup_family`) is honestly unable to
+    // re-derive the authority, which is `WaBodyUnknown` — never a hard error
+    // that a caller might retry into, and never a guess. Same discipline
+    // `check_attested_subject_admission` applies to the same call.
+    let family = match directory.lookup_family(&policy.wa_family_key_id).await {
+        Ok(Some(f)) => f,
+        Ok(None) | Err(Error::Unsupported { .. }) => {
+            return Ok(Err((
+                ReclaimRefusal::WaBodyUnknown,
+                format!(
+                    "the published WA body {:?} is not a family this node can resolve — \
+                     authority must be re-derived from local verified state, and there is none",
+                    policy.wa_family_key_id
+                ),
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let roster: Vec<String> = match directory
+        .active_family_members(&policy.wa_family_key_id)
+        .await
+    {
+        Ok(members) => members.into_iter().map(|m| m.key_id).collect(),
+        Err(Error::Unsupported { .. }) => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    if roster.is_empty() {
+        return Ok(Err((
+            ReclaimRefusal::WaRosterEmpty,
+            format!(
+                "the WA body {:?} has an empty active roster — no threshold is meetable",
+                policy.wa_family_key_id
+            ),
+        )));
+    }
+    // The threshold is the BODY's own, over the FULL roster (see the doc).
+    let required = super::trust_root::family_charter_threshold(&family, roster.len());
+
+    // CC 4.3 "The Wise wear the same card": only roster members whose
+    // registered identity_type set carries `wise_authority` are counted. A
+    // legibility filter on the NUMERATOR — the seat is what confers, so this
+    // can only refuse, never admit.
+    let mut carded: Vec<String> = Vec::with_capacity(roster.len());
+    for key_id in &roster {
+        if let Some(rec) = directory.lookup_public_key(key_id).await? {
+            if identity_type::set_contains(&rec.identity_type, identity_type::WISE_AUTHORITY) {
+                carded.push(rec.key_id);
+            }
+        }
+    }
+    let counted = super::reverse_quorum::count_distinct_roster_scrubs(
+        directory,
+        &finding.attestation_envelope,
+        &finding.scrubs(),
+        &carded,
+    )
+    .await;
+    Ok(Ok(WaQuorum {
+        counted: counted.len(),
+        required,
+        roster_size: roster.len(),
+    }))
+}
+
+/// rc3's answer to persist's open question 3, encoded: *"the owner-binding
+/// attestation itself establishes the initial floor, so a binding is never
+/// floorless."*
+///
+/// The floor for the abandonment predicate is therefore the LATER of every
+/// signed touch-claim floor this node holds and the binding's own
+/// `asserted_at`. Consequence: a binding whose owner never emitted a single
+/// touch-claim is still measurable — it simply has to be older than the
+/// window — which is what makes the CC 3.2 MUST reachable instead of
+/// permanently blocked on a producer that does not exist yet. It is still
+/// FAIL-SAFE in the direction that matters: a *recent* binding is never
+/// abandoned, and no floor is ever invented from thin air.
+fn initial_freshness_floor(
+    binding: &Attestation,
+    touch_floors: [Option<DateTime<Utc>>; 2],
+) -> DateTime<Utc> {
+    let mut floor = binding.asserted_at;
+    for f in touch_floors.into_iter().flatten() {
+        floor = merge_floor(floor, f);
+    }
+    floor
+}
+
+/// Does `issuer` hold CC 2.4.1.1 rule-(4) standing on `node` — a live
+/// `delegates_to(node → issuer)` carrying
+/// [`DELEGATION_SCOPE_OWNER_BINDING_RECOVERY`]?
+async fn holds_recovery_delegation(
+    directory: &dyn FederationDirectory,
+    node: &str,
+    issuer: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, Error> {
+    for r in directory.list_attestations_by(node).await? {
+        if r.attestation_type != attestation_type::DELEGATES_TO || r.attested_key_id != issuer {
+            continue;
+        }
+        if let Some(exp) = r.expires_at {
+            if exp <= now {
+                continue;
+            }
+        }
+        let scopes = super::admission::delegation_scope_set(&r.attestation_envelope);
+        if scopes.contains(DELEGATION_SCOPE_OWNER_BINDING_RECOVERY) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  The gate
+// ─────────────────────────────────────────────────────────────────────────
+
+/// **The CC 3.2 recovery gate.** Is `reclaim_row` — a `withdraws` against a
+/// LIVE owner-binding issued by someone other than the incumbent owner — an
+/// admissible step 3 of the four-step reclaim ceremony?
+///
+/// Called from [`super::admission::check_withdraws_admission`] in BOTH
+/// directions, which is the point:
+///
+/// - when the ordinary 4-rule gate REFUSES (persist's owner-bindings carry
+///   no `subject_key_ids` today, so rule 2 never fires for them), this is
+///   the sanctioned exception — recorded as rule
+///   [`RECLAIM_WITHDRAWS_ADMISSION_RULE`];
+/// - when the ordinary gate ADMITS under rule 2, 3 or 4 against a live
+///   owner-binding, this gate must ALSO pass. That is CC 3.2's recovery
+///   gate, and without it *"a compromised node key withdraws its own owner
+///   and the single-owner invariant is worthless"* — the self-liberation
+///   exploit rule 2 opens the moment a conformant producer starts naming K
+///   in the binding's `subject_key_ids`, as CC 3.2 says it must.
+///
+/// `now` is threaded explicitly so tests are deterministic.
 pub async fn check_ownership_reclaim_admission(
     directory: &dyn FederationDirectory,
     reclaim_row: &Attestation,
     policy: Option<&ReclaimPolicy>,
     now: DateTime<Utc>,
 ) -> Result<ReclaimVerdict, Error> {
-    // (1) Shape check: is this even a candidate reclaim? A pure no-op
-    // otherwise — callers fall through to their normal logic unchanged.
+    // (0) Shape check: is this even a candidate? A pure no-op otherwise —
+    //     callers fall through to their normal logic unchanged.
     if reclaim_row.attestation_type != attestation_type::WITHDRAWS {
         return Ok(ReclaimVerdict::NotAReclaim);
     }
@@ -308,106 +982,285 @@ pub async fn check_ownership_reclaim_admission(
     if !is_owner_binding_envelope(&target.attestation_envelope) {
         return Ok(ReclaimVerdict::NotAReclaim);
     }
-    // Self-withdrawal (the incumbent revoking their OWN binding) is
-    // ordinary rule-1 authority — never a reclaim, regardless of policy.
+    // Self-withdrawal (the incumbent revoking their OWN binding) is ordinary
+    // rule-1 authority — never a reclaim, regardless of policy.
     if reclaim_row.attesting_key_id == target.attesting_key_id {
         return Ok(ReclaimVerdict::NotAReclaim);
     }
 
-    // (2) Inert-by-default: no policy, no reclaim. Fail-closed, not a
-    // silent no-op — the node stays locked, correctly, until CC#43.
-    let Some(policy) = policy else {
-        return Ok(ReclaimVerdict::Refused {
-            reason: "no ReclaimPolicy configured — the mechanism ships inert pending \
-                     CIRISConstitution#43"
-                .to_owned(),
-        });
-    };
+    // (1) THE SINGLE-ACT WALL, checked before authority is even considered.
+    //     A `withdraws` that names who gets the node next is not step 3 of a
+    //     four-step ceremony; it is the collapse rc3 forbids by name.
+    for key in SUCCESSOR_OWNER_FIELDS {
+        if reclaim_row.attestation_envelope.get(key).is_some() {
+            return Ok(ReclaimVerdict::refuse(
+                ReclaimRefusal::SingleActTransferAttempted,
+                format!(
+                    "the gated withdraws names a successor owner ({key:?}); CC 3.2 forbids \
+                     transferring incumbent → claimant in one act — K MUST pass through the \
+                     unowned state, then take a fresh owner-binding co-signed by K"
+                ),
+            ));
+        }
+    }
 
-    // (3a) Provably-abandoned: the incumbent's (and/or the node's) signed
-    // freshness floor is PRESENT and older than `now - abandonment_window`.
-    //
-    // v21.8.0 (CIRISPersist#519, activation) — FAIL-SAFE: an ABSENT floor is
-    // NOT abandonment. Absence of a signed freshness floor is absence of
-    // evidence, not evidence of death — treating it as abandoned would make
-    // EVERY node reclaimable before any touch-claim producer exists (no node
-    // has a floor yet), i.e. a mass-seizable mesh the instant a policy is
-    // injected. Only a floor that was DEMONSTRABLY alive (present) and then
-    // stopped advancing past the window is proof of abandonment. Consequence
-    // (documented, tracked): a node whose owner NEVER emitted a floor stays
-    // unreclaimable until ownership-establishment bootstraps an initial touch
-    // (a #519 follow-up); the CC 3.2 MUST is satisfied for the touched-then-
-    // dark case, which is the real-world one once producers ship.
-    let incumbent = target.attesting_key_id.as_str();
-    let node = target.attested_key_id.as_str();
-    let incumbent_floor = directory
-        .lookup_freshness_floor(incumbent, OWNERSHIP_FRESHNESS_TARGET_KIND)
-        .await?;
-    let node_floor = directory
-        .lookup_freshness_floor(node, OWNERSHIP_FRESHNESS_TARGET_KIND)
-        .await?;
-    let latest = match (incumbent_floor, node_floor) {
-        (Some(a), Some(b)) => Some(merge_floor(a.fresh_as_of, b.fresh_as_of)),
-        (Some(a), None) => Some(a.fresh_as_of),
-        (None, Some(b)) => Some(b.fresh_as_of),
-        (None, None) => None,
+    // (2) The deployment pin. No published WA body ⇒ nothing is admissible
+    //     here (fail-secure, and exactly what CC 3.2 says about an
+    //     unpublished window).
+    let Some(policy) = policy else {
+        return Ok(ReclaimVerdict::refuse(
+            ReclaimRefusal::NoDeploymentPolicy,
+            format!(
+                "this deployment has published no CC 4.3 Wise-Authority body (set {}) and no \
+                 owner_abandonment_window — no reclaim is admissible here",
+                ReclaimPolicy::WA_FAMILY_ENV
+            ),
+        ));
     };
-    let cutoff = now - policy.abandonment_window;
-    // is_some_and: absent floor ⇒ false ⇒ NOT abandoned (fail-safe).
-    let abandoned = latest.is_some_and(|f| f < cutoff);
-    if !abandoned {
+    if let Some(reason) = policy.pin_refusal() {
+        let detail = match reason {
+            ReclaimRefusal::AccordRosterIsNotWaAuthority => format!(
+                "the published reclaim authority {:?} is the HUMANITY_ACCORD family; \
+                 CIRISConstitution rc3 moved ownerless-reclaim authority to the CC 4.3 \
+                 Wise-Authority quorum — the accord holder roster is NOT a WA body",
+                policy.wa_family_key_id
+            ),
+            ReclaimRefusal::AbandonmentWindowBelowFloor => format!(
+                "the published owner_abandonment_window ({}s) is below CC 3.2's 90-day floor",
+                policy.abandonment_window.num_seconds()
+            ),
+            _ => "the published WA body key_id is empty".to_owned(),
+        };
+        return Ok(ReclaimVerdict::refuse(reason, detail));
+    }
+
+    // (3) Step 2 — the wa_adjudication_ref MUST be present and MUST resolve
+    //     to a real CC 4.3 finding against THIS binding.
+    let Some(finding_ref) = envelope_str(
+        &reclaim_row.attestation_envelope,
+        field::WA_ADJUDICATION_REF,
+    ) else {
+        return Ok(ReclaimVerdict::refuse(
+            ReclaimRefusal::WaAdjudicationRefMissing,
+            format!(
+                "the withdraws against owner-binding {} carries no {:?}; CC 3.2 REQUIRES the \
+                 gated withdraws to name a CC 4.3 Wise-Authority quorum finding of abandonment \
+                 or seizure — the substrate records the finding, it never makes it",
+                target.attestation_id,
+                field::WA_ADJUDICATION_REF
+            ),
+        ));
+    };
+    let Some(finding_row) = directory.get_attestation(finding_ref).await? else {
+        return Ok(ReclaimVerdict::refuse(
+            ReclaimRefusal::WaAdjudicationRefUnresolvable,
+            format!(
+                "{:?} {finding_ref:?} resolves to no attestation this node holds",
+                field::WA_ADJUDICATION_REF
+            ),
+        ));
+    };
+    let Some(finding) = super::admission::envelope_dimension(&finding_row.attestation_envelope)
+        .and_then(WaFinding::from_dimension)
+        .filter(|_| finding_row.attestation_type == attestation_type::SCORES)
+    else {
+        return Ok(ReclaimVerdict::refuse(
+            ReclaimRefusal::NotAWaFinding,
+            format!(
+                "{finding_ref:?} is not a CC 4.3 quorum finding — expected a `scores` row on \
+                 {DIMENSION_FINDING_ABANDONMENT:?} or {DIMENSION_FINDING_SEIZURE:?}"
+            ),
+        ));
+    };
+    let binds_this = envelope_str(
+        &finding_row.attestation_envelope,
+        field::TARGET_OWNER_BINDING_ID,
+    ) == Some(target.attestation_id.as_str())
+        && finding_row.attested_key_id == target.attested_key_id;
+    if !binds_this {
+        return Ok(ReclaimVerdict::refuse(
+            ReclaimRefusal::FindingNotAgainstThisBinding,
+            format!(
+                "finding {finding_ref:?} does not adjudicate owner-binding {} on node {} — a \
+                 finding is scoped to one binding, never a bearer token for every node",
+                target.attestation_id, target.attested_key_id
+            ),
+        ));
+    }
+
+    // (4) Step 1 — the petition. A finding with no resolvable petition
+    //     against the SAME binding is a collapsed ceremony.
+    let Some(petition_ref) = envelope_str(&finding_row.attestation_envelope, field::PETITION_REF)
+    else {
+        return Ok(ReclaimVerdict::refuse(
+            ReclaimRefusal::PetitionMissing,
+            format!(
+                "finding {finding_ref:?} carries no {:?}; the CC 3.2 ceremony is FOUR steps and \
+                 MUST NOT be collapsed — step 1 is a petition naming K and the evidence",
+                field::PETITION_REF
+            ),
+        ));
+    };
+    let petition_ok = match directory.get_attestation(petition_ref).await? {
+        Some(p) => {
+            super::admission::envelope_dimension(&p.attestation_envelope)
+                == Some(DIMENSION_PETITION)
+                && envelope_str(&p.attestation_envelope, field::TARGET_OWNER_BINDING_ID)
+                    == Some(target.attestation_id.as_str())
+                && p.attested_key_id == target.attested_key_id
+        }
+        None => false,
+    };
+    if !petition_ok {
+        return Ok(ReclaimVerdict::refuse(
+            ReclaimRefusal::PetitionUnresolvable,
+            format!(
+                "{:?} {petition_ref:?} does not resolve to a {DIMENSION_PETITION:?} row against \
+                 owner-binding {} on node {}",
+                field::PETITION_REF,
+                target.attestation_id,
+                target.attested_key_id
+            ),
+        ));
+    }
+
+    // (5) Step 2 — re-tally the WA quorum from this node's OWN state.
+    let quorum = match wa_quorum_over_body(directory, policy, &finding_row).await? {
+        Ok(q) => q,
+        Err((reason, detail)) => return Ok(ReclaimVerdict::refuse(reason, detail)),
+    };
+    if !quorum.met() {
         return Ok(ReclaimVerdict::Refused {
-            reason: match latest {
-                None => format!(
-                    "incumbent owner {incumbent} (and node {node}) have NO signed freshness \
-                     floor — absence is not proof of abandonment (fail-safe); not reclaimable"
-                ),
-                Some(_) => format!(
-                    "incumbent owner {incumbent} (or node {node}) has a freshness floor within \
-                     the {}s abandonment window — not abandoned",
-                    policy.abandonment_window.num_seconds()
-                ),
-            },
+            reason: ReclaimRefusal::WaQuorumShort,
+            detail: format!(
+                "finding {finding_ref:?} carries {} distinct verified card-carrying co-signature(s) \
+                 from the WA body {:?}, but its own consensus_protocol demands {} of {}",
+                quorum.counted, policy.wa_family_key_id, quorum.required, quorum.roster_size
+            ),
+            quorum: Some(quorum),
         });
     }
 
-    // (3b) A VERIFIED m-of-n quorum, re-derived from persist's OWN
-    // registered keys (Registry-of-Record) — never a caller-passed
-    // boolean.
-    let bytes = match reclaim_assertion_bytes(&target, &reclaim_row.attesting_key_id) {
-        Ok(b) => b,
-        Err(reason) => return Ok(ReclaimVerdict::Refused { reason }),
-    };
-    let mut roster: Vec<ThresholdMember> =
-        Vec::with_capacity(policy.reclaim_quorum.roster_key_ids.len());
-    for kid in &policy.reclaim_quorum.roster_key_ids {
-        if let Some(rec) = directory.lookup_public_key(kid).await? {
-            roster.push(ThresholdMember {
-                member_id: rec.key_id,
-                ed25519_public_key_base64: rec.pubkey_ed25519_base64,
-                mldsa65_public_key_base64: rec.pubkey_ml_dsa_65_base64,
-                role: Some(Role::Founder),
+    // (6) Step 3 — the issuer's standing. rc3's recovery path rides CC
+    //     2.4.1.1 rule (2) (the node K itself, or a named subject of the
+    //     binding) and rule (4) (a live owner_binding_recovery delegate of
+    //     K) — and no other.
+    let node = target.attested_key_id.as_str();
+    let issuer = reclaim_row.attesting_key_id.as_str();
+    let rule2 = issuer == node || target.subject_key_ids.iter().any(|s| s == issuer);
+    let standing = rule2 || holds_recovery_delegation(directory, node, issuer, now).await?;
+    if !standing {
+        return Ok(ReclaimVerdict::Refused {
+            reason: ReclaimRefusal::IssuerLacksRecoveryStanding,
+            detail: format!(
+                "{issuer:?} is neither the node {node:?} nor a named subject of the binding \
+                 (CC 2.4.1.1 rule 2), and holds no live delegates_to({node} → {issuer}) carrying \
+                 {DELEGATION_SCOPE_OWNER_BINDING_RECOVERY:?} (rule 4)"
+            ),
+            quorum: Some(quorum),
+        });
+    }
+
+    // (7) The abandonment predicate — persist's OWN evidence, on top of the
+    //     quorum's finding. A SEIZURE finding never reaches this test: rc3
+    //     is explicit that the recovery path also reaches a LIVE wrongful
+    //     binding, so requiring staleness there would make front-running
+    //     permanent, which is the failure this clause exists to prevent.
+    if finding == WaFinding::Abandonment {
+        let incumbent = target.attesting_key_id.as_str();
+        let incumbent_floor = directory
+            .lookup_freshness_floor(incumbent, OWNERSHIP_FRESHNESS_TARGET_KIND)
+            .await?
+            .map(|f| f.fresh_as_of);
+        let node_floor = directory
+            .lookup_freshness_floor(node, OWNERSHIP_FRESHNESS_TARGET_KIND)
+            .await?
+            .map(|f| f.fresh_as_of);
+        let floor = initial_freshness_floor(&target, [incumbent_floor, node_floor]);
+        let cutoff = now - policy.abandonment_window;
+        if floor >= cutoff {
+            return Ok(ReclaimVerdict::Refused {
+                reason: ReclaimRefusal::NotAbandoned,
+                detail: format!(
+                    "incumbent owner {incumbent} (or node {node}) has a freshness floor of \
+                     {floor} — inside the {}s abandonment window; the owner is quiet, not gone",
+                    policy.abandonment_window.num_seconds()
+                ),
+                quorum: Some(quorum),
             });
         }
     }
-    let n = roster.len();
-    let qp = QuorumPolicy::new(policy.reclaim_quorum.threshold, n);
-    let sigs = reclaim_quorum_signatures_from_envelope(&reclaim_row.attestation_envelope);
-    match verify_quorum_policy(&bytes, &roster, &sigs, qp) {
-        Ok(_) => Ok(ReclaimVerdict::Admit),
-        Err(e) => Ok(ReclaimVerdict::Refused {
-            reason: format!("reclaim quorum not met ({}-of-{n}): {e}", qp.m),
-        }),
+
+    Ok(ReclaimVerdict::Admit { finding, quorum })
+}
+
+/// **Ceremony step 4** — a fresh owner-binding on a node that has been
+/// through a reclaim MUST be co-signed by that node.
+///
+/// Wired into [`super::admission::check_single_node_owner_admission`], so
+/// all three backends inherit it from one chokepoint.
+///
+/// "Has been through a reclaim" is derived from this node's own stored
+/// rows and nothing else: a `withdraws` against K stamped with
+/// [`RECLAIM_WITHDRAWS_ADMISSION_RULE`] by the gate above. The
+/// co-signature is counted with the same
+/// [`count_distinct_roster_scrubs`](super::reverse_quorum) body the WA
+/// quorum uses — one predicate, one implementation — over the one-member
+/// roster `[K]`.
+///
+/// A no-op for a first (genesis) binding and for a refresh by the incumbent:
+/// #578 rules on the RECLAIM rebinding, and widening the co-signature
+/// requirement to every binding in the mesh is a separate, producer-visible
+/// change.
+pub async fn check_post_reclaim_rebinding_admission(
+    directory: &dyn FederationDirectory,
+    row: &Attestation,
+) -> Result<(), Error> {
+    if row.attestation_type != attestation_type::DELEGATES_TO
+        || !is_owner_binding_envelope(&row.attestation_envelope)
+    {
+        return Ok(());
     }
+    let node = row.attested_key_id.as_str();
+    let reclaimed = directory
+        .list_attestations_for(node)
+        .await?
+        .iter()
+        .any(|r| {
+            r.attestation_type == attestation_type::WITHDRAWS
+                && r.withdraws_admission_rule == Some(RECLAIM_WITHDRAWS_ADMISSION_RULE)
+        });
+    if !reclaimed {
+        return Ok(());
+    }
+    let node_roster = [node.to_owned()];
+    let cosigned = super::reverse_quorum::count_distinct_roster_scrubs(
+        directory,
+        &row.attestation_envelope,
+        &row.scrubs(),
+        &node_roster,
+    )
+    .await;
+    if cosigned.is_empty() {
+        return Err(Error::OwnershipReclaimRefused {
+            node_key_id: node.to_owned(),
+            owner_binding_id: row.attestation_id.clone(),
+            reason: ReclaimRefusal::FreshBindingNotCosignedByNode,
+            detail: format!(
+                "node {node} has been through a CC 3.2 reclaim, so its fresh owner-binding MUST \
+                 be co-signed by {node} itself (ceremony step 4); the row carries no verifying \
+                 co-signature from it"
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 mod tests {
+    use super::test_support as rts;
     use super::*;
     use crate::engine::Engine;
-    use crate::federation::tier_ingest::test_support as ts;
-    use crate::federation::types::{attestation_tier, cohort_scope, identity_type, SignerForm};
-    use crate::federation::{FederationDirectory, SignedAttestation, SignedTouchClaim};
     use crate::signing::LocalSigner;
     use ed25519_dalek::SigningKey;
     use std::sync::Arc;
@@ -422,13 +1275,238 @@ mod tests {
         ))
     }
 
-    /// Build + hybrid-sign a `SignedTouchClaim` via `ts::sign_envelope`'s
-    /// DETERMINISTIC per-key_id signer — the same signer
-    /// [`ts::register_identity_key`] / [`ts::owner_binding_attestation`]
-    /// register/sign with, so one `register_identity_key` call serves
-    /// both the owner-binding AND its self-touch claim. `self_touch`
-    /// requires `attesting_key_id == target_key_id`.
-    fn self_touch_claim(target_key_id: &str, fresh_as_of: DateTime<Utc>) -> SignedTouchClaim {
+    /// Every refusal token is unique and non-empty, and every ceremony step
+    /// 0..=4 is named by at least one variant — so no step can be silently
+    /// dropped from the enum while the ceremony still claims four steps.
+    #[test]
+    fn refusal_tokens_are_closed_and_cover_every_ceremony_step() {
+        use std::collections::BTreeSet;
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut steps: BTreeSet<u8> = BTreeSet::new();
+        for r in ReclaimRefusal::ALL {
+            assert!(!r.as_str().is_empty(), "{r:?} has an empty token");
+            assert!(seen.insert(r.as_str()), "duplicate token for {r:?}");
+            steps.insert(r.ceremony_step());
+        }
+        assert_eq!(
+            seen.len(),
+            ReclaimRefusal::ALL.len(),
+            "ALL must list every variant exactly once"
+        );
+        for step in 0u8..=4 {
+            assert!(
+                steps.contains(&step),
+                "no refusal names ceremony step {step} — a step nothing can refuse is a step \
+                 nothing enforces"
+            );
+        }
+    }
+
+    /// The shipped default: 180 days, twice CC 3.2's 90-day floor, and the
+    /// floor is what the policy gate actually applies.
+    #[test]
+    fn shipped_window_is_compliant_and_the_floor_bites() {
+        assert_eq!(
+            ReclaimPolicy::DEFAULT_ABANDONMENT_WINDOW,
+            Duration::days(180)
+        );
+        assert!(
+            ReclaimPolicy::DEFAULT_ABANDONMENT_WINDOW >= ReclaimPolicy::CC_ABANDONMENT_WINDOW_FLOOR
+        );
+        let mut short = ReclaimPolicy::wise_authority("wa-body");
+        short.abandonment_window = Duration::days(7);
+        assert_eq!(
+            short.pin_refusal(),
+            Some(ReclaimRefusal::AbandonmentWindowBelowFloor)
+        );
+        assert_eq!(ReclaimPolicy::wise_authority("wa-body").pin_refusal(), None);
+    }
+
+    /// **The rc3 non-conformance, named.** A policy pointing reclaim
+    /// authority at the HUMANITY_ACCORD holder roster is REFUSED — that is
+    /// what `ReclaimPolicy::humanity_accord_default` shipped in v21.8.0.
+    #[test]
+    fn accord_roster_is_refused_as_reclaim_authority() {
+        let accord = ReclaimPolicy::wise_authority(
+            ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID,
+        );
+        assert_eq!(
+            accord.pin_refusal(),
+            Some(ReclaimRefusal::AccordRosterIsNotWaAuthority),
+            "rc3 moved reclaim authority to the CC 4.3 WA quorum — the accord roster is not a \
+             WA body, and a deployment must not be able to point it back"
+        );
+    }
+
+    /// rc3's answer to question 3: the owner-binding itself establishes the
+    /// initial floor, so a binding is never floorless — and a later
+    /// touch-claim only ever moves the floor FORWARD.
+    #[test]
+    fn a_binding_is_never_floorless() {
+        let t0: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let mut binding = rts::bare_owner_binding("b", "owner", "node");
+        binding.asserted_at = t0;
+        assert_eq!(
+            initial_freshness_floor(&binding, [None, None]),
+            t0,
+            "with no touch-claims at all the binding's own asserted_at IS the floor"
+        );
+        let later = t0 + Duration::days(30);
+        assert_eq!(
+            initial_freshness_floor(&binding, [Some(later), None]),
+            later
+        );
+        let earlier = t0 - Duration::days(30);
+        assert_eq!(
+            initial_freshness_floor(&binding, [Some(earlier), None]),
+            t0,
+            "a stale touch-claim never drags the floor BACKWARDS below the binding"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn ownership_reclaim_ceremony_sqlite() {
+        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("construct sqlite engine");
+        let dir = engine.federation_directory();
+        rts::exercise_reclaim_ceremony(&*dir, "sq").await;
+    }
+
+    #[tokio::test]
+    async fn ownership_reclaim_ceremony_memory() {
+        let dir = crate::store::memory::MemoryBackend::new();
+        rts::exercise_reclaim_ceremony(&dir, "mem").await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn ownership_reclaim_ceremony_postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!(
+                "skipping ownership_reclaim_ceremony_postgres: CIRIS_PERSIST_TEST_PG_URL unset"
+            );
+            return;
+        };
+        let engine = Engine::with_signer(test_signer(), &dsn)
+            .await
+            .expect("construct postgres engine");
+        let dir = engine.federation_directory();
+        let tag = format!("pg{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        rts::exercise_reclaim_ceremony(&*dir, &tag).await;
+    }
+}
+
+/// The #578 behavioural witness, run by the sqlite / postgres / memory
+/// suites against `&dyn FederationDirectory` so the three backends cannot
+/// silently diverge on the plane that decides **who can take a node**.
+/// `suffix` scopes every fixture key so a run against a shared postgres test
+/// DB does not collide with a prior one.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::federation::tier_ingest::test_support as ts;
+    use crate::federation::types::{
+        attestation_tier, cohort_scope, identity_type, FamilyMember, SignerForm,
+    };
+    use crate::federation::{Family, SignedAttestation, SignedTouchClaim};
+
+    /// An UNSIGNED owner-binding row (used by pure unit tests that never
+    /// store it).
+    pub(super) fn bare_owner_binding(id: &str, owner: &str, node: &str) -> Attestation {
+        ts::owner_binding_attestation(id, owner, node)
+    }
+
+    /// Register `key_id` carrying its REAL deterministic hybrid pubkeys and
+    /// the given `identity_type` set (comma-joined per CC 3.4.7.1).
+    async fn register(dir: &dyn FederationDirectory, key_id: &str, types: &[&str]) {
+        let (ed_pk, mldsa_pk) = ts::hybrid_pubkeys(key_id);
+        let now = Utc::now();
+        dir.put_public_key(crate::federation::SignedKeyRecord {
+            record: crate::federation::KeyRecord {
+                key_id: key_id.to_owned(),
+                pubkey_ed25519_base64: ed_pk,
+                pubkey_ml_dsa_65_base64: mldsa_pk,
+                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                identity_type: identity_type::join_set(types.iter().copied()),
+                identity_ref: key_id.to_owned(),
+                valid_from: now,
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "id": key_id }),
+                original_content_hash: "deadbeef".to_owned(),
+                scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+                scrub_signature_pqc: None,
+                scrub_key_id: key_id.to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .expect("register key");
+    }
+
+    /// Build a federation-tier attestation of `kind` signed by `signer`, with
+    /// `cosigners` added as `additional_scrubs` over the SAME envelope.
+    fn signed_row(
+        signer: &str,
+        attested: &str,
+        kind: &str,
+        envelope: serde_json::Value,
+        cosigners: &[&str],
+        asserted_at: DateTime<Utc>,
+    ) -> Attestation {
+        let (och, classical, pqc) = ts::sign_envelope(signer, &envelope);
+        let additional_scrubs = cosigners
+            .iter()
+            .map(|c| {
+                let (_h, cl, pq) = ts::sign_envelope(c, &envelope);
+                crate::federation::types::ScrubSig {
+                    scrub_key_id: (*c).to_owned(),
+                    scrub_signature_classical: cl,
+                    scrub_signature_pqc: pq,
+                }
+            })
+            .collect();
+        Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: signer.to_owned(),
+            attested_key_id: attested.to_owned(),
+            attestation_type: kind.to_owned(),
+            weight: None,
+            asserted_at,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            scrub_key_id: signer.to_owned(),
+            scrub_timestamp: asserted_at,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: cohort_scope::FEDERATION.to_owned(),
+            tier: attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs,
+        }
+    }
+
+    async fn store(dir: &dyn FederationDirectory, row: &Attestation) -> Result<(), Error> {
+        dir.put_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+    }
+
+    /// A hybrid-signed `self_touch` freshness claim.
+    fn self_touch(target_key_id: &str, fresh_as_of: DateTime<Utc>) -> SignedTouchClaim {
         let unsigned = SignedTouchClaim {
             target_key_id: target_key_id.to_owned(),
             target_kind: OWNERSHIP_FRESHNESS_TARGET_KIND.to_owned(),
@@ -454,434 +1532,660 @@ mod tests {
         }
     }
 
-    /// Build a reclaim `withdraws` [`Attestation`] against `target`, issued
-    /// by `reclaimer`, embedding `quorum_sigs`. Hybrid-signed by
-    /// `reclaimer`'s deterministic key via `ts::sign_envelope` (the row's
-    /// OWN primary signature — orthogonal to the embedded quorum, which is
-    /// what [`check_ownership_reclaim_admission`] actually verifies).
-    /// `attestation_id` is a fresh UUID (the postgres backend's column is
-    /// `::uuid`-typed — see `reference_test_fixtures_uuid_vs_uuid_like` —
-    /// so a human-readable tag string is REJECTED by that backend, sqlite's
-    /// laxer TEXT column just happened not to notice).
-    fn reclaim_row(
-        reclaimer: &str,
-        target: &Attestation,
-        quorum_sigs: &[ThresholdSignature],
-    ) -> Attestation {
-        let envelope = build_reclaim_withdraws_envelope(&target.attestation_id, quorum_sigs);
-        let (och, classical, pqc) = ts::sign_envelope(reclaimer, &envelope);
-        let ts_now: DateTime<Utc> = Utc::now();
-        Attestation {
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            attesting_key_id: reclaimer.to_owned(),
-            attested_key_id: target.attested_key_id.clone(),
-            attestation_type: attestation_type::WITHDRAWS.to_owned(),
-            weight: None,
-            asserted_at: ts_now,
-            expires_at: None,
-            attestation_envelope: envelope,
-            original_content_hash: och,
-            scrub_signature_classical: classical,
-            scrub_signature_pqc: pqc,
-            scrub_key_id: reclaimer.to_owned(),
-            scrub_timestamp: ts_now,
-            pqc_completed_at: None,
-            persist_row_hash: String::new(),
-            subject_key_ids: Vec::new(),
-            withdraws_admission_rule: None,
-            cohort_scope: "federation".to_owned(),
-            tier: attestation_tier::FEDERATION.to_owned(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
+    /// **The whole ceremony, both directions.** Run against every backend.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn exercise_reclaim_ceremony(dir: &dyn FederationDirectory, suffix: &str) {
+        let now = Utc::now();
+        let owner = format!("r-owner-{suffix}");
+        let node = format!("r-node-{suffix}");
+        let claimant = format!("r-claimant-{suffix}");
+        let filer = format!("r-filer-{suffix}");
+        let wa_body = format!("r-wa-body-{suffix}");
+        let wa: [String; 3] = [
+            format!("r-wa-a-{suffix}"),
+            format!("r-wa-b-{suffix}"),
+            format!("r-wa-c-{suffix}"),
+        ];
+
+        register(dir, &owner, &[identity_type::USER]).await;
+        register(dir, &claimant, &[identity_type::USER]).await;
+        register(dir, &node, &[identity_type::NODE]).await;
+        register(dir, &filer, &[identity_type::USER]).await;
+        for k in &wa {
+            register(
+                dir,
+                k,
+                &[identity_type::USER, identity_type::WISE_AUTHORITY],
+            )
+            .await;
         }
-    }
 
-    /// Shared fixture: register an incumbent owner + node + reclaimer, and
-    /// admit a LIVE owner-binding `delegates_to(owner → node)` through the
-    /// REAL production gate ([`FederationDirectory::put_attestation`]).
-    /// Returns the stored owner-binding row (its `attestation_id` is what a
-    /// reclaim's `references_attestation_id` names).
-    async fn seed_owner_binding(
-        dir: &dyn FederationDirectory,
-        tag: &str,
-    ) -> (String, String, String, Attestation) {
-        let owner = format!("recl-owner-{tag}");
-        let node = format!("recl-node-{tag}");
-        let reclaimer = format!("recl-reclaimer-{tag}");
-        ts::register_identity_key(dir, &owner, identity_type::USER).await;
-        ts::register_identity_key(dir, &node, identity_type::NODE).await;
-        ts::register_identity_key(dir, &reclaimer, identity_type::USER).await;
-
-        // A fresh UUID, not a human-readable tag: the postgres backend's
-        // `attestation_id` column is `::uuid`-typed (sqlite's laxer TEXT
-        // column doesn't enforce this — see
-        // `reference_test_fixtures_uuid_vs_uuid_like`).
-        let binding_id = uuid::Uuid::new_v4().to_string();
-        dir.put_attestation(SignedAttestation {
-            attestation: ts::owner_binding_attestation(&binding_id, &owner, &node),
+        // The CC 4.3 WA body: a family whose roster IS the quorum and whose
+        // own consensus_protocol IS the threshold. `majority` floors at a
+        // strict majority of 3 ⇒ 2.
+        dir.put_family_local(Family {
+            family_key_id: wa_body.clone(),
+            family_name: format!("wise authorities {suffix}"),
+            members: wa
+                .iter()
+                .map(|k| FamilyMember {
+                    key_id: k.clone(),
+                    joined_at: now,
+                    role: Some("member".to_owned()),
+                })
+                .collect(),
+            founded_at: now,
+            consensus_protocol: "majority".to_owned(),
+            consensus_protocol_entrenched: false,
+            persist_row_hash: String::new(),
         })
         .await
-        .expect("owner-binding admitted via the real gate");
-        let target = dir
+        .expect("seat the WA body");
+
+        let policy = ReclaimPolicy::wise_authority(&wa_body);
+
+        // ── The incumbent binding, admitted through the REAL gate, dated
+        //    outside the abandonment window so the abandonment arm is
+        //    reachable (rc3: the binding itself IS the initial floor).
+        let binding_id = uuid::Uuid::new_v4().to_string();
+        let mut binding = ts::owner_binding_attestation(&binding_id, &owner, &node);
+        binding.asserted_at = now - Duration::days(400);
+        binding.scrub_timestamp = binding.asserted_at;
+        store(dir, &binding).await.expect("incumbent binding");
+        let stored_binding = dir
             .get_attestation(&binding_id)
             .await
-            .unwrap()
-            .expect("owner-binding row stored");
-        (owner, node, reclaimer, target)
-    }
-
-    /// A 2-of-3 [`ReclaimPolicy`] over a freshly-registered 3-member
-    /// roster (all real, distinct hybrid keys).
-    async fn two_of_three_policy(
-        dir: &dyn FederationDirectory,
-        tag: &str,
-        abandonment_window: Duration,
-    ) -> (ReclaimPolicy, [String; 3]) {
-        let roster = [
-            format!("recl-quorum-a-{tag}"),
-            format!("recl-quorum-b-{tag}"),
-            format!("recl-quorum-c-{tag}"),
-        ];
-        for r in &roster {
-            ts::register_hybrid_key(dir, r).await;
-        }
-        let policy = ReclaimPolicy {
-            abandonment_window,
-            reclaim_quorum: ReclaimQuorum {
-                roster_key_ids: roster.to_vec(),
-                threshold: 2,
-            },
-        };
-        (policy, roster)
-    }
-
-    // ── witness: non_reclaim_row_is_noop ────────────────────────────────
-
-    async fn run_non_reclaim_row_is_noop(dir: &dyn FederationDirectory, tag: &str) {
-        let (owner, _node, reclaimer, target) = seed_owner_binding(dir, tag).await;
-        let now = Utc::now();
-
-        // (a) not even a `withdraws` — an ordinary `scores`-shaped row.
-        let mut not_withdraws = reclaim_row(&reclaimer, &target, &[]);
-        not_withdraws.attestation_type = "scores".to_owned();
+            .expect("read")
+            .expect("binding stored");
+        assert!(
+            stored_binding.asserted_at < now - policy.abandonment_window,
+            "({suffix}) rc3: the binding itself IS the initial freshness floor, and this fixture \
+             needs it OUTSIDE the window for the abandonment arm to be reachable"
+        );
         assert_eq!(
-            check_ownership_reclaim_admission(dir, &not_withdraws, None, now)
+            crate::federation::admission::owner_of(dir, &node)
                 .await
-                .unwrap(),
-            ReclaimVerdict::NotAReclaim,
-            "a non-withdraws row must never be treated as a reclaim"
+                .expect("owner_of"),
+            Some(owner.clone()),
+            "({suffix}) the node starts owned by its incumbent"
         );
 
-        // (b) a withdraws targeting something that ISN'T an owner-binding —
-        // an ordinary (non-owner) `delegates_to`, the act-on-behalf/
-        // hierarchy shape `check_single_node_owner_admission` and
-        // `is_owner_binding_envelope` both explicitly leave untouched (no
-        // `dimension` / `delegation_purpose` owner-binding marker).
-        let plain_id = format!("nr-b-target-{tag}");
-        let plain_envelope = serde_json::json!({
-            "id": plain_id,
-            "kind": "delegates_to",
-            "scope": ["infra:serve"],
-        });
-        let (och, classical, pqc) = ts::sign_envelope(&owner, &plain_envelope);
-        let plain_ts = Utc::now();
-        // Row id is a fresh UUID (postgres's `::uuid` column) — `plain_id`
-        // above is just descriptive envelope content, not the row key.
-        let non_owner_target = Attestation {
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            attesting_key_id: owner.clone(),
-            attested_key_id: target.attested_key_id.clone(),
-            attestation_type: attestation_type::DELEGATES_TO.to_owned(),
-            weight: Some(1.0),
-            asserted_at: plain_ts,
-            expires_at: None,
-            attestation_envelope: plain_envelope,
-            original_content_hash: och,
-            scrub_signature_classical: classical,
-            scrub_signature_pqc: pqc,
-            scrub_key_id: owner.clone(),
-            scrub_timestamp: plain_ts,
-            pqc_completed_at: None,
+        // ── Step 1: the petition.
+        let petition = signed_row(
+            &filer,
+            &node,
+            attestation_type::SCORES,
+            build_reclaim_petition_envelope(&binding_id, "owner unreachable for 13 months"),
+            &[],
+            now,
+        );
+        store(dir, &petition).await.expect("petition");
+
+        // ── Step 2: the CC 4.3 finding, co-signed 2-of-3 by the WA body.
+        let finding_env = build_wa_finding_envelope(
+            WaFinding::Abandonment,
+            &binding_id,
+            &petition.attestation_id,
+            "sustained non-response plus out-of-band confirmation",
+        );
+        let finding = signed_row(
+            &wa[0],
+            &node,
+            attestation_type::SCORES,
+            finding_env.clone(),
+            &[&wa[1]],
+            now,
+        );
+        store(dir, &finding).await.expect("finding");
+
+        // ══ RED 1 — a withdraws with NO wa_adjudication_ref is refused,
+        //    naming exactly that. This is CC 3.2's recovery gate: without
+        //    it, K's own key liberates K from its owner.
+        let mut bare_env = EnvelopeCore {
+            references_attestation_id: Some(binding_id.clone()),
+            ..Default::default()
+        }
+        .to_value();
+        bare_env
+            .as_object_mut()
+            .expect("object")
+            .remove(field::WA_ADJUDICATION_REF);
+        let bare = signed_row(
+            &node,
+            &node,
+            attestation_type::WITHDRAWS,
+            bare_env,
+            &[],
+            now,
+        );
+        assert_eq!(
+            check_ownership_reclaim_admission(dir, &bare, Some(&policy), now)
+                .await
+                .expect("gate")
+                .refusal(),
+            Some(ReclaimRefusal::WaAdjudicationRefMissing),
+            "({suffix}) a gated withdraws with no wa_adjudication_ref must be refused BY NAME"
+        );
+        assert!(
+            store(dir, &bare).await.is_err(),
+            "({suffix}) and the real put gate must refuse it too — the gate is not advisory"
+        );
+
+        // ══ RED 2 — a wa_adjudication_ref that resolves to nothing.
+        let dangling = signed_row(
+            &node,
+            &node,
+            attestation_type::WITHDRAWS,
+            build_reclaim_withdraws_envelope(&binding_id, &uuid::Uuid::new_v4().to_string()),
+            &[],
+            now,
+        );
+        assert_eq!(
+            check_ownership_reclaim_admission(dir, &dangling, Some(&policy), now)
+                .await
+                .expect("gate")
+                .refusal(),
+            Some(ReclaimRefusal::WaAdjudicationRefUnresolvable),
+            "({suffix}) a ref naming no held attestation is refused"
+        );
+        // …and one that resolves to a REAL row that is not a finding.
+        let not_a_finding = signed_row(
+            &node,
+            &node,
+            attestation_type::WITHDRAWS,
+            build_reclaim_withdraws_envelope(&binding_id, &petition.attestation_id),
+            &[],
+            now,
+        );
+        assert_eq!(
+            check_ownership_reclaim_admission(dir, &not_a_finding, Some(&policy), now)
+                .await
+                .expect("gate")
+                .refusal(),
+            Some(ReclaimRefusal::NotAWaFinding),
+            "({suffix}) the petition is not the finding — a ref must resolve to a QUORUM finding"
+        );
+
+        // ══ RED 3 — an under-signed finding (1 of the required 2).
+        let short_finding = signed_row(
+            &wa[0],
+            &node,
+            attestation_type::SCORES,
+            finding_env.clone(),
+            &[],
+            now,
+        );
+        store(dir, &short_finding).await.expect("short finding");
+        let short_withdraws = signed_row(
+            &node,
+            &node,
+            attestation_type::WITHDRAWS,
+            build_reclaim_withdraws_envelope(&binding_id, &short_finding.attestation_id),
+            &[],
+            now,
+        );
+        match check_ownership_reclaim_admission(dir, &short_withdraws, Some(&policy), now)
+            .await
+            .expect("gate")
+        {
+            ReclaimVerdict::Refused {
+                reason: ReclaimRefusal::WaQuorumShort,
+                quorum: Some(q),
+                ..
+            } => {
+                assert_eq!(
+                    (q.counted, q.required, q.roster_size),
+                    (1, 2, 3),
+                    "({suffix}) the refusal must say how far short: {q:?}"
+                );
+            }
+            other => panic!("({suffix}) a 1-of-3 finding must be WaQuorumShort, got {other:?}"),
+        }
+
+        // ══ RED 3b — THE SYBIL. Two keys that SELF-ASSERT the
+        //    `wise_authority` card but hold no seat in the WA body co-sign a
+        //    finding. `identity_type` is self-declared at registration
+        //    (CC 3.4.7.1 / #543 `DerivedFromVerifiedState`), so if the card
+        //    alone counted, anyone could register two keys and take any node
+        //    in the mesh. The seat is what confers; the card is only
+        //    legibility.
+        let sybil: [String; 2] = [format!("r-sybil-a-{suffix}"), format!("r-sybil-b-{suffix}")];
+        for k in &sybil {
+            register(
+                dir,
+                k,
+                &[identity_type::USER, identity_type::WISE_AUTHORITY],
+            )
+            .await;
+        }
+        let sybil_finding = signed_row(
+            &sybil[0],
+            &node,
+            attestation_type::SCORES,
+            finding_env.clone(),
+            &[&sybil[1]],
+            now,
+        );
+        store(dir, &sybil_finding).await.expect("sybil finding");
+        let sybil_withdraws = signed_row(
+            &node,
+            &node,
+            attestation_type::WITHDRAWS,
+            build_reclaim_withdraws_envelope(&binding_id, &sybil_finding.attestation_id),
+            &[],
+            now,
+        );
+        match check_ownership_reclaim_admission(dir, &sybil_withdraws, Some(&policy), now)
+            .await
+            .expect("gate")
+        {
+            ReclaimVerdict::Refused {
+                reason: ReclaimRefusal::WaQuorumShort,
+                quorum: Some(q),
+                ..
+            } => assert_eq!(
+                q.counted, 0,
+                "({suffix}) a self-asserted `wise_authority` card with no seat must count for \
+                 NOTHING: {q:?}"
+            ),
+            other => panic!(
+                "({suffix}) two self-declared WAs outside the body must not reach quorum, got \
+                 {other:?}"
+            ),
+        }
+
+        // ══ RED 3c — THE CARD. CC 4.3's normative heading is "The Wise wear
+        //    the same card": a SEATED member whose registered identity_type
+        //    does not carry `wise_authority` is not legible as a WA and its
+        //    co-signature does not COUNT — while still sitting in the
+        //    denominator. A second body, so the 2-of-3 green path above keeps
+        //    its own roster.
+        let uncarded = format!("r-uncarded-{suffix}");
+        register(dir, &uncarded, &[identity_type::USER]).await;
+        let body2 = format!("r-wa-body2-{suffix}");
+        dir.put_family_local(Family {
+            family_key_id: body2.clone(),
+            family_name: format!("half-legible authorities {suffix}"),
+            members: [&wa[0], &wa[1], &uncarded]
+                .iter()
+                .map(|k| FamilyMember {
+                    key_id: (*k).clone(),
+                    joined_at: now,
+                    role: Some("member".to_owned()),
+                })
+                .collect(),
+            founded_at: now,
+            consensus_protocol: "majority".to_owned(),
+            consensus_protocol_entrenched: false,
             persist_row_hash: String::new(),
-            subject_key_ids: Vec::new(),
-            withdraws_admission_rule: None,
-            cohort_scope: "federation".to_owned(),
-            tier: attestation_tier::FEDERATION.to_owned(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
-        };
-        dir.put_attestation(SignedAttestation {
-            attestation: non_owner_target.clone(),
         })
         .await
-        .expect("plain (non-owner) delegates_to admitted");
-        let withdraws_non_owner = reclaim_row(&reclaimer, &non_owner_target, &[]);
-        assert_eq!(
-            check_ownership_reclaim_admission(dir, &withdraws_non_owner, None, now)
-                .await
-                .unwrap(),
-            ReclaimVerdict::NotAReclaim,
-            "a withdraws against a non-owner-binding target is not this mechanism's concern"
+        .expect("seat the half-legible body");
+        let half_legible = signed_row(
+            &wa[0],
+            &node,
+            attestation_type::SCORES,
+            finding_env.clone(),
+            &[&uncarded],
+            now,
         );
-
-        // (c) self-withdrawal — the incumbent revoking their OWN binding.
-        let self_withdraw = reclaim_row(&owner, &target, &[]);
-        assert_eq!(
-            check_ownership_reclaim_admission(dir, &self_withdraw, None, now)
-                .await
-                .unwrap(),
-            ReclaimVerdict::NotAReclaim,
-            "self-withdrawal is ordinary rule-1 authority, never a reclaim"
+        store(dir, &half_legible)
+            .await
+            .expect("half-legible finding");
+        let half_withdraws = signed_row(
+            &node,
+            &node,
+            attestation_type::WITHDRAWS,
+            build_reclaim_withdraws_envelope(&binding_id, &half_legible.attestation_id),
+            &[],
+            now,
         );
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn non_reclaim_row_is_noop() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("construct sqlite engine");
-        let dir = engine.federation_directory();
-        run_non_reclaim_row_is_noop(&*dir, "sq").await;
-    }
-
-    // ── witness: reclaim_inert_without_policy_refuses ───────────────────
-
-    async fn run_reclaim_inert_without_policy_refuses(dir: &dyn FederationDirectory, tag: &str) {
-        let (owner, _node, reclaimer, target) = seed_owner_binding(dir, tag).await;
-        // v21.8.0 fail-safe: the control below (WITH a policy → Admit) needs a
-        // genuinely-abandoned owner, i.e. a PRESENT-then-stale floor.
-        let stale = self_touch_claim(&owner, Utc::now() - Duration::days(60));
-        dir.put_touch_claim(&stale).await.expect("stale self-touch");
-        let (policy, roster) = two_of_three_policy(dir, tag, Duration::days(30)).await;
-        let bytes = reclaim_assertion_bytes(&target, &reclaimer).unwrap();
-        let sigs = vec![
-            ts::threshold_sign(&roster[0], &bytes),
-            ts::threshold_sign(&roster[1], &bytes),
-        ];
-        let row = reclaim_row(&reclaimer, &target, &sigs);
-
-        // A well-formed reclaim (satisfies quorum + provably-abandoned via the
-        // stale floor above) — but policy is None ⇒ always refused.
-        match check_ownership_reclaim_admission(dir, &row, None, Utc::now())
-            .await
-            .unwrap()
+        match check_ownership_reclaim_admission(
+            dir,
+            &half_withdraws,
+            Some(&ReclaimPolicy::wise_authority(&body2)),
+            now,
+        )
+        .await
+        .expect("gate")
         {
-            ReclaimVerdict::Refused { .. } => {}
-            other => panic!("policy=None must ALWAYS refuse, got {other:?}"),
+            ReclaimVerdict::Refused {
+                reason: ReclaimRefusal::WaQuorumShort,
+                quorum: Some(q),
+                ..
+            } => assert_eq!(
+                (q.counted, q.required, q.roster_size),
+                (1, 2, 3),
+                "({suffix}) TWO seated members signed, but only the card-carrying one COUNTS — \
+                 and the uncarded seat still sits in the denominator: {q:?}"
+            ),
+            other => panic!(
+                "({suffix}) a seated-but-illegible co-signer must not carry the quorum, got \
+                 {other:?}"
+            ),
         }
-        // Sanity: the SAME row, SAME quorum, WITH the policy, admits — so
-        // the None-refusal above is really the policy gate, not some other
-        // defect in the fixture.
-        assert_eq!(
-            check_ownership_reclaim_admission(dir, &row, Some(&policy), Utc::now())
-                .await
-                .unwrap(),
-            ReclaimVerdict::Admit,
-            "control: the identical well-formed reclaim admits once a policy is injected"
+
+        // ══ RED 4 — the accord roster is not a WA body.
+        let accord_policy = ReclaimPolicy::wise_authority(
+            ciris_verify_core::accord_genesis::HUMANITY_ACCORD_FAMILY_KEY_ID,
         );
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn reclaim_inert_without_policy_refuses() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("construct sqlite engine");
-        let dir = engine.federation_directory();
-        run_reclaim_inert_without_policy_refuses(&*dir, "sq").await;
-    }
-
-    // ── witness: reclaim_admits_abandoned_owner_with_quorum ─────────────
-
-    async fn run_reclaim_admits_abandoned_owner_with_quorum(
-        dir: &dyn FederationDirectory,
-        tag: &str,
-    ) {
-        let (owner, _node, reclaimer, target) = seed_owner_binding(dir, tag).await;
-        // v21.8.0 fail-safe semantics: PROVABLE abandonment requires a floor
-        // that was PRESENT and then went stale (absence is not proof — see
-        // reclaim_refuses_absent_floor). Store a stale self-touch (60 days ago),
-        // well outside the 30-day window.
-        let stale = self_touch_claim(&owner, Utc::now() - Duration::days(60));
-        dir.put_touch_claim(&stale)
-            .await
-            .expect("a past-dated self-touch is admitted (not future-skewed)");
-        let (policy, roster) = two_of_three_policy(dir, tag, Duration::days(30)).await;
-        let bytes = reclaim_assertion_bytes(&target, &reclaimer).unwrap();
-        let sigs = vec![
-            ts::threshold_sign(&roster[0], &bytes),
-            ts::threshold_sign(&roster[2], &bytes),
-        ];
-        let row = reclaim_row(&reclaimer, &target, &sigs);
-        assert_eq!(
-            check_ownership_reclaim_admission(dir, &row, Some(&policy), Utc::now())
-                .await
-                .unwrap(),
-            ReclaimVerdict::Admit,
-            "a present-then-stale (provably-abandoned) owner + a real 2-of-3 quorum must admit"
+        let good_env = build_reclaim_withdraws_envelope(&binding_id, &finding.attestation_id);
+        let good = signed_row(
+            &node,
+            &node,
+            attestation_type::WITHDRAWS,
+            good_env.clone(),
+            &[],
+            now,
         );
-    }
+        assert_eq!(
+            check_ownership_reclaim_admission(dir, &good, Some(&accord_policy), now)
+                .await
+                .expect("gate")
+                .refusal(),
+            Some(ReclaimRefusal::AccordRosterIsNotWaAuthority),
+            "({suffix}) v21.8.0's accord-rostered authority is now non-conformant"
+        );
+        // …and with NO published policy at all, nothing is seizable.
+        assert_eq!(
+            check_ownership_reclaim_admission(dir, &good, None, now)
+                .await
+                .expect("gate")
+                .refusal(),
+            Some(ReclaimRefusal::NoDeploymentPolicy),
+            "({suffix}) an unpublished WA body means no reclaim is admissible here"
+        );
 
-    /// v21.8.0 (CIRISPersist#519 activation) — the shipped conservative
-    /// default: a 180-day window + a strict-majority accord quorum. Locks the
-    /// pre-ratification parameters CC#43 will confirm/refine; an empty roster
-    /// yields threshold 1 over 0 members (unmeetable) — fail-closed.
-    #[test]
-    fn humanity_accord_default_is_conservative() {
-        let p = ReclaimPolicy::humanity_accord_default(vec!["A1".into(), "B1".into(), "C1".into()]);
-        assert_eq!(p.abandonment_window, Duration::days(180));
-        assert_eq!(p.reclaim_quorum.threshold, 2, "strict majority of 3");
-        assert_eq!(p.reclaim_quorum.roster_key_ids.len(), 3);
-        // empty roster ⇒ threshold 1, roster 0 ⇒ no quorum ever meetable.
-        let empty = ReclaimPolicy::humanity_accord_default(vec![]);
-        assert_eq!(empty.reclaim_quorum.threshold, 1);
-        assert!(empty.reclaim_quorum.roster_key_ids.is_empty());
-    }
+        // ══ RED 5 — THE SINGLE-ACT TRANSFER. Refused before authority is
+        //    even considered, and unrepresentable in the admitted verdict.
+        let mut collapsed_env = good_env.clone();
+        collapsed_env.as_object_mut().expect("object").insert(
+            "successor_owner_key_id".to_owned(),
+            serde_json::Value::String(claimant.clone()),
+        );
+        let collapsed = signed_row(
+            &node,
+            &node,
+            attestation_type::WITHDRAWS,
+            collapsed_env,
+            &[],
+            now,
+        );
+        assert_eq!(
+            check_ownership_reclaim_admission(dir, &collapsed, Some(&policy), now)
+                .await
+                .expect("gate")
+                .refusal(),
+            Some(ReclaimRefusal::SingleActTransferAttempted),
+            "({suffix}) a withdraws that names who gets the node next collapses steps 3 and 4"
+        );
+        assert!(
+            store(dir, &collapsed).await.is_err(),
+            "({suffix}) …and the real put gate refuses it, so it never lands"
+        );
 
-    /// v21.8.0 (CIRISPersist#519 activation) — the FAIL-SAFE: an owner with NO
-    /// signed freshness floor at all is NOT reclaimable, even with a valid
-    /// quorum and a policy. Absence of a floor is absence of evidence, not
-    /// proof of death — this is what makes activation safe before any
-    /// touch-claim producer exists (every node's floor is absent today).
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn reclaim_refuses_absent_floor() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("construct sqlite engine");
-        let dir = engine.federation_directory();
-        let (_owner, _node, reclaimer, target) = seed_owner_binding(&*dir, "absent").await;
-        // No touch claim stored → floor absent.
-        let (policy, roster) = two_of_three_policy(&*dir, "absent", Duration::days(30)).await;
-        let bytes = reclaim_assertion_bytes(&target, &reclaimer).unwrap();
-        let sigs = vec![
-            ts::threshold_sign(&roster[0], &bytes),
-            ts::threshold_sign(&roster[2], &bytes),
-        ];
-        let row = reclaim_row(&reclaimer, &target, &sigs);
+        // ══ RED 6 — an issuer with no CC rule-(2)/(4) standing.
+        let outsider = signed_row(
+            &filer,
+            &node,
+            attestation_type::WITHDRAWS,
+            good_env.clone(),
+            &[],
+            now,
+        );
+        assert_eq!(
+            check_ownership_reclaim_admission(dir, &outsider, Some(&policy), now)
+                .await
+                .expect("gate")
+                .refusal(),
+            Some(ReclaimRefusal::IssuerLacksRecoveryStanding),
+            "({suffix}) a quorum finding is not a warrant for an arbitrary third party"
+        );
+
+        // ══ RED 7 — a fresh binding while the incumbent is still live is the
+        //    ordinary single-owner refusal (the claimant cannot skip step 3).
+        let premature =
+            ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &claimant, &node);
         assert!(
             matches!(
-                check_ownership_reclaim_admission(&*dir, &row, Some(&policy), Utc::now())
-                    .await
-                    .unwrap(),
-                ReclaimVerdict::Refused { .. }
+                store(dir, &premature).await,
+                Err(Error::NodeAlreadyOwned { .. })
             ),
-            "an absent freshness floor is not abandonment — reclaim must be refused (fail-safe)"
+            "({suffix}) the claimant cannot bind while the incumbent is live"
         );
-    }
 
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn reclaim_admits_abandoned_owner_with_quorum() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+        // ══ GREEN — step 3: the full ceremony admits, THROUGH THE REAL GATE.
+        assert!(
+            check_ownership_reclaim_admission(dir, &good, Some(&policy), now)
+                .await
+                .expect("gate")
+                .is_admit(),
+            "({suffix}) petition + 2-of-3 finding + rule-(2) issuer + lapsed floor ⇒ admit"
+        );
+        std::env::set_var(ReclaimPolicy::WA_FAMILY_ENV, &wa_body);
+        store(dir, &good).await.expect("the gated withdraws lands");
+        std::env::remove_var(ReclaimPolicy::WA_FAMILY_ENV);
+        let stored_withdraws = dir
+            .get_attestation(&good.attestation_id)
             .await
-            .expect("construct sqlite engine");
-        let dir = engine.federation_directory();
-        run_reclaim_admits_abandoned_owner_with_quorum(&*dir, "sq").await;
-    }
+            .expect("read")
+            .expect("stored");
+        assert_eq!(
+            stored_withdraws.withdraws_admission_rule,
+            Some(RECLAIM_WITHDRAWS_ADMISSION_RULE),
+            "({suffix}) the row records WHICH rule admitted it"
+        );
 
-    // ── witness: reclaim_refuses_live_owner ─────────────────────────────
+        // ══ THE UNOWNED STATE — between steps 3 and 4, K has NO owner.
+        assert_eq!(
+            crate::federation::admission::owner_of(dir, &node)
+                .await
+                .expect("owner_of"),
+            None,
+            "({suffix}) after the gated withdraws K is UNOWNED — empty self cohort, fail-secure. \
+             If the incumbent were still resolvable here the ceremony would not pass through the \
+             unowned state at all and the single-act wall would be cosmetic."
+        );
 
-    async fn run_reclaim_refuses_live_owner(dir: &dyn FederationDirectory, tag: &str) {
-        let (owner, _node, reclaimer, target) = seed_owner_binding(dir, tag).await;
-        let now = Utc::now();
-        // The owner touched recently — well within the 30-day window.
-        let claim = self_touch_claim(&owner, now - Duration::minutes(5));
-        dir.put_touch_claim(&claim)
-            .await
-            .expect("fresh self-touch admitted");
-
-        let (policy, roster) = two_of_three_policy(dir, tag, Duration::days(30)).await;
-        let bytes = reclaim_assertion_bytes(&target, &reclaimer).unwrap();
-        let sigs = vec![
-            ts::threshold_sign(&roster[0], &bytes),
-            ts::threshold_sign(&roster[1], &bytes),
-        ];
-        let row = reclaim_row(&reclaimer, &target, &sigs);
-        match check_ownership_reclaim_admission(dir, &row, Some(&policy), now)
-            .await
-            .unwrap()
-        {
-            ReclaimVerdict::Refused { .. } => {}
-            other => panic!("a live (recently-touched) owner must be Refused, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn reclaim_refuses_live_owner() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
-            .await
-            .expect("construct sqlite engine");
-        let dir = engine.federation_directory();
-        run_reclaim_refuses_live_owner(&*dir, "sq").await;
-    }
-
-    // ── witness: reclaim_refuses_insufficient_quorum ────────────────────
-
-    async fn run_reclaim_refuses_insufficient_quorum(dir: &dyn FederationDirectory, tag: &str) {
-        let (_owner, _node, reclaimer, target) = seed_owner_binding(dir, tag).await;
-        let (policy, roster) = two_of_three_policy(dir, tag, Duration::days(30)).await;
-        let bytes = reclaim_assertion_bytes(&target, &reclaimer).unwrap();
-
-        // (a) sub-threshold: only 1 of the required 2 signs.
-        let sigs_short = vec![ts::threshold_sign(&roster[0], &bytes)];
-        let row_short = reclaim_row(&reclaimer, &target, &sigs_short);
-        match check_ownership_reclaim_admission(dir, &row_short, Some(&policy), Utc::now())
-            .await
-            .unwrap()
-        {
-            ReclaimVerdict::Refused { .. } => {}
-            other => panic!("sub-threshold quorum must be Refused, got {other:?}"),
+        // ══ RED 8 — step 4 without K's co-signature is refused.
+        let uncosigned =
+            ts::owner_binding_attestation(&uuid::Uuid::new_v4().to_string(), &claimant, &node);
+        match store(dir, &uncosigned).await {
+            Err(Error::OwnershipReclaimRefused {
+                reason: ReclaimRefusal::FreshBindingNotCosignedByNode,
+                ..
+            }) => {}
+            other => panic!(
+                "({suffix}) a post-reclaim rebinding not co-signed by K must be refused, got \
+                 {other:?}"
+            ),
         }
 
-        // (b) forged: 2 submissions, but one signature is corrupted, so
-        // only 1 counts as valid — still insufficient.
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        let mut forged = ts::threshold_sign(&roster[1], &bytes);
-        forged.ed25519_signature_base64 = B64.encode([0u8; 64]);
-        let sigs_forged = vec![ts::threshold_sign(&roster[0], &bytes), forged];
-        let row_forged = reclaim_row(&reclaimer, &target, &sigs_forged);
-        match check_ownership_reclaim_admission(dir, &row_forged, Some(&policy), Utc::now())
+        // ══ GREEN — step 4: co-signed by K, the claimant binds.
+        let rebind_id = uuid::Uuid::new_v4().to_string();
+        let mut rebind = ts::owner_binding_attestation(&rebind_id, &claimant, &node);
+        let (_h, cl, pq) = ts::sign_envelope(&node, &rebind.attestation_envelope);
+        rebind.additional_scrubs = vec![crate::federation::types::ScrubSig {
+            scrub_key_id: node.clone(),
+            scrub_signature_classical: cl,
+            scrub_signature_pqc: pq,
+        }];
+        store(dir, &rebind)
             .await
-            .unwrap()
-        {
-            ReclaimVerdict::Refused { .. } => {}
-            other => panic!("a forged co-signature must not count, got {other:?}"),
-        }
-    }
+            .expect("co-signed rebinding lands");
+        assert_eq!(
+            crate::federation::admission::owner_of(dir, &node)
+                .await
+                .expect("owner_of"),
+            Some(claimant.clone()),
+            "({suffix}) and only now, after four distinct acts, is K owned again"
+        );
 
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn reclaim_refuses_insufficient_quorum() {
-        let engine = Engine::with_signer(test_signer(), "sqlite::memory:")
+        // ══ THE SEIZURE ARM — a LIVE binding, reached by a seizure finding.
+        //    A fresh touch-claim proves the incumbent is alive; abandonment
+        //    would refuse, seizure must not (rc3: a front-run is reversible).
+        let node2 = format!("r-node2-{suffix}");
+        let owner2 = format!("r-owner2-{suffix}");
+        register(dir, &node2, &[identity_type::NODE]).await;
+        register(dir, &owner2, &[identity_type::USER]).await;
+        let b2_id = uuid::Uuid::new_v4().to_string();
+        store(dir, &ts::owner_binding_attestation(&b2_id, &owner2, &node2))
             .await
-            .expect("construct sqlite engine");
-        let dir = engine.federation_directory();
-        run_reclaim_refuses_insufficient_quorum(&*dir, "sq").await;
-    }
-
-    // ── the same 5 witnesses, once more, against postgres when reachable ─
-
-    #[cfg(feature = "postgres")]
-    #[tokio::test]
-    async fn ownership_reclaim_matrix_postgres() {
-        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
-            eprintln!(
-                "skipping ownership_reclaim_matrix_postgres: CIRIS_PERSIST_TEST_PG_URL unset"
-            );
-            return;
+            .expect("live binding");
+        dir.put_touch_claim(&self_touch(&owner2, now - Duration::minutes(5)))
+            .await
+            .expect("fresh self-touch");
+        let p2 = signed_row(
+            &filer,
+            &node2,
+            attestation_type::SCORES,
+            build_reclaim_petition_envelope(&b2_id, "front-run at provisioning"),
+            &[],
+            now,
+        );
+        store(dir, &p2).await.expect("petition 2");
+        let mk_finding = |kind: WaFinding| {
+            signed_row(
+                &wa[0],
+                &node2,
+                attestation_type::SCORES,
+                build_wa_finding_envelope(kind, &b2_id, &p2.attestation_id, "fraudulent binding"),
+                &[&wa[2]],
+                now,
+            )
         };
-        let engine = Engine::with_signer(test_signer(), &dsn)
+        let aband2 = mk_finding(WaFinding::Abandonment);
+        store(dir, &aband2).await.expect("abandonment finding 2");
+        let seiz2 = mk_finding(WaFinding::Seizure);
+        store(dir, &seiz2).await.expect("seizure finding 2");
+
+        // ══ RED 9 — A FINDING IS NOT A BEARER TOKEN. The genuine, fully
+        //    quorum-signed finding minted against node2's binding is replayed
+        //    against the FIRST node's binding. Everything about it verifies —
+        //    real WAs, real signatures, real quorum — and it must still be
+        //    refused, because it adjudicates a different binding.
+        let replayed = signed_row(
+            &node,
+            &node,
+            attestation_type::WITHDRAWS,
+            build_reclaim_withdraws_envelope(&binding_id, &seiz2.attestation_id),
+            &[],
+            now,
+        );
+        assert_eq!(
+            check_ownership_reclaim_admission(dir, &replayed, Some(&policy), now)
+                .await
+                .expect("gate")
+                .refusal(),
+            Some(ReclaimRefusal::FindingNotAgainstThisBinding),
+            "({suffix}) a valid finding for ONE binding must not authorize a withdraws against \
+             another — a quorum finding is scoped, never a warrant for the mesh"
+        );
+
+        let w_aband = signed_row(
+            &node2,
+            &node2,
+            attestation_type::WITHDRAWS,
+            build_reclaim_withdraws_envelope(&b2_id, &aband2.attestation_id),
+            &[],
+            now,
+        );
+        assert_eq!(
+            check_ownership_reclaim_admission(dir, &w_aband, Some(&policy), now)
+                .await
+                .expect("gate")
+                .refusal(),
+            Some(ReclaimRefusal::NotAbandoned),
+            "({suffix}) a LIVE owner is quiet-proof: abandonment refuses even with a real quorum"
+        );
+        let w_seiz = signed_row(
+            &node2,
+            &node2,
+            attestation_type::WITHDRAWS,
+            build_reclaim_withdraws_envelope(&b2_id, &seiz2.attestation_id),
+            &[],
+            now,
+        );
+        match check_ownership_reclaim_admission(dir, &w_seiz, Some(&policy), now)
             .await
-            .expect("construct postgres engine");
-        let dir = engine.federation_directory();
-        let tag = format!("pg-{}", uuid::Uuid::new_v4().simple());
-        run_non_reclaim_row_is_noop(&*dir, &format!("nr-{tag}")).await;
-        run_reclaim_inert_without_policy_refuses(&*dir, &format!("inert-{tag}")).await;
-        run_reclaim_admits_abandoned_owner_with_quorum(&*dir, &format!("admit-{tag}")).await;
-        run_reclaim_refuses_live_owner(&*dir, &format!("live-{tag}")).await;
-        run_reclaim_refuses_insufficient_quorum(&*dir, &format!("short-{tag}")).await;
+            .expect("gate")
+        {
+            ReclaimVerdict::Admit {
+                finding: WaFinding::Seizure,
+                ..
+            } => {}
+            other => panic!(
+                "({suffix}) rc3: the SAME recovery path reaches a live wrongful binding on a \
+                 seizure finding — a front-run must be reversible, got {other:?}"
+            ),
+        }
+
+        // ══ RED 10 — THE SELF-LIBERATION EXPLOIT, on the rc3-CONFORMANT
+        //    producer shape. rc3: *"The owner-binding `delegates_to(owner → K)`
+        //    names K in its `subject_key_ids`"* — and the moment a producer
+        //    does that, CEG rule 2 (subject self-revocation) ADMITS a
+        //    `withdraws` from K against its own owner, with no adjudication at
+        //    all. That is precisely what CC 3.2 says makes the single-owner
+        //    invariant "worthless".
+        //
+        //    Persist's owner-bindings carry no subject_key_ids today, so the
+        //    other witnesses all travel the rules-1-4-REFUSED branch. This one
+        //    travels the rules-ADMIT branch, which is the load-bearing half:
+        //    without the gate on that side, the row below simply lands.
+        let node3 = format!("r-node3-{suffix}");
+        let owner3 = format!("r-owner3-{suffix}");
+        register(dir, &node3, &[identity_type::NODE]).await;
+        register(dir, &owner3, &[identity_type::USER]).await;
+        let b3_id = uuid::Uuid::new_v4().to_string();
+        let mut b3 = ts::owner_binding_attestation(&b3_id, &owner3, &node3);
+        b3.subject_key_ids = vec![node3.clone()];
+        store(dir, &b3)
+            .await
+            .expect("conformant binding names K as subject");
+        assert_eq!(
+            crate::federation::admission::resolve_withdraws_admission_rule(
+                dir,
+                &node3,
+                &dir.get_attestation(&b3_id)
+                    .await
+                    .expect("read")
+                    .expect("stored")
+            )
+            .await
+            .expect("rule"),
+            2,
+            "({suffix}) the ordinary 4-rule gate really does hand K rule-2 authority over its \
+             own owner-binding — this is the exploit the recovery gate exists to close"
+        );
+        let liberation = signed_row(
+            &node3,
+            &node3,
+            attestation_type::WITHDRAWS,
+            build_reclaim_withdraws_envelope(&b3_id, ""),
+            &[],
+            now,
+        );
+        match store(dir, &liberation).await {
+            // No WA body is published in this process, so the refusal lands at
+            // ceremony step 0 — which is the SHIPPED posture and the strongest
+            // form of this witness: with nothing published, a compromised node
+            // key cannot shed its owner no matter what else it carries.
+            Err(Error::OwnershipReclaimRefused {
+                reason: ReclaimRefusal::NoDeploymentPolicy,
+                ..
+            }) => {}
+            other => panic!(
+                "({suffix}) a rule-2 withdraws against a LIVE owner-binding MUST be refused \
+                 without a resolving wa_adjudication_ref — a compromised node key must not be \
+                 able to shed its own owner, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            crate::federation::admission::owner_of(dir, &node3)
+                .await
+                .expect("owner_of"),
+            Some(owner3.clone()),
+            "({suffix}) …and the node is still owned — the refusal wrote nothing"
+        );
     }
 }

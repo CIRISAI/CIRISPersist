@@ -5,6 +5,168 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased] — #578: who can take a node
+
+> **Scope note.** This section covers **CIRISPersist#578 only**. The version line in
+> `Cargo.toml` is deliberately untouched — a sibling cut owns it, and this section will fold
+> into whatever release it lands in.
+
+### The ruling
+
+CIRISConstitution **rc3** rules the CC 3.2 ownerless-lock recovery path (resolving
+CIRISConstitution#43 item 2), and it differs from what v21.8.0 shipped. Persist committed to
+*"implements whatever CC ratifies"*; this is that ratification, and it changes **who can take a
+node**, so it lands before any reclaim executes in production.
+
+- **Authority is the CC 4.3 Wise-Authority quorum, not the HUMANITY_ACCORD holder roster.**
+  `ReclaimPolicy::humanity_accord_default` and `ReclaimQuorum` are **removed**. `ReclaimPolicy`
+  now names a **WA body** — a `federation_families` row whose roster IS the quorum — and
+  `ReclaimRefusal::AccordRosterIsNotWaAuthority` refuses, by name, a deployment that points the
+  pin back at the accord family. A deployment that publishes nothing refuses everything.
+- **The gated `withdraws` MUST carry a `wa_adjudication_ref`** resolving to the quorum finding.
+  The v21.8.0 shape — an m-of-n co-signature carried directly on the `withdraws` — is gone.
+  *"The substrate records the finding; it never makes it."*
+- **Four steps, never collapsed.** Petition → CC 4.3 quorum finding → gated `withdraws`, after
+  which the node is **unowned** (empty `self` cohort, fail-secure) → fresh owner-binding
+  co-signed by the node. Each step is a refusable gate; `ReclaimRefusal::ceremony_step` names
+  which one, and a unit gate proves every step 0–4 has at least one refusal that can name it.
+- **The 180-day `DEFAULT_ABANDONMENT_WINDOW` stays** as a deployment value (CC pins a 90-day
+  floor). The floor is now enforced: a published window below it is refused, not clamped —
+  running a window nobody published is what CC 3.2 forbids.
+- **rc3 answers persist's open question 3 in-text**, so the answer is encoded rather than
+  bolted on: the owner-binding attestation itself establishes the initial freshness floor. A
+  binding is never floorless, and a stale touch-claim can never drag the floor *backwards*
+  below its binding.
+
+  **Where the fail-secure default moved, stated plainly.** v21.8.0 leaned on "an ABSENT floor is
+  never abandonment", and the reason no node was reclaimable was *incidental*: no touch-claim
+  producer existed, so every floor was absent. Encoding rc3's answer removes that accident — a
+  binding older than the window is now measurable on its own. What replaces it is **deliberate**
+  and much stronger: with no WA body published, `from_deployment_pin` yields `None` and every
+  reclaim is refused at step 0. Nothing in the mesh is seizable until an operator names an
+  adjudicating body, and even then a reclaim needs a petition row, a quorum-signed finding aimed
+  at that exact binding, and an issuer with CC rule-(2)/(4) standing. Net: one sub-predicate
+  loosens, the gate as a whole tightens by a wide margin — and the reason nothing is reclaimable
+  is now an operator decision rather than a missing producer.
+
+### The single-act wall
+
+CC 3.2: *"Reclaim MUST NOT transfer incumbent → claimant in one act."* Made impossible on three
+independent levels, because one is a lapse away from being none:
+
+1. **Unrepresentable.** `ReclaimVerdict::Admit` carries a finding and a quorum and *has no field
+   that could name a successor owner*. A caller holding an admitted verdict has been authorized
+   to admit a `withdraws` and handed no way to say who gets the node next.
+2. **Refused on the wire.** A `withdraws` envelope carrying any of `SUCCESSOR_OWNER_FIELDS` is
+   refused with `SingleActTransferAttempted` *before authority is even considered* — silently
+   ignoring the field would be safe today and would train producers to keep shipping the shape.
+3. **Refused by the ownership gate.** Step 4 still runs `check_single_node_owner_admission`,
+   which rejects a different granter while any live binding remains. The claimant can only bind
+   after the node has genuinely passed through the unowned state.
+
+### Two live defects the ceremony witness surfaced
+
+Both were invisible to the v21.8.0 tests because those called the gate function directly and
+never stored a row.
+
+- **The recovery gate was missing in the direction that already admits.** CC 3.2 requires a
+  `wa_adjudication_ref` on a rule-(2)/(4) `withdraws` too — *"without this gate a compromised
+  node key withdraws its own owner and the single-owner invariant is worthless."* Persist gated
+  only the branch where rules 1–4 refuse. Rules 2/3/4 already **admit** a third-party `withdraws`
+  against a live owner-binding; the only reason that is not a live self-liberation exploit today
+  is that persist's own owner-bindings carry no `subject_key_ids` — which rc3 says a conformant
+  producer MUST populate with K. The gate now runs on **both** branches, closing it before the
+  producer change lands rather than after.
+- **`live_owner_binding_granters` folded only the granter's OWN retraction.** A recovery
+  `withdraws` is issued by the node (or its recovery delegate), never by the incumbent — so
+  step 3 would have stored an admitted `withdraws` and left `owner_of(K)` still resolving to the
+  incumbent. The node would never have reached the unowned state, "empty `self` cohort,
+  fail-secure" would have been prose, and step 4 would have refused the rightful claimant
+  forever. A binding is now non-live if **any** admitted `withdraws`/`recants` references it.
+  Two lists that disagreed about what *live* means; one list now.
+
+### V117 — rule 5 has never been storable
+
+`withdraws_admission_rule` has carried `CHECK (… BETWEEN 1 AND 4)` since V055. v21.8.0 added a
+fifth rule and stamped `5` on the rows it admitted — a value **both SQL backends refuse at
+INSERT**. The memory backend has no CHECK and accepted it, which is exactly why four minor
+versions passed without notice: the only backend exercised end-to-end was the one that enforces
+nothing. The #578 witness stores the gated `withdraws` through the real `put_attestation` path on
+all three backends and hit it on the first run — the recurring "shipped means host-reachable"
+class. V117 widens the range to 5 on sqlite (table rebuild, V114's staging recipe) and postgres
+(discovery-drop + re-add), and keeps it **closed**: a sixth rule widens it deliberately, in a
+migration, on both backends. The value is load-bearing twice — as audit, and as the state
+`check_post_reclaim_rebinding_admission` reads back to know a node owes its own co-signature.
+
+### Authority is re-derived from this node's own verified state (#377)
+
+Nothing is caller-supplied. The roster is `active_family_members` of the pinned WA body
+(revocation-folded; membership changes need the family's own m-of-n, so a Sybil cannot seat
+itself). The threshold is the body's own stored `consensus_protocol` through
+`family_charter_threshold` — floored at a strict majority, fail-secure on anything unrecognised.
+The count is `count_distinct_roster_scrubs`, the same body the charter plane and the commons' undo
+door use, re-verifying every co-signature against pubkeys resolved from this node's directory.
+One predicate, one implementation.
+
+CC 4.3's own normative heading is *"The Wise wear the same card"*, so a counted co-signer must
+also carry `wise_authority` in its registered `identity_type` set — a legibility filter on the
+**numerator** only. The **denominator stays the full roster**: CC 4.3 lets an unresponsive WA
+lapse out of a live set so absence cannot *block*, but on this path a smaller live set means a
+*lower* threshold, and an adversary who can silence WAs would shrink the body down to the seats
+it has captured. Counting against the full roster can only refuse more than CC requires, never
+admit more — the safe direction when the question is whether somebody else gets your node.
+
+### Two decisions CC leaves to the substrate — flagged, not buried
+
+rc3 pins the ceremony and the authority; it does not pin *how the substrate is told either one*.
+Both choices below fail **closed** by default, so neither can make a seizure easier than CC
+allows — but both want confirmation from the ratification chain and byte-agreement from the
+producer side, because a wire shape only one repo knows is a shape nobody can use.
+
+1. **How the WA body is named.** CC 1.16.5 puts appointment outside the wire, so persist takes a
+   deployment-published `family_key_id` (`CIRIS_PERSIST_WA_ADJUDICATION_FAMILY_KEY_ID`) and
+   re-derives roster and threshold from its own stored family. This is the load-bearing pin: it
+   decides whose signatures can take a node. Unset ⇒ nothing is reclaimable.
+2. **What the finding and petition look like.** CC says only *"minted as an attestation"*.
+   Persist mints them on `wa_adjudication:{finding}`; the ratification ask is tracked the same
+   way `objection:{state}` (#574) is.
+
+Refusing the accord family as a WA body is a guard against the **silent** case, not a hard
+barrier: an operator who genuinely wants the accord holders adjudicating must seat them in a
+distinct WA family, which is a deliberate, visible act rather than a pin left where it was. It
+also keeps CC 4.5.1's two independent checks — WA quorum as primary substantive review, 1-of-6
+accord/steward sign-off as secondary — from collapsing into one body.
+
+The WA seat's strength rests on the family plane's existing write posture, and this cut adds no
+new gate there: a **remote** peer cannot seat itself (`put_family` is INSERT-only, so an existing
+`family_key_id` collides on the primary key, and every roster change rides
+`verify_membership_quorum`), while the host-local roster APIs are the node operator's own
+surface — the same trust boundary the accord family already sits behind.
+
+### Also
+
+- The **seizure** arm: rc3 is explicit that the same recovery path reaches a *live* wrongful
+  binding admitted by front-run or fraud, so a seizure finding deliberately does **not** run the
+  abandonment window. A front-run is reversible, not permanent. The witness proves both arms
+  against the same live binding: abandonment refuses it, seizure admits it.
+- New `Error::OwnershipReclaimRefused` (stable `kind()` token
+  `federation_ownership_reclaim_refused`) carrying the typed `ReclaimRefusal`. A bare refusal on
+  a node-seizure path is unacceptable.
+- The finding and petition are minted on a new `wa_adjudication:{finding}` namespace family —
+  **not** under `ownership:*`, because CC 3.4 reserves that family to the live owner and says the
+  recovery path *"rides `withdraws` + `wa_adjudication_ref` and never a fresh `ownership:*`
+  emission."* A finding minted on `ownership:*` would be a seizure by attestation. Ratification
+  ask tracked like `objection:{state}` (#574).
+- One shared exercise body (`exercise_reclaim_ceremony`) runs the whole ceremony end to end plus
+  twelve labelled red witnesses on **memory, sqlite and postgres** — including two that separate
+  the WA **seat**
+  from the WA **card**, since `identity_type` is self-declared: two keys that self-assert
+  `wise_authority` but hold no seat count for **nothing**, and a seated member that does not wear
+  the card does not count *while still sitting in the denominator*. Six deliberate mutations
+  (drop the card filter, drop the single-act wall, revert the withdraws fold, drop the step-4
+  co-signature, drop issuer standing, gate only the refusing branch) each turn a witness red, so
+  none of them is vacuously green.
+
 ## [25.0.0] — 2026-08-02 — #577: the verify pin was a mesh-wide ceiling
 
 **MAJOR because the dependency graph moves under every consumer**, not because persist's own
