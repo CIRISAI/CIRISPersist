@@ -529,15 +529,17 @@ pub struct KeyGrantPayload {
 /// **MANDATORY for streaming epoch-DEK grants** (the §10.5.3 cascade);
 /// a content grant may stay v1, but a stream/epoch grant carrying v1 is
 /// rejected at ingest. Wraps with the `ciris-crypto::key_grant`
-/// `wrap_dek_for_recipient_v2` construction (`KEY_GRANT_ALGORITHM_V2 =
-/// "x25519-mlkem768-aes256-gcm-hkdf-sha256"`, v4.10.0). The payload wire
-/// string `"x25519_mlkem768_aes256_gcm_hkdf_sha256"` names that
-/// construction; **pending CIRISRegistry ratification (CIRISRegistry#64)**
-/// — the CEG mandates `wrap_algorithm: v2` but does not yet pin the
-/// payload enum string (unlike v1's §5.6.8.4-pinned string), so this is
-/// proposed via the same propose-then-ratify path as the STREAM-nonce
-/// epoch encoding (CIRISRegistry#63). If the registry ratifies a
-/// different string, only this serde rename changes.
+/// `wrap_dek_for_recipient_v2` construction. The payload wire string
+/// `"x25519_mlkem768_aes256_gcm_hkdf_sha256"` names that construction.
+///
+/// **RATIFIED** at v25.1.0 (CIRISPersist#582): CC 5.1 (class rule CC 3.3.2,
+/// CIRISVerify#234) pins this snake_case spelling as *the single wire
+/// identifier*, closing the propose-then-ratify loop this doc block opened
+/// against CIRISRegistry#64. `ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2`
+/// now carries the same string; the hyphenated form verify shipped through
+/// v11.0.0 is a non-conformant alias that MUST be rejected and MUST NOT be
+/// normalized before comparison — which is why
+/// [`WrapAlgorithm::from_wire_str`] matches exactly and folds nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WrapAlgorithm {
     /// HPKE RFC 9180 base mode, KEM X25519, AEAD AES-128-GCM. Locked
@@ -563,12 +565,26 @@ impl WrapAlgorithm {
 
     /// Parse from the wire-shaped string. Returns `None` on vocabulary
     /// mismatch.
+    ///
+    /// v25.1.0 (CIRISPersist#582, CC 5.1 / CIRISVerify#234) — the v2 arm
+    /// defers to `ciris_crypto::key_grant::key_grant_algorithm_v2_accepts`,
+    /// the **only sanctioned comparison** for that identifier, instead of
+    /// re-spelling it here. Two validators for one artifact must share ONE
+    /// predicate, or the vocabulary drifts the moment one of them is edited.
+    ///
+    /// `accept_legacy_hyphenated = false`: the hyphenated form is
+    /// non-conformant and is refused at the parse door. The predicate
+    /// deliberately does **not** normalize — folding `-` → `_` would make two
+    /// distinct wire identifiers compare equal and defeat CC 5.1's
+    /// single-identifier rule. Already-stored hyphenated values are retired by
+    /// [`crate::maintenance::vocabulary`] (superseded, never rewritten), not
+    /// laundered here.
     pub fn from_wire_str(s: &str) -> Option<Self> {
+        if ciris_crypto::key_grant::key_grant_algorithm_v2_accepts(s, false) {
+            return Some(Self::X25519MlKem768Aes256GcmHkdfSha256);
+        }
         match s {
             "hpke_rfc9180_base_x25519_aes_gcm" => Some(Self::HpkeRfc9180BaseX25519AesGcm),
-            "x25519_mlkem768_aes256_gcm_hkdf_sha256" => {
-                Some(Self::X25519MlKem768Aes256GcmHkdfSha256)
-            }
             _ => None,
         }
     }
@@ -1262,6 +1278,30 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256).unwrap(),
             r#""x25519_mlkem768_aes256_gcm_hkdf_sha256""#
+        );
+    }
+
+    /// v25.1.0 (CIRISPersist#582, CC 5.1 / CIRISVerify#234) — persist's enum
+    /// and verify's constant name ONE construction, and a `#[serde(rename)]`
+    /// attribute cannot be a `const`. So the equality is asserted here: if
+    /// verify re-spells the identifier again, this fires instead of persist
+    /// silently serializing a form nothing else accepts.
+    #[test]
+    fn v2_wire_string_is_verifys_ratified_identifier() {
+        assert_eq!(
+            WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256.as_str(),
+            ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2,
+            "the serde rename + as_str spelling must equal verify's constant"
+        );
+        // The non-conformant hyphenated alias is REFUSED at the parse door,
+        // and is NOT normalized into the conformant form.
+        assert_eq!(
+            WrapAlgorithm::from_wire_str(
+                ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED
+            ),
+            None,
+            "CC 5.1: the hyphenated alias is non-conformant and MUST NOT be \
+             normalized before comparison"
         );
     }
 

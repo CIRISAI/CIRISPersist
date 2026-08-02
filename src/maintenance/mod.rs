@@ -11,6 +11,14 @@
 //!   the [`ArchiveWindow`] knob.
 //! - [`service`] — the [`MaintenanceService`] trait surface.
 //! - [`postgres`] / [`sqlite`] — backend impls (feature-gated).
+//! - [`vocabulary`] — v25.1.0 (CIRISPersist#582) the **vocabulary
+//!   tightening** sweep: a one-time (and re-runnable) maintenance action
+//!   that retires a non-conformant wire identifier from stored
+//!   attestations by SUPERSEDING the rows that carry it. Same idiom as
+//!   the rest of this module (typed report, per-phase counts,
+//!   idempotent, every backend); unlike the others it needs a signer, so
+//!   it is reached through [`crate::Engine::tighten_vocabulary`] rather
+//!   than the raw-connection [`MaintenanceService`] trait.
 //!
 //! # Per-module retention defaults
 //!
@@ -39,11 +47,16 @@ pub mod service;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod types;
+pub mod vocabulary;
 
 pub use service::MaintenanceService;
 pub use types::{
     validate_sql_identifier, ArchiveReport, ArchiveWindow, MaintenanceReport, PruneReport,
     RetentionPolicy, RetentionPolicyRow, RetentionReport, VacuumReport,
+};
+pub use vocabulary::{
+    run_vocabulary_tightening, TighteningAction, TighteningFamily, TighteningOutcome,
+    TighteningSkip, VocabularyTightening, VocabularyTighteningReport,
 };
 
 /// Maintenance-layer errors. Surface kinds map onto the PyO3 typed

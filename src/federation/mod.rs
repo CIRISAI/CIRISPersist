@@ -36,6 +36,9 @@ pub mod accord_quorum;
 pub mod admission;
 pub mod age;
 pub mod at_rest_cascade;
+/// v25.1.0 (CIRISPersist#582) — the backend-generic signed-ATTESTATION emit
+/// recipe (distinct from [`emit`], the trust-grant/audit-entry API).
+pub mod attestation_emit;
 #[cfg(feature = "cirisaudit")]
 pub mod backfill;
 pub mod blackhole;

@@ -3692,13 +3692,15 @@ impl Engine {
     /// canonical bytes are both SHA-256'd (`original_content_hash`) and
     /// hybrid-signed by the caller, so the two paths sign byte-identical
     /// content.
+    ///
+    /// v25.1.0 (CIRISPersist#582) — delegates to
+    /// [`attestation_emit::canonicalize`](crate::federation::attestation_emit::canonicalize),
+    /// the backend-generic half of the recipe.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     fn emit_canonicalize(
         envelope: &serde_json::Value,
     ) -> Result<Vec<u8>, crate::federation::Error> {
-        crate::verify::canonical::ceg_produce_canonicalize(envelope).map_err(|e| {
-            crate::federation::Error::Backend(format!("emit_attestation canonicalize: {e}"))
-        })
+        crate::federation::attestation_emit::canonicalize(envelope)
     }
 
     /// Shared body of [`Self::emit_attestation`] / [`Self::emit_attestation_self`]:
@@ -3718,71 +3720,27 @@ impl Engine {
         sig: ciris_crypto::HybridSignature,
         input: crate::federation::EmitAttestationInput,
     ) -> Result<String, crate::federation::Error> {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use sha2::{Digest, Sha256};
-
-        // CIRISPersist#293 (CC 2.6.3 / §0.6) — refuse a non-canonical
-        // (uppercase / empty) subject id at admission, before the row is
-        // assembled. Covers BOTH emit entry points (this is their shared
-        // body), so `emit_attestation` and `emit_attestation_self` enforce
-        // it identically on either backend.
-        crate::federation::validate_subject_key_ids(&input.subject_key_ids)?;
-
-        let original_content_hash = hex::encode(Sha256::digest(canonical));
-        let now = chrono::Utc::now();
-
-        let attested_key_id = input.attested_key_id.unwrap_or_else(|| key_id.clone());
-        // v21.11.0 (CIRISPersist#527) — the emit chokepoint VALIDATES the
-        // recipient axis; it does NOT default it. The prior `is_empty() =>
-        // FEDERATION` was a second fail-OPEN on the same axis as
-        // `with_envelope`'s (now-removed) default: an empty `cohort_scope`
-        // was silently laundered into a valid `federation`, broadcasting
-        // federation-wide AND slipping past the put-side `check_cohort_scope`
-        // empty-rejection. Now an empty/invalid scope is REJECTED here (a
-        // producer must state the axis — `with_envelope` requires it), so no
-        // construction path can fail open.
-        crate::federation::admission::check_cohort_scope(&input.cohort_scope)?;
-        let cohort_scope = input.cohort_scope;
-
-        let row = crate::federation::Attestation {
-            attestation_id: uuid::Uuid::new_v4().to_string(),
-            attesting_key_id: key_id.clone(),
-            attested_key_id,
-            attestation_type: input.attestation_type,
-            // v9.4.0 (#252) — fold the optional weight onto the row. `None`
-            // preserves the pre-9.4.0 default (read as `1.0` by the trust
-            // model); `Some(w)` lets a weighted `scores` producer keep its
-            // band instead of collapsing to `1.0`.
-            weight: input.weight,
-            asserted_at: now,
-            expires_at: input.expires_at,
-            attestation_envelope: input.attestation_envelope.to_value(),
-            original_content_hash,
-            scrub_signature_classical: B64.encode(&sig.classical.signature),
-            scrub_signature_pqc: Some(B64.encode(&sig.pqc.signature)),
-            scrub_key_id: key_id,
-            scrub_timestamp: now,
-            pqc_completed_at: Some(now),
-            persist_row_hash: String::new(),
-            subject_key_ids: input.subject_key_ids,
-            withdraws_admission_rule: None,
-            cohort_scope,
-            tier: crate::federation::types::attestation_tier::FEDERATION.to_string(),
-            promoted_at: None,
-            additional_scrubs: Vec::new(),
-        };
-        let attestation_id = row.attestation_id.clone();
-        // v21.2.0 (CIRISPersist#509 FLOOR) — chokepoint (c): capture what
-        // the promote-on-consent sweep needs to know BEFORE `row` moves
-        // into `put_attestation` below.
-        let is_grant_dimension =
-            crate::federation::admission::envelope_dimension(&row.attestation_envelope)
-                == Some(crate::federation::consent_grammar::GRANT_DIMENSION);
-        let attester_key_id = row.attesting_key_id.clone();
-
-        self.federation_directory()
-            .put_attestation(crate::federation::SignedAttestation { attestation: row })
-            .await?;
+        // v25.1.0 (CIRISPersist#582) — the assemble+put half is the
+        // backend-generic `attestation_emit::assemble_and_put`, so a sweep
+        // holding only a `FederationDirectory` (and the in-memory backend,
+        // which has no Engine at all) emits through THIS recipe rather than a
+        // hand-rolled copy of it. Both admission gates this chokepoint owns —
+        // #293 subject-id canonicality and #527 cohort_scope validate-never-
+        // default — moved WITH the body, so they still cover both entry
+        // points and both backends.
+        let emitted = crate::federation::attestation_emit::assemble_and_put(
+            &*self.federation_directory(),
+            key_id,
+            canonical,
+            sig,
+            input,
+        )
+        .await?;
+        let attestation_id = emitted.attestation_id;
+        // v21.2.0 (CIRISPersist#509 FLOOR) — chokepoint (c): what the
+        // promote-on-consent sweep needs to know about the row just written.
+        let is_grant_dimension = emitted.is_grant_dimension;
+        let attester_key_id = emitted.attesting_key_id;
 
         // v21.2.0 (CIRISPersist#509 FLOOR) — "the payload follows the
         // consent edge": a newly-admitted SELF-authored
@@ -4254,6 +4212,56 @@ impl Engine {
                 crate::maintenance::sqlite::SqliteMaintenanceBackend::new(b.conn_handle()),
             ),
         }
+    }
+
+    /// v25.1.0 (CIRISPersist#582) — run one **vocabulary tightening** over
+    /// this node's federation-tier attestations: retire every row carrying
+    /// `target`'s non-conformant value at `target.field_path` by emitting a
+    /// tightened replacement plus a `supersedes` composer naming the original.
+    ///
+    /// The old rows **stay** — signed, superseded, auditable. Nothing is
+    /// rewritten in place, because a signed row rewritten in place no longer
+    /// matches its own signature (CIRISPersist#541).
+    ///
+    /// This is the host-reachable entry point for the maintenance action; the
+    /// sweep itself lives in [`crate::maintenance::vocabulary`] and is
+    /// backend-generic. Emission goes through
+    /// [`Self::emit_attestation_self`] — the node's real signed-emit path —
+    /// so the sweep cannot certify a recipe no host actually runs.
+    ///
+    /// - `dry_run = true` examines and classifies but writes nothing.
+    /// - Only rows attested by THIS node's derived key are retired; anything
+    ///   else is skipped and reported
+    ///   ([`TighteningSkip::ForeignAttester`](crate::maintenance::TighteningSkip::ForeignAttester)).
+    /// - Idempotent: a second run over an already-tightened corpus writes
+    ///   nothing and says so
+    ///   ([`VocabularyTighteningReport::wrote_nothing`](crate::maintenance::VocabularyTighteningReport::wrote_nothing)).
+    ///
+    /// The first caller is CC 5.1's snake_case key-grant identifier —
+    /// [`VocabularyTightening::key_grant_algorithm_v2`](crate::maintenance::VocabularyTightening::key_grant_algorithm_v2)
+    /// — but the sweep hardcodes neither that field nor that value: the next
+    /// tightening is a call, not a new sweep.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn tighten_vocabulary(
+        &self,
+        target: &crate::maintenance::VocabularyTightening,
+        dry_run: bool,
+    ) -> Result<crate::maintenance::VocabularyTighteningReport, crate::maintenance::Error> {
+        let attester = self.local_derived_key_id().await.map_err(|e| {
+            crate::maintenance::Error::Backend(format!(
+                "tighten_vocabulary derive attester key_id: {e} — a tightening emits SIGNED \
+                 replacement rows, so it needs the node's own hybrid signer"
+            ))
+        })?;
+        let dir = self.federation_directory();
+        crate::maintenance::run_vocabulary_tightening(
+            &*dir,
+            &attester,
+            target,
+            dry_run,
+            |input| async move { self.emit_attestation_self(input).await },
+        )
+        .await
     }
 
     /// v1.11.0 (CIRISPersist#89) — Rust-public ingest facade: run the

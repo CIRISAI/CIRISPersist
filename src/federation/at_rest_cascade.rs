@@ -64,8 +64,17 @@ pub const WRAP_ALGORITHM_CONTENT_MASTER: &str = "aes256_gcm_content_master";
 /// `wrap_algorithm` DB/wire string for a recipient v2 grant — the
 /// CEG §10.5.3 / §5.6.8.4 pinned payload string (underscored), matching
 /// `cirisnode::media_sharing::WrapAlgorithm::X25519MlKem768Aes256GcmHkdfSha256`.
-/// (NOTE: distinct from `ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2`,
-/// which is the hyphenated crypto-internal label inside the wrap envelope.)
+///
+/// v25.1.0 (CIRISPersist#582, CC 5.1 / CIRISVerify#234) — this string and
+/// `ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2` are now **the same
+/// identifier**. They were not: verify's constant carried the hyphenated
+/// spelling until v11.1.0, when CC 5.1 (class rule CC 3.3.2) ratified the
+/// snake_case form as *the single wire identifier* and demoted the hyphenated
+/// one to a non-conformant alias that MUST be rejected and MUST NOT be
+/// normalized before comparison. Persist's column string was already
+/// conformant; the convergence is verify's constant moving to meet it. See
+/// [`crate::maintenance::vocabulary`] for how already-stored non-conformant
+/// values are retired (superseded, never rewritten).
 pub const WRAP_ALGORITHM_V2: &str = "x25519_mlkem768_aes256_gcm_hkdf_sha256";
 
 /// HKDF `context` (info string) for the content-at-rest master key.
@@ -257,6 +266,31 @@ pub struct RecipientWrap {
 /// Returns the `KeyGrantWrapV2` JSON envelope — the exact shape
 /// `wheel_key_grant::wrap_dek_for_recipient_v2_json` produces, so the
 /// PyO3 unwrap surface round-trips it.
+///
+/// # The `"algorithm"` label and CC 5.1 (CIRISPersist#582)
+///
+/// This envelope's `"algorithm"` field is the ONE place persist writes
+/// `ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2` into durable bytes: the
+/// envelope is stored verbatim as `federation_blob_key_grants.wrapped_dek`
+/// (and the community-DEK member-grant column). Verify's v11.1.0 re-spelling
+/// therefore means grants written before that pin carry the hyphenated,
+/// now-non-conformant form at rest.
+///
+/// Those rows are **not** in scope for
+/// [`crate::maintenance::vocabulary`]'s supersede sweep, and deliberately so:
+/// they are unsigned substrate state, not attestations, so there is no
+/// signature to desync and no `supersedes` chain to hang a retirement on — and
+/// the label is descriptive metadata about an AEAD ciphertext that persist's
+/// own unwrap path never reads (`unwrap_dek_v2_json` consumes only the four
+/// `*_b64` fields). Re-labelling a stored wrap would change bytes nobody
+/// verifies to satisfy a rule nobody applies here.
+///
+/// A CONSUMER that does compare the stored label must use verify's sanctioned
+/// `key_grant_algorithm_v2_accepts(candidate, accept_legacy_hyphenated =
+/// true)` while draining pre-v11.1.0 wraps — the escape hatch CC 5.1 supplies
+/// for exactly this — and MUST NOT normalize the separator, which would make
+/// the two identifiers compare equal and defeat the rule. The permanent fix on
+/// that plane is a re-wrap (a fresh DEK cascade), not a relabel.
 pub fn wrap_dek_v2(
     x25519_base64: &str,
     ml_kem_768_base64: &str,
@@ -1126,7 +1160,17 @@ mod tests {
         let dek = fresh_dek().unwrap();
 
         let json = wrap_dek_v2(&B64.encode(x_pub), &B64.encode(&ml_pub), &dek).unwrap();
-        assert!(json.contains("x25519-mlkem768-aes256-gcm-hkdf-sha256"));
+        // v25.1.0 (#582, CC 5.1 / CIRISVerify#234) — assert against the
+        // CONSTANT, not a spelling. The literal used to be pinned here, so the
+        // v11.1.0 hyphenated→snake_case re-cut turned an unrelated crypto
+        // round-trip test into a red. What this test owns is "the envelope
+        // advertises the algorithm the wrap actually used"; which string that
+        // is belongs to verify, and CC 5.1 is where it is ratified.
+        assert!(json.contains(ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2));
+        assert!(
+            !json.contains(ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2_LEGACY_HYPHENATED),
+            "the non-conformant hyphenated alias must never be EMITTED: {json}"
+        );
 
         // Recover via the wheel_key_grant unwrap surface shape.
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
