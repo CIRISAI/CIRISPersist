@@ -131,9 +131,18 @@ pub const DIMENSION_DISMISSAL: &str = "objection:dismissed:v1";
 /// ([`super::admission::MINTED_NAMESPACE_FAMILIES`]), so a future family minted
 /// without its row fails persist's own build.
 ///
-/// The cohort-member-only emitter rule the ask named is the gate
-/// [`record_objection`] enforces here; CC's row carries the family, and the
-/// emitter/composition elaboration rides CIRISConstitution#67.
+/// **The row registers the family, NOT the emitter rule.** CC's row carries
+/// `reserved: false` and **no** `reserved_rule`; its description ends
+/// *"Registered per CC 3.1.7 R2(a); emitter/composition elaboration rides #67."*
+/// So [`authority_for`](super::namespace::registry::authority_for)`("objection:…")`
+/// returns `ProducerSteward` / `reserved: None`, before and after the re-vendor
+/// alike — contrast `accord:*`, whose row does carry `accord_holder-only`.
+///
+/// The cohort-member-only rule is therefore enforced by [`record_objection`] and
+/// by nothing else. Nothing on this plane reads `.reserved`, and nothing should
+/// start until the rule is on the row. Tracked in
+/// [`MINTED_RULES_NOT_ON_THE_ROW`](super::admission::MINTED_RULES_NOT_ON_THE_ROW);
+/// getting it onto the row rides CIRISConstitution#67.
 pub const NAMESPACE_FAMILY: &str = "objection:{state}";
 
 /// Envelope field names shared by the producer side and persist's fold, so

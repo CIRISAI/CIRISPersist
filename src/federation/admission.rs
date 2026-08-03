@@ -556,6 +556,52 @@ pub const MINTED_NAMESPACE_FAMILIES: &[&str] = &[
     "wa_adjudication:{state}",
 ];
 
+/// **Minted families whose emitter rule is NOT on their registry row**
+/// (CIRISPersist#590).
+///
+/// R2(a) is satisfied one level shallower than it reads. All three of persist's
+/// minted families now carry rows — but every one of those rows has
+/// `reserved: false` and **no `reserved_rule`**, so
+/// [`authority_for`](crate::federation::namespace::registry::authority_for)
+/// resolves `ProducerSteward` / `reserved: None` for all of them. The rules ARE
+/// written down — CC's row for `quarantine:{state}` literally says
+/// *"slash-duty-holder-only emitter"* — but in the `description` prose, and
+/// `registry`'s raw shape deserializes `reserved_rule` and nothing else. A prose
+/// rule is not a registered rule.
+///
+/// That distinction is the whole reason this pin exists. Persist enforces each
+/// of these rules in a purpose-built gate, so the wire is safe; what is NOT safe
+/// is anyone believing the manifest is a second belt. A reviewer reading the
+/// JSON sees the rule in the description and concludes the family is reserved;
+/// `authority_for` says it is open. Two validators for one artifact then share a
+/// predicate that exists in neither of their sources — which is exactly the
+/// class R2 was written against, one level deeper than R2 reaches.
+///
+/// `(family, the rule persist enforces, the enforcing gate, the CC ask)`.
+/// [`tests::minted_rules_not_on_the_row_are_pinned_and_still_missing`] deletes
+/// the line the moment CC lands the rule.
+pub const MINTED_RULES_NOT_ON_THE_ROW: &[(&str, &str, &str, &str)] = &[
+    (
+        "objection:{state}",
+        "cohort-member-only",
+        "federation::reverse_quorum::record_objection",
+        "CIRISConstitution#67 (the row itself defers: \"emitter/composition elaboration rides \
+         #67\")",
+    ),
+    (
+        "quarantine:{state}",
+        "slash-duty-holder-only",
+        "federation::admission::check_delegated_duty_scores_admission",
+        "CIRISConstitution#76 (the rule is in the row's description prose, not its reserved_rule)",
+    ),
+    (
+        "wa_adjudication:{state}",
+        "CC 4.3 WA-quorum finding, re-derived from persist's own verified state",
+        "federation::ownership_reclaim::check_ownership_reclaim_admission",
+        "CIRISConstitution#73",
+    ),
+];
+
 /// Family stems persist gates with **hand-written arms** rather than a
 /// [`ReservedPrefixRule`] row — the gates [`check_reserved_prefix_admission`]
 /// and [`DimensionAdmissionPolicy::check`] apply directly.
@@ -604,12 +650,20 @@ pub const UNREGISTERED_GATED_FAMILIES: &[&str] =
     &["content_rating:", "content_class:", "cw_class:"];
 
 /// Every family stem persist **governs**: the ones it gates
-/// ([`default_reserved_prefix_rules`] + [`HARD_CODED_RESERVED_STEMS`]) and the
-/// ones it mints ([`MINTED_NAMESPACE_FAMILIES`]). Sorted, deduped.
+/// ([`default_reserved_prefix_rules`] + [`HARD_CODED_RESERVED_STEMS`] +
+/// [`RESERVED_CLASS_DIMENSION_PREFIXES`](crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES))
+/// and the ones it mints ([`MINTED_NAMESPACE_FAMILIES`]). Sorted, deduped.
 ///
-/// **Derived, never re-listed.** The rule table is read at its source, so
-/// adding a `ReservedPrefixRule` automatically puts its family under the R2
-/// gate — the two lists cannot drift, because there is only one list.
+/// **Derived, never re-listed.** Every source is read at ITS source, so adding a
+/// `ReservedPrefixRule` — or a prefix to the #575 quota reserve — automatically
+/// puts that family under the R2 gate. There is no fourth list to keep in step,
+/// which is the only version of this that survives contact.
+///
+/// The quota reserve is included for a reason worth stating: a family that
+/// carries reserved admission BUDGET is a family this node has decided is
+/// special, and R2 asks who said so. Today it adds no stem the other sources
+/// lack (`accord:` and `objection:` are already governed) — the point is that
+/// the next prefix added there cannot arrive unregistered and unnoticed.
 #[must_use]
 pub fn governed_family_stems() -> Vec<String> {
     use crate::federation::namespace::registry::family_stem;
@@ -617,6 +671,11 @@ pub fn governed_family_stems() -> Vec<String> {
         .iter()
         .map(|r| family_stem(&r.pattern_prefix).to_owned())
         .chain(HARD_CODED_RESERVED_STEMS.iter().map(|s| (*s).to_owned()))
+        .chain(
+            crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES
+                .iter()
+                .map(|s| family_stem(s).to_owned()),
+        )
         .chain(
             MINTED_NAMESPACE_FAMILIES
                 .iter()
@@ -667,6 +726,9 @@ fn is_governed_family(namespace: &str) -> bool {
         .iter()
         .any(|r| family_stem(&r.pattern_prefix) == stem)
         || HARD_CODED_RESERVED_STEMS.contains(&stem)
+        || crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES
+            .iter()
+            .any(|s| family_stem(s) == stem)
         || MINTED_NAMESPACE_FAMILIES
             .iter()
             .any(|f| family_stem(f) == stem)
@@ -8896,6 +8958,69 @@ mod tests {
         }
     }
 
+    /// **R2(a), one level deeper: a registered family whose RULE is not
+    /// registered.** Every minted family must either carry a machine-readable
+    /// `reserved_rule` on its row, or be pinned in
+    /// [`MINTED_RULES_NOT_ON_THE_ROW`] with the rule persist enforces, the gate
+    /// that enforces it, and the CC ask to land it.
+    ///
+    /// Both directions bite. A minted family with neither a rule nor a pin is
+    /// an emitter rule nobody has written down anywhere. A pin whose rule HAS
+    /// landed is a stale excuse that would keep the family out of the real
+    /// differential — so it must be deleted the moment CC lands it.
+    #[test]
+    fn minted_rules_not_on_the_row_are_pinned_and_still_missing() {
+        use crate::federation::namespace::registry;
+        use std::collections::BTreeSet;
+        let pinned: BTreeSet<&str> = MINTED_RULES_NOT_ON_THE_ROW
+            .iter()
+            .map(|(fam, ..)| *fam)
+            .collect();
+
+        for fam in MINTED_NAMESPACE_FAMILIES {
+            let entry = registry::entries()
+                .iter()
+                .find(|e| &e.prefix == fam)
+                .expect("R2(a) gate already asserts the row exists");
+            let has_rule = entry.authority.reserved.is_some();
+            assert!(
+                has_rule || pinned.contains(fam),
+                "{fam:?} is minted by persist, its row carries NO machine-readable reserved_rule, \
+                 and MINTED_RULES_NOT_ON_THE_ROW does not pin it. The family is registered but \
+                 the AUTHORITY is not: authority_for() resolves ProducerSteward/reserved:None, so \
+                 anything trusting the classifier reads the family as open while persist gates \
+                 it. Land the rule on the CC row, or pin it here with the gate that actually \
+                 enforces it — a rule in the row's description prose is not a registered rule, \
+                 because nothing parses prose."
+            );
+        }
+
+        for (fam, rule, gate, ask) in MINTED_RULES_NOT_ON_THE_ROW {
+            assert!(
+                MINTED_NAMESPACE_FAMILIES.contains(fam),
+                "{fam:?} is pinned as a minted-family rule gap but persist does not mint it"
+            );
+            let entry = registry::entries().iter().find(|e| &e.prefix == fam);
+            assert!(
+                entry.is_some_and(|e| e.authority.reserved.is_none()),
+                "{fam:?} is pinned as having no reserved_rule, but the vendored row now CARRIES \
+                 one — delete the line so the family goes through the real differential"
+            );
+            assert!(
+                !rule.is_empty(),
+                "{fam:?} must name the rule persist enforces"
+            );
+            assert!(
+                gate.starts_with("federation::"),
+                "{fam:?} must name the gate that enforces it, got {gate:?}"
+            );
+            assert!(
+                ask.contains("CIRISConstitution#"),
+                "{fam:?} must name the CC ask that lands the rule, got {ask:?}"
+            );
+        }
+    }
+
     /// The mint list is not a hand-kept parallel copy: every entry is the
     /// `NAMESPACE_FAMILY` const of the module that actually mints on it, so the
     /// declaration and the minting code cannot diverge.
@@ -9125,9 +9250,10 @@ mod tests {
         );
     }
 
-    /// The governed set is DERIVED from the rule table, not re-listed beside
-    /// it: every `pattern_prefix`'s stem is governed by construction, so adding
-    /// a rule puts its family under R2 automatically.
+    /// The governed set is DERIVED from its sources, not re-listed beside them:
+    /// every `pattern_prefix`'s stem, every hard-coded arm and every quota-
+    /// reserve prefix is governed by construction, so adding one anywhere puts
+    /// its family under R2 automatically.
     #[test]
     fn governed_set_is_derived_from_the_rule_table() {
         use crate::federation::namespace::registry::family_stem;
@@ -9143,8 +9269,50 @@ mod tests {
         for arm in HARD_CODED_RESERVED_STEMS {
             assert!(stems.contains(&(*arm).to_owned()), "{arm:?} not governed");
         }
+        for p in crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES {
+            assert!(
+                stems.contains(&family_stem(p).to_owned()),
+                "{p:?} carries reserved admission budget but is not governed — a family this node \
+                 treats as special that R2 never asks about"
+            );
+        }
         // sorted + deduped, so `is_governed_family`'s scan and this list agree
         assert!(stems.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// **The #575 copy-debt, retired** (CIRISPersist#590).
+    ///
+    /// `RESERVED_CLASS_DIMENSION_PREFIXES` carries the string `"objection:"` as
+    /// a deliberate copy of a family `reverse_quorum` owns, and its own doc
+    /// names the retirement condition: *"When #574 and #575 land in one tree,
+    /// replace `"objection:"` with a reference to
+    /// `reverse_quorum::NAMESPACE_FAMILY` so the prefix and the dimensions that
+    /// ride it cannot drift apart."*
+    ///
+    /// They HAVE landed in one tree. The const's type (`&[&str]`, matched with
+    /// `starts_with` on a hot admission path) can't hold a runtime-derived stem
+    /// without becoming a function, so the binding is made here instead: the
+    /// literal must equal `family_stem` of the const that owns the family.
+    /// Same guarantee — the two cannot drift — without changing a public type
+    /// or paying an allocation per admitted row.
+    #[test]
+    fn quota_reserve_objection_prefix_is_bound_to_the_family_that_owns_it() {
+        use crate::federation::namespace::registry::family_stem;
+        let owned = family_stem(crate::federation::reverse_quorum::NAMESPACE_FAMILY);
+        assert!(
+            crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES
+                .contains(&owned),
+            "the #575 quota reserve must protect exactly the stem \
+             reverse_quorum::NAMESPACE_FAMILY declares ({owned:?}) — a reserve that names a \
+             different string protects rows nobody emits and leaves the real ones to be crowded \
+             out"
+        );
+        // And the accord half names the family CC reserves, not a near-miss.
+        assert!(
+            crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES
+                .contains(&family_stem("accord:*")),
+            "the accord kill-switch stem must be in the reserve"
+        );
     }
 
     // ── CEG 0.3 §5.6.8.3 + §11.5.3 — four new reserved-prefix tests ──

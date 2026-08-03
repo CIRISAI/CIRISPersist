@@ -113,17 +113,30 @@ pub const DIMENSION_WITHHELD: &str = "quarantine:withheld:v1";
 pub const DIMENSION_RELEASED: &str = "quarantine:released:v1";
 
 /// The CC 3.1 namespace family both dimensions live under. **Registered**
-/// (CIRISPersist#590): CC 1.0-rc3 catalogues it at CC 3.1.9.2, owning
-/// component `node`, alongside `moderation:{allegation_type}`,
-/// `slashing:{outcome}`, `reconsideration:{grounds}` and #574's
-/// `objection:{state}` — carrying the **slash-duty-holder-only** emitter rule
-/// this repo already enforces at
-/// [`check_delegated_duty_scores_admission`](super::admission::check_delegated_duty_scores_admission)'s
-/// [`QUARANTINE_DIMENSION_PREFIX`](super::admission::QUARANTINE_DIMENSION_PREFIX) arm.
-///
-/// It is on the CC 3.1.7 R2(a) mint gate
+/// (CIRISPersist#590): CC 1.0-rc3 catalogues it at CC 3.1.9.2, owning component
+/// `node`, alongside `moderation:{allegation_type}`, `slashing:{outcome}`,
+/// `reconsideration:{grounds}` and #574's `objection:{state}`. It is on the
+/// CC 3.1.7 R2(a) mint gate
 /// ([`super::admission::MINTED_NAMESPACE_FAMILIES`]): a family persist mints
 /// without landing its registry row now fails persist's own build.
+///
+/// **The row registers the family, NOT the emitter rule.** CC's row says
+/// *"slash-duty-holder-only emitter"* in its `description` — human prose that
+/// nothing parses — while its machine-readable `reserved_rule` is **absent**.
+/// `registry::RawFamily` deserializes `reserved_rule` and ignores everything
+/// else, so
+/// [`authority_for`](super::namespace::registry::authority_for)`("quarantine:…")`
+/// returns `ProducerSteward` / `reserved: None`.
+///
+/// So the slash-duty-holder gate at
+/// [`check_delegated_duty_scores_admission`](super::admission::check_delegated_duty_scores_admission)'s
+/// [`QUARANTINE_DIMENSION_PREFIX`](super::admission::QUARANTINE_DIMENSION_PREFIX)
+/// arm is the **only** enforcement. Nothing on this plane reads `.reserved`, and
+/// nothing should start until the rule is on the row — a prose rule read as a
+/// registered one is how two validators come to share a predicate that exists in
+/// neither of their sources. Tracked in
+/// [`MINTED_RULES_NOT_ON_THE_ROW`](super::admission::MINTED_RULES_NOT_ON_THE_ROW);
+/// getting it onto the row rides CIRISConstitution#76.
 pub const NAMESPACE_FAMILY: &str = "quarantine:{state}";
 
 /// Envelope field names shared by the producer side and persist's fold, so the

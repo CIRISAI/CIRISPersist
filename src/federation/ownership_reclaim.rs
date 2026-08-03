@@ -185,6 +185,14 @@ pub const RECLAIM_WITHDRAWS_ADMISSION_RULE: u8 = 5;
 /// R2(a) gate is comparing persist's intention against CC's record and calling
 /// a mismatch agreement.
 ///
+/// **The row registers the family, NOT an emitter rule** — `reserved: false`,
+/// no `reserved_rule`, so
+/// [`authority_for`](super::namespace::registry::authority_for) resolves
+/// `ProducerSteward` / `reserved: None`. The CC 4.3 WA-quorum authority this
+/// plane requires is re-derived from persist's own verified state in
+/// [`check_ownership_reclaim_admission`] and asserted nowhere else. Tracked in
+/// [`MINTED_RULES_NOT_ON_THE_ROW`](super::admission::MINTED_RULES_NOT_ON_THE_ROW).
+///
 /// The finding deliberately does **not** live under `ownership:*`: CC 3.4
 /// reserves that family to the live owner and says the recovery path *"rides
 /// `withdraws` + `wa_adjudication_ref` and never a fresh `ownership:*`

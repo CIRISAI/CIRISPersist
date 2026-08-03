@@ -77,6 +77,27 @@ manifest — the #541/#532/#588 two-lists-that-disagree class, made a build fail
   the Constitution never spoke about is the "reject conformant traffic and blame the producer"
   failure #590 was opened to prevent. The ask on CC is a Part-3 row for each.
 
+#### A third prefix list, folded in — and one copy-debt retired
+
+`governed_family_stems()` also reads `replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES`
+(the #575 quota reserve). It adds no stem today — `accord:` and `objection:` are already
+governed — but a family carrying reserved admission *budget* is a family this node has decided
+is special, and R2 asks who said so; the next prefix added there cannot now arrive unregistered.
+
+That const's doc named its own retirement condition: *"When #574 and #575 land in one tree,
+replace `"objection:"` with a reference to `reverse_quorum::NAMESPACE_FAMILY`."* They have.
+The const's type (`&[&str]`, matched with `starts_with` on a hot admission path) cannot hold a
+runtime-derived stem without becoming a function, so the binding is made as a gate instead:
+the literal must equal `family_stem(reverse_quorum::NAMESPACE_FAMILY)`. Same guarantee, no
+public type change, no per-row allocation.
+
+**Note for consumers of `authority_for`:** CC registered `objection:{state}` with
+`reserved: false` and **no** `reserved_rule` — the row carries the family, and the
+emitter/composition rule is explicitly deferred to CIRISConstitution#67. So the reverse-quorum
+cohort-member-only rule is enforced by persist's own gate and by nothing in the manifest;
+`authority_for("objection:*")` returns `ProducerSteward` / `reserved: None` both before and
+after this re-vendor. (Contrast `accord:*`, whose row does carry `accord_holder-only`.)
+
 #### The vendor-drift witness
 
 CC's own first R2 regeneration silently dropped four families (`judge_model:verdict`,
