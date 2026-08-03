@@ -131,9 +131,37 @@ witness, so the residual cannot quietly become untrue in either direction.
 backends: the local-tier `capacity:*` write is refused naming the local-tier rule; the
 type-keyed shape is refused too; an ordinary local row still admits and still promotes (a
 rule, not a lockdown); a de-admitted author's row is refused at promotion; a refused
-promotion leaves the row byte-identical; and `(federation, self)` is refused by the
-primitive. Plus the engine-level witness on the exact issue path, and two unit witnesses
-pinning the one-predicate-two-doors property and the residual.
+promotion leaves the row byte-identical; `(federation, self)` is refused by the primitive;
+and a pre-v25.2.0 **legacy** local-tier capacity row is refused at promotion with the typed
+`ConsentGateRefused`, then admitted once the subject grants `analyze`.
+
+That last arm exists because closing the local door makes the promotion gate's consent arm
+unreachable from an empty corpus — SHIPPED-means-host-reachable read in reverse. It has a
+concrete answer rather than a defence-in-depth hand-wave: every release through v25.1.0
+admitted these rows, deployments already hold them, and the upgrade does not delete them.
+
+Plus three engine/unit witnesses: the exact issue path through the public surface; the
+one-predicate-two-doors property; and the residual itself.
+
+#### Mutation-tested
+
+Five deliberate mutations, each applied to the shipped fix and reverted:
+
+| Mutation | Caught by |
+|---|---|
+| `check_capacity_never_local` removed from **sqlite only** | sqlite B8, the engine witness, and the substrate state machine (backend parity) |
+| the whole promotion gate no-opped | B8 on all three backends |
+| the CC 3.4.5 consent arm removed from the gate | B8 on all three backends |
+| the AV-77 arm removed from the gate | B8 on all three backends |
+| the `set_attestation_cohort_scope` pre-stamp restored | *initially nothing* — see below |
+
+The last one is the reason mutation testing was worth doing. The state machine found the
+ordering bug originally, but found it *through* an AV-45 refusal the shipped gate
+deliberately does not perform — so with the fix as shipped, the harness only rediscovers
+the hazard when its random search happens to pair a scope-changing `Promote` with a
+refusing one. A probabilistic witness for an ordering rule is not a witness.
+`attestation_promote_refusal_does_not_prestamp_placement_589` now drives it deterministically
+and is the only test that goes red under that mutation.
 
 ### Breaking
 
