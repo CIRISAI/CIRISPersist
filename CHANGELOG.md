@@ -5,6 +5,146 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased] — #519/#520/#568: the list of what persist rules on, and the scan that finds the next one
+
+### Added — `federation::family_rules`: the family-rule inventory (#519 / #520)
+
+v26.0.0 closed six defects with one shape between them — a hand-maintained list
+that had drifted from the inventory it stood for — and every fix was a new gate
+for one list. This is the generalization: the inventory that had never existed
+at all.
+
+`namespace::registry` answers *which families exist and what rule CC states*.
+`admission` answers *is this row admissible*. Neither answered **which families
+persist rules on that nothing else can see** — and a family in that set has two
+validators, persist's gate and `authority_for`, that disagree about whether it
+is governed, with only one of them written where a consumer can read it.
+
+#590 built the first slice: `MINTED_FAMILY_RULES_NOT_ON_THE_ROW`, scoped to the
+three families persist is the PRODUCER of, because CC 3.1.7 R2(a) is a producer
+obligation. R2(a) is not the whole exposure. Measured on the vendored rc3 cut,
+**those three are 3 of 17.**
+
+#### The left side is derived; only the gap is pinned
+
+`family_rules::persist_ruled_prefixes()` reads every ruling surface at ITS
+source — `default_reserved_prefix_rules()`, `HARD_CODED_RESERVED_STEMS`,
+`MINTED_NAMESPACE_FAMILIES`, `RESERVED_CLASS_DIMENSION_PREFIXES`, and the
+purpose-built gates at the const each gate branches on
+(`MODERATION_DIMENSION_PREFIX`, `RECONSIDERATION_DIMENSION_PREFIX`,
+`QUARANTINE_DIMENSION_PREFIX`, `PEER_DEADMISSION_DIMENSION`,
+`ATTESTATION_LADDER_DEPRECATED_PREFIX`,
+`invariant::NEWLY_ENFORCED_SELF_EMISSION_PREFIXES`,
+`registry::ACCORD_CO_SCRUB_MATCH_PREFIX`). Adding a reserved-prefix row, a
+hard-coded stem, a minted family or a quota-reserved prefix puts that family
+under the gate with no second edit.
+
+`RULES_NOT_ON_THE_ROW` pins the gap — `(prefix, rule, enforced_at[], gap,
+minted_by_persist, cc_ask)` — and bites both ways: an unpinned gap fails the
+build, and a pin whose rule has landed fails until deleted.
+
+The 14 newly enumerated, by why the registry is silent:
+
+- **`NoRuleOnTheRow`** (the row exists, states nothing) — `moderation:` and
+  `reconsideration:` (CC 4.5.5 named-moderator duty walk), `hard_case:`,
+  `age_self_declared:` (the band-not-level shape rule), `health:liveness:` (the
+  self-emission ban #519 landed from the supersets walk),
+  `revocation:peer_admission:` (AV-77, self-authored-only at consumption), and
+  `attestation:`.
+- **`RuleOnCataloguedLeavesOnly`** (CC states the rule per leaf; persist gates
+  the family) — `audit_chain:`, `corpus_health:`, `identity_continuity:`,
+  `federation_directory:`, `capacity:`, `detection:`. Safe direction — persist
+  is stricter, never laxer — but a novel `capacity:{factor}` or
+  `detection:{newkind}` resolves to *no rule* through the classifier while
+  persist refuses it. Exactly the shape #379 fixed from the other side.
+- **`ClassAssertedByPersistNotTheRow`** — `provenance:build_manifest`. The
+  sharpest one: `registry::class_for` hardcodes `AuthorityClass::AccordCoScrub`
+  for it, so **the manifest-derived classifier returns an authority the
+  manifest never stated.** A hand-written rule inside the artifact whose entire
+  job is to be derived. Hoisted to `ACCORD_CO_SCRUB_MATCH_PREFIX` so the
+  assertion is readable at its source, and pinned; the ask is to land the rule
+  on the row and delete the arm.
+
+#### The source scan, because the derivation still had one free variable
+
+The derivation reads consts — so *which consts* was still hand-maintained, and a
+new purpose-built gate keyed on a literal nobody wired in would have been
+invisible to it. The same failure one level up.
+
+`every_admission_shaped_prefix_literal_is_classified` scans persist's non-test
+source for family-shaped literals in admission-shaped positions (`starts_with` /
+`strip_prefix` arguments; `PREFIX` / `DIMENSION` / `FAMILY` / `NAMESPACE`
+consts) and requires every stem to be persist-ruled, registry-ruled, or declared
+in `NOT_A_FAMILY_RULE` with the reason it is not a governed family (role
+namespaces, decision-rule tokens, corpus-kind and log-id prefixes, DSN schemes —
+19 entries).
+
+**It has already paid.** `attestation:`'s CEG-0.1 ladder rule
+(`attestation:l{N}:{mechanism}` is deprecated and admits only under
+`DualAccept`) was found by the scan, not by anyone remembering it. Nothing had
+ever enumerated it, and CC's five `attestation:` rows state no rule at all.
+
+#### Two prose claims that were wrong, executed
+
+- #590's scope note said persist hand-gates *"`moderation:` and `slashing:`
+  through `check_moderation_admission`'s duty-holder walk"*.
+  `check_delegated_duty_scores_admission` routes `moderation:` → moderate,
+  `reconsideration:` → review, `quarantine:` → slash. **`slashing:` is not
+  gated at admission by persist at all** — the only `slashing` surface in the
+  crate is the `cirisnode`-feature-gated typed table, a different plane. The
+  family that walk gates and nobody had listed is `reconsideration:`. Pinned by
+  `slashing_is_not_a_persist_ruled_family`, so if persist ever does gate it the
+  build says so. An unverified prose claim inside a doc *about* unverified prose
+  claims is the finding, not the typo.
+- The pin's `enforced_at` entries now have to RESOLVE.
+  `pinned_sites_resolve_to_a_definition_in_source` requires each cited symbol to
+  be a real `fn` definition (and, for a `Type::method` citation, in a file that
+  declares the type) — #590's pin named its gates as free text nothing checked,
+  which is how a rename leaves an inventory pointing at nothing. Same lesson as
+  the v24.3.0 evidence-pointer tightening.
+
+#### BREAKING
+
+`admission::MINTED_FAMILY_RULES_NOT_ON_THE_ROW` is **removed**, superseded by
+`family_rules::RULES_NOT_ON_THE_ROW` (a typed struct and a strict superset —
+the minted three are the `minted_by_persist == true` subset, cross-checked
+against `MINTED_NAMESPACE_FAMILIES` in both directions). Keeping both would have
+recreated the two-lists class the module exists to close. Newly `pub`:
+`admission::HARD_CODED_RESERVED_STEMS`,
+`admission::ATTESTATION_LADDER_DEPRECATED_PREFIX`,
+`invariant::NEWLY_ENFORCED_SELF_EMISSION_PREFIXES`,
+`registry::ACCORD_CO_SCRUB_MATCH_PREFIX` — each read by the derivation at its
+source rather than re-spelled.
+
+#### Mutation-tested
+
+Five mutations, each killed: deleting the `moderation:` pin (3 tests red);
+adding a production `starts_with("newfamily:")` gate (the scan, red); renaming a
+cited gate `fn` with all its callers (the site resolver, red); landing a
+`reserved_rule` on a pinned row (the stale-pin bite, red); deleting the
+`provenance:build_manifest` classifier arm (the classifier-asserted arm, red).
+
+### Changed — #568: the hardware-attestation deferral doc names the TPM shape, not just its absence
+
+The verify v12.1.0 capability matrix landed with #567. Two residues closed:
+
+- The mission-alignment citation still named **v3.0.1** — nine majors behind the
+  pinned cut — and the flag by a spelling verify never used. Re-read against the
+  pinned verify: the doctrine holds verbatim, so the version pin is *dropped*
+  rather than bumped, and the flag is quoted as `is_truly_hardware_attested`. A
+  claim stable across nine majors does not need a version beside it; the
+  capabilities do, and they carry theirs.
+- **The TPM row now says "local chain walk".** Verify v12.1.0 *does* expose
+  `registry::RegistryClient::verify_tpm_attestation`, and reading only the
+  symbol name would make the deferral look already closed. It `POST`s the quote
+  and EK cert to `/v1/integrity/tpm/verify` on a remote registry and returns
+  that registry's answer — the desktop analogue of Play Integrity, not of
+  `verify_android_key_attestation`'s offline walk to a baked root. Adopting it
+  would make an **online third party** load-bearing for `accord_holder`
+  admission, which is not a decision persist takes unilaterally. Same-name /
+  different-substance, named in the table so the next reader does not spend the
+  round trip finding it out.
+
 ## [26.0.0] — 2026-08-03 — #590/#589/#591/#567/#585/#580/#581: a promotion is a write, a registry row is a rule, and the checks that could not fail
 
 Six issues. The through-line is one sentence: **a check that cannot fail is a report, and a report

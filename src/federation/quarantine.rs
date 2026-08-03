@@ -139,7 +139,7 @@ pub const DIMENSION_RELEASED: &str = "quarantine:released:v1";
 /// nothing should start until the rule is on the row — a prose rule read as a
 /// registered one is how two validators come to share a predicate that exists in
 /// neither of their sources. Tracked in
-/// [`MINTED_FAMILY_RULES_NOT_ON_THE_ROW`](super::admission::MINTED_FAMILY_RULES_NOT_ON_THE_ROW);
+/// [`RULES_NOT_ON_THE_ROW`](super::family_rules::RULES_NOT_ON_THE_ROW);
 /// getting it onto the row rides CIRISConstitution#76.
 pub const NAMESPACE_FAMILY: &str = "quarantine:{state}";
 

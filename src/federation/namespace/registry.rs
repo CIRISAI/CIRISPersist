@@ -125,6 +125,21 @@ fn match_prefix_of(prefix: &str) -> String {
     prefix[..cut].to_string()
 }
 
+/// **The one match_prefix this classifier answers from persist's own source
+/// rather than from the manifest** (CIRISPersist#519).
+///
+/// A build manifest is accord-co-scrubbed — identical authority to a canonical
+/// seed, which is what closes the chicken/egg at genesis. CC's
+/// `provenance:build_manifest:{target}` row states no `reserved_rule`, so
+/// [`authority_for`] returns an authority the Constitution's artifact never
+/// carried, and nothing downstream can audit that answer against CC.
+///
+/// Named rather than inlined so [`crate::federation::family_rules`] can read
+/// the assertion at its source and pin it as the gap it is
+/// (`RowRuleGap::ClassAssertedByPersistNotTheRow`); the ask is to land the
+/// rule on the row and delete the arm.
+pub const ACCORD_CO_SCRUB_MATCH_PREFIX: &str = "provenance:build_manifest";
+
 /// Derive the emit [`AuthorityClass`] for a family from its catalogued
 /// reserved-emit rule, layering persist's own trust-root knowledge on top.
 ///
@@ -143,7 +158,7 @@ fn match_prefix_of(prefix: &str) -> String {
 /// bindings), which the edge engine authorizes structurally (via the object
 /// kind), not through this dimension registry.
 fn class_for(match_prefix: &str, rule: Option<&str>) -> AuthorityClass {
-    if match_prefix.starts_with("provenance:build_manifest") {
+    if match_prefix.starts_with(ACCORD_CO_SCRUB_MATCH_PREFIX) {
         return AuthorityClass::AccordCoScrub;
     }
     match rule {

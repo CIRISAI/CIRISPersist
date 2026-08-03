@@ -4,12 +4,19 @@
 //! # Mission alignment (FSD-002 §7.3 + FEDERATION_ANNOUNCEMENT §4.5.2)
 //!
 //! HUMANITY_ACCORD keys (`identity_type = 'accord_holder'`) MUST live
-//! on hardware substrate. CIRISVerify v3.0.1's
-//! `docs/HARDWARE_ATTESTATION.md` explicitly does NOT publish a single
-//! `hardware_attested: bool` — per the auth ≠ trust separation,
-//! Verify exposes evidence; the consumer (persist) authors the
-//! policy. Persist's
+//! on hardware substrate. CIRISVerify's `docs/HARDWARE_ATTESTATION.md`
+//! explicitly does NOT publish a single `is_truly_hardware_attested`
+//! boolean — *"a flag would be verify making the policy decision, which it
+//! must not"*. Per the auth ≠ trust separation, verify exposes evidence; the
+//! consumer (persist) authors the policy. Persist's
 //! [`HardwareAttestationPolicy`] is that policy.
+//!
+//! (The citation used to name **v3.0.1**, nine majors behind the pinned cut,
+//! and the flag by a spelling verify never used — CIRISPersist#568. Re-read
+//! against the pinned verify: the claim holds verbatim, so the version pin is
+//! dropped rather than bumped. A doctrine that has been stable across nine
+//! majors does not need a version beside it; the *capabilities* below do, and
+//! they carry theirs.)
 //!
 //! Persist's verdict for an `accord_holder` row depends on WHICH custody
 //! story the evidence tells — see [`AttestationEvidence`]'s three arms.
@@ -60,7 +67,7 @@
 //! | YubiKey PIV custody | shipped, hardware-validated | `verify_accord_custody_attestation` / `verify_yubikey_piv_attestation` |
 //! | Android Key Attestation | shipped **v10.8.0** | `device_attestation::verify_android_key_attestation{,_with_store}` |
 //! | Apple App Attest | shipped **v11.0.0** | `device_attestation::verify_apple_app_attest{,_with_store}` |
-//! | **TPM EK** | **STILL DEFERRED** | — the last open leg of **CIRISVerify#199** |
+//! | **TPM EK (local chain walk)** | **STILL DEFERRED** | — the last open leg of **CIRISVerify#199** |
 //! | Pinned vendor roots | verify now bakes them | `trust_anchor_store::baked` — Yubico, Google ×2, Apple |
 //! | Constrained anchor store | shipped v10.9.0–v10.11.0 | `TrustAnchorStore::resolve(purpose, environment)` |
 //! | Presenter binding (build) | shipped v10.7.0 | `verify_build_attestation_bundle` (CIRISPersist#567) |
@@ -72,6 +79,19 @@
 //! it is now a *choice* rather than an absence, and only the TPM EK leg is
 //! genuinely unavailable — blocked upstream on vendor-root-**set**
 //! management, which is a different problem from pinning one root.
+//!
+//! **The TPM row says "local chain walk" for a reason.** Verify DOES expose
+//! `registry::RegistryClient::verify_tpm_attestation` at v12.1.0, and reading
+//! only the symbol name would make the deferral look already closed. It
+//! `POST`s the quote and EK cert to `/v1/integrity/tpm/verify` on a remote
+//! registry and returns that registry's answer — the desktop analogue of Play
+//! Integrity, not of `verify_android_key_attestation`'s offline walk to a baked
+//! root. Adopting it would make an **online third party** load-bearing for
+//! `accord_holder` admission, which is a different trust story from every other
+//! row in this table and not one persist may take unilaterally. Same-name /
+//! different-substance is the class this crate keeps meeting; naming the shape
+//! in the table is how the next reader does not spend the round trip finding it
+//! out.
 //!
 //! # The measurement/gate inversion this module must not make
 //!
