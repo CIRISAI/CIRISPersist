@@ -15647,6 +15647,22 @@ mod tests {
         .await;
     }
 
+    /// CIRISPersist#591 — the MEMORY leg of the shared
+    /// escalation-on-silence witness. Memory tolerates what sqlite and postgres
+    /// reject, so this leg is where a divergence in the steward tier's
+    /// duty-holder derivation would hide rather than where it would be caught —
+    /// which is exactly why it runs the SAME body as the other two.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn escalation_on_silence_parity_memory_591() {
+        let backend = MemoryBackend::new();
+        crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
+            &backend,
+            "memory-esc",
+        )
+        .await;
+    }
+
     /// v25.1.0 (CIRISPersist#570 asks 2/3/5) — the MEMORY leg of the shared
     /// admin-op witness. The quarantine plane composes trait methods over
     /// `&dyn FederationDirectory` (no new table, no migration), and memory is

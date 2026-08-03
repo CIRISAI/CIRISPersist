@@ -20207,6 +20207,29 @@ mod tests {
         .await;
     }
 
+    /// CIRISPersist#591 — the sqlite leg of the shared
+    /// escalation-on-silence witness (see the postgres + memory legs); all three
+    /// call the SAME `exercise_escalation_on_silence` body.
+    ///
+    /// This leg carries one thing the others cannot: it puts a community
+    /// declaring `reverse_quorum:2/9:3600+escalate:600:3` through a real
+    /// `put_community` against the real V116 `GLOB` CHECK. There is deliberately
+    /// no sqlite twin of V120 — GLOB's `*` already spans `:` and `+`, so the
+    /// coarse sqlite arm admits the suffix unchanged and a table rebuild of
+    /// `federation_communities` would have been an irreversible migration taken
+    /// on a false premise. This test is what makes that a checked claim rather
+    /// than a comment.
+    #[tokio::test]
+    async fn escalation_on_silence_parity_sqlite_591() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::reverse_quorum::test_support::exercise_escalation_on_silence(
+            &backend,
+            "sqlite-esc",
+        )
+        .await;
+    }
+
     /// v25.1.0 (CIRISPersist#570 asks 2/3/5) — the sqlite leg of the shared
     /// admin-op witness (see the postgres + memory legs); all three call the
     /// SAME `quarantine::test_support::exercise_admin_ops` body, so no backend
