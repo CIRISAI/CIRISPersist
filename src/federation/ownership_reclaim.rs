@@ -191,7 +191,7 @@ pub const RECLAIM_WITHDRAWS_ADMISSION_RULE: u8 = 5;
 /// `ProducerSteward` / `reserved: None`. The CC 4.3 WA-quorum authority this
 /// plane requires is re-derived from persist's own verified state in
 /// [`check_ownership_reclaim_admission`] and asserted nowhere else. Tracked in
-/// [`MINTED_FAMILY_RULES_NOT_ON_THE_ROW`](super::admission::MINTED_FAMILY_RULES_NOT_ON_THE_ROW).
+/// [`RULES_NOT_ON_THE_ROW`](super::family_rules::RULES_NOT_ON_THE_ROW).
 ///
 /// The finding deliberately does **not** live under `ownership:*`: CC 3.4
 /// reserves that family to the live owner and says the recovery path *"rides

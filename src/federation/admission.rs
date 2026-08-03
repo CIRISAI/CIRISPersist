@@ -557,79 +557,6 @@ pub const MINTED_NAMESPACE_FAMILIES: &[&str] = &[
     "wa_adjudication:{state}",
 ];
 
-/// **Minted families whose emitter rule is NOT on their registry row**
-/// (CIRISPersist#590).
-///
-/// R2(a) is satisfied one level shallower than it reads. All three of persist's
-/// minted families now carry rows — but every one of those rows has
-/// `reserved: false` and **no `reserved_rule`**, so
-/// [`authority_for`](crate::federation::namespace::registry::authority_for)
-/// resolves `ProducerSteward` / `reserved: None` for all of them. The rules ARE
-/// written down — CC's row for `quarantine:{state}` literally says
-/// *"slash-duty-holder-only emitter"* — but in the `description` prose, and
-/// `registry`'s raw shape deserializes `reserved_rule` and nothing else. A prose
-/// rule is not a registered rule.
-///
-/// That distinction is the whole reason this pin exists. Persist enforces each
-/// of these rules in a purpose-built gate, so the wire is safe; what is NOT safe
-/// is anyone believing the manifest is a second belt. A reviewer reading the
-/// JSON sees the rule in the description and concludes the family is reserved;
-/// `authority_for` says it is open. Two validators for one artifact then share a
-/// predicate that exists in neither of their sources — which is exactly the
-/// class R2 was written against, one level deeper than R2 reaches.
-///
-/// Named `MINTED_FAMILY_…` and not `MINTED_…` because the shorter form parses
-/// two ways — "rules that were minted" and "rules of the families persist
-/// mints" — and only the second is meant. One name, one reading.
-///
-/// **Scope: persist's MINTED families only — this is not the whole population.**
-/// Measured on the vendored rc3 cut: **34 of 109** families carry a
-/// machine-readable rule, so **75 do not**, spread across **14 CC sections**
-/// with none at all (3.1.5.1-4, 3.1.6, 3.1.8.3, 3.1.9.1-7, 3.1.10). Persist
-/// hand-gates several of those it did not mint — `moderation:` and `slashing:`
-/// through [`check_moderation_admission`]'s duty-holder walk since v8.7.1,
-/// `hard_case:` through the substrate-emitter arm, `health:liveness:` through
-/// the invariant registry — and every one is the same divergence, older than
-/// this issue. Enumerating THOSE is the `namespace_supersets` invariant
-/// registry's job (#519), not this const's; what belongs here is the set persist
-/// is the *producer* for, because R2(a) is a producer obligation.
-///
-/// **Persist named one instance of this class years before anyone named the
-/// class.** [`crate::federation::invariant`]'s module doc records that the
-/// manifest's `health:liveness:{version}` walk asserts a self-emission ban CC
-/// never put in a machine-readable field, and that the manifest's own
-/// `placement_fields_required` entry proposed the remedy verbatim — which #519
-/// then implemented as a single arm. One instance, seen and fixed; the class,
-/// unnamed until now.
-///
-/// `(family, the rule persist enforces, the gate(s) that enforce it, the CC ask)`.
-/// The gate field is a **list** because one family can have several admission
-/// doors — CIRISPersist#591 adds a second door on `objection:` — and a registry
-/// of enforcement sites that names one of two is the exact thing it exists to
-/// prevent. [`tests::minted_family_rules_not_on_the_row_are_pinned_and_still_missing`]
-/// deletes the line the moment CC lands the rule.
-pub const MINTED_FAMILY_RULES_NOT_ON_THE_ROW: &[(&str, &str, &[&str], &str)] = &[
-    (
-        "objection:{state}",
-        "cohort-member-only",
-        &["federation::reverse_quorum::record_objection"],
-        "CIRISConstitution#67 (the row itself defers: \"emitter/composition elaboration rides \
-         #67\")",
-    ),
-    (
-        "quarantine:{state}",
-        "slash-duty-holder-only",
-        &["federation::admission::check_delegated_duty_scores_admission"],
-        "CIRISConstitution#76 (the rule is in the row's description prose, not its reserved_rule)",
-    ),
-    (
-        "wa_adjudication:{state}",
-        "CC 4.3 WA-quorum finding, re-derived from persist's own verified state",
-        &["federation::ownership_reclaim::check_ownership_reclaim_admission"],
-        "CIRISConstitution#73",
-    ),
-];
-
 /// Family stems persist gates with **hand-written arms** rather than a
 /// [`ReservedPrefixRule`] row — the gates [`check_reserved_prefix_admission`]
 /// and [`DimensionAdmissionPolicy::check`] apply directly.
@@ -639,7 +566,11 @@ pub const MINTED_FAMILY_RULES_NOT_ON_THE_ROW: &[(&str, &str, &[&str], &str)] = &
 /// governed set from ONLY `default_reserved_prefix_rules()` would have quietly
 /// excused `accord:` / `hard_case:` / `capacity:` — the most reserved families
 /// in the Part.
-const HARD_CODED_RESERVED_STEMS: &[&str] = &[
+///
+/// `pub` since v26 (#519): [`crate::federation::family_rules`] derives the
+/// family-rule inventory from this list at ITS source rather than re-listing
+/// the same four stems a fifth time.
+pub const HARD_CODED_RESERVED_STEMS: &[&str] = &[
     // CC 3.4.1 — the one constitutional asymmetry (accord_holder-only).
     "accord:",
     // substrate-emitted; `hard_case:` → substrate_persist.
@@ -1091,6 +1022,15 @@ impl DimensionAdmissionPolicy {
     }
 }
 
+/// The DEPRECATED CEG 0.1 attestation-ladder prefix (`attestation:l<N>:…`).
+///
+/// Hoisted to a const in v26 (#519): this is a shape rule persist applies to
+/// the whole `attestation:` family, and CC's five catalogued rows state no rule
+/// at all — so [`crate::federation::family_rules`] has to be able to read the
+/// prefix at the site that branches on it rather than re-spelling the literal.
+/// The source scan found this one; nobody remembered it.
+pub const ATTESTATION_LADDER_DEPRECATED_PREFIX: &str = "attestation:l";
+
 /// True iff `dim` matches the deprecated CEG 0.1 attestation-ladder
 /// shape `attestation:l<N>:<mechanism>`, where `<N>` is one or more
 /// ASCII digits and `<mechanism>` is any non-empty suffix. CEG 0.2
@@ -1098,7 +1038,7 @@ impl DimensionAdmissionPolicy {
 /// during the 0.1 → 0.2 transition window (see
 /// [`AttestationLadderTransitionPolicy`]).
 fn is_deprecated_attestation_ladder_prefix(dim: &str) -> bool {
-    let Some(rest) = dim.strip_prefix("attestation:l") else {
+    let Some(rest) = dim.strip_prefix(ATTESTATION_LADDER_DEPRECATED_PREFIX) else {
         return false;
     };
     let Some((digits, mech)) = rest.split_once(':') else {
@@ -9681,84 +9621,16 @@ mod tests {
         }
     }
 
-    /// **R2(a), one level deeper: a registered family whose RULE is not
-    /// registered.** Every minted family must either carry a machine-readable
-    /// `reserved_rule` on its row, or be pinned in
-    /// [`MINTED_FAMILY_RULES_NOT_ON_THE_ROW`] with the rule persist enforces, the gate
-    /// that enforces it, and the CC ask to land it.
+    /// **The population the inventory does NOT cover, measured rather than
+    /// asserted.**
     ///
-    /// Both directions bite. A minted family with neither a rule nor a pin is
-    /// an emitter rule nobody has written down anywhere. A pin whose rule HAS
-    /// landed is a stale excuse that would keep the family out of the real
-    /// differential — so it must be deleted the moment CC lands it.
-    #[test]
-    fn minted_family_rules_not_on_the_row_are_pinned_and_still_missing() {
-        use crate::federation::namespace::registry;
-        use std::collections::BTreeSet;
-        let pinned: BTreeSet<&str> = MINTED_FAMILY_RULES_NOT_ON_THE_ROW
-            .iter()
-            .map(|(fam, ..)| *fam)
-            .collect();
-
-        for fam in MINTED_NAMESPACE_FAMILIES {
-            let entry = registry::entries()
-                .iter()
-                .find(|e| &e.prefix == fam)
-                .expect("R2(a) gate already asserts the row exists");
-            let has_rule = entry.authority.reserved.is_some();
-            assert!(
-                has_rule || pinned.contains(fam),
-                "{fam:?} is minted by persist, its row carries NO machine-readable reserved_rule, \
-                 and MINTED_FAMILY_RULES_NOT_ON_THE_ROW does not pin it. The family is registered but \
-                 the AUTHORITY is not: authority_for() resolves ProducerSteward/reserved:None, so \
-                 anything trusting the classifier reads the family as open while persist gates \
-                 it. Land the rule on the CC row, or pin it here with the gate that actually \
-                 enforces it — a rule in the row's description prose is not a registered rule, \
-                 because nothing parses prose."
-            );
-        }
-
-        for (fam, rule, gates, ask) in MINTED_FAMILY_RULES_NOT_ON_THE_ROW {
-            assert!(
-                MINTED_NAMESPACE_FAMILIES.contains(fam),
-                "{fam:?} is pinned as a minted-family rule gap but persist does not mint it"
-            );
-            let entry = registry::entries().iter().find(|e| &e.prefix == fam);
-            assert!(
-                entry.is_some_and(|e| e.authority.reserved.is_none()),
-                "{fam:?} is pinned as having no reserved_rule, but the vendored row now CARRIES \
-                 one — delete the line so the family goes through the real differential"
-            );
-            assert!(
-                !rule.is_empty(),
-                "{fam:?} must name the rule persist enforces"
-            );
-            assert!(
-                !gates.is_empty(),
-                "{fam:?} names no enforcing gate — a rule the manifest does not state and no gate \
-                 claims is a rule nothing enforces"
-            );
-            for gate in *gates {
-                assert!(
-                    gate.starts_with("federation::"),
-                    "{fam:?} must name each gate by module path, got {gate:?}"
-                );
-            }
-            assert!(
-                ask.contains("CIRISConstitution#"),
-                "{fam:?} must name the CC ask that lands the rule, got {ask:?}"
-            );
-        }
-    }
-
-    /// **The population this pin does NOT cover, measured rather than asserted.**
-    ///
-    /// `MINTED_FAMILY_RULES_NOT_ON_THE_ROW` is scoped to families persist *mints*, and
-    /// a reader could reasonably take a const called "rules not on the row" for
-    /// the whole set. It is not close: most of the manifest carries no
-    /// machine-readable rule. This records the real shape so the scope limit is
-    /// a measured fact in the build rather than a caveat in a doc comment, and
-    /// so a re-vendor that materially changes rule coverage is visible.
+    /// [`family_rules::RULES_NOT_ON_THE_ROW`](crate::federation::family_rules::RULES_NOT_ON_THE_ROW)
+    /// pins the families PERSIST rules on whose row states nothing. That is not
+    /// the whole population, and a reader could take a const called "rules not
+    /// on the row" for it: most of the manifest carries no machine-readable
+    /// rule for anyone. This records the real shape so the scope limit is a
+    /// measured fact in the build rather than a caveat in a doc comment, and so
+    /// a re-vendor that materially changes rule coverage is visible.
     ///
     /// Deliberately a floor-check, not an equality: CC adding rules is the
     /// desired direction and must not fail the build.
@@ -9774,7 +9646,7 @@ mod tests {
             with_rule < total / 2,
             "rule coverage is now {with_rule}/{total} — over half. That is a GOOD change, but it \
              means the 'the manifest mostly does not state emitter rules' premise behind \
-             MINTED_FAMILY_RULES_NOT_ON_THE_ROW's scope note is stale; re-measure it."
+             family_rules::RULES_NOT_ON_THE_ROW's scope note is stale; re-measure it."
         );
         // The specific claim the #67 / #76 asks rest on: persist's own minted
         // section is rule-free — and so are many others, which is why the ask
@@ -9794,7 +9666,8 @@ mod tests {
                 .filter(|e| e.cc_section == "3.1.9.2")
                 .all(|e| e.authority.reserved.is_none()),
             "a CC 3.1.9.2 family now carries a machine-readable rule ({s3192:?}) — check whether \
-             it is one of persist's three, and if so delete its MINTED_FAMILY_RULES_NOT_ON_THE_ROW line"
+             it is one of persist's three, and if so delete its \
+             family_rules::RULES_NOT_ON_THE_ROW line"
         );
     }
 

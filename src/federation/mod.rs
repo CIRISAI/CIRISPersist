@@ -52,6 +52,13 @@ pub mod consent_grammar;
 pub mod consent_peer_set;
 #[cfg(feature = "cirisaudit")]
 pub mod emit;
+// (CIRISPersist#519 / #520) — the family-rule INVENTORY: every namespace family
+// persist states an emitter/composition rule about, derived from each ruling
+// surface at its own source, plus the pinned gap where the vendored registry
+// states no such rule. Generalizes #590's minted-only pin (3 of 17) and closes
+// it with a source scan, so a new purpose-built gate cannot be invisible to the
+// inventory. Pure gates + accessors; no wire surface.
+pub mod family_rules;
 pub mod genesis;
 pub mod goal;
 pub mod hardware_attestation;

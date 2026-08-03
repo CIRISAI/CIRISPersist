@@ -199,7 +199,10 @@ pub fn admission_enforceable(inv: &FamilyInvariant) -> bool {
 /// [`tests`] mirroring [`tests::health_liveness_self_emission_rejected`]) —
 /// never something [`admission_enforceable`]'s heuristic drives
 /// automatically.
-const NEWLY_ENFORCED_SELF_EMISSION_PREFIXES: &[&str] = &["health:liveness:"];
+/// `pub` since v26 (#519): [`crate::federation::family_rules`] derives the
+/// family-rule inventory from this list at ITS source, so a family whose
+/// self-emission ban lives only here cannot be invisible to the inventory.
+pub const NEWLY_ENFORCED_SELF_EMISSION_PREFIXES: &[&str] = &["health:liveness:"];
 
 /// The reason token [`enforce_admission_invariants`] rejects under, carried
 /// on [`Error::DimensionRejected`]'s `reason` field. Not a
