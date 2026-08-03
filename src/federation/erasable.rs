@@ -71,12 +71,24 @@
 //! redacting node tolerates its own rows and the first peer refuses them.
 //!
 //! That failure does not apply here, and the claim is **proved rather than
-//! asserted** — `tests::erasable_envelope_survives_total_erasure_at_the_real_ingest_gate`
-//! runs the *real* [`verify_federation_tier_ingest`](super::tier_ingest::verify_federation_tier_ingest)
+//! asserted** — the `ingest_gate_proof` module runs the *real*
+//! [`verify_federation_tier_ingest`](super::tier_ingest::verify_federation_tier_ingest)
 //! over a real hybrid-signed row before and after erasing every member, on
-//! every backend. It passes both times because the row is byte-identical.
-//! The control in the same module erases one field of a **sealed** envelope
-//! and shows the same gate refusing it.
+//! memory / sqlite / postgres, and hands the erased row to a **second,
+//! independent store** that has never seen it — the exact plane §7.3 says a
+//! redaction dies on. It is admitted and stored, because the row is
+//! byte-identical.
+//!
+//! The control in the same module erases one field of a **sealed** envelope and
+//! shows the same gate refusing it — and it measured something §7.3 and #573
+//! both got slightly wrong, which is worth having on the record:
+//!
+//! > The hybrid signature is verified **before** the `original_content_hash`
+//! > cross-check. So a sealed row that an authority lawfully redacted is not
+//! > refused with the ambiguous *"envelope canonicalizes to X, row declares
+//! > Y"*; it is refused as **`Classical signature verification failed:
+//! > Ed25519`**. To an operator that does not read as ambiguous — it reads as a
+//! > forgery attempt against the erasing authority's own key.
 //!
 //! Consequences worth naming:
 //!
@@ -931,5 +943,297 @@ mod tests {
             assert_eq!(serde_json::to_value(r).unwrap(), serde_json::json!(tok));
             assert_eq!(r.as_str(), tok);
         }
+    }
+}
+
+/// **The inertness test** — the one claim this whole design rests on, run
+/// against the REAL gate rather than asserted.
+///
+/// `docs/design/PAYLOAD_ENUMERATION.md` §7.3 established that a persist-side
+/// redaction is *locally invisible* and is refused by **the first peer it
+/// replicates to**, because the check that bites is
+/// `sha256(canonical(envelope)) == original_content_hash` plus the hybrid
+/// signature over those same bytes, receiver-side. Persist has no
+/// `RowHashMismatch` variant; the node that redacts never notices.
+///
+/// So the only honest way to claim an erasure design is not inert is to put a
+/// really-signed row through
+/// [`verify_federation_tier_ingest`](super::tier_ingest::verify_federation_tier_ingest)
+/// **after** erasing it, and — because the failure is defined as happening at a
+/// *peer* — to have a **second, independent store** that has never seen the
+/// object accept and keep it. Both are done here.
+///
+/// The sealed control is what makes the passing test mean anything: it erases
+/// a field of a SEALED envelope and shows the identical gate refusing it with
+/// the identical operator-facing message. Without it, a gate that was not
+/// running would look exactly the same.
+#[cfg(test)]
+mod ingest_gate_proof {
+    use super::*;
+    use crate::federation::tier_ingest::test_support::{register_hybrid_key, sign_envelope};
+    use crate::federation::tier_ingest::verify_federation_tier_ingest;
+    use crate::federation::types::{attestation_tier, attestation_type, compute_persist_row_hash};
+    use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
+
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    fn test_signer() -> std::sync::Arc<crate::signing::LocalSigner> {
+        std::sync::Arc::new(crate::signing::LocalSigner::from_parts(
+            ed25519_dalek::SigningKey::from_bytes(&[0x5Au8; 32]),
+            "erasable-proof-steward".to_owned(),
+            None,
+            None,
+        ))
+    }
+
+    /// The bytes a takedown would need to erase. #573's own sharpest case is
+    /// that a removal record's `reason` can carry the thing being removed; the
+    /// second member is the low-entropy shape an UNSALTED digest would leak.
+    fn erasable_members() -> Vec<Vec<u8>> {
+        vec![
+            b"the verbatim reported content, which is the thing a takedown removes".to_vec(),
+            b"true".to_vec(),
+        ]
+    }
+
+    fn header(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "dimension": "identity_binding:v1",
+            "score": 1.0,
+            "confidence": 0.9,
+        })
+    }
+
+    fn row(attester: &str, envelope: serde_json::Value) -> Attestation {
+        let (och, classical, pqc) = sign_envelope(attester, &envelope);
+        let now = chrono::Utc::now();
+        Attestation {
+            // `::uuid`-cast on the PG write path — a real UUID, per the
+            // uuid_like() fixture lesson.
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: attester.to_owned(),
+            attested_key_id: attester.to_owned(),
+            attestation_type: attestation_type::SCORES.to_owned(),
+            weight: Some(1.0),
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            scrub_key_id: attester.to_owned(),
+            scrub_timestamp: now,
+            pqc_completed_at: Some(now),
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: attestation_tier::FEDERATION.to_owned(),
+            tier: attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+
+    /// **ERASABLE: total erasure changes nothing the wire looks at.** Mint,
+    /// sign, store, erase every member, then re-run the REAL gate over the
+    /// unchanged row. Returns the erased row so the caller can hand it to an
+    /// independent store — the peer half of the claim.
+    async fn erasable_survives_erasure(dir: &dyn FederationDirectory, tag: &str) -> Attestation {
+        let attester = format!("erasable-attester-{tag}");
+        register_hybrid_key(dir, &attester).await;
+
+        let (envelope, mut set) =
+            seal(&header(&format!("erasable-{tag}")), &erasable_members()).unwrap();
+        let att = row(&attester, envelope);
+        let id = att.attestation_id.clone();
+        let hash_before = compute_persist_row_hash(&att).unwrap();
+
+        // Admitted while fully disclosed — the gate runs inside put_attestation.
+        dir.put_attestation(SignedAttestation {
+            attestation: att.clone(),
+        })
+        .await
+        .expect("erasable row must be admitted before erasure");
+        assert_eq!(
+            verify_members(&att.attestation_envelope, &set).unwrap(),
+            vec![MemberState::Disclosed; 2]
+        );
+
+        // ERASE EVERYTHING. The disclosures are neither row members nor
+        // envelope members, so this touches no stored byte of the object.
+        set.erase_all();
+
+        let stored = dir
+            .get_attestation(&id)
+            .await
+            .expect("get")
+            .expect("row present");
+        assert_eq!(
+            stored.attestation_envelope, att.attestation_envelope,
+            "erasure must not have moved the stored envelope"
+        );
+        assert_eq!(
+            compute_persist_row_hash(&att).unwrap(),
+            hash_before,
+            "erasure must not move persist_row_hash — which is why no second \
+             consent_role-shaped exclusion is needed"
+        );
+
+        // THE CLAIM: the real receiver-side gate still admits it.
+        verify_federation_tier_ingest(dir, &att)
+            .await
+            .expect("the real ingest gate must still admit a fully-erased erasable row");
+
+        // And what survives tells the truth: both members erased, neither
+        // recoverable, and the erasure visible rather than silent.
+        assert_eq!(
+            verify_members(&att.attestation_envelope, &set).unwrap(),
+            vec![MemberState::Redacted; 2]
+        );
+        assert_eq!(
+            erased_indices(&att.attestation_envelope, &set).unwrap(),
+            vec![0, 1]
+        );
+        let surviving = serde_json::to_string(&att.attestation_envelope).unwrap();
+        assert!(
+            !surviving.contains("takedown removes"),
+            "erased bytes must not survive anywhere in the signed envelope"
+        );
+
+        att
+    }
+
+    /// The peer half: a store that has never seen the object accepts and keeps
+    /// the fully-erased row. This is the exact plane §7.3 says a redaction dies
+    /// on.
+    async fn a_peer_admits_the_erased_row(peer: &dyn FederationDirectory, erased: &Attestation) {
+        register_hybrid_key(peer, &erased.attesting_key_id).await;
+        peer.put_attestation(SignedAttestation {
+            attestation: erased.clone(),
+        })
+        .await
+        .expect("a PEER must admit a fully-erased erasable row — otherwise this is inert");
+        assert!(
+            peer.get_attestation(&erased.attestation_id)
+                .await
+                .expect("get")
+                .is_some(),
+            "the peer must have STORED it, not merely not-refused it"
+        );
+    }
+
+    /// **SEALED: the control.** Erasing a field of a sealed envelope produces
+    /// exactly the failure #573 was opened over.
+    ///
+    /// **It is worse than #573 and `PAYLOAD_ENUMERATION.md` §7.3 predicted, and
+    /// this test is where that was measured.** Both expected the operator to
+    /// see the `original_content_hash mismatch` message — ambiguous between
+    /// redaction and tampering. In fact the hybrid signature is verified
+    /// **before** the hash cross-check
+    /// ([`verify_envelope_hybrid_signature`](super::tier_ingest::verify_envelope_hybrid_signature)
+    /// runs `verify_hybrid` first and only then compares the declared hash), so
+    /// a lawfully-redacted sealed row never reaches the ambiguous message at
+    /// all. It is refused as **"Classical signature verification failed:
+    /// Ed25519"** — which does not read as ambiguous to an operator, it reads
+    /// as an **attack**.
+    ///
+    /// That strengthens the ruling rather than weakening it: an authority
+    /// performing a lawful erasure on a sealed object produces, at every peer,
+    /// an alert indistinguishable from a forgery attempt against that
+    /// authority's own key.
+    async fn sealed_erasure_is_refused(dir: &dyn FederationDirectory, tag: &str) {
+        let attester = format!("sealed-attester-{tag}");
+        register_hybrid_key(dir, &attester).await;
+
+        let mut envelope = header(&format!("sealed-{tag}"));
+        envelope.as_object_mut().unwrap().insert(
+            "payload".to_owned(),
+            serde_json::json!("the verbatim reported content, inside the signature this time"),
+        );
+        let mut att = row(&attester, envelope);
+
+        dir.put_attestation(SignedAttestation {
+            attestation: att.clone(),
+        })
+        .await
+        .expect("the sealed row must be admitted before we try to erase it");
+
+        // "Erase" the payload the only way a sealed object allows — rewrite it.
+        att.attestation_envelope
+            .as_object_mut()
+            .unwrap()
+            .insert("payload".to_owned(), serde_json::Value::Null);
+
+        let err = verify_federation_tier_ingest(dir, &att)
+            .await
+            .expect_err("erasing inside a signed envelope must be refused");
+        assert_eq!(err.kind(), "federation_federation_tier_unverified");
+        let msg = err.to_string();
+        // The gate refuses — and the refusal names a SIGNATURE failure, not the
+        // hash mismatch #573 and §7.3 both expected. Pinned, because the
+        // ordering is the finding: it means a lawful erasure of a sealed object
+        // is reported to every peer as a forgery against the erasing
+        // authority's own key.
+        assert!(
+            msg.contains("signature verification failed"),
+            "expected the hybrid-signature branch (it runs before the hash \
+             cross-check); if this moved, the operator-facing story for a sealed \
+             redaction moved with it: {msg}"
+        );
+        assert!(
+            !msg.contains("redact") && !msg.contains("erasu"),
+            "the refusal cannot tell an operator a lawful erasure from a tamper — \
+             that is the whole of CIRISVerify#241: {msg}"
+        );
+    }
+
+    /// The gate runs on the memory backend in production, so the matrix runs
+    /// there too — with two genuinely independent stores.
+    #[tokio::test]
+    async fn memory() {
+        let origin = crate::store::memory::MemoryBackend::new();
+        let peer = crate::store::memory::MemoryBackend::new();
+        let erased = erasable_survives_erasure(&origin, "memory").await;
+        a_peer_admits_the_erased_row(&peer, &erased).await;
+        sealed_erasure_is_refused(&origin, "memory").await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite() {
+        let origin = crate::engine::Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("origin engine");
+        let peer = crate::engine::Engine::with_signer(test_signer(), "sqlite::memory:")
+            .await
+            .expect("peer engine");
+        let (o, p) = (origin.federation_directory(), peer.federation_directory());
+        let erased = erasable_survives_erasure(&*o, "sqlite").await;
+        a_peer_admits_the_erased_row(&*p, &erased).await;
+        sealed_erasure_is_refused(&*o, "sqlite").await;
+    }
+
+    /// Postgres runs the erasure + control legs. The independent-peer leg is
+    /// memory/sqlite only, and deliberately: two independent postgres stores
+    /// need a second database, and several suites in this repo assert absolute
+    /// corpus counts against the one DSN. The load-bearing assertion —
+    /// `verify_federation_tier_ingest` admitting the erased row — IS the
+    /// receiver-side check, and it runs here in full.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn postgres() {
+        let Ok(dsn) = std::env::var("CIRIS_PERSIST_TEST_PG_URL") else {
+            eprintln!(
+                "skipping erasable::ingest_gate_proof::postgres: CIRIS_PERSIST_TEST_PG_URL unset"
+            );
+            return;
+        };
+        let engine = crate::engine::Engine::with_signer(test_signer(), &dsn)
+            .await
+            .expect("postgres engine");
+        let dir = engine.federation_directory();
+        let tag = format!("pg-{}", uuid::Uuid::new_v4().simple());
+        erasable_survives_erasure(&*dir, &tag).await;
+        sealed_erasure_is_refused(&*dir, &format!("{tag}-sealed")).await;
     }
 }
