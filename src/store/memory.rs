@@ -2161,6 +2161,19 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // was accepted unconditionally here.
         crate::federation::admission::check_cohort_scope(&row.cohort_scope)?;
 
+        // v25.2.0 (CIRISPersist#589 / AV-83) — `capacity:*` IS NEVER LOCAL.
+        // See `src/store/sqlite.rs` put_attestation for the full rationale:
+        // the v4.4.0 rule lived only inside `check_local_tier_eligibility`,
+        // which this door never calls, while this door accepts
+        // `tier = "local"`. Pure predicate ⇒ tier 1; a refusal, never an
+        // accept. Backend-symmetric with sqlite + postgres.
+        if row.tier == crate::federation::types::attestation_tier::LOCAL {
+            crate::federation::admission::check_capacity_never_local(
+                &row.attestation_type,
+                crate::federation::admission::envelope_dimension(&row.attestation_envelope),
+            )?;
+        }
+
         // v18.1.0 (CIRISPersist#473 followup) — the `trace:*`
         // Information-Type validator: self-emission polarity
         // (`attesting_key_id` ∈ `subject_key_ids`) plus the inline-trace /
@@ -5786,6 +5799,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     async fn promote_attestation(
         &self,
         attestation_id: &str,
+        cohort_scope: &str,
         scrub_signature_classical: &str,
         scrub_signature_pqc: Option<&str>,
         original_content_hash_hex: &str,
@@ -5793,6 +5807,31 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, crate::federation::Error> {
         use crate::federation::types::attestation_tier;
+        // v25.2.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE.
+        // See `src/store/sqlite.rs` promote_attestation for the rationale.
+        // It MUST run before `self.state.lock()`: every gate in the stack
+        // reads the directory through that same lock, so gating inside the
+        // critical section would deadlock this backend. Running it first is
+        // also verify-before-mutation (AV-9) — a refused promotion never
+        // touches the row.
+        {
+            let current = self.get_attestation(attestation_id).await?.ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "federation_attestations row {attestation_id} does not exist"
+                ))
+            })?;
+            if current.tier != attestation_tier::FEDERATION {
+                let mut as_promoted = current;
+                as_promoted.tier = attestation_tier::FEDERATION.to_string();
+                as_promoted.cohort_scope = cohort_scope.to_owned();
+                crate::federation::admission::check_promotion_admission(
+                    self,
+                    &as_promoted,
+                    self.self_key_id().as_deref(),
+                )
+                .await?;
+            }
+        }
         let mut state = self.state.lock().expect("memory backend lock");
         let row = state
             .federation_attestations
@@ -5807,6 +5846,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             return Ok(false);
         }
         let now = scrub_timestamp;
+        row.cohort_scope = cohort_scope.to_owned();
         row.original_content_hash = original_content_hash_hex.to_owned();
         row.scrub_signature_classical = scrub_signature_classical.to_owned();
         row.scrub_signature_pqc = scrub_signature_pqc.map(|s| s.to_owned());
@@ -5844,6 +5884,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
     async fn promote_attestation_transformed(
         &self,
         attestation_id: &str,
+        cohort_scope: &str,
         envelope_json: &serde_json::Value,
         scrub_signature_classical: &str,
         scrub_signature_pqc: Option<&str>,
@@ -5852,6 +5893,28 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         scrub_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, crate::federation::Error> {
         use crate::federation::types::attestation_tier;
+        // v25.2.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE,
+        // over the TRANSFORMED envelope. Runs before the state lock for the
+        // same deadlock reason as `promote_attestation`.
+        {
+            let current = self.get_attestation(attestation_id).await?.ok_or_else(|| {
+                crate::federation::Error::InvalidArgument(format!(
+                    "federation_attestations row {attestation_id} does not exist"
+                ))
+            })?;
+            if current.tier != attestation_tier::FEDERATION {
+                let mut as_promoted = current;
+                as_promoted.attestation_envelope = envelope_json.clone();
+                as_promoted.tier = attestation_tier::FEDERATION.to_string();
+                as_promoted.cohort_scope = cohort_scope.to_owned();
+                crate::federation::admission::check_promotion_admission(
+                    self,
+                    &as_promoted,
+                    self.self_key_id().as_deref(),
+                )
+                .await?;
+            }
+        }
         let mut state = self.state.lock().expect("memory backend lock");
         let row = state
             .federation_attestations
@@ -5866,6 +5929,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
             return Ok(false);
         }
         let now = scrub_timestamp;
+        row.cohort_scope = cohort_scope.to_owned();
         row.attestation_envelope = envelope_json.clone();
         row.original_content_hash = original_content_hash_hex.to_owned();
         row.scrub_signature_classical = scrub_signature_classical.to_owned();
@@ -7684,12 +7748,16 @@ mod accord_tests {
         .await;
     }
 
-    /// #589 RED DEMO — promote bypasses the tier-4 stack, on memory.
+    /// #589 B8 / AV-83 — the promotion admission gate + "capacity is never
+    /// local", on memory. Shared exercise body with sqlite + postgres.
     #[tokio::test]
-    async fn promote_bypasses_tier4_red_demo_memory_589() {
+    async fn promotion_admission_gate_memory_589() {
         let backend = MemoryBackend::new();
-        crate::federation::bootstrap_admission::test_support::exercise_589_red_demo(
-            &backend, "mem589",
+        backend.set_self_key_id(Some("mem589-self".to_string()));
+        crate::federation::bootstrap_admission::test_support::exercise_promotion_admission_gate(
+            &backend,
+            "mem589-self",
+            "mem589",
         )
         .await;
     }

@@ -4033,6 +4033,19 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // backstop for direct-SQL bypass.
         crate::federation::admission::check_cohort_scope(&row.cohort_scope)?;
 
+        // v25.2.0 (CIRISPersist#589 / AV-83) — `capacity:*` IS NEVER LOCAL.
+        // See `src/store/sqlite.rs` put_attestation for the full rationale:
+        // the v4.4.0 rule lived only inside `check_local_tier_eligibility`,
+        // which this door never calls, while this door accepts
+        // `tier = "local"`. Pure predicate ⇒ tier 1; a refusal, never an
+        // accept. Backend-symmetric with memory + sqlite.
+        if row.tier == crate::federation::types::attestation_tier::LOCAL {
+            crate::federation::admission::check_capacity_never_local(
+                &row.attestation_type,
+                crate::federation::admission::envelope_dimension(&row.attestation_envelope),
+            )?;
+        }
+
         // v18.1.0 (CIRISPersist#473 followup) — the `trace:*`
         // Information-Type validator: self-emission polarity
         // (`attesting_key_id` ∈ `subject_key_ids`) plus the inline-trace /
@@ -8806,6 +8819,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn promote_attestation(
         &self,
         attestation_id: &str,
+        cohort_scope: &str,
         scrub_signature_classical: &str,
         scrub_signature_pqc: Option<&str>,
         original_content_hash_hex: &str,
@@ -8824,8 +8838,23 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let och: Vec<u8> = hex::decode(original_content_hash_hex).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
+        // v25.2.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE.
+        // See `src/store/sqlite.rs` promote_attestation for the rationale.
+        // Gated on the POST-promotion shape; verify-before-mutation.
+        {
+            let mut as_promoted = row.clone();
+            as_promoted.tier = attestation_tier::FEDERATION.to_string();
+            as_promoted.cohort_scope = cohort_scope.to_owned();
+            crate::federation::admission::check_promotion_admission(
+                self,
+                &as_promoted,
+                self.self_key_id().as_deref(),
+            )
+            .await?;
+        }
         let now = scrub_timestamp;
         let pqc_owned = scrub_signature_pqc.map(|s| s.to_owned());
+        row.cohort_scope = cohort_scope.to_owned();
         row.original_content_hash = original_content_hash_hex.to_owned();
         row.scrub_signature_classical = scrub_signature_classical.to_owned();
         row.scrub_signature_pqc = pqc_owned.clone();
@@ -8864,7 +8893,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                  SET original_content_hash = $1, scrub_signature_classical = $2, \
                      scrub_signature_pqc = $3, scrub_key_id = $4, scrub_timestamp = $5, \
                      pqc_completed_at = $6, persist_row_hash = $7, tier = 'federation', \
-                     promoted_at = $5, additional_scrubs = '[]' \
+                     promoted_at = $5, additional_scrubs = '[]', cohort_scope = $9 \
                  WHERE attestation_id = $8 AND tier = 'local'",
                 &[
                     &och,
@@ -8875,6 +8904,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &pqc_completed,
                     &new_hash,
                     &att_uuid,
+                    &cohort_scope,
                 ],
             )
             .await
@@ -8910,6 +8940,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
     async fn promote_attestation_transformed(
         &self,
         attestation_id: &str,
+        cohort_scope: &str,
         envelope_json: &serde_json::Value,
         scrub_signature_classical: &str,
         scrub_signature_pqc: Option<&str>,
@@ -8929,8 +8960,23 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         let och: Vec<u8> = hex::decode(original_content_hash_hex).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
+        // v25.2.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE,
+        // over the TRANSFORMED envelope (the bytes this row will federate as).
+        {
+            let mut as_promoted = row.clone();
+            as_promoted.attestation_envelope = envelope_json.clone();
+            as_promoted.tier = attestation_tier::FEDERATION.to_string();
+            as_promoted.cohort_scope = cohort_scope.to_owned();
+            crate::federation::admission::check_promotion_admission(
+                self,
+                &as_promoted,
+                self.self_key_id().as_deref(),
+            )
+            .await?;
+        }
         let now = scrub_timestamp;
         let pqc_owned = scrub_signature_pqc.map(|s| s.to_owned());
+        row.cohort_scope = cohort_scope.to_owned();
         row.attestation_envelope = envelope_json.clone();
         row.original_content_hash = original_content_hash_hex.to_owned();
         row.scrub_signature_classical = scrub_signature_classical.to_owned();
@@ -8970,7 +9016,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                      scrub_signature_classical = $3, scrub_signature_pqc = $4, \
                      scrub_key_id = $5, scrub_timestamp = $6, pqc_completed_at = $7, \
                      persist_row_hash = $8, tier = 'federation', promoted_at = $6, \
-                     additional_scrubs = '[]' \
+                     additional_scrubs = '[]', cohort_scope = $10 \
                  WHERE attestation_id = $9 AND tier = 'local'",
                 &[
                     &row.attestation_envelope,
@@ -8982,6 +9028,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &pqc_completed,
                     &new_hash,
                     &att_uuid,
+                    &cohort_scope,
                 ],
             )
             .await
@@ -20256,10 +20303,12 @@ mod tests {
         .await;
     }
 
-    /// #589 RED DEMO — promote bypasses the tier-4 stack, on postgres.
+    /// #589 B8 / AV-83 — the promotion admission gate + "capacity is never
+    /// local", on postgres. Shared exercise body; the tag is unique per run
+    /// because this database persists across tests.
     #[tokio::test]
     #[serial_test::serial(postgres)]
-    async fn promote_bypasses_tier4_red_demo_postgres_589() {
+    async fn promotion_admission_gate_postgres_589() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -20267,8 +20316,12 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
         let tag = format!("pg589{}", uuid_like());
-        crate::federation::bootstrap_admission::test_support::exercise_589_red_demo(&backend, &tag)
-            .await;
+        let me = format!("{tag}-self");
+        backend.set_self_key_id(Some(me.clone()));
+        crate::federation::bootstrap_admission::test_support::exercise_promotion_admission_gate(
+            &backend, &me, &tag,
+        )
+        .await;
     }
 
     /// #541 — the signed-row-survives-unsigned-write invariant on postgres.

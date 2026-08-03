@@ -3180,10 +3180,26 @@ pub trait FederationDirectory: Send + Sync {
     /// signing bytes are the §0.9-canonical envelope (gated produce
     /// canonicalizer), so a promoted row is byte-identical on the wire to
     /// a natively-federation one (Registry must #1).
+    ///
+    /// # v25.2.0 (CIRISPersist#589 / AV-83) — the primitive carries its placement
+    ///
+    /// `cohort_scope` is the placement the promoted row lands at, written in
+    /// the SAME statement as the tier flip. Before this it was a separate
+    /// [`Self::set_attestation_cohort_scope`] call the caller made first
+    /// ("placement before tier"), which was safe only while promotion could
+    /// not refuse on authority grounds. Now that
+    /// [`admission::check_promotion_admission`] runs here, that two-step left a
+    /// REFUSED promotion having already mutated the row's `cohort_scope` and
+    /// `persist_row_hash` — a verify-before-mutation (AV-9) violation, and
+    /// exactly what the substrate state machine's I2a caught. Carrying the
+    /// placement is #519's own "a promotion is placement-touching, so the
+    /// primitive must carry it" argument applied one layer further down: an
+    /// incomplete OR a partially-applied promotion is no longer expressible.
     #[allow(clippy::too_many_arguments)]
     async fn promote_attestation(
         &self,
         attestation_id: &str,
+        cohort_scope: &str,
         scrub_signature_classical: &str,
         scrub_signature_pqc: Option<&str>,
         original_content_hash_hex: &str,
@@ -3217,10 +3233,13 @@ pub trait FederationDirectory: Send + Sync {
     /// new directory methods — this is an engine-internal primitive, not
     /// wired into the FFI directory capsule); sqlite/postgres/memory
     /// override.
+    /// v25.2.0 (CIRISPersist#589 / AV-83) — carries `cohort_scope` for the same
+    /// reason [`Self::promote_attestation`] does; see that method.
     #[allow(clippy::too_many_arguments)]
     async fn promote_attestation_transformed(
         &self,
         attestation_id: &str,
+        cohort_scope: &str,
         envelope_json: &serde_json::Value,
         scrub_signature_classical: &str,
         scrub_signature_pqc: Option<&str>,
@@ -3230,6 +3249,7 @@ pub trait FederationDirectory: Send + Sync {
     ) -> Result<bool, Error> {
         let _ = (
             attestation_id,
+            cohort_scope,
             envelope_json,
             scrub_signature_classical,
             scrub_signature_pqc,
