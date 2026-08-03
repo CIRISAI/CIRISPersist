@@ -27451,6 +27451,11 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         }
         // Rate-limit → RuntimeError; lens maps to 429.
         crate::federation::Error::RateLimited { .. } => PyRuntimeError::new_err(kind),
+        // v25.1.0 (CIRISPersist#569) — CONSENT BEFORE SCORING is an
+        // admission-gate rejection like its siblings above: the caller emitted
+        // a trust signal about a subject who authorized no such thing.
+        // Caller-fault (4xx shape) — ValueError.
+        crate::federation::Error::ConsentGateRefused(_) => PyValueError::new_err(kind),
         // v3.4.0 (CIRISPersist#123) — trust gate rejection is
         // caller-side authorization failure; ValueError (4xx).
         crate::federation::Error::TrustBelowThreshold { .. } => PyValueError::new_err(kind),

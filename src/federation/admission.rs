@@ -1428,35 +1428,238 @@ pub fn check_capacity_not_self_attested(
     Ok(())
 }
 
-/// v22.0.0 (CIRISConstitution#46) — the `capacity:*` family a row CLAIMS, on
-/// EITHER wire shape, or `None` for a non-capacity row.
-///
-/// Reputation rides `attestation_type = scores` with the family in
-/// `dimension`; the legacy type-keyed shape (`attestation_type =
-/// capacity:...`) also exists. #543 finding 2 was exactly a gate keyed to one
-/// of the two shapes and therefore reaching zero real callers — so every
-/// `capacity:*` rule reads the family through this one helper. The DIMENSION
-/// wins when both are present: it is the axis the emit path actually uses.
+/// v25.1.0 (CIRISPersist#569) — the `capacity:*` prefix, named once. The
+/// substrate's own open-sender reputation family; verify's namespace does not
+/// contain it, so it is the one member of the consent-gated set persist owns.
 ///
 /// `capacity_assurance:*` is a DIFFERENT family (it does not start with
-/// `capacity:` — the next byte is `_`) and is deliberately not matched: it is
+/// `capacity:` — the next byte is `_`) and is deliberately NOT matched: it is
 /// role-gated (a registered `witness` assessor), not open-sender.
+pub const CAPACITY_FAMILY_PREFIX: &str = "capacity:";
+
+/// v25.1.0 (CIRISPersist#569) — **WHICH consent rule** a dimension falls under.
+///
+/// Closed, and every variant corresponds to exactly one classification source.
+/// Deliberately no `Other` — a catch-all would reintroduce the "which rule
+/// refused me?" disjunction one name deeper (the #565 / #575 lesson). Serde
+/// tokens are snake_case and [`Self::as_str`] returns the SAME token, so a
+/// consumer keys on a program constant and never on a message string. The
+/// token set is the downstream contract and this mapping is **APPEND-ONLY**.
+///
+/// **One variant today, and that is the ruling — not an oversight.** #569
+/// briefly added a `VerifyConsensualReputation` variant covering every family
+/// CIRISVerify's registry classifies `ConsensualReputation`; CC 3.4.5's
+/// per-family disposition put all four of them OUTSIDE the gate (see
+/// [`consent_gated_family`]) and the variant was removed before merge. The
+/// type stays because a refusal must still name its rule as a program
+/// constant, and because the boundary it draws is the one CC 3.4.5 drew:
+/// *"consent-before-scoring binds the family that judges agents —
+/// `capacity:*` — never the families that verify artifacts."* If a future CC
+/// amendment moves a family across that line, it arrives here as a new
+/// variant and as a deliberate edit to
+/// [`tests::verify_dimension_registry_is_the_only_enumeration`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentGatedFamily {
+    /// [`CAPACITY_FAMILY_PREFIX`] — CC 3.4.5's open-sender reputation family,
+    /// consent-gated since v22.0.0 (CIRISConstitution#46 / AV-79). The family
+    /// that judges an AGENT, which is what makes it the gated one.
+    Capacity,
+}
+
+impl ConsentGatedFamily {
+    /// The **stable program token** for this classification — identical to the
+    /// serde token, so a consumer that reads the wire and a consumer that
+    /// holds the typed value key on the same constant.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Capacity => "capacity",
+        }
+    }
+
+    /// Every variant, in declaration order — the closed set, for exhaustive
+    /// gates and for a consumer enumerating the taxonomy it must handle.
+    pub const ALL: &'static [Self] = &[Self::Capacity];
+}
+
+impl std::fmt::Display for ConsentGatedFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// v25.1.0 (CIRISPersist#569) — is `dimension` consent-gated, and under which
+/// rule? `None` for every family outside the gated set.
+///
+/// # The gated set is `capacity:*`, and CC 3.4.5 is why
+///
+/// CIRISPersist#569 widened this predicate to every family CIRISVerify's
+/// registry then classified `ConsensualReputation` (deliberately plain text,
+/// not an intra-doc link: verify's classification type is the one surface that
+/// moves under a re-pin, and it is named in exactly one place — see
+/// [`tests::verify_dimension_registry_is_the_only_enumeration`])
+/// — `attestation:registry_consensus`, `attestation:license_validity`,
+/// `cert_validity:{authority}`, `rollback_detected:{revision_field}`. **CC
+/// 3.4.5's per-family disposition paragraph put every one of them outside the
+/// gate**, and the widening was held before merge:
+///
+/// - the first three, with `provenance:*` and the rest, are **artifact-integrity
+///   verification** — they *"score builds, manifests, licenses and certificates
+///   — not a subject's conduct or capacity; integrity checking is the trust
+///   precondition, and a forger never consents to verification"*;
+/// - `rollback_detected:{revision_field}` is *"an adversarial detector (−1-only
+///   polarity), on the abuse-response side of the line by construction"* —
+///   gating it would let an adversary opt out of its own rollback detection,
+///   which is the very thing #569 said it would never do when it left
+///   `detection:*` / `moderation:*` / `slashing:*` alone;
+/// - and the rule itself: *"Consent-before-scoring binds the family that judges
+///   **agents** — `capacity:*` — never the families that verify **artifacts**."*
+///
+/// # Where #569 was right, and where it was wrong
+///
+/// #569 refused to hold a hand-copied list and derived its set from
+/// [`dim::lookup`](ciris_verify_core::federation_provenance::dim::lookup) —
+/// the correct instinct, and the #541 / #532 / #574 lesson applied. Its error
+/// was one layer up: it treated verify's classification as a *ruling*, when
+/// verify itself calls the split **"a proposal from the measuring side, not a
+/// ruling"**. Verify knows what each dimension IS; the Constitution decides
+/// what the substrate does about it. So this predicate reads the floor, not
+/// the measuring side — and [`tests::verify_dimension_registry_is_the_only_enumeration`]
+/// is the adjudication record that keeps the two visible to each other, going
+/// red if EITHER moves.
+///
+/// # Not a weakening (CC 3.4.5, reciprocity clause)
+///
+/// *"A subject that declines analysis cannot be scored; its
+/// `capacity:composite` is undefined and MUST NOT be emitted; and every gate
+/// that requires a capacity verdict therefore **fails closed** for that
+/// subject."* Consent-before-scoring is reciprocal: a declining subject is not
+/// scored at all, which is a stronger outcome than being scored without
+/// consent — while the planes that verify artifacts and report abuse, which
+/// never judged that subject's conduct, keep working.
 #[must_use]
-pub fn capacity_claim_family(row: &super::Attestation) -> Option<&str> {
-    let dimension = envelope_dimension(&row.attestation_envelope);
-    if dimension.is_some_and(|d| d.starts_with("capacity:")) {
-        return dimension;
+pub fn consent_gated_family(dimension: &str) -> Option<ConsentGatedFamily> {
+    if dimension.starts_with(CAPACITY_FAMILY_PREFIX) {
+        return Some(ConsentGatedFamily::Capacity);
     }
-    if row.attestation_type.starts_with("capacity:") {
-        return Some(row.attestation_type.as_str());
-    }
+    // Everything else, deliberately: verify's whole namespace (artifact
+    // integrity, log infrastructure, self-reports, and the `rollback_detected:`
+    // adversarial detector) per CC 3.4.5's per-family disposition, plus every
+    // role-gated abuse-response family outside it (`detection:*` /
+    // `moderation:*` / `slashing:*`, `revocation:peer_admission:v1`).
     None
 }
 
-/// v22.0.0 (CIRISConstitution#46) — **CONSENT BEFORE SCORING**: a
-/// federation-tier `capacity:*` claim about subject S from attester P is
-/// REFUSED unless a live [`CAPACITY_CONSENT_SCOPE`] consent from S covering P
-/// exists in this node's verified corpus.
+/// v25.1.0 (CIRISPersist#569) — the consent-gated claim a row makes, on
+/// EITHER wire shape, or `None` when the row is in no gated family.
+///
+/// Reputation rides `attestation_type = scores` with the family in
+/// `dimension`; the type-keyed shape (`attestation_type = capacity:composite`)
+/// also exists. #543 finding 2 was
+/// exactly a gate keyed to one of the two shapes and therefore reaching zero
+/// real callers (the AV-74 lesson) — so every consent rule reads the family
+/// through this one helper, which asks BOTH. The DIMENSION wins when both
+/// carry a gated family: it is the axis the emit path actually uses.
+#[must_use]
+pub fn consent_gated_claim(row: &super::Attestation) -> Option<ConsentGatedClaim<'_>> {
+    if let Some(d) = envelope_dimension(&row.attestation_envelope) {
+        if let Some(family) = consent_gated_family(d) {
+            return Some(ConsentGatedClaim {
+                family,
+                dimension: d,
+            });
+        }
+    }
+    consent_gated_family(&row.attestation_type).map(|family| ConsentGatedClaim {
+        family,
+        dimension: row.attestation_type.as_str(),
+    })
+}
+
+/// v25.1.0 (CIRISPersist#569) — what [`consent_gated_claim`] resolved: the
+/// exact dimension string the row claimed, and WHICH rule puts it behind
+/// consent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsentGatedClaim<'a> {
+    /// Which consent rule covers the claim.
+    pub family: ConsentGatedFamily,
+    /// The dimension string the row actually carried, on whichever wire
+    /// shape carried it.
+    pub dimension: &'a str,
+}
+
+/// v25.1.0 (CIRISPersist#569) — the typed refusal
+/// [`check_capacity_consent_admission`] returns: WHICH rule, WHICH dimension,
+/// WHO was claimed about by WHOM, and the stance the fold actually resolved.
+///
+/// A refusal is a verdict, and a verdict without its evidence sends the reader
+/// to the wrong layer (#575). String-matching a message to learn "was this the
+/// consent gate?" is what this type makes unnecessary rather than merely
+/// discouraged: it survives the conversion into
+/// [`Error::ConsentGateRefused`](crate::federation::Error::ConsentGateRefused)
+/// intact, so a consumer branches on `family` and reads `dimension` /
+/// `stance` as data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsentGateRefused {
+    /// WHICH rule refused. A closed enum, not a message string.
+    pub family: ConsentGatedFamily,
+    /// The dimension the refused row claimed, verbatim.
+    pub dimension: String,
+    /// S — the subject the claim is ABOUT, and the only party who can
+    /// authorize it.
+    pub subject_key_id: String,
+    /// P — the attester who tried to publish the claim.
+    pub attester_key_id: String,
+    /// What [`resolve_scoped_consent`](super::FederationDirectory::resolve_scoped_consent)
+    /// resolved for (S → P, [`ANALYZE_CONSENT_SCOPE`]). Never `Granted` —
+    /// that is the admit path.
+    pub stance: super::hard_case::ConsentState,
+}
+
+impl std::fmt::Display for ConsentGateRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no live consent covers this {dimension} emission ({family} rule): subject \
+             {subject} has not granted attester {attester} the \"{scope}\" scope (resolved \
+             stance: {stance:?}) — a party MUST NOT emit a score that judges a subject unless a \
+             live consent:scope:{scope} from that subject covers the attester \
+             (CIRISConstitution#46, ratified at CC 3.4.5). The subject authorizes it with a \
+             `{granted}:v1` row whose attested_key_id is the attester and whose envelope names \
+             scope \"{scope}\".",
+            dimension = self.dimension,
+            family = self.family,
+            subject = self.subject_key_id,
+            attester = self.attester_key_id,
+            scope = ANALYZE_CONSENT_SCOPE,
+            stance = self.stance,
+            granted = super::consent::consent_dimension::STATE_GRANTED_PREFIX,
+        )
+    }
+}
+
+impl From<ConsentGateRefused> for Error {
+    fn from(refused: ConsentGateRefused) -> Self {
+        Error::ConsentGateRefused(refused)
+    }
+}
+
+/// v22.0.0 (CIRISConstitution#46), ratified and bounded at CC 3.4.5 —
+/// **CONSENT BEFORE SCORING**: a federation-tier claim in a
+/// [`ConsentGatedFamily`] about subject S from attester P is REFUSED unless a
+/// live [`ANALYZE_CONSENT_SCOPE`] consent from S covering P exists in this
+/// node's verified corpus.
+///
+/// # The gated set is `capacity:*`
+///
+/// CIRISPersist#569 widened this gate to every family verify classifies
+/// `ConsensualReputation` and CC 3.4.5 disposed of all four of those families
+/// the other way, so the widening was held before merge and the gate is
+/// `capacity:*` — the family that judges an AGENT. The per-family reasoning,
+/// and why the narrowing is the STRONGER outcome rather than the weaker one,
+/// is on [`consent_gated_family`], which is the one predicate every arm of
+/// this rule classifies through.
 ///
 /// # The default this inverts
 ///
@@ -1482,7 +1685,7 @@ pub fn capacity_claim_family(row: &super::Attestation) -> Option<&str> {
 /// consent representation the substrate already maintains and folds:
 /// `attesting_key_id` = S, `attested_key_id` = P, envelope `dimension` =
 /// `consent:state:granted|revoked|expired:*`, envelope `scope` naming
-/// [`CAPACITY_CONSENT_SCOPE`]. It is resolved through
+/// [`ANALYZE_CONSENT_SCOPE`]. It is resolved through
 /// [`resolve_scoped_consent`](super::FederationDirectory::resolve_scoped_consent)
 /// — the ONE canonical scoped fold (a default trait method, so all three
 /// backends answer from identical code): latest-wins by `asserted_at`,
@@ -1492,11 +1695,21 @@ pub fn capacity_claim_family(row: &super::Attestation) -> Option<&str> {
 ///
 /// # Scope — what it deliberately does NOT catch
 ///
-/// - **Non-`capacity:*` families.** CC#46's own scope boundary: open-sender
-///   families are consent-gated, role-gated ones are unchanged. An abuser
-///   never consents to `detection:*` / `moderation:*` / `slashing:*`, and the
-///   first uniform application of this rule would delete the abuse-response
-///   plane. `revocation:peer_admission:v1` (AV-77) is likewise untouched.
+/// - **Families outside [`consent_gated_family`].** CC#46's own scope
+///   boundary. An abuser never consents to `detection:*` / `moderation:*` /
+///   `slashing:*`, and a uniform application of this rule would delete the
+///   abuse-response plane. `revocation:peer_admission:v1` (AV-77) is likewise
+///   untouched.
+/// - **CIRISVerify's entire namespace**, per CC 3.4.5's per-family
+///   disposition: the self-reports and log-infrastructure families have no
+///   third-party subject at all; the artifact-integrity families score builds,
+///   manifests, licenses and certificates rather than a subject's conduct, and
+///   *"a forger never consents to verification"*; and
+///   `rollback_detected:{revision_field}` is an adversarial detector on the
+///   abuse-response side of the line — gating it would hand the adversary the
+///   off switch for its own detection. Witnessed by B7
+///   ([`super::bootstrap_admission::test_support::exercise_verify_families_are_not_consent_gated`])
+///   on all three backends, not merely asserted here.
 /// - **Local-tier rows.** A local-tier row is not an EMISSION — it is this
 ///   node's own working state, un-replicated, so consent-to-publish has
 ///   nothing to bind to yet. This arm is LOAD-BEARING, not redundant, and the
@@ -1508,10 +1721,11 @@ pub fn capacity_claim_family(row: &super::Attestation) -> Option<&str> {
 ///   every family and those rows admit). So the local-tier `capacity:*` row
 ///   is reachable here, and this arm is what lets it through.
 ///
-///   The residual is therefore real and named rather than papered over: a
-///   local-tier `capacity:*` row written via `put_attestation` and then
-///   `attestation_promote`d becomes a federation-tier `capacity:*` row that
-///   never faced this gate. That is the PROMOTE path's pre-existing shape —
+///   The residual is therefore real and named rather than papered over, and it
+///   is tracked as **CIRISPersist#589**: a local-tier `capacity:*` row written
+///   via `put_attestation` and then `attestation_promote`d becomes a
+///   federation-tier `capacity:*` row that never faced this gate. That is the
+///   PROMOTE path's pre-existing shape —
 ///   it re-signs and flips `tier` without re-running ANY tier-4 put-gate, so
 ///   it equally bypasses AV-45, AV-77 and the moderation gates — but note the
 ///   asymmetry with this gate's own sibling: [`check_capacity_not_self_attested`]
@@ -1536,12 +1750,26 @@ pub fn capacity_claim_family(row: &super::Attestation) -> Option<&str> {
 /// scoring is refused everywhere. That IS CC#46's semantics: consent BEFORE
 /// scoring means the plane opens when subjects open it, not before. There is
 /// no bootstrap bypass on purpose; a bypass keyed to "the mesh is young" would
-/// be a permanent hole with a temporary name.
+/// be a permanent hole with a temporary name. CC 3.4.5's reciprocity clause
+/// names the same posture from the subject's side: a subject that declines
+/// analysis *"cannot be scored; its `capacity:composite` is undefined and MUST
+/// NOT be emitted; and every gate that requires a capacity verdict therefore
+/// fails closed for that subject."*
+///
+/// # It bites this node's OWN emit surface
+///
+/// [`Engine::emit_attestation`](crate::Engine::emit_attestation) and
+/// [`emit_attestation_self`](crate::Engine::emit_attestation_self) store
+/// through `put_attestation`, so they face this gate like any peer — no local
+/// bypass. `engine::tests::emit_attestation_consent_gate_bites_own_surface_569`
+/// witnesses it: the node's own `capacity:*` emit about a third party is
+/// refused until that subject grants and admits after, while its
+/// `rollback_detected:*` emit about the same silent subject admits throughout.
 pub async fn check_capacity_consent_admission(
     directory: &dyn super::FederationDirectory,
     row: &super::Attestation,
 ) -> Result<(), Error> {
-    let Some(family) = capacity_claim_family(row) else {
+    let Some(claim) = consent_gated_claim(row) else {
         return Ok(());
     };
     if row.tier != super::types::attestation_tier::FEDERATION {
@@ -1555,7 +1783,7 @@ pub async fn check_capacity_consent_admission(
         .resolve_scoped_consent(
             &row.attesting_key_id, // the consent edge points AT the attester P
             &row.attested_key_id,  // and is authored BY the subject S
-            CAPACITY_CONSENT_SCOPE,
+            ANALYZE_CONSENT_SCOPE,
             None,
             chrono::Utc::now(),
         )
@@ -1563,28 +1791,28 @@ pub async fn check_capacity_consent_admission(
     if stance == super::hard_case::ConsentState::Granted {
         return Ok(());
     }
-    Err(Error::InvalidArgument(format!(
-        "no live consent covers this {family} emission: subject {subject} has not granted \
-         attester {attester} the \"{CAPACITY_CONSENT_SCOPE}\" scope (resolved stance: \
-         {stance:?}) — a party MUST NOT emit a capacity:* score about a subject unless a live \
-         consent:scope:{CAPACITY_CONSENT_SCOPE} from that subject covers the attester \
-         (CIRISConstitution#46). The subject authorizes it with a \
-         `{granted}:v1` row whose attested_key_id is the attester and whose envelope names \
-         scope \"{CAPACITY_CONSENT_SCOPE}\".",
-        subject = row.attested_key_id,
-        attester = row.attesting_key_id,
-        granted = super::consent::consent_dimension::STATE_GRANTED_PREFIX,
-    )))
+    Err(ConsentGateRefused {
+        family: claim.family,
+        dimension: claim.dimension.to_owned(),
+        subject_key_id: row.attested_key_id.clone(),
+        attester_key_id: row.attesting_key_id.clone(),
+        stance,
+    }
+    .into())
 }
 
 /// v22.0.0 (CIRISConstitution#46) — the CC 3.3.1 consent-grant KIND that
 /// authorizes deriving scores about a subject: *"`analyze` (derive features
 /// / scores / classifications)"*. Named here rather than re-spelled at each
-/// call site, and pinned by `capacity_consent_scope_is_the_grammar_analyze_kind`
+/// call site, and pinned by `analyze_consent_scope_is_the_grammar_analyze_kind`
 /// to the wire token of
 /// [`consent_grammar::TransmissionPrinciple::Analyze`](crate::federation::consent_grammar::TransmissionPrinciple::Analyze)
 /// — persist has ONE `analyze` vocabulary, not two that can drift apart.
-pub const CAPACITY_CONSENT_SCOPE: &str = "analyze";
+///
+/// v25.1.0 (CIRISPersist#569) — renamed from `ANALYZE_CONSENT_SCOPE`: the
+/// scope was never capacity-specific (it is CC 3.3.1's `analyze` kind), and
+/// the gate that reads it no longer is either. Clean break, no alias.
+pub const ANALYZE_CONSENT_SCOPE: &str = "analyze";
 
 /// v4.13.0 (CIRISPersist#192, CEG 0.18 §5.6.8.8) — validate an
 /// occurrence's optional content-encryption pubkeys on admit: each half
@@ -7793,11 +8021,11 @@ mod tests {
     /// `analyze`s would be the axis-fusion mistake in reverse — one concept,
     /// two strings that can drift.
     #[test]
-    fn capacity_consent_scope_is_the_grammar_analyze_kind() {
+    fn analyze_consent_scope_is_the_grammar_analyze_kind() {
         use crate::federation::consent_grammar::TransmissionPrinciple;
         assert_eq!(
             serde_json::to_value(TransmissionPrinciple::Analyze).unwrap(),
-            serde_json::Value::String(CAPACITY_CONSENT_SCOPE.to_string()),
+            serde_json::Value::String(ANALYZE_CONSENT_SCOPE.to_string()),
             "the gate's scope token and the grammar's transmission principle are one vocabulary"
         );
         assert!(
@@ -7805,69 +8033,345 @@ mod tests {
                 .as_array()
                 .expect("principles is an array")
                 .contains(&serde_json::Value::String(
-                    CAPACITY_CONSENT_SCOPE.to_string()
+                    ANALYZE_CONSENT_SCOPE.to_string()
                 )),
             "and it is a published grammar principle, not a private string"
         );
     }
 
-    /// The family reader sees BOTH wire shapes and neither neighbour.
+    /// Build a minimal deserialized [`crate::federation::Attestation`] with the
+    /// given `attestation_type` + envelope — enough for the pure classifiers.
+    #[cfg(test)]
+    fn minimal_row(at: &str, envelope: serde_json::Value) -> crate::federation::Attestation {
+        serde_json::from_value(serde_json::json!({
+            "attestation_id": "a-1",
+            "attesting_key_id": "p",
+            "attested_key_id": "s",
+            "attestation_type": at,
+            "asserted_at": "2026-06-01T00:00:00Z",
+            "attestation_envelope": envelope,
+            "original_content_hash": "00",
+            "scrub_signature_classical": "AA",
+            "scrub_key_id": "p",
+            "scrub_timestamp": "2026-06-01T00:00:00Z",
+            "persist_row_hash": "",
+            "cohort_scope": "federation",
+        }))
+        .expect("minimal attestation deserializes")
+    }
+
+    /// The claim reader sees BOTH wire shapes and neither neighbour.
     /// (`capacity_assurance:` is a role-gated family — matching it here would
     /// consent-gate the abuse-response plane, which CC#46 explicitly excludes.)
     #[test]
-    fn capacity_claim_family_reads_both_wire_shapes() {
-        let mk = |at: &str, envelope: serde_json::Value| -> crate::federation::Attestation {
-            serde_json::from_value(serde_json::json!({
-                "attestation_id": "a-1",
-                "attesting_key_id": "p",
-                "attested_key_id": "s",
-                "attestation_type": at,
-                "asserted_at": "2026-06-01T00:00:00Z",
-                "attestation_envelope": envelope,
-                "original_content_hash": "00",
-                "scrub_signature_classical": "AA",
-                "scrub_key_id": "p",
-                "scrub_timestamp": "2026-06-01T00:00:00Z",
-                "persist_row_hash": "",
-                "cohort_scope": "federation",
-            }))
-            .expect("minimal attestation deserializes")
+    fn consent_gated_claim_reads_both_wire_shapes() {
+        let mk = minimal_row;
+        let claim = |row: crate::federation::Attestation| {
+            consent_gated_claim(&row).map(|c| (c.family, c.dimension.to_owned()))
         };
         // The dimension shape — how reputation actually travels.
         assert_eq!(
-            capacity_claim_family(&mk(
+            claim(mk(
                 "scores",
                 serde_json::json!({"dimension": "capacity:core_identity:v1"})
             )),
-            Some("capacity:core_identity:v1")
+            Some((
+                ConsentGatedFamily::Capacity,
+                "capacity:core_identity:v1".to_owned()
+            ))
         );
         // The legacy type shape.
         assert_eq!(
-            capacity_claim_family(&mk("capacity:composite", serde_json::json!({}))),
-            Some("capacity:composite")
+            claim(mk("capacity:composite", serde_json::json!({}))),
+            Some((
+                ConsentGatedFamily::Capacity,
+                "capacity:composite".to_owned()
+            ))
         );
         // The dimension wins when both are present.
         assert_eq!(
-            capacity_claim_family(&mk(
+            claim(mk(
                 "capacity:composite",
                 serde_json::json!({"dimension": "capacity:core_identity:v1"})
             )),
-            Some("capacity:core_identity:v1")
+            Some((
+                ConsentGatedFamily::Capacity,
+                "capacity:core_identity:v1".to_owned()
+            ))
         );
-        // Neighbours that must NOT be caught.
+        // Neighbours that must NOT be caught. `capacity_assurance:*` is a
+        // role-gated family (a registered `witness` assessor), and the last
+        // five are CIRISVerify's namespace, which CC 3.4.5 dispositions
+        // family-by-family OUTSIDE this gate: self-reports and log
+        // infrastructure have no third-party subject; artifact-integrity
+        // verification scores builds, manifests, licenses and certificates
+        // rather than a subject's conduct; and `rollback_detected:*` is an
+        // adversarial detector, gating which would let an adversary opt out of
+        // its own detection.
         for (at, dim) in [
             ("scores", "capacity_assurance:v1"),
             ("capacity_assurance:v1", "trust:demo:v1"),
             ("scores", "detection:probe:v1"),
             ("scores", PEER_DEADMISSION_DIMENSION),
             ("scores", "trust:demo:v1"),
+            ("scores", "attestation:self_verify"),
+            ("scores", "hardware_custody:tpm"),
+            ("scores", "provenance:build_manifest:aarch64"),
+            ("scores", "attestation:registry_consensus"),
+            ("scores", "attestation:license_validity"),
+            ("scores", "rollback_detected:agent_version:v1"),
+            ("cert_validity:acme", "trust:demo:v1"),
+            ("scores", "cert_validity:acme"),
         ] {
             assert_eq!(
-                capacity_claim_family(&mk(at, serde_json::json!({"dimension": dim}))),
+                claim(mk(at, serde_json::json!({"dimension": dim}))),
                 None,
-                "({at}, {dim}) is not a capacity:* claim"
+                "({at}, {dim}) is not a consent-gated claim"
             );
         }
+    }
+
+    /// v25.1.0 (CIRISPersist#569, adjudicated by CC 3.4.5) — **THE
+    /// ADJUDICATION RECORD between the measuring side and the floor, and the
+    /// ONLY place in this crate that reads verify's consent classification.**
+    ///
+    /// This test does not defend a gate. It holds a **disagreement** open so
+    /// nobody has to rediscover it — and it is deliberately the single site
+    /// that touches the version-dependent surface of
+    /// `ciris_verify_core::federation_provenance::dim`, so whoever re-pins
+    /// verify has one function to edit rather than a scatter (see the
+    /// **v12.0.0** block below).
+    ///
+    /// # The disagreement, as it stood at v11.x
+    ///
+    /// CIRISVerify's registry classified four families
+    /// `ConsentClass::ConsensualReputation` and its own doc said they
+    /// *"belong behind the subject's `analyze` consent"*. **CIRISPersist does
+    /// not gate them.** CC 3.4.5's per-family disposition paragraph —
+    /// *"Disposition of the CC 2.3.2 verification families under this rule
+    /// (per family)"* — dispositions all four individually and puts every one
+    /// outside the gate: `attestation:registry_consensus`,
+    /// `attestation:license_validity` and `cert_validity:{authority}` are
+    /// **artifact-integrity verification** (*"a forger never consents to
+    /// verification"*), and `rollback_detected:{revision_field}` is *"an
+    /// adversarial detector (−1-only polarity), on the abuse-response side of
+    /// the line by construction"*. The rule: *"Consent-before-scoring binds
+    /// the family that judges **agents** — `capacity:*` — never the families
+    /// that verify **artifacts**."*
+    ///
+    /// That was never persist overruling verify. It is the two sides doing
+    /// their own jobs: **verify knows what each dimension IS**; the
+    /// Constitution decides what the substrate does about it. Verify said so
+    /// itself — the split is *"a proposal from the measuring side, not a
+    /// ruling"* — and CIRISPersist#569 is what happens when a consumer reads
+    /// the proposal as the ruling. It shipped the widened gate at 18:17; CC
+    /// 3.4.5 was ratified at 19:56; the widening was held before merge.
+    ///
+    /// # It must go red if EITHER side moves
+    ///
+    /// - **Verify moves** (a family added, dropped, or reclassified): the
+    ///   `dim::ALL` size pin, the recognition-only pin and the classification
+    ///   assertion read verify's registry directly.
+    /// - **The floor moves** (a CC amendment carrying a family across the
+    ///   line): the ruling block asserts persist gates NONE of `dim::ALL`, so
+    ///   a widening — deliberate or accidental — cannot land quietly, and a
+    ///   deliberate one has to edit this record and say why.
+    ///
+    /// Neither direction may arrive as a side-effect of a dependency bump.
+    #[test]
+    fn verify_dimension_registry_is_the_only_enumeration() {
+        use ciris_verify_core::federation_provenance::dim::{self, ConsentClass};
+        use std::collections::BTreeSet;
+
+        // CC part_3's 15 rows; 14 verify FAMILIES (the locale leaf is a
+        // sub-form of `provenance:build_manifest:`, not its own family), of
+        // which 13 are verify-emitted — `transparency_log:cosigned:` is
+        // witness-emitted and recognized only.
+        assert_eq!(
+            dim::ALL.len(),
+            14,
+            "verify's dimension registry changed size — a family was added or removed upstream. \
+             ADJUDICATE, do not just re-pin: read CC 3.4.5's paragraph headed \"Disposition of \
+             the CC 2.3.2 verification families under this rule (per family)\" and decide which \
+             side of the artifact/agent line the new family falls on. The Constitution settles \
+             it; verify's classification is evidence, not the verdict."
+        );
+        assert_eq!(
+            dim::ALL.iter().filter(|d| !d.verify_emits).count(),
+            1,
+            "exactly one registry entry is recognition-only (transparency_log:cosigned:)"
+        );
+
+        // ─────────────────────────────────────────────────────────────────
+        // THE MEASURING SIDE'S CLASSIFICATION — the ONLY version-dependent
+        // read of verify's registry in this crate. Everything else here and
+        // in B7 uses `dim::ALL` / `dim::lookup` / `prefix` / `parameterized`,
+        // which are stable across the re-pin.
+        //
+        // **Pinned against ciris-verify-core v11.x.** CIRISVerify v12.0.0 —
+        // shipped in response to this rework, and agreeing with it — replaces
+        // this surface:
+        //
+        //   * `ConsentClass`                  -> `ConsentDisposition`
+        //   * `ConsensualReputation`          -> `ArtifactVerification` /
+        //                                        `AbuseResponse` (per CC 3.4.5)
+        //   * the predicate becomes a METHOD: `spec.is_consent_gated()`,
+        //     deliberately not an implicit property of a variant name, "so the
+        //     wrong gate cannot be re-derived from variant names" — which is
+        //     exactly the mistake #569 made.
+        //
+        // ON RE-PIN, replace the block below with the STRONGER form verify
+        // proposed (it fires if verify ever re-gates ANY family, not only if
+        // one of four named prefixes moves):
+        //
+        //   for spec in dim::ALL {
+        //       assert!(
+        //           !spec.is_consent_gated(),
+        //           "{} is consent-gated by verify, but CC 3.4.5 gates no \
+        //            verify-owned family — adjudicate before following it",
+        //           spec.prefix
+        //       );
+        //   }
+        //
+        // Keep the two pins above and the ruling block below unchanged.
+        // ─────────────────────────────────────────────────────────────────
+        let verify_says_reputation: BTreeSet<&str> = dim::ALL
+            .iter()
+            .filter(|d| d.consent_class == ConsentClass::ConsensualReputation)
+            .map(|d| d.prefix)
+            .collect();
+        assert_eq!(
+            verify_says_reputation,
+            BTreeSet::from([
+                "attestation:license_validity",
+                "attestation:registry_consensus",
+                "cert_validity:",
+                "rollback_detected:",
+            ]),
+            "verify's ConsensualReputation set moved. These are the four families CC 3.4.5 \
+             dispositioned BY NAME and placed outside the consent gate. If this is the v12.0.0 \
+             re-pin, follow the block comment above and switch to the `is_consent_gated()` form. \
+             If it is anything else, the disagreement this test records has changed shape and \
+             needs a human: re-read CC 3.4.5's per-family disposition and decide whether the new \
+             classification changes what the FLOOR says — it usually will not, because verify's \
+             classification is a proposal from the measuring side, not a ruling."
+        );
+
+        // ── THE FLOOR'S RULING — persist gates NONE of verify's namespace ──
+        // Over the WHOLE registry, not just the four above: a CC amendment
+        // moving any family across the line, or a re-widening of the gate,
+        // lands here. Probed through the one predicate the gate itself calls,
+        // on the real dimension shape, so this asserts shipped behaviour and
+        // not a restatement of the source.
+        for spec in dim::ALL {
+            let probe = if spec.parameterized {
+                format!("{}probe:v1", spec.prefix)
+            } else {
+                spec.prefix.to_owned()
+            };
+            assert_eq!(
+                consent_gated_family(&probe),
+                None,
+                "{probe} is consent-gated by persist, but CC 3.4.5 puts every verify-owned \
+                 family OUTSIDE the gate: the artifact-integrity families verify builds, \
+                 manifests, licenses and certificates rather than a subject's conduct (\"a forger \
+                 never consents to verification\"), and rollback_detected:* is an adversarial \
+                 detector on the abuse-response side of the line — gating it would let an \
+                 adversary opt out of its own rollback detection. If a CC amendment has moved \
+                 this family across the line, add the ConsentGatedFamily variant and change this \
+                 assertion; do not widen the gate quietly. Settled by: CIRISConstitution \
+                 constitution/part_3_the_namespace.md, CC 3.4.5, the paragraph headed \
+                 \"Disposition of the CC 2.3.2 verification families under this rule (per \
+                 family)\"."
+            );
+        }
+
+        // Every probe B7 drives through the real put path is a family verify
+        // actually declares — so the two witnesses cannot drift apart, and B7
+        // cannot end up probing a name that no longer exists.
+        for probe in crate::federation::bootstrap_admission::test_support::CC_345_UNGATED_PROBES {
+            assert!(
+                dim::lookup(probe).is_some(),
+                "B7 probes {probe}, which verify's registry does not resolve"
+            );
+        }
+
+        // And the converse: the ONE family that is gated is the one CC 3.4.5
+        // names — the family that judges agents.
+        assert_eq!(
+            consent_gated_family("capacity:core_identity:v1"),
+            Some(ConsentGatedFamily::Capacity),
+            "capacity:* is the family CC 3.4.5 binds: \"consent-before-scoring binds the family \
+             that judges agents — capacity:* — never the families that verify artifacts\""
+        );
+        assert!(
+            dim::lookup("capacity:core_identity:v1").is_none(),
+            "capacity:* is persist-owned and outside verify's namespace — which is why the gated \
+             set cannot be read off verify's registry at all"
+        );
+
+        // And persist's OWN pre-existing hand-list of ladder mechanisms is not
+        // a rival registry: every entry resolves in verify's, unparameterized.
+        for m in ATTESTATION_LADDER_MECHANISMS {
+            let spec = dim::lookup(m).unwrap_or_else(|| {
+                panic!("{m} is in persist's ladder list but not in verify's registry")
+            });
+            assert!(
+                !spec.parameterized && spec.prefix == *m,
+                "{m} resolves to a DIFFERENT registry family ({}) — the two lists have drifted",
+                spec.prefix
+            );
+        }
+    }
+
+    /// The typed refusal is a program contract, not a message: the serde token
+    /// and [`ConsentGatedFamily::as_str`] are the SAME string, and
+    /// [`ConsentGatedFamily::ALL`] is complete.
+    #[test]
+    fn consent_gated_family_tokens_match_serde() {
+        for family in ConsentGatedFamily::ALL {
+            let json = serde_json::to_string(family).expect("serialize");
+            assert_eq!(
+                json,
+                format!("\"{}\"", family.as_str()),
+                "serde token and as_str must be one spelling"
+            );
+            let back: ConsentGatedFamily = serde_json::from_str(&json).expect("round-trip");
+            assert_eq!(back, *family);
+        }
+        assert_eq!(
+            ConsentGatedFamily::ALL.len(),
+            1,
+            "ALL must list every variant — it is what a consumer enumerates. ONE today because \
+             CC 3.4.5 binds consent-before-scoring to the family that judges agents and to \
+             nothing else; a second variant is a Constitutional amendment moving a family across \
+             that line, never a convenience."
+        );
+        // The refusal renders its evidence: rule, dimension, both parties.
+        let refused = ConsentGateRefused {
+            family: ConsentGatedFamily::Capacity,
+            dimension: "capacity:core_identity:v1".to_owned(),
+            subject_key_id: "s".to_owned(),
+            attester_key_id: "p".to_owned(),
+            stance: crate::federation::hard_case::ConsentState::Unspecified,
+        };
+        let rendered = refused.to_string();
+        for needle in [
+            "capacity:core_identity:v1",
+            "capacity",
+            ANALYZE_CONSENT_SCOPE,
+            "Unspecified",
+        ] {
+            assert!(
+                rendered.contains(needle),
+                "the refusal must name {needle}: {rendered}"
+            );
+        }
+        assert_eq!(
+            Error::from(refused).kind(),
+            "federation_consent_gate_refused",
+            "and it reaches the wire as its own kind, not a generic argument complaint"
+        );
     }
 
     // ── v3.0.0 (CIRISPersist#116, CEG 0.2 §7.0) — reserved-prefix ──

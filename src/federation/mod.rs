@@ -309,6 +309,10 @@ pub use replication::{
 // must not be welded to an internal module layout. Definition stays beside the
 // logic that produces it (the `register::KeyRefusalReason` precedent from #565).
 pub use replication::admission::{PeerQuotaRefusal, PeerQuotaRefused};
+// v25.1.0 (CIRISPersist#569) — same rationale as `PeerQuotaRefusal` above:
+// `Error::ConsentGateRefused` carries these, so a consumer must not have to
+// name a path into `admission` to match on the error it was handed.
+pub use admission::{ConsentGateRefused, ConsentGatedClaim, ConsentGatedFamily};
 pub use rooting::{
     provenance_chain, root_binding, ProvenanceChain, ProvenanceLink, RootingRejection,
     RootingVerdict, MAX_PROVENANCE_DEPTH,
@@ -4570,6 +4574,19 @@ pub enum Error {
         reason: PeerQuotaRefusal,
     },
 
+    /// v25.1.0 (CIRISPersist#569) — **CONSENT BEFORE SCORING** refused this
+    /// row: a federation-tier trust signal about a subject who has granted the
+    /// attester no live [`admission::ANALYZE_CONSENT_SCOPE`] consent.
+    ///
+    /// The payload names WHICH rule ([`admission::ConsentGatedFamily`]), the
+    /// dimension verbatim, both parties, and the stance the fold actually
+    /// resolved — so a consumer branches on a program constant and reads the
+    /// rest as data, never string-matching the message. Before #569 this
+    /// refusal was a bare [`Error::InvalidArgument`], indistinguishable on the
+    /// wire from every other argument complaint.
+    #[error("{0}")]
+    ConsentGateRefused(admission::ConsentGateRefused),
+
     /// Row would conflict with an existing row whose content differs.
     /// Idempotent re-submission of the *same* content is OK; this
     /// fires only when the caller is overwriting.
@@ -5647,6 +5664,7 @@ impl Error {
             Error::InvalidArgument(_) => "federation_invalid_argument",
             Error::SignatureInvalid(_) => "federation_signature_invalid",
             Error::RateLimited { .. } => "federation_rate_limited",
+            Error::ConsentGateRefused(_) => "federation_consent_gate_refused",
             Error::Conflict(_) => "federation_conflict",
             Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
             Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",

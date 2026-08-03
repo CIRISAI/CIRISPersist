@@ -20335,7 +20335,7 @@ mod tests {
                         &agent,
                         &scorer,
                         "consent:state:granted:v1",
-                        &[crate::federation::admission::CAPACITY_CONSENT_SCOPE],
+                        &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
                         chrono::Utc::now() - chrono::Duration::seconds(60),
                     ),
             })
@@ -38878,6 +38878,18 @@ mod tests {
         backend.run_migrations().await.unwrap();
         crate::federation::bootstrap_admission::test_support::exercise_capacity_consent_gate(
             &backend, "sq46",
+        )
+        .await;
+    }
+
+    /// #569 B7 (CC 3.4.5) — the verify-owned verification families are NOT
+    /// consent-gated, on sqlite. Shared exercise body.
+    #[tokio::test]
+    async fn bootstrap_verify_families_not_consent_gated_sqlite_569() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::bootstrap_admission::test_support::exercise_verify_families_are_not_consent_gated(
+            &backend, "sq569",
         )
         .await;
     }

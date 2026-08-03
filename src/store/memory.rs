@@ -7673,6 +7673,17 @@ mod accord_tests {
         .await;
     }
 
+    /// #569 B7 (CC 3.4.5) — the verify-owned verification families are NOT
+    /// consent-gated, on memory. Shared exercise body.
+    #[tokio::test]
+    async fn bootstrap_verify_families_not_consent_gated_memory_569() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_verify_families_are_not_consent_gated(
+            &backend, "mem569",
+        )
+        .await;
+    }
+
     /// #541 — the signed-row-survives-unsigned-write invariant on memory.
     #[tokio::test]
     async fn signed_row_survives_local_write_memory_541() {

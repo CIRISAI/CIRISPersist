@@ -12567,7 +12567,7 @@ mod tests {
                             "{}:v1",
                             crate::federation::consent::consent_dimension::STATE_GRANTED_PREFIX
                         ),
-                        &[crate::federation::admission::CAPACITY_CONSENT_SCOPE],
+                        &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
                         chrono::Utc::now() - chrono::Duration::seconds(60),
                     ),
             },
@@ -12615,6 +12615,133 @@ mod tests {
             .expect("default emit");
         let p_row = sq.get_attestation(&p_id).await.unwrap().expect("row");
         assert_eq!(p_row.weight, None, "None ⇒ unchanged default");
+    }
+
+    /// v25.1.0 (CIRISPersist#569) — **THE GATE BITES THE NODE'S OWN EMIT
+    /// SURFACE — AND ONLY WHERE CC 3.4.5 PUT IT.**
+    ///
+    /// A put-gate that exempted the local emit path would be unreachable from
+    /// the only side that matters: this node would happily publish about a
+    /// subject who never consented while refusing the identical row from a
+    /// peer. [`Engine::emit_attestation`] stores through `put_attestation`, so
+    /// it faces `check_capacity_consent_admission` like anyone.
+    ///
+    /// Witnesses both halves of the boundary on the emit API itself, because a
+    /// gate is only as trustworthy as what it lets through:
+    /// (a) this node's own unconsented `capacity:*` emit about a third party is
+    /// REFUSED with the typed
+    /// [`crate::federation::Error::ConsentGateRefused`]; (b) its
+    /// `rollback_detected:*` emit about that SAME silent subject ADMITS — CC
+    /// 3.4.5 puts the adversarial detector on the abuse-response side of the
+    /// line, and a node that could not report a rollback until the rolled-back
+    /// party consented would have no detector at all; (c) once the subject
+    /// grants `analyze`, the capacity emit admits too.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn emit_attestation_consent_gate_bites_own_surface_569() {
+        use crate::federation::types::attestation_type::SCORES;
+        use crate::federation::FederationDirectory;
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("ciris-569");
+        let derived = signer.derived_key_id();
+        let engine = Engine::with_signer(signer.clone(), "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.put_public_key(sweeper_test_key_derived_for(&derived, "ciris-569"))
+            .await
+            .expect("seed key");
+        let subject = "verify-signal-subject";
+        crate::federation::tier_ingest::test_support::register_hybrid_key(&*sq, subject).await;
+
+        const CAPACITY: &str = "capacity:core_identity:v1";
+        const ROLLBACK: &str = "rollback_detected:agent_version:v1";
+
+        let emit = |dimension: &str| {
+            let mut input = crate::federation::EmitAttestationInput::with_envelope(
+                SCORES,
+                crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "dimension": dimension,
+                    "score": 1.0,
+                    "confidence": 0.9,
+                }))
+                .unwrap(),
+                crate::federation::types::cohort_scope::FEDERATION,
+            );
+            // Someone ELSE's row, not the emitter's own.
+            input.attested_key_id = Some(subject.to_owned());
+            input
+        };
+
+        // (a) The node's OWN capacity emit is refused — no bypass for the
+        // local path.
+        let err = engine
+            .emit_attestation(&signer, emit(CAPACITY))
+            .await
+            .expect_err("#569: this node's own unconsented capacity:* emit must be REFUSED");
+        assert!(
+            matches!(&err, crate::federation::Error::ConsentGateRefused(r)
+                if r.dimension == CAPACITY
+                    && r.family == crate::federation::ConsentGatedFamily::Capacity
+                    && r.attester_key_id == derived
+                    && r.subject_key_id == subject),
+            "#569: the refusal is the typed consent gate, naming this node as the attester: \
+             {err:?}"
+        );
+
+        // (b) THE OTHER HALF — the adversarial detector fires about the SAME
+        // subject, with that subject still silent. If this were gated, a party
+        // could suppress its own rollback detection by declining `analyze`.
+        let rollback_id = engine
+            .emit_attestation(&signer, emit(ROLLBACK))
+            .await
+            .expect(
+                "#569/CC 3.4.5: rollback_detected:* is on the abuse-response side of the line — \
+                 it must emit with the subject silent",
+            );
+        let rollback_row = sq
+            .get_attestation(&rollback_id)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(
+            crate::federation::admission::envelope_dimension(&rollback_row.attestation_envelope),
+            Some(ROLLBACK),
+            "#569: and the detector's row landed intact"
+        );
+
+        // (c) The subject opens the plane; the capacity emit then admits.
+        FederationDirectory::put_attestation(
+            &*sq,
+            crate::federation::SignedAttestation {
+                attestation:
+                    crate::federation::bootstrap_admission::test_support::consent_scope_row(
+                        &uuid::Uuid::new_v4().to_string(),
+                        subject,
+                        &derived,
+                        &format!(
+                            "{}:v1",
+                            crate::federation::consent::consent_dimension::STATE_GRANTED_PREFIX
+                        ),
+                        &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
+                        chrono::Utc::now() - chrono::Duration::seconds(60),
+                    ),
+            },
+        )
+        .await
+        .expect("seed S->P analyze consent");
+
+        let id = engine
+            .emit_attestation(&signer, emit(CAPACITY))
+            .await
+            .expect("#569: with the subject's live analyze grant, the capacity emit admits");
+        let row = sq.get_attestation(&id).await.unwrap().expect("row");
+        assert_eq!(
+            crate::federation::admission::envelope_dimension(&row.attestation_envelope),
+            Some(CAPACITY),
+            "#569: and the stored row carries the gated dimension"
+        );
     }
 
     // ── #249 Cut C ── delegates_to / moderation emit ceremonies ───────

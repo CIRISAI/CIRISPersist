@@ -20237,6 +20237,25 @@ mod tests {
         .await;
     }
 
+    /// #569 B7 (CC 3.4.5) — the verify-owned verification families are NOT
+    /// consent-gated, on postgres. Shared exercise body; the tag is unique
+    /// per run because this database persists across tests.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn bootstrap_verify_families_not_consent_gated_postgres_569() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg569{}", uuid_like());
+        crate::federation::bootstrap_admission::test_support::exercise_verify_families_are_not_consent_gated(
+            &backend, &tag,
+        )
+        .await;
+    }
+
     /// #541 — the signed-row-survives-unsigned-write invariant on postgres.
     #[tokio::test]
     #[serial_test::serial(postgres)]
