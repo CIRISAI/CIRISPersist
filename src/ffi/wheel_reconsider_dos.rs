@@ -218,6 +218,9 @@ impl PyReconsiderDosGuard {
         Ok(())
     }
 
+    /// A constant `"ReconsiderDosGuard()"`. Deliberately reports NOTHING about
+    /// the guard's state: it never takes the lock, so it cannot deadlock when
+    /// called from inside a panic, and it cannot leak filing contents.
     fn __repr__(&self) -> String {
         // Don't lock for repr — the guard's internal HashMaps don't
         // expose a public count surface anyway, and we'd rather not

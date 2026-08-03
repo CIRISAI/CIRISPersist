@@ -4058,6 +4058,9 @@ impl PyEngine {
         })
     }
 
+    /// v20.0.0 (CIRISPersist#495) — the pinned envelope-vocabulary manifest
+    /// and its `sha256`, as `{"manifest_json", "sha256"}`. A cross-repo harness
+    /// asserts every processor pins the byte-identical vocabulary cut.
     fn envelope_vocabulary(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         catch_panic(|| {
             let out = PyDict::new(py);
@@ -4073,6 +4076,10 @@ impl PyEngine {
         })
     }
 
+    /// v19.2.0 (CIRISPersist#494) — the pinned trace-summary EXTRACTION
+    /// manifest and its `sha256`, as `{"manifest_json", "sha256"}`. This names
+    /// which fields a summary is derived from, so two processors can prove they
+    /// summarise the same way; it is not the summary data itself.
     fn trace_summary_extraction(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         catch_panic(|| {
             let out = PyDict::new(py);
@@ -14738,6 +14745,9 @@ impl PyEngine {
         })
     }
 
+    /// Corpus-shape rollup over a filtered window — the coarse distribution a
+    /// caller reads BEFORE deciding what to query in detail. Reports shape, not
+    /// rows: it says how much is there, never what any single row says.
     fn corpus_shape(
         &self,
         py: Python<'_>,
@@ -31238,6 +31248,7 @@ struct ScoringFactorStream {
 
 #[pymethods]
 impl ScoringFactorStream {
+    /// `async for` entry point — returns self, per the async-iterator protocol.
     fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -31268,6 +31279,8 @@ impl ScoringFactorStream {
         slf
     }
 
+    /// Advance the SYNC iterator: the next per-agent aggregate JSON, or `None`
+    /// (raising `StopIteration`) once the pre-computed buffer is drained.
     fn __next__(&mut self) -> Option<String> {
         if self.index >= self.items.len() {
             return None;
@@ -31289,15 +31302,6 @@ impl ScoringFactorStream {
     }
 }
 
-/// v8.5.0 (CIRISPersist#231) — the cross-crate registration hook for the
-/// CIRISServer one-wheel re-export (CIRISServer#4). Adds `Engine`, the
-/// scoring-stream + reconsider-DoS-guard classes, the typed exception
-/// hierarchy, `__version__` / `SUPPORTED_SCHEMA_VERSIONS`, and the free
-/// `reset_engine` function to a **caller-provided** module. CIRISServer's
-/// `mod python` calls this on its `ciris_server.persist` submodule so one
-/// `.so` hosts one PyO3 type registry — killing the CIRISPersist#109
-/// cross-wheel type-identity hazard the one-wheel exists to remove.
-///
 /// v21.7.0 (CIRISPersist#519 / CIRISConformance#83) — run persist's
 /// manifest-driven field-conformance harness against the LIVE wheel and
 /// return the violations (an empty list ⇒ conformant). This is the surface a

@@ -35,12 +35,17 @@ from .ciris_persist import (
     NotFound,
     Permanent,
     PersistError,
+    ReconsiderDosGuard,
     SUPPORTED_SCHEMA_VERSIONS,
+    ScoringFactorStream,
     Transient,
     __version__,
     engine_teardown_wait,
     engine_teardowns_in_flight,
+    namespace_manifest_version,
+    persist_field_conformance,
     reset_engine,
+    transform_algebra_hash,
 )
 
 __all__ = [
@@ -68,6 +73,18 @@ __all__ = [
     # path becomes a de-facto contract.
     "engine_teardown_wait",
     "engine_teardowns_in_flight",
+    # CIRISPersist#595 — the rest of what the `#[pymodule]` actually
+    # registers. `ReconsiderDosGuard` and `ScoringFactorStream` are
+    # `m.add_class`ed and the three cross-harness functions are
+    # `m.add_function`ed, but none reached this package, so every consumer
+    # had to write `from ciris_persist.ciris_persist import ...` — the same
+    # private-path-becomes-contract failure #581 fixed for the teardown
+    # surface, still open for these six.
+    "ReconsiderDosGuard",
+    "ScoringFactorStream",
+    "namespace_manifest_version",
+    "persist_field_conformance",
+    "transform_algebra_hash",
 ]
 
 # v3.12.2 (CIRISPersist#156) — diagnostic harness surface. Re-exported
@@ -80,8 +97,15 @@ __all__ = [
 #   1. wheel built with `--features debug-tools`  (compile-time)
 #   2. CIRIS_PERSIST_PANIC_LOG exported            (runtime)
 #   3. caller invokes panic_count() / install_panic_logger()
+#
+# CIRISPersist#595: the stub now DECLARES both, because a `.pyi` structurally
+# cannot express `#[cfg(feature = ...)]` presence — a build-conditional symbol
+# is either always described or never, and "never" is the failure mode #581
+# created. The `try`/`except ImportError` below remains the runtime truth, and
+# there is deliberately no `# type: ignore` here: with the symbols described,
+# one would be an unused-ignore error under `--strict`.
 try:
-    from .ciris_persist import (  # type: ignore[attr-defined]
+    from .ciris_persist import (
         install_panic_logger,
         panic_count,
     )
