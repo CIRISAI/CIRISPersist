@@ -81,6 +81,88 @@ delete them. This is that flip. It also **splits the fixture**: #593's version r
 both clauses, so the granter-retraction assertion ran with the subject's retraction already in place
 and would have passed whether or not that clause existed. Two clauses reading different rows need two
 fixtures, or the weaker one is never under test.
+## [Unreleased] — CIRISServer#356: the node's refusals were legible, its STATE was not
+
+- **Seven of the ten signals #356 names were computed and discarded.** Three reached Python;
+  `DrillFreshness`, `trust_root_valid`, `KeyStatementStanding`, `QuarantineState`,
+  `ReverseQuorumStanding`, `StewardTierStanding` and `slot_denials()` reached nothing. Server and
+  edge reach persist only through the FFI, so for them those signals did not exist — the AV-77 /
+  #444 / #589 class again, at read-surface scale. Six new bindings close it:
+
+  | binding | class | signals |
+  |---|---|---|
+  | `trust_root_verdict_json` | `deontic` | `trust_root_valid` + `DrillFreshness`, on ONE verdict |
+  | `resolve_key_statement_standing_json` | `deontic` | `KeyStatementStanding` |
+  | `resolve_quarantine_json` | `deontic` | `QuarantineState` |
+  | `resolve_reverse_quorum_json` | `deontic` | `ReverseQuorumStanding` + `StewardTierStanding`, on ONE fold |
+  | `peer_quota_observation_json` | `epistemic` | `slot_denials` + its denominator |
+  | `node_state_json` | `epistemic` | the node-scoped fold of all of them |
+
+- **`node_state_json` is a GAUGE, not a gate**, and says so in the type. Every band renders an
+  authority that lives elsewhere; the authority is what a decision must consult. Drill freshness in
+  particular stays a signal — `TrustRootVerdict::valid` does not consult it and must not, or a
+  genesis root gets a shelf life again (#550/#551 item 4).
+
+- **Bands never floats, and a band never REPLACES a token.** `StateBand` is
+  `green`/`yellow`/`red`/`unknown`. Every signal carries its band *and* the underlying typed token,
+  because the band is lossy on purpose and the token is not — which is how the fold distinguishes
+  the zeroes rather than collapsing them. The four ways of having no valid trust root are four
+  tokens on two bands (`no_self_key` and `unreadable` are UNKNOWN; `no_trust_edges` and
+  `no_valid_root` are RED — "I was never told who I am" is not "I root to nothing").
+  `not_quarantined` vs `released` and `overdue: 0` vs `overdue: null` are the same discipline.
+
+- **`unknown` is representable, is never green, and is never absent.** It ranks between yellow and
+  red in the roll-up, and because a roll-up could let an unknown hide behind a red, `unknown[]`
+  names every unknown signal individually. Most failure modes on this plane are silent ones.
+
+- **Clock-dependence is stated, not discovered.** `clock_dependent[]` names the fields that
+  transition on elapsed time with **no state change and no new row** — drill bands at 90/180 days,
+  the consent SLA, future-dated revocation and quarantine markers. `as_of` reports the instant, and
+  every read takes an optional RFC 3339 clock so a consumer can pin it.
+
+- **`list_consent_revocation_promotion_overdue_readonly_json`** — the emitting reader is
+  *idempotent*, which means no duplicate rows and **not** no writes: it re-executes
+  `record_hard_case` for every overdue row on every call, so a dashboard poll drove audit-plane
+  writes forever while the row count sat still. The read-only twin shares the emitting one's
+  `is_promotion_overdue` predicate (which also replaced a third open-coded copy inside
+  `run_consent_sla_watch`) and emits nothing. Proven on all three backends by counting `hard_case`
+  rows across five reader calls and five `node_state` folds — the count stays at **zero**, then the
+  emitting sibling raises it and stays idempotent. Asserting only "unchanged across N calls" would
+  have passed for both methods.
+
+- **`slot_denials` was exposed, with the volatility in the TYPE.** It is a per-backend-instance
+  counter: it resets on restart, differs between processes serving one node, and is stored nowhere.
+  `PeerQuotaObservation` therefore carries a literal `process_local: true` field and the payload
+  carries a fixed `note` naming what the numbers are not. It is also not a throttling metric —
+  ordinary quota refusals are not counted there; it is the #583 tail-squeeze tripwire, which **must
+  be 0** by the tracked-peers cap derivation.
+
+  Exposing the bare counter would have been worse than omitting it, because `0` on a fresh process
+  is indistinguishable from `0` on a healthy one. Pairing it with `tracked_peers` fixes that: an
+  empty bucket table means the branch has never been exercised, so the band is **`unknown`**, not
+  `green`. No schema change — persisting it would be one, and was not taken.
+
+- **Four of the ten are not node facts** and are not folded in: transit eligibility needs a peer,
+  load-bearing needs an object, and both reverse-quorum standings need a cohort and an action.
+  Inventing a target would produce an answer indistinguishable from a real one, so `targeted[]`
+  names each with the binding that answers it — the omission is legible rather than silent.
+
+- No migration. All folds are over rows already stored; the one new `FederationDirectory` method
+  (`peer_quota_observation`) is defaulted to `None`, which every consumer must render as *unknown*.
+
+- **Unrelated pre-existing red, found while checking the feature matrix and fixed rather than
+  deferred: the crate has not compiled without a backend feature since v25.1.0.**
+  `validate_subject_key_ids` was `#[cfg(any(postgres, sqlite))]` on the stated grounds that its
+  *sole* caller carried the same gate; #582 added a second, **ungated** caller
+  (`attestation_emit::assemble_and_put`), and the premise stopped being true. Since that release,
+  `cargo check` with no features — and CI's own `cargo nextest run --test wire_format_fixtures`
+  default leg — failed with *"cannot find function `validate_subject_key_ids`"*. The gate is
+  removed (an ungated caller makes the function live in every configuration).
+
+  Recovered by the one-line fix: the **9-test `wire_format_fixtures` default leg** and the
+  **1137-test `test-anchor`-only configuration**, neither of which had been able to build for three
+  releases. Verified pre-existing by reverting this branch's Rust changes and reproducing the
+  failure at the v28.1.0 tag.
 
 ## [28.1.0] — 2026-08-03 — #564: reachability stage 2, and the release primitive that always says no
 

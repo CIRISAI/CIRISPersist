@@ -741,6 +741,31 @@ class Engine:
         for, and treats "I cannot tell" as "safe to erase".
         """
 
+    def is_named_moderator_json(self, key_id: str, community_id: str, duty: str) -> str:
+        """#249 Cut A — is ``key_id`` a **named moderator** of ``community_id``
+        for ``duty`` (``"moderate"`` / ``"takedown"`` / ``"review"``)? Returns the
+        JSON literal ``"true"`` or ``"false"``.
+
+        **``"false"`` is a truthy Python string.** ``json.loads`` it; a bare
+        ``if`` grants moderator authority to every key. Fail-closed underneath —
+        an unknown community answers ``false`` rather than raising, so a wrong
+        community id reads as "not a moderator", never as an error.
+        """
+
+    def is_steward_bound_json(self, key_id: str) -> str:
+        """#249 Cut A — is ``key_id`` **steward-bound**: does it resolve to a
+        ``user``-role human identity, directly, via an occurrence, or via a live
+        ``delegates_to`` from a user-role granter? Returns the JSON literal
+        ``"true"`` or ``"false"``.
+
+        **``"false"`` is a truthy Python string** — see
+        :meth:`is_named_moderator_json`. Fail-closed: a key whose chain to a human
+        cannot be walked answers ``false``.
+        """
+
+    def issue_accord_nonce(self, family_key_id: str, nonce: str) -> None:
+        """(derived) deontic — #302 (M4) — record a server-issued proposal nonce."""
+
     def may_release_copy_json(
         self, object_kind: str, object_id: str, object_id2: str | None = None
     ) -> str:
@@ -768,31 +793,6 @@ class Engine:
 
         Read-only -- it releases, evicts and mutates nothing.
         """
-
-    def is_named_moderator_json(self, key_id: str, community_id: str, duty: str) -> str:
-        """#249 Cut A — is ``key_id`` a **named moderator** of ``community_id``
-        for ``duty`` (``"moderate"`` / ``"takedown"`` / ``"review"``)? Returns the
-        JSON literal ``"true"`` or ``"false"``.
-
-        **``"false"`` is a truthy Python string.** ``json.loads`` it; a bare
-        ``if`` grants moderator authority to every key. Fail-closed underneath —
-        an unknown community answers ``false`` rather than raising, so a wrong
-        community id reads as "not a moderator", never as an error.
-        """
-
-    def is_steward_bound_json(self, key_id: str) -> str:
-        """#249 Cut A — is ``key_id`` **steward-bound**: does it resolve to a
-        ``user``-role human identity, directly, via an occurrence, or via a live
-        ``delegates_to`` from a user-role granter? Returns the JSON literal
-        ``"true"`` or ``"false"``.
-
-        **``"false"`` is a truthy Python string** — see
-        :meth:`is_named_moderator_json`. Fail-closed: a key whose chain to a human
-        cannot be walked answers ``false``.
-        """
-
-    def issue_accord_nonce(self, family_key_id: str, nonce: str) -> None:
-        """(derived) deontic — #302 (M4) — record a server-issued proposal nonce."""
 
     def put_accord_decision_json(self, payload_json: str) -> None:
         """(derived) deontic — #302 — record the server's frozen-L decision. payload_json = { "decision": <AccordDecision>, "steward_signatures": <obj|null> }. Immutable (M2)."""
@@ -988,6 +988,104 @@ class Engine:
     def remove_peer_record(self, key_id: str, hard: bool) -> None:
         """(derived) deontic — Federation directory: remove a peer record. hard=false soft-marks removed_at; hard=true cascades through the FK to delete the federation_keys row (..."""
 
+    def resolve_key_statement_standing_json(self, key_id: str, statement_at: str | None = None, now: str | None = None) -> str:
+        """CIRISServer#356 — **do this key's past statements still stand?**
+
+        Returns the fold as JSON: ``{key_id, statement_at, standing,
+        covered_by, considered}``. ``standing`` is one of three stable tokens
+        and **they are not two**:
+
+        * ``"stands"`` -- no revocation this node holds covers a statement made
+          at ``statement_at``.
+        * ``"suspect_after_bound"`` -- a covering revocation exists and it is
+          history-bounded: this key said this *after* the bound. The key's
+          honest past is untouched.
+        * ``"suspect_unbounded"`` -- an unbounded revocation covers the key.
+          Everything it ever said is in doubt, because the revocation declined
+          to say otherwise.
+
+        Collapsing the middle token into either neighbour throws away exactly
+        what a bounded de-admission bought: before it, a key compromised on
+        Tuesday cost every honest signature it had ever made.
+
+        **Every arm is a truthy string**, including ``"suspect_unbounded"``.
+        ``json.loads`` it and read ``["standing"]``; a bare truth-test reads a
+        corpus-wide compromise as an approval.
+
+        ``statement_at`` and ``now`` are RFC 3339 and both default to the
+        current instant. **Clock-dependent** on ``now``: a revocation whose
+        ``effective_at`` has not arrived is not counted yet, so this transitions
+        on elapsed time with no new row. Read-only.
+        """
+
+    def resolve_quarantine_json(self, key_id: str, now: str | None = None) -> str:
+        """CIRISServer#356 — **is this key withheld from serving?**
+
+        Returns the fold as JSON: ``{key_id, state, marker_id?, decided_by?,
+        delegation_id?, effective_at?, grounds?, marker_ids}``. ``state`` is
+        one of three stable tokens, and the third one is the point:
+
+        * ``"not_quarantined"`` -- no marker about this key has taken effect
+          here.
+        * ``"withheld"`` -- the governing marker withholds; the serve paths skip
+          this key's rows.
+        * ``"released"`` -- a quarantine was raised and lifted. **Serving, and
+          it was not always.** Deliberately distinct from ``"not_quarantined"``:
+          "never withheld" and "withheld and released" are different facts, and
+          an operator reviewing a key deserves the second one.
+
+        The serve decision is ``state == "withheld"`` and nothing else --
+        ``"released"`` does **not** withhold. ``marker_ids`` names the whole
+        evidence set, not only the winner; that enumeration is what a
+        compromised-authority review reads.
+
+        **Every arm is a truthy string.** ``json.loads`` it and read
+        ``["state"]``; ``if engine.resolve_quarantine_json(k)`` is ``True`` for
+        a key this node is refusing to serve.
+
+        ``now`` is RFC 3339, defaulting to the current instant.
+        **Clock-dependent**: a marker whose ``effective_at`` has not arrived
+        does not count yet. Read-only -- this never records a marker.
+        """
+
+    def resolve_reverse_quorum_json(self, cohort: str, cohort_key_id: str, action_attestation_id: str, now: str | None = None) -> str:
+        """CIRISServer#356 — **is a brake active on this action, and did the
+        duty-holders answer?**
+
+        One call for both reverse-quorum signals, because they are already one
+        fold. The payload carries ``standing`` -- *does the action stand?*
+        (``"not_governed"`` / ``"window_open"`` / ``"stood"`` /
+        ``"reversed"``), with ``distinct_objectors``, ``required``,
+        ``roster_size`` and the counted/dismissed objection ids beside it --
+        and ``escalation[]``, one record per objection, each carrying
+        ``steward``: *did the people carrying the duty answer?*
+
+        **``steward`` has three separate zeroes and they do not share a
+        token.** ``"silent"`` (nobody answered), ``"overruled"`` (somebody
+        answered, but the answer was an undo, and undos are never unilateral)
+        and ``"no_duty_holders"`` (there was nobody to answer) all open
+        escalation and are three different diagnoses of *why*. Mapping them to
+        one value re-introduces the defect the type was built to prevent: a
+        failing commons and a healthy one must not read identically.
+        ``"awaiting"`` is **not** a zero -- it is the healthy in-progress
+        state, and treating it as silence escalates every objection the moment
+        it is raised.
+
+        ``cohort`` is ``"self"`` / ``"family"`` / ``"community"`` /
+        ``"affiliations"``. An ``action_attestation_id`` this node does not
+        hold raises ``ValueError`` rather than returning a fold about nothing
+        -- an empty fold would be indistinguishable from a real
+        ``"not_governed"`` verdict.
+
+        **Every arm is a truthy string**, including ``"reversed"``.
+        ``json.loads`` it.
+
+        ``now`` is RFC 3339, defaulting to the current instant.
+        **Clock-dependent**: the objection window and the steward deadline both
+        close on elapsed time, with no new row. Read-only -- the objected-to
+        row is never touched.
+        """
+
     def resolve_transit_eligibility_json(self, user_key_id: str, peer_key_id: str) -> str:
         """v24.1.0 (CIRISPersist#561) — **may ``peer_key_id`` carry our relay
         traffic?** Returns the verdict as JSON
@@ -1154,6 +1252,44 @@ class Engine:
 
     def supersede_canonical(self, old_key_id: str, signed_key_record_json: str, proposal_digest: str) -> None:
         """(derived) deontic — v13.1.0 (CIRISPersist#377, CC 3.4.7.1 / FSD Trust Root) — supersede (rotate) a canonical server. signed_key_record_json is the successor's SignedKe..."""
+
+    def trust_root_verdict_json(self, user_key_id: str, root_key_id: str) -> str:
+        """CIRISServer#356 — **does this node still have a live trust root at
+        all, and when was it last drilled?**
+
+        The full verdict as JSON: ``{edge_exists, root_self_declares,
+        charter_has_recovery, last_drill_at, drill_freshness, halt_latched,
+        valid, root_kind, charter_quorum?, bounded_until?}``. One call for two
+        signals, because they are one verdict -- a drill is a property *of* a
+        root, and the walk that decides validity is the walk that finds the
+        drill.
+
+        **``drill_freshness`` is a signal, never a gate.** ``valid`` does not
+        consult it and must not be made to. A root is valid until revoked,
+        halted, or un-trusted; a stale drill distinguishes *governed* from
+        *abandoned*, which is a thing to show a human, not a thing to withhold
+        service over. Gating on it re-introduces the deadman that gave a
+        genesis root a ~90-day shelf life -- every node depending on it going
+        dark together, with no error at the point of use.
+
+        **It is clock-dependent, and nothing about that is visible in the
+        rows.** ``drill_freshness`` crosses ``"Green"`` -> ``"Yellow"`` ->
+        ``"Red"`` at 90 and 180 days with no state change and no new row. Two
+        reads either side of a boundary differ and nothing caused the
+        difference: diff these as a gauge, never as a ledger.
+        ``last_drill_at`` is the stable fact underneath, and ``"Red"`` covers
+        *never drilled* as well as *long ago* -- ``last_drill_at is None`` is
+        what tells those apart.
+
+        Note the case: ``drill_freshness`` serializes **PascalCase**, its
+        pre-existing wire contract. :meth:`node_state_json` carries the same
+        three states in a lowercase band vocabulary.
+
+        **``valid: false`` is a truthy string.**
+        ``if engine.trust_root_verdict_json(u, r)`` is ``True`` for a verdict
+        that just said this node's root does not check out. ``json.loads`` it
+        and read ``["valid"]``. Read-only.
+        """
 
     def unwrap_dek_b64(self, recipient_x25519_priv_b64: str, wrap_json: str) -> str:
         """(derived) deontic — v3.8.0 — unwrap a KeyGrantWrap JSON envelope using the recipient's X25519 private key. Returns the recovered DEK b64."""
@@ -1819,6 +1955,132 @@ class Engine:
     def get_repository_statistics(self, filter_json: str, caller_occurrence_key_id: str | None = None) -> str:
         """(derived) epistemic — Corpus-shape rollup for a window — distinct trace counts by task_class, QA language / question_num, agent name / version, primary model, deployment..."""
 
+    def node_state_json(self, self_key_id: str | None = None, root_key_id: str | None = None, now: str | None = None, sla_seconds: int | None = None) -> str:
+        """CIRISServer#356 — **how is this node?**, in one call.
+
+        Folds the node-scoped state signals into one payload, so a dashboard
+        refresh is one round-trip instead of ten and the composition lives in
+        persist rather than being reimplemented per consumer::
+
+            {as_of, self_key_id?, band, unknown[], clock_dependent[], targeted[],
+             trust_root:    {band, standing, root_ref?, roots_considered,
+                             verdict?, last_drill_at?, drill_freshness?,
+                             drill_band},
+             key_statements:{band, standing?, statement_at, covered_by[],
+                             considered},
+             quarantine:    {band, state?, marker_id?, decided_by?, grounds?},
+             consent_sla:   {band, overdue?, sla_seconds,
+                             sample_attestation_ids[], read_only},
+             peer_quota:    {band, observation?, note}}
+
+        **A gauge, not a gate.** Nothing in this payload may be gated on. Every
+        band renders an authority that lives elsewhere, and the authority is
+        what a decision must consult: :meth:`trust_root_verdict_json` decides
+        whether a root serves, :meth:`resolve_quarantine_json`'s
+        ``state == "withheld"`` decides whether a key is served. This is a
+        summary taken at an instant, and summaries lose information on purpose.
+
+        **Bands, never floats -- and a band never replaces a token.** ``band``
+        is ``"green"`` / ``"yellow"`` / ``"red"`` / ``"unknown"``, mirroring the
+        three names ``drill_freshness`` already shipped. Every signal carries
+        its band **and** its underlying typed token, because the band is lossy
+        and the token is not. Where two states share a band their tokens still
+        differ.
+
+        That is the *distinguish the zeroes* rule applied here: the four ways
+        of having no valid trust root are four tokens (``"no_self_key"`` /
+        ``"no_trust_edges"`` / ``"no_valid_root"`` / ``"unreadable"``) on two
+        different bands; ``"not_quarantined"`` and ``"released"`` are two
+        tokens on two bands; ``overdue: 0`` and ``overdue: None`` are two facts
+        on two bands.
+
+        **A red headline does not mean an invalid root.** The drill band is
+        folded in, because "last drill performed 200 days ago" is precisely
+        what an operator surface should show -- but it stays a *signal*, and
+        ``trust_root.verdict["valid"]`` does not consult it. A node can read
+        ``band: "red"`` here and serve perfectly.
+
+        **``"unknown"`` is not ``"green"``, and it is never absent.** Any signal
+        this node cannot currently compute renders ``"unknown"``. Most failure
+        modes here are silent ones -- a host that never called
+        :meth:`set_self_key_id`, a backend that does not implement a read, a
+        counter never exercised -- and every one of them produces *no bad
+        news*. ``unknown`` ranks between yellow and red in the top-level
+        roll-up, and because a roll-up could otherwise let an unknown hide
+        behind a red, **``unknown[]`` names every unknown signal
+        individually**. Read that list; do not infer it from the headline.
+
+        **Which signals move with the clock alone**: ``clock_dependent[]``
+        names them, and they are not few. Drill freshness crosses its bands at
+        90 and 180 days, a consent SLA goes overdue, a future-dated revocation
+        or quarantine marker takes effect -- all with no state change and no
+        new row. A consumer diffing two reads will see transitions nothing
+        caused. ``as_of`` is the instant every band was evaluated against; pass
+        ``now`` to pin it.
+
+        **What is deliberately not here**: four signals are answers about a
+        *target* -- a peer, an object, an objection -- not facts about a node.
+        Inventing a target would produce an answer indistinguishable from a
+        real one. ``targeted[]`` names each with the binding that answers it,
+        so the omission is legible rather than silent.
+
+        **This writes nothing**, including the consent-SLA leg, which uses the
+        read-only overdue query. Poll it freely.
+
+        **The return is a truthy string on every arm.** A node whose every
+        signal reads ``"red"`` still returns a non-empty ``str``.
+        ``json.loads`` it and read ``["band"]`` and ``["unknown"]``.
+
+        ``self_key_id`` defaults to the id declared via
+        :meth:`set_self_key_id`. ``root_key_id`` pins the trust-root walk to
+        one root instead of enumerating this node's own ``trust:accepts``
+        edges. ``now`` is RFC 3339.
+        """
+
+    def peer_quota_observation_json(self) -> str | None:
+        """CIRISServer#356 — the peer-write-quota **tail-squeeze tripwire**, as
+        JSON ``{process_local, tracked_peers, slot_denials}``, or ``None`` when
+        this backend holds no quota.
+
+        **Read the volatility before the numbers.** ``process_local`` is always
+        ``True``, and it is in the payload rather than only in this docstring
+        on purpose. The quota is held per backend instance, never as a process
+        global, so both counters **reset on restart**, **differ between
+        processes serving one node**, and are **stored nowhere** -- no row backs
+        them, no replication carries them, and no peer can be shown them as
+        evidence.
+
+        This is a gauge *of this process*, not a fact about the node. Summing
+        it across replicas, diffing it across restarts, or putting it on a
+        trust card would each read it as something it is not. Making it durable
+        is a schema change and was deliberately not taken.
+
+        **What it is genuinely for**: ``slot_denials`` **must be 0** -- the
+        tracked-peers cap is derived to make the branch that increments it
+        unreachable by arithmetic. A non-zero reading does not mean "traffic is
+        heavy", it means *the inequality the derivation gate asserts no longer
+        holds in this build*. It is **not** a throttling metric; ordinary
+        per-peer quota refusals are a different and far more common thing, and
+        are not counted here at all.
+
+        Those arrive as a ``RuntimeError`` on the **write** path, and the
+        boundary is worth stating: persist's Rust error carries a typed reason
+        naming *which* budget refused and in *which* regime, and the FFI error
+        mapping currently drops it -- Python sees only the bare
+        ``"federation_rate_limited"``. That gap is real and this method does
+        not close it.
+
+        **Zero is not health until the tripwire has been exercised.**
+        ``slot_denials == 0`` on a freshly-booted process is *untested*, not
+        *clean*. ``tracked_peers`` is the denominator that tells those apart:
+        ``0`` means no peer write has been charged here at all.
+        :meth:`node_state_json` applies exactly that rule and bands this
+        ``"unknown"`` rather than ``"green"`` -- do the same if you render it
+        yourself.
+
+        Read-only.
+        """
+
     def secrets_is_healthy(self) -> bool:
         """(derived) epistemic — v0.6.1 — Liveness probe. [build-conditional: #[cfg(feature = "secrets")]]"""
 
@@ -2375,6 +2637,37 @@ class Engine:
 
     def list_consent_revocation_promotion_overdue_json(self, sla_seconds: int | None = None) -> str:
         """(derived) empirical — v16 (CIRISPersist#434, CC 5.3.2.2) — the consent-revocation promotion-overdue reader: every subject-side consent:state:revoked still resting LOCAL-..."""
+
+    def list_consent_revocation_promotion_overdue_readonly_json(self, sla_seconds: int | None = None) -> str:
+        """CIRISServer#356 — **the overdue question, asked without answering in
+        the audit log.**
+
+        Identical payload to
+        :meth:`list_consent_revocation_promotion_overdue_json` for the same
+        ``sla_seconds`` -- the same JSON array of ``{attestation_id,
+        target_key_id, subject_key_id, asserted_at, age_seconds, tier}``,
+        computed by the same predicate over the same rows -- with the
+        ``hard_case`` emission removed. The two share one predicate rather than
+        copying it, so they cannot drift into disagreeing about what "overdue"
+        means.
+
+        **Writes nothing, on any backend, on every call.** The emitting sibling
+        is *idempotent*, which means no duplicate rows -- it does not mean no
+        writes: it re-executes ``record_hard_case`` for every overdue row on
+        every call, so a dashboard polling it drives audit-plane writes forever
+        while the row count sits perfectly still. Poll this one instead; use the
+        emitting sibling for a watcher tick or an operator acknowledging the
+        condition. Reading and attesting are two different acts and they now
+        have two method names.
+
+        ``attestation_id`` is the :meth:`attestation_promote` handle that
+        clears each row. ``sla_seconds`` defaults to 86400, the 24 h
+        never-rest-local tripwire.
+
+        **The return is JSON text**, so ``'[]'`` is a non-empty ``str`` --
+        ``if engine.list_consent_revocation_promotion_overdue_readonly_json()``
+        is ``True`` even when nothing is overdue. ``json.loads`` it.
+        """
 
     def list_families_for_member_active_json(self, member_identity_key_id: str) -> str:
         """(derived) empirical — #249 Cut A — families member_identity_key_id is currently an active member of (roster − effective revocations). Returns JSON array of Family object..."""

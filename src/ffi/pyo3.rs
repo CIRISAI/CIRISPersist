@@ -2535,6 +2535,605 @@ impl PyEngine {
         })
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    //  CIRISServer#356 — the operator read surface.
+    //
+    //  A node's refusals were legible; its STATE was computed and
+    //  discarded. These five reads plus `node_state_json` are persist's
+    //  half of that gap, and they are here rather than only on `Engine`
+    //  for the reason every read on this surface is: server and edge
+    //  reach persist through this FFI, so a signal with no binding is a
+    //  signal that does not exist for them (AV-77, #444, #589).
+    // ─────────────────────────────────────────────────────────────────
+
+    /// CIRISServer#356 — **does this node still have a live trust root at
+    /// all, and when was it last drilled?** The full
+    /// [`TrustRootVerdict`](crate::federation::trust_root::TrustRootVerdict)
+    /// as JSON: `{edge_exists, root_self_declares, charter_has_recovery,
+    /// last_drill_at, drill_freshness, halt_latched, valid, root_kind,
+    /// charter_quorum?, bounded_until?}`.
+    ///
+    /// One binding for two of #356's signals because they are one verdict: a
+    /// drill is a property OF a root, and the walk that decides validity is
+    /// the walk that finds the drill. Splitting them would mean two reads that
+    /// could disagree about which root they were describing.
+    ///
+    /// # `drill_freshness` is a SIGNAL, never a gate
+    ///
+    /// `valid` **does not consult it** and must not be made to
+    /// (CIRISPersist#550 / #551 item 4). A root is valid until revoked,
+    /// halted, or un-trusted; a stale drill distinguishes *governed* from
+    /// *abandoned*, which is a thing to show a human, not a thing to withhold
+    /// service over. Gating on it re-introduces the deadman that gave a
+    /// genesis root a ~90-day shelf life and would darken every node
+    /// depending on it, together, with no error at the point of use.
+    ///
+    /// # It is CLOCK-DEPENDENT, and nothing about that is visible in the rows
+    ///
+    /// `drill_freshness` crosses `"Green"` → `"Yellow"` → `"Red"` at 90 and
+    /// 180 days **with no state change and no new row**. Two reads either side
+    /// of a boundary differ, and nothing caused the difference. Diff these
+    /// verdicts as a gauge, never as a ledger; `last_drill_at` is the stable
+    /// fact underneath, and `"Red"` covers *never drilled* as well as *long
+    /// ago* (`last_drill_at == null` is what tells those apart).
+    ///
+    /// Note the case: `drill_freshness` serializes **PascalCase**, which is
+    /// its pre-existing wire contract. [`Self::node_state_json`] carries the
+    /// same three states in a lowercase band vocabulary.
+    ///
+    /// # `valid: false` is a TRUTHY Python string
+    ///
+    /// This returns JSON *text*. `if engine.trust_root_verdict_json(u, r)` is
+    /// `True` for a verdict that just said this node's root does not check
+    /// out. Parse it and read `["valid"]`.
+    ///
+    /// **Read-only.** Persist mutates nothing here.
+    fn trust_root_verdict_json(
+        &self,
+        py: Python<'_>,
+        user_key_id: &str,
+        root_key_id: &str,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let user = user_key_id.to_owned();
+        let root = root_key_id.to_owned();
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let verdict = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::trust_root::trust_root_valid(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &user,
+                                &root,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::trust_root::trust_root_valid(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &user,
+                                &root,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&verdict).map_err(|e| {
+                    PyValueError::new_err(format!("trust_root_verdict serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// CIRISServer#356 — **do this key's past statements still stand?**
+    /// Returns the
+    /// [`KeyStatementFold`](crate::federation::KeyStatementFold) as JSON:
+    /// `{key_id, statement_at, standing, covered_by, considered}`.
+    ///
+    /// `standing` is one of three stable tokens and **they are not two**:
+    ///
+    /// - `"stands"` — no revocation this node holds covers a statement made at
+    ///   `statement_at`.
+    /// - `"suspect_after_bound"` — a covering revocation exists and it is
+    ///   history-bounded: this key said this AFTER the bound. The key's honest
+    ///   past is untouched.
+    /// - `"suspect_unbounded"` — an unbounded revocation covers the key.
+    ///   Everything it ever said is in doubt, because the revocation declined
+    ///   to say otherwise.
+    ///
+    /// Collapsing the middle token into either neighbour throws away exactly
+    /// what a bounded de-admission bought: before it, a key compromised on
+    /// Tuesday cost every honest signature it had ever made.
+    ///
+    /// `statement_at` and `now` are RFC 3339; both default to the current
+    /// instant. **Clock-dependent** on `now`: a revocation whose
+    /// `effective_at` has not arrived is not counted yet, so this transitions
+    /// on elapsed time with no new row.
+    ///
+    /// # `"suspect_unbounded"` is a TRUTHY Python string
+    ///
+    /// So is every other arm. `if engine.resolve_key_statement_standing_json(…)`
+    /// is `True` for a fold that just said this key's whole corpus is in
+    /// doubt. Parse it and read `["standing"]`.
+    ///
+    /// **Read-only.** Persist mutates nothing here.
+    #[pyo3(signature = (key_id, statement_at=None, now=None))]
+    fn resolve_key_statement_standing_json(
+        &self,
+        py: Python<'_>,
+        key_id: &str,
+        statement_at: Option<&str>,
+        now: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let key = key_id.to_owned();
+        let stmt_at = parse_rfc3339_arg("statement_at", statement_at)?;
+        let at = parse_rfc3339_arg("now", now)?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let fold = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::register::resolve_key_statement_standing(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key,
+                                stmt_at,
+                                at,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::register::resolve_key_statement_standing(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key,
+                                stmt_at,
+                                at,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&fold).map_err(|e| {
+                    PyValueError::new_err(format!("key_statement_standing serialize: {e}"))
+                })
+            })
+        })
+    }
+
+    /// CIRISServer#356 — **is this key withheld from serving?** Returns the
+    /// [`QuarantineFold`](crate::federation::QuarantineFold) as JSON:
+    /// `{key_id, state, marker_id?, decided_by?, delegation_id?,
+    /// effective_at?, grounds?, marker_ids}`.
+    ///
+    /// `state` is one of three stable tokens, and the third one is the point:
+    ///
+    /// - `"not_quarantined"` — no marker about this key has taken effect here.
+    /// - `"withheld"` — the governing marker withholds; the serve paths skip
+    ///   this key's rows.
+    /// - `"released"` — a quarantine was raised and lifted. **Serving, and it
+    ///   was not always.** Deliberately distinct from `"not_quarantined"`:
+    ///   "never withheld" and "withheld and released" are different facts, and
+    ///   an operator reviewing a key deserves the second one.
+    ///
+    /// The fold names its whole evidence set (`marker_ids`), not only the
+    /// winner — that enumeration is what a compromised-authority review reads.
+    ///
+    /// `now` is RFC 3339 and defaults to the current instant.
+    /// **Clock-dependent**: a marker whose `effective_at` has not arrived does
+    /// not count yet.
+    ///
+    /// # `"withheld"` is a TRUTHY Python string
+    ///
+    /// So is every other arm. Do not truth-test the return; parse it and read
+    /// `["state"]`. The serve decision itself is `state == "withheld"` and
+    /// nothing else — `"released"` does NOT withhold.
+    ///
+    /// **Read-only.** This never records a marker — admitting one is
+    /// `Engine::record_quarantine_marker` on the Rust surface, which has no
+    /// FFI binding as of this cut.
+    #[pyo3(signature = (key_id, now=None))]
+    fn resolve_quarantine_json(
+        &self,
+        py: Python<'_>,
+        key_id: &str,
+        now: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let key = key_id.to_owned();
+        let at = parse_rfc3339_arg("now", now)?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let fold = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::quarantine::resolve_quarantine(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key,
+                                at,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::quarantine::resolve_quarantine(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                &key,
+                                at,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&fold)
+                    .map_err(|e| PyValueError::new_err(format!("quarantine serialize: {e}")))
+            })
+        })
+    }
+
+    /// CIRISServer#356 — **is a brake active on this action, and did the
+    /// duty-holders answer?** Returns the
+    /// [`ReverseQuorumFold`](crate::federation::reverse_quorum::ReverseQuorumFold)
+    /// as JSON.
+    ///
+    /// One binding for both of #356's reverse-quorum signals because they are
+    /// already one fold, and fusing or splitting them would be the defect the
+    /// types exist to prevent. The payload carries:
+    ///
+    /// - `standing` — *does the action stand?*  `"not_governed"` /
+    ///   `"window_open"` / `"stood"` / `"reversed"`, with `distinct_objectors`,
+    ///   `required`, `roster_size` and the counted/dismissed objection ids
+    ///   beside it.
+    /// - `escalation[]` — one record per objection, each carrying `steward`:
+    ///   *did the people carrying the duty answer?*
+    ///
+    /// # `steward` has THREE separate zeroes and they do not share a token
+    ///
+    /// `"silent"` (nobody answered), `"overruled"` (somebody answered, but the
+    /// answer was an undo, and undos are never unilateral) and
+    /// `"no_duty_holders"` (there was nobody to answer) all open escalation
+    /// and are **three different diagnoses of why**. A consumer that maps them
+    /// to one value re-introduces exactly the defect this type was built to
+    /// prevent — a failing commons and a healthy one must not read
+    /// identically. `"awaiting"` is **not** a zero: it is the healthy
+    /// in-progress state, and treating it as silence escalates every objection
+    /// the moment it is raised.
+    ///
+    /// `cohort` is one of `"self"` / `"family"` / `"community"` /
+    /// `"affiliations"`. `action_attestation_id` names the commons action
+    /// under objection; an id this node does not hold raises `ValueError`
+    /// rather than returning a fold about nothing. `now` is RFC 3339,
+    /// defaulting to the current instant — **clock-dependent**: the objection
+    /// window and the steward deadline both close on elapsed time, with no new
+    /// row.
+    ///
+    /// # `"reversed"` is a TRUTHY Python string
+    ///
+    /// So is `"stood"`. Parse the payload; do not truth-test it.
+    ///
+    /// **Read-only.** Persist mutates nothing on any arm — the fold is a
+    /// derived state, not a sentence, and the objected-to row is never
+    /// touched.
+    #[pyo3(signature = (cohort, cohort_key_id, action_attestation_id, now=None))]
+    fn resolve_reverse_quorum_json(
+        &self,
+        py: Python<'_>,
+        cohort: &str,
+        cohort_key_id: &str,
+        action_attestation_id: &str,
+        now: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let cohort = crate::federation::cohort::Cohort::from_token(cohort).map_err(|bad| {
+            PyValueError::new_err(format!(
+                "resolve_reverse_quorum: {bad:?} is not a rostered cohort \
+                 (expected self/family/community/affiliations)"
+            ))
+        })?;
+        let cohort_key = cohort_key_id.to_owned();
+        let action_id = action_attestation_id.to_owned();
+        let at = parse_rfc3339_arg("now", now)?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            py.detach(move || {
+                let fold = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            reverse_quorum_by_action_id(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                cohort,
+                                &cohort_key,
+                                &action_id,
+                                at,
+                            )
+                            .await
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            reverse_quorum_by_action_id(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                cohort,
+                                &cohort_key,
+                                &action_id,
+                                at,
+                            )
+                            .await
+                        })?
+                    }
+                };
+                serde_json::to_string(&fold)
+                    .map_err(|e| PyValueError::new_err(format!("reverse_quorum serialize: {e}")))
+            })
+        })
+    }
+
+    /// CIRISServer#356 — the peer-write-quota **tail-squeeze tripwire**, as
+    /// JSON: `{process_local, tracked_peers, slot_denials}`, or `null` when
+    /// this backend holds no quota.
+    ///
+    /// # Read the volatility before the numbers
+    ///
+    /// `process_local` is always `true`, and it is in the payload rather than
+    /// only in this docstring on purpose. The quota is held per backend
+    /// instance, never as a process global, so both counters **reset on
+    /// restart**, **differ between processes serving one node**, and are
+    /// **stored nowhere** — no row backs them, no replication carries them,
+    /// and no peer can be shown them as evidence.
+    ///
+    /// This is therefore a gauge OF THIS PROCESS, not a fact about the node.
+    /// Summing it across replicas, diffing it across restarts, or putting it
+    /// on a trust card would each read it as something it is not. Making it
+    /// durable is a schema change and was deliberately not taken.
+    ///
+    /// # What it is genuinely for
+    ///
+    /// `slot_denials` **must be 0**: the tracked-peers cap is derived to make
+    /// the branch that increments it unreachable by arithmetic. A non-zero
+    /// reading does not mean "traffic is heavy", it means *the inequality the
+    /// derivation gate asserts no longer holds in this build*. It is **not** a
+    /// throttling metric — ordinary per-peer quota refusals are a different,
+    /// far more common thing and are not counted here at all.
+    ///
+    /// Those refusals arrive as a `RuntimeError` on the WRITE path, and note
+    /// the honest boundary: v24.3.0 (CIRISPersist#575) put the typed
+    /// [`PeerQuotaRefusal`](crate::federation::PeerQuotaRefusal) — *which*
+    /// budget, in *which* regime — on the Rust error, and
+    /// `federation_err_to_py` currently drops it, so a Python caller sees only
+    /// the bare `federation_rate_limited` kind. That is the other half of
+    /// #356's throttling row and it is NOT closed by this binding; carrying
+    /// the reason across the FFI is a write-path change with its own
+    /// compatibility surface and belongs in its own cut.
+    ///
+    /// # Zero is not health until the tripwire has been exercised
+    ///
+    /// `slot_denials == 0` on a freshly-booted process is *untested*, not
+    /// *clean*. `tracked_peers` is the denominator that tells those apart:
+    /// `0` means no peer write has been charged here at all.
+    /// [`Self::node_state_json`] applies exactly that rule and bands this
+    /// `"unknown"` rather than `"green"` — do the same if you render it
+    /// yourself.
+    ///
+    /// **Read-only.**
+    fn peer_quota_observation_json(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            py.detach(move || {
+                let observation = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        use crate::federation::FederationDirectory;
+                        pg.peer_quota_observation()
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        use crate::federation::FederationDirectory;
+                        sq.peer_quota_observation()
+                    }
+                };
+                observation
+                    .map(|o| {
+                        serde_json::to_string(&o).map_err(|e| {
+                            PyValueError::new_err(format!("peer_quota_observation serialize: {e}"))
+                        })
+                    })
+                    .transpose()
+            })
+        })
+    }
+
+    /// CIRISServer#356 — **how is this node?**, in one call.
+    ///
+    /// Folds the node-scoped state signals into a single
+    /// [`NodeState`](crate::federation::node_state::NodeState) JSON payload,
+    /// so a dashboard refresh is one round-trip instead of ten and the
+    /// composition lives here rather than being reimplemented per consumer.
+    ///
+    /// ```text
+    /// {as_of, self_key_id?, band, unknown[], clock_dependent[], targeted[],
+    ///  trust_root:   {band, standing, root_ref?, roots_considered, verdict?,
+    ///                 last_drill_at?, drill_freshness?, drill_band},
+    ///  key_statements:{band, standing?, statement_at, covered_by[], considered},
+    ///  quarantine:   {band, state?, marker_id?, decided_by?, grounds?},
+    ///  consent_sla:  {band, overdue?, sla_seconds, sample_attestation_ids[],
+    ///                 read_only},
+    ///  peer_quota:   {band, observation?, note}}
+    /// ```
+    ///
+    /// # A GAUGE, not a gate
+    ///
+    /// **Nothing in this payload may be gated on.** Every band is a rendering
+    /// of an authority that lives elsewhere, and the authority is what a
+    /// decision must consult:
+    /// [`Self::trust_root_verdict_json`] decides whether a root serves,
+    /// [`Self::resolve_quarantine_json`]'s `state == "withheld"` decides
+    /// whether a key is served. A `NodeState` is a summary taken at an instant,
+    /// and summaries lose information deliberately. It exists so a human can
+    /// look at it.
+    ///
+    /// # Bands, never floats — and a band never REPLACES a token
+    ///
+    /// `band` is `"green"` / `"yellow"` / `"red"` / `"unknown"`, mirroring the
+    /// three names `drill_freshness` already shipped. Every signal carries its
+    /// band **and** its underlying typed token, because a band is lossy on
+    /// purpose and the token is not. Where two states share a band their
+    /// tokens still differ — a consumer that needs the difference has it
+    /// without a second call.
+    ///
+    /// That is the #356 *distinguish the zeroes* rule, applied here as: the
+    /// four ways of having no valid trust root are four tokens
+    /// (`no_self_key` / `no_trust_edges` / `no_valid_root` / `unreadable`) on
+    /// two different bands; `not_quarantined` and `released` are two tokens on
+    /// two bands; `overdue: 0` and `overdue: null` are two facts on two bands.
+    ///
+    /// # `"unknown"` is not `"green"`, and it is never absent
+    ///
+    /// Any signal this node cannot currently compute renders `"unknown"` —
+    /// never green, never omitted. Most failure modes on this plane are silent
+    /// ones (a host that never called `set_self_key_id`, a backend that does
+    /// not implement a read, a counter never exercised), and every one of them
+    /// produces *no bad news*. `unknown` ranks between yellow and red in the
+    /// top-level `band` roll-up, and because a roll-up could otherwise let an
+    /// unknown hide behind a red, **`unknown[]` names every unknown signal
+    /// individually**. Read that list; do not infer it from the headline.
+    ///
+    /// # A red headline does not mean an invalid root
+    ///
+    /// The drill band is folded into `band`, because *"last drill performed
+    /// 200 days ago"* is precisely what #356 asks this surface to show. It
+    /// remains a signal: `trust_root.verdict["valid"]` does not consult it, so
+    /// a node can read `band: "red"` here and serve perfectly. A consumer that
+    /// turned this headline into a gate would re-create the deadman #551
+    /// item 4 removed.
+    ///
+    /// # Which signals move with the clock alone
+    ///
+    /// `clock_dependent[]` names them, and they are not few: drill freshness
+    /// crosses its bands at 90 and 180 days, a consent SLA goes overdue, and a
+    /// future-dated revocation or quarantine marker takes effect — **all with
+    /// no state change and no new row**. A consumer diffing two reads will see
+    /// transitions nothing caused. `as_of` is the instant every one of them
+    /// was evaluated against; pass `now` to pin it.
+    ///
+    /// # What is deliberately not here
+    ///
+    /// Four of #356's ten signals are answers about a *target* — a peer, an
+    /// object, an objection — not facts about a node. Inventing a target to
+    /// fold them in would produce an answer indistinguishable from a real one.
+    /// `targeted[]` names each with the binding that answers it, so the
+    /// omission is legible rather than silent.
+    ///
+    /// # This method WRITES NOTHING
+    ///
+    /// Including the consent-SLA leg, which uses
+    /// [`Self::list_consent_revocation_promotion_overdue_readonly_json`]'s
+    /// underlying read and not its emitting sibling. Poll it freely.
+    ///
+    /// # The return is a TRUTHY Python string on every arm
+    ///
+    /// A node whose every signal reads `"red"` still returns a non-empty
+    /// `str`. `json.loads` it and read `["band"]` and `["unknown"]`.
+    ///
+    /// `self_key_id` defaults to the id declared via
+    /// [`Self::set_self_key_id`]; passing it explicitly overrides that for one
+    /// call. `root_key_id` pins the trust-root walk to one root instead of
+    /// enumerating this node's own `trust:accepts` edges. `now` is RFC 3339.
+    #[pyo3(signature = (self_key_id=None, root_key_id=None, now=None, sla_seconds=None))]
+    fn node_state_json(
+        &self,
+        py: Python<'_>,
+        self_key_id: Option<&str>,
+        root_key_id: Option<&str>,
+        now: Option<&str>,
+        sla_seconds: Option<u64>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        // Fall back to the host's declared identity — the same slot the AV-77
+        // de-admission gate reads. A node that never declared one is not an
+        // error here: every self-scoped signal reports `unknown` and says so,
+        // which is the honest answer and the whole reason the band exists.
+        let declared = match self_key_id {
+            Some(s) => Some(s.to_owned()),
+            None => engine_slot()
+                .as_ref()
+                .and_then(|cell| cell.engine_view().self_key_id()),
+        };
+        let root = root_key_id.map(ToOwned::to_owned);
+        let at = parse_rfc3339_arg("now", now)?;
+        let sla = std::time::Duration::from_secs(sla_seconds.unwrap_or(86_400));
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let declared = declared.clone();
+            let root = root.clone();
+            py.detach(move || {
+                let opts = crate::federation::node_state::NodeStateOptions {
+                    self_key_id: declared.as_deref(),
+                    root_key_id: root.as_deref(),
+                    now: at,
+                    sla,
+                };
+                let state = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::node_state::resolve_node_state(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                opts,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::node_state::resolve_node_state(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                opts,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&state)
+                    .map_err(|e| PyValueError::new_err(format!("node_state serialize: {e}")))
+            })
+        })
+    }
+
     /// CIRISPersist#564 stage 2 — **may this node release its copy?**
     ///
     /// `is_load_bearing(X) == "no" ∧ anti_entropy_satisfied(X)`. Returns the
@@ -9061,6 +9660,20 @@ impl PyEngine {
     /// `hard_case:consent_revocation_promotion_overdue`, idempotently
     /// (the same deterministic event_id the consent-SLA watcher derives,
     /// so repeated scans and watcher ticks never duplicate the event).
+    ///
+    /// # This method WRITES. Do not poll it.
+    ///
+    /// CIRISServer#356 — "idempotent" here means *no duplicate rows*, and it
+    /// does not mean *no writes*: every call re-executes `record_hard_case`
+    /// for every currently-overdue row. A dashboard refreshing this every few
+    /// seconds drives audit-plane writes at that rate indefinitely while the
+    /// `hard_case` row count sits perfectly still — which is exactly why the
+    /// row count is the wrong thing to have been watching.
+    ///
+    /// Use this one to put the breach ON THE RECORD (a scheduled watcher
+    /// tick, an operator acknowledging the condition). To simply *ask*, call
+    /// [`Self::list_consent_revocation_promotion_overdue_readonly_json`],
+    /// which returns the identical payload and emits nothing.
     #[pyo3(signature = (sla_seconds=None))]
     fn list_consent_revocation_promotion_overdue_json(
         &self,
@@ -9099,6 +9712,72 @@ impl PyEngine {
                 };
                 serde_json::to_string(&rows)
                     .map_err(|e| PyValueError::new_err(format!("promotion_overdue serialize: {e}")))
+            })
+        })
+    }
+
+    /// CIRISServer#356 — **the overdue question, asked without answering in
+    /// the audit log.**
+    ///
+    /// Identical payload to
+    /// [`Self::list_consent_revocation_promotion_overdue_json`] for the same
+    /// `sla_seconds` — the same JSON array of `{attestation_id,
+    /// target_key_id, subject_key_id, asserted_at, age_seconds, tier}`,
+    /// computed by the same `is_promotion_overdue` predicate over the same
+    /// rows — with the `hard_case` emission removed. The two share one
+    /// predicate rather than copying it, so they cannot drift into disagreeing
+    /// about what "overdue" means.
+    ///
+    /// **Writes nothing, on any backend, on every call.** Poll this one: an
+    /// operator dashboard should be able to ask "are we late on a deletion we
+    /// promised?" as often as it likes without the act of looking becoming a
+    /// row in the record. Its emitting sibling stays the right call for a
+    /// watcher tick, and the difference between reading and attesting now has
+    /// two method names instead of a caveat.
+    ///
+    /// **An empty array is falsy and a non-empty one is truthy**, which for
+    /// once is the safe direction — but the array is JSON *text*, and
+    /// `'[]'` is a non-empty `str`. `if engine.…_readonly_json(…)` is `True`
+    /// even when nothing is overdue. `json.loads` it.
+    #[pyo3(signature = (sla_seconds=None))]
+    fn list_consent_revocation_promotion_overdue_readonly_json(
+        &self,
+        py: Python<'_>,
+        sla_seconds: Option<u64>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let sla = std::time::Duration::from_secs(sla_seconds.unwrap_or(86_400));
+            py.detach(move || {
+                let now = chrono::Utc::now();
+                let rows: Vec<crate::federation::ConsentPromotionOverdueRow> = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_consent_revocation_promotion_overdue_readonly(now, sla)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            use crate::federation::FederationDirectory;
+                            backend
+                                .list_consent_revocation_promotion_overdue_readonly(now, sla)
+                                .await
+                                .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&rows).map_err(|e| {
+                    PyValueError::new_err(format!("promotion_overdue_readonly serialize: {e}"))
+                })
             })
         })
     }
@@ -27515,6 +28194,62 @@ fn decode_b64_leaves(leaf_bytes_b64_json: &str) -> PyResult<Vec<Vec<u8>>> {
                 .map_err(|e| PyValueError::new_err(format!("leaf base64 decode: {e}")))
         })
         .collect()
+}
+
+/// CIRISServer#356 — parse an optional RFC 3339 instant argument, defaulting
+/// to now.
+///
+/// The #356 reads all take an explicit clock because several of their bands
+/// move on elapsed time alone; a caller that wants to reason about a
+/// transition has to be able to pin the instant it is asking about. Parsed at
+/// the boundary (before `catch_panic`) so a malformed argument is a plain
+/// `ValueError` naming the parameter, never a mid-walk failure.
+fn parse_rfc3339_arg(param: &str, value: Option<&str>) -> PyResult<chrono::DateTime<chrono::Utc>> {
+    match value {
+        Some(s) => Ok(chrono::DateTime::parse_from_rfc3339(s)
+            .map_err(|e| PyValueError::new_err(format!("{param} RFC 3339 parse: {e}")))?
+            .with_timezone(&chrono::Utc)),
+        None => Ok(chrono::Utc::now()),
+    }
+}
+
+/// CIRISServer#356 — resolve the reverse-quorum fold for an action named by
+/// `attestation_id`.
+///
+/// The FFI takes an id because Python has no `Attestation`; the id is looked
+/// up through the directory's own read so the fold is computed over a row this
+/// node actually holds. An id we do not hold is a `ValueError` rather than a
+/// fold about nothing — an empty fold would be indistinguishable from a real
+/// `not_governed` verdict, which is the class of answer this whole surface
+/// exists to stop producing.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+async fn reverse_quorum_by_action_id(
+    directory: &dyn crate::federation::FederationDirectory,
+    cohort: crate::federation::cohort::Cohort,
+    cohort_key_id: &str,
+    action_attestation_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> PyResult<crate::federation::reverse_quorum::ReverseQuorumFold> {
+    let action = directory
+        .get_attestation(action_attestation_id)
+        .await
+        .map_err(federation_err_to_py)?
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "resolve_reverse_quorum: this node holds no attestation \
+                 {action_attestation_id:?} — cannot fold a brake over an action it \
+                 has never seen"
+            ))
+        })?;
+    crate::federation::reverse_quorum::resolve_reverse_quorum(
+        directory,
+        cohort,
+        cohort_key_id,
+        &action,
+        now,
+    )
+    .await
+    .map_err(federation_err_to_py)
 }
 
 fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
