@@ -577,27 +577,42 @@ pub const MINTED_NAMESPACE_FAMILIES: &[&str] = &[
 /// predicate that exists in neither of their sources — which is exactly the
 /// class R2 was written against, one level deeper than R2 reaches.
 ///
-/// `(family, the rule persist enforces, the enforcing gate, the CC ask)`.
-/// [`tests::minted_rules_not_on_the_row_are_pinned_and_still_missing`] deletes
-/// the line the moment CC lands the rule.
-pub const MINTED_RULES_NOT_ON_THE_ROW: &[(&str, &str, &str, &str)] = &[
+/// **Scope: persist's MINTED families only — this is not the whole population.**
+/// Measured on the vendored rc3 cut: **34 of 109** families carry a
+/// machine-readable rule, so **75 do not**, spread across **14 CC sections**
+/// with none at all (3.1.5.1-4, 3.1.6, 3.1.8.3, 3.1.9.1-7, 3.1.10). Persist
+/// hand-gates several of those it did not mint — `moderation:` and `slashing:`
+/// through [`check_moderation_admission`]'s duty-holder walk since v8.7.1,
+/// `hard_case:` through the substrate-emitter arm, `health:liveness:` through
+/// the invariant registry — and every one is the same divergence, older than
+/// this issue. Enumerating THOSE is the `namespace_supersets` invariant
+/// registry's job (#519), not this const's; what belongs here is the set persist
+/// is the *producer* for, because R2(a) is a producer obligation.
+///
+/// `(family, the rule persist enforces, the gate(s) that enforce it, the CC ask)`.
+/// The gate field is a **list** because one family can have several admission
+/// doors — CIRISPersist#591 adds a second door on `objection:` — and a registry
+/// of enforcement sites that names one of two is the exact thing it exists to
+/// prevent. [`tests::minted_rules_not_on_the_row_are_pinned_and_still_missing`]
+/// deletes the line the moment CC lands the rule.
+pub const MINTED_RULES_NOT_ON_THE_ROW: &[(&str, &str, &[&str], &str)] = &[
     (
         "objection:{state}",
         "cohort-member-only",
-        "federation::reverse_quorum::record_objection",
+        &["federation::reverse_quorum::record_objection"],
         "CIRISConstitution#67 (the row itself defers: \"emitter/composition elaboration rides \
          #67\")",
     ),
     (
         "quarantine:{state}",
         "slash-duty-holder-only",
-        "federation::admission::check_delegated_duty_scores_admission",
+        &["federation::admission::check_delegated_duty_scores_admission"],
         "CIRISConstitution#76 (the rule is in the row's description prose, not its reserved_rule)",
     ),
     (
         "wa_adjudication:{state}",
         "CC 4.3 WA-quorum finding, re-derived from persist's own verified state",
-        "federation::ownership_reclaim::check_ownership_reclaim_admission",
+        &["federation::ownership_reclaim::check_ownership_reclaim_admission"],
         "CIRISConstitution#73",
     ),
 ];
@@ -8995,7 +9010,7 @@ mod tests {
             );
         }
 
-        for (fam, rule, gate, ask) in MINTED_RULES_NOT_ON_THE_ROW {
+        for (fam, rule, gates, ask) in MINTED_RULES_NOT_ON_THE_ROW {
             assert!(
                 MINTED_NAMESPACE_FAMILIES.contains(fam),
                 "{fam:?} is pinned as a minted-family rule gap but persist does not mint it"
@@ -9011,14 +9026,68 @@ mod tests {
                 "{fam:?} must name the rule persist enforces"
             );
             assert!(
-                gate.starts_with("federation::"),
-                "{fam:?} must name the gate that enforces it, got {gate:?}"
+                !gates.is_empty(),
+                "{fam:?} names no enforcing gate — a rule the manifest does not state and no gate \
+                 claims is a rule nothing enforces"
             );
+            for gate in *gates {
+                assert!(
+                    gate.starts_with("federation::"),
+                    "{fam:?} must name each gate by module path, got {gate:?}"
+                );
+            }
             assert!(
                 ask.contains("CIRISConstitution#"),
                 "{fam:?} must name the CC ask that lands the rule, got {ask:?}"
             );
         }
+    }
+
+    /// **The population this pin does NOT cover, measured rather than asserted.**
+    ///
+    /// `MINTED_RULES_NOT_ON_THE_ROW` is scoped to families persist *mints*, and
+    /// a reader could reasonably take a const called "rules not on the row" for
+    /// the whole set. It is not close: most of the manifest carries no
+    /// machine-readable rule. This records the real shape so the scope limit is
+    /// a measured fact in the build rather than a caveat in a doc comment, and
+    /// so a re-vendor that materially changes rule coverage is visible.
+    ///
+    /// Deliberately a floor-check, not an equality: CC adding rules is the
+    /// desired direction and must not fail the build.
+    #[test]
+    fn most_of_the_manifest_carries_no_machine_readable_rule() {
+        use crate::federation::namespace::registry;
+        let total = registry::entries().len();
+        let with_rule = registry::entries()
+            .iter()
+            .filter(|e| e.authority.reserved.is_some())
+            .count();
+        assert!(
+            with_rule < total / 2,
+            "rule coverage is now {with_rule}/{total} — over half. That is a GOOD change, but it \
+             means the 'the manifest mostly does not state emitter rules' premise behind \
+             MINTED_RULES_NOT_ON_THE_ROW's scope note is stale; re-measure it."
+        );
+        // The specific claim the #67 / #76 asks rest on: persist's own minted
+        // section is rule-free — and so are many others, which is why the ask
+        // is about the generator's coverage and not about three rows.
+        let s3192: Vec<&str> = registry::entries()
+            .iter()
+            .filter(|e| e.cc_section == "3.1.9.2")
+            .map(|e| e.prefix.as_str())
+            .collect();
+        assert!(
+            !s3192.is_empty(),
+            "CC 3.1.9.2 vanished from the manifest — the section persist mints into"
+        );
+        assert!(
+            registry::entries()
+                .iter()
+                .filter(|e| e.cc_section == "3.1.9.2")
+                .all(|e| e.authority.reserved.is_none()),
+            "a CC 3.1.9.2 family now carries a machine-readable rule ({s3192:?}) — check whether \
+             it is one of persist's three, and if so delete its MINTED_RULES_NOT_ON_THE_ROW line"
+        );
     }
 
     /// The mint list is not a hand-kept parallel copy: every entry is the

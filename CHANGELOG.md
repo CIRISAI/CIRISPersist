@@ -91,6 +91,30 @@ runtime-derived stem without becoming a function, so the binding is made as a ga
 the literal must equal `family_stem(reverse_quorum::NAMESPACE_FAMILY)`. Same guarantee, no
 public type change, no per-row allocation.
 
+#### The row registers the family; it does not register the rule
+
+R2(a) turned out to be satisfied one level shallower than it reads. All three minted families
+now carry rows — and all three carry `reserved: false` with **no `reserved_rule`**, so
+`authority_for` resolves `ProducerSteward` / `reserved: None` for every one. The rules are
+written down, but in the row's `description` prose: CC's `quarantine:{state}` row literally says
+*"slash-duty-holder-only emitter"*, while the raw shape deserializes `reserved_rule` and nothing
+else. A rule that is machine-readable to a reviewer and invisible to the classifier is the same
+failure R2 names, one layer down — and this repo's doc comment asserted the wrong side of it
+until it was checked.
+
+`admission::MINTED_RULES_NOT_ON_THE_ROW` pins each gap as `(family, rule persist enforces,
+gate(s) enforcing it, CC ask)`. The gate field is a **list**, because one family can have
+several admission doors and a registry of enforcement sites that names one of two is the thing
+it exists to prevent. The gate bites both ways: an unpinned gap fails the build, and a pin whose
+rule has landed fails until deleted.
+
+**Scope, measured rather than asserted.** The pin covers persist's *minted* families only, and
+that limit is now a test: **34 of 109** families carry a machine-readable rule, so **75 do
+not**, across **14 CC sections with none at all**. Persist hand-gates several it did not mint —
+`moderation:` and `slashing:` since v8.7.1, `hard_case:`, `health:liveness:` — each the same
+divergence and older than this issue. Enumerating those is #519's invariant registry, not this
+cut; recording that they exist is.
+
 **Note for consumers of `authority_for`:** CC registered `objection:{state}` with
 `reserved: false` and **no** `reserved_rule` — the row carries the family, and the
 emitter/composition rule is explicitly deferred to CIRISConstitution#67. So the reverse-quorum
