@@ -5,6 +5,161 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased] — #585: CI stops keeping its own list of which features exist
+
+`secrets-server` did not compile. The `capability_roles` rename from #565 (v24.2.0) never
+reached `src/server/secrets.rs` — three sites still said `record.roles`. Three releases of a
+feature-gated module broken on `main`, with every CI run green. The compile break was fixed on
+main in `401bbb3`; this cut is about the gate that should have caught it.
+
+### The defect was a list, not a rename
+
+`.github/workflows/ci.yml` spelled out the feature sets clippy and the test matrix ran against.
+`secrets-server` was not among them, so **no job compiled it** — not clippy, not the test job,
+not the wheel, not the mobile builds. The list was a second inventory of which features exist,
+maintained by diligence, and it disagreed with `Cargo.toml` silently.
+
+Same class as the #444 route table and the v22 AV-77 "SHIPPED means HOST-REACHABLE" lesson: a
+hand-maintained mirror of a real inventory drifts, and the drift is invisible precisely because
+the mirror is what gets checked.
+
+It was not two copies. It was **four**, and no two agreed:
+
+| where | carried | omitted |
+| --- | --- | --- |
+| `ci.yml` clippy | 9 features | `secrets-server`, `secrets-client`, `encrypted-kv`, `tls`, `cirisincident`, all 16 `cirislens_*`, … |
+| `ci.yml` test matrix | 4 + one axis per leg | same, plus the five axes not on that leg |
+| `scripts/hooks/pre-commit` | `postgres,pyo3,server,sqlite,tls` under a comment claiming it "matched the CI matrix's strictest job" | it matched nothing; it carried `tls`, which no CI job compiled, and omitted every substrate axis every CI leg carried |
+| `ios-build` / `android-ndk` env | 27 features | `secrets-server`, `secrets-client`, `encrypted-kv`, `postgres`, `server`, `tls`, … |
+
+### The cure is derivation, not diligence
+
+`scripts/ci_feature_matrix.py` — one tool, `Cargo.toml [features]` as the only inventory.
+
+- **`set <leg>`** — the feature string for a CI leg, computed. `ci.yml` asks; it no longer
+  spells. The test matrix rows now name a *leg*, not a list.
+- **`check`** — the gate. Runs in the `lint` job before anything compiles (~40 ms), and in
+  `pre-commit` whenever `Cargo.toml` / `ci.yml` / the script / `pyproject.toml` is staged.
+
+Two coverage axes, kept distinct because they are not the same claim:
+
+- **COMPILE** — total *by construction*. The `lint` job now runs
+  `cargo clippy --all-features --all-targets -- -D warnings`, which cannot omit a feature.
+  `check` fails if that invocation ever leaves `ci.yml`; deleting it is the only way to reopen
+  the hole. It is a step on the existing lint runner, not a new job, and clippy emits metadata
+  rather than object code — so it pays none of the codegen despite pulling the Candle/ORT
+  graph, and the `lint` job is CIRISCache restore-only, so those artifacts never enter the
+  shared blob.
+- **TEST** — a new `rest` leg carries the **complement**: every declared feature not carried by
+  a named leg and not held out. A feature added to `Cargo.toml` is therefore tested with nobody
+  remembering to come back here. Holding one out requires an entry in `NOT_TESTED` **with a
+  written reason**; `check` rejects an empty reason and rejects a key that no longer names a
+  real feature. Omission is now an act someone has to commit, in a reviewable diff. Before, it
+  required no act at all.
+
+The `rest` leg is not a duplicate build. It runs **2678 tests**, among them every
+`secrets-server`, `secrets-client`, `encrypted-kv`, `tls`, `cirisincident` and `cirislens_*`
+test in the repo — none of which had ever executed in CI. Measured green locally against a real
+Postgres: `2678 passed, 10 skipped` in 986 s of test time. Its `timeout-minutes` is 50 rather
+than 35 because it also compiles a wider graph from a cache warmed for the `core` shape. Same
+reasoning as #543's 25→35 — this is the runner-stall backstop, not the hang detector, which
+`.config/nextest.toml` still owns per test and by name.
+
+### A configuration, not a flag: `test-anchor` gets a rider
+
+`test-anchor` cannot be covered by adding it to a leg's feature list. The feature compiles the
+genesis relaxation in; `ciris_verify_core::test_anchor::test_anchor_active()` — reading
+`CIRIS_TEST_TRUST_ROOT` — is what switches it on. With the env unset it is inert, so a
+30-feature leg carrying the flag would certify nothing. It needs its own invocation, under
+nextest specifically, because the genesis fixtures use `std::env::set_var` and per-test process
+isolation is what stops that leaking into the rest of the suite.
+
+So the model has a second kind of test invocation: a **rider**, a small configuration that runs
+as an extra step on an existing leg rather than claiming a whole runner. `test-anchor` rides
+`cirisaudit` (the shortest leg) — sqlite-only, ~1650 tests, ~2 min. `check` fails if the step is
+dropped or if its host leg moves, so a rider cannot quietly stop running while the gate keeps
+counting it as covered. That failure mode — the gate lying in the #585 direction — is the one
+worth spending a check on.
+
+The narrow shipped-shape clippy pass stays, and is *not* redundant with `--all-features`:
+`dead_code` and `unused_imports` fire only when a feature is OFF, so the total pass structurally
+cannot see them. Its list is derived too (`set lint`).
+
+For the six legs that already existed, the derivation reproduces the old hand-written strings
+**byte for byte** — `set core` is `postgres server pyo3 sqlite`, `set lint` is
+`postgres server pyo3 sqlite cirisaudit secrets cirisnode cirisgraph telemetry`. Nothing about
+what those legs check changed; only where the answer comes from.
+
+Verified by mutation, not by assertion — each of these was made to fail on purpose:
+
+| mutation | result |
+| --- | --- |
+| delete the `--all-features` clippy line | ✗ "that invocation is the ONLY thing that makes compile coverage total by construction" |
+| delete the `rest` leg from the matrix | ✗ "legs defined here but absent from ci.yml's matrix: ['rest']" |
+| quietly drop the `test-anchor` rider step | ✗ "counted as test coverage here but ci.yml never runs it" |
+| add a new feature to `Cargo.toml`, touch nothing else | ✓ — it lands in `rest` automatically, compiled *and* tested |
+| hold a feature out with an empty reason | ✗ "must say why, in writing, here" |
+| leave a stale `NOT_TESTED` key after a rename | ✗ "stale entry; delete it" |
+
+### The 19 lints CI had never seen
+
+`--all-features` clippy surfaced exactly 19 warnings at v25.1.0, all of them in test code, and
+— read one at a time rather than auto-fixed, because a lint in code nobody has compiled can be
+pointing at a defect — **all 19 are style**:
+
+- 18 × `clippy::manual_async_fn` on `MockSecrets` in `src/pipeline/mod.rs`, an 18-method
+  in-test `SecretsService` stub. Now spelled `async fn`. The trait declares RPITIT with an
+  explicit `+ Send`, which an `async fn` impl still has to satisfy, so the signature is
+  unchanged. Never seen because the mock is gated on `secrets` **and** `scrub`, and no CI job
+  carried `scrub`.
+- 1 × `clippy::needless_borrow` in `src/server/secrets.rs` — `BASE64.decode(&sign(&body))`, a
+  `&String` where `impl AsRef<[u8]>` was wanted. Never seen because nothing compiled
+  `secrets-server` at all.
+
+### It caught a bench nobody was compiling either
+
+`--all-targets` includes benches, and benches carry `required-features`. `benches/encrypted_kv.rs`
+declares `required-features = ["encrypted-kv"]`, `bench.yml` has no `run_bench` line for it, and
+no CI feature list carried `encrypted-kv` — so **nothing compiled that bench**, by either
+workflow. It compiles today; it now compiles on every PR. `bench.yml`'s own hardening comment
+already records the same class landing once before ("this is exactly how `storage_floor`'s
+`blocking_lock` compile break hid on main"), caught then by an exit-code mask rather than a
+feature list. Every bench target is now compile-gated on the ordinary PR path, not only by the
+bench workflow's schedule.
+
+### Features that were compiled by no job at all
+
+Beyond `secrets-server`: `secrets-client`, `encrypted-kv`, `tls`, `cirisincident`,
+`test-genesis-seam`, `c-abi`, `peer-replicate`, `pyo3-sqlite`, `default-sovereign-light`,
+`default-pipeline-ml`, `test-anchor`, `test-panic`, `debug-tools`, `scrub`, `extract`,
+`scrub-ner`, `scrub-ort`. The 16 `cirislens_*` features and `classify` were compiled by the
+iOS/Android cross-builds but by nothing that ran their tests. All 46 are compiled now; 39 of the
+46 are also tested, and the other seven each carry a written reason.
+
+### Held out of the test invocations, on the record — seven, each with a reason
+
+`extension-module` (strips libpython from the test binary → `undefined symbol: _Py_DecRef`),
+`test-panic` (its whole surface is one `#[pyfunction]` reachable only from Python; it *is*
+exercised, by the pytest catch_panic regression the `core` leg already runs, just not by a Rust
+leg, which would compile it and call it zero times), `scrub-ner` /
+`scrub-ort` / `default-pipeline-ml` (+500MB of Candle/ORT codegen, and `scrub-ner` turns an
+existing test into a network call — `ner::tests::stub_returns_not_configured_without_setup`
+reaches `is_configured()`, which under that feature is `BACKEND.get_or_init(init)`, a lazy model
+load from `CIRISLENS_NER_MODEL_DIR` or HF Hub), `_pyffi` (internal; every leg gets it via `pyo3`),
+and `default` (the empty set — the `wire_format_fixtures` step *is* that invocation). Every one
+of them is still compiled and linted by the `--all-features` pass.
+
+### Test counts
+
+| configuration | before | after |
+| --- | --- | --- |
+| `sqlite` | 1645 | 1645 |
+| `sqlite test-anchor` | 1650 | 1650 |
+| `sqlite postgres` | 1979 | 1979 |
+| `rest` leg (new) | never run | **2678 passed, 10 skipped** |
+
+Nothing existing moved. The only Rust changes are inside two test bodies that no CI job compiled.
+
 ## [25.1.0] — 2026-08-02 — #582/#578/#570/#583/#569: who may take a node, who may withhold it, what a quota can see — and a gate the floor narrowed mid-flight
 
 Five issues, and one release-shaped lesson. #569 was written against a genuinely open

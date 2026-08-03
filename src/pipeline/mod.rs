@@ -1191,183 +1191,138 @@ mod tests {
     #[cfg(all(feature = "secrets", feature = "scrub"))]
     struct MockSecrets;
 
+    // v25.x (CIRISPersist#585) — spelled `async fn`, not
+    // `-> impl Future { async { .. } }`. The trait declares RPITIT with an
+    // explicit `+ Send`, which an `async fn` impl still has to satisfy, so
+    // this is the same signature with less ceremony (clippy::manual_async_fn,
+    // 18 of the 19 lints the never-run `--all-features` pass was hiding).
     #[cfg(all(feature = "secrets", feature = "scrub"))]
     impl crate::secrets::SecretsService for MockSecrets {
-        fn store_secret(
+        async fn store_secret(
             &self,
             _key: String,
             _value: String,
             _accessor: String,
-        ) -> impl Future<Output = Result<(), crate::secrets::SecretsError>> + Send {
-            async { Ok(()) }
+        ) -> Result<(), crate::secrets::SecretsError> {
+            Ok(())
         }
-        fn retrieve_secret(
+        async fn retrieve_secret(
             &self,
             _key: &str,
             _accessor: String,
-        ) -> impl Future<Output = Result<Option<String>, crate::secrets::SecretsError>> + Send
-        {
-            async { Ok(None) }
+        ) -> Result<Option<String>, crate::secrets::SecretsError> {
+            Ok(None)
         }
-        fn recall_secret(
+        async fn recall_secret(
             &self,
             _uuid: &str,
             _purpose: String,
             _accessor: String,
             _decrypt: bool,
-        ) -> impl Future<
-            Output = Result<
-                Option<crate::secrets::types::SecretRecallResult>,
-                crate::secrets::SecretsError,
-            >,
-        > + Send {
-            async { Ok(None) }
+        ) -> Result<Option<crate::secrets::types::SecretRecallResult>, crate::secrets::SecretsError>
+        {
+            Ok(None)
         }
-        fn list_stored_secrets(
+        async fn list_stored_secrets(
             &self,
             _limit: usize,
             _filter: crate::secrets::types::SecretsListFilter,
-        ) -> impl Future<
-            Output = Result<
-                Vec<crate::secrets::types::SecretReference>,
-                crate::secrets::SecretsError,
-            >,
-        > + Send {
-            async { Ok(Vec::new()) }
+        ) -> Result<Vec<crate::secrets::types::SecretReference>, crate::secrets::SecretsError>
+        {
+            Ok(Vec::new())
         }
-        fn forget_secret(
+        async fn forget_secret(
             &self,
             _uuid: &str,
             _accessor: String,
-        ) -> impl Future<Output = Result<bool, crate::secrets::SecretsError>> + Send {
-            async { Ok(false) }
+        ) -> Result<bool, crate::secrets::SecretsError> {
+            Ok(false)
         }
-        fn process_incoming_text(
+        async fn process_incoming_text(
             &self,
             _text: &str,
             _source_message_id: &str,
             _accessor: String,
-        ) -> impl Future<
-            Output = Result<
-                (String, Vec<crate::secrets::types::SecretReference>),
-                crate::secrets::SecretsError,
-            >,
-        > + Send {
-            async { Err(crate::secrets::SecretsError::Internal("mock".into())) }
+        ) -> Result<
+            (String, Vec<crate::secrets::types::SecretReference>),
+            crate::secrets::SecretsError,
+        > {
+            Err(crate::secrets::SecretsError::Internal("mock".into()))
         }
-        fn decapsulate_secrets_in_parameters(
+        async fn decapsulate_secrets_in_parameters(
             &self,
             _action_type: &str,
             params: serde_json::Value,
             _ctx: crate::secrets::types::DecapsulationContext,
-        ) -> impl Future<Output = Result<serde_json::Value, crate::secrets::SecretsError>> + Send
-        {
-            async move { Ok(params) }
+        ) -> Result<serde_json::Value, crate::secrets::SecretsError> {
+            Ok(params)
         }
-        fn encrypt(
+        async fn encrypt(&self, _plaintext: &str) -> Result<String, crate::secrets::SecretsError> {
+            Ok(String::new())
+        }
+        async fn decrypt(&self, _ciphertext: &str) -> Result<String, crate::secrets::SecretsError> {
+            Ok(String::new())
+        }
+        async fn get_filter_config(
             &self,
-            _plaintext: &str,
-        ) -> impl Future<Output = Result<String, crate::secrets::SecretsError>> + Send {
-            async { Ok(String::new()) }
+        ) -> Result<crate::secrets::types::FilterConfig, crate::secrets::SecretsError> {
+            Err(crate::secrets::SecretsError::Internal(
+                "mock filter config".into(),
+            ))
         }
-        fn decrypt(
-            &self,
-            _ciphertext: &str,
-        ) -> impl Future<Output = Result<String, crate::secrets::SecretsError>> + Send {
-            async { Ok(String::new()) }
-        }
-        fn get_filter_config(
-            &self,
-        ) -> impl Future<
-            Output = Result<crate::secrets::types::FilterConfig, crate::secrets::SecretsError>,
-        > + Send {
-            async {
-                Err(crate::secrets::SecretsError::Internal(
-                    "mock filter config".into(),
-                ))
-            }
-        }
-        fn update_filter_config(
+        async fn update_filter_config(
             &self,
             _updates: crate::secrets::types::FilterUpdateRequest,
             _accessor: String,
-        ) -> impl Future<
-            Output = Result<
-                crate::secrets::types::FilterUpdateResult,
-                crate::secrets::SecretsError,
-            >,
-        > + Send {
-            async {
-                Err(crate::secrets::SecretsError::Internal(
-                    "mock filter update".into(),
-                ))
-            }
+        ) -> Result<crate::secrets::types::FilterUpdateResult, crate::secrets::SecretsError>
+        {
+            Err(crate::secrets::SecretsError::Internal(
+                "mock filter update".into(),
+            ))
         }
-        fn get_service_stats(
+        async fn get_service_stats(
             &self,
-        ) -> impl Future<
-            Output = Result<
-                crate::secrets::types::SecretsServiceStats,
-                crate::secrets::SecretsError,
-            >,
-        > + Send {
-            async { Err(crate::secrets::SecretsError::Internal("mock stats".into())) }
+        ) -> Result<crate::secrets::types::SecretsServiceStats, crate::secrets::SecretsError>
+        {
+            Err(crate::secrets::SecretsError::Internal("mock stats".into()))
         }
-        fn is_healthy(
-            &self,
-        ) -> impl Future<Output = Result<bool, crate::secrets::SecretsError>> + Send {
-            async { Ok(true) }
+        async fn is_healthy(&self) -> Result<bool, crate::secrets::SecretsError> {
+            Ok(true)
         }
-        fn get_access_logs(
+        async fn get_access_logs(
             &self,
             _secret_uuid: Option<&str>,
             _limit: usize,
-        ) -> impl Future<
-            Output = Result<
-                Vec<crate::secrets::types::AccessLogEntry>,
-                crate::secrets::SecretsError,
-            >,
-        > + Send {
-            async { Ok(Vec::new()) }
+        ) -> Result<Vec<crate::secrets::types::AccessLogEntry>, crate::secrets::SecretsError>
+        {
+            Ok(Vec::new())
         }
-        fn reencrypt_all(
+        async fn reencrypt_all(
             &self,
             _new_master_key_ref: crate::secrets::types::MasterKeyRef,
             _accessor: String,
-        ) -> impl Future<
-            Output = Result<crate::secrets::types::RotationResult, crate::secrets::SecretsError>,
-        > + Send {
-            async {
-                Err(crate::secrets::SecretsError::Internal(
-                    "mock reencrypt".into(),
-                ))
-            }
+        ) -> Result<crate::secrets::types::RotationResult, crate::secrets::SecretsError> {
+            Err(crate::secrets::SecretsError::Internal(
+                "mock reencrypt".into(),
+            ))
         }
-        fn rotate_master_key(
+        async fn rotate_master_key(
             &self,
             _new_master: Option<Vec<u8>>,
             _accessor: String,
-        ) -> impl Future<
-            Output = Result<crate::secrets::types::MasterKeyRef, crate::secrets::SecretsError>,
-        > + Send {
-            async { Err(crate::secrets::SecretsError::Internal("mock rotate".into())) }
+        ) -> Result<crate::secrets::types::MasterKeyRef, crate::secrets::SecretsError> {
+            Err(crate::secrets::SecretsError::Internal("mock rotate".into()))
         }
-        fn test_encryption(
-            &self,
-        ) -> impl Future<Output = Result<bool, crate::secrets::SecretsError>> + Send {
-            async { Ok(true) }
+        async fn test_encryption(&self) -> Result<bool, crate::secrets::SecretsError> {
+            Ok(true)
         }
-        fn migrate_to_hardware_key(
+        async fn migrate_to_hardware_key(
             &self,
             _accessor: String,
-        ) -> impl Future<
-            Output = Result<crate::secrets::types::MasterKeyRef, crate::secrets::SecretsError>,
-        > + Send {
-            async {
-                Err(crate::secrets::SecretsError::HardwareKeyUnavailable(
-                    "mock".into(),
-                ))
-            }
+        ) -> Result<crate::secrets::types::MasterKeyRef, crate::secrets::SecretsError> {
+            Err(crate::secrets::SecretsError::HardwareKeyUnavailable(
+                "mock".into(),
+            ))
         }
     }
 
