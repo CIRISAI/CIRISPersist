@@ -102,7 +102,14 @@ else. A rule that is machine-readable to a reviewer and invisible to the classif
 failure R2 names, one layer down — and this repo's doc comment asserted the wrong side of it
 until it was checked.
 
-`admission::MINTED_RULES_NOT_ON_THE_ROW` pins each gap as `(family, rule persist enforces,
+Swept for the general case: across all 109 rows, **exactly one** carries a description asserting
+an emitter rule its `reserved_rule` omits — `quarantine:{state}`. (The only other prose hit,
+`non_maleficence:{aspect}`, is about score polarity, not emission.) That makes it the sharpest
+example for the CC ask: the rule is already decided and written down, one field away from being
+enforceable by anyone but us. No gate keys on that sweep — matching prose to infer a rule is the
+section-walk heuristic R2 explicitly forbids, just pointed at a different field.
+
+`admission::MINTED_FAMILY_RULES_NOT_ON_THE_ROW` pins each gap as `(family, rule persist enforces,
 gate(s) enforcing it, CC ask)`. The gate field is a **list**, because one family can have
 several admission doors and a registry of enforcement sites that names one of two is the thing
 it exists to prevent. The gate bites both ways: an unpinned gap fails the build, and a pin whose

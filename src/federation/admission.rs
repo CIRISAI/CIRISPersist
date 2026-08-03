@@ -577,6 +577,10 @@ pub const MINTED_NAMESPACE_FAMILIES: &[&str] = &[
 /// predicate that exists in neither of their sources — which is exactly the
 /// class R2 was written against, one level deeper than R2 reaches.
 ///
+/// Named `MINTED_FAMILY_…` and not `MINTED_…` because the shorter form parses
+/// two ways — "rules that were minted" and "rules of the families persist
+/// mints" — and only the second is meant. One name, one reading.
+///
 /// **Scope: persist's MINTED families only — this is not the whole population.**
 /// Measured on the vendored rc3 cut: **34 of 109** families carry a
 /// machine-readable rule, so **75 do not**, spread across **14 CC sections**
@@ -589,13 +593,21 @@ pub const MINTED_NAMESPACE_FAMILIES: &[&str] = &[
 /// registry's job (#519), not this const's; what belongs here is the set persist
 /// is the *producer* for, because R2(a) is a producer obligation.
 ///
+/// **Persist named one instance of this class years before anyone named the
+/// class.** [`crate::federation::invariant`]'s module doc records that the
+/// manifest's `health:liveness:{version}` walk asserts a self-emission ban CC
+/// never put in a machine-readable field, and that the manifest's own
+/// `placement_fields_required` entry proposed the remedy verbatim — which #519
+/// then implemented as a single arm. One instance, seen and fixed; the class,
+/// unnamed until now.
+///
 /// `(family, the rule persist enforces, the gate(s) that enforce it, the CC ask)`.
 /// The gate field is a **list** because one family can have several admission
 /// doors — CIRISPersist#591 adds a second door on `objection:` — and a registry
 /// of enforcement sites that names one of two is the exact thing it exists to
-/// prevent. [`tests::minted_rules_not_on_the_row_are_pinned_and_still_missing`]
+/// prevent. [`tests::minted_family_rules_not_on_the_row_are_pinned_and_still_missing`]
 /// deletes the line the moment CC lands the rule.
-pub const MINTED_RULES_NOT_ON_THE_ROW: &[(&str, &str, &[&str], &str)] = &[
+pub const MINTED_FAMILY_RULES_NOT_ON_THE_ROW: &[(&str, &str, &[&str], &str)] = &[
     (
         "objection:{state}",
         "cohort-member-only",
@@ -8976,7 +8988,7 @@ mod tests {
     /// **R2(a), one level deeper: a registered family whose RULE is not
     /// registered.** Every minted family must either carry a machine-readable
     /// `reserved_rule` on its row, or be pinned in
-    /// [`MINTED_RULES_NOT_ON_THE_ROW`] with the rule persist enforces, the gate
+    /// [`MINTED_FAMILY_RULES_NOT_ON_THE_ROW`] with the rule persist enforces, the gate
     /// that enforces it, and the CC ask to land it.
     ///
     /// Both directions bite. A minted family with neither a rule nor a pin is
@@ -8984,10 +8996,10 @@ mod tests {
     /// landed is a stale excuse that would keep the family out of the real
     /// differential — so it must be deleted the moment CC lands it.
     #[test]
-    fn minted_rules_not_on_the_row_are_pinned_and_still_missing() {
+    fn minted_family_rules_not_on_the_row_are_pinned_and_still_missing() {
         use crate::federation::namespace::registry;
         use std::collections::BTreeSet;
-        let pinned: BTreeSet<&str> = MINTED_RULES_NOT_ON_THE_ROW
+        let pinned: BTreeSet<&str> = MINTED_FAMILY_RULES_NOT_ON_THE_ROW
             .iter()
             .map(|(fam, ..)| *fam)
             .collect();
@@ -9001,7 +9013,7 @@ mod tests {
             assert!(
                 has_rule || pinned.contains(fam),
                 "{fam:?} is minted by persist, its row carries NO machine-readable reserved_rule, \
-                 and MINTED_RULES_NOT_ON_THE_ROW does not pin it. The family is registered but \
+                 and MINTED_FAMILY_RULES_NOT_ON_THE_ROW does not pin it. The family is registered but \
                  the AUTHORITY is not: authority_for() resolves ProducerSteward/reserved:None, so \
                  anything trusting the classifier reads the family as open while persist gates \
                  it. Land the rule on the CC row, or pin it here with the gate that actually \
@@ -9010,7 +9022,7 @@ mod tests {
             );
         }
 
-        for (fam, rule, gates, ask) in MINTED_RULES_NOT_ON_THE_ROW {
+        for (fam, rule, gates, ask) in MINTED_FAMILY_RULES_NOT_ON_THE_ROW {
             assert!(
                 MINTED_NAMESPACE_FAMILIES.contains(fam),
                 "{fam:?} is pinned as a minted-family rule gap but persist does not mint it"
@@ -9045,7 +9057,7 @@ mod tests {
 
     /// **The population this pin does NOT cover, measured rather than asserted.**
     ///
-    /// `MINTED_RULES_NOT_ON_THE_ROW` is scoped to families persist *mints*, and
+    /// `MINTED_FAMILY_RULES_NOT_ON_THE_ROW` is scoped to families persist *mints*, and
     /// a reader could reasonably take a const called "rules not on the row" for
     /// the whole set. It is not close: most of the manifest carries no
     /// machine-readable rule. This records the real shape so the scope limit is
@@ -9066,7 +9078,7 @@ mod tests {
             with_rule < total / 2,
             "rule coverage is now {with_rule}/{total} — over half. That is a GOOD change, but it \
              means the 'the manifest mostly does not state emitter rules' premise behind \
-             MINTED_RULES_NOT_ON_THE_ROW's scope note is stale; re-measure it."
+             MINTED_FAMILY_RULES_NOT_ON_THE_ROW's scope note is stale; re-measure it."
         );
         // The specific claim the #67 / #76 asks rest on: persist's own minted
         // section is rule-free — and so are many others, which is why the ask
@@ -9086,7 +9098,7 @@ mod tests {
                 .filter(|e| e.cc_section == "3.1.9.2")
                 .all(|e| e.authority.reserved.is_none()),
             "a CC 3.1.9.2 family now carries a machine-readable rule ({s3192:?}) — check whether \
-             it is one of persist's three, and if so delete its MINTED_RULES_NOT_ON_THE_ROW line"
+             it is one of persist's three, and if so delete its MINTED_FAMILY_RULES_NOT_ON_THE_ROW line"
         );
     }
 

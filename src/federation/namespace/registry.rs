@@ -595,6 +595,51 @@ mod tests {
         }
     }
 
+    /// **The redundancy `RawFamily` bets on.** Its comment says the manifest's
+    /// `reserved` bool "is redundant with `reserved_rule` presence", and on that
+    /// basis serde **ignores `reserved` entirely**. If CC ever ships
+    /// `reserved: true` with no `reserved_rule`, persist reads that family as
+    /// OPEN while the manifest asserts it is reserved — a reservation dropped on
+    /// the floor by a parser doing what its comment promised.
+    ///
+    /// Perfectly correlated on this cut, zero rows in either direction. The bet
+    /// is sound; this is what makes it a checked bet rather than an assumption.
+    #[test]
+    fn reserved_bool_and_reserved_rule_presence_are_redundant() {
+        let raw: RawManifest = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let root: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let rows = root["families"].as_array().expect("families array");
+        assert_eq!(rows.len(), raw.families.len());
+        let mut asserted_but_unruled: Vec<&str> = Vec::new();
+        let mut ruled_but_unasserted: Vec<&str> = Vec::new();
+        for row in rows {
+            let prefix = row["prefix"].as_str().expect("prefix");
+            let flag = row
+                .get("reserved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let has_rule = row.get("reserved_rule").is_some_and(|v| !v.is_null());
+            if flag && !has_rule {
+                asserted_but_unruled.push(prefix);
+            }
+            if has_rule && !flag {
+                ruled_but_unasserted.push(prefix);
+            }
+        }
+        assert!(
+            asserted_but_unruled.is_empty(),
+            "{asserted_but_unruled:?} carry `reserved: true` with NO `reserved_rule`. serde \
+             ignores the bool, so `authority_for` reports these families OPEN while the manifest \
+             says they are reserved — a reservation silently dropped at the parser. Either CC \
+             must land the rule, or RawFamily must stop ignoring the bool."
+        );
+        assert!(
+            ruled_but_unasserted.is_empty(),
+            "{ruled_but_unasserted:?} carry a `reserved_rule` but `reserved: false` — the \
+             manifest contradicts itself about whether the family is reserved"
+        );
+    }
+
     /// A `reserved_rule` with a null `cc_ref` (rc3's `trust:{job}:{version}`)
     /// parses, and resolves to the family's own catalogue section rather than
     /// an empty string that reads like a present-but-blank citation.

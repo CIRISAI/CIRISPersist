@@ -141,7 +141,7 @@ pub const DIMENSION_DISMISSAL: &str = "objection:dismissed:v1";
 /// The cohort-member-only rule is therefore enforced by [`record_objection`] and
 /// by nothing else. Nothing on this plane reads `.reserved`, and nothing should
 /// start until the rule is on the row. Tracked in
-/// [`MINTED_RULES_NOT_ON_THE_ROW`](super::admission::MINTED_RULES_NOT_ON_THE_ROW);
+/// [`MINTED_FAMILY_RULES_NOT_ON_THE_ROW`](super::admission::MINTED_FAMILY_RULES_NOT_ON_THE_ROW);
 /// getting it onto the row rides CIRISConstitution#67.
 pub const NAMESPACE_FAMILY: &str = "objection:{state}";
 

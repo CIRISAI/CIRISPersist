@@ -123,6 +123,10 @@ pub const DIMENSION_RELEASED: &str = "quarantine:released:v1";
 /// **The row registers the family, NOT the emitter rule.** CC's row says
 /// *"slash-duty-holder-only emitter"* in its `description` — human prose that
 /// nothing parses — while its machine-readable `reserved_rule` is **absent**.
+/// On the vendored rc3 cut this row is the **only** one of 109 whose
+/// description asserts an emitter rule its `reserved_rule` omits, which makes
+/// it the sharpest available example for the CC ask: the rule is decided, and
+/// it is one field away from being enforceable by anyone but us.
 /// `registry::RawFamily` deserializes `reserved_rule` and ignores everything
 /// else, so
 /// [`authority_for`](super::namespace::registry::authority_for)`("quarantine:…")`
@@ -135,7 +139,7 @@ pub const DIMENSION_RELEASED: &str = "quarantine:released:v1";
 /// nothing should start until the rule is on the row — a prose rule read as a
 /// registered one is how two validators come to share a predicate that exists in
 /// neither of their sources. Tracked in
-/// [`MINTED_RULES_NOT_ON_THE_ROW`](super::admission::MINTED_RULES_NOT_ON_THE_ROW);
+/// [`MINTED_FAMILY_RULES_NOT_ON_THE_ROW`](super::admission::MINTED_FAMILY_RULES_NOT_ON_THE_ROW);
 /// getting it onto the row rides CIRISConstitution#76.
 pub const NAMESPACE_FAMILY: &str = "quarantine:{state}";
 
