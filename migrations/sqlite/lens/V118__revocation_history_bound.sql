@@ -1,0 +1,47 @@
+-- V118 — the time-bounded de-admission column, SQLite dialect
+-- v25.1.0 (CIRISPersist#570 ask 4)
+--
+-- POSTGRES PARITY: migrations/postgres/lens/V118__revocation_history_bound.sql
+--
+-- WHAT AND WHY
+-- ------------
+-- `federation_revocations` could express exactly one thing about a key's past:
+-- nothing. `revoked_at` says when the revocation was issued and `effective_at`
+-- says when it takes effect — both about the key GOING FORWARD. Neither says
+-- anything about the statements the key already made, so the only expressible
+-- response to a key compromise destroyed the key's entire honest history.
+--
+-- That is CIRISServer's ADMIN_OPS_TAXONOMY family 2b, and DigiNotar is the
+-- precedent: the long tail of a total revocation is measured in the things
+-- that were fine and died anyway.
+--
+--     revoked_after — the last instant this key's statements are still stood
+--                     behind. A statement asserted at or before it survives;
+--                     one asserted after it is suspect.
+--
+-- NULL is the pre-v25.1 meaning and stays the default: all-or-nothing. No
+-- existing row changes, and an unbounded revocation keeps hashing exactly as
+-- it did (the Rust field is `Option` with `skip_serializing_if = "is_none"`,
+-- so a NULL bound never enters canonical bytes).
+--
+-- THE BOUND IS SIGNED
+-- -------------------
+-- This column is the ONLY field on the revocation plane that makes part of a
+-- revoked key's corpus keep standing — every other field makes things less
+-- admissible, this one makes things more. So it is not merely stored: the
+-- admission gate (`federation::register::check_revocation_bound`, run on all
+-- three backends before the row is hashed) REFUSES any row whose column value
+-- is not mirrored, to the second, by a `revoked_after` inside the SIGNED
+-- `revocation_envelope`, and refuses a bound later than `effective_at`.
+-- An unsigned leniency field is an attacker's field.
+--
+-- No index: the bound is read through `revocations_for(key_id)`, which is
+-- already indexed on `revoked_key_id`; a bound-ordered scan has no consumer.
+--
+-- ORDERING: this is a bare ADD COLUMN on `federation_revocations`. It touches
+-- no other table and has no FK into one, so it is order-independent with
+-- respect to any sibling migration in the same batch — including a
+-- `federation_attestations` table rebuild, which SQLite needs whenever a
+-- table-level CHECK has to widen.
+
+ALTER TABLE federation_revocations ADD COLUMN revoked_after TEXT;

@@ -27567,6 +27567,17 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::CharterInvalid { .. } => PyValueError::new_err(kind),
         // v19.1.0 — caller-fixable: supply a valid quorum-signed bundle.
         crate::federation::Error::GenesisBundleInvalid { .. } => PyValueError::new_err(kind),
+        // v25.1.0 (CIRISPersist#570 ask 3/4) — caller-fixable, and the typed
+        // token rides in the message so a Python consumer can branch on WHICH
+        // branch refused without a second copy of the taxonomy. Both are
+        // append-only `as_str` tokens (`delegation_id_absent`,
+        // `envelope_bound_absent`, …).
+        crate::federation::Error::AdminActionUnattributed { reason } => {
+            PyValueError::new_err(format!("{kind}: {}", reason.as_str()))
+        }
+        crate::federation::Error::RevocationBoundInvalid { reason } => {
+            PyValueError::new_err(format!("{kind}: {}", reason.as_str()))
+        }
     }
 }
 
@@ -27642,6 +27653,14 @@ fn blob_err_to_py(e: crate::federation::BlobError) -> PyErr {
         // won't clear the condition (only host-disk recovery does).
         crate::federation::BlobError::DiskPressureProxyRefused { .. } => {
             PyValueError::new_err(kind)
+        }
+        // v25.1.0 (CIRISPersist#570 ask 5) — quarantine withhold. PERMANENT
+        // for the same reason as the pressure refusal above, but for a
+        // different cause: this is a policy decision by a `slash` authority,
+        // and it clears only when a release marker lands. The holder key rides
+        // in the message so an operator can find the marker rather than guess.
+        crate::federation::BlobError::QuarantineWithheld { ref key_id } => {
+            PyValueError::new_err(format!("{kind}: {key_id}"))
         }
         crate::federation::BlobError::Backend(_) => PyRuntimeError::new_err(kind),
     }

@@ -2534,6 +2534,39 @@ pub const DELEGATION_SCOPE_TAKEDOWN: &str = "takedown";
 /// attestation on the delegator's behalf, and ONLY then.
 pub const DELEGATION_SCOPE_REVIEW: &str = "review";
 
+/// v25.1.0 (CIRISPersist#570 ask 2; CIRISServer `FSD/ADMIN_OPS_TAXONOMY.md`,
+/// CC 6.1.2) — the `slash` delegated-duty scope: **the authority to take
+/// something AWAY.**
+///
+/// The four scopes above it are all authorities to **emit** — write a note,
+/// file a report, publish a takedown notice. Between "write a note" and the
+/// node-wide kill switch there was nothing, so every graded response either
+/// under-reached (a note nobody has to read) or over-reached (halt the node).
+/// `slash` is the middle rung: it authorizes the tier-3/4 ops that REMOVE —
+/// today [`quarantine`](crate::federation::quarantine) (ask 5, withhold from
+/// serving) and time-bounded de-admission
+/// ([`Revocation::revoked_after`](crate::federation::Revocation::revoked_after),
+/// ask 4).
+///
+/// Identical wire acceptance and identical walk to the other four: a bare
+/// string OR a JSON array-set on a `delegates_to` envelope, traversed under
+/// [`DelegationWalkPolicy::MODERATION_DUTY`] (⊆-parent attenuation,
+/// `sub_delegation`-gated deputization, `withdraws`-retracted edges skipped,
+/// depth ≤ [`MAX_MODERATION_DELEGATION_DEPTH`]), rooted at a
+/// [`is_steward_bound`] duty holder. There is deliberately no laxer path for
+/// the scope that takes things away.
+///
+/// # It is not a decoration
+///
+/// The #333 lesson this repo keeps re-learning is that a conferral nothing
+/// gates on is a stored label. `slash` gates a real door from the moment it
+/// exists: [`check_delegated_duty_scores_admission`] routes every
+/// [`QUARANTINE_DIMENSION_PREFIX`] row through it, so a quarantine marker
+/// authored by a key with no live `slash` chain is refused and never stored —
+/// which in turn is what lets the serve path treat "held" as "authorized"
+/// without re-walking the graph on every page.
+pub const DELEGATION_SCOPE_SLASH: &str = "slash";
+
 /// v6.7.0 (CIRISPersist#146 Ask 6, CEG 1.0-RC5 §5.6.8.14) — the reserved
 /// `scores` dimension prefix for a **canonical-binding** claim. A bare
 /// `scores` on `identity:canonical_binding:{H}` with `attesting_key_id =
@@ -3625,6 +3658,19 @@ pub const MODERATION_DIMENSION_PREFIX: &str = "moderation:";
 ///
 /// [`review`]: DELEGATION_SCOPE_REVIEW
 pub const RECONSIDERATION_DIMENSION_PREFIX: &str = "reconsideration:";
+
+/// v25.1.0 (CIRISPersist#570 ask 2 + ask 5) — reserved `scores` dimension
+/// prefix for a **quarantine marker** (see
+/// [`quarantine`](crate::federation::quarantine) for the two dimensions and
+/// the fold). A `scores` row under this prefix asserts *"withhold this key's
+/// rows from serving"* / *"stop withholding them"*; its emission is gated by
+/// the [`slash`] delegated-duty scope.
+///
+/// This prefix is the reason [`DELEGATION_SCOPE_SLASH`] is load-bearing rather
+/// than declarative: it is the third arm of the dimension→duty map below.
+///
+/// [`slash`]: DELEGATION_SCOPE_SLASH
+pub const QUARANTINE_DIMENSION_PREFIX: &str = "quarantine:";
 
 /// v8.7.1 (CIRISPersist#233, CEG RC24 §11.10) — the §11.10 delegated-duty
 /// depth bound (§13.3: depth ≤ 5). Distinct from the
@@ -6531,6 +6577,12 @@ pub async fn check_delegated_duty_scores_admission(
         DELEGATION_SCOPE_MODERATE
     } else if dimension.starts_with(RECONSIDERATION_DIMENSION_PREFIX) {
         DELEGATION_SCOPE_REVIEW
+    } else if dimension.starts_with(QUARANTINE_DIMENSION_PREFIX) {
+        // v25.1.0 (CIRISPersist#570 ask 2/5) — the third arm. A quarantine
+        // marker takes something away, so it is gated on the ONE scope that
+        // authorizes removal, walked under exactly the same policy as the two
+        // emit duties above (there is no laxer path for the harsher op).
+        DELEGATION_SCOPE_SLASH
     } else {
         return Ok(());
     };

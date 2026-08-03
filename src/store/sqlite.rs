@@ -4251,6 +4251,12 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         check_revocation_anti_rollback_sqlite(&self.conn, &row.revoked_key_id, row.scrub_timestamp)
             .await?;
 
+        // v25.1.0 (CIRISPersist#570 ask 4) — the history bound must be the
+        // one that was SIGNED, and must be coherent with `effective_at`.
+        // Runs here, before persist_row_hash and before INSERT, so a refused
+        // bound leaves no trace (AV-9). See `check_revocation_bound`.
+        crate::federation::check_revocation_bound(&row)?;
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
@@ -4270,8 +4276,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    persist_row_hash\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    revoked_after, persist_row_hash\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     row.revocation_id,
                     row.revoked_key_id,
@@ -4287,6 +4293,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     row.scrub_timestamp.to_rfc3339(),
                     row.pqc_completed_at.map(|t| t.to_rfc3339()),
                     row.observed_region,
+                    row.revoked_after.map(|t| t.to_rfc3339()),
                     row.persist_row_hash,
                 ],
             )?;
@@ -4318,7 +4325,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         revoked_at, effective_at, revocation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                        persist_row_hash \
+                        revoked_after, persist_row_hash \
                      FROM federation_revocations \
                      WHERE revoked_key_id = ?1 \
                      ORDER BY effective_at DESC",
@@ -6887,6 +6894,11 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         &self,
         event: crate::federation::HardCaseEvent,
     ) -> Result<(), crate::federation::Error> {
+        // v25.1.0 (CIRISPersist#570 ask 3) — the attribution gate.
+        // Verify-before-mutation: an `admin_action` record that does not carry
+        // {delegation_id, reason} is refused naming WHICH, and no row is
+        // written. A no-op for every observed-condition kind.
+        crate::federation::check_admin_action_attribution(&event)?;
         let detail_json = serde_json::to_string(&event.detail).map_err(|e| {
             crate::federation::Error::Backend(format!("hard_case detail serialize: {e}"))
         })?;
@@ -8511,7 +8523,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         );
         let conn = self.conn.clone();
         let limit_usize = limit as usize;
-        tokio::task::spawn_blocking(
+        let page = tokio::task::spawn_blocking(
             move || -> Result<crate::read::ScoresPage, crate::federation::Error> {
                 let conn = conn.lock();
                 let mut stmt = conn
@@ -8535,7 +8547,27 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             },
         )
         .await
-        .map_err(|e| Error::Backend(format!("list_attestation_log join: {e}")))?
+        .map_err(|e| Error::Backend(format!("list_attestation_log join: {e}")))??;
+
+        // v25.1.0 (CIRISPersist#570 ask 5) — THE SERVE CONSULT. This is the
+        // relay read a peer's rows leave through, so it is where the
+        // quarantine marker has to bite: rows authored by a withheld key are
+        // dropped from the page. Retained locally, withheld from serving,
+        // reversible — nothing below this line deletes anything.
+        //
+        // `next_cursor` is deliberately computed BEFORE the filter (above,
+        // from the SQL page's trailing row): the cursor must advance over the
+        // rows that existed, or a fully-withheld page would stall the walk
+        // forever. Pages may therefore come back short; callers already
+        // tolerate that.
+        let next_cursor = page.next_cursor;
+        let items = crate::federation::quarantine::filter_withheld_rows(
+            self,
+            page.items,
+            chrono::Utc::now(),
+        )
+        .await?;
+        Ok(crate::read::ScoresPage { items, next_cursor })
     }
 
     async fn record_announced_peer(
@@ -8789,7 +8821,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                         revoked_at, effective_at, revocation_envelope, \
                         original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                         scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                        persist_row_hash \
+                        revoked_after, persist_row_hash \
                      FROM federation_revocations WHERE revocation_id = ?1",
                     [&id],
                     sqlite_row_to_revocation,
@@ -14050,6 +14082,9 @@ fn sqlite_row_to_revocation(
     let scrub_timestamp: String = row.get("scrub_timestamp")?;
     let pqc_completed_at: Option<String> = row.get("pqc_completed_at")?;
     let observed_region: String = row.get("observed_region")?;
+    // v25.1.0 (CIRISPersist#570 ask 4) — the history bound. NULL is the
+    // pre-v25.1 meaning: all-or-nothing.
+    let revoked_after: Option<String> = row.get("revoked_after")?;
     Ok(crate::federation::Revocation {
         revocation_id: row.get("revocation_id")?,
         revoked_key_id: row.get("revoked_key_id")?,
@@ -14065,6 +14100,7 @@ fn sqlite_row_to_revocation(
         scrub_timestamp: parse_rfc3339(&scrub_timestamp),
         pqc_completed_at: pqc_completed_at.as_deref().map(parse_rfc3339),
         observed_region,
+        revoked_after: revoked_after.as_deref().map(parse_rfc3339),
         persist_row_hash: row.get("persist_row_hash")?,
     })
 }
@@ -16984,7 +17020,7 @@ impl crate::read::ReadEngine for SqliteBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, \
                     scrub_signature_pqc, scrub_key_id, scrub_timestamp, \
-                    pqc_completed_at, observed_region, persist_row_hash \
+                    pqc_completed_at, observed_region, revoked_after, persist_row_hash \
              FROM federation_revocations {where_sql} \
              ORDER BY revoked_at DESC, revocation_id DESC LIMIT ?{p_limit}"
         );
@@ -20109,6 +20145,33 @@ mod tests {
         .await;
     }
 
+    /// v25.1.0 (CIRISPersist#570 asks 2/3/5) — the sqlite leg of the shared
+    /// admin-op witness (see the postgres + memory legs); all three call the
+    /// SAME `quarantine::test_support::exercise_admin_ops` body, so no backend
+    /// can silently disagree about who may withhold, what withholding does to
+    /// the serve path, or whether an admin action must carry its authority.
+    #[tokio::test]
+    async fn admin_ops_parity_sqlite_570() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::quarantine::test_support::exercise_admin_ops(&backend, "sqlite-qa")
+            .await;
+    }
+
+    /// v25.1.0 (CIRISPersist#570 ask 4) — the sqlite leg of the shared
+    /// revocation-history-bound witness. The bound is stored in a column
+    /// (V118), so "it round-trips" is a per-backend claim, not a shared one.
+    #[tokio::test]
+    async fn revocation_bound_parity_sqlite_570() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::register::bound_test_support::exercise_revocation_bound(
+            &backend,
+            "sqlite-rb",
+        )
+        .await;
+    }
+
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the sqlite leg of the shared
     /// backend-parity witness for the three new #509 methods (see
     /// `postgres::tests::consent_509_backend_methods_parity_postgres`);
@@ -21641,6 +21704,7 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             observed_region: crate::federation::verify_coord::region::US.into(),
+            revoked_after: None,
             persist_row_hash: String::new(),
         }
     }

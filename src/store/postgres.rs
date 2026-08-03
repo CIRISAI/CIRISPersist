@@ -4908,6 +4908,12 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         check_revocation_anti_rollback_postgres(&client, &row.revoked_key_id, row.scrub_timestamp)
             .await?;
 
+        // v25.1.0 (CIRISPersist#570 ask 4) — the history bound must be the
+        // one that was SIGNED, and must be coherent with `effective_at`.
+        // Runs here, before persist_row_hash and before INSERT, so a refused
+        // bound leaves no trace (AV-9). See `check_revocation_bound`.
+        crate::federation::check_revocation_bound(&row)?;
+
         row.persist_row_hash = crate::federation::types::compute_persist_row_hash(&row)?;
 
         let original_content_hash = hex::decode(&row.original_content_hash).map_err(|e| {
@@ -4935,8 +4941,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
                     scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
-                    persist_row_hash\
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                    revoked_after, persist_row_hash\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
                 &[
                     &revocation_uuid,
                     &row.revoked_key_id,
@@ -4952,6 +4958,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                     &row.scrub_timestamp,
                     &row.pqc_completed_at,
                     &row.observed_region,
+                    &row.revoked_after,
                     &row.persist_row_hash,
                 ],
             )
@@ -4982,7 +4989,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, persist_row_hash \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
+                    revoked_after, persist_row_hash \
                  FROM cirislens.federation_revocations \
                  WHERE revoked_key_id = $1 \
                  ORDER BY effective_at DESC",
@@ -7484,6 +7492,11 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         &self,
         event: crate::federation::HardCaseEvent,
     ) -> Result<(), crate::federation::Error> {
+        // v25.1.0 (CIRISPersist#570 ask 3) — the attribution gate.
+        // Verify-before-mutation: an `admin_action` record that does not carry
+        // {delegation_id, reason} is refused naming WHICH, and no row is
+        // written. A no-op for every observed-condition kind.
+        crate::federation::check_admin_action_attribution(&event)?;
         let client = self
             .get_client()
             .await
@@ -9250,6 +9263,17 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         } else {
             None
         };
+        // Release the pooled client before the quarantine consult below —
+        // `filter_withheld_rows` re-enters this backend and takes its own.
+        drop(client);
+
+        // v25.1.0 (CIRISPersist#570 ask 5) — THE SERVE CONSULT. See the
+        // sqlite twin for the full rationale, including why `next_cursor` is
+        // computed BEFORE the filter (a fully-withheld page must still advance
+        // the walk) and why pages may come back short.
+        let items =
+            crate::federation::quarantine::filter_withheld_rows(self, items, chrono::Utc::now())
+                .await?;
         Ok(crate::read::ScoresPage { items, next_cursor })
     }
 
@@ -9385,7 +9409,8 @@ impl crate::federation::FederationDirectory for PostgresBackend {
                 "SELECT revocation_id::text, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, persist_row_hash \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
+                    revoked_after, persist_row_hash \
                  FROM cirislens.federation_revocations WHERE revocation_id = $1",
                 &[&rev_uuid],
             )
@@ -14394,6 +14419,9 @@ fn pg_row_to_revocation(
         scrub_timestamp: row.safe_get_with("scrub_timestamp", mk_err)?,
         pqc_completed_at: row.safe_get_with("pqc_completed_at", mk_err)?,
         observed_region: row.safe_get_with("observed_region", mk_err)?,
+        // v25.1.0 (CIRISPersist#570 ask 4) — the history bound. NULL is the
+        // pre-v25.1 meaning: all-or-nothing.
+        revoked_after: row.safe_get_with("revoked_after", mk_err)?,
         persist_row_hash: row.safe_get_with("persist_row_hash", mk_err)?,
     })
 }
@@ -17297,7 +17325,8 @@ impl crate::read::ReadEngine for PostgresBackend {
             "SELECT revocation_id::text AS revocation_id, revoked_key_id, revoking_key_id, reason, \
                     revoked_at, effective_at, revocation_envelope, \
                     original_content_hash, scrub_signature_classical, scrub_signature_pqc, \
-                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, persist_row_hash \
+                    scrub_key_id, scrub_timestamp, pqc_completed_at, observed_region, \
+                    revoked_after, persist_row_hash \
              FROM cirislens.federation_revocations \
              {where_sql} \
              ORDER BY revoked_at DESC, revocation_id DESC \
@@ -20377,6 +20406,42 @@ mod tests {
         let suffix = uuid_like();
         crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(&backend, &suffix)
             .await;
+    }
+
+    /// v25.1.0 (CIRISPersist#570 asks 2/3/5) — the POSTGRES leg of the shared
+    /// admin-op witness (see `sqlite::tests::admin_ops_parity_sqlite_570` and
+    /// the memory leg); all three call the SAME
+    /// `quarantine::test_support::exercise_admin_ops` body.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn admin_ops_parity_postgres_570() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::quarantine::test_support::exercise_admin_ops(&backend, &suffix).await;
+    }
+
+    /// v25.1.0 (CIRISPersist#570 ask 4) — the POSTGRES leg of the shared
+    /// revocation-history-bound witness. The bound is a TIMESTAMPTZ column
+    /// here and TEXT on sqlite, so the round-trip claim is per-backend.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn revocation_bound_parity_postgres_570() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::register::bound_test_support::exercise_revocation_bound(
+            &backend, &suffix,
+        )
+        .await;
     }
 
     /// v21.2.0 (CIRISPersist#509 FLOOR) — the postgres leg of the shared
@@ -24461,6 +24526,7 @@ mod tests {
             scrub_timestamp: now,
             pqc_completed_at: None,
             observed_region: crate::federation::verify_coord::region::US.into(),
+            revoked_after: None,
             persist_row_hash: String::new(),
         };
         backend
@@ -28661,6 +28727,7 @@ mod tests {
             scrub_timestamp: now,
             pqc_completed_at: None,
             observed_region: crate::federation::verify_coord::region::US.into(),
+            revoked_after: None,
             persist_row_hash: String::new(),
         };
         backend
@@ -30240,6 +30307,7 @@ mod tests {
                     scrub_timestamp: chrono::Utc::now(),
                     pqc_completed_at: None,
                     observed_region: crate::federation::verify_coord::region::US.into(),
+                    revoked_after: None,
                     persist_row_hash: String::new(),
                 },
             })

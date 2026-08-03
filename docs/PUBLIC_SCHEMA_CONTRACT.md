@@ -162,6 +162,11 @@ Append-only revocation log. Consumers compute "is K revoked at T?" by
 querying revocations of K with `effective_at <= T` and applying their
 own consensus policy.
 
+v25.1.0 (CIRISPersist#570 ask 4) adds the second question a consumer can now
+ask: **"does a statement K made at T still stand?"** — see `revoked_after`
+below, and `federation::register::resolve_key_statement_standing` for the fold
+(and for the explicit list of read paths that do NOT honour the bound).
+
 | Column                       | Type        | Tier     | Notes |
 |------------------------------|-------------|----------|-------|
 | `revocation_id`              | uuid        | stable   | Primary key. |
@@ -170,6 +175,7 @@ own consensus policy.
 | `reason`                     | text        | stable   | Free-form; consumers parse if they care. |
 | `revoked_at`                 | timestamptz | stable   | When the revocation was issued. |
 | `effective_at`               | timestamptz | stable   | When it takes effect; may be past (retroactive) or future (scheduled). |
+| `revoked_after`              | timestamptz | stable   | v25.1.0 (V118, #570 ask 4) — the **history bound**: the last instant this key's statements are still stood behind. A statement asserted at or before it survives the revocation; one asserted after it is suspect. NULL (the default, and every pre-v25.1 row) means all-or-nothing, which is what an unbounded revocation has always meant. **Signed**: admission refuses any row whose value is not mirrored, to the second, by a `revoked_after` in `revocation_envelope`, or whose bound is later than `effective_at`. |
 | `revocation_envelope`        | jsonb       | stable   | Canonical bytes that were signed. |
 | `original_content_hash`      | bytea       | stable   | SHA-256 of canonical envelope. |
 | `scrub_signature_classical`  | text        | stable   | Ed25519 signature, base64. |

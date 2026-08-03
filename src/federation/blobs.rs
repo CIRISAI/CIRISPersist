@@ -1661,6 +1661,23 @@ pub enum BlobError {
         tier: &'static str,
     },
 
+    /// v25.1.0 (CIRISPersist#570 ask 5) — a local holder of these bytes is
+    /// **quarantined**: withheld from serving by a live
+    /// [`slash`](crate::federation::admission::DELEGATION_SCOPE_SLASH)-borne
+    /// marker (see [`quarantine`](crate::federation::quarantine)).
+    ///
+    /// The bytes are RETAINED — this refuses to serve them, it never deletes
+    /// them, and releasing the marker restores serving with no reconstruction.
+    /// A peer receiving this should fetch from another holder; unlike
+    /// [`Self::DiskPressureProxyRefused`] it will not clear on its own,
+    /// because it is a policy decision rather than a capacity one.
+    #[error("withheld from serving: local holder {key_id} is quarantined")]
+    QuarantineWithheld {
+        /// The withheld holder — named so an operator can find the marker
+        /// (`resolve_quarantine(key_id)`) rather than guess.
+        key_id: String,
+    },
+
     /// Backend-level error (DB connection, serialization, etc.).
     #[error("backend: {0}")]
     Backend(String),
@@ -1682,6 +1699,7 @@ impl BlobError {
             BlobError::NotGranted { .. } => "blob_not_granted",
             BlobError::NotHeld { .. } => "blob_not_held",
             BlobError::DiskPressureProxyRefused { .. } => "blob_disk_pressure_proxy_refused",
+            BlobError::QuarantineWithheld { .. } => "blob_quarantine_withheld",
             BlobError::Backend(_) => "blob_backend",
         }
     }

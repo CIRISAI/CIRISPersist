@@ -2764,43 +2764,58 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         }
         // #455 — owner-scope LOG walk: NO caller gate, NO lifecycle folding,
         // federation-tier (the replicable set) only, byte-faithful rows.
-        let state = self.state.lock().expect("memory backend lock");
-        let mut rows: Vec<crate::federation::Attestation> = state
-            .federation_attestations
-            .iter()
-            .filter(|r| {
-                r.tier == crate::federation::types::attestation_tier::FEDERATION
-                    && subject_key_id.is_none_or(|subj| r.subject_key_ids.iter().any(|s| s == subj))
-            })
-            .cloned()
-            .collect();
-        rows.sort_by(|a, b| {
-            b.asserted_at
-                .cmp(&a.asserted_at)
-                .then_with(|| b.attestation_id.cmp(&a.attestation_id))
-        });
-        if let Some(c) = &cursor {
-            rows.retain(|r| {
-                (r.asserted_at, r.attestation_id.as_str())
-                    < (c.last_asserted_at, c.last_attestation_id.as_str())
-            });
-        }
+        //
+        // Scoped in a block so the state guard is DROPPED before the
+        // quarantine consult below: `filter_withheld_rows` re-enters this
+        // backend through `list_attestations_for`, which takes the same lock,
+        // and a guard merely `drop()`ed still keeps the future non-`Send`.
+        // (sqlite/postgres hold no equivalent guard at this point.)
         let limit_usize = limit as usize;
-        rows.truncate(limit_usize);
-        let next_cursor = if rows.len() == limit_usize {
-            rows.last().map(|last| {
-                crate::read::AttestationCursor::from_trailing(
-                    last.asserted_at,
-                    last.attestation_id.clone(),
-                )
-            })
-        } else {
-            None
+        let (rows, next_cursor) = {
+            let state = self.state.lock().expect("memory backend lock");
+            let mut rows: Vec<crate::federation::Attestation> = state
+                .federation_attestations
+                .iter()
+                .filter(|r| {
+                    r.tier == crate::federation::types::attestation_tier::FEDERATION
+                        && subject_key_id
+                            .is_none_or(|subj| r.subject_key_ids.iter().any(|s| s == subj))
+                })
+                .cloned()
+                .collect();
+            rows.sort_by(|a, b| {
+                b.asserted_at
+                    .cmp(&a.asserted_at)
+                    .then_with(|| b.attestation_id.cmp(&a.attestation_id))
+            });
+            if let Some(c) = &cursor {
+                rows.retain(|r| {
+                    (r.asserted_at, r.attestation_id.as_str())
+                        < (c.last_asserted_at, c.last_attestation_id.as_str())
+                });
+            }
+            rows.truncate(limit_usize);
+            let next_cursor = if rows.len() == limit_usize {
+                rows.last().map(|last| {
+                    crate::read::AttestationCursor::from_trailing(
+                        last.asserted_at,
+                        last.attestation_id.clone(),
+                    )
+                })
+            } else {
+                None
+            };
+            (rows, next_cursor)
         };
-        Ok(crate::read::ScoresPage {
-            items: rows,
-            next_cursor,
-        })
+
+        // v25.1.0 (CIRISPersist#570 ask 5) — THE SERVE CONSULT. See the
+        // sqlite twin for the full rationale, including why `next_cursor` is
+        // computed BEFORE the filter (a fully-withheld page must still advance
+        // the walk) and why pages may come back short.
+        let items =
+            crate::federation::quarantine::filter_withheld_rows(self, rows, chrono::Utc::now())
+                .await?;
+        Ok(crate::read::ScoresPage { items, next_cursor })
     }
 
     async fn record_announced_peer(
@@ -3105,6 +3120,12 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // locks itself). Hybrid-Strict vs the revoking key's registered
         // pubkeys — was FK + trust-score only, forgeable de-peer DoS.
         crate::federation::verify_revocation_admission(self, &row).await?;
+        // v25.1.0 (CIRISPersist#570 ask 4) — the history bound must be the one
+        // that was SIGNED, and must be coherent with `effective_at`. Runs
+        // before persist_row_hash and before the push, so a refused bound
+        // leaves no trace (AV-9) — and runs HERE, on memory, because the
+        // backend-symmetry lesson has cost this repo seven releases.
+        crate::federation::check_revocation_bound(&row)?;
         let mut state = self.state.lock().expect("memory backend lock");
         if !state.federation_keys.contains_key(&row.revoked_key_id) {
             return Err(crate::federation::Error::InvalidArgument(format!(
@@ -4691,6 +4712,11 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         &self,
         event: crate::federation::hard_case::HardCaseEvent,
     ) -> Result<(), crate::federation::Error> {
+        // v25.1.0 (CIRISPersist#570 ask 3) — the attribution gate.
+        // Verify-before-mutation: an `admin_action` record that does not carry
+        // {delegation_id, reason} is refused naming WHICH, and no row is
+        // written. A no-op for every observed-condition kind.
+        crate::federation::check_admin_action_attribution(&event)?;
         let mut state = self.state.lock().expect("memory backend lock");
         state
             .federation_hard_case_events
@@ -8413,6 +8439,7 @@ mod tests {
             scrub_timestamp: "2026-05-01T00:00:00Z".parse().unwrap(),
             pqc_completed_at: None,
             observed_region: crate::federation::verify_coord::region::US.into(),
+            revoked_after: None,
             persist_row_hash: String::new(),
         }
     }
@@ -15516,6 +15543,35 @@ mod tests {
         crate::federation::reverse_quorum::test_support::exercise_reverse_quorum(
             &backend,
             "memory-rq",
+        )
+        .await;
+    }
+
+    /// v25.1.0 (CIRISPersist#570 asks 2/3/5) — the MEMORY leg of the shared
+    /// admin-op witness. The quarantine plane composes trait methods over
+    /// `&dyn FederationDirectory` (no new table, no migration), and memory is
+    /// the backend where the serve-path filter is easiest to get subtly wrong
+    /// — it is the only one holding a lock across the read the filter re-enters.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn admin_ops_parity_memory_570() {
+        let backend = MemoryBackend::new();
+        crate::federation::quarantine::test_support::exercise_admin_ops(&backend, "memory-qa")
+            .await;
+    }
+
+    /// v25.1.0 (CIRISPersist#570 ask 4) — the MEMORY leg of the shared
+    /// revocation-history-bound witness. Memory has no column to round-trip
+    /// through, which is exactly why it runs: the ADMISSION gate must be
+    /// backend-symmetric even where the storage is not (the seven-times
+    /// lesson).
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn revocation_bound_parity_memory_570() {
+        let backend = MemoryBackend::new();
+        crate::federation::register::bound_test_support::exercise_revocation_bound(
+            &backend,
+            "memory-rb",
         )
         .await;
     }

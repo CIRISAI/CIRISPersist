@@ -4976,14 +4976,46 @@ impl Engine {
         use crate::federation::BlobStorage;
 
         let pressure = self.current_disk_pressure();
+        let local_holders = self.list_local_holders(sha256).await?;
         if pressure.refuses_proxy_serves {
             // Classify: is this proxy content (no local/family holder)?
-            let local_holders = self.list_local_holders(sha256).await?;
             let is_protected = local_holders.iter().any(|k| self.is_local_or_family_key(k));
             if !is_protected {
                 return Err(crate::federation::BlobError::DiskPressureProxyRefused {
                     operation: "serve",
                     tier: pressure.tier.label(),
+                });
+            }
+        }
+
+        // v25.1.0 (CIRISPersist#570 ask 5) — THE QUARANTINE CONSULT on the
+        // blob half of the serve path. If ANY local holder of these bytes is
+        // withheld, we do not hand them to a peer.
+        //
+        // ANY rather than ALL, deliberately: withholding is the restrictive
+        // direction, and a graded response that fails open under ambiguity is
+        // not a response. The bytes stay on disk — this refuses to SERVE, it
+        // never deletes, and lifting the marker restores serving with no
+        // reconstruction.
+        //
+        // Distinct from the pressure gate above in kind, not just in reason:
+        // pressure says "not now, ask another holder", quarantine says "not
+        // from us". Both are permanent-for-this-node signals to the peer.
+        let directory = self.federation_directory();
+        let now = chrono::Utc::now();
+        for holder in &local_holders {
+            let withheld =
+                crate::federation::quarantine::is_withheld(directory.as_ref(), holder, now)
+                    .await
+                    .map_err(|e| {
+                        crate::federation::BlobError::InvalidArgument(format!(
+                            "quarantine consult for holder {holder}: {e} ({})",
+                            e.kind()
+                        ))
+                    })?;
+            if withheld {
+                return Err(crate::federation::BlobError::QuarantineWithheld {
+                    key_id: holder.clone(),
                 });
             }
         }
@@ -5819,6 +5851,71 @@ impl Engine {
         revocation: crate::federation::SignedRevocation,
     ) -> Result<(), crate::federation::Error> {
         self.federation_directory().put_revocation(revocation).await
+    }
+
+    /// v25.1.0 (CIRISPersist#570 ask 5) — admit and store one quarantine /
+    /// release marker (see [`quarantine`](crate::federation::quarantine)).
+    ///
+    /// The host-reachable half of the withhold-from-serving plane: a marker
+    /// admitted here is what the serve paths
+    /// ([`serve_blob_to_peer`](Self::serve_blob_to_peer) and every backend's
+    /// `list_attestation_log`) then consult. Verify-before-mutation — a
+    /// refused marker writes nothing, and the returned
+    /// [`QuarantineOutcome`](crate::federation::QuarantineOutcome) names WHICH
+    /// branch refused rather than making the caller parse a message.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn record_quarantine_marker(
+        &self,
+        marker: &crate::federation::Attestation,
+    ) -> Result<crate::federation::QuarantineOutcome, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::quarantine::record_quarantine_marker(directory.as_ref(), marker).await
+    }
+
+    /// v25.1.0 (CIRISPersist#570 ask 5) — what this node's held markers say
+    /// about `key_id` right now: the state, the governing marker, who decided
+    /// it, the `delegation_id` they acted under, and the grounds.
+    ///
+    /// Evidence, not verdict — persist mutates nothing here, and the fold says
+    /// what the rows say, never whether the quarantined key deserved it.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn resolve_quarantine(
+        &self,
+        key_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::QuarantineFold, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::quarantine::resolve_quarantine(directory.as_ref(), key_id, now).await
+    }
+
+    /// v25.1.0 (CIRISPersist#570 ask 4) — **does a statement `key_id` made at
+    /// `statement_at` still stand**, given the revocations this node holds?
+    ///
+    /// The enforcement point for the time-bounded de-admission
+    /// ([`Revocation::revoked_after`](crate::federation::Revocation::revoked_after)).
+    /// Before #570 a revocation was all-or-nothing: a key compromised on
+    /// Tuesday cost every honest signature it ever made. A bounded revocation
+    /// says *from this instant*, and this is the read that honours it.
+    ///
+    /// See
+    /// [`resolve_key_statement_standing`](crate::federation::register::resolve_key_statement_standing)
+    /// for the explicit list of read paths that do NOT honour the bound and
+    /// why — the honest boundary rather than a half-shipped claim.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn resolve_key_statement_standing(
+        &self,
+        key_id: &str,
+        statement_at: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::federation::KeyStatementFold, crate::federation::Error> {
+        let directory = self.federation_directory();
+        crate::federation::register::resolve_key_statement_standing(
+            directory.as_ref(),
+            key_id,
+            statement_at,
+            now,
+        )
+        .await
     }
 
     /// v3.2.0 (CIRISPersist#120) — Rust-tier accessor returning an
