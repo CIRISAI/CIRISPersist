@@ -164,6 +164,34 @@ fixtures, or the weaker one is never under test.
   releases. Verified pre-existing by reverting this branch's Rust changes and reproducing the
   failure at the v28.1.0 tag.
 
+## [28.2.0] — 2026-08-03 — #594 + #356: the last fold closes, and a running node becomes legible
+
+- **#594** — the consent-revocation proxy walk consulted **no retraction at all**. Fourth and last
+  occurrence of the granter-scoped fold class (#578 ownership, #584 stewardship, #593 moderation),
+  and the strongest: the other three consult *too narrow* a set; this one built no set. A
+  `delegates_to` **withdrawn by its own granter** still conferred proxy authority on CEG 2.4.1.1
+  rule (3) — the path for subjects who cannot hold a key. `skip_withdrawn_edges` is **deleted, not
+  flipped**: a flag whose only `false` value was a bug should not survive as a knob.
+
+- **#356** — 7 new PyO3 bindings close the observability gap. Only **3 of 10** node-state signals
+  reached Python, which is how server consumes persist. Now all of them, plus `node_state_json`.
+  Four are `deontic` and hand-written per the binding-class rule.
+
+  - **A non-emitting overdue reader.** The existing one flags each row as a `hard_case`
+    *idempotently* — no duplicate rows, **not no writes** — so a dashboard refresh wrote to the audit
+    plane. Proven by asserting the count stays at **zero** across 5 reads, then that the emitting
+    sibling raises it. (Count-unchanged alone would have passed for the buggy case.)
+  - **`slot_denials` exposed with its volatility in the type** — `process_local: true`, paired with
+    `tracked_peers` so an empty bucket table reads **`unknown`, not green**.
+  - **Four of the ten are not node facts** and are deliberately not folded: transit eligibility needs
+    a peer, load-bearing an object, both reverse-quorum standings a cohort. Inventing a target yields
+    an answer indistinguishable from a real one. `targeted[]` names each and its binding.
+
+- **Pre-existing red, fixed:** the crate has not compiled **without a backend feature since
+  v25.1.0**. `validate_subject_key_ids` was cfg-gated to `postgres|sqlite` while #582 added an
+  ungated caller. Recovers CI's own default `wire_format_fixtures` leg (9 tests) and the
+  `test-anchor`-only configuration (1137).
+
 ## [28.1.0] — 2026-08-03 — #564: reachability stage 2, and the release primitive that always says no
 
 - **#564 stages 2-4** — `is_load_bearing` gains the composite-keyed classes
