@@ -1229,6 +1229,37 @@ impl Engine {
         crate::federation::load_bearing::is_load_bearing(&*dir, object).await
     }
 
+    /// CIRISPersist#564 stage 2 — **may this node release its copy of
+    /// `object`?**
+    ///
+    /// The host handle for
+    /// [`crate::federation::load_bearing::may_release_copy`]:
+    /// `is_load_bearing(X) == No ∧ anti_entropy_satisfied(X)`. Both halves,
+    /// never one — dropping a copy that has nowhere else to live is data loss
+    /// wearing a GC costume, so a `No` from the reachability half alone is not
+    /// permission.
+    ///
+    /// **Read-only, and today the answer is always
+    /// [`MayRelease::No`](crate::federation::load_bearing::MayRelease::No).**
+    /// Persist cannot verify that any object resides elsewhere — it has no
+    /// peer transport, its replication surface is inbound-apply plus
+    /// outbound-pull, and nothing records a peer acknowledging a holding — so
+    /// the second conjunct is structurally unsatisfiable here. That is the
+    /// fail-secure posture, not a stub: closing it needs an acknowledgment
+    /// plane written by the layer that talks to peers.
+    ///
+    /// Exposed for the same reason as
+    /// [`Self::is_load_bearing`] — a predicate no host can call is not
+    /// shipped (AV-77).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn may_release_copy(
+        &self,
+        object: crate::federation::load_bearing::ObjectRef,
+    ) -> Result<crate::federation::load_bearing::MayRelease, crate::federation::Error> {
+        let dir = self.federation_directory();
+        crate::federation::load_bearing::may_release_copy(&*dir, object).await
+    }
+
     /// v24.1.0 (CIRISPersist#561) — **may `peer_key_id` carry our relay
     /// traffic, and for how long may that answer be cached?**
     ///
@@ -15019,6 +15050,91 @@ mod tests {
             "unproven must read Unknown at the host handle, got {verdict:?}"
         );
         assert!(verdict.treated_as_load_bearing());
+    }
+
+    /// CIRISPersist#564 stage 2 — **the host-reachability witness** for
+    /// `may_release_copy`, and the fail-secure property asserted where a
+    /// caller would actually act on it.
+    ///
+    /// The object under test is the one case that reads
+    /// [`LoadBearing::No`] — an object this node does not hold. The
+    /// reachability half therefore says "nothing depends on it", and a
+    /// primitive that stopped there would hand back a release. It must not:
+    /// the anti-entropy conjunct is unsatisfiable on this substrate, so the
+    /// answer is `No` with BOTH halves reported.
+    ///
+    /// If this test ever goes green on `MayRelease::Yes`, something has taught
+    /// persist to believe a peer holds a copy without an acknowledgment plane
+    /// to prove it.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn may_release_copy_runs_through_the_engine_handle_sqlite() {
+        use crate::federation::load_bearing::{AntiEntropy, LoadBearing, MayRelease, ObjectRef};
+
+        let signer = crate::federation::tier_ingest::test_support::local_signer("lb-release");
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+
+        let object = ObjectRef::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+        };
+        // Precondition: this is the provably-not-load-bearing case.
+        assert_eq!(
+            engine
+                .is_load_bearing(object.clone())
+                .await
+                .expect("reachability half"),
+            LoadBearing::No
+        );
+
+        match engine
+            .may_release_copy(object)
+            .await
+            .expect("may_release_copy is reachable from an Engine")
+        {
+            MayRelease::No {
+                load_bearing,
+                anti_entropy,
+            } => {
+                assert_eq!(load_bearing, LoadBearing::No);
+                assert!(
+                    matches!(anti_entropy, AntiEntropy::Unverifiable { .. }),
+                    "residence must read Unverifiable on a substrate with no acknowledgment \
+                     plane, got {anti_entropy:?}"
+                );
+            }
+            MayRelease::Yes => panic!(
+                "the host handle released a copy on the reachability half ALONE — the \
+                 anti-entropy conjunct has become decorative"
+            ),
+        }
+
+        // Every class is reachable from the host, not just the two stage 1 had.
+        for object in [
+            ObjectRef::TransportDestination {
+                occurrence_key_id: "lb-release-occ".to_string(),
+                transport_kind: "websocket".to_string(),
+            },
+            ObjectRef::FountainContent {
+                content_id: "lb-release-content".to_string(),
+                corpus_kind: "trace".to_string(),
+            },
+            ObjectRef::HardCaseEvent {
+                event_id: "lb-release-hc".to_string(),
+            },
+        ] {
+            let class = object.class();
+            assert!(
+                !engine
+                    .may_release_copy(object)
+                    .await
+                    .unwrap_or_else(|e| panic!("{} unreachable from Engine: {e}", class.as_str()))
+                    .is_releasable(),
+                "{} must not be releasable",
+                class.as_str()
+            );
+        }
     }
 
     /// #249 — `file_moderation` stores a `moderation:{allegation}` scores

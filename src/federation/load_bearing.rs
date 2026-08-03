@@ -59,10 +59,16 @@ use serde::{Deserialize, Serialize};
 /// than naming it here.
 pub const FEDERATION_KEY_FAMILY: &str = "federation_key";
 
-/// What the object under test is. Extended APPEND-ONLY as later stages teach
-/// the predicate about routes, blobs and fountain units — the existing eviction
-/// plane already answers holdings for content it stores, so those arms will
-/// reuse it rather than duplicate it (#564).
+/// What the object under test is. Extended APPEND-ONLY; stage 2 (#564) added
+/// the three classes the issue's dependency-kind sweep names and stage 1 could
+/// not yet address — routes, fountain units and hard-case evidence.
+///
+/// Every arm MUST map to an [`ObjectClass`], and every `ObjectClass` MUST have
+/// an [`object_class_policy`]. Both are exhaustive matches, so **adding an arm
+/// without declaring its predicate is a compile failure** — the
+/// [`super::replication_policy::policy_for`] discipline, applied to the
+/// reachability axis. That is what makes the sweep exhaustive by construction
+/// rather than by anyone remembering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectRef {
@@ -77,17 +83,249 @@ pub enum ObjectRef {
         /// The row's `key_id`.
         key_id: String,
     },
+    /// CIRISPersist#564 stage 2 — a `federation_transport_destinations` row: one
+    /// route, keyed as the table keys it. The issue's "transport routes →
+    /// reachability to peers we may serve (#561's hop eligibility)".
+    TransportDestination {
+        /// The occurrence the route reaches.
+        occurrence_key_id: String,
+        /// The route's transport kind (`reticulum` / `websocket` / …).
+        transport_kind: String,
+    },
+    /// CIRISPersist#564 stage 2 — a fountain-coded content unit, by its
+    /// `(content_id, corpus_kind)` manifest key. The issue's "blobs / fountain
+    /// units → the existing eviction plane already answers this; reuse rather
+    /// than duplicate".
+    FountainContent {
+        /// The manifest's `content_id`.
+        content_id: String,
+        /// The manifest's `corpus_kind`.
+        corpus_kind: String,
+    },
+    /// CIRISPersist#564 stage 2 — a `hard_case_events` row, by `event_id`. The
+    /// issue's "breach/hard_case evidence → load-bearing while any verdict
+    /// process may cite it".
+    HardCaseEvent {
+        /// The row's `event_id`.
+        event_id: String,
+    },
 }
 
 impl ObjectRef {
     /// The identifier, whichever arm this is — for logging and for the
-    /// `object_id` a consumer echoes back.
+    /// `object_id` a consumer echoes back. Composite-keyed arms report their
+    /// leading key; [`Self::class`] disambiguates.
     #[must_use]
     pub fn id(&self) -> &str {
         match self {
             Self::Attestation { attestation_id } => attestation_id,
             Self::KeyRecord { key_id } => key_id,
+            Self::TransportDestination {
+                occurrence_key_id, ..
+            } => occurrence_key_id,
+            Self::FountainContent { content_id, .. } => content_id,
+            Self::HardCaseEvent { event_id } => event_id,
         }
+    }
+
+    /// The [`ObjectClass`] this ref belongs to. Exhaustive — a new arm must
+    /// name its class here, and the class must then carry a policy.
+    #[must_use]
+    pub const fn class(&self) -> ObjectClass {
+        match self {
+            Self::Attestation { .. } => ObjectClass::Attestation,
+            Self::KeyRecord { .. } => ObjectClass::KeyRecord,
+            Self::TransportDestination { .. } => ObjectClass::TransportDestination,
+            Self::FountainContent { .. } => ObjectClass::FountainContent,
+            Self::HardCaseEvent { .. } => ObjectClass::HardCaseEvent,
+        }
+    }
+
+    /// **The ONE parse door** from an FFI/host-shaped `(kind, id, id2)` triple
+    /// to a typed ref.
+    ///
+    /// Every host entry point funnels through here rather than matching the
+    /// kind token itself, so the two FFI surfaces cannot drift into supporting
+    /// different subsets of the classes — the failure that gave #564 stage 1 a
+    /// predicate reachable for two classes and unreachable for the rest.
+    /// Exhaustive over [`ObjectClass::ALL`]; a class with no arm is a test
+    /// failure ([`tests::every_class_is_constructible_from_host_parts`]).
+    ///
+    /// `id2` is REQUIRED for the composite-keyed classes and rejected loudly
+    /// when absent — a silently-defaulted `transport_kind` would answer about a
+    /// different route than the caller asked about.
+    pub fn from_parts(kind: &str, id: &str, id2: Option<&str>) -> Result<Self, String> {
+        let need2 = |what: &str| -> Result<String, String> {
+            id2.map(str::to_owned).ok_or_else(|| {
+                format!("object_kind {kind:?} is keyed on (id, {what}) — {what} is required")
+            })
+        };
+        match kind {
+            "attestation" => Ok(Self::Attestation {
+                attestation_id: id.to_owned(),
+            }),
+            "key_record" => Ok(Self::KeyRecord {
+                key_id: id.to_owned(),
+            }),
+            "transport_destination" => Ok(Self::TransportDestination {
+                occurrence_key_id: id.to_owned(),
+                transport_kind: need2("transport_kind")?,
+            }),
+            "fountain_content" => Ok(Self::FountainContent {
+                content_id: id.to_owned(),
+                corpus_kind: need2("corpus_kind")?,
+            }),
+            "hard_case_event" => Ok(Self::HardCaseEvent {
+                event_id: id.to_owned(),
+            }),
+            other => Err(format!(
+                "unknown object_kind {other:?} — expected one of {:?}",
+                ObjectClass::ALL.map(|c| c.as_str())
+            )),
+        }
+    }
+}
+
+/// The closed set of object classes the reachability sweep covers — the
+/// storage-keyed counterpart to the per-family predicate axis.
+///
+/// A family declares what a *claim* implies; a class declares how an *object*
+/// is reference-counted at all. The two are orthogonal: `Attestation` resolves
+/// through the family axis, while a route has no family and is answered
+/// structurally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectClass {
+    /// `federation_attestations` — resolved through the per-family axis.
+    Attestation,
+    /// `federation_keys`.
+    KeyRecord,
+    /// `federation_transport_destinations`.
+    TransportDestination,
+    /// `content_manifest` + `content_symbols`.
+    FountainContent,
+    /// `hard_case_events`.
+    HardCaseEvent,
+}
+
+impl ObjectClass {
+    /// Every class, in declaration order. The gate iterates this.
+    pub const ALL: [ObjectClass; 5] = [
+        ObjectClass::Attestation,
+        ObjectClass::KeyRecord,
+        ObjectClass::TransportDestination,
+        ObjectClass::FountainContent,
+        ObjectClass::HardCaseEvent,
+    ];
+
+    /// The stable program token — identical to the serde token.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Attestation => "attestation",
+            Self::KeyRecord => "key_record",
+            Self::TransportDestination => "transport_destination",
+            Self::FountainContent => "fountain_content",
+            Self::HardCaseEvent => "hard_case_event",
+        }
+    }
+}
+
+/// How a class is reference-counted, and — when it cannot be — why. Closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassResolution {
+    /// Resolved through the per-family declared predicate axis
+    /// ([`super::namespace::supersets::load_bearing_predicate`]).
+    PerFamilyPredicate,
+    /// Answered structurally from targeted reads on this class's own table —
+    /// **both directions**. Reads prove YES, and their emptiness proves NO,
+    /// so an object absent from them is genuinely not depended on here.
+    StructuralReads,
+    /// Targeted reads prove YES, but **NO is unprovable**: some way of naming
+    /// this object has no index, so an empty read means "found no dependent by
+    /// the routes we can search", not "there is no dependent". Resolves
+    /// [`LoadBearing::Unknown`] rather than `No` — the distinction from
+    /// [`Self::StructuralReads`] that the whole fail-secure posture rests on,
+    /// and one a single "structural" label quietly erased.
+    StructuralYesOnly,
+    /// DEFERRED to a plane that already owns this object's retention. Resolves
+    /// [`LoadBearing::Unknown`] here on purpose: two mechanisms deciding one
+    /// object's fate is the two-lists-that-disagree class #564 exists to avoid.
+    DeferredToOwningPlane,
+    /// Persist holds no reverse index that could prove the object unreferenced,
+    /// so NOT-load-bearing is unprovable. Fail-secure [`LoadBearing::Unknown`].
+    NoReverseIndex,
+}
+
+/// The per-class policy: how it resolves, and the rationale a consumer reads
+/// instead of coming back here to ask.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjectClassPolicy {
+    /// The class this governs.
+    pub class: ObjectClass,
+    /// How it is reference-counted.
+    pub resolution: ClassResolution,
+    /// Why — including, for the deferring/unprovable arms, WHICH read persist
+    /// would need. A gap that names its missing read is actionable; a shrug
+    /// is not.
+    pub rationale: &'static str,
+}
+
+/// The ONE policy per class. Exhaustive `match`: adding an [`ObjectClass`]
+/// without a policy is a **compile failure**.
+#[must_use]
+pub const fn object_class_policy(class: ObjectClass) -> ObjectClassPolicy {
+    let (resolution, rationale) = match class {
+        ObjectClass::Attestation => (
+            ClassResolution::PerFamilyPredicate,
+            "a claim's dependents are whatever its FAMILY implies, so the manifest's declared \
+             per-family predicate is the authority; an undeclared family resolves Unknown",
+        ),
+        ObjectClass::KeyRecord => (
+            ClassResolution::StructuralYesOnly,
+            "a key is load-bearing while any held row names it. `list_attestations_by` / \
+             `list_attestations_for` prove YES; no index answers \"which rows name it as scrub \
+             or co-scrub\", so NO stays unproven and resolves Unknown",
+        ),
+        ObjectClass::TransportDestination => (
+            ClassResolution::StructuralReads,
+            "a LIVE route is what makes an occurrence reachable, and a RETIRED route is a \
+             tombstone the route plane deliberately keeps gossiping \
+             (`list_signed_transport_destinations_for` includes retired rows on purpose). Both \
+             are dependents this node can read directly, so both prove YES; a route absent from \
+             both reads is not held here at all",
+        ),
+        ObjectClass::FountainContent => (
+            ClassResolution::DeferredToOwningPlane,
+            "the eviction plane ALREADY decides fountain retention — tier eviction, \
+             consent-driven hard delete, the §Q pin reserve. #564 says reuse rather than \
+             duplicate, and a second mechanism with its own reasoning is exactly the \
+             two-lists-that-disagree shape. Reference counting therefore declines to answer \
+             here and defers; deferring resolves Unknown, which is fail-secure. \
+             NOTE this arm does not even run the absence check the other classes do: \
+             `FederationDirectory` carries no `(content_id, corpus_kind)` point-read \
+             (`get_fountain_content` is a `Backend` method, off the dyn surface), and \
+             `list_held_fountain_content` is keyed on the PUBLISHER. Absence would be \
+             cheap to answer once a point-read is promoted; until then Unknown \
+             subsumes it, which errs in the safe direction",
+        ),
+        ObjectClass::HardCaseEvent => (
+            ClassResolution::NoReverseIndex,
+            "breach evidence is load-bearing while any verdict process may cite it. Persist \
+             emits and lists hard-case rows but stores no index of OPEN verdict processes, and \
+             the WA quorum that turns evidence into sentences runs elsewhere — so nothing here \
+             can prove a given row uncited. It also skips the absence check: `HardCaseFilter` \
+             filters on `kind`/`since` only, so a point-read by `event_id` would mean listing \
+             the whole corpus — the same cost stage 1 declined to spend on the key-record NO \
+             case. Same shape as the declared-undeclared `accord:*` \
+             and `bond_posted:{currency}` families",
+        ),
+    };
+    ObjectClassPolicy {
+        class,
+        resolution,
+        rationale,
     }
 }
 
@@ -107,6 +345,13 @@ pub enum DependencyKind {
     /// from the corpus — a declaration, which is the point: `trust:accepts:v1`
     /// must be load-bearing on a node that holds nothing else at all.
     DeclaredAlways,
+    /// CIRISPersist#564 stage 2 — a LIVE route: removing it removes an address this
+    /// node can be reached on, which is an action it may take.
+    ReachabilityRoute,
+    /// CIRISPersist#564 stage 2 — a RETIRED route kept deliberately so the tombstone
+    /// gossips. Removing it would let a peer's stale route resurrect, so the
+    /// tombstone is doing work precisely BECAUSE the route is dead.
+    GossipTombstone,
 }
 
 impl DependencyKind {
@@ -117,6 +362,8 @@ impl DependencyKind {
             Self::RetainedAttestation => "retained_attestation",
             Self::NamingRow => "naming_row",
             Self::DeclaredAlways => "declared_always",
+            Self::ReachabilityRoute => "reachability_route",
+            Self::GossipTombstone => "gossip_tombstone",
         }
     }
 }
@@ -261,6 +508,112 @@ pub async fn is_load_bearing(
             attestation_load_bearing(directory, &row).await
         }
         ObjectRef::KeyRecord { key_id } => key_record_load_bearing(directory, &key_id).await,
+        ObjectRef::TransportDestination {
+            occurrence_key_id,
+            transport_kind,
+        } => {
+            transport_destination_load_bearing(directory, &occurrence_key_id, &transport_kind).await
+        }
+        ObjectRef::FountainContent {
+            content_id,
+            corpus_kind,
+        } => Ok(deferred_or_unindexed(
+            ObjectClass::FountainContent,
+            &format!("{content_id}/{corpus_kind}"),
+        )),
+        ObjectRef::HardCaseEvent { event_id } => {
+            Ok(deferred_or_unindexed(ObjectClass::HardCaseEvent, &event_id))
+        }
+    }
+}
+
+/// The shared fail-secure resolution for a class whose policy says persist
+/// either DEFERS to an owning plane or holds no reverse index.
+///
+/// Both are the same runtime fact — persist cannot prove this object
+/// unreferenced — and both are therefore [`LoadBearing::Unknown`]. They differ
+/// only in WHY, and the policy's rationale carries that, so the caller learns
+/// which of the two it hit without a second call.
+///
+/// The `family` slot reports the CLASS token rather than a manifest family,
+/// because these objects have no `dimension` and inventing one would be a lie
+/// the consumer could not detect.
+fn deferred_or_unindexed(class: ObjectClass, object_id: &str) -> LoadBearing {
+    let policy = object_class_policy(class);
+    debug_assert!(
+        matches!(
+            policy.resolution,
+            ClassResolution::DeferredToOwningPlane | ClassResolution::NoReverseIndex
+        ),
+        "deferred_or_unindexed called for a class that claims it can answer structurally"
+    );
+    LoadBearing::Unknown {
+        family: class.as_str().to_string(),
+        reason: format!("{object_id}: {}", policy.rationale),
+    }
+}
+
+/// The route arm. A route is load-bearing while this node holds it in either
+/// of the two route reads, and the two mean different things:
+///
+/// - present in [`FederationDirectory::list_transport_destinations_for`] — a
+///   LIVE address; removing it removes a way this node can be reached.
+/// - present only in the SIGNED read (which includes retired rows on purpose,
+///   "tombstones must gossip") — a RETIRED route whose tombstone is the work.
+///
+/// Absent from both, the route is not held here, and nothing here can depend on
+/// a copy that is not here — the same absence rule the attestation arm uses.
+async fn transport_destination_load_bearing(
+    directory: &dyn FederationDirectory,
+    occurrence_key_id: &str,
+    transport_kind: &str,
+) -> Result<LoadBearing, Error> {
+    let mut because: Vec<Dependency> = Vec::new();
+    let object_id = format!("{occurrence_key_id}/{transport_kind}");
+
+    for route in directory
+        .list_transport_destinations_for(occurrence_key_id)
+        .await?
+    {
+        if route.transport_kind == transport_kind {
+            because.push(Dependency {
+                kind: DependencyKind::ReachabilityRoute,
+                object_id: object_id.clone(),
+                detail: format!(
+                    "a LIVE {transport_kind} route reaches occurrence {occurrence_key_id} at \
+                     {}; dropping it drops that reachability",
+                    route.destination
+                ),
+            });
+        }
+    }
+
+    // Retired rows appear ONLY in the signed read. Consult it whenever the
+    // live read found nothing — that is exactly the tombstone case.
+    if because.is_empty() {
+        for signed in directory
+            .list_signed_transport_destinations_for(occurrence_key_id)
+            .await?
+        {
+            if signed.transport_destination.transport_kind == transport_kind {
+                because.push(Dependency {
+                    kind: DependencyKind::GossipTombstone,
+                    object_id: object_id.clone(),
+                    detail: format!(
+                        "a RETIRED {transport_kind} route for occurrence {occurrence_key_id} — \
+                         the route plane keeps retired rows in the signed read so the tombstone \
+                         gossips; dropping it would let a peer's stale route resurrect"
+                    ),
+                });
+            }
+        }
+    }
+
+    if because.is_empty() {
+        Ok(LoadBearing::No)
+    } else {
+        because.truncate(MAX_DEPENDENCIES_REPORTED);
+        Ok(LoadBearing::Yes { because })
     }
 }
 
@@ -416,6 +769,165 @@ async fn key_record_load_bearing(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// CIRISPersist#564 stage 2 — `may_release_copy`, and the ANTI-ENTROPY
+// CONJUNCT that is the whole point of it.
+//
+//     may_release_copy(X) ⇔ is_load_bearing(X) == No ∧ anti_entropy_satisfied(X)
+//
+// Both halves, never one. #564: "Dropping a copy that has nowhere else to live
+// is data loss wearing a GC costume." Stage 2 still releases NOTHING — it is
+// the predicate that stage 3 would have to satisfy, built now so that a stage-3
+// author cannot forget the second half. Making the conjunct structural is the
+// deliverable; a helper that returned only the first half would be worse than
+// nothing, because it would look complete.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Whether the object verifiably resides where it is **relative to** — the
+/// second conjunct.
+///
+/// # Persist cannot currently produce [`Self::Satisfied`], and that is a finding
+///
+/// The check requires knowing that some OTHER node holds the object (for a
+/// consent about peer `P`: that `P` holds it, or that it was offered and
+/// acknowledged). Persist cannot know that:
+///
+/// - It has **no peer transport**. The crate's only outbound HTTP client is the
+///   feature-gated federated-secrets client; there is no peer-to-peer send
+///   path anywhere in `src/`.
+/// - Its replication surface is **inbound-apply and outbound-PULL only**
+///   (`apply_replicated_key_record`, `list_signed_*_since`). A pull surface
+///   does not learn who pulled, nor whether they kept it.
+/// - There is **no stored acknowledgment or offer receipt** — no table, no
+///   column, no trait method records "peer `P` acknowledged holding `X`".
+///
+/// So the honest value today is always [`Self::Unverifiable`], which is
+/// fail-secure: the conjunct is never satisfied, so nothing is ever releasable.
+/// This is a *structural* block, not a stub — closing it needs an
+/// acknowledgment plane written by the layer that actually talks to peers, and
+/// [`Self::Satisfied`] is the shape that plane would have to produce.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AntiEntropy {
+    /// The object verifiably resides elsewhere. **Nothing in persist produces
+    /// this today** — see the type-level note, and
+    /// [`tests::nothing_yields_anti_entropy_satisfied_today`], which is the
+    /// regression gate on that claim.
+    Satisfied {
+        /// Where it was verified to reside.
+        because: Vec<Dependency>,
+    },
+    /// It provably does NOT reside elsewhere — this copy is the only one.
+    NotSatisfied {
+        /// Why residence is disproven.
+        reason: String,
+    },
+    /// Residence cannot be verified from this node's own state. **Fail-secure**
+    /// and the only value persist returns today.
+    Unverifiable {
+        /// What persist would need in order to answer.
+        reason: String,
+    },
+}
+
+impl AntiEntropy {
+    /// The fail-secure reading: only a proven [`Self::Satisfied`] counts.
+    ///
+    /// Named for the conjunct it stands for, so a caller cannot read
+    /// `!not_satisfied` as "fine" — `Unverifiable` is not fine.
+    #[must_use]
+    pub const fn is_satisfied(&self) -> bool {
+        matches!(self, Self::Satisfied { .. })
+    }
+}
+
+/// The stage-2 verdict: may this node release its copy?
+///
+/// **Deliberately a distinct type from the erasure plane's verdict (#573).**
+/// The two questions have OPPOSITE failure directions — reachability fails
+/// SECURE (an undeclared family is never released), erasure fails OPEN (an
+/// unenumerated container is silently never erased). One shared "is this
+/// covered?" verdict would be wrong for one of them, so the enumeration is
+/// shared and the verdicts are not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MayRelease {
+    /// BOTH conjuncts proven. Constructible only via [`may_release_copy`], and
+    /// only when nothing depends on the object AND it verifiably lives
+    /// elsewhere.
+    Yes,
+    /// Blocked — and the verdict names WHICH half blocked it, so a caller
+    /// never has to guess whether it was reachability or residence.
+    No {
+        /// The reachability half.
+        load_bearing: LoadBearing,
+        /// The residence half.
+        anti_entropy: AntiEntropy,
+    },
+}
+
+impl MayRelease {
+    /// `true` only for [`Self::Yes`]. The single place a caller should branch.
+    #[must_use]
+    pub const fn is_releasable(&self) -> bool {
+        matches!(self, Self::Yes)
+    }
+}
+
+/// CIRISPersist#564 stage 2 — **may this node release its copy of
+/// `object`?**
+///
+/// `is_load_bearing(X) == No ∧ anti_entropy_satisfied(X)`. Evaluates both
+/// halves and reports both, always — a `No` that named only the half that
+/// happened to be checked first would send a caller to fix the wrong thing.
+///
+/// **This releases nothing.** It is a read, like everything else in this
+/// module; stage 3 is the release, and it does not exist. Given
+/// [`anti_entropy_satisfied`] cannot return [`AntiEntropy::Satisfied`] on this
+/// substrate, the honest present-day answer is that **`Yes` is unreachable** —
+/// which is the correct fail-secure posture and is asserted by
+/// [`tests::may_release_is_unreachable_without_an_acknowledgment_plane`].
+pub async fn may_release_copy(
+    directory: &dyn FederationDirectory,
+    object: ObjectRef,
+) -> Result<MayRelease, Error> {
+    let load_bearing = is_load_bearing(directory, object.clone()).await?;
+    let anti_entropy = anti_entropy_satisfied(directory, &object).await?;
+    if matches!(load_bearing, LoadBearing::No) && anti_entropy.is_satisfied() {
+        return Ok(MayRelease::Yes);
+    }
+    Ok(MayRelease::No {
+        load_bearing,
+        anti_entropy,
+    })
+}
+
+/// CIRISPersist#564 stage 2 — the second conjunct: does `object`
+/// verifiably reside where it is relative to?
+///
+/// Returns [`AntiEntropy::Unverifiable`] for every object, naming the missing
+/// plane. See [`AntiEntropy`] for why that is structural rather than a stub.
+/// `directory` is taken so the signature does not change when an
+/// acknowledgment plane lands — the reads it will need are directory reads.
+#[allow(clippy::unused_async)] // the signature is the contract; see the doc.
+pub async fn anti_entropy_satisfied(
+    directory: &dyn FederationDirectory,
+    object: &ObjectRef,
+) -> Result<AntiEntropy, Error> {
+    let _ = directory;
+    Ok(AntiEntropy::Unverifiable {
+        reason: format!(
+            "persist cannot verify that {} {} resides anywhere else: it has no peer transport, \
+             its replication surface is inbound-apply plus outbound-pull (a pull never learns \
+             who kept what), and no table records a peer acknowledging a holding. Closing this \
+             needs an acknowledgment plane written by the layer that talks to peers; until then \
+             residence is unproven, and unproven blocks release",
+            object.class().as_str(),
+            object.id()
+        ),
+    })
+}
+
 /// v24.2.0 (CIRISPersist#564 stage 1) — the shared, backend-agnostic
 /// behavioural witness, run by the sqlite / postgres / memory suites against
 /// `&dyn FederationDirectory` so the three backends cannot silently diverge on
@@ -425,7 +937,10 @@ async fn key_record_load_bearing(
 /// against a shared postgres test DB does not collide with a prior one.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {
-    use super::{is_load_bearing, DependencyKind, LoadBearing, ObjectRef};
+    use super::{
+        is_load_bearing, may_release_copy, AntiEntropy, DependencyKind, LoadBearing, MayRelease,
+        ObjectRef,
+    };
     use crate::federation::types::{attestation_tier, attestation_type};
     use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
 
@@ -703,6 +1218,197 @@ pub(crate) mod test_support {
             LoadBearing::No,
             "an absent object is trivially not load-bearing HERE"
         );
+
+        // ── (8) #564 stage 2 — the ROUTE class. Absent → No; live → Yes and
+        //    NAMED as reachability.
+        let route_kind = "websocket";
+        assert_eq!(
+            is_load_bearing(
+                dir,
+                ObjectRef::TransportDestination {
+                    occurrence_key_id: live_peer.clone(),
+                    transport_kind: route_kind.to_owned(),
+                },
+            )
+            .await
+            .expect("route verdict"),
+            LoadBearing::No,
+            "a route this node does not hold cannot be depended on here"
+        );
+
+        dir.put_transport_destination(&crate::federation::self_at_login::TransportDestination {
+            occurrence_key_id: live_peer.clone(),
+            transport_kind: route_kind.to_owned(),
+            destination: format!("wss://lb-fixture-{suffix}.invalid/ws"),
+            asserted_at: chrono::Utc::now(),
+            last_seen_at: None,
+            transport_ed25519_pubkey_base64: None,
+            transport_x25519_pubkey_base64: None,
+            binding_provenance: crate::federation::self_at_login::BindingProvenance::default(),
+            epoch: 0,
+            retired_at: None,
+        })
+        .await
+        .expect("route admits");
+
+        match is_load_bearing(
+            dir,
+            ObjectRef::TransportDestination {
+                occurrence_key_id: live_peer.clone(),
+                transport_kind: route_kind.to_owned(),
+            },
+        )
+        .await
+        .expect("route verdict")
+        {
+            LoadBearing::Yes { because } => assert!(
+                because
+                    .iter()
+                    .any(|d| d.kind == DependencyKind::ReachabilityRoute),
+                "a live route IS the reachability it provides: {because:?}"
+            ),
+            other => panic!("a held live route must be Yes, got {other:?}"),
+        }
+
+        // A DIFFERENT transport_kind on the same occurrence is a different
+        // route — the composite key must not smear across kinds.
+        assert_eq!(
+            is_load_bearing(
+                dir,
+                ObjectRef::TransportDestination {
+                    occurrence_key_id: live_peer.clone(),
+                    transport_kind: "reticulum".to_owned(),
+                },
+            )
+            .await
+            .expect("route verdict"),
+            LoadBearing::No,
+            "the verdict is per-route, not per-occurrence"
+        );
+
+        // ── (9) The DEFERRING and UNINDEXED classes read Unknown and NAME
+        //    themselves — never `No`, which would be a licence to collect an
+        //    object whose retention another plane owns.
+        for object in [
+            ObjectRef::FountainContent {
+                content_id: format!("lb-content-{suffix}"),
+                corpus_kind: "trace".to_owned(),
+            },
+            ObjectRef::HardCaseEvent {
+                event_id: format!("lb-hc-{suffix}"),
+            },
+        ] {
+            let class = object.class();
+            match is_load_bearing(dir, object).await.expect("class verdict") {
+                LoadBearing::Unknown { family, reason } => {
+                    assert_eq!(family, class.as_str());
+                    assert!(!reason.is_empty(), "an Unknown must carry its reason");
+                }
+                other => panic!(
+                    "{} must be fail-secure Unknown, got {other:?}",
+                    class.as_str()
+                ),
+            }
+        }
+
+        // ── (9b) **The declared resolution must MATCH the observed one.**
+        //
+        //    `object_class_policy` describes how a class is reference-counted;
+        //    `is_load_bearing` decides it. Those are two statements of one
+        //    fact, and nothing but this makes them agree — flip a class's
+        //    `ClassResolution` and the doc would lie while the code carried on.
+        //    That is the two-lists-that-disagree class, and writing the policy
+        //    down is exactly what creates the second list.
+        //
+        //    Probed with ids that cannot exist, so the ONLY thing under test is
+        //    the class's resolution shape: a class that answers from reads says
+        //    `No` for an absent object, and a class that defers or has no
+        //    reverse index says `Unknown` regardless.
+        for class in super::ObjectClass::ALL {
+            let absent = ObjectRef::from_parts(
+                class.as_str(),
+                &format!("lb-absent-{suffix}"),
+                Some(&format!("lb-absent2-{suffix}")),
+            )
+            .expect("every class is constructible");
+            let verdict = is_load_bearing(dir, absent).await.expect("absent verdict");
+            match super::object_class_policy(class).resolution {
+                super::ClassResolution::PerFamilyPredicate
+                | super::ClassResolution::StructuralReads => assert_eq!(
+                    verdict,
+                    LoadBearing::No,
+                    "{} DECLARES it answers from reads in BOTH directions, so an absent object \
+                     must be `No`",
+                    class.as_str()
+                ),
+                super::ClassResolution::StructuralYesOnly
+                | super::ClassResolution::DeferredToOwningPlane
+                | super::ClassResolution::NoReverseIndex => assert!(
+                    matches!(verdict, LoadBearing::Unknown { .. }),
+                    "{} DECLARES it cannot prove NO, so it must resolve Unknown, got {verdict:?}",
+                    class.as_str()
+                ),
+            }
+        }
+
+        // ── (10) **THE STAGE-2 PROPERTY.** The inert grants are the ONLY
+        //    objects here that read `No` — and they STILL may not be released,
+        //    because persist cannot verify the copy lives anywhere else. If
+        //    this ever passes, #564's second conjunct has become decorative
+        //    and the 234-row case turns into 234 deletions.
+        for id in &inert {
+            let object = ObjectRef::Attestation {
+                attestation_id: id.clone(),
+            };
+            assert_eq!(
+                is_load_bearing(dir, object.clone())
+                    .await
+                    .expect("reachability half"),
+                LoadBearing::No,
+                "precondition: this grant is the provably-inert case"
+            );
+            match may_release_copy(dir, object)
+                .await
+                .expect("release verdict")
+            {
+                MayRelease::No {
+                    load_bearing,
+                    anti_entropy,
+                } => {
+                    assert_eq!(
+                        load_bearing,
+                        LoadBearing::No,
+                        "the verdict must report the reachability half it actually computed"
+                    );
+                    assert!(
+                        matches!(anti_entropy, AntiEntropy::Unverifiable { .. }),
+                        "residence is unverifiable on this substrate, got {anti_entropy:?}"
+                    );
+                }
+                MayRelease::Yes => panic!(
+                    "grant {id} was released with NO acknowledgment plane — a copy with nowhere \
+                     else to live was just declared collectable"
+                ),
+            }
+        }
+
+        // …and the same holds for a load-bearing object, blocked by BOTH
+        // halves rather than one.
+        match may_release_copy(
+            dir,
+            ObjectRef::Attestation {
+                attestation_id: accepts.clone(),
+            },
+        )
+        .await
+        .expect("release verdict")
+        {
+            MayRelease::No { load_bearing, .. } => assert!(
+                load_bearing.treated_as_load_bearing(),
+                "trust:accepts:v1 must block on the reachability half too"
+            ),
+            MayRelease::Yes => panic!("the un-trust lever must never be releasable"),
+        }
     }
 }
 
@@ -750,6 +1456,278 @@ mod tests {
                 serde_json::to_string(&kind).expect("serialize"),
                 format!("\"{}\"", kind.as_str())
             );
+        }
+    }
+
+    /// The class gate: every [`ObjectClass`] carries a policy, every policy
+    /// carries a non-empty rationale, and `ALL` is complete.
+    ///
+    /// `object_class_policy` is an exhaustive match, so a class with no policy
+    /// cannot compile; what this adds is that `ALL` did not fall behind the
+    /// enum, which is the way a "complete" list actually rots.
+    #[test]
+    fn every_object_class_declares_a_policy() {
+        for class in ObjectClass::ALL {
+            let policy = object_class_policy(class);
+            assert_eq!(policy.class, class, "policy must name its own class");
+            assert!(
+                policy.rationale.len() > 40,
+                "{}: a rationale that does not explain itself is a shrug with punctuation",
+                class.as_str()
+            );
+        }
+        // ALL is complete: every arm the mapping can produce is in it.
+        for object in [
+            ObjectRef::Attestation {
+                attestation_id: String::new(),
+            },
+            ObjectRef::KeyRecord {
+                key_id: String::new(),
+            },
+            ObjectRef::TransportDestination {
+                occurrence_key_id: String::new(),
+                transport_kind: String::new(),
+            },
+            ObjectRef::FountainContent {
+                content_id: String::new(),
+                corpus_kind: String::new(),
+            },
+            ObjectRef::HardCaseEvent {
+                event_id: String::new(),
+            },
+        ] {
+            assert!(
+                ObjectClass::ALL.contains(&object.class()),
+                "{:?} maps to a class missing from ObjectClass::ALL",
+                object.class()
+            );
+        }
+    }
+
+    /// **Host reachability, at the parse door.** Every declared class must be
+    /// constructible from the `(kind, id, id2)` triple the FFI hands over, and
+    /// the token it is constructible under must be the class's OWN token.
+    ///
+    /// This is the gate on the AV-77 failure: a class the predicate handles
+    /// but no host can name is not shipped. Iterating `ObjectClass::ALL` means
+    /// adding a class without an FFI door goes red here rather than shipping
+    /// unreachable.
+    #[test]
+    fn every_class_is_constructible_from_host_parts() {
+        for class in ObjectClass::ALL {
+            // Composite-keyed classes need id2; try with, which must always work.
+            let built =
+                ObjectRef::from_parts(class.as_str(), "id-1", Some("id-2")).unwrap_or_else(|e| {
+                    panic!("{} is not reachable from the FFI: {e}", class.as_str())
+                });
+            assert_eq!(
+                built.class(),
+                class,
+                "the {:?} token built a {:?}",
+                class.as_str(),
+                built.class()
+            );
+        }
+        assert!(ObjectRef::from_parts("not_a_class", "x", None).is_err());
+    }
+
+    /// A composite-keyed class REFUSES a missing second key rather than
+    /// defaulting it. A defaulted `transport_kind` would answer confidently
+    /// about a route the caller never asked about.
+    #[test]
+    fn composite_keyed_classes_refuse_a_missing_second_key() {
+        for (kind, missing) in [
+            ("transport_destination", "transport_kind"),
+            ("fountain_content", "corpus_kind"),
+        ] {
+            let err = ObjectRef::from_parts(kind, "id-1", None)
+                .expect_err("a composite-keyed class must refuse a missing second key");
+            assert!(
+                err.contains(missing),
+                "the refusal must NAME the missing key, got {err:?}"
+            );
+        }
+        // The single-keyed classes are unaffected by id2 being absent.
+        for kind in ["attestation", "key_record", "hard_case_event"] {
+            assert!(ObjectRef::from_parts(kind, "id-1", None).is_ok());
+        }
+    }
+
+    /// The class tokens are program constants, not prose.
+    #[test]
+    fn object_class_tokens_match_serde() {
+        for class in ObjectClass::ALL {
+            assert_eq!(
+                serde_json::to_string(&class).expect("serialize"),
+                format!("\"{}\"", class.as_str())
+            );
+        }
+    }
+
+    /// **The stage-2 safety property.** Nothing on this substrate may produce
+    /// [`AntiEntropy::Satisfied`], because persist cannot verify that any
+    /// object resides anywhere else — no transport, no acknowledgment record.
+    ///
+    /// A SOURCE SCAN, not a call-site check: the failure this guards is
+    /// somebody adding a `Satisfied` producer to make a stage-3 release path
+    /// go green, and a behavioural test over today's call graph would not see
+    /// that. Same discipline `family_rules.rs` uses to close its own loop —
+    /// over-reporting is the safe direction here.
+    #[test]
+    fn nothing_yields_anti_entropy_satisfied_today() {
+        // The needles are ASSEMBLED at runtime, never written contiguously, so
+        // this scanner does not match its own source. A scan that trips on
+        // itself is a scan nobody can keep green, and it would be silenced.
+        let qualified = ["AntiEntropy", "Satisfied"].join("::");
+        let via_self = ["Self", "Satisfied"].join("::");
+
+        let mut sources: Vec<(String, String)> = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    if let Ok(t) = std::fs::read_to_string(&p) {
+                        out.push((p.display().to_string(), t));
+                    }
+                }
+            }
+        }
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+        assert!(
+            sources.len() > 20,
+            "the source walk collapsed ({} files) — this gate would pass vacuously",
+            sources.len()
+        );
+
+        let mut producers: Vec<String> = Vec::new();
+        for (path, text) in &sources {
+            for (i, line) in text.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                if !(t.contains(&qualified) || t.contains(&via_self)) {
+                    continue;
+                }
+                // `matches!(self, Self::Satisfied { .. })` in `is_satisfied`
+                // READS the variant; it does not construct one.
+                if t.contains("matches!") {
+                    continue;
+                }
+                producers.push(format!("  {}:{}: {}", path, i + 1, t));
+            }
+        }
+        assert!(
+            producers.is_empty(),
+            "the `{qualified}` variant is constructed somewhere in src/. It must not be, until \
+             an acknowledgment plane exists that can PROVE a peer holds the object — otherwise \
+             `may_release_copy` starts returning Yes and #564's second conjunct becomes \
+             decorative, which turns the 234-row case into 234 deletions. Found:\n{}",
+            producers.join("\n")
+        );
+        // And the honest value is the fail-secure one.
+        assert!(!AntiEntropy::Unverifiable {
+            reason: String::new()
+        }
+        .is_satisfied());
+        assert!(!AntiEntropy::NotSatisfied {
+            reason: String::new()
+        }
+        .is_satisfied());
+    }
+
+    /// **Fail-secure, end to end**: with no acknowledgment plane, `Yes` is
+    /// unreachable REGARDLESS of the reachability half. Even a proven `No`
+    /// from `is_load_bearing` must not release, because the copy may have
+    /// nowhere else to live.
+    ///
+    /// Constructed directly rather than through a backend so the property is
+    /// asserted over the whole verdict space, not one fixture's corner of it.
+    #[test]
+    fn may_release_is_unreachable_without_an_acknowledgment_plane() {
+        let unverifiable = AntiEntropy::Unverifiable {
+            reason: "no acknowledgment plane".into(),
+        };
+        for load_bearing in [
+            LoadBearing::No,
+            LoadBearing::Yes {
+                because: Vec::new(),
+            },
+            LoadBearing::Unknown {
+                family: "whatever".into(),
+                reason: "no predicate".into(),
+            },
+        ] {
+            // This mirrors `may_release_copy`'s conjunct exactly.
+            let releasable = matches!(load_bearing, LoadBearing::No) && unverifiable.is_satisfied();
+            assert!(
+                !releasable,
+                "no verdict may release while residence is unverifiable, got a release for \
+                 {load_bearing:?}"
+            );
+        }
+        let refusal = MayRelease::No {
+            load_bearing: LoadBearing::No,
+            anti_entropy: unverifiable,
+        };
+        assert!(!refusal.is_releasable());
+        assert!(MayRelease::Yes.is_releasable());
+
+        // The FFI returns this as JSON TEXT, and the PyO3 docstrings promise a
+        // specific shape while warning that BOTH arms are truthy Python
+        // strings. Gate the shape those warnings are written against: a
+        // docstring naming a wire form nothing checks is the same
+        // two-statements-of-one-fact problem one layer out.
+        assert_eq!(
+            serde_json::to_string(&MayRelease::Yes).expect("serialize"),
+            "\"yes\"",
+            "the release arm must stay a bare string — the docstrings name it"
+        );
+        let refused = serde_json::to_string(&refusal).expect("serialize");
+        assert!(
+            refused.starts_with("{\"no\":"),
+            "the refusal arm must stay {{\"no\":…}} — the docstrings name it; got {refused}"
+        );
+        // Both are non-empty strings, i.e. TRUTHY in Python. This is the
+        // footgun the docstrings exist to name, asserted rather than asserted-
+        // about: if a future shape made one of them falsy, the warning would
+        // become wrong in the direction that reads as safe.
+        for json in [
+            serde_json::to_string(&MayRelease::Yes).expect("serialize"),
+            refused,
+        ] {
+            assert!(!json.is_empty() && json != "\"\"" && json != "0");
+        }
+    }
+
+    /// The deferring / unindexed classes resolve `Unknown` and NAME themselves
+    /// — never `No`. A `No` here would be a licence to collect an object whose
+    /// retention another plane owns.
+    #[test]
+    fn deferred_and_unindexed_classes_are_fail_secure_unknown() {
+        for class in [ObjectClass::FountainContent, ObjectClass::HardCaseEvent] {
+            match deferred_or_unindexed(class, "obj-1") {
+                LoadBearing::Unknown { family, reason } => {
+                    assert_eq!(family, class.as_str(), "an Unknown must name its class");
+                    assert!(
+                        reason.contains("obj-1"),
+                        "the reason must name the object it is about: {reason}"
+                    );
+                }
+                other => panic!(
+                    "{} must be fail-secure Unknown, got {other:?}",
+                    class.as_str()
+                ),
+            }
+            assert!(deferred_or_unindexed(class, "obj-1").treated_as_load_bearing());
         }
     }
 

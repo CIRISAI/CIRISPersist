@@ -2450,42 +2450,55 @@ impl PyEngine {
     /// and it does no work here — regardless of its age or its author's
     /// fate, which is why this needs no clock and scores no principal.
     ///
-    /// `object_kind` is `"attestation"` or `"key_record"`; `object_id`
-    /// is the `attestation_id` / `key_id`.
+    /// `object_kind` is one of the
+    /// [`ObjectClass`](crate::federation::load_bearing::ObjectClass) tokens —
+    /// `attestation` / `key_record` / `transport_destination` /
+    /// `fountain_content` / `hard_case_event`. `object_id2` carries the second
+    /// key for the composite-keyed classes (`transport_destination` →
+    /// `transport_kind`, `fountain_content` → `corpus_kind`) and is REQUIRED
+    /// for those — a defaulted second key would answer about a different
+    /// object than the caller asked about.
     ///
-    /// **Fail-secure**: a family with no declared load-bearing predicate
-    /// resolves `unknown`, which is TREATED AS load-bearing. An
-    /// undeclared family is a manifest gap, never a licence to collect.
+    /// # Three-valued, and the third value is the point
     ///
-    /// **Read-only.** This releases, evicts and mutates NOTHING, and a
-    /// `"no"` is not permission to drop anything: release additionally
-    /// requires the anti-entropy conjunct (#564 stage 2), which does not
-    /// exist yet. Dropping a copy that has nowhere else to live is data
-    /// loss wearing a GC costume.
+    /// **Fail-secure**: a family or class whose dependents this node cannot
+    /// see resolves `unknown`, which is TREATED AS load-bearing. `"unknown"`
+    /// is **not** `"no"` — it means "I cannot tell", and reading it as `"no"`
+    /// releases an object something still depends on. An undeclared family is
+    /// a manifest gap, never a licence to collect.
+    ///
+    /// # Every arm is a TRUTHY Python string — including `"no"`
+    ///
+    /// This returns JSON *text*. In Python, `if engine.is_load_bearing_json(…)`
+    /// is `True` for every possible answer, including the bare string `"no"`.
+    /// Callers MUST `json.loads` it and branch on the parsed value. A bare
+    /// truth-test does not merely lose information here: it collapses the
+    /// three-valued verdict this primitive exists to provide, and does so in
+    /// the unsafe direction on both of the arms that matter.
+    ///
+    /// **Read-only.** This releases, evicts and mutates NOTHING, and a `"no"`
+    /// is not permission to drop anything: release additionally requires the
+    /// anti-entropy conjunct — see [`Self::may_release_copy_json`], which is
+    /// the only surface that answers the release question. Dropping a copy
+    /// that has nowhere else to live is data loss wearing a GC costume.
     ///
     /// Exposed here because edge and server reach persist through this
     /// FFI — a predicate no host can call is not shipped (AV-77).
+    #[pyo3(signature = (object_kind, object_id, object_id2=None))]
     fn is_load_bearing_json(
         &self,
         py: Python<'_>,
         object_kind: &str,
         object_id: &str,
+        object_id2: Option<&str>,
     ) -> PyResult<String> {
         self.ensure_usable()?;
-        let object = match object_kind {
-            "attestation" => crate::federation::load_bearing::ObjectRef::Attestation {
-                attestation_id: object_id.to_owned(),
-            },
-            "key_record" => crate::federation::load_bearing::ObjectRef::KeyRecord {
-                key_id: object_id.to_owned(),
-            },
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "is_load_bearing object_kind must be \"attestation\" or \"key_record\", got \
-                     {other:?}"
-                )))
-            }
-        };
+        let object = crate::federation::load_bearing::ObjectRef::from_parts(
+            object_kind,
+            object_id,
+            object_id2,
+        )
+        .map_err(|e| PyValueError::new_err(format!("is_load_bearing: {e}")))?;
         catch_panic(|| {
             let runtime = self.runtime.clone();
             let object = object.clone();
@@ -2518,6 +2531,85 @@ impl PyEngine {
                 };
                 serde_json::to_string(&verdict)
                     .map_err(|e| PyValueError::new_err(format!("is_load_bearing serialize: {e}")))
+            })
+        })
+    }
+
+    /// CIRISPersist#564 stage 2 — **may this node release its copy?**
+    ///
+    /// `is_load_bearing(X) == "no" ∧ anti_entropy_satisfied(X)`. Returns the
+    /// JSON [`MayRelease`](crate::federation::load_bearing::MayRelease)
+    /// verdict, which on the `no` arm reports BOTH halves so a caller never
+    /// has to guess which one blocked it.
+    ///
+    /// # The return is a TRUTHY Python string on BOTH arms
+    ///
+    /// `{"no":{…}}` and `"yes"` are both truthy, so
+    /// `if engine.may_release_copy_json(…)` is `True` for a refusal. Since
+    /// this is the surface a caller gates a DELETION on, a bare truth-test
+    /// here deletes exactly what the primitive refused. `json.loads` it and
+    /// branch on the parsed arm — never on the string.
+    ///
+    /// **Today this always answers `no`.** Persist cannot verify that an
+    /// object resides anywhere else: no peer transport, replication is
+    /// inbound-apply plus outbound-pull (a pull never learns who kept what),
+    /// and nothing records a peer acknowledging a holding. The conjunct is
+    /// therefore structurally unsatisfiable here — fail-secure by
+    /// construction, not by policy. Closing it needs an acknowledgment plane
+    /// written by the layer that talks to peers.
+    ///
+    /// **Read-only.** It releases, evicts and mutates NOTHING; the release
+    /// itself is #564 stage 3 and does not exist.
+    ///
+    /// Argument shape is identical to
+    /// [`Self::is_load_bearing_json`], including the `object_id2` rule.
+    #[pyo3(signature = (object_kind, object_id, object_id2=None))]
+    fn may_release_copy_json(
+        &self,
+        py: Python<'_>,
+        object_kind: &str,
+        object_id: &str,
+        object_id2: Option<&str>,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        let object = crate::federation::load_bearing::ObjectRef::from_parts(
+            object_kind,
+            object_id,
+            object_id2,
+        )
+        .map_err(|e| PyValueError::new_err(format!("may_release_copy: {e}")))?;
+        catch_panic(|| {
+            let runtime = self.runtime.clone();
+            let object = object.clone();
+            py.detach(move || {
+                let verdict = match &self.backend {
+                    #[cfg(feature = "postgres")]
+                    BackendDispatch::Postgres(pg) => {
+                        let backend = pg.clone();
+                        runtime.block_on(async move {
+                            crate::federation::load_bearing::may_release_copy(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                object,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                    #[cfg(feature = "sqlite")]
+                    BackendDispatch::Sqlite(sq) => {
+                        let backend = sq.clone();
+                        runtime.block_on(async move {
+                            crate::federation::load_bearing::may_release_copy(
+                                &*backend as &dyn crate::federation::FederationDirectory,
+                                object,
+                            )
+                            .await
+                            .map_err(federation_err_to_py)
+                        })?
+                    }
+                };
+                serde_json::to_string(&verdict)
+                    .map_err(|e| PyValueError::new_err(format!("may_release_copy serialize: {e}")))
             })
         })
     }
