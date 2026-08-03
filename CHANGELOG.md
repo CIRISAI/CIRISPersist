@@ -5,7 +5,7 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased] — #569: the consent gate answered one question and read as a verdict on the set
+## [Unreleased] — #569: the consent gate stays on `capacity:*`, and now says why
 
 > **Scope note (like #574's):** this section covers **#569 only**. It was written in an isolated
 > worktree; `Cargo.toml`'s version line is owned by a sibling agent this cut, so nothing here
@@ -13,124 +13,217 @@ threat-model citations because this crate's audit story is the point.
 > picks the number. The version tokens in the code comments below (`v25.1.0`) are the author's
 > expectation, not a claim on the cut.
 
-### The gap
+### What happened, in order
 
-v22.0.0 shipped AV-79 / CIRISConstitution#46: a federation-tier `capacity:*` claim about subject
-S is refused unless S's live `consent:scope:analyze` covers the attester. **It matched
-`capacity:*` and nothing else.**
+- **18:17** — #569 shipped a widening of the CC#46 consent-before-scoring gate: from `capacity:*`
+  to every family CIRISVerify's registry classifies `ConsentClass::ConsensualReputation`. In
+  practice that gated four more families: `attestation:registry_consensus`,
+  `attestation:license_validity`, `cert_validity:{authority}`, `rollback_detected:{revision_field}`.
+- **19:56** — CIRISConstitution ratified **CC 3.4.5**, whose paragraph *"Disposition of the CC
+  2.3.2 verification families under this rule (per family)"* dispositions all fourteen verify
+  families individually and puts **every one of them outside the gate**.
+- **Held before merge.** The branch was never merged as authored. What ships is the narrowing.
 
-Meanwhile CIRISVerify owns a whole namespace of third-party trust signals — scored, consumed by
-CIRISLensCore's reputation scoring, riding the same `scores` + `dimension` shape into the same
-graph — and **not one of them asked the subject anything.** A subject could decline `analyze`,
-believe they had opted out of being scored, and still accumulate the signals that drive
-reputation. That is the shape #569 named: *a check that answers one question while reading as a
-verdict on the set.*
+**Persist follows CC 3.4.5, not verify's `ConsentClass`, where the two disagree.** Verify's
+registry still labels those four `ConsensualReputation` and its own doc says they *"belong behind
+the subject's `analyze` consent"*; the Constitution says otherwise, and the Constitution is the
+floor. That disagreement is now a test, not a footnote (below).
 
-Production canonical on 2026-08-01 had 240 `consent:replication:v1` rows and **zero**
-`consent:state:*` rows mesh-wide — the carrier worked, the `analyze` producer was absent. As
-nodes start authoring `analyze`, "gated" and "ungated" become observable for the first time.
+### Why the Constitution ruled the other way
 
-### The set is DERIVED, not transcribed
+- **Artifact-integrity verification** — `attestation:registry_consensus`,
+  `attestation:license_validity`, `cert_validity:{authority}` (with `attestation:hardware_rooted`,
+  `attestation:agent_integrity`, `provenance:*`): these *"score builds, manifests, licenses and
+  certificates — not a subject's conduct or capacity; integrity checking is the trust
+  precondition, and **a forger never consents to verification**."*
+- **`rollback_detected:{revision_field}`** — *"an adversarial detector (−1-only polarity), **on
+  the abuse-response side of the line by construction**."*
+- **The rule** — *"Consent-before-scoring binds the family that judges **agents** — `capacity:*` —
+  never the families that verify **artifacts**."*
 
-The rule is **not** "gate all scoring": an abuser never consents to `detection:*` /
-`moderation:*` / `slashing:*`, and applying this uniformly would delete the abuse-response
-plane. So the question is *which* families, and the answer had to come from somewhere that
-cannot silently fall behind.
+The sharpest consequence is the one the witness now pins by name: **gating `rollback_detected:*`
+behind the subject's own `analyze` consent lets an adversary opt out of rollback detection.** That
+contradicts #569's own stated principle — *never gate abuse-response* — which #569 applied
+correctly to `detection:*` / `moderation:*` / `slashing:*` and then missed on the one adversarial
+family living inside verify's namespace.
 
-CIRISVerify **v11.0.0** (adopted in v25.0.0) ships the authoritative registry:
-`ciris_verify_core::federation_provenance::dim::{ALL, lookup, DimensionSpec, ConsentClass}` — 14
-families, each carrying verify's own classification of what it *is*:
+### Not a weakening — CC 3.4.5's reciprocity clause
 
-- **`ConsensualReputation`** — a third-party signal about a subject. Belongs behind `analyze`.
-- **`SelfAttestation`** — a node's statement about its own artifact or custody. No third-party
-  subject exists, so consent is not the applicable gate; gating these would be the same category
-  error as gating `detection:*`.
+> *"A subject that declines analysis cannot be scored; its `capacity:composite` is undefined and
+> MUST NOT be emitted; and every gate that requires a capacity verdict therefore **fails closed**
+> for that subject. Opting out of being scored is opting out of everything that requires a score."*
 
-`admission::consent_gated_family` calls `dim::lookup` and reads that class. **It holds no list of
-its own.** A hand-copied set of 14 strings here would be a second registry maintained separately
-from the first — the two-lists-that-disagree class this repo keeps paying for (#541, #532, and
-#574 found the same vocabulary closed in three places) — and it would fail in the only direction
-that matters: silently, on the family added upstream.
+A declining subject is not scored **at all** — a stronger outcome than being scored without
+consent — while the planes that verify artifacts and report abuse, which never judged that
+subject's conduct, keep working.
 
-The gated set today, entirely a consequence of that call:
+### The gated set
 
-| Family | Source |
-|---|---|
-| `capacity:*` | persist/CC 3.4.5 — the one member persist owns (verify's namespace does not contain it) |
-| `attestation:registry_consensus` | verify registry, `ConsensualReputation` |
-| `attestation:license_validity` | verify registry, `ConsensualReputation` |
-| `cert_validity:{authority}` | verify registry, `ConsensualReputation` |
-| `rollback_detected:{revision_field}` | verify registry, `ConsensualReputation` |
+| Family | Gated? | Source |
+|---|---|---|
+| `capacity:*` | **yes** | CC 3.4.5 — the family that judges agents; persist-owned, outside verify's namespace entirely |
+| `attestation:registry_consensus` | no | CC 3.4.5 — artifact-integrity verification |
+| `attestation:license_validity` | no | CC 3.4.5 — artifact-integrity verification |
+| `cert_validity:{authority}` | no | CC 3.4.5 — artifact-integrity verification |
+| `rollback_detected:{revision_field}` | no | CC 3.4.5 — adversarial detector, abuse-response side |
+| the other ten verify families | no | CC 3.4.5 — self-reports, log infrastructure, artifact integrity |
+| `detection:*` / `moderation:*` / `slashing:*` / `revocation:peer_admission:v1` | no | unchanged — an abuser never consents to abuse response |
 
-The other nine verify families (`attestation:self_verify` / `hardware_rooted` /
-`agent_integrity`, `transparency_log:inclusion` / `consistency` / `cosigned:`,
-`provenance:slsa:` / `build_manifest:` / `skill_import:`, `hardware_custody:`) are
-`SelfAttestation` and stay ungated — **verify's classification, not persist's guess.** Verify
-called the split *"a proposal from the measuring side, not a ruling"*; persist accepts it as
-shipped and would raise a specific family rather than fork the taxonomy.
+`consent_gated_family` is therefore a prefix test again, and it says in one place why every other
+family is absent.
 
-`verify_dimension_registry_is_the_only_enumeration` pins the registry's *shape* — a pin, not a
-rival registry: nothing in the gate reads those strings. It exists so a **reclassification**
-upstream (a family changing consent class, which silently changes what this node refuses) lands
-as a red test to adjudicate rather than as a side-effect of a dependency bump. It also proves
-persist's pre-existing `ATTESTATION_LADDER_MECHANISMS` hand-list resolves inside verify's
-registry, so the two have not drifted.
+### What #569 got right, and the error one layer up
 
-### Every AV-79 property preserved
+#569 refused to hold a hand-copied list: it derived its set from
+`ciris_verify_core::federation_provenance::dim::lookup` rather than transcribing fourteen strings
+into persist. That instinct is correct and is the #541 / #532 / #574 lesson applied — a second
+registry maintained separately from the first fails silently, in the only direction that matters.
 
-- **Both wire shapes.** `consent_gated_claim` reads the envelope `dimension` AND
-  `attestation_type` — the AV-74 lesson, that a gate keyed on one shape reaches zero callers on
-  the other, at a new address. Witnessed on both.
-- **Absent consent = refused**, never implied. `Unspecified` is a refusal.
-- **Genesis goes dark deliberately** — and #569 widens what goes dark. No bootstrap bypass: a
-  bypass keyed to "the mesh is young" is a permanent hole with a temporary name.
-- **Local-tier exempt** (un-replicated working state, not an emission), **self-attestation
-  refused upstream** by AV-62/74 so the refusal names the right rule.
-- **It bites the node's own emit surface.** `emit_attestation` stores through `put_attestation`
-  and gets no bypass; `emit_attestation_consent_gate_bites_own_surface_569` witnesses this
-  node's own unconsented emit refused, then admitted after the subject grants.
+Its error was one layer up: **it treated verify's classification as a ruling.** Verify itself
+calls the split *"a proposal from the measuring side, not a ruling"* — a phrase quoted in #569's
+own test doc. Verify knows what each dimension **is**; the Constitution decides what the substrate
+**does about it**. The machinery is preserved; the authority it obeys changed.
 
-### Typed refusal (breaking, on the wire)
+### `verify_dimension_registry_is_the_only_enumeration` is now an adjudication record
 
-The refusal was `Error::InvalidArgument` — kind `federation_invalid_argument`, indistinguishable
-from every other argument complaint, recognizable only by matching message text. It is now
-`Error::ConsentGateRefused(ConsentGateRefused)`, kind **`federation_consent_gate_refused`**,
-carrying the closed `ConsentGatedFamily` discriminator, the dimension verbatim, both parties, and
-the stance the fold actually resolved. Same shape as #565's `KeyRefusalReason` and #575's
-`PeerQuotaRefusal`: serde token ≡ `as_str()`, `ALL` complete, no `Other`.
+The pin test was not deleted — it got more valuable. It now asserts **both sides of a live
+disagreement**:
+
+- verify's `ConsensualReputation` set is still exactly those four prefixes (plus the `dim::ALL.len() == 14`
+  size pin and the recognition-only pin, kept);
+- **and persist deliberately gates none of them**, probed through the same predicate the gate
+  calls;
+- and the one family that IS gated is `capacity:*`, which does not resolve in verify's registry at
+  all — which is why the gated set can never be read off that registry.
+
+It goes red if **either** side moves: verify reclassifying a family, or a future CC amendment
+carrying one across the line. The failure messages say which document settles it (CC 3.4.5, that
+paragraph, by name) and that verify's classification is evidence rather than the verdict.
+
+It is also the **only** place in this crate that reads verify's consent classification. B7 and
+every other consumer use `dim::ALL` / `dim::lookup` / `prefix` / `parameterized`, which are stable
+across a re-pin. That isolation is deliberate: whoever re-pins verify has one function to edit.
+
+### The measuring side agreed — CIRISVerify v12.0.0
+
+Filing this disagreement upstream resolved it. **CIRISVerify v12.0.0 removes `ConsentClass`
+entirely**, replacing it with `ConsentDisposition` tracking CC 3.4.5's ratified per-family
+disposition: the four families become `ArtifactVerification` / `AbuseResponse`, and **no
+verify-owned family is consent-gated** — exposed as a *method*, `is_consent_gated()`, rather than
+an implicit property of a variant name, "so the wrong gate cannot be re-derived from variant
+names". Verify's assessment: narrowing persist's gate to `capacity:*` *"is correct, and verify's
+registry no longer contradicts it"*.
+
+**Persist still pins v11.x here.** The v12 re-pin is a MAJOR landing separately, on the assembled
+tree. The adjudication test carries a block comment naming the incoming rename and the exact
+replacement to make — verify's own proposal, and a stronger tripwire than the four-prefix pin:
+
+```rust
+for spec in dim::ALL { assert!(!spec.is_consent_gated(), ...); }
+```
+
+That fires if verify ever re-gates *any* family, not only if one of four named prefixes moves. The
+`dim::ALL.len() == 14` pin, the recognition-only pin, and the floor's ruling block are unchanged
+by the re-pin.
+
+Worth recording, because it is the part #569 got right: verify's note back was *"deriving your
+gate from the registry rather than transcribing a list was the right call and is what surfaced
+this — please keep doing that."* The instinct was sound; only the authority it trusted was wrong.
+
+### Kept from #569
+
+Re-verified after the narrowing rather than assumed:
+
+- **Both wire shapes.** `consent_gated_claim` reads the envelope `dimension` AND `attestation_type`
+  — the AV-74 lesson that a gate keyed on one shape reaches zero callers on the other.
+- **The typed refusal.** `Error::ConsentGateRefused(ConsentGateRefused)`, kind
+  **`federation_consent_gate_refused`**, carrying the closed `ConsentGatedFamily` discriminator,
+  the dimension verbatim, both parties, and the resolved stance. Same shape as #565's
+  `KeyRefusalReason` and #575's `PeerQuotaRefusal`: serde token ≡ `as_str()`, `ALL` complete, no
+  `Other`. `ConsentGatedFamily` now has one variant, and that is the ruling rather than an
+  oversight — a second variant would be a Constitutional amendment.
+- **The emit-surface witness**, retargeted and strengthened: this node's own unconsented
+  `capacity:*` emit is refused, its `rollback_detected:*` emit about the *same silent subject*
+  admits, and the capacity emit admits once that subject grants. Both halves of the boundary on
+  the API a node actually calls.
+- **Genesis goes dark**, no bootstrap bypass; **local-tier exempt**; **self-emission** still
+  refused upstream by AV-62/74 so the refusal names the right rule.
+- `ANALYZE_CONSENT_SCOPE` (was `CAPACITY_CONSENT_SCOPE`) — kept renamed: the constant names CC
+  3.3.1's `analyze` grant kind, which was never capacity-specific and is pinned to the consent
+  grammar's `TransmissionPrinciple::Analyze` wire token.
+
+### Removed from #569
+
+- `ConsentGatedFamily::VerifyConsensualReputation` and every arm, const and assertion behind it.
+- The `dim::lookup` call inside `consent_gated_family` — the gate no longer asks the measuring
+  side what to refuse. The registry is still read, in the adjudication test, which is where a
+  proposal belongs.
+- **The BREAKING rename is reverted**: `check_consent_gated_admission` → back to
+  **`check_capacity_consent_admission`**. The gate is capacity-only again, so the original name is
+  accurate — and a public rename downstream must adopt should buy something.
 
 ### Breaking
 
-- `admission::check_capacity_consent_admission` → **`check_consent_gated_admission`**.
 - `admission::capacity_claim_family` → **`consent_gated_claim`** (returns a typed
   `ConsentGatedClaim` naming WHICH rule, not a bare `&str`).
-- `admission::CAPACITY_CONSENT_SCOPE` → **`ANALYZE_CONSENT_SCOPE`** (the scope was never
-  capacity-specific; it is CC 3.3.1's `analyze` kind).
+- `admission::CAPACITY_CONSENT_SCOPE` → **`ANALYZE_CONSENT_SCOPE`**.
 - New `Error::ConsentGateRefused` variant; the CC#46 refusal kind moves off
-  `federation_invalid_argument`.
+  `federation_invalid_argument` to `federation_consent_gate_refused`.
 
 Clean break, no aliases (repo doctrine).
 
 ### Tests
 
-Red-first: with the widening reverted, the unconsented `attestation:registry_consensus` claim was
-witnessed **ADMITTED** on memory, on sqlite, and through the node's own `emit_attestation` — the
-gap, reproduced before it was closed.
+**Red-first, both directions, on the pre-rework code:**
 
-**B7**, a new shared `bootstrap_admission::test_support` exercise body driven by all three
-backends, derives its probe set from `dim::ALL` (a witness that lists families by hand proves the
-gate covers the list, never that the list covers the namespace). Per family: unconsented ⇒
-typed refusal naming that dimension; live `analyze` grant ⇒ admits; revocation ⇒ refused again
-with the resolved stance as evidence; the type-keyed shape gated identically; every
-`SelfAttestation` family NOT consent-refused; a non-trust-signal `scores` row untouched.
+| Witness | Before (pre-rework) | After |
+|---|---|---|
+| unconsented `rollback_detected:agent_version:v1`, third-party attester | **REFUSED** — `federation_consent_gate_refused`, family `verify_consensual_reputation` | **ADMITTED** |
+| unconsented `attestation:license_validity`, third-party attester | **REFUSED** — same kind and family | **ADMITTED** |
+| unconsented `capacity:core_identity:v1` (control) | REFUSED | REFUSED — family `capacity` |
 
-One existing test needed the gate's own fixture updated rather than worked around: B5's shared
-body pinned the old `federation_invalid_argument` kind, which is exactly the wire change above —
-it now asserts the typed refusal and its `Capacity` discriminator.
+**B7 inverted.** The shared `bootstrap_admission::test_support` exercise body driven by all three
+backends now witnesses the opposite invariant: (a) `rollback_detected:*` admits unconsented, first
+and by name because it is the sharpest adjudicated case; (b) `attestation:license_validity` and
+(c) the rest of `CC_345_UNGATED_PROBES` admit unconsented, each re-resolved in verify's registry
+so a rename lands as a red test rather than as a probe that quietly stopped probing; (d) the
+type-keyed wire shape is ungated identically; (e) CONTRAST — `capacity:*` from the same attester
+about the same silent subject is still refused with the typed refusal naming the `Capacity` rule,
+so the gate *narrowed* rather than evaporated; (f) and the subject's own `analyze` grant re-opens
+it.
 
-sqlite **1592/1592** · test-anchor **1597/1597** · postgres **1922/1922** (+5 / +5 / +6 over
-v25.0.0's 1587 / 1592 / 1916) · `cargo fmt --all` clean · clippy `-D warnings` clean on
-`--features sqlite` and on CI's full feature set.
+The "cannot be re-widened quietly" guarantee lives in the adjudication test, where it is stronger:
+it sweeps **all fourteen** registry families through `consent_gated_family` and asserts none is
+gated, rather than only the four #569 had gated.
+
+B5 (the `capacity:*` gate itself) is unchanged and still green, including the typed-refusal kind
+assertion #569 added to its shared body.
+
+`cargo nextest run --features sqlite` **1592/1592** · `--features "sqlite test-anchor"`
+**1597/1597** · `--features "sqlite postgres server pyo3"` (own database) **1979/1979**
+(`--lib` 1917/1917) · `cargo fmt --all --check` clean · clippy `-D warnings` clean on
+`--features sqlite`, on `--features "sqlite postgres server pyo3"`, and on the pre-commit hook's
+`postgres,pyo3,server,sqlite,tls --all-targets`.
+
+The rework is **test-count-neutral against #569**: zero test functions added or removed (the three
+B7 backend drivers were renamed 1:1), which the sqlite and test-anchor totals confirm by landing
+on #569's exact numbers. Against v25.0.0 the branch is +6 test functions (+5 in a sqlite-only
+build).
+
+**Note for whoever runs this suite with `cargo test` rather than nextest:** the `test-anchor`
+build fails 17 unrelated tests under `cargo test`, because `federation::genesis`'s fixtures call
+`std::env::set_var("CIRIS_TESTING_MODE", …)` — process-global state that leaks across threads into
+the genesis and canonical-gate tests, which assert the *production* anchor. nextest's
+process-per-test isolation is what makes the suite deterministic; it is the gate for a reason.
+
+### Out of scope, and named
+
+The **promote-path residual** is real, pre-existing, and now tracked as **CIRISPersist#589**:
+`attestation_promote` re-signs and flips `tier` without re-running any AV-76 tier-4 put-gate, so a
+local-tier `capacity:*` row written via `put_attestation` can reach federation tier having never
+faced this gate. It equally bypasses AV-45, AV-77 and the moderation gates; closing it belongs at
+the chokepoint, not by widening this gate. Documented on `check_capacity_consent_admission`, where
+it already was.
 
 ## [25.0.0] — 2026-08-02 — #577: the verify pin was a mesh-wide ceiling
 

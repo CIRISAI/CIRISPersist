@@ -4371,7 +4371,7 @@ impl crate::federation::FederationDirectory for PostgresBackend {
         // AV-62/74's dimension-keyed self-emission arm — so a SELF-attested
         // capacity row is still reported as self-emission rather than shadowed
         // by "no consent". Backend-symmetric across memory / sqlite / postgres.
-        crate::federation::admission::check_consent_gated_admission(self, &row).await?;
+        crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
 
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here, in the cheap
@@ -20190,12 +20190,12 @@ mod tests {
         .await;
     }
 
-    /// #569 B7 — the SAME consent rule over every verify-classified
-    /// consensual-reputation family, on postgres. Shared exercise body; the
-    /// tag is unique per run because this database persists across tests.
+    /// #569 B7 (CC 3.4.5) — the verify-owned verification families are NOT
+    /// consent-gated, on postgres. Shared exercise body; the tag is unique
+    /// per run because this database persists across tests.
     #[tokio::test]
     #[serial_test::serial(postgres)]
-    async fn bootstrap_verify_reputation_consent_gate_postgres_569() {
+    async fn bootstrap_verify_families_not_consent_gated_postgres_569() {
         let Some(dsn) = pg_dsn() else {
             eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
             return;
@@ -20203,7 +20203,7 @@ mod tests {
         let backend = PostgresBackend::connect(&dsn).await.expect("connect");
         backend.run_migrations().await.expect("migrations run");
         let tag = format!("pg569{}", uuid_like());
-        crate::federation::bootstrap_admission::test_support::exercise_verify_reputation_consent_gate(
+        crate::federation::bootstrap_admission::test_support::exercise_verify_families_are_not_consent_gated(
             &backend, &tag,
         )
         .await;

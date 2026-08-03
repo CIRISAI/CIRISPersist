@@ -2436,7 +2436,7 @@ impl crate::federation::FederationDirectory for MemoryBackend {
         // AV-62/74's dimension-keyed self-emission arm — so a SELF-attested
         // capacity row is still reported as self-emission rather than shadowed
         // by "no consent". Backend-symmetric across memory / sqlite / postgres.
-        crate::federation::admission::check_consent_gated_admission(self, &row).await?;
+        crate::federation::admission::check_capacity_consent_admission(self, &row).await?;
 
         // v22.0.0 (CIRISPersist#543 / AV-77) — THE DE-ADMISSION GATE. A peer
         // this node has de-admitted gets its writes refused here. No-op when
@@ -7647,12 +7647,12 @@ mod accord_tests {
         .await;
     }
 
-    /// #569 B7 — the SAME consent rule over every verify-classified
-    /// consensual-reputation family, on memory. Shared exercise body.
+    /// #569 B7 (CC 3.4.5) — the verify-owned verification families are NOT
+    /// consent-gated, on memory. Shared exercise body.
     #[tokio::test]
-    async fn bootstrap_verify_reputation_consent_gate_memory_569() {
+    async fn bootstrap_verify_families_not_consent_gated_memory_569() {
         let backend = MemoryBackend::new();
-        crate::federation::bootstrap_admission::test_support::exercise_verify_reputation_consent_gate(
+        crate::federation::bootstrap_admission::test_support::exercise_verify_families_are_not_consent_gated(
             &backend, "mem569",
         )
         .await;

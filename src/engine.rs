@@ -12444,7 +12444,7 @@ mod tests {
         // capacity:* emit below is a federation-tier claim ABOUT `subject`,
         // so it needs S's live `analyze` grant covering this engine's
         // emitting key. Without this row the emit is REFUSED by
-        // `check_consent_gated_admission` — which is not a fixture
+        // `check_capacity_consent_admission` — which is not a fixture
         // inconvenience but the gate biting on the node's OWN emit surface:
         // `emit_attestation` stores through `put_attestation`, and the local
         // surface gets no bypass (the inverted AV-77 lesson — a gate that
@@ -12513,25 +12513,29 @@ mod tests {
     }
 
     /// v25.1.0 (CIRISPersist#569) — **THE GATE BITES THE NODE'S OWN EMIT
-    /// SURFACE.**
+    /// SURFACE — AND ONLY WHERE CC 3.4.5 PUT IT.**
     ///
     /// A put-gate that exempted the local emit path would be unreachable from
     /// the only side that matters: this node would happily publish about a
     /// subject who never consented while refusing the identical row from a
-    /// peer. [`Engine::emit_attestation`] stores through `put_attestation`,
-    /// so it faces `check_consent_gated_admission` like anyone — and #569's
-    /// widening reaches it for the VERIFY-owned families too, not just
-    /// `capacity:*`.
+    /// peer. [`Engine::emit_attestation`] stores through `put_attestation`, so
+    /// it faces `check_capacity_consent_admission` like anyone.
     ///
-    /// Witnesses the full arc on the emit API itself: refused with the typed
-    /// [`crate::federation::Error::ConsentGateRefused`], admitted after the
-    /// subject grants `analyze`.
+    /// Witnesses both halves of the boundary on the emit API itself, because a
+    /// gate is only as trustworthy as what it lets through:
+    /// (a) this node's own unconsented `capacity:*` emit about a third party is
+    /// REFUSED with the typed
+    /// [`crate::federation::Error::ConsentGateRefused`]; (b) its
+    /// `rollback_detected:*` emit about that SAME silent subject ADMITS — CC
+    /// 3.4.5 puts the adversarial detector on the abuse-response side of the
+    /// line, and a node that could not report a rollback until the rolled-back
+    /// party consented would have no detector at all; (c) once the subject
+    /// grants `analyze`, the capacity emit admits too.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn emit_attestation_consent_gate_bites_own_surface_569() {
         use crate::federation::types::attestation_type::SCORES;
         use crate::federation::FederationDirectory;
-        use ciris_verify_core::federation_provenance::dim::{self, ConsentClass};
 
         let signer = crate::federation::tier_ingest::test_support::local_signer("ciris-569");
         let derived = signer.derived_key_id();
@@ -12545,15 +12549,10 @@ mod tests {
         let subject = "verify-signal-subject";
         crate::federation::tier_ingest::test_support::register_hybrid_key(&*sq, subject).await;
 
-        // The probe dimension is DERIVED from verify's registry, like the gate
-        // and the B7 witness — never a string typed in by hand here.
-        let spec = dim::ALL
-            .iter()
-            .find(|d| d.consent_class == ConsentClass::ConsensualReputation && !d.parameterized)
-            .expect("verify declares an unparameterized consensual-reputation family");
-        let dimension = spec.prefix;
+        const CAPACITY: &str = "capacity:core_identity:v1";
+        const ROLLBACK: &str = "rollback_detected:agent_version:v1";
 
-        let emit = || {
+        let emit = |dimension: &str| {
             let mut input = crate::federation::EmitAttestationInput::with_envelope(
                 SCORES,
                 crate::federation::envelope::EnvelopeCore::from_value(serde_json::json!({
@@ -12565,26 +12564,49 @@ mod tests {
                 .unwrap(),
                 crate::federation::types::cohort_scope::FEDERATION,
             );
-            // Someone ELSE's trust signal, not the emitter's own.
+            // Someone ELSE's row, not the emitter's own.
             input.attested_key_id = Some(subject.to_owned());
             input
         };
 
-        // (a) The node's OWN emit is refused — no bypass for the local path.
+        // (a) The node's OWN capacity emit is refused — no bypass for the
+        // local path.
         let err = engine
-            .emit_attestation(&signer, emit())
+            .emit_attestation(&signer, emit(CAPACITY))
             .await
-            .expect_err("#569: this node's own unconsented verify-signal emit must be REFUSED");
+            .expect_err("#569: this node's own unconsented capacity:* emit must be REFUSED");
         assert!(
             matches!(&err, crate::federation::Error::ConsentGateRefused(r)
-                if r.dimension == dimension
+                if r.dimension == CAPACITY
+                    && r.family == crate::federation::ConsentGatedFamily::Capacity
                     && r.attester_key_id == derived
                     && r.subject_key_id == subject),
             "#569: the refusal is the typed consent gate, naming this node as the attester: \
              {err:?}"
         );
 
-        // (b) The subject opens the plane; the same emit then admits.
+        // (b) THE OTHER HALF — the adversarial detector fires about the SAME
+        // subject, with that subject still silent. If this were gated, a party
+        // could suppress its own rollback detection by declining `analyze`.
+        let rollback_id = engine
+            .emit_attestation(&signer, emit(ROLLBACK))
+            .await
+            .expect(
+                "#569/CC 3.4.5: rollback_detected:* is on the abuse-response side of the line — \
+                 it must emit with the subject silent",
+            );
+        let rollback_row = sq
+            .get_attestation(&rollback_id)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(
+            crate::federation::admission::envelope_dimension(&rollback_row.attestation_envelope),
+            Some(ROLLBACK),
+            "#569: and the detector's row landed intact"
+        );
+
+        // (c) The subject opens the plane; the capacity emit then admits.
         FederationDirectory::put_attestation(
             &*sq,
             crate::federation::SignedAttestation {
@@ -12606,13 +12628,13 @@ mod tests {
         .expect("seed S->P analyze consent");
 
         let id = engine
-            .emit_attestation(&signer, emit())
+            .emit_attestation(&signer, emit(CAPACITY))
             .await
-            .expect("#569: with the subject's live analyze grant, the emit admits");
+            .expect("#569: with the subject's live analyze grant, the capacity emit admits");
         let row = sq.get_attestation(&id).await.unwrap().expect("row");
         assert_eq!(
             crate::federation::admission::envelope_dimension(&row.attestation_envelope),
-            Some(dimension),
+            Some(CAPACITY),
             "#569: and the stored row carries the gated dimension"
         );
     }
