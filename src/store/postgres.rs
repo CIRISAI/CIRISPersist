@@ -20256,6 +20256,21 @@ mod tests {
         .await;
     }
 
+    /// #589 RED DEMO — promote bypasses the tier-4 stack, on postgres.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn promote_bypasses_tier4_red_demo_postgres_589() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = format!("pg589{}", uuid_like());
+        crate::federation::bootstrap_admission::test_support::exercise_589_red_demo(&backend, &tag)
+            .await;
+    }
+
     /// #541 — the signed-row-survives-unsigned-write invariant on postgres.
     #[tokio::test]
     #[serial_test::serial(postgres)]

@@ -7684,6 +7684,16 @@ mod accord_tests {
         .await;
     }
 
+    /// #589 RED DEMO — promote bypasses the tier-4 stack, on memory.
+    #[tokio::test]
+    async fn promote_bypasses_tier4_red_demo_memory_589() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_589_red_demo(
+            &backend, "mem589",
+        )
+        .await;
+    }
+
     /// #541 — the signed-row-survives-unsigned-write invariant on memory.
     #[tokio::test]
     async fn signed_row_survives_local_write_memory_541() {

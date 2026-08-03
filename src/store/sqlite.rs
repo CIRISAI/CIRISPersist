@@ -38894,6 +38894,17 @@ mod tests {
         .await;
     }
 
+    /// #589 RED DEMO — promote bypasses the tier-4 stack, on sqlite.
+    #[tokio::test]
+    async fn promote_bypasses_tier4_red_demo_sqlite_589() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::bootstrap_admission::test_support::exercise_589_red_demo(
+            &backend, "sq589",
+        )
+        .await;
+    }
+
     /// #541 — the signed-row-survives-unsigned-write invariant on sqlite.
     #[tokio::test]
     async fn signed_row_survives_local_write_sqlite_541() {

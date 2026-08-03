@@ -780,4 +780,81 @@ pub mod test_support {
         .await
         .expect("({tag}) AV-77: de-admitting one peer must not affect another");
     }
+
+    // ── CIRISPersist#589 — THE RED DEMO (temporary, pre-fix) ───────────
+    /// TEMPORARY: assert the #589 exploit SUCCEEDS, so the premise is
+    /// executed rather than read. Deleted / inverted by the fix.
+    pub async fn exercise_589_red_demo(dir: &dyn FederationDirectory, tag: &str) {
+        use crate::federation::types::{attestation_tier, cohort_scope};
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let attester = format!("{tag}-p589-{run}"); // P — the scorer
+        let subject = format!("{tag}-s589-{run}"); // S — the scored, silent
+        for k in [&attester, &subject] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+        }
+        const DIM: &str = "capacity:composite:v1";
+
+        // Control: the DIRECT federation-tier write is refused (B5 holds).
+        let direct = dir
+            .put_attestation(SignedAttestation {
+                attestation: scores_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &attester,
+                    &subject,
+                    DIM,
+                ),
+            })
+            .await;
+        eprintln!("[589/{tag}] CONTROL direct federation-tier put: {direct:?}");
+        assert!(direct.is_err(), "[589/{tag}] control: direct write refused");
+
+        // (1) THE LOCAL DOOR — `put_attestation` at tier=local.
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut row = scores_row(&id, &attester, &subject, DIM);
+        row.tier = attestation_tier::LOCAL.to_owned();
+        row.cohort_scope = cohort_scope::FEDERATION.to_owned();
+        let och = row.original_content_hash.clone();
+        let sc = row.scrub_signature_classical.clone();
+        let sp = row.scrub_signature_pqc.clone();
+        let local_put = dir
+            .put_attestation(SignedAttestation { attestation: row })
+            .await;
+        eprintln!("[589/{tag}] BEFORE (1) put_attestation tier=local capacity: {local_put:?}");
+        local_put.expect("[589] the local-tier capacity row is ADMITTED (the open door)");
+
+        // (2) THE PROMOTE — no tier-4 gate re-runs.
+        let promoted = dir
+            .promote_attestation(&id, &sc, sp.as_deref(), &och, &attester, chrono::Utc::now())
+            .await;
+        eprintln!("[589/{tag}] BEFORE (2) promote_attestation: {promoted:?}");
+        assert!(
+            promoted.expect("[589] promote succeeds"),
+            "[589] promote flipped the tier"
+        );
+
+        // (3) THE ARTIFACT — a federation-tier capacity:composite row about a
+        // subject that granted nothing. CC 3.4.5: MUST NOT be emitted.
+        let after = dir
+            .get_attestation(&id)
+            .await
+            .expect("read back")
+            .expect("row");
+        eprintln!(
+            "[589/{tag}] BEFORE (3) stored row: tier={} cohort_scope={} dimension={:?} \
+             attester={} subject={} promoted_at={:?}",
+            after.tier,
+            after.cohort_scope,
+            crate::federation::admission::envelope_dimension(&after.attestation_envelope),
+            after.attesting_key_id,
+            after.attested_key_id,
+            after.promoted_at,
+        );
+        assert_eq!(
+            after.tier,
+            attestation_tier::FEDERATION,
+            "[589] EXPLOIT CONFIRMED: a federation-tier capacity:composite row exists \
+             for a subject with no analyze consent"
+        );
+    }
 }

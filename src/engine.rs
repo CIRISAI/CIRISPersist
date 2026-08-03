@@ -11111,6 +11111,81 @@ mod tests {
         assert_eq!(after2.promoted_at, after.promoted_at);
     }
 
+    /// #589 RED DEMO — the exact issue path, end to end through the PUBLIC
+    /// `Engine::attestation_promote` surface: `put_attestation` a
+    /// `tier = "local"` `capacity:composite:v1` row about a subject that has
+    /// granted nothing, then promote it, and read back a federation-tier row
+    /// that never faced the consent gate.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn attestation_promote_bypasses_consent_gate_red_demo_589() {
+        use crate::federation::types::{attestation_tier, cohort_scope};
+        use crate::federation::{FederationDirectory, SignedAttestation};
+
+        let signer = pqc_signer("occ589");
+        let node = signer.derived_key_id();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        seed_promote_key(&sq, &node).await;
+
+        let attester = "p589-attester".to_string();
+        let subject = "s589-subject".to_string();
+        for k in [&attester, &subject] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(&*sq, k).await;
+        }
+        const DIM: &str = "capacity:composite:v1";
+
+        // CONTROL — the direct federation-tier write is refused (B5 holds).
+        let direct = sq
+            .put_attestation(SignedAttestation {
+                attestation: crate::federation::bootstrap_admission::test_support::scores_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &attester,
+                    &subject,
+                    DIM,
+                ),
+            })
+            .await;
+        eprintln!("[589/engine] CONTROL direct federation-tier put: {direct:?}");
+        assert!(direct.is_err(), "control: the direct write is refused");
+
+        // (1) the local door.
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut row = crate::federation::bootstrap_admission::test_support::scores_row(
+            &id, &attester, &subject, DIM,
+        );
+        row.tier = attestation_tier::LOCAL.to_owned();
+        row.cohort_scope = cohort_scope::SELF.to_owned();
+        let local_put = sq
+            .put_attestation(SignedAttestation { attestation: row })
+            .await;
+        eprintln!("[589/engine] BEFORE (1) put_attestation tier=local: {local_put:?}");
+        local_put.expect("[589] the local-tier capacity row is ADMITTED");
+
+        // (2) the PUBLIC promote surface.
+        let promoted = engine
+            .attestation_promote(&id, cohort_scope::FEDERATION)
+            .await;
+        eprintln!("[589/engine] BEFORE (2) Engine::attestation_promote: {promoted:?}");
+        assert!(promoted.expect("[589] promote succeeds"), "tier flipped");
+
+        // (3) the artifact CC 3.4.5 says MUST NOT exist.
+        let after = sq.get_attestation(&id).await.unwrap().expect("row");
+        eprintln!(
+            "[589/engine] BEFORE (3) stored row: tier={} cohort_scope={} dim={:?}",
+            after.tier,
+            after.cohort_scope,
+            crate::federation::admission::envelope_dimension(&after.attestation_envelope),
+        );
+        assert_eq!(
+            after.tier,
+            attestation_tier::FEDERATION,
+            "[589] EXPLOIT CONFIRMED through the public Engine surface"
+        );
+    }
+
     // ── v21.2.0 (CIRISPersist#509 FLOOR) — "the payload follows the
     //    consent edge": promote_consented_backlog + its two chokepoints.
 
