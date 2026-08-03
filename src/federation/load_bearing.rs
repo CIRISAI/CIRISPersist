@@ -140,6 +140,50 @@ impl ObjectRef {
             Self::HardCaseEvent { .. } => ObjectClass::HardCaseEvent,
         }
     }
+
+    /// **The ONE parse door** from an FFI/host-shaped `(kind, id, id2)` triple
+    /// to a typed ref.
+    ///
+    /// Every host entry point funnels through here rather than matching the
+    /// kind token itself, so the two FFI surfaces cannot drift into supporting
+    /// different subsets of the classes — the failure that gave #564 stage 1 a
+    /// predicate reachable for two classes and unreachable for the rest.
+    /// Exhaustive over [`ObjectClass::ALL`]; a class with no arm is a test
+    /// failure ([`tests::every_class_is_constructible_from_host_parts`]).
+    ///
+    /// `id2` is REQUIRED for the composite-keyed classes and rejected loudly
+    /// when absent — a silently-defaulted `transport_kind` would answer about a
+    /// different route than the caller asked about.
+    pub fn from_parts(kind: &str, id: &str, id2: Option<&str>) -> Result<Self, String> {
+        let need2 = |what: &str| -> Result<String, String> {
+            id2.map(str::to_owned).ok_or_else(|| {
+                format!("object_kind {kind:?} is keyed on (id, {what}) — {what} is required")
+            })
+        };
+        match kind {
+            "attestation" => Ok(Self::Attestation {
+                attestation_id: id.to_owned(),
+            }),
+            "key_record" => Ok(Self::KeyRecord {
+                key_id: id.to_owned(),
+            }),
+            "transport_destination" => Ok(Self::TransportDestination {
+                occurrence_key_id: id.to_owned(),
+                transport_kind: need2("transport_kind")?,
+            }),
+            "fountain_content" => Ok(Self::FountainContent {
+                content_id: id.to_owned(),
+                corpus_kind: need2("corpus_kind")?,
+            }),
+            "hard_case_event" => Ok(Self::HardCaseEvent {
+                event_id: id.to_owned(),
+            }),
+            other => Err(format!(
+                "unknown object_kind {other:?} — expected one of {:?}",
+                ObjectClass::ALL.map(|c| c.as_str())
+            )),
+        }
+    }
 }
 
 /// The closed set of object classes the reachability sweep covers — the
@@ -875,7 +919,10 @@ pub async fn anti_entropy_satisfied(
 /// against a shared postgres test DB does not collide with a prior one.
 #[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
 pub(crate) mod test_support {
-    use super::{is_load_bearing, DependencyKind, LoadBearing, ObjectRef};
+    use super::{
+        is_load_bearing, may_release_copy, AntiEntropy, DependencyKind, LoadBearing, MayRelease,
+        ObjectRef,
+    };
     use crate::federation::types::{attestation_tier, attestation_type};
     use crate::federation::{Attestation, FederationDirectory, SignedAttestation};
 
@@ -1153,6 +1200,157 @@ pub(crate) mod test_support {
             LoadBearing::No,
             "an absent object is trivially not load-bearing HERE"
         );
+
+        // ── (8) #564 stage 2 — the ROUTE class. Absent → No; live → Yes and
+        //    NAMED as reachability.
+        let route_kind = "websocket";
+        assert_eq!(
+            is_load_bearing(
+                dir,
+                ObjectRef::TransportDestination {
+                    occurrence_key_id: live_peer.clone(),
+                    transport_kind: route_kind.to_owned(),
+                },
+            )
+            .await
+            .expect("route verdict"),
+            LoadBearing::No,
+            "a route this node does not hold cannot be depended on here"
+        );
+
+        dir.put_transport_destination(&crate::federation::self_at_login::TransportDestination {
+            occurrence_key_id: live_peer.clone(),
+            transport_kind: route_kind.to_owned(),
+            destination: format!("wss://lb-fixture-{suffix}.invalid/ws"),
+            asserted_at: chrono::Utc::now(),
+            last_seen_at: None,
+            transport_ed25519_pubkey_base64: None,
+            transport_x25519_pubkey_base64: None,
+            binding_provenance: crate::federation::self_at_login::BindingProvenance::default(),
+            epoch: 0,
+            retired_at: None,
+        })
+        .await
+        .expect("route admits");
+
+        match is_load_bearing(
+            dir,
+            ObjectRef::TransportDestination {
+                occurrence_key_id: live_peer.clone(),
+                transport_kind: route_kind.to_owned(),
+            },
+        )
+        .await
+        .expect("route verdict")
+        {
+            LoadBearing::Yes { because } => assert!(
+                because
+                    .iter()
+                    .any(|d| d.kind == DependencyKind::ReachabilityRoute),
+                "a live route IS the reachability it provides: {because:?}"
+            ),
+            other => panic!("a held live route must be Yes, got {other:?}"),
+        }
+
+        // A DIFFERENT transport_kind on the same occurrence is a different
+        // route — the composite key must not smear across kinds.
+        assert_eq!(
+            is_load_bearing(
+                dir,
+                ObjectRef::TransportDestination {
+                    occurrence_key_id: live_peer.clone(),
+                    transport_kind: "reticulum".to_owned(),
+                },
+            )
+            .await
+            .expect("route verdict"),
+            LoadBearing::No,
+            "the verdict is per-route, not per-occurrence"
+        );
+
+        // ── (9) The DEFERRING and UNINDEXED classes read Unknown and NAME
+        //    themselves — never `No`, which would be a licence to collect an
+        //    object whose retention another plane owns.
+        for object in [
+            ObjectRef::FountainContent {
+                content_id: format!("lb-content-{suffix}"),
+                corpus_kind: "trace".to_owned(),
+            },
+            ObjectRef::HardCaseEvent {
+                event_id: format!("lb-hc-{suffix}"),
+            },
+        ] {
+            let class = object.class();
+            match is_load_bearing(dir, object).await.expect("class verdict") {
+                LoadBearing::Unknown { family, reason } => {
+                    assert_eq!(family, class.as_str());
+                    assert!(!reason.is_empty(), "an Unknown must carry its reason");
+                }
+                other => panic!(
+                    "{} must be fail-secure Unknown, got {other:?}",
+                    class.as_str()
+                ),
+            }
+        }
+
+        // ── (10) **THE STAGE-2 PROPERTY.** The inert grants are the ONLY
+        //    objects here that read `No` — and they STILL may not be released,
+        //    because persist cannot verify the copy lives anywhere else. If
+        //    this ever passes, #564's second conjunct has become decorative
+        //    and the 234-row case turns into 234 deletions.
+        for id in &inert {
+            let object = ObjectRef::Attestation {
+                attestation_id: id.clone(),
+            };
+            assert_eq!(
+                is_load_bearing(dir, object.clone())
+                    .await
+                    .expect("reachability half"),
+                LoadBearing::No,
+                "precondition: this grant is the provably-inert case"
+            );
+            match may_release_copy(dir, object)
+                .await
+                .expect("release verdict")
+            {
+                MayRelease::No {
+                    load_bearing,
+                    anti_entropy,
+                } => {
+                    assert_eq!(
+                        load_bearing,
+                        LoadBearing::No,
+                        "the verdict must report the reachability half it actually computed"
+                    );
+                    assert!(
+                        matches!(anti_entropy, AntiEntropy::Unverifiable { .. }),
+                        "residence is unverifiable on this substrate, got {anti_entropy:?}"
+                    );
+                }
+                MayRelease::Yes => panic!(
+                    "grant {id} was released with NO acknowledgment plane — a copy with nowhere \
+                     else to live was just declared collectable"
+                ),
+            }
+        }
+
+        // …and the same holds for a load-bearing object, blocked by BOTH
+        // halves rather than one.
+        match may_release_copy(
+            dir,
+            ObjectRef::Attestation {
+                attestation_id: accepts.clone(),
+            },
+        )
+        .await
+        .expect("release verdict")
+        {
+            MayRelease::No { load_bearing, .. } => assert!(
+                load_bearing.treated_as_load_bearing(),
+                "trust:accepts:v1 must block on the reachability half too"
+            ),
+            MayRelease::Yes => panic!("the un-trust lever must never be releasable"),
+        }
     }
 }
 
@@ -1248,6 +1446,55 @@ mod tests {
         }
     }
 
+    /// **Host reachability, at the parse door.** Every declared class must be
+    /// constructible from the `(kind, id, id2)` triple the FFI hands over, and
+    /// the token it is constructible under must be the class's OWN token.
+    ///
+    /// This is the gate on the AV-77 failure: a class the predicate handles
+    /// but no host can name is not shipped. Iterating `ObjectClass::ALL` means
+    /// adding a class without an FFI door goes red here rather than shipping
+    /// unreachable.
+    #[test]
+    fn every_class_is_constructible_from_host_parts() {
+        for class in ObjectClass::ALL {
+            // Composite-keyed classes need id2; try with, which must always work.
+            let built =
+                ObjectRef::from_parts(class.as_str(), "id-1", Some("id-2")).unwrap_or_else(|e| {
+                    panic!("{} is not reachable from the FFI: {e}", class.as_str())
+                });
+            assert_eq!(
+                built.class(),
+                class,
+                "the {:?} token built a {:?}",
+                class.as_str(),
+                built.class()
+            );
+        }
+        assert!(ObjectRef::from_parts("not_a_class", "x", None).is_err());
+    }
+
+    /// A composite-keyed class REFUSES a missing second key rather than
+    /// defaulting it. A defaulted `transport_kind` would answer confidently
+    /// about a route the caller never asked about.
+    #[test]
+    fn composite_keyed_classes_refuse_a_missing_second_key() {
+        for (kind, missing) in [
+            ("transport_destination", "transport_kind"),
+            ("fountain_content", "corpus_kind"),
+        ] {
+            let err = ObjectRef::from_parts(kind, "id-1", None)
+                .expect_err("a composite-keyed class must refuse a missing second key");
+            assert!(
+                err.contains(missing),
+                "the refusal must NAME the missing key, got {err:?}"
+            );
+        }
+        // The single-keyed classes are unaffected by id2 being absent.
+        for kind in ["attestation", "key_record", "hard_case_event"] {
+            assert!(ObjectRef::from_parts(kind, "id-1", None).is_ok());
+        }
+    }
+
     /// The class tokens are program constants, not prose.
     #[test]
     fn object_class_tokens_match_serde() {
@@ -1270,24 +1517,62 @@ mod tests {
     /// over-reporting is the safe direction here.
     #[test]
     fn nothing_yields_anti_entropy_satisfied_today() {
-        let src = include_str!("load_bearing.rs");
-        // Skip the enum declaration and the doc comments that name the variant.
-        let producers = src
-            .lines()
-            .enumerate()
-            .filter(|(_, l)| l.contains("AntiEntropy::Satisfied"))
-            .filter(|(_, l)| {
-                let t = l.trim_start();
-                !t.starts_with("//") && !t.starts_with("///")
-            })
-            .map(|(i, l)| format!("  line {}: {}", i + 1, l.trim()))
-            .collect::<Vec<_>>();
+        // The needles are ASSEMBLED at runtime, never written contiguously, so
+        // this scanner does not match its own source. A scan that trips on
+        // itself is a scan nobody can keep green, and it would be silenced.
+        let qualified = ["AntiEntropy", "Satisfied"].join("::");
+        let via_self = ["Self", "Satisfied"].join("::");
+
+        let mut sources: Vec<(String, String)> = Vec::new();
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    if let Ok(t) = std::fs::read_to_string(&p) {
+                        out.push((p.display().to_string(), t));
+                    }
+                }
+            }
+        }
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+        assert!(
+            sources.len() > 20,
+            "the source walk collapsed ({} files) — this gate would pass vacuously",
+            sources.len()
+        );
+
+        let mut producers: Vec<String> = Vec::new();
+        for (path, text) in &sources {
+            for (i, line) in text.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                if !(t.contains(&qualified) || t.contains(&via_self)) {
+                    continue;
+                }
+                // `matches!(self, Self::Satisfied { .. })` in `is_satisfied`
+                // READS the variant; it does not construct one.
+                if t.contains("matches!") {
+                    continue;
+                }
+                producers.push(format!("  {}:{}: {}", path, i + 1, t));
+            }
+        }
         assert!(
             producers.is_empty(),
-            "AntiEntropy::Satisfied is constructed somewhere. It must not be, until an \
-             acknowledgment plane exists that can PROVE a peer holds the object — otherwise \
+            "the `{qualified}` variant is constructed somewhere in src/. It must not be, until \
+             an acknowledgment plane exists that can PROVE a peer holds the object — otherwise \
              `may_release_copy` starts returning Yes and #564's second conjunct becomes \
-             decorative. Found:\n{}",
+             decorative, which turns the 234-row case into 234 deletions. Found:\n{}",
             producers.join("\n")
         );
         // And the honest value is the fail-secure one.
