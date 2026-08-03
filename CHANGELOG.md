@@ -5,7 +5,37 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [Unreleased]
+## [28.0.0] — 2026-08-03 — #573/#593/#595: erasability is decided at mint, the third fold closes, and 390 symbols stop being invisible
+
+- **#573** — the containment question CC left open (constraint (d)) is answered by rejecting both
+  branches: **SEALED vs ERASABLE is decided at MINT**, not at redaction. An erasable object carries
+  salted disclosures *beside* the envelope, bound by digests *inside* it; erasure drops a disclosure
+  and **nothing signed is ever altered**. Proven by erasing every member and re-running the real
+  ingest verifier — admitted, row hash byte-identical, and a second store that never saw the object
+  admits and stores it. Cost stated plainly: **everything minted today is sealed and can never be
+  erased.**
+- **#593** — third occurrence of the granter-scoped-only retraction fold (after #578, #584). One
+  extracted BFS serves all four callers; **five written biconditionals** confirmed and asserted
+  first, two of which a per-site repair would have falsified. Read cost **measured, not estimated**:
+  exactly 2×, memoized per recipient, never a per-edge fan-out.
+- **#595** — the type stub described **119 of 509** exported symbols while the wheel shipped
+  `py.typed`, so checkers reported 390 working methods as errors. Now 509, classified under the
+  CIRISConstitution#83 taxonomy with a gate enforcing totality, freshness and stricter treatment of
+  the four binding classes. **`Engine.__init__` was hand-written wrong** — a checker rejected every
+  correct construction, the first line any consumer writes.
+
+The taxonomy gained a twelfth row: **testimonial** — *varying it makes the record unable to prove
+what happened*. 49 members. The line that earns it despite sharing `empirical`'s disposition is
+**repairability**: an empirical wrong is correctable by re-reading the world; a testimonial wrong is
+not, because the record *was* the world for that fact. `jurisdictional` was tested and **died** —
+persist has no jurisdiction plane, so "who decides" is encoded as a scoped capability and folds into
+`deontic` without residual.
+
+**Security-relevant:** the `*_json` adjudicators return a JSON string on both arms, so `"false"` is
+truthy in Python — `if engine.is_named_moderator_json(...)` granted authority to every key. All nine
+are now hand-written stubs naming the misuse.
+
+### v28 work
 
 ### #593: a subject-revoked `delegates_to` stops conferring a moderation duty — and the three copies of that walk become one
 
@@ -124,7 +154,7 @@ Every clause is pinned by a mutation that reddens a specific assertion:
 
 Directory-read counters, so a walk's read cost is a measurement rather than an estimate. Two relaxed
 atomic increments inside methods that already take the state mutex.
-## [Unreleased] — #595: the type stub describes the whole FFI surface, and says what breaks if you get each part wrong
+### #595: the type stub describes the whole FFI surface, and says what breaks if you get each part wrong
 
 `python/ciris_persist/ciris_persist.pyi` documented **119 of 509** PyO3-exported symbols.
 
@@ -146,7 +176,7 @@ Measured on a `--strict` consumer file exercising thirty symbols across the surf
 before this cut, 0 after.** Every one of the 29 was mypy correctly reporting what the stub said, and
 the stub was wrong.
 
-### Added — `scripts/pyi_surface.py`: the gate, which is the durable half
+#### Added — `scripts/pyi_surface.py`: the gate, which is the durable half
 
 Shipping 390 stubs without a gate resets the clock on the same drift. The script derives the
 inventory from `src/ffi/**` — **the whole directory, not just `pyo3.rs`**, which is how
@@ -165,7 +195,7 @@ symbol, a hand-deleted stub entry, a stale pin row, an invented class name, a BI
 downgraded to generated output, a `deontic` door stripped of its docstring, a module-registered
 exception dropped from the stub, and a new `#[pyclass]` with no stub class. **All nine killed.**
 
-### Added — `scripts/ffi_taxonomy.tsv`: every symbol classified by the wrong that varying it causes
+#### Added — `scripts/ffi_taxonomy.tsv`: every symbol classified by the wrong that varying it causes
 
 Per CIRISConstitution#83, each symbol carries one class answering **"what different kind of wrong
 happens if I vary this?"** The class is **not derived from the name**: this surface is prefixed by
@@ -183,13 +213,13 @@ That last rule is not pedantry. The `*_json` adjudicators return a JSON string o
 the refusal `'{"eligible": false}'` is **truthy**. A stub saying `Any` invites
 `if engine.resolve_transit_eligibility_json(...)`, which permits exactly what the method refused.
 
-### Fixed — `Engine.__init__` was hand-written, and hand-written WRONG
+#### Fixed — `Engine.__init__` was hand-written, and hand-written WRONG
 
 The stub declared `Engine(dsn, scrubber=None)`. The Rust `#[new]` requires `signing_key_id` and
 accepts eleven more parameters. A checker reading the old stub rejected **every correct
 construction** — the first line any consumer writes.
 
-### Fixed — symbols the `#[pymodule]` registers that never reached the package
+#### Fixed — symbols the `#[pymodule]` registers that never reached the package
 
 `ReconsiderDosGuard`, `ScoringFactorStream`, `persist_field_conformance`,
 `namespace_manifest_version` and `transform_algebra_hash` are registered on the native module but
@@ -202,14 +232,14 @@ Separately, the typed exception hierarchy (`PersistError` / `NotFound` / `Confli
 `__init__.py` and declared by **no** stub entry — persist's own package failed a type check before a
 consumer ever reached it. The gate now checks every `m.add(...)` / `m.add_class(...)` name.
 
-### Fixed — a stale doc paragraph, and five undocumented FFI methods
+#### Fixed — a stale doc paragraph, and five undocumented FFI methods
 
 `persist_field_conformance` carried `register`'s doc as its first paragraph. Docs added for
 `envelope_vocabulary`, `trace_summary_extraction`, `corpus_shape`, and two iterator methods. Not
 cosmetic here: the stub derives its statement of each symbol from that first paragraph, and the gate
 refuses a `deontic` or `testimonial` symbol that has none.
 
-### A passing `check` means COMPLETE, not CORRECT
+#### A passing `check` means COMPLETE, not CORRECT
 
 Parameter names, arity, defaults and Python types are **derived** from the Rust — authoritative for
 the FFI boundary, since PyO3 generates the conversion from exactly those types. What is **not**
