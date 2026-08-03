@@ -5728,6 +5728,45 @@ pub enum Error {
         community_key_id: String,
     },
 
+    /// CIRISPersist#592 (**AV-84**) — a promotion tried to place a row
+    /// into a TARGETED cohort plane (`family` / `community`) while the row
+    /// names a party other than its own producer.
+    ///
+    /// This is NOT [`Error::WriteScopeRefused`] wearing a new hat, and the two
+    /// must never collapse into one: AV-45's refusal means *"the writer is not
+    /// a member of the target it named"*, a verdict this table cannot reach
+    /// because an attestation has no `cohort_target_id` to name a target with.
+    /// This one means *"the row is not the promoter's own content, so the one
+    /// cohort placement the promote door CAN adjudicate is unavailable"*.
+    /// Reporting the first for the second would send an operator hunting for a
+    /// membership record that was never the problem — the #565 lesson (a
+    /// refusal names its own branch) applied to the one axis where a shared
+    /// name would be actively misleading.
+    ///
+    /// The row is NOT promoted and NOT mutated (verify-before-mutation, AV-9).
+    /// Stable `kind()` token `federation_cohort_standing_refused`; consumers
+    /// branch on [`admission::CohortStandingRefusal::as_str`], never this text.
+    /// See [`admission::check_promotion_cohort_standing`].
+    #[error(
+        "targeted-cohort placement refused ({reason}): promoting to cohort_scope \
+         {cohort_scope:?} requires the row to name no party but its own producer \
+         {producer_key_id:?}, but its {} names {foreign_key_id:?}. A promotion into a \
+         family/community plane is a producer self-declaration about its own content's \
+         visibility (CIRISPersist#592 / AV-84); a claim about a third party belongs at a \
+         broad belonging-tier, where any authenticated writer may emit",
+        reason.field()
+    )]
+    CohortStandingRefused {
+        /// The targeted placement that was refused (`family` / `community`).
+        cohort_scope: String,
+        /// The row's producer — `attesting_key_id`.
+        producer_key_id: String,
+        /// The party the row names who is NOT the producer.
+        foreign_key_id: String,
+        /// WHICH field carried the foreign party.
+        reason: admission::CohortStandingRefusal,
+    },
+
     /// v8.2.0 (CEG 1.0-RC11 §19.1 / CIRISPersist#228 item 1 / #229 item 1)
     /// — a WholenessWitness was REJECTED at the verify-before-persist
     /// gate: the §19.0 PQC-mandatory hard cut (classical-only / missing
@@ -5842,6 +5881,7 @@ impl Error {
                 "federation_user_target_steward_binding_forbidden"
             }
             Error::CommunityHasNoModerator { .. } => "federation_community_no_moderator",
+            Error::CohortStandingRefused { .. } => "federation_cohort_standing_refused",
             Error::FederationTierUnverified { .. } => "federation_federation_tier_unverified",
             Error::WitnessAdmit(e) => e.kind(),
             Error::Backend(_) => "federation_backend",

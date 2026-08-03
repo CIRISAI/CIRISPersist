@@ -4166,6 +4166,15 @@ impl crate::federation::FederationDirectory for SqliteBackend {
             ))
         })?;
         row.cohort_scope = cohort_scope.to_owned();
+        // CIRISPersist#592 (AV-84) — THE SECOND PLACEMENT DOOR.
+        // `repair_stranded_scope_backlog` re-scopes an already-federation row
+        // to a covering grant's audience through here, which can be
+        // `community` — so without this the standing gate on `promote_attestation`
+        // would have a door beside it, which is this repo's own recurring class
+        // (a rule shipped behind one door while the motion uses another).
+        // Verify-before-mutation (AV-9): `row` is a local clone and nothing has
+        // been written yet.
+        crate::federation::admission::check_promotion_cohort_standing(&row)?;
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
         let new_hash = crate::federation::types::compute_persist_row_hash(&for_hash)?;
@@ -39020,6 +39029,19 @@ mod tests {
             &backend,
             "sq589-self",
             "sq589",
+        )
+        .await;
+    }
+
+    /// #592 B9 / AV-84 — a targeted-cohort placement is a producer
+    /// self-declaration, on sqlite. Shared exercise body with memory +
+    /// postgres.
+    #[tokio::test]
+    async fn promotion_cohort_standing_gate_sqlite_592() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::bootstrap_admission::test_support::exercise_promotion_cohort_standing_gate(
+            &backend, "sq592",
         )
         .await;
     }

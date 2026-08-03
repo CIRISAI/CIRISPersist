@@ -3080,6 +3080,23 @@ impl crate::federation::FederationDirectory for MemoryBackend {
                     "federation_attestations row {attestation_id} does not exist"
                 ))
             })?;
+        // CIRISPersist#592 (AV-84) — THE SECOND PLACEMENT DOOR.
+        // `repair_stranded_scope_backlog` re-scopes an already-federation row
+        // to a covering grant's audience through here, which can be
+        // `community` — so without this the standing gate on
+        // `promote_attestation` would have a door beside it, this repo's own
+        // recurring class.
+        //
+        // Gated on a CANDIDATE clone, before `row` is touched: this backend
+        // holds `&mut` into live state, so stamping first and checking second
+        // would leave a REFUSED re-scope having already mutated the row — the
+        // AV-9 violation sqlite/postgres are structurally protected from by
+        // working on a loaded copy. Memory tolerating what the SQL backends
+        // reject is exactly the class this ordering exists to deny.
+        let mut candidate = row.clone();
+        candidate.cohort_scope = cohort_scope.to_owned();
+        crate::federation::admission::check_promotion_cohort_standing(&candidate)?;
+
         row.cohort_scope = cohort_scope.to_owned();
         let mut for_hash = row.clone();
         for_hash.persist_row_hash = String::new();
@@ -7758,6 +7775,18 @@ mod accord_tests {
             &backend,
             "mem589-self",
             "mem589",
+        )
+        .await;
+    }
+
+    /// #592 B9 / AV-84 — a targeted-cohort placement is a producer
+    /// self-declaration, on memory. Shared exercise body with sqlite +
+    /// postgres.
+    #[tokio::test]
+    async fn promotion_cohort_standing_gate_memory_592() {
+        let backend = MemoryBackend::new();
+        crate::federation::bootstrap_admission::test_support::exercise_promotion_cohort_standing_gate(
+            &backend, "mem592",
         )
         .await;
     }

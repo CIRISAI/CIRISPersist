@@ -27616,6 +27616,14 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         crate::federation::Error::RevocationBoundInvalid { reason } => {
             PyValueError::new_err(format!("{kind}: {}", reason.as_str()))
         }
+        // CIRISPersist#592 (AV-84) — caller-fixable, and the branch token
+        // rides in the message for the same reason the two above do: a Python
+        // consumer must be able to tell "the row names a third party" from a
+        // membership failure without holding a second copy of the taxonomy.
+        // Promote at a broad belonging-tier, or promote a row you authored.
+        crate::federation::Error::CohortStandingRefused { reason, .. } => {
+            PyValueError::new_err(format!("{kind}: {}", reason.as_str()))
+        }
     }
 }
 
