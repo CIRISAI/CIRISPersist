@@ -339,6 +339,65 @@ content?"*. Forcing one implementation onto both is the axis-fusion defect this 
 promote contract tightened again. A caller that promotes a row it did not author into `family` /
 `community` now gets `federation_cohort_standing_refused` where it previously got `Ok`. Broad-tier
 promotions (`federation` and friends) are unaffected.
+## [Unreleased] — #584: a subject-revoked `delegates_to` stops conferring stewardship
+
+`#578` repaired `live_owner_binding_granters`, which folded **only the granter's own** retraction
+when deciding whether an owner-binding was still live. `admission.rs` carried the same fold in three
+more places — `is_steward_bound`, `steward_bindings_of` and `steward_binding_chain` — so a
+`delegates_to` retracted under CEG §3.2.3 rule 2/3/4 (by its subject, by a canonical-bound claimant,
+by a consent-revocation proxy) kept conferring stewardship on the whole mesh, not just inside a
+reclaim ceremony. Same two-lists-that-disagree class as `#541`: the set we preserve was not the set
+we verify.
+
+### The fix is the extraction, not the fold
+
+`admission.rs` states the invariant `is_steward_bound(k) ⟺ !steward_bindings_of(k).is_empty()` in
+prose, with a note recording that `#306`'s fix had to be hand-mirrored into the second copy. So
+repairing the fold at ONE site makes a written invariant **false** — one side says *bound*, the
+other returns *empty*. That is exactly what the red-first witness shows: apply the naive partial fix
+and the biconditional fails.
+
+All four walks (the three above plus the ownership projection) are now one function,
+`live_delegation_granters(subject, filter)`, whose only per-caller axis is whether the edge must
+carry the CC 1.13.3.3 owner-binding dimension. `nodes_stewarded_by` inherits it for free — it is
+defined by re-asking `steward_bindings_of`. `owner_of ⊆ steward_bindings_of` now holds by
+construction rather than by two functions being edited in step.
+
+### BEHAVIOUR CHANGE — bindings accepted today start being refused
+
+This is deliberate, un-flagged and un-grandfathered: a subject-revoked delegation must not confer
+stewardship. The fold is **read-time**, so there is no migration and no stored-data change —
+previously-admitted rows simply stop resolving as live bindings.
+
+The blast radius is witnessed, not assumed. `check_no_moderator_federate_apply` scans
+`cohort_key_id`, which `#574` objection envelopes carry by design, and it reaches `is_steward_bound`.
+A commons whose authority root is a NODE key is moderator-bearing **solely** by the delegation
+clause, so a subject-revoked edge takes its moderator away and every subsequent federation-tier row
+keyed on it — including the `#574` objection and the `#591` ballot — is refused
+`federation_community_no_moderator` (CC 4.5.4 / §11.11 rule 3, "better no group than an unmoderated
+one"). The witness also proves the state is **exitable**: a fresh steward binding is a row about the
+node, not about the commons, so the §11.11 apply gate does not refuse the very act that lifts it.
+Commons rostered by `user`-role members — every existing `#574`/`#591` fixture — self-anchor and are
+untouched.
+
+### Left in place, named
+
+The three forward `delegates_to` BFS walks (`issuer_reaches_target_via_scoped_delegation`,
+`reachable_under_scope_with_reasons`, `enumerate_scoped_delegation_reach`) bucket retractions by the
+**granter only** under `DelegationWalkPolicy::MODERATION_DUTY` — the same defect class, one plane
+over: a subject-revoked edge in a moderation chain still confers a delegated duty. It is not folded
+in here for the reason `#578` did not fold in this issue: it is a different mesh-wide behaviour
+change (takedown / review authority), it needs a per-edge incoming-row read the current walk does not
+make, and it deserves its own red-first witnesses and its own adoption note.
+
+### Witnesses (memory · sqlite · postgres, one shared body through the real `put_attestation`)
+
+- `steward_binding_liveness_parity_*_584` — the biconditional asserted at **every** state
+  transition, plus subject-revocation liveness. The subject's `withdraws` is admitted under rule 2
+  by the real gate and the witness asserts `withdraws_admission_rule == Some(2)`, so it cannot
+  silently degrade into an unresolved-authority row that proves nothing.
+- `objection_plane_blast_radius_*_584` — the §11.11 consequence above, end to end, including
+  recovery.
 
 ## [26.0.0] — 2026-08-03 — #590/#589/#591/#567/#585/#580/#581: a promotion is a write, a registry row is a rule, and the checks that could not fail
 

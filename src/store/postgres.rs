@@ -20623,6 +20623,43 @@ mod tests {
             .await;
     }
 
+    /// (CIRISPersist#584) — the POSTGRES leg of the shared steward-binding
+    /// liveness witness (see the sqlite + memory legs); all three call the
+    /// SAME `admission::steward_liveness_test_support` body.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn steward_binding_liveness_parity_postgres_584() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::admission::steward_liveness_test_support::exercise_steward_binding_liveness(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
+    /// (CIRISPersist#584) — the POSTGRES leg of the objection-plane
+    /// blast-radius witness (see the sqlite + memory legs).
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn objection_plane_blast_radius_postgres_584() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::admission::steward_liveness_test_support::exercise_objection_plane_blast_radius(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
     /// v25.1.0 (CIRISPersist#570 ask 4) — the POSTGRES leg of the shared
     /// revocation-history-bound witness. The bound is a TIMESTAMPTZ column
     /// here and TEXT on sqlite, so the round-trip claim is per-backend.

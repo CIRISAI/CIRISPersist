@@ -15734,6 +15734,34 @@ mod tests {
             .await;
     }
 
+    /// (CIRISPersist#584) — the MEMORY leg of the shared steward-binding
+    /// liveness witness (the biconditional + subject-revocation liveness). All
+    /// three backends drive the SAME body through the real `put_attestation`,
+    /// so no backend can keep a subject-revoked `delegates_to` conferring
+    /// stewardship after the others stop.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn steward_binding_liveness_parity_memory_584() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::steward_liveness_test_support::exercise_steward_binding_liveness(
+            &backend, "mem",
+        )
+        .await;
+    }
+
+    /// (CIRISPersist#584) — the MEMORY leg of the objection-plane blast-radius
+    /// witness: the stricter fold DOES begin refusing #574 objections in a
+    /// node-rostered commons whose members' bindings are subject-revoked.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn objection_plane_blast_radius_memory_584() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::steward_liveness_test_support::exercise_objection_plane_blast_radius(
+            &backend, "mem",
+        )
+        .await;
+    }
+
     /// v25.1.0 (CIRISPersist#570 ask 4) — the MEMORY leg of the shared
     /// revocation-history-bound witness. Memory has no column to round-trip
     /// through, which is exactly why it runs: the ADMISSION gate must be
