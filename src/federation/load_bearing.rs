@@ -83,7 +83,7 @@ pub enum ObjectRef {
         /// The row's `key_id`.
         key_id: String,
     },
-    /// v27 (#564 stage 2) — a `federation_transport_destinations` row: one
+    /// CIRISPersist#564 stage 2 — a `federation_transport_destinations` row: one
     /// route, keyed as the table keys it. The issue's "transport routes →
     /// reachability to peers we may serve (#561's hop eligibility)".
     TransportDestination {
@@ -92,7 +92,7 @@ pub enum ObjectRef {
         /// The route's transport kind (`reticulum` / `websocket` / …).
         transport_kind: String,
     },
-    /// v27 (#564 stage 2) — a fountain-coded content unit, by its
+    /// CIRISPersist#564 stage 2 — a fountain-coded content unit, by its
     /// `(content_id, corpus_kind)` manifest key. The issue's "blobs / fountain
     /// units → the existing eviction plane already answers this; reuse rather
     /// than duplicate".
@@ -102,7 +102,7 @@ pub enum ObjectRef {
         /// The manifest's `corpus_kind`.
         corpus_kind: String,
     },
-    /// v27 (#564 stage 2) — a `hard_case_events` row, by `event_id`. The
+    /// CIRISPersist#564 stage 2 — a `hard_case_events` row, by `event_id`. The
     /// issue's "breach/hard_case evidence → load-bearing while any verdict
     /// process may cite it".
     HardCaseEvent {
@@ -238,8 +238,17 @@ pub enum ClassResolution {
     /// Resolved through the per-family declared predicate axis
     /// ([`super::namespace::supersets::load_bearing_predicate`]).
     PerFamilyPredicate,
-    /// Answered structurally from targeted reads on this class's own table.
+    /// Answered structurally from targeted reads on this class's own table —
+    /// **both directions**. Reads prove YES, and their emptiness proves NO,
+    /// so an object absent from them is genuinely not depended on here.
     StructuralReads,
+    /// Targeted reads prove YES, but **NO is unprovable**: some way of naming
+    /// this object has no index, so an empty read means "found no dependent by
+    /// the routes we can search", not "there is no dependent". Resolves
+    /// [`LoadBearing::Unknown`] rather than `No` — the distinction from
+    /// [`Self::StructuralReads`] that the whole fail-secure posture rests on,
+    /// and one a single "structural" label quietly erased.
+    StructuralYesOnly,
     /// DEFERRED to a plane that already owns this object's retention. Resolves
     /// [`LoadBearing::Unknown`] here on purpose: two mechanisms deciding one
     /// object's fate is the two-lists-that-disagree class #564 exists to avoid.
@@ -274,7 +283,7 @@ pub const fn object_class_policy(class: ObjectClass) -> ObjectClassPolicy {
              per-family predicate is the authority; an undeclared family resolves Unknown",
         ),
         ObjectClass::KeyRecord => (
-            ClassResolution::StructuralReads,
+            ClassResolution::StructuralYesOnly,
             "a key is load-bearing while any held row names it. `list_attestations_by` / \
              `list_attestations_for` prove YES; no index answers \"which rows name it as scrub \
              or co-scrub\", so NO stays unproven and resolves Unknown",
@@ -293,14 +302,23 @@ pub const fn object_class_policy(class: ObjectClass) -> ObjectClassPolicy {
              consent-driven hard delete, the §Q pin reserve. #564 says reuse rather than \
              duplicate, and a second mechanism with its own reasoning is exactly the \
              two-lists-that-disagree shape. Reference counting therefore declines to answer \
-             here and defers; deferring resolves Unknown, which is fail-secure",
+             here and defers; deferring resolves Unknown, which is fail-secure. \
+             NOTE this arm does not even run the absence check the other classes do: \
+             `FederationDirectory` carries no `(content_id, corpus_kind)` point-read \
+             (`get_fountain_content` is a `Backend` method, off the dyn surface), and \
+             `list_held_fountain_content` is keyed on the PUBLISHER. Absence would be \
+             cheap to answer once a point-read is promoted; until then Unknown \
+             subsumes it, which errs in the safe direction",
         ),
         ObjectClass::HardCaseEvent => (
             ClassResolution::NoReverseIndex,
             "breach evidence is load-bearing while any verdict process may cite it. Persist \
              emits and lists hard-case rows but stores no index of OPEN verdict processes, and \
              the WA quorum that turns evidence into sentences runs elsewhere — so nothing here \
-             can prove a given row uncited. Same shape as the declared-undeclared `accord:*` \
+             can prove a given row uncited. It also skips the absence check: `HardCaseFilter` \
+             filters on `kind`/`since` only, so a point-read by `event_id` would mean listing \
+             the whole corpus — the same cost stage 1 declined to spend on the key-record NO \
+             case. Same shape as the declared-undeclared `accord:*` \
              and `bond_posted:{currency}` families",
         ),
     };
@@ -327,10 +345,10 @@ pub enum DependencyKind {
     /// from the corpus — a declaration, which is the point: `trust:accepts:v1`
     /// must be load-bearing on a node that holds nothing else at all.
     DeclaredAlways,
-    /// v27 (#564 stage 2) — a LIVE route: removing it removes an address this
+    /// CIRISPersist#564 stage 2 — a LIVE route: removing it removes an address this
     /// node can be reached on, which is an action it may take.
     ReachabilityRoute,
-    /// v27 (#564 stage 2) — a RETIRED route kept deliberately so the tombstone
+    /// CIRISPersist#564 stage 2 — a RETIRED route kept deliberately so the tombstone
     /// gossips. Removing it would let a peer's stale route resurrect, so the
     /// tombstone is doing work precisely BECAUSE the route is dead.
     GossipTombstone,
@@ -752,7 +770,7 @@ async fn key_record_load_bearing(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// v27 (CIRISPersist#564 stage 2) — `may_release_copy`, and the ANTI-ENTROPY
+// CIRISPersist#564 stage 2 — `may_release_copy`, and the ANTI-ENTROPY
 // CONJUNCT that is the whole point of it.
 //
 //     may_release_copy(X) ⇔ is_load_bearing(X) == No ∧ anti_entropy_satisfied(X)
@@ -856,7 +874,7 @@ impl MayRelease {
     }
 }
 
-/// v27 (CIRISPersist#564 stage 2) — **may this node release its copy of
+/// CIRISPersist#564 stage 2 — **may this node release its copy of
 /// `object`?**
 ///
 /// `is_load_bearing(X) == No ∧ anti_entropy_satisfied(X)`. Evaluates both
@@ -884,7 +902,7 @@ pub async fn may_release_copy(
     })
 }
 
-/// v27 (CIRISPersist#564 stage 2) — the second conjunct: does `object`
+/// CIRISPersist#564 stage 2 — the second conjunct: does `object`
 /// verifiably reside where it is relative to?
 ///
 /// Returns [`AntiEntropy::Unverifiable`] for every object, naming the missing
@@ -1288,6 +1306,46 @@ pub(crate) mod test_support {
                 }
                 other => panic!(
                     "{} must be fail-secure Unknown, got {other:?}",
+                    class.as_str()
+                ),
+            }
+        }
+
+        // ── (9b) **The declared resolution must MATCH the observed one.**
+        //
+        //    `object_class_policy` describes how a class is reference-counted;
+        //    `is_load_bearing` decides it. Those are two statements of one
+        //    fact, and nothing but this makes them agree — flip a class's
+        //    `ClassResolution` and the doc would lie while the code carried on.
+        //    That is the two-lists-that-disagree class, and writing the policy
+        //    down is exactly what creates the second list.
+        //
+        //    Probed with ids that cannot exist, so the ONLY thing under test is
+        //    the class's resolution shape: a class that answers from reads says
+        //    `No` for an absent object, and a class that defers or has no
+        //    reverse index says `Unknown` regardless.
+        for class in super::ObjectClass::ALL {
+            let absent = ObjectRef::from_parts(
+                class.as_str(),
+                &format!("lb-absent-{suffix}"),
+                Some(&format!("lb-absent2-{suffix}")),
+            )
+            .expect("every class is constructible");
+            let verdict = is_load_bearing(dir, absent).await.expect("absent verdict");
+            match super::object_class_policy(class).resolution {
+                super::ClassResolution::PerFamilyPredicate
+                | super::ClassResolution::StructuralReads => assert_eq!(
+                    verdict,
+                    LoadBearing::No,
+                    "{} DECLARES it answers from reads in BOTH directions, so an absent object \
+                     must be `No`",
+                    class.as_str()
+                ),
+                super::ClassResolution::StructuralYesOnly
+                | super::ClassResolution::DeferredToOwningPlane
+                | super::ClassResolution::NoReverseIndex => assert!(
+                    matches!(verdict, LoadBearing::Unknown { .. }),
+                    "{} DECLARES it cannot prove NO, so it must resolve Unknown, got {verdict:?}",
                     class.as_str()
                 ),
             }

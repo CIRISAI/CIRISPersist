@@ -1229,7 +1229,7 @@ impl Engine {
         crate::federation::load_bearing::is_load_bearing(&*dir, object).await
     }
 
-    /// v27 (CIRISPersist#564 stage 2) — **may this node release its copy of
+    /// CIRISPersist#564 stage 2 — **may this node release its copy of
     /// `object`?**
     ///
     /// The host handle for
@@ -15052,7 +15052,7 @@ mod tests {
         assert!(verdict.treated_as_load_bearing());
     }
 
-    /// v27 (CIRISPersist#564 stage 2) — **the host-reachability witness** for
+    /// CIRISPersist#564 stage 2 — **the host-reachability witness** for
     /// `may_release_copy`, and the fail-secure property asserted where a
     /// caller would actually act on it.
     ///

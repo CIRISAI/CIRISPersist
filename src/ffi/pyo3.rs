@@ -2522,7 +2522,7 @@ impl PyEngine {
         })
     }
 
-    /// v27 (CIRISPersist#564 stage 2) — **may this node release its copy?**
+    /// CIRISPersist#564 stage 2 — **may this node release its copy?**
     ///
     /// `is_load_bearing(X) == "no" ∧ anti_entropy_satisfied(X)`. Returns the
     /// JSON [`MayRelease`](crate::federation::load_bearing::MayRelease)
