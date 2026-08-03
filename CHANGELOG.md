@@ -5,6 +5,70 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased] — #579: the classification unit is `(field, op)`, and one reading of the pointer is gone
+
+CIRISConstitution rc3 ratified the axis-fusion gate at CC 4.5.1.1 (resolving CIRISConstitution#44)
+with two refinements, and this cut lands persist's half of both.
+
+### The unit moved from the field to `(field, op)`
+
+`PERSIST_AUTHORED_AXIS_CLASSIFICATIONS` was `(field, kind, rationale)`; it is now
+`(field, op, kind, rationale)`. rc3's sentence is the whole argument: *"a slot meaning one relation
+under one operation and another under a different one is not one classifiable object; classifying it
+as one is how a fusion hides."*
+
+The new column is the obvious place to rebuild the very defect #532 closed, so `op` is pinned to a
+single meaning — **the emitting operation's signed discriminator, i.e. the row's
+`attestation_type`** — and the pin is a gate, not a docstring:
+
+- `axis_classification_ops_are_live_discriminators` binds every op token to a live
+  `attestation_type` constant. This is why CC's prose arm *"under composition"* lands as
+  `attestation_type::SUPERSEDES` and not the word `composition`: a class name in a discriminator
+  column is the same fusion at one remove.
+- `no_field_mixes_op_invariant_with_op_specific_rows` is the anti-fusion gate proper. `*`
+  (`AXIS_OP_EVERY`) means *holds under every op* and is never a fallback — so a field carries either
+  exactly one `*` row or only discriminator-named rows. Allowing both would make `*` mean "all ops"
+  in one row and "the remaining ops" in another: one name, two answers.
+
+Of the 15 proposals #532 filed pending ratification, rc3 settled all 15: 12 `n/a` + 2
+`axiomatic_intent` stand as proposed (with the live falsifiers rc3 attached to `scope` and `enabled`
+now recorded in their rationales, and rc3's *direction MUST NOT ride `consent`* recorded in that
+one), and the 15th is the op split below.
+
+### `references_attestation_id` no longer reads as a subject binding
+
+Three relations, three operations. Under `withdraws` the pointer is the revoke target
+(`axiomatic_intent`); under composition it is the temporal prior (`n/a`, not cross-axis at all); and
+under subject-binding it is **not admitted** — subject authority rides `subject_key_ids` and nothing
+else (CC 2.3.1 / CC 4.5.2.1). Removing that reading removes the third axis, and with it the
+pointer-decides-authority shape.
+
+That is a semantic claim about what a reference *means*, so it is exercised rather than asserted.
+`precedence::test_support::exercise_pointer_confers_no_subject_authority` runs on memory, sqlite and
+postgres through the real `put_attestation`, with controls on both sides: the subject of `P` may not
+revoke a row whose only relation to them is that it points at `P`; that same subject MAY revoke `P`
+itself (rule 2, admitted); the producer's own `withdraws` still follows the pointer and retires its
+target; and a subject-keyed read returns `P` and never the pointing row. Implementing the forbidden
+reading in `resolve_withdraws_admission_rule` fails all three legs.
+
+rc3 also attaches a revision condition — *"if any processor is found reading the pointer without the
+discriminator, op-separation has failed empirically and the remedy is the field split"* — so
+`every_pointer_read_is_discriminator_guarded` scans persist's own sources for it. A falsifier nothing
+evaluates is a ruling nobody can lose.
+
+`recants` is persist's own judgment call, flagged for CC: it is a structural composer, but persist's
+tombstone fold makes a `recipient_revoke` decision on its pointer exactly as it does on a
+`withdraws` one, so the composition/`n/a` arm would be a false claim. It is classified with the
+`withdraws` arm.
+
+### Also: `trace_manifest:v1.content_hash` is a digest again
+
+`check_trace_dimension_admission` validated `starts_with("sha256:")` and a non-empty remainder, so a
+truncated digest, an uppercase one, and `"sha256:"` + a sentence all admitted as conformant trace
+manifests. CC 3.1.5 requires the CC 2.6.3 encoding: `"sha256:"` + exactly 64 lowercase hex. Both live
+emitters (`ingest.rs`, the `engine.rs` backfill) already produce exactly that, so the gate now
+matches what it was always meant to check.
+
 ## [26.0.0] — 2026-08-03 — #590/#589/#591/#567/#585/#580/#581: a promotion is a write, a registry row is a rule, and the checks that could not fail
 
 Six issues. The through-line is one sentence: **a check that cannot fail is a report, and a report

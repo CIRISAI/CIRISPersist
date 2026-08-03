@@ -1846,6 +1846,28 @@ pub fn lift_envelope_attested_roles(row: &mut super::KeyRecord) {
 /// machine-checkable interim, the same posture as the CC#38 size cap.
 pub const TRACE_DIMENSION_PREFIX: &str = "trace:";
 
+/// CIRISPersist#579 (CC 3.1.5 → CC 2.6.3) — is `s` a well-formed sha256 digest
+/// token: the literal `"sha256:"` followed by **exactly 64 lowercase hex
+/// digits**?
+///
+/// CC 2.6.3 is the encoding rule every digest on the wire follows, and CC 3.1.5
+/// binds `trace_manifest:v1.content_hash` to it. Checking the prefix and "there
+/// is something after it" admits `sha256:` + a sentence, `sha256:DEADBEEF`
+/// (uppercase — a DIFFERENT byte string that hashes differently downstream),
+/// and a truncated digest: shapes a consumer will fail on, admitted here as
+/// conformant. A shape check that admits a malformed value is not a shape
+/// check.
+fn is_sha256_digest_token(s: &str) -> bool {
+    const PREFIX: &str = "sha256:";
+    const HEX_LEN: usize = 64;
+    s.strip_prefix(PREFIX).is_some_and(|hex| {
+        hex.len() == HEX_LEN
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    })
+}
+
 /// v18.1.0 (CIRISPersist#473 followup) — the `trace:*` Information-Type
 /// validator. No-op for non-`trace:` dimensions. For `trace:*`:
 ///
@@ -1857,7 +1879,8 @@ pub const TRACE_DIMENSION_PREFIX: &str = "trace:";
 ///    (strings) and EXACTLY ONE of:
 ///    - `trace` (object) — the inline post-scrub CompleteTrace, or
 ///    - `manifest` (object) — `schema == "trace_manifest:v1"`,
-///      `content_hash` a `"sha256:"`-prefixed string, positive integer
+///      `content_hash` a CC 2.6.3 digest token (`"sha256:"` + 64 lowercase
+///      hex — [`is_sha256_digest_token`], CIRISPersist#579), positive integer
 ///      `byte_len`, integer `component_count` (the CC#38 oversize form).
 ///
 /// Admission validates SHAPE, machine-checkably — a `trace:*` row that
@@ -1917,11 +1940,11 @@ pub fn check_trace_dimension_admission(
                 );
             }
             match m.get("content_hash").and_then(|v| v.as_str()) {
-                Some(h) if h.starts_with("sha256:") && h.len() > "sha256:".len() => {}
+                Some(h) if is_sha256_digest_token(h) => {}
                 _ => {
                     return refuse(
-                        "trace:* manifest form: \"content_hash\" must be a \
-                         \"sha256:\"-prefixed string"
+                        "trace:* manifest form: \"content_hash\" must be \
+                         \"sha256:\" + 64 lowercase hex (CC 3.1.5 / CC 2.6.3)"
                             .into(),
                     )
                 }
@@ -12863,12 +12886,17 @@ mod trace_dimension_tests {
         })
     }
 
+    /// A CC 2.6.3 digest token, the shape both live emitters produce
+    /// (`format!("sha256:{}", hex::encode(sha256))` — `ingest.rs` and the
+    /// `engine.rs` backfill).
+    const DIGEST: &str = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
     fn manifest_env() -> serde_json::Value {
         serde_json::json!({
             "dimension": "trace:complete:v1",
             "trace_id": "t-1", "agent_id_hash": "ah-1",
             "manifest": {"schema": "trace_manifest:v1",
-                          "content_hash": "sha256:abc123",
+                          "content_hash": DIGEST,
                           "byte_len": 2_000_000, "component_count": 16}
         })
     }
@@ -12927,21 +12955,21 @@ mod trace_dimension_tests {
             // both forms
             serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"a",
                                "trace":{}, "manifest":{"schema":"trace_manifest:v1",
-                               "content_hash":"sha256:x","byte_len":1,"component_count":1}}),
+                               "content_hash":DIGEST,"byte_len":1,"component_count":1}}),
             // inline not an object
             serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"a","trace":"str"}),
             // manifest wrong schema
             serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"a",
-                               "manifest":{"schema":"nope","content_hash":"sha256:x","byte_len":1,"component_count":1}}),
+                               "manifest":{"schema":"nope","content_hash":DIGEST,"byte_len":1,"component_count":1}}),
             // manifest un-prefixed hash
             serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"a",
                                "manifest":{"schema":"trace_manifest:v1","content_hash":"abc","byte_len":1,"component_count":1}}),
             // manifest zero byte_len
             serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"a",
-                               "manifest":{"schema":"trace_manifest:v1","content_hash":"sha256:x","byte_len":0,"component_count":1}}),
+                               "manifest":{"schema":"trace_manifest:v1","content_hash":DIGEST,"byte_len":0,"component_count":1}}),
             // manifest missing component_count
             serde_json::json!({"dimension":"trace:x:v1","trace_id":"t","agent_id_hash":"a",
-                               "manifest":{"schema":"trace_manifest:v1","content_hash":"sha256:x","byte_len":1}}),
+                               "manifest":{"schema":"trace_manifest:v1","content_hash":DIGEST,"byte_len":1}}),
         ];
         for (i, env) in cases.iter().enumerate() {
             let err = check_trace_dimension_admission(
@@ -12957,6 +12985,56 @@ mod trace_dimension_tests {
                 "case {i} typed kind"
             );
         }
+    }
+
+    /// CIRISPersist#579 (CC 3.1.5 → CC 2.6.3) — `content_hash` is a DIGEST,
+    /// not a string that starts with `"sha256:"`.
+    ///
+    /// The old check was `starts_with("sha256:") && len > 7`, so every value
+    /// below admitted as a conformant trace manifest: a truncated digest, an
+    /// UPPERCASE one (a different byte string — CC 2.6.3 fixes the encoding
+    /// precisely so two spellings of one digest cannot both be canonical), a
+    /// digest with a stray character, and `"sha256:"` + prose. Admission
+    /// validates SHAPE machine-checkably; a shape gate that admits a malformed
+    /// value is a gate that cannot fail.
+    #[test]
+    fn manifest_content_hash_must_be_lowercase_hex_cc_263() {
+        let with_hash = |h: &str| {
+            serde_json::json!({
+                "dimension": "trace:complete:v1",
+                "trace_id": "t-1", "agent_id_hash": "ah-1",
+                "manifest": {"schema": "trace_manifest:v1", "content_hash": h,
+                             "byte_len": 2_000_000, "component_count": 16}
+            })
+        };
+        let hex64 = &DIGEST["sha256:".len()..];
+        let bad = [
+            "sha256:abc123",                             // truncated
+            &format!("sha256:{}", hex64.to_uppercase()), // uppercase hex
+            &format!("sha256:{}g", &hex64[..63]),        // non-hex digit
+            &format!("sha256:{hex64}0"),                 // 65 nibbles
+            &format!("sha256:{}", &hex64[..63]),         // 63 nibbles
+            "sha256:not a hash at all, just some prose here that is long enough",
+            "sha256:",
+        ];
+        for h in bad {
+            let err = check_trace_dimension_admission(
+                Some("trace:complete:v1"),
+                "prod",
+                &subjects(&["prod"]),
+                &with_hash(h),
+            )
+            .expect_err(&format!("malformed digest {h:?} must refuse"));
+            assert_eq!(err.kind(), "federation_trace_dimension_invalid");
+        }
+        // The live emitters' shape still admits.
+        check_trace_dimension_admission(
+            Some("trace:complete:v1"),
+            "prod",
+            &subjects(&["prod"]),
+            &with_hash(DIGEST),
+        )
+        .expect("a real sha256 digest token admits");
     }
 }
 
