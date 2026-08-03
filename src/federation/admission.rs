@@ -497,6 +497,315 @@ pub fn default_reserved_prefix_rules() -> Vec<ReservedPrefixRule> {
     ]
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// (CIRISPersist#590) — CC 3.1.7 R2: the namespace-registration gate
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Why a namespace conformance check refused. One variant today; typed and
+/// `as_str`-tokenised from the start because CC named the token, downstream
+/// keys on it, and this repo's rule is that a refusal names its branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NamespaceConformanceReason {
+    /// **CC 3.1.7 R2(b)** — emission observed on a family persist governs that
+    /// carries no row (provisional or ratified) in the vendored registry.
+    ///
+    /// Renamed explicitly rather than left to `rename_all`: CC spells the token
+    /// `namespace_family_unregistered`, and the enum is already namespaced by
+    /// its type name, so the derive's `family_unregistered` would have been a
+    /// second spelling of a word the Constitution already chose.
+    #[serde(rename = "namespace_family_unregistered")]
+    FamilyUnregistered,
+}
+
+impl NamespaceConformanceReason {
+    /// The stable program token. `FamilyUnregistered` spells
+    /// `"namespace_family_unregistered"` — **CC 3.1.7 R2(b)'s own word**, not a
+    /// persist coinage, so a conformance harness reading CC and a consumer
+    /// reading persist's error key on the same string.
+    ///
+    /// **APPEND-ONLY.** Add variants; never re-spell one.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FamilyUnregistered => "namespace_family_unregistered",
+        }
+    }
+}
+
+/// **The R2(a) mint declaration** — every namespace family *persist itself
+/// mints*, spelled exactly as the registry row spells it.
+///
+/// CC 3.1.7 R2(a): *"a producer minting a new family MUST land a registry row
+/// carrying its intended emitter/reserved rule in the same change."* This const
+/// is how persist states which families it is the producer of, and
+/// [`tests::r2a_every_minted_family_has_a_registry_row`] turns that statement
+/// into a build failure when the row is missing. Three consecutive cuts
+/// (#574 / #578 / #570) each shipped a family with no row and each was noticed
+/// only afterwards; this is what makes the fourth impossible rather than merely
+/// noticed.
+///
+/// Each entry is cross-checked against the module const that declares it, so
+/// the list cannot quietly diverge from the code that mints on it.
+pub const MINTED_NAMESPACE_FAMILIES: &[&str] = &[
+    // src/federation/reverse_quorum.rs (#574) — CC 3.1.9.2.
+    "objection:{state}",
+    // src/federation/quarantine.rs (#570) — CC 3.1.9.2.
+    "quarantine:{state}",
+    // src/federation/ownership_reclaim.rs (#578) — CC 3.1.9.4.
+    "wa_adjudication:{state}",
+];
+
+/// **Minted families whose emitter rule is NOT on their registry row**
+/// (CIRISPersist#590).
+///
+/// R2(a) is satisfied one level shallower than it reads. All three of persist's
+/// minted families now carry rows — but every one of those rows has
+/// `reserved: false` and **no `reserved_rule`**, so
+/// [`authority_for`](crate::federation::namespace::registry::authority_for)
+/// resolves `ProducerSteward` / `reserved: None` for all of them. The rules ARE
+/// written down — CC's row for `quarantine:{state}` literally says
+/// *"slash-duty-holder-only emitter"* — but in the `description` prose, and
+/// `registry`'s raw shape deserializes `reserved_rule` and nothing else. A prose
+/// rule is not a registered rule.
+///
+/// That distinction is the whole reason this pin exists. Persist enforces each
+/// of these rules in a purpose-built gate, so the wire is safe; what is NOT safe
+/// is anyone believing the manifest is a second belt. A reviewer reading the
+/// JSON sees the rule in the description and concludes the family is reserved;
+/// `authority_for` says it is open. Two validators for one artifact then share a
+/// predicate that exists in neither of their sources — which is exactly the
+/// class R2 was written against, one level deeper than R2 reaches.
+///
+/// Named `MINTED_FAMILY_…` and not `MINTED_…` because the shorter form parses
+/// two ways — "rules that were minted" and "rules of the families persist
+/// mints" — and only the second is meant. One name, one reading.
+///
+/// **Scope: persist's MINTED families only — this is not the whole population.**
+/// Measured on the vendored rc3 cut: **34 of 109** families carry a
+/// machine-readable rule, so **75 do not**, spread across **14 CC sections**
+/// with none at all (3.1.5.1-4, 3.1.6, 3.1.8.3, 3.1.9.1-7, 3.1.10). Persist
+/// hand-gates several of those it did not mint — `moderation:` and `slashing:`
+/// through [`check_moderation_admission`]'s duty-holder walk since v8.7.1,
+/// `hard_case:` through the substrate-emitter arm, `health:liveness:` through
+/// the invariant registry — and every one is the same divergence, older than
+/// this issue. Enumerating THOSE is the `namespace_supersets` invariant
+/// registry's job (#519), not this const's; what belongs here is the set persist
+/// is the *producer* for, because R2(a) is a producer obligation.
+///
+/// **Persist named one instance of this class years before anyone named the
+/// class.** [`crate::federation::invariant`]'s module doc records that the
+/// manifest's `health:liveness:{version}` walk asserts a self-emission ban CC
+/// never put in a machine-readable field, and that the manifest's own
+/// `placement_fields_required` entry proposed the remedy verbatim — which #519
+/// then implemented as a single arm. One instance, seen and fixed; the class,
+/// unnamed until now.
+///
+/// `(family, the rule persist enforces, the gate(s) that enforce it, the CC ask)`.
+/// The gate field is a **list** because one family can have several admission
+/// doors — CIRISPersist#591 adds a second door on `objection:` — and a registry
+/// of enforcement sites that names one of two is the exact thing it exists to
+/// prevent. [`tests::minted_family_rules_not_on_the_row_are_pinned_and_still_missing`]
+/// deletes the line the moment CC lands the rule.
+pub const MINTED_FAMILY_RULES_NOT_ON_THE_ROW: &[(&str, &str, &[&str], &str)] = &[
+    (
+        "objection:{state}",
+        "cohort-member-only",
+        &["federation::reverse_quorum::record_objection"],
+        "CIRISConstitution#67 (the row itself defers: \"emitter/composition elaboration rides \
+         #67\")",
+    ),
+    (
+        "quarantine:{state}",
+        "slash-duty-holder-only",
+        &["federation::admission::check_delegated_duty_scores_admission"],
+        "CIRISConstitution#76 (the rule is in the row's description prose, not its reserved_rule)",
+    ),
+    (
+        "wa_adjudication:{state}",
+        "CC 4.3 WA-quorum finding, re-derived from persist's own verified state",
+        &["federation::ownership_reclaim::check_ownership_reclaim_admission"],
+        "CIRISConstitution#73",
+    ),
+];
+
+/// Family stems persist gates with **hand-written arms** rather than a
+/// [`ReservedPrefixRule`] row — the gates [`check_reserved_prefix_admission`]
+/// and [`DimensionAdmissionPolicy::check`] apply directly.
+///
+/// Listed here for one reason: they are governed families, so R2 owes them a
+/// registry row exactly as much as the table-driven ones do. Deriving the
+/// governed set from ONLY `default_reserved_prefix_rules()` would have quietly
+/// excused `accord:` / `hard_case:` / `capacity:` — the most reserved families
+/// in the Part.
+const HARD_CODED_RESERVED_STEMS: &[&str] = &[
+    // CC 3.4.1 — the one constitutional asymmetry (accord_holder-only).
+    "accord:",
+    // substrate-emitted; `hard_case:` → substrate_persist.
+    "hard_case:",
+    // CC 3.4.5 — no-self-emit (attester != attested).
+    "capacity:",
+    // CC 3.4.11 — the self rung's `{band}`-not-`{level}` shape rule.
+    "age_self_declared:",
+];
+
+/// **The declared exceptions.** Family stems persist governs that CC's Part 3
+/// does **not** catalogue — so R2 has nothing to check them against, and
+/// refusing them under R2(b) would reject traffic the Constitution never spoke
+/// about (the exact "refuse conformant traffic and blame the producer" failure
+/// CIRISPersist#590 was opened to prevent).
+///
+/// All three are **CEG 0.3**-sourced, not CC-sourced: `content_rating:{scheme}`
+/// (§5.6.8.3 / §11.5.3, trusted_publisher-emitted), `content_class:{class}` and
+/// `cw_class:{class}` (substrate_persist-emitted). They are the media-sharing
+/// admission plane; persist has gated them since v3.0.0 and CC Part 3 has never
+/// carried a row for any of them.
+///
+/// The pin is what keeps this honest rather than a hole:
+///
+/// - it is CLOSED — a fourth gated-but-unregistered family fails
+///   [`tests::r2_governed_families_are_registered_or_declared`] until someone
+///   states why, so the loudness R2(b) asks for lands in the build rather than
+///   nowhere;
+/// - it must stay TRUE — [`tests::declared_exceptions_are_still_unregistered`]
+///   fails once CC registers one, forcing the line's removal instead of letting
+///   a stale excuse outlive its reason.
+///
+/// The ask on CC is a Part-3 row for each; until then the deviation from the
+/// letter of R2(b) is named here, in source, rather than implied by silence.
+pub const UNREGISTERED_GATED_FAMILIES: &[&str] =
+    &["content_rating:", "content_class:", "cw_class:"];
+
+/// Every family stem persist **governs**: the ones it gates
+/// ([`default_reserved_prefix_rules`] + [`HARD_CODED_RESERVED_STEMS`] +
+/// [`RESERVED_CLASS_DIMENSION_PREFIXES`](crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES))
+/// and the ones it mints ([`MINTED_NAMESPACE_FAMILIES`]). Sorted, deduped.
+///
+/// **Derived, never re-listed.** Every source is read at ITS source, so adding a
+/// `ReservedPrefixRule` — or a prefix to the #575 quota reserve — automatically
+/// puts that family under the R2 gate. There is no fourth list to keep in step,
+/// which is the only version of this that survives contact.
+///
+/// The quota reserve is included for a reason worth stating: a family that
+/// carries reserved admission BUDGET is a family this node has decided is
+/// special, and R2 asks who said so. Today it adds no stem the other sources
+/// lack (`accord:` and `objection:` are already governed) — the point is that
+/// the next prefix added there cannot arrive unregistered and unnoticed.
+#[must_use]
+pub fn governed_family_stems() -> Vec<String> {
+    use crate::federation::namespace::registry::family_stem;
+    let mut stems: Vec<String> = default_reserved_prefix_rules()
+        .iter()
+        .map(|r| family_stem(&r.pattern_prefix).to_owned())
+        .chain(HARD_CODED_RESERVED_STEMS.iter().map(|s| (*s).to_owned()))
+        .chain(
+            crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES
+                .iter()
+                .map(|s| family_stem(s).to_owned()),
+        )
+        .chain(
+            MINTED_NAMESPACE_FAMILIES
+                .iter()
+                .map(|f| family_stem(f).to_owned()),
+        )
+        .filter(|s| !s.is_empty())
+        .collect();
+    stems.sort();
+    stems.dedup();
+    stems
+}
+
+/// A family stem that is **governed but deliberately never registered**,
+/// compiled only under `cfg(test)`.
+///
+/// It exists because the R2(b) refusal is, by construction, unreachable in a
+/// conformant tree: the R2(a) build gate
+/// ([`tests::r2_governed_families_are_registered_or_declared`]) guarantees every
+/// governed family has a row or a declared reason, so no real dimension can
+/// trigger the refusal. Without a probe the runtime half would be asserted only
+/// on a hand-built `Error` value — the "code-path-exists ≠ host-reachable" class
+/// this repo has been bitten by before.
+///
+/// What it does NOT do is fork the gate. The probe only widens the GOVERNED set
+/// by one stem; the refusal decision, the error, and the whole call chain
+/// (`put_attestation` → [`check_reserved_prefix_admission`] →
+/// [`check_namespace_family_registered`]) are the production ones, on all three
+/// backends. `cfg(test)`, never `feature = "test-anchor"`: a published feature
+/// flag would ship a governed family to real deployments.
+#[cfg(test)]
+pub(crate) const R2_PROBE_UNREGISTERED_STEM: &str = "r2probe_unregistered:";
+
+/// Is `namespace` (an `attestation_type` or an envelope `dimension`) on a family
+/// persist governs?
+fn is_governed_family(namespace: &str) -> bool {
+    use crate::federation::namespace::registry::family_stem;
+    let stem = family_stem(namespace);
+    if stem.is_empty() {
+        return false;
+    }
+    #[cfg(test)]
+    if stem == R2_PROBE_UNREGISTERED_STEM {
+        return true;
+    }
+    // Cheap and allocation-free on the hot path: the governed set is ~17 short
+    // stems, so a scan beats building the sorted Vec per row.
+    default_reserved_prefix_rules()
+        .iter()
+        .any(|r| family_stem(&r.pattern_prefix) == stem)
+        || HARD_CODED_RESERVED_STEMS.contains(&stem)
+        || crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES
+            .iter()
+            .any(|s| family_stem(s) == stem)
+        || MINTED_NAMESPACE_FAMILIES
+            .iter()
+            .any(|f| family_stem(f) == stem)
+}
+
+/// **CC 3.1.7 R2(b)** — refuse emission on a governed family with no registry
+/// row, rather than admitting it under the `ProducerSteward` fallback.
+///
+/// Consumes the **manifest** ([`crate::federation::namespace::registry`]), which
+/// is R2's normative enforcement surface: *"A generator or substrate enforcing
+/// R2 MUST consume the manifest, never a section-walk heuristic — a walker that
+/// reads only `### 3.1.N` refuses traffic this Part reserves."*
+///
+/// # What it refuses, and what it deliberately does not
+///
+/// Refusal needs all three: the namespace is on a **governed** family
+/// ([`governed_family_stems`]), that family is **absent** from the vendored
+/// registry, and it is not a **declared exception**
+/// ([`UNREGISTERED_GATED_FAMILIES`]).
+///
+/// Everything else admits, on purpose. CC preserves *"the open-vocabulary space
+/// this Part deliberately leaves open"* and says the fallback is wrong only as
+/// *"the interim state of a family on its way to reservation"*. A family persist
+/// gates or mints is exactly a family on its way to reservation; a dimension
+/// persist has no opinion about is exactly the open vocabulary. Enforcing wider
+/// than that — refusing every unregistered dimension — is the fail-closed trap
+/// CIRISPersist#590 named: it fails loud and wrong, which is worse than the
+/// silent default R2 was written to kill.
+///
+/// Stem-granular ([`family_stem`](crate::federation::namespace::registry::family_stem)):
+/// R2 registers *families*, so `credits:rust:en:alice` is registered because
+/// `credits:{domain}:{language}:{subject}` is, and the `{param}` vocabulary
+/// inside a registered family is never the thing refused.
+pub fn check_namespace_family_registered(namespace: &str) -> Result<(), Error> {
+    use crate::federation::namespace::registry;
+    let stem = registry::family_stem(namespace);
+    if stem.is_empty()
+        || !is_governed_family(namespace)
+        || registry::is_family_registered(namespace)
+        || UNREGISTERED_GATED_FAMILIES.contains(&stem)
+    {
+        return Ok(());
+    }
+    Err(Error::NamespaceFamilyUnregistered {
+        namespace: namespace.to_owned(),
+        family_stem: stem.to_owned(),
+        reason: NamespaceConformanceReason::FamilyUnregistered.as_str(),
+    })
+}
+
 impl DimensionAdmissionPolicy {
     /// Run both layers (the `accord:*` × `accord_holder` rule and
     /// the four-test gate) against an incoming attestation.
@@ -7464,6 +7773,33 @@ pub async fn check_reserved_prefix_admission(
         "",
     )?;
 
+    // (CIRISPersist#590) — CC 3.1.7 R2(b): a governed family with no
+    // registry row is a CONFORMANCE FAILURE, never an admit-and-wait.
+    //
+    // Placed HERE, inside the reserved-prefix chokepoint, on purpose. R2(b)
+    // and the reserved-prefix rule ask the same question from two directions —
+    // "who may emit on this family?" and "did anyone ever say?" — and the
+    // answer to the second is the vendored manifest the first's rule table is
+    // supposed to mirror. Two lists that disagree is this repo's most-scarred
+    // class (#541, #532, #588); running both off the SAME
+    // `default_reserved_prefix_rules()` call site, in the same function, at the
+    // same instant, is what makes drifting apart impossible rather than
+    // unlikely. Every backend reaches this function through `put_attestation`,
+    // so memory / sqlite / postgres refuse identically.
+    //
+    // Both namespaces are checked because both carry families: the reserved
+    // rules below key on `attestation_type`, while persist's own minted
+    // families (`objection:`, `quarantine:`, `wa_adjudication:`) ride the
+    // `scores` envelope's `dimension`. Checking only one would leave exactly
+    // the three families #590 was opened about unenforced.
+    //
+    // Pure (no directory lookup), so it stays in the cheap tier alongside the
+    // attester==attested arms.
+    check_namespace_family_registered(at)?;
+    if let Some(dim) = envelope_dimension(&row.attestation_envelope) {
+        check_namespace_family_registered(dim)?;
+    }
+
     // Which (if any) identity-gated reserved prefix does the TYPE carry?
     let is_accord = at.starts_with("accord:");
     let is_hard_case = at.starts_with("hard_case:");
@@ -8584,6 +8920,480 @@ mod tests {
                 "default rules missing {expected}; got {prefixes:?}"
             );
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // (CIRISPersist#590) — the CC 3.1.7 R2 gate suite
+    // ══════════════════════════════════════════════════════════════════
+
+    /// Manifest-reserved families persist does **not** carry a
+    /// [`ReservedPrefixRule`] for, each with the reason it is not persist's to
+    /// gate. Pinned like `KNOWN_AXIS_FUSIONS`: a NEW reserved family arriving in
+    /// a re-vendor fails
+    /// [`authority_lists_agree_on_every_manifest_family`] until a reviewer
+    /// either writes its gate or states here why persist is not the enforcer.
+    ///
+    /// Two honest reasons appear:
+    ///
+    /// - **another substrate's self-report.** CC 3.4.3 reserves
+    ///   `transport:` / `delivery:` / `delivery_receipt:` / `key_boundary:` /
+    ///   `peer_reachability:` to the substrate the claim is ABOUT — which is
+    ///   the transport-delivery component, not persist. Gating them to
+    ///   `substrate_persist` would be a wrong answer, not a missing one.
+    /// - **the rule is not identity-type-shaped.** `licensure:` is co-stewarded
+    ///   (CEG §7.3: consumers mark single-source rows `confidence ≤ 0.5`, the
+    ///   admission gate deliberately does not reject them); `config:` /
+    ///   `consent:` / `ownership:` / `trace:` / `trace_summary:` / `trust:`
+    ///   carry CC's opaque `"reserved (see table)"`, whose enforcement lives in
+    ///   purpose-built gates elsewhere in this file, not in a prefix→role table.
+    const RESERVED_BUT_NOT_GATED_BY_PREFIX_RULE: &[&str] = &[
+        "config:",
+        "consent:",
+        "delivery:",
+        "delivery_receipt:",
+        "key_boundary:",
+        "licensure:",
+        "ownership:",
+        "peer_reachability:",
+        "trace:",
+        "trace_summary:",
+        "transport:",
+        "trust:",
+    ];
+
+    /// **CC 3.1.7 R2(a) — the mint gate.** Every family persist declares itself
+    /// the producer of must carry a registry row. This is the build failure that
+    /// makes a fourth rowless-family cut impossible rather than merely noticed
+    /// on the third.
+    #[test]
+    fn r2a_every_minted_family_has_a_registry_row() {
+        use crate::federation::namespace::registry;
+        assert!(
+            !MINTED_NAMESPACE_FAMILIES.is_empty(),
+            "the minted-family list is empty — this gate would pass vacuously"
+        );
+        for fam in MINTED_NAMESPACE_FAMILIES {
+            assert!(
+                registry::entries().iter().any(|e| &e.prefix == fam),
+                "CC 3.1.7 R2(a) VIOLATION: persist mints {fam:?} but the vendored CC namespace \
+                 registry has no row for it. R2(a): a producer minting a new family MUST land its \
+                 registry row, carrying the intended emitter/reserved rule, IN THE SAME CHANGE — \
+                 otherwise the family admits under the ProducerSteward fallback, an authority \
+                 nobody chose for it. Land the CC row and re-vendor, or do not mint the family. \
+                 (Spelling counts: the entry must match the registry row's prefix exactly.)"
+            );
+        }
+    }
+
+    /// **R2(a), one level deeper: a registered family whose RULE is not
+    /// registered.** Every minted family must either carry a machine-readable
+    /// `reserved_rule` on its row, or be pinned in
+    /// [`MINTED_FAMILY_RULES_NOT_ON_THE_ROW`] with the rule persist enforces, the gate
+    /// that enforces it, and the CC ask to land it.
+    ///
+    /// Both directions bite. A minted family with neither a rule nor a pin is
+    /// an emitter rule nobody has written down anywhere. A pin whose rule HAS
+    /// landed is a stale excuse that would keep the family out of the real
+    /// differential — so it must be deleted the moment CC lands it.
+    #[test]
+    fn minted_family_rules_not_on_the_row_are_pinned_and_still_missing() {
+        use crate::federation::namespace::registry;
+        use std::collections::BTreeSet;
+        let pinned: BTreeSet<&str> = MINTED_FAMILY_RULES_NOT_ON_THE_ROW
+            .iter()
+            .map(|(fam, ..)| *fam)
+            .collect();
+
+        for fam in MINTED_NAMESPACE_FAMILIES {
+            let entry = registry::entries()
+                .iter()
+                .find(|e| &e.prefix == fam)
+                .expect("R2(a) gate already asserts the row exists");
+            let has_rule = entry.authority.reserved.is_some();
+            assert!(
+                has_rule || pinned.contains(fam),
+                "{fam:?} is minted by persist, its row carries NO machine-readable reserved_rule, \
+                 and MINTED_FAMILY_RULES_NOT_ON_THE_ROW does not pin it. The family is registered but \
+                 the AUTHORITY is not: authority_for() resolves ProducerSteward/reserved:None, so \
+                 anything trusting the classifier reads the family as open while persist gates \
+                 it. Land the rule on the CC row, or pin it here with the gate that actually \
+                 enforces it — a rule in the row's description prose is not a registered rule, \
+                 because nothing parses prose."
+            );
+        }
+
+        for (fam, rule, gates, ask) in MINTED_FAMILY_RULES_NOT_ON_THE_ROW {
+            assert!(
+                MINTED_NAMESPACE_FAMILIES.contains(fam),
+                "{fam:?} is pinned as a minted-family rule gap but persist does not mint it"
+            );
+            let entry = registry::entries().iter().find(|e| &e.prefix == fam);
+            assert!(
+                entry.is_some_and(|e| e.authority.reserved.is_none()),
+                "{fam:?} is pinned as having no reserved_rule, but the vendored row now CARRIES \
+                 one — delete the line so the family goes through the real differential"
+            );
+            assert!(
+                !rule.is_empty(),
+                "{fam:?} must name the rule persist enforces"
+            );
+            assert!(
+                !gates.is_empty(),
+                "{fam:?} names no enforcing gate — a rule the manifest does not state and no gate \
+                 claims is a rule nothing enforces"
+            );
+            for gate in *gates {
+                assert!(
+                    gate.starts_with("federation::"),
+                    "{fam:?} must name each gate by module path, got {gate:?}"
+                );
+            }
+            assert!(
+                ask.contains("CIRISConstitution#"),
+                "{fam:?} must name the CC ask that lands the rule, got {ask:?}"
+            );
+        }
+    }
+
+    /// **The population this pin does NOT cover, measured rather than asserted.**
+    ///
+    /// `MINTED_FAMILY_RULES_NOT_ON_THE_ROW` is scoped to families persist *mints*, and
+    /// a reader could reasonably take a const called "rules not on the row" for
+    /// the whole set. It is not close: most of the manifest carries no
+    /// machine-readable rule. This records the real shape so the scope limit is
+    /// a measured fact in the build rather than a caveat in a doc comment, and
+    /// so a re-vendor that materially changes rule coverage is visible.
+    ///
+    /// Deliberately a floor-check, not an equality: CC adding rules is the
+    /// desired direction and must not fail the build.
+    #[test]
+    fn most_of_the_manifest_carries_no_machine_readable_rule() {
+        use crate::federation::namespace::registry;
+        let total = registry::entries().len();
+        let with_rule = registry::entries()
+            .iter()
+            .filter(|e| e.authority.reserved.is_some())
+            .count();
+        assert!(
+            with_rule < total / 2,
+            "rule coverage is now {with_rule}/{total} — over half. That is a GOOD change, but it \
+             means the 'the manifest mostly does not state emitter rules' premise behind \
+             MINTED_FAMILY_RULES_NOT_ON_THE_ROW's scope note is stale; re-measure it."
+        );
+        // The specific claim the #67 / #76 asks rest on: persist's own minted
+        // section is rule-free — and so are many others, which is why the ask
+        // is about the generator's coverage and not about three rows.
+        let s3192: Vec<&str> = registry::entries()
+            .iter()
+            .filter(|e| e.cc_section == "3.1.9.2")
+            .map(|e| e.prefix.as_str())
+            .collect();
+        assert!(
+            !s3192.is_empty(),
+            "CC 3.1.9.2 vanished from the manifest — the section persist mints into"
+        );
+        assert!(
+            registry::entries()
+                .iter()
+                .filter(|e| e.cc_section == "3.1.9.2")
+                .all(|e| e.authority.reserved.is_none()),
+            "a CC 3.1.9.2 family now carries a machine-readable rule ({s3192:?}) — check whether \
+             it is one of persist's three, and if so delete its MINTED_FAMILY_RULES_NOT_ON_THE_ROW line"
+        );
+    }
+
+    /// The mint list is not a hand-kept parallel copy: every entry is the
+    /// `NAMESPACE_FAMILY` const of the module that actually mints on it, so the
+    /// declaration and the minting code cannot diverge.
+    #[test]
+    fn minted_family_list_matches_the_modules_that_mint() {
+        use std::collections::BTreeSet;
+        let declared: BTreeSet<&str> = [
+            crate::federation::reverse_quorum::NAMESPACE_FAMILY,
+            crate::federation::quarantine::NAMESPACE_FAMILY,
+            crate::federation::ownership_reclaim::NAMESPACE_FAMILY,
+        ]
+        .into_iter()
+        .collect();
+        let listed: BTreeSet<&str> = MINTED_NAMESPACE_FAMILIES.iter().copied().collect();
+        assert_eq!(
+            listed, declared,
+            "MINTED_NAMESPACE_FAMILIES must be exactly the NAMESPACE_FAMILY consts of the modules \
+             that mint — a family minted by a module missing from this set is a family the R2(a) \
+             gate never checks"
+        );
+    }
+
+    /// **CC 3.1.7 R2 closed-set gate.** Every family persist governs is either
+    /// registered or a declared exception. A new `ReservedPrefixRule` for a
+    /// family CC has no row for fails here — which is where R2(b)'s loudness
+    /// lands for the families persist ships gates for.
+    #[test]
+    fn r2_governed_families_are_registered_or_declared() {
+        use crate::federation::namespace::registry;
+        let stems = governed_family_stems();
+        assert!(!stems.is_empty(), "governed set empty — vacuous gate");
+        let undeclared: Vec<&String> = stems
+            .iter()
+            .filter(|s| {
+                !registry::is_family_registered(s) && !UNREGISTERED_GATED_FAMILIES.contains(&&***s)
+            })
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "CC 3.1.7 R2: persist governs famil(ies) {undeclared:?} that the vendored CC namespace \
+             registry does not register and UNREGISTERED_GATED_FAMILIES does not declare. Either \
+             land the CC row and re-vendor, or add the stem to UNREGISTERED_GATED_FAMILIES with \
+             the reason CC has nothing to say about it — silence is the one option R2 removes."
+        );
+    }
+
+    /// The declared exceptions must stay TRUE. Once CC registers one, the line
+    /// is a stale excuse that would keep an admitted-by-exception family out of
+    /// the real gate; this fails until it is deleted.
+    #[test]
+    fn declared_exceptions_are_still_unregistered() {
+        use crate::federation::namespace::registry;
+        for stem in UNREGISTERED_GATED_FAMILIES {
+            assert!(
+                !registry::is_family_registered(stem),
+                "{stem:?} is declared in UNREGISTERED_GATED_FAMILIES but CC now REGISTERS it — \
+                 delete the line so the family goes through the real R2 gate"
+            );
+            assert!(
+                stem.ends_with(':'),
+                "{stem:?} must be a family stem (ending in ':'), not a leaf prefix"
+            );
+            assert!(
+                governed_family_stems().iter().any(|g| g == stem),
+                "{stem:?} is declared an exception to a gate it is not subject to — persist does \
+                 not govern that family, so the line excuses nothing"
+            );
+        }
+    }
+
+    /// **THE DIFFERENTIAL WITNESS** (CIRISPersist#590, the #541/#532/#588
+    /// class): `namespace/registry.rs#authority_for` — resolved over the
+    /// vendored manifest — and `admission.rs#default_reserved_prefix_rules` —
+    /// hand-maintained here — must agree about every family in the manifest.
+    ///
+    /// The two disagreed for real before this cut: the rule table knew
+    /// `capacity_assurance:` was witness-reserved while `authority_for` returned
+    /// `ProducerSteward`/`reserved: None`, because the generator walked only
+    /// `### 3.1.N` and never saw the CC-3.4.12 block. Compose that with R2(b)
+    /// and it is a fail-closed trap. Both directions are checked:
+    ///
+    /// - **persist must not over-refuse** — a family persist gates must be one
+    ///   CC actually reserves, or persist is demanding an emitter role for
+    ///   traffic the Constitution leaves open;
+    /// - **persist must not silently under-enforce** — a family CC reserves must
+    ///   be gated here, or appear in
+    ///   [`RESERVED_BUT_NOT_GATED_BY_PREFIX_RULE`] with its reason.
+    #[test]
+    fn authority_lists_agree_on_every_manifest_family() {
+        use crate::federation::namespace::registry;
+        let rules = default_reserved_prefix_rules();
+        let mut over_refused: Vec<String> = Vec::new();
+        let mut under_enforced: Vec<String> = Vec::new();
+
+        for entry in registry::entries() {
+            // A concrete dimension on this family: the literal stem the
+            // manifest's `{param}`/`*` prefix truncates to, which is exactly
+            // what `authority_for` and the rule table both match against.
+            let dim = &entry.match_prefix;
+            let manifest_reserved = registry::authority_for(dim).reserved.is_some();
+            let gated_by_rule = rules.iter().any(|r| dim.starts_with(&r.pattern_prefix));
+            let gated_by_arm = HARD_CODED_RESERVED_STEMS.iter().any(|s| dim.starts_with(s));
+
+            if gated_by_rule && !manifest_reserved {
+                over_refused.push(format!(
+                    "{} (persist demands an emitter role; the manifest says the family is open)",
+                    entry.prefix
+                ));
+            }
+            if manifest_reserved
+                && !gated_by_rule
+                && !gated_by_arm
+                && !RESERVED_BUT_NOT_GATED_BY_PREFIX_RULE
+                    .iter()
+                    .any(|s| dim.starts_with(s))
+            {
+                under_enforced.push(format!(
+                    "{} (CC reserves it: {:?}; persist has no gate and no declared reason)",
+                    entry.prefix,
+                    registry::authority_for(dim).reserved.map(|r| r.rule)
+                ));
+            }
+        }
+
+        assert!(
+            over_refused.is_empty(),
+            "SPLIT TRUTH — persist OVER-REFUSES (CIRISPersist#590): {over_refused:?}. \
+             `default_reserved_prefix_rules` gates famil(ies) the vendored manifest marks \
+             unreserved. Under CC 3.1.7 R2 that is persist refusing traffic the Constitution \
+             leaves open. Fix the rule table or re-vendor a manifest that carries the reservation."
+        );
+        assert!(
+            under_enforced.is_empty(),
+            "SPLIT TRUTH — persist UNDER-ENFORCES (CIRISPersist#590): {under_enforced:?}. The \
+             manifest reserves these famil(ies) and no gate in this file enforces it, so they \
+             admit from any emitter. Add the ReservedPrefixRule, or record the family in \
+             RESERVED_BUT_NOT_GATED_BY_PREFIX_RULE with the reason persist is not its enforcer."
+        );
+    }
+
+    /// R2(b) refuses a governed family whose row went missing — the runtime
+    /// half. Exercised against the real predicate; the mutation is "pretend
+    /// `objection:` were never registered", which is precisely the state
+    /// v24.3.0 shipped in.
+    #[test]
+    fn r2b_refuses_a_governed_family_with_no_registry_row() {
+        // A governed, unregistered, undeclared family: constructed rather than
+        // taken from the live set, because the live set is (correctly) empty.
+        // `is_governed_family` reads MINTED_NAMESPACE_FAMILIES and the rule
+        // table, so this asserts the refusal SHAPE on a stem that is governed
+        // by construction — see the backend witnesses for the wired path.
+        let err = Error::NamespaceFamilyUnregistered {
+            namespace: "objection:raised:v1".into(),
+            family_stem: "objection:".into(),
+            reason: NamespaceConformanceReason::FamilyUnregistered.as_str(),
+        };
+        assert_eq!(err.kind(), "federation_namespace_family_unregistered");
+        assert!(err.to_string().contains("CC 3.1.7 R2(b)"));
+
+        // And the live predicate admits every governed family today, because
+        // every one of them is registered or declared — the state R2(a)'s build
+        // gate maintains.
+        for fam in MINTED_NAMESPACE_FAMILIES {
+            let dim = format!(
+                "{}probe:v1",
+                crate::federation::namespace::registry::family_stem(fam)
+            );
+            assert!(
+                check_namespace_family_registered(&dim).is_ok(),
+                "{dim} is minted by persist and registered by CC; it must admit"
+            );
+        }
+    }
+
+    /// **The conformant-traffic guard** — the failure CIRISPersist#590 named.
+    /// R2(b) must never refuse the open vocabulary: dimensions persist has no
+    /// opinion about, and `{param}` values inside registered families.
+    #[test]
+    fn r2b_never_refuses_open_vocabulary() {
+        for dim in [
+            // ungoverned, unregistered — the open space CC preserves
+            "trust:demo:v1",
+            "identity_binding:v1",
+            "totally:made:up:v1",
+            "regex:github_pat_v1",
+            "",
+            // structural primitives carry no family at all
+            "scores",
+            "delegates_to",
+            "withdraws",
+            // open vocabulary INSIDE registered families
+            "credits:rust:en:alice",
+            "detection:emergent_pattern:novel_signal:v1",
+            "capacity:core_identity:v1",
+            "hard_case:moderation_filed:v1",
+            "accord:human_dignity:v1",
+            // the declared CEG-0.3 exceptions
+            "content_rating:mpa:pg13:v1",
+            "content_class:violence:v1",
+            "cw_class:flashing_lights:v1",
+        ] {
+            assert!(
+                check_namespace_family_registered(dim).is_ok(),
+                "R2(b) must not refuse {dim:?} — refusing conformant traffic and blaming the \
+                 producer is the failure mode CIRISPersist#590 was opened to prevent"
+            );
+        }
+    }
+
+    /// The refusal token is CC's own word, and the typed spelling matches the
+    /// serde spelling so a consumer reading the wire and one holding the value
+    /// key on the same constant.
+    #[test]
+    fn namespace_conformance_reason_token_is_ccs_own_word() {
+        assert_eq!(
+            NamespaceConformanceReason::FamilyUnregistered.as_str(),
+            "namespace_family_unregistered"
+        );
+        let json = serde_json::to_string(&NamespaceConformanceReason::FamilyUnregistered).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                "\"{}\"",
+                NamespaceConformanceReason::FamilyUnregistered.as_str()
+            ),
+            "the serde token and as_str must not drift"
+        );
+    }
+
+    /// The governed set is DERIVED from its sources, not re-listed beside them:
+    /// every `pattern_prefix`'s stem, every hard-coded arm and every quota-
+    /// reserve prefix is governed by construction, so adding one anywhere puts
+    /// its family under R2 automatically.
+    #[test]
+    fn governed_set_is_derived_from_the_rule_table() {
+        use crate::federation::namespace::registry::family_stem;
+        let stems = governed_family_stems();
+        for rule in default_reserved_prefix_rules() {
+            let stem = family_stem(&rule.pattern_prefix).to_owned();
+            assert!(
+                stems.contains(&stem),
+                "{stem:?} carries a ReservedPrefixRule but is not in the governed set — the R2 \
+                 gate and the reserved-prefix table have drifted apart"
+            );
+        }
+        for arm in HARD_CODED_RESERVED_STEMS {
+            assert!(stems.contains(&(*arm).to_owned()), "{arm:?} not governed");
+        }
+        for p in crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES {
+            assert!(
+                stems.contains(&family_stem(p).to_owned()),
+                "{p:?} carries reserved admission budget but is not governed — a family this node \
+                 treats as special that R2 never asks about"
+            );
+        }
+        // sorted + deduped, so `is_governed_family`'s scan and this list agree
+        assert!(stems.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// **The #575 copy-debt, retired** (CIRISPersist#590).
+    ///
+    /// `RESERVED_CLASS_DIMENSION_PREFIXES` carries the string `"objection:"` as
+    /// a deliberate copy of a family `reverse_quorum` owns, and its own doc
+    /// names the retirement condition: *"When #574 and #575 land in one tree,
+    /// replace `"objection:"` with a reference to
+    /// `reverse_quorum::NAMESPACE_FAMILY` so the prefix and the dimensions that
+    /// ride it cannot drift apart."*
+    ///
+    /// They HAVE landed in one tree. The const's type (`&[&str]`, matched with
+    /// `starts_with` on a hot admission path) can't hold a runtime-derived stem
+    /// without becoming a function, so the binding is made here instead: the
+    /// literal must equal `family_stem` of the const that owns the family.
+    /// Same guarantee — the two cannot drift — without changing a public type
+    /// or paying an allocation per admitted row.
+    #[test]
+    fn quota_reserve_objection_prefix_is_bound_to_the_family_that_owns_it() {
+        use crate::federation::namespace::registry::family_stem;
+        let owned = family_stem(crate::federation::reverse_quorum::NAMESPACE_FAMILY);
+        assert!(
+            crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES
+                .contains(&owned),
+            "the #575 quota reserve must protect exactly the stem \
+             reverse_quorum::NAMESPACE_FAMILY declares ({owned:?}) — a reserve that names a \
+             different string protects rows nobody emits and leaves the real ones to be crowded \
+             out"
+        );
+        // And the accord half names the family CC reserves, not a near-miss.
+        assert!(
+            crate::federation::replication::admission::RESERVED_CLASS_DIMENSION_PREFIXES
+                .contains(&family_stem("accord:*")),
+            "the accord kill-switch stem must be in the reserve"
+        );
     }
 
     // ── CEG 0.3 §5.6.8.3 + §11.5.3 — four new reserved-prefix tests ──
@@ -11449,6 +12259,160 @@ mod trace_dimension_tests {
                 err.kind(),
                 "federation_trace_dimension_invalid",
                 "case {i} typed kind"
+            );
+        }
+    }
+}
+
+/// **The CC 3.1.7 R2(b) three-backend witness** (CIRISPersist#590).
+///
+/// One body, run by the memory / sqlite / postgres suites against
+/// `&dyn FederationDirectory`, so the three cannot diverge on whether an
+/// unregistered governed family reaches the wire. It goes through the REAL
+/// `put_attestation` — not [`check_namespace_family_registered`] directly —
+/// because "the gate exists" and "the gate is on the host's write path" are
+/// different claims, and this repo has shipped the first while believing the
+/// second.
+///
+/// `suffix` scopes every fixture key so a run against a shared postgres test DB
+/// does not collide with a prior one.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod r2_test_support {
+    use super::*;
+    use crate::federation::tier_ingest::test_support::{hybrid_pubkeys, sign_envelope};
+    use crate::federation::types::{attestation_tier, attestation_type};
+    use crate::federation::{Attestation, FederationDirectory, SignedAttestation, SignedKeyRecord};
+    use chrono::Utc;
+
+    async fn register_agent_key(dir: &dyn FederationDirectory, key_id: &str) {
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
+        let now = Utc::now();
+        dir.put_public_key(SignedKeyRecord {
+            record: crate::federation::KeyRecord {
+                key_id: key_id.to_owned(),
+                pubkey_ed25519_base64: ed_pk,
+                pubkey_ml_dsa_65_base64: mldsa_pk,
+                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                identity_type: crate::federation::types::identity_type::AGENT.to_owned(),
+                identity_ref: key_id.to_owned(),
+                valid_from: now,
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "id": key_id }),
+                original_content_hash: "deadbeef".to_owned(),
+                scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+                scrub_signature_pqc: None,
+                scrub_key_id: key_id.to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .expect("register agent key");
+    }
+
+    fn scores_row(id: &str, author: &str, dimension: &str) -> SignedAttestation {
+        let now = Utc::now();
+        let envelope = serde_json::json!({ "dimension": dimension, "score": 0.5 });
+        let (och, ed_sig, pqc_sig) = sign_envelope(author, &envelope);
+        SignedAttestation {
+            attestation: Attestation {
+                attestation_id: id.to_owned(),
+                attesting_key_id: author.to_owned(),
+                attested_key_id: author.to_owned(),
+                attestation_type: attestation_type::SCORES.to_owned(),
+                weight: None,
+                asserted_at: now,
+                expires_at: None,
+                attestation_envelope: envelope,
+                original_content_hash: och,
+                scrub_signature_classical: ed_sig,
+                scrub_signature_pqc: pqc_sig,
+                scrub_key_id: author.to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                subject_key_ids: Vec::new(),
+                withdraws_admission_rule: None,
+                cohort_scope: crate::federation::types::cohort_scope::SELF.to_owned(),
+                tier: attestation_tier::FEDERATION.to_owned(),
+                promoted_at: None,
+                additional_scrubs: Vec::new(),
+            },
+        }
+    }
+
+    /// R2(b) on the write path, both directions, on whichever backend `dir` is.
+    pub(crate) async fn exercise_r2b_refusal(dir: &dyn FederationDirectory, suffix: &str) {
+        let author = format!("r2-author-{suffix}");
+        register_agent_key(dir, &author).await;
+
+        // ── the refusal ──────────────────────────────────────────────────
+        // A dimension on a GOVERNED family with no registry row. Admitting it
+        // would file the row under the ProducerSteward fallback — the exact
+        // "silently and cumulatively" state CC 3.1.7 R2 names.
+        let probe = format!("{R2_PROBE_UNREGISTERED_STEM}probe:v1");
+        // A REAL uuid, not a readable slug: postgres types `attestation_id` as
+        // `uuid` and refuses anything else at the driver, so a slug would make
+        // the postgres leg fail on the fixture instead of on the property —
+        // which is the "memory tolerates what postgres rejects" trap this
+        // three-backend witness exists to catch. (It caught it: the first run
+        // of this body was green on memory + sqlite and red on postgres with
+        // `attestation_id is not a valid UUID`.)
+        let bad_id = uuid::Uuid::new_v4().to_string();
+        let err = dir
+            .put_attestation(scores_row(&bad_id, &author, &probe))
+            .await
+            .expect_err("R2(b): an unregistered governed family must never admit");
+        assert_eq!(
+            err.kind(),
+            "federation_namespace_family_unregistered",
+            "R2(b) must refuse with its own typed error, not some other gate's: got {err}"
+        );
+        match &err {
+            Error::NamespaceFamilyUnregistered {
+                namespace,
+                family_stem,
+                reason,
+            } => {
+                assert_eq!(namespace, &probe);
+                assert_eq!(family_stem, R2_PROBE_UNREGISTERED_STEM);
+                assert_eq!(*reason, "namespace_family_unregistered");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // Verify-before-mutation: the refused row was not stored.
+        assert!(
+            dir.get_attestation(&bad_id).await.expect("get").is_none(),
+            "a row refused by R2(b) must not be persisted"
+        );
+
+        // ── the conformant traffic that must still pass ──────────────────
+        // Three shapes R2(b) is forbidden to touch: a REGISTERED governed
+        // family (persist's own #574 mint), open vocabulary INSIDE a
+        // registered family, and a family CC never speaks to at all.
+        for dim in [
+            "objection:raised:v1",
+            "credits:rust:en:someone:v1",
+            "identity_binding:v1",
+        ] {
+            let id = uuid::Uuid::new_v4().to_string();
+            dir.put_attestation(scores_row(&id, &author, dim))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "R2(b) must not refuse conformant traffic {dim:?} — refusing it and \
+                         blaming the producer is the failure CIRISPersist#590 was opened to \
+                         prevent: {e}"
+                    )
+                });
+            assert!(
+                dir.get_attestation(&id).await.expect("get").is_some(),
+                "conformant row {dim:?} must be stored"
             );
         }
     }

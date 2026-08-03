@@ -14,6 +14,20 @@
 //! change is therefore a deliberate, reviewable bump of all three consts — the
 //! copy can never silently drift from the Constitution it mirrors.
 //!
+//! **The removal direction is the dangerous one** (CIRISPersist#590).
+//! A count bump plus a source-hash bump is the signature of *any* re-vendor —
+//! including one that silently DROPS families. CC's own first CC-3.1.7-R2
+//! regeneration lost four (`judge_model:verdict`, `health:liveness`,
+//! `seed_holder_voting_alignment`, `watchlist`) to a prose paragraph inserted
+//! mid-table (a blank line plus prose terminates a markdown table), and the
+//! only signal was a count discrepancy that was very nearly reconciled away.
+//! So the drift control is not only the three consts: [`VENDORED_FAMILY_PREFIXES`]
+//! pins every family this cut carries and
+//! [`tests::no_vendored_family_silently_disappears`] fails on any prefix that
+//! vanishes. Additions are cheap and pass; a removal must be moved to
+//! [`RETIRED_FAMILIES`] by hand, with a reason — which is exactly the review a
+//! silent drop never gets.
+//!
 //! [`namespace_registry.json`]: <the vendored file in this directory>
 
 use super::{Authority, AuthorityClass, ReservedRule};
@@ -24,14 +38,14 @@ const REGISTRY_JSON: &str = include_str!("namespace_registry.json");
 
 /// The CC version [`REGISTRY_JSON`] was generated from. Bump in lockstep when
 /// re-vendoring (the drift gate asserts the file's `_meta.cc_version` matches).
-pub const VENDORED_CC_VERSION: &str = "1.0-rc2";
+pub const VENDORED_CC_VERSION: &str = "1.0-rc3";
 /// SHA-256 of the CC `part_3_the_namespace.md` bytes the manifest was generated
 /// from (the manifest's `_meta.source_sha256`). Pins the exact source cut.
 pub const VENDORED_SOURCE_SHA256: &str =
-    "ade64edccce493e99f2617d236b1dffd6b99e2dfae91a9a4c012c9f4dfd6c64b";
+    "774062a90c0a31520648839e6bef110d3305d0f78d35cf3e821e3af6b4b02ba8";
 /// The number of prefix families in this vendored cut (the enumerated leaf
 /// count; CC 3.1's "83" summary is stale — see CIRISConstitution#30).
-pub const VENDORED_N_FAMILIES: usize = 95;
+pub const VENDORED_N_FAMILIES: usize = 109;
 
 /// One resolved namespace family — a CC 3.1 prefix, its owning component, and
 /// the [`Authority`] its reserved-prefix rule (CC 3.4) demands.
@@ -89,7 +103,17 @@ struct RawFamily {
 #[derive(serde::Deserialize)]
 struct RawReservedRule {
     rule: String,
-    cc_ref: String,
+    /// **Optional in the manifest.** Most reserved families name the CC 3.4
+    /// clause that rules them (`"CC 3.4.1"`); a family whose reservation is
+    /// stated in its own CC 3.1 catalogue row rather than a separate clause
+    /// carries `"cc_ref": null` (rc3: `trust:{job}:{version}`). Deserializing
+    /// that into a `String` is what a `serde` `missing field`/`invalid type`
+    /// panic at first `authority_for` call looks like, so it is typed
+    /// `Option` and resolved to the family's own catalogue section in
+    /// [`parse_manifest`] — never to an empty string, which would be a
+    /// citation that reads as present and points nowhere.
+    #[serde(default)]
+    cc_ref: Option<String>,
 }
 
 /// The literal stem of a family prefix — everything before the first `{`
@@ -150,7 +174,10 @@ fn parse_manifest() -> Vec<NamespaceEntry> {
             let match_prefix = match_prefix_of(&f.prefix);
             let reserved = f.reserved_rule.map(|r| ReservedRule {
                 rule: r.rule,
-                cc_ref: r.cc_ref,
+                // A manifest row with no `cc_ref` is ruled by its own CC 3.1
+                // catalogue row; cite THAT rather than leave the field an
+                // empty string a reader would take for a missing citation.
+                cc_ref: r.cc_ref.unwrap_or_else(|| format!("CC {}", f.cc_section)),
             });
             let class = class_for(&match_prefix, reserved.as_ref().map(|r| r.rule.as_str()));
             NamespaceEntry {
@@ -215,6 +242,193 @@ pub fn authority_for(dimension: &str) -> Authority {
         })
 }
 
+// ── (CIRISPersist#590, CC 3.1.7 R2) — family-STEM registration ──
+
+/// The **family stem** of a dimension or `attestation_type` — everything up to
+/// and including its first `:` (`"objection:raised:v1"` → `"objection:"`), or
+/// the whole token when it carries no `:`.
+///
+/// This is the granularity CC 3.1.7 R2 speaks at. R2 refuses "a family with no
+/// registry row"; a *family* is `objection:{state}`, not the leaf
+/// `objection:raised:v1`, and CC explicitly preserves "the open-vocabulary space
+/// this Part deliberately leaves open" — the `{param}` slots WITHIN a registered
+/// family. Enforcing at leaf granularity would refuse exactly that open
+/// vocabulary (`credits:{domain}:{language}:{subject}` admits any domain), which
+/// is the "refuse conformant traffic" failure CIRISPersist#590 was opened to
+/// prevent.
+#[must_use]
+pub fn family_stem(dimension: &str) -> &str {
+    match dimension.find(':') {
+        Some(i) => &dimension[..=i],
+        None => dimension,
+    }
+}
+
+/// Every **family stem** the vendored manifest registers, sorted and deduped.
+/// The R2 registration test: a stem in this set has at least one catalogue row,
+/// so a dimension under it is emitted on a *registered* family.
+pub fn registered_family_stems() -> &'static [&'static str] {
+    static STEMS: OnceLock<Vec<&'static str>> = OnceLock::new();
+    STEMS.get_or_init(|| {
+        let mut v: Vec<&'static str> = registry().iter().map(|e| family_stem(&e.prefix)).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    })
+}
+
+/// **CC 3.1.7 R2 registration predicate** — does `dimension` sit on a family the
+/// vendored manifest registers? Consumes the MANIFEST, never a section-walk
+/// heuristic (R2's normative enforcement surface: "a walker that reads only
+/// `### 3.1.N` refuses traffic this Part reserves").
+///
+/// Stem-granular by [`family_stem`]. `""` is not a family and answers `false`.
+#[must_use]
+pub fn is_family_registered(dimension: &str) -> bool {
+    let stem = family_stem(dimension);
+    !stem.is_empty() && registered_family_stems().binary_search(&stem).is_ok()
+}
+
+/// **The removal gate** (CIRISPersist#590 item 4). Every family prefix the
+/// vendored cut carries, pinned in source so a re-vendor that DROPS one fails
+/// the build instead of moving a count.
+///
+/// Direction matters and is asymmetric on purpose:
+///
+/// - **Additions are cheap.** A new CC family appears in the manifest, this list
+///   does not mention it, and nothing fails. Bump it when convenient.
+/// - **Removals are the incident.** CC's first R2 regeneration silently lost
+///   four families to a prose paragraph inserted mid-markdown-table; 106 + 3 − 4
+///   = 105 and the only signal was an arithmetic discrepancy. A prefix that
+///   disappears from the manifest fails
+///   [`tests::no_vendored_family_silently_disappears`] BY NAME, and clearing it
+///   means moving the line to [`RETIRED_FAMILIES`] with a reason.
+///
+/// Yes, this is a second list beside the manifest — deliberately. The
+/// disagreement between them IS the alarm; that is the opposite of the
+/// two-lists-that-quietly-disagree class (#541, #532, #588), where neither list
+/// could see the other.
+pub const VENDORED_FAMILY_PREFIXES: &[&str] = &[
+    "accord:*",
+    "activity_tier:{period}",
+    "age_assurance:{level}:{band}:{version}",
+    "age_self_declared:{band}:{version}",
+    "agent_files:{kind}:{platform_or_target}",
+    "approach:{goal_id}",
+    "attestation:agent_integrity",
+    "attestation:hardware_rooted",
+    "attestation:license_validity",
+    "attestation:registry_consensus",
+    "attestation:self_verify",
+    "audit_chain:hash_continuity",
+    "autonomy:{aspect}",
+    "benchmark:he300:{category}:{version}",
+    "beneficence:{aspect}",
+    "bond_posted:{currency}",
+    "build:registered:{target}",
+    "capacity:composite",
+    "capacity:core_identity",
+    "capacity:incompleteness_awareness",
+    "capacity:integrity",
+    "capacity:resilience",
+    "capacity:sustained_coherence",
+    "capacity_assurance:{level}:{domain}:{band}:{version}",
+    "cert_validity:{authority}",
+    "coherence_standing:{cohort}",
+    "commitment_fulfillment:{prior_contribution_id}",
+    "config:{scope}",
+    "conscience:coherence",
+    "conscience:entropy",
+    "conscience:epistemic_humility",
+    "conscience:optimization_veto",
+    "consent:{kind}",
+    "corpus_health:n_eff_measurable",
+    "credits:{domain}:{language}:substrate_building",
+    "credits:{domain}:{language}:{subject}",
+    "delivery:{class}",
+    "delivery_receipt:{stream_id}",
+    "detection:conscience_override_rate",
+    "detection:correlated_action:{axis}",
+    "detection:cross_agent_divergence",
+    "detection:distributive:access:{resource_type}",
+    "detection:hash_chain_integrity",
+    "detection:intra_agent_consistency",
+    "detection:temporal_drift",
+    "dma:csdma:*",
+    "dma:dsdma:{domain}:*",
+    "dma:idma:*",
+    "dma:pdma:*",
+    "expertise:{domain}:{language}",
+    "federation_directory:replication_lag",
+    "fidelity:explainability_sla:{tier}",
+    "fidelity:{aspect}",
+    "goal:{scale}",
+    "hard_case:{kind}",
+    "hardware_custody:{platform}",
+    "health:liveness:{version}",
+    "holds_bytes:sha256:{prefix}",
+    "identity_continuity:relational_anchor",
+    "integrity:{aspect}",
+    "judge_model:verdict:{model_id}",
+    "justice:{aspect}",
+    "key_boundary:{scope}",
+    "licensure:{authority_id}",
+    "locality:decision:{scale}",
+    "manifold_conformity:{cohort}",
+    "method:{approach_id}:{substrate_rung}",
+    "moderation:{allegation_type}",
+    "moderation_track_record:{community_key_id}",
+    "multilateral_participation:{forum}:{kind}",
+    "need:{domain}:{kind}",
+    "non_maleficence:{aspect}",
+    "objection:{state}",
+    "ownership:{relation}:{target_kind}:{version}",
+    "partner_role:{role}",
+    "peer_reachability:{network}",
+    "progress_measure:{method_id}",
+    "prohibited:{category}",
+    "provenance:build_manifest:{target}",
+    "provenance:build_manifest:{target}:locale:{lang_code}",
+    "provenance:skill_import:{source}",
+    "provenance:slsa:{level}",
+    "quarantine:{state}",
+    "ratchet:flag:coordinated_voting_cluster",
+    "ratchet:flag:counter_rii:{layer}",
+    "ratchet:flag:density_anomaly",
+    "ratchet:flag:expertise_attestation_anomaly",
+    "ratchet:flag:harassment_pattern",
+    "ratchet:flag:out_of_distribution_voting",
+    "reconsideration:{grounds}",
+    "revocation:{entity_type}:{reason}",
+    "rollback_detected:{revision_field}",
+    "seed_holder_voting_alignment:{cell}",
+    "slashing:{outcome}",
+    "system:*",
+    "testimonial_witness:{kind}",
+    "trace:{form}:{version}",
+    "trace_summary:{kind}",
+    "transparency_log:consistency",
+    "transparency_log:cosigned:{tree_size}",
+    "transparency_log:inclusion",
+    "transport:{kind}",
+    "trust:{job}:{version}",
+    "truth_grounding:{subject}",
+    "vote:{contribution_id}",
+    "wa_adjudication:{state}",
+    "watchlist:{id}",
+    "weighted_aggregate:{contribution_id}",
+    "witness_diversity:{contribution_id}",
+];
+
+/// Families CC has **deliberately retired** — present in an earlier vendored cut,
+/// intentionally absent from this one. Empty as of the rc3 vendor: no CC family
+/// has ever been retired, and every disappearance so far has been a generator
+/// accident.
+///
+/// The escape hatch for [`VENDORED_FAMILY_PREFIXES`]: moving a line here is how
+/// a reviewer says "this removal is intended", in a diff someone must read.
+pub const RETIRED_FAMILIES: &[&str] = &[];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +462,193 @@ mod tests {
         for w in reg.windows(2) {
             assert!(w[0].match_prefix.len() >= w[1].match_prefix.len());
         }
+    }
+
+    // ── (CIRISPersist#590) — the vendor-drift witnesses ──────────
+
+    /// **The equality that caught CC's own incident.** `_meta.n_families` is a
+    /// number the generator writes; `families[]` is what it actually emitted.
+    /// The four-family drop showed up as nothing else — the two disagreeing is
+    /// the whole signal, and it was nearly reconciled away by hand. Assert it,
+    /// and assert no prefix appears twice (a duplicate would let the count
+    /// match while a distinct family was lost).
+    #[test]
+    fn manifest_row_count_equals_meta_and_carries_no_duplicates() {
+        use std::collections::BTreeSet;
+        let raw: RawManifest = serde_json::from_str(REGISTRY_JSON).unwrap();
+        assert_eq!(
+            raw.families.len(),
+            raw.meta.n_families,
+            "MANIFEST SELF-CONTRADICTION (CIRISPersist#590): families[] has {} rows but \
+             _meta.n_families says {}. This exact discrepancy — and nothing else — was the only \
+             signal when CC's generator silently dropped four families to a prose paragraph \
+             inserted mid-table. Do not reconcile the number; find the missing rows.",
+            raw.families.len(),
+            raw.meta.n_families
+        );
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for f in &raw.families {
+            assert!(
+                seen.insert(f.prefix.as_str()),
+                "duplicate family prefix {:?} — a duplicate lets _meta.n_families balance while a \
+                 distinct family is missing",
+                f.prefix
+            );
+        }
+    }
+
+    /// **The removal direction.** Every prefix the pinned
+    /// [`VENDORED_FAMILY_PREFIXES`] list carries must still be in the manifest.
+    /// Additions are free; a disappearance fails BY NAME and is cleared only by
+    /// moving the line to [`RETIRED_FAMILIES`] — a diff a reviewer has to read.
+    #[test]
+    fn no_vendored_family_silently_disappears() {
+        use std::collections::BTreeSet;
+        let raw: RawManifest = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let live: BTreeSet<&str> = raw.families.iter().map(|f| f.prefix.as_str()).collect();
+        let retired: BTreeSet<&str> = RETIRED_FAMILIES.iter().copied().collect();
+        let missing: Vec<&&str> = VENDORED_FAMILY_PREFIXES
+            .iter()
+            .filter(|p| !live.contains(*p) && !retired.contains(*p))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "VENDOR DRIFT — REMOVAL (CIRISPersist#590): {} pinned famil(ies) vanished from the \
+             re-vendored manifest: {missing:?}. A family that disappears takes its reserved rule \
+             with it, so CC-reserved traffic starts admitting under the ProducerSteward fallback \
+             (CC 3.1.7 R2) and R2(b) starts refusing rows it should not. If the removal is \
+             INTENDED, move each line from VENDORED_FAMILY_PREFIXES to RETIRED_FAMILIES with a CC \
+             reference. If it is not, the generator lost them — CC's first R2 regeneration lost \
+             four to a prose paragraph inserted mid-markdown-table.",
+            missing.len()
+        );
+        // The pin must not itself rot: a family in BOTH lists is a
+        // contradiction ("retired" and "still expected" at once).
+        for p in RETIRED_FAMILIES {
+            assert!(
+                !VENDORED_FAMILY_PREFIXES.contains(p),
+                "{p:?} is in RETIRED_FAMILIES and VENDORED_FAMILY_PREFIXES at once"
+            );
+            assert!(
+                !live.contains(p),
+                "{p:?} is listed RETIRED but the manifest still carries it — un-retire it"
+            );
+        }
+    }
+
+    /// The pinned list is a list of REAL prefixes and is kept in sync in the
+    /// cheap direction too: it should describe the cut it ships with, so an
+    /// out-of-date pin (many additions un-recorded) is visible at a glance
+    /// rather than accumulating until the removal gate is meaningless.
+    #[test]
+    fn pinned_family_list_matches_this_vendored_cut() {
+        use std::collections::BTreeSet;
+        let raw: RawManifest = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let live: BTreeSet<&str> = raw.families.iter().map(|f| f.prefix.as_str()).collect();
+        let pinned: BTreeSet<&str> = VENDORED_FAMILY_PREFIXES.iter().copied().collect();
+        assert_eq!(
+            pinned.len(),
+            VENDORED_FAMILY_PREFIXES.len(),
+            "VENDORED_FAMILY_PREFIXES contains a duplicate"
+        );
+        let unpinned: Vec<&&str> = live.difference(&pinned).collect();
+        assert!(
+            unpinned.is_empty(),
+            "the vendored manifest carries famil(ies) the pin does not list: {unpinned:?} — add \
+             them to VENDORED_FAMILY_PREFIXES so the removal gate keeps covering them"
+        );
+    }
+
+    /// `family_stem` is the R2 granularity: up to and including the first `:`.
+    #[test]
+    fn family_stem_cuts_at_the_first_colon() {
+        assert_eq!(family_stem("objection:raised:v1"), "objection:");
+        assert_eq!(family_stem("objection:{state}"), "objection:");
+        assert_eq!(family_stem("accord:*"), "accord:");
+        assert_eq!(family_stem("scores"), "scores");
+        assert_eq!(family_stem(""), "");
+        assert_eq!(
+            family_stem("detection:distributive:access:x:v1"),
+            "detection:"
+        );
+    }
+
+    /// R2's registration predicate over the real manifest — including the three
+    /// families persist itself minted, which is the whole reason #590 exists.
+    #[test]
+    fn is_family_registered_answers_from_the_manifest() {
+        for dim in [
+            "objection:raised:v1",
+            "quarantine:withheld:v1",
+            "wa_adjudication:petition:v1",
+            "accord:invoke:halt",
+            "capacity:core_identity:v1",
+            // open vocabulary WITHIN a registered family stays registered —
+            // this is the traffic R2 explicitly preserves.
+            "credits:rust:en:someone",
+            "detection:emergent_pattern:novel_signal:v1",
+        ] {
+            assert!(is_family_registered(dim), "{dim} must be registered");
+        }
+        for dim in ["totally:made:up:v1", "", "scores"] {
+            assert!(!is_family_registered(dim), "{dim} must NOT be registered");
+        }
+    }
+
+    /// **The redundancy `RawFamily` bets on.** Its comment says the manifest's
+    /// `reserved` bool "is redundant with `reserved_rule` presence", and on that
+    /// basis serde **ignores `reserved` entirely**. If CC ever ships
+    /// `reserved: true` with no `reserved_rule`, persist reads that family as
+    /// OPEN while the manifest asserts it is reserved — a reservation dropped on
+    /// the floor by a parser doing what its comment promised.
+    ///
+    /// Perfectly correlated on this cut, zero rows in either direction. The bet
+    /// is sound; this is what makes it a checked bet rather than an assumption.
+    #[test]
+    fn reserved_bool_and_reserved_rule_presence_are_redundant() {
+        let raw: RawManifest = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let root: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let rows = root["families"].as_array().expect("families array");
+        assert_eq!(rows.len(), raw.families.len());
+        let mut asserted_but_unruled: Vec<&str> = Vec::new();
+        let mut ruled_but_unasserted: Vec<&str> = Vec::new();
+        for row in rows {
+            let prefix = row["prefix"].as_str().expect("prefix");
+            let flag = row
+                .get("reserved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let has_rule = row.get("reserved_rule").is_some_and(|v| !v.is_null());
+            if flag && !has_rule {
+                asserted_but_unruled.push(prefix);
+            }
+            if has_rule && !flag {
+                ruled_but_unasserted.push(prefix);
+            }
+        }
+        assert!(
+            asserted_but_unruled.is_empty(),
+            "{asserted_but_unruled:?} carry `reserved: true` with NO `reserved_rule`. serde \
+             ignores the bool, so `authority_for` reports these families OPEN while the manifest \
+             says they are reserved — a reservation silently dropped at the parser. Either CC \
+             must land the rule, or RawFamily must stop ignoring the bool."
+        );
+        assert!(
+            ruled_but_unasserted.is_empty(),
+            "{ruled_but_unasserted:?} carry a `reserved_rule` but `reserved: false` — the \
+             manifest contradicts itself about whether the family is reserved"
+        );
+    }
+
+    /// A `reserved_rule` with a null `cc_ref` (rc3's `trust:{job}:{version}`)
+    /// parses, and resolves to the family's own catalogue section rather than
+    /// an empty string that reads like a present-but-blank citation.
+    #[test]
+    fn null_cc_ref_resolves_to_the_catalogue_section() {
+        let a = authority_for("trust:charter:v1");
+        let r = a.reserved.expect("trust:{job} carries a reserved rule");
+        assert!(!r.cc_ref.is_empty(), "cc_ref must never be an empty string");
+        assert_eq!(r.cc_ref, "CC 3.1.1");
     }
 
     #[test]

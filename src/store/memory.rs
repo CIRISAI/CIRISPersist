@@ -15582,6 +15582,20 @@ mod tests {
             .await;
     }
 
+    /// (CIRISPersist#590, CC 3.1.7 R2(b)) — the MEMORY leg of the shared
+    /// namespace-registration witness. Memory tolerates what sqlite/postgres
+    /// reject, which is exactly why it gets its own leg: an R2 refusal that
+    /// lived in a backend-local guard rather than the shared
+    /// `check_reserved_prefix_admission` chokepoint would pass on two backends
+    /// and be silently absent on this one.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[tokio::test]
+    async fn namespace_family_unregistered_parity_memory_590() {
+        let backend = MemoryBackend::new();
+        crate::federation::admission::r2_test_support::exercise_r2b_refusal(&backend, "memory-r2")
+            .await;
+    }
+
     /// v25.1.0 (CIRISPersist#570 ask 4) — the MEMORY leg of the shared
     /// revocation-history-bound witness. Memory has no column to round-trip
     /// through, which is exactly why it runs: the ADMISSION gate must be

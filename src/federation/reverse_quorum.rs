@@ -122,17 +122,27 @@ pub const DIMENSION_OBJECTION: &str = "objection:raised:v1";
 /// asymmetry — see [`ReverseQuorumPolicy::dismissal_threshold`].
 pub const DIMENSION_DISMISSAL: &str = "objection:dismissed:v1";
 
-/// The CC 3.1 namespace family both dimensions live under. **Not yet in the
-/// vendored registry** ([`super::namespace::registry`] pins CC 1.0-rc2 at 95
-/// families); a dimension outside the manifest resolves
-/// [`AuthorityClass::ProducerSteward`](super::namespace::AuthorityClass::ProducerSteward),
-/// so these rows admit today and the ratification ask is about making the
-/// authority EXPLICIT rather than about unblocking the plane.
+/// The CC 3.1 namespace family both dimensions live under. **Registered**
+/// (CIRISPersist#590): CC 1.0-rc3 catalogues it at CC 3.1.9.2, owning
+/// component `node`, alongside `moderation:{allegation_type}`,
+/// `slashing:{outcome}` and `reconsideration:{grounds}`. Between #574 and the
+/// re-vendor it was rowless, which is the state CC 3.1.7 R2 exists to make
+/// impossible; it is now on the R2(a) mint gate
+/// ([`super::admission::MINTED_NAMESPACE_FAMILIES`]), so a future family minted
+/// without its row fails persist's own build.
 ///
-/// The ask: `objection:{state}`, owning component `node`, CC §3.1.9.2
-/// (alongside `moderation:{allegation_type}`, `slashing:{outcome}`,
-/// `reconsideration:{grounds}`), reserved rule **cohort-member-only** — which
-/// is precisely the gate [`record_objection`] already enforces here.
+/// **The row registers the family, NOT the emitter rule.** CC's row carries
+/// `reserved: false` and **no** `reserved_rule`; its description ends
+/// *"Registered per CC 3.1.7 R2(a); emitter/composition elaboration rides #67."*
+/// So [`authority_for`](super::namespace::registry::authority_for)`("objection:…")`
+/// returns `ProducerSteward` / `reserved: None`, before and after the re-vendor
+/// alike — contrast `accord:*`, whose row does carry `accord_holder-only`.
+///
+/// The cohort-member-only rule is therefore enforced by [`record_objection`] and
+/// by nothing else. Nothing on this plane reads `.reserved`, and nothing should
+/// start until the rule is on the row. Tracked in
+/// [`MINTED_FAMILY_RULES_NOT_ON_THE_ROW`](super::admission::MINTED_FAMILY_RULES_NOT_ON_THE_ROW);
+/// getting it onto the row rides CIRISConstitution#67.
 pub const NAMESPACE_FAMILY: &str = "objection:{state}";
 
 /// Envelope field names shared by the producer side and persist's fold, so

@@ -112,20 +112,35 @@ pub const DIMENSION_WITHHELD: &str = "quarantine:withheld:v1";
 /// without reconstructing anything.
 pub const DIMENSION_RELEASED: &str = "quarantine:released:v1";
 
-/// The CC 3.1 namespace family both dimensions live under. **Not yet in the
-/// vendored registry** ([`super::namespace::registry`]); a dimension outside
-/// the manifest resolves
-/// [`AuthorityClass::ProducerSteward`](super::namespace::AuthorityClass::ProducerSteward),
-/// so these rows admit today and the ratification ask is about making the
-/// authority EXPLICIT rather than about unblocking the plane.
+/// The CC 3.1 namespace family both dimensions live under. **Registered**
+/// (CIRISPersist#590): CC 1.0-rc3 catalogues it at CC 3.1.9.2, owning component
+/// `node`, alongside `moderation:{allegation_type}`, `slashing:{outcome}`,
+/// `reconsideration:{grounds}` and #574's `objection:{state}`. It is on the
+/// CC 3.1.7 R2(a) mint gate
+/// ([`super::admission::MINTED_NAMESPACE_FAMILIES`]): a family persist mints
+/// without landing its registry row now fails persist's own build.
 ///
-/// The ask (persist does NOT re-vendor the registry — this is a filing):
-/// `quarantine:{state}`, owning component `node`, CC §3.1.9.2 (alongside
-/// `moderation:{allegation_type}`, `slashing:{outcome}`,
-/// `reconsideration:{grounds}`, and #574's `objection:{state}`), reserved rule
-/// **slash-duty-holder-only** — which is precisely the gate
-/// [`check_delegated_duty_scores_admission`](super::admission::check_delegated_duty_scores_admission)
-/// already enforces on the [`QUARANTINE_DIMENSION_PREFIX`](super::admission::QUARANTINE_DIMENSION_PREFIX) arm.
+/// **The row registers the family, NOT the emitter rule.** CC's row says
+/// *"slash-duty-holder-only emitter"* in its `description` — human prose that
+/// nothing parses — while its machine-readable `reserved_rule` is **absent**.
+/// On the vendored rc3 cut this row is the **only** one of 109 whose
+/// description asserts an emitter rule its `reserved_rule` omits, which makes
+/// it the sharpest available example for the CC ask: the rule is decided, and
+/// it is one field away from being enforceable by anyone but us.
+/// `registry::RawFamily` deserializes `reserved_rule` and ignores everything
+/// else, so
+/// [`authority_for`](super::namespace::registry::authority_for)`("quarantine:…")`
+/// returns `ProducerSteward` / `reserved: None`.
+///
+/// So the slash-duty-holder gate at
+/// [`check_delegated_duty_scores_admission`](super::admission::check_delegated_duty_scores_admission)'s
+/// [`QUARANTINE_DIMENSION_PREFIX`](super::admission::QUARANTINE_DIMENSION_PREFIX)
+/// arm is the **only** enforcement. Nothing on this plane reads `.reserved`, and
+/// nothing should start until the rule is on the row — a prose rule read as a
+/// registered one is how two validators come to share a predicate that exists in
+/// neither of their sources. Tracked in
+/// [`MINTED_FAMILY_RULES_NOT_ON_THE_ROW`](super::admission::MINTED_FAMILY_RULES_NOT_ON_THE_ROW);
+/// getting it onto the row rides CIRISConstitution#76.
 pub const NAMESPACE_FAMILY: &str = "quarantine:{state}";
 
 /// Envelope field names shared by the producer side and persist's fold, so the

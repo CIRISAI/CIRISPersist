@@ -245,8 +245,9 @@ pub use admission::{
     verify_signed_transport_destination, verify_touch_claim_admission, withdraw_accord_role,
     withdraw_accord_role_over_roster, withdraw_canonical_role, withdraw_infra_attest_role,
     AttestationLadderTransitionPolicy, CanonicalWithdrawal, DimensionAdmissionPolicy,
-    DimensionRejectionReason, ReachabilityVerdict, ReservedPrefixRule, RoleWithdrawal,
-    ATTESTATION_LADDER_MECHANISMS, DEFAULT_MAX_TOUCH_SKEW,
+    DimensionRejectionReason, NamespaceConformanceReason, ReachabilityVerdict, ReservedPrefixRule,
+    RoleWithdrawal, ATTESTATION_LADDER_MECHANISMS, DEFAULT_MAX_TOUCH_SKEW,
+    MINTED_NAMESPACE_FAMILIES, UNREGISTERED_GATED_FAMILIES,
 };
 pub use blackhole::{BlackholeRecord, BlackholeRules, RETICULUM_IDENTITY_HASH_LEN};
 pub use blobs::{
@@ -4732,6 +4733,41 @@ pub enum Error {
         got_identity_type: String,
     },
 
+    /// (CIRISPersist#590, **CC 3.1.7 R2(b)**). Emission was observed on
+    /// a namespace family persist itself **governs** — one it gates
+    /// ([`admission::default_reserved_prefix_rules`] and the hard-coded reserved
+    /// arms) or one it **mints**
+    /// ([`admission::MINTED_NAMESPACE_FAMILIES`]) — that carries **no row** in
+    /// the vendored `namespace_registry.json`.
+    ///
+    /// R2(b): *"a substrate observing emission on a family with no registry row
+    /// (provisional or ratified) MUST surface it as a conformance failure
+    /// (`namespace_family_unregistered`), never admit-and-wait."* Admitting
+    /// would file the row under the `ProducerSteward` fallback — an authority
+    /// nobody chose for it — silently and cumulatively.
+    ///
+    /// The refusal is deliberately **stem-granular and scoped to governed
+    /// families**: the open-vocabulary space CC leaves open (`{param}` slots
+    /// inside a registered family, and families this Part never speaks to) is
+    /// untouched, because refusing it is the "reject conformant traffic and
+    /// blame the producer" failure CIRISPersist#590 was opened to prevent.
+    #[error(
+        "namespace family unregistered (CC 3.1.7 R2(b)): {namespace:?} is emitted on family \
+         {family_stem:?}, which persist governs but the vendored CC namespace registry does not \
+         register — admitting it would file it under the ProducerSteward fallback, an authority \
+         nobody chose for it"
+    )]
+    NamespaceFamilyUnregistered {
+        /// The `attestation_type` or envelope `dimension` that was refused.
+        namespace: String,
+        /// Its family stem (up to and including the first `:`) — the
+        /// granularity CC 3.1.7 R2 registers at.
+        family_stem: String,
+        /// Stable machine-readable reason token — CC's own R2(b) spelling, via
+        /// [`admission::NamespaceConformanceReason::as_str`].
+        reason: &'static str,
+    },
+
     /// v10.3.0 (CIRISPersist#288, CC 3.4.5). A `capacity:*` attestation
     /// was self-emitted (`attesting_key_id == attested_key_id`). The
     /// Constitution's "Critical enforcement" rule: a `capacity:*` score
@@ -5685,6 +5721,7 @@ impl Error {
             Error::ReservedPrefixEmitterMismatch { .. } => {
                 "federation_reserved_prefix_emitter_mismatch"
             }
+            Error::NamespaceFamilyUnregistered { .. } => "federation_namespace_family_unregistered",
             Error::EnvelopeSchemaViolation { .. } => "federation_envelope_schema_violation",
             Error::AccordHolderRequiresAttestationEvidence { .. } => {
                 "federation_accord_holder_requires_attestation_evidence"
