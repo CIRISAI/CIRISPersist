@@ -1674,12 +1674,38 @@ mod tests {
                  {load_bearing:?}"
             );
         }
-        assert!(!MayRelease::No {
+        let refusal = MayRelease::No {
             load_bearing: LoadBearing::No,
             anti_entropy: unverifiable,
-        }
-        .is_releasable());
+        };
+        assert!(!refusal.is_releasable());
         assert!(MayRelease::Yes.is_releasable());
+
+        // The FFI returns this as JSON TEXT, and the PyO3 docstrings promise a
+        // specific shape while warning that BOTH arms are truthy Python
+        // strings. Gate the shape those warnings are written against: a
+        // docstring naming a wire form nothing checks is the same
+        // two-statements-of-one-fact problem one layer out.
+        assert_eq!(
+            serde_json::to_string(&MayRelease::Yes).expect("serialize"),
+            "\"yes\"",
+            "the release arm must stay a bare string — the docstrings name it"
+        );
+        let refused = serde_json::to_string(&refusal).expect("serialize");
+        assert!(
+            refused.starts_with("{\"no\":"),
+            "the refusal arm must stay {{\"no\":…}} — the docstrings name it; got {refused}"
+        );
+        // Both are non-empty strings, i.e. TRUTHY in Python. This is the
+        // footgun the docstrings exist to name, asserted rather than asserted-
+        // about: if a future shape made one of them falsy, the warning would
+        // become wrong in the direction that reads as safe.
+        for json in [
+            serde_json::to_string(&MayRelease::Yes).expect("serialize"),
+            refused,
+        ] {
+            assert!(!json.is_empty() && json != "\"\"" && json != "0");
+        }
     }
 
     /// The deferring / unindexed classes resolve `Unknown` and NAME themselves
