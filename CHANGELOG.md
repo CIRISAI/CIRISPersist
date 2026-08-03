@@ -5,6 +5,85 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased] — #564 stage 2: the release predicate persist cannot satisfy, made structural
+
+Stage 1 shipped `is_load_bearing` — *"is this CEG object load-bearing on THIS node?"* — answering
+two object classes through the manifest's per-family predicate axis. Stage 2 is the rest of the
+sweep, plus the conjunct that decides whether an answer of `No` means anything.
+
+### The exhaustive object-class sweep
+
+#564's dependency-kind list names six kinds; stage 1 could address three. The other three had no way
+to even be **named** — `ObjectRef` had no arm for a route, a fountain unit, or a hard-case row.
+
+`ObjectClass` (closed, with `ALL`) and `object_class_policy` (exhaustive `match`) apply the
+`replication_policy::policy_for` discipline to the reachability axis: **a class without a declared
+predicate is a compile failure**, and `ObjectRef::class()` is exhaustive too, so a new arm cannot
+skip declaring how it is reference-counted.
+
+- **`TransportDestination` resolves structurally, in both directions.** A live route *is* the
+  reachability it provides; a retired route is a tombstone the route plane deliberately keeps
+  gossiping (`list_signed_transport_destinations_for` includes retired rows on purpose). Both are
+  dependents this node reads directly, so both prove `Yes` and their joint emptiness proves `No`.
+- **`FountainContent` DEFERS** to the eviction plane that already owns fountain retention. #564 says
+  reuse rather than duplicate, and a second mechanism reasoning about one object's fate is the
+  two-lists-that-disagree shape the issue exists to avoid. Deferring resolves `Unknown`.
+- **`HardCaseEvent` has no reverse index** of open verdict processes — the WA quorum that turns
+  evidence into sentences runs elsewhere — so *uncited* is unprovable. `Unknown`, the same shape as
+  the declared-`undeclared` `accord:*` and `bond_posted:{currency}` families.
+
+### `may_release_copy`, and the half that blocks it
+
+    may_release_copy(X) ⇔ is_load_bearing(X) == No ∧ anti_entropy_satisfied(X)
+
+Both halves, always evaluated, both reported — a `No` that named only the half checked first would
+send a caller to fix the wrong thing.
+
+**The finding that shapes the stage: persist cannot produce `AntiEntropy::Satisfied`.** It has no
+peer transport; its replication surface is inbound-apply plus outbound-**pull**, and a pull never
+learns who kept what; and no table, column or trait method records a peer acknowledging a holding.
+Residence is therefore structurally unverifiable here, so **release is unreachable** — which is the
+correct fail-secure posture rather than a stub. Closing it needs an acknowledgment plane written by
+the layer that actually talks to peers, and `Satisfied` is the shape that plane would have to
+produce.
+
+That claim is held by a **source scan over all of `src/`**, not a call-graph test, because the
+failure mode is somebody adding a `Satisfied` producer to make a later release path go green. Its
+needles are assembled at runtime so the scanner does not match its own source — a scan that trips on
+itself is a scan someone silences.
+
+The verdict type is deliberately **separate from the erasure plane's** (#573): reachability fails
+SECURE, erasure fails OPEN, and one shared "is this covered?" verdict would be wrong for one of them.
+
+### The gate the documentation created
+
+Writing `object_class_policy` down produced a *second* statement of how each class is
+reference-counted, with nothing making it agree with the code that decides. The cross-check probes
+every `ObjectClass::ALL` with ids that cannot exist and asserts the verdict shape the **declared**
+resolution predicts; it runs in the shared witness body, so all three backends enforce it.
+
+It went red on its first run, on a real disagreement: `KeyRecord` was labelled `StructuralReads`, but
+stage 1's key-record arm returns `Unknown` for an absent key — *"which rows name it as scrub or
+co-scrub"* has no index, so an empty read means "found none by the routes we can search", not "there
+is none". One label had erased exactly the distinction the fail-secure posture rests on. Split into
+`StructuralReads` (reads prove `Yes`, their emptiness proves `No`) and `StructuralYesOnly` (reads
+prove `Yes`; `No` is unprovable ⇒ `Unknown`).
+
+### Reachability
+
+`ObjectRef::from_parts` is the **one parse door** from a host `(kind, id, id2)` triple; both FFI
+entry points funnel through it, so they cannot drift into supporting different subsets — which is how
+stage 1's surface came to handle two classes and no more. `every_class_is_constructible_from_host_parts`
+iterates `ObjectClass::ALL`, so a class with no FFI door goes red rather than shipping unreachable
+(AV-77 / #444 / #589). Composite-keyed classes **refuse** a missing second key: a defaulted
+`transport_kind` answers confidently about a route the caller never asked about.
+
+`Engine::may_release_copy` and `may_release_copy_json` ship alongside; `is_load_bearing_json` gains
+`object_id2` (additive, defaulted).
+
+**Releases, evicts and mutates nothing.** Stages 3 (release) and 4 (compaction) remain open and are
+blocked on the acknowledgment plane above, not on effort.
+
 ## [27.0.0] — 2026-08-03 — #519/#586/#579/#571/#592/#584: the rules persist enforces, enumerated — and four preconditions nothing was testing
 
 Six issues, and a pattern that only became visible with all six in one cut: **v26.0.0 shipped four
