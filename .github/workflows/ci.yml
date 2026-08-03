@@ -83,13 +83,24 @@ jobs:
         # If a future feature ever gates substrate write-path code, flip
         # `gauntlet: true` on that entry. That is a real reason; "more is
         # safer" is not.
+        #
+        # v25.x (CIRISPersist#585) — a row names a LEG, not a feature list.
+        # `scripts/ci_feature_matrix.py set <leg>` derives the list from
+        # `Cargo.toml [features]` at run time. Until this cut the lists were
+        # spelled out here, which made this file a second inventory of which
+        # features exist — and it drifted: `secrets-server` was on no list, so
+        # NO job compiled it, and it sat broken through three releases with CI
+        # green. The `rest` leg is the COMPLEMENT (everything not carried by a
+        # row above and not held out in `NOT_TESTED`), so a feature added to
+        # Cargo.toml is tested without anyone remembering to come here.
         substrate:
-          - { name: core,       features: "postgres server pyo3 sqlite",            gauntlet: true }
-          - { name: cirisaudit, features: "postgres server pyo3 sqlite cirisaudit", gauntlet: false }
-          - { name: secrets,    features: "postgres server pyo3 sqlite secrets",    gauntlet: false }
-          - { name: cirisnode,  features: "postgres server pyo3 sqlite cirisnode",  gauntlet: false }
-          - { name: cirisgraph, features: "postgres server pyo3 sqlite cirisgraph", gauntlet: false }
-          - { name: telemetry,  features: "postgres server pyo3 sqlite telemetry",  gauntlet: false }
+          - { name: core,       leg: core,       gauntlet: true }
+          - { name: cirisaudit, leg: cirisaudit, gauntlet: false }
+          - { name: secrets,    leg: secrets,    gauntlet: false }
+          - { name: cirisnode,  leg: cirisnode,  gauntlet: false }
+          - { name: cirisgraph, leg: cirisgraph, gauntlet: false }
+          - { name: telemetry,  leg: telemetry,  gauntlet: false }
+          - { name: rest,       leg: rest,       gauntlet: false }
     services:
       postgres:
         # CIRISPersist#222 — PLAIN postgres:16, NOT timescaledb. The
@@ -153,7 +164,7 @@ jobs:
       # whole CI sat for >1h before I cancelled by hand.
       - name: install cargo-nextest
         uses: taiki-e/install-action@nextest
-      - name: cargo nextest (postgres + server + pyo3 + ${{ matrix.substrate.name }})
+      - name: cargo nextest (leg ${{ matrix.substrate.leg }} — features derived from Cargo.toml)
         # v2.0.1 — workflow-level kill switch independent of nextest:
         # if nextest itself stalls (or the runner does), GA aborts at
         # 35 min instead of waiting an hour.
@@ -166,7 +177,16 @@ jobs:
         # the gauntlet), so this step-level number is a backstop against the
         # RUNNER stalling, not the primary hang detector — which is why adding
         # headroom here costs no diagnostic sharpness.
-        timeout-minutes: 35
+        #
+        # v25.x (CIRISPersist#585) — 50 for `rest` only. That leg carries the
+        # ~30 features no named leg does, so it compiles a wider graph from a
+        # cache warmed for the `core` shape, and runs 2678 tests (measured
+        # green locally: 2678 passed, 10 skipped, 986s of test time) — more
+        # than any existing leg. Same reasoning as #543's 25→35: this is the
+        # runner-stall backstop, not the hang detector — `.config/nextest.toml`
+        # still kills a hung test by name at its own bound — so the headroom
+        # costs no diagnostic sharpness.
+        timeout-minutes: ${{ matrix.substrate.leg == 'rest' && 50 || 35 }}
         env:
           CIRIS_PERSIST_TEST_PG_URL: postgres://ciris:ciris@localhost:5432/ciris_persist_test
         # --test-threads=1 — nextest spawns each test in its own
@@ -183,15 +203,45 @@ jobs:
         # class in one line at the cost of slightly higher per-entry
         # wall time (still bounded by `timeout-minutes: 25` below,
         # and the matrix axis still parallelizes across substrates).
-        run: >-
-          cargo nextest run --all-targets --no-fail-fast
-          --test-threads=1 --features
-          "${{ matrix.substrate.features }}"
-          ${{ matrix.substrate.gauntlet && ' ' || '-E ''not test(/substrate_machine/)''' }}
+        #
+        # v25.x (CIRISPersist#585) — the feature list is DERIVED from
+        # `Cargo.toml [features]`, never spelled here. It is echoed first so a
+        # failure is attributable to an exact set from the log alone.
+        run: |
+          set -euo pipefail
+          FEATURES="$(python3 scripts/ci_feature_matrix.py set '${{ matrix.substrate.leg }}')"
+          echo "leg '${{ matrix.substrate.leg }}' → --features \"${FEATURES}\""
+          cargo nextest run --all-targets --no-fail-fast \
+            --test-threads=1 --features "${FEATURES}" \
+            ${{ matrix.substrate.gauntlet && ' ' || '-E ''not test(/substrate_machine/)''' }}
       - name: cargo nextest (default — fixture suite)
         if: matrix.substrate.name == 'core'
         timeout-minutes: 5
         run: cargo nextest run --test wire_format_fixtures
+      # v25.x (CIRISPersist#585) — the `test-anchor` CONFIGURATION, which CI
+      # had never run at all. It is not a flag that can ride another leg's
+      # feature list: the feature compiles the genesis relaxation in and
+      # `ciris_verify_core::test_anchor::test_anchor_active()` (reading
+      # `CIRIS_TEST_TRUST_ROOT`) switches it on, so with the env unset it is
+      # inert and a 30-feature leg carrying it would certify nothing. It needs
+      # its own invocation — and nextest specifically, because the genesis
+      # fixtures use `std::env::set_var` and per-test process isolation is what
+      # keeps that from leaking into the rest of the suite.
+      #
+      # A RIDER, not a matrix row: sqlite-only, ~1650 tests, ~2 min of test
+      # time. A whole runner for it would be the local-optimization /
+      # global-pessimization trade #543 already rejected, so it rides
+      # `cirisaudit` (the shortest leg) as an extra step.
+      # `scripts/ci_feature_matrix.py check` fails if this step is dropped or
+      # if its host leg changes.
+      - name: cargo nextest (test-anchor configuration — sqlite only)
+        if: matrix.substrate.leg == 'cirisaudit'
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          FEATURES="$(python3 scripts/ci_feature_matrix.py set test-anchor)"
+          echo "rider 'test-anchor' → --features \"${FEATURES}\""
+          cargo nextest run --no-fail-fast --features "${FEATURES}"
       # v0.5.4 (CIRISPersist#29) — Python regression test for the FFI
       # catch_panic layer. Builds the wheel with the `test-panic`
       # feature gate enabled (release wheels don't), then pytest
@@ -933,6 +983,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      # v25.x (CIRISPersist#585) — this job now also runs an --all-features
+      # clippy pass, which pulls the Candle/ORT graph on top of the ~3.7 GB
+      # CIRISCache restore. Check-only, so no object code, but the headroom is
+      # cheap and the ENOSPC-kills-the-agent signature (v17.5.0/.1) is not.
+      # Same inline rm the test + wheel legs use — no third-party action.
+      - name: Free runner disk (reclaim unused preinstalled toolchains)
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "after:"; df -h / | tail -1
       # v10.7.0 (CIRISVerify v8.0.0, #141) — no libtss2-dev; clippy compiles
       # the full graph but ciris-keyring no longer link-binds tss-esapi.
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -946,14 +1009,37 @@ jobs:
           plat: linux-x86_64
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
-      # v2.0 — clippy over the same widened feature set as the test
-      # job, so the substrate backends (cirisaudit, secrets, …) are
-      # lint-gated, not just compiled.
-      - name: cargo clippy
-        run: >-
-          cargo clippy --all-targets --features
-          "postgres server pyo3 sqlite cirisaudit secrets cirisnode cirisgraph telemetry"
-          -- -D warnings
+      # v25.x (CIRISPersist#585) — the coverage gate. Pure Python over
+      # Cargo.toml + this file; ~40 ms, no compilation, so it fails FIRST and
+      # names the uncovered feature instead of letting a 10-minute build
+      # discover it. This is the inversion #585 asks for: omission is now an
+      # error, where before it was silence.
+      - name: feature-matrix coverage gate
+        run: python3 scripts/ci_feature_matrix.py check
+      # v2.0 — clippy over the shipped-shape feature set. NOT redundant with
+      # the --all-features pass below: `dead_code` / `unused_imports` fire only
+      # when a feature is OFF, so the narrow pass catches lints the total pass
+      # structurally cannot. The set is derived (`set lint`), not spelled.
+      - name: cargo clippy (shipped shape)
+        run: |
+          set -euo pipefail
+          FEATURES="$(python3 scripts/ci_feature_matrix.py set lint)"
+          echo "--features \"${FEATURES}\""
+          cargo clippy --all-targets --features "${FEATURES}" -- -D warnings
+      # v25.x (CIRISPersist#585) — the COMPILE-totality gate, and the one
+      # `secrets-server` needed. `--all-features` cannot omit a feature, so a
+      # feature added to Cargo.toml is compiled + linted from the moment it
+      # exists; `secrets-server` went three releases uncompiled precisely
+      # because the list here was written by hand and it was not on it.
+      #
+      # Check-only (clippy emits metadata, never links or codegens), so despite
+      # pulling the Candle/ORT graph this is far cheaper than a build job, and
+      # it rides the existing lint runner rather than adding one. This job is
+      # RESTORE-only for CIRISCache, so the ML artifacts never enter the shared
+      # blob. `scripts/ci_feature_matrix.py check` fails if this line is
+      # deleted — it is the only thing making coverage total by construction.
+      - name: cargo clippy (--all-features — every feature compiled, none omittable)
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
       # No save here — the linux-x86_64-test `core` leg is the single saver for
       # the shared linux-x86_64 key (#311), so this restore-only job can't race

@@ -23,9 +23,25 @@ if git diff --cached --quiet; then
     exit 0
 fi
 
-# Only run if Rust files changed. Bench-only / changelog-only /
-# migration-only / docs-only commits skip the full Rust gate.
-if ! git diff --cached --name-only | grep -qE '\.rs$|^Cargo\.(toml|lock)$'; then
+STAGED="$(git diff --cached --name-only)"
+
+# v25.x (CIRISPersist#585) — the coverage gate keys off the files that
+# CAN break coverage, which are not Rust files: Cargo.toml's feature
+# table, the workflow, and the derivation itself. Milliseconds, so it
+# runs before the expensive Rust gates and before their file filter.
+if echo "$STAGED" | grep -qE '^Cargo\.toml$|^\.github/workflows/ci\.yml$|^scripts/ci_feature_matrix\.py$|^pyproject\.toml$'; then
+    echo "─── pre-commit: feature-matrix coverage gate ───"
+    # Same predicate, same implementation, as CI's `lint` job.
+    if ! python3 scripts/ci_feature_matrix.py check; then
+        echo
+        echo "✗ feature coverage gate failed — see above." >&2
+        exit 1
+    fi
+fi
+
+# Only run the Rust gates if Rust files changed. Bench-only /
+# changelog-only / migration-only / docs-only commits skip them.
+if ! echo "$STAGED" | grep -qE '\.rs$|^Cargo\.(toml|lock)$'; then
     exit 0
 fi
 
@@ -36,12 +52,27 @@ if ! cargo fmt --all --check; then
     exit 1
 fi
 
-echo "─── pre-commit: cargo clippy (full features, all targets) ───"
-# Match the CI matrix's strictest job: full features + all targets +
-# -D warnings. Slower than `cargo clippy` alone but matches what CI
-# rejects, so we catch the regression here instead of on the runner.
+echo "─── pre-commit: cargo clippy (shipped shape, all targets) ───"
+# v25.x (CIRISPersist#585) — the feature list is DERIVED from
+# Cargo.toml via the same script CI's `lint` job asks. It used to be
+# spelled out here as `postgres,pyo3,server,sqlite,tls` under a comment
+# claiming it matched "the CI matrix's strictest job" — it did not, and
+# had not for a long time (it carried `tls`, which no CI job compiled,
+# and omitted all five substrate axes that every CI leg carries). A
+# third hand-written copy of the feature list, disagreeing with the
+# other two: exactly the #585 defect, one layer out.
+#
+# CI additionally runs `cargo clippy --all-features --all-targets --
+# -D warnings`, which is what makes coverage total. It is not run here
+# because it pulls the ~500MB Candle/ORT graph; run it by hand before
+# pushing anything that touches feature-gated code.
+#
+# Computed on its own line, NOT inline in the `if` — `set -e` is
+# suppressed inside an `if` condition, so a failing substitution there
+# would silently degrade to `--features ""` and lint almost nothing.
+LINT_FEATURES="$(python3 scripts/ci_feature_matrix.py set lint)"
 if ! cargo clippy \
-        --features postgres,pyo3,server,sqlite,tls \
+        --features "$LINT_FEATURES" \
         --all-targets \
         -- -D warnings; then
     echo

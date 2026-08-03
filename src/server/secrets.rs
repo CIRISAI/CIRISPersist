@@ -1128,7 +1128,7 @@ mod tests {
             "accessor": "z",
         }))
         .unwrap();
-        let mut sig_bytes = BASE64.decode(&sign(&body)).unwrap();
+        let mut sig_bytes = BASE64.decode(sign(&body)).unwrap();
         sig_bytes[0] ^= 0xFF;
         let bad_sig = BASE64.encode(&sig_bytes);
         let resp = app
