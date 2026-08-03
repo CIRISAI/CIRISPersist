@@ -40,9 +40,11 @@ The distinction is made **before** any erasure happens and does not change when
 one does. An erased object keeps the kind it was minted with. `src/federation/erasable.rs`
 is the shape; `ciris_verify_core::redactable` is the cryptography under it.
 
-Today **[TESTED]** all 88 payload carriers are sealed — the enumeration in
-`PAYLOAD_ENUMERATION.md` §6 reproduces exactly (88 carriers, 38 hashed), so
-nothing has moved and nothing is erasable yet.
+Today every one of the 88 payload carriers is sealed. **[TESTED]** —
+`PAYLOAD_ENUMERATION.md` §6's derivation reproduces exactly (88 carriers, 38
+hashed), so the enumeration has not moved; and `grep -rl 'redactable\|Redactable'
+src/ --include=*.rs` returns `src/federation/erasable.rs` alone, so nothing
+mints a commitment yet.
 
 ---
 
@@ -53,7 +55,10 @@ nothing has moved and nothing is erasable yet.
 CIRISVerify#241 asked for this to be the deciding question, reasoning that
 *"a bounded set makes the distinct-kind answer obviously right."*
 
-**[TESTED]** — the set is not bounded. Of the 38 payload carriers on hashed
+**[BELIEVED — basis: the §6 derivation is TESTED and gives the 38-carrier list;
+the characterization below is a reading of those column names and their write
+doors, not a test. The 50 non-hashed carriers were not assessed at all.]** — the
+set is not bounded. Of the 38 payload carriers on hashed
 rows, most take content a remote party influences: `attestation_envelope` on
 every attestation of every dimension; `registration_envelope` and
 `attestation_evidence` on the key plane; `policy_blob` on communities and peer
@@ -76,6 +81,15 @@ is the load-bearing step:
 this. A capability that makes *every* object partial-able is the wrong fail
 direction on the plane whose failure mode is silent retention and silent
 partiality.
+
+**The ruling does not rest on the set being unbounded.** That claim only
+refutes the *heuristic* CIRISVerify#241 offered for reaching a distinct kind;
+if the set turned out bounded after all, the ruling is unchanged, because what
+decides it is structural: a payload inside a signature cannot leave it (§1.2),
+and universal redactability is a fail-open property on every object (above).
+The bounded/unbounded question changes only how obvious the answer looks, not
+which answer it is — which is worth saying, because §1.1's characterization is
+the weakest-evidenced claim in this document.
 
 ### 1.2 What it costs, and where #573's premise does not hold
 
@@ -258,9 +272,13 @@ re-invented:
 observes that CIRISServer#346's admin ops require `{delegation_id, reason}` in
 `HardCaseEvent.detail`, so *"the tombstone recording an infohazard's removal is
 itself an arbitrary-payload object with no erasure path — the removal record
-can carry the thing being removed."* **[TESTED]** — `reason` is not merely
-allowed there, it is *mandatory*: `AdminActionRefusal::{ReasonAbsent,
-ReasonMalformed}` refuse an admin-action row without a non-empty string.
+can carry the thing being removed."* **[TESTED — `federation::hard_case`'s own
+suite, not one added here]** — `reason` is not merely *allowed* there, it is
+**mandatory**: `check_admin_action_attribution` runs at the top of every
+backend's `record_hard_case` (verify-before-mutation) and refuses with
+`AdminActionRefusal::{ReasonAbsent, ReasonMalformed}` if the key is missing or
+is not a non-empty string. So persist *requires* a free-text field on every
+admin act and provides no way to remove what lands in it.
 
 `hard_case_events` carries no `persist_row_hash` and no signature, so `reason`
 could simply be `UPDATE`d to null — no cryptography required. **That is exactly
@@ -308,7 +326,7 @@ should hear:
    verify-running peer reporting the same thing. Persist's `read_commitment` /
    `erased_indices` is that shape today, on persist's side of the fence.
 
-### 5.3 CIRISConstitution — two refinements (#78)
+### 5.3 CIRISConstitution — three refinements (#78)
 
 1. **Constraint (d) as phrased presupposes a redacted object.** Both branches —
    same kind with redacted members, or a distinct redacted kind — describe an

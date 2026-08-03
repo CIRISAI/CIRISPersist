@@ -137,9 +137,19 @@
 //!
 //! # What is deliberately not here
 //!
-//! Storage for disclosures, and `erase_object` itself. Those need a migration
-//! and are named in the issue thread rather than half-built here; this module
-//! is the shape they store and the proof that storing it is not inert.
+//! Storage for disclosures, and `erase_object` itself. Those need a migration,
+//! and they are **blocked on one question that should be answered before a
+//! schema is baked**: *does a disclosure set replicate, and under which consent
+//! edge?* An erasable object's envelope replicates today, unchanged; its
+//! disclosures do not, because there is no plane for them.
+//!
+//! That is a coherent degraded state and it fails in the right direction — an
+//! unreplicated disclosure set is indistinguishable from a fully-erased one, so
+//! the failure is *content unavailable*, never *content leaked* and never
+//! *object rejected*. It is not the inert failure #573 was opened over. But a
+//! table committed before that question is answered would bake the wrong shape,
+//! so this module is the shape they will store and the proof that storing it is
+//! not inert — and nothing more. See `docs/design/ERASURE_CONTAINMENT.md` §5.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -585,11 +595,17 @@ fn decode_digest(hex_str: &str) -> Option<[u8; 32]> {
 /// exists to close. The two properties #573 asks for are not jointly
 /// satisfiable in general; this type is where the trade-off is made
 /// deliberately instead of by omission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecognitionPolicy {
     /// Publish nothing. The salted member digest still survives in the signed
     /// envelope as the tombstone; it reveals nothing about the value.
+    ///
+    /// **`#[default]`, so the safe branch is the one a caller gets by
+    /// omission.** A prose default is not a default — a `Default` impl that
+    /// published would make every erasure that forgot to say otherwise a
+    /// disclosure.
+    #[default]
     Withheld,
     /// The operator asserts the erased bytes carry enough entropy that
     /// publishing `sha256` of them does not disclose them.
@@ -932,6 +948,13 @@ mod tests {
             recognition_hash(&[0u8; 128], RecognitionPolicy::Withheld).unwrap_err(),
             RecognitionRefusal::Withheld,
             "publishing an unsalted hash is never the default"
+        );
+        // And the DEFAULT is the safe branch, not merely the documented one —
+        // a caller who omits the policy must not thereby publish.
+        assert_eq!(RecognitionPolicy::default(), RecognitionPolicy::Withheld);
+        assert_eq!(
+            recognition_hash(&[0u8; 128], RecognitionPolicy::default()).unwrap_err(),
+            RecognitionRefusal::Withheld
         );
     }
 
