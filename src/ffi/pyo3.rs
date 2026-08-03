@@ -27413,7 +27413,14 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // admission-gate-rejection shape (caller-fault, ValueError).
         // v12.7.0 (#368, CC 3.4.11) — age_assurance:* self-emission is its
         // exact sibling (subject-must-not-emit; caller-fault, ValueError).
+        // (#590, CC 3.1.7 R2(b)) — emission on a governed family with no
+        // registry row is a CONFORMANCE failure, and conformance failures are
+        // the producer's: R2(b)'s whole point is that the gap "fails loud at
+        // the producer rather than quiet at the floor", so it surfaces as a
+        // 4xx-shaped caller fault alongside the other admission rejections
+        // rather than as a substrate error the caller cannot act on.
         crate::federation::Error::ReservedPrefixEmitterMismatch { .. }
+        | crate::federation::Error::NamespaceFamilyUnregistered { .. }
         | crate::federation::Error::CapacitySelfEmissionRejected { .. }
         | crate::federation::Error::AgeAssuranceSelfEmissionRejected { .. } => {
             PyValueError::new_err(kind)

@@ -12107,7 +12107,14 @@ pub(crate) mod r2_test_support {
         // would file the row under the ProducerSteward fallback — the exact
         // "silently and cumulatively" state CC 3.1.7 R2 names.
         let probe = format!("{R2_PROBE_UNREGISTERED_STEM}probe:v1");
-        let bad_id = format!("r2-bad-{suffix}");
+        // A REAL uuid, not a readable slug: postgres types `attestation_id` as
+        // `uuid` and refuses anything else at the driver, so a slug would make
+        // the postgres leg fail on the fixture instead of on the property —
+        // which is the "memory tolerates what postgres rejects" trap this
+        // three-backend witness exists to catch. (It caught it: the first run
+        // of this body was green on memory + sqlite and red on postgres with
+        // `attestation_id is not a valid UUID`.)
+        let bad_id = uuid::Uuid::new_v4().to_string();
         let err = dir
             .put_attestation(scores_row(&bad_id, &author, &probe))
             .await
@@ -12139,15 +12146,12 @@ pub(crate) mod r2_test_support {
         // Three shapes R2(b) is forbidden to touch: a REGISTERED governed
         // family (persist's own #574 mint), open vocabulary INSIDE a
         // registered family, and a family CC never speaks to at all.
-        for (i, dim) in [
+        for dim in [
             "objection:raised:v1",
             "credits:rust:en:someone:v1",
             "identity_binding:v1",
-        ]
-        .iter()
-        .enumerate()
-        {
-            let id = format!("r2-ok-{suffix}-{i}");
+        ] {
+            let id = uuid::Uuid::new_v4().to_string();
             dir.put_attestation(scores_row(&id, &author, dim))
                 .await
                 .unwrap_or_else(|e| {
