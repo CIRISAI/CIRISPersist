@@ -294,19 +294,42 @@ backend's `record_hard_case` (verify-before-mutation) and refuses with
 is not a non-empty string. So persist *requires* a free-text field on every
 admin act and provides no way to remove what lands in it.
 
-**[TESTED — `migrations/postgres/lens/V075__hard_case_events.sql:19-26`]** —
-the table's full column list is `event_id, kind, target_key_id,
-subject_key_id, detail, emitted_at`. **No signature, and no
-`persist_row_hash`.** So `reason` can simply be `UPDATE`d to null, and no
-cryptography is involved anywhere on the plane.
+**[TESTED]** — the table's full column list is `event_id, kind, target_key_id,
+subject_key_id, detail, emitted_at`, identically on both backends
+(`migrations/postgres/lens/V075__hard_case_events.sql:19-26`,
+`migrations/sqlite/lens/V075__hard_case_events.sql:21-28`), and
+`HardCaseEvent` carries the same six (`src/federation/hard_case.rs:149-169`).
+**No signature, and no `persist_row_hash`.**
+
+And because reading a `CREATE TABLE` while missing a later `ALTER` is exactly
+how a claim like this goes wrong in the *other* direction:
+`grep -rniE "ALTER TABLE.*hard_case" migrations/` returns **nothing** — V075's
+`CREATE` plus its two indexes are the table's entire schema history. No
+integrity column was ever added. The write path agrees from the other side:
+both inserts name exactly those six columns and compute no hash
+(`src/store/sqlite.rs:945`, `src/store/postgres.rs:1793`).
 
 **A commitment alone does not fix this, and an earlier draft of this document
 said it did.** The claim was that holding the reason as a disclosure with a
-salted commitment in `detail` would make it *withholdable but not
-replaceable*. That is false for an unsigned, mutable row: **an actor who can
-null the reason can equally rewrite the commitment sitting beside it.** A
-commitment binds only to the extent that whatever carries it is itself
-integrity-protected, and here nothing is.
+salted commitment would make it *withholdable but not replaceable*. That is
+false for an unsigned, mutable row: **an actor who can rewrite the reason can
+equally rewrite the commitment sitting beside it.** A commitment binds only to
+the extent that whatever carries it is itself integrity-protected, and here
+nothing is.
+
+Two details that make it worse than the retracted claim assumed, not better:
+
+- **There is no `reason` column** — `reason` is a *key inside* `detail`
+  (`admin_field::REASON`); `grep reason` over V075 returns zero hits. So a
+  disclosure would need a **new column on this table**, which inherits the same
+  missing integrity carrier it would have been relying on. The problem is not
+  that an existing commitment is unprotected; it is that the table has nowhere
+  to put one that binds.
+- **The cheap attack is not nulling — it is writing the schema's own default.**
+  `detail` is `NOT NULL DEFAULT '{}'` on both backends. Rewriting it to `{}` is
+  a *legal, schema-preferred* value, so the result is a row **indistinguishable
+  from one that never carried context**, rather than one that visibly lost it.
+  A `NULL` would at least be a scar.
 
 The corrected finding is sharper than the one it replaces:
 
@@ -316,7 +339,8 @@ The corrected finding is sharper than the one it replaces:
 > all** — not a signature, not a row hash. Its enumeration is therefore only as
 > trustworthy as the node's own database, which is exactly the thing a
 > compromised authority has. Erasability is the *second* problem on this table;
-> the first is that a reason can be silently substituted today.
+> the first is that a reason can be reset to `{}` today and read afterwards as
+> an act that simply never carried one.
 
 So the ask here is a pair, not a single change: bind the `hard_case` row into
 something the node cannot silently rewrite, **and then** make its reason a
