@@ -718,18 +718,55 @@ class Engine:
     def install_storage_budget_v1(self, wire_json: str, ed25519_pubkey_base64: str, ml_dsa_65_pubkey_base64: str) -> int:
         """(derived) deontic — #370 (§Q B2/B3, CC 6.1.5.2) — INSTALL a signed StorageBudgetV1 so it governs this node's capacity eviction. Verifies the bound-hybrid signature aga..."""
 
-    def is_load_bearing_json(self, object_kind: str, object_id: str) -> str:
-        """v24.2.0 (CIRISPersist#564) — **is this CEG object load-bearing on THIS
-        node?** ``object_kind`` is ``"attestation"`` or ``"key_record"``.
+    def is_load_bearing_json(
+        self, object_kind: str, object_id: str, object_id2: str | None = None
+    ) -> str:
+        """CIRISPersist#564 — **is this CEG object load-bearing on THIS node?**
+
+        ``object_kind`` is one of ``"attestation"``, ``"key_record"``,
+        ``"transport_destination"``, ``"fountain_content"``,
+        ``"hard_case_event"``. ``object_id2`` carries the second key for the
+        composite-keyed classes (``transport_destination`` -> ``transport_kind``,
+        ``fountain_content`` -> ``corpus_kind``) and is **required** for those --
+        it raises rather than defaulting, because a defaulted second key
+        answers about a different object than you asked about.
 
         Three-valued, and the third value is the point. The verdict JSON is
         ``{"yes": {"because": [...]}}``, the bare string ``"no"``, or
-        ``{"unknown": {"family": ..., "reason": ...}}`` — *unknown* means this
+        ``{"unknown": {"family": ..., "reason": ...}}`` -- *unknown* means this
         node cannot see the dependents, which is NOT *no*.
 
-        **Every arm is a truthy string**, including ``"no"``. Treating the return
-        as a boolean releases an object the node is still load-bearing for, and
-        treats "I cannot tell" as "safe to erase".
+        **Every arm is a truthy string**, including ``"no"``. Treating the
+        return as a boolean releases an object the node is still load-bearing
+        for, and treats "I cannot tell" as "safe to erase".
+        """
+
+    def may_release_copy_json(
+        self, object_kind: str, object_id: str, object_id2: str | None = None
+    ) -> str:
+        """CIRISPersist#564 stage 2 -- **may this node release its copy?**
+
+        ``is_load_bearing(X) == "no"`` **and** ``anti_entropy_satisfied(X)``.
+        Arguments are identical to :meth:`is_load_bearing_json`, including the
+        ``object_id2`` rule.
+
+        Returns ``"yes"`` or ``{"no": {"load_bearing": ..., "anti_entropy":
+        ...}}`` -- the refusal reports BOTH halves, so you never have to guess
+        which one blocked it.
+
+        **Today this always answers no.** Persist cannot verify that an object
+        resides anywhere else: it has no peer transport, its replication
+        surface is inbound-apply plus outbound-pull (a pull never learns who
+        kept what), and nothing records a peer acknowledging a holding. The
+        second conjunct is structurally unsatisfiable here -- fail-secure by
+        construction, not by policy.
+
+        **Both arms are truthy strings.** This is the surface you would gate a
+        deletion on, so ``if engine.may_release_copy_json(...)`` deletes
+        exactly what the primitive refused. ``json.loads`` it and branch on the
+        parsed arm.
+
+        Read-only -- it releases, evicts and mutates nothing.
         """
 
     def is_named_moderator_json(self, key_id: str, community_id: str, duty: str) -> str:

@@ -352,6 +352,7 @@ Engine	mark_replay_resolved	procedural
 Engine	mark_transport_delivered	procedural
 Engine	mark_transport_failed	procedural
 Engine	match_ack_to_outbound	procedural
+Engine	may_release_copy_json	deontic
 Engine	moderators_of_json	empirical
 Engine	next_sequence	testimonial
 Engine	nodes_stewarded_by_json	empirical

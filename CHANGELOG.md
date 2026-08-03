@@ -5,6 +5,33 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [28.1.0] — 2026-08-03 — #564: reachability stage 2, and the release primitive that always says no
+
+- **#564 stages 2-4** — `is_load_bearing` gains the composite-keyed classes
+  (`transport_destination`, `fountain_content`, `hard_case_event`) and a second key that **raises
+  rather than defaults**, because a defaulted second key answers about a different object than you
+  asked about. New `may_release_copy_json` = `is_load_bearing == "no"` **and**
+  `anti_entropy_satisfied`.
+
+  **It always answers no today, and that is the honest answer.** Persist cannot verify an object
+  resides anywhere else: no peer transport, a replication surface that is inbound-apply plus
+  outbound-pull, and a pull never learns who kept what. The second conjunct is **structurally
+  unsatisfiable here — fail-secure by construction, not by policy.** The refusal reports both halves
+  so a caller never has to guess which one blocked it.
+
+- Both new surfaces are classified **`deontic`** under the CIRISConstitution#83 taxonomy and
+  hand-written accordingly. `is_load_bearing_json` is three-valued and **`"unknown"` is not `"no"`**
+  — it means this node cannot see the dependents. Every arm is a truthy string, so
+  `if engine.may_release_copy_json(...)` deletes exactly what the primitive refused.
+
+- **#573 documentation retraction.** The claim that holding `hard_case_events.reason` as a salted
+  disclosure would make it "withholdable but not replaceable" was **false and is withdrawn**. There
+  is no `reason` column — it is a key inside `detail`, which is `NOT NULL DEFAULT '{}'` with no
+  signature and no row hash. So the cheap attack is not nulling but **writing the schema's own
+  default**, leaving a row indistinguishable from one that never carried context. A `NULL` would at
+  least be a scar. The ask is now explicitly a pair: bind the row into something the node cannot
+  silently rewrite, *then* make its reason a disclosure. Doing only the second buys nothing.
+
 ## [28.0.0] — 2026-08-03 — #573/#593/#595: erasability is decided at mint, the third fold closes, and 390 symbols stop being invisible
 
 - **#573** — the containment question CC left open (constraint (d)) is answered by rejecting both
