@@ -103,9 +103,14 @@
 //!   `PAYLOAD_ENUMERATION.md` §7.5 item 1 and CIRISVerify#241 both expected a
 //!   row-level marker outside the row hash. None is needed: the disclosures
 //!   are not row members, so the row hash is untouched by erasure.
-//! - **No wire break.** An erasable envelope is an ordinary envelope with one
-//!   more object-valued member. 248 of 265 wire fields are already
-//!   `untyped_extra`; this is one more.
+//! - **No wire break on the canonicalization or signature planes.** An erasable
+//!   envelope is an ordinary envelope with one more object-valued member; 248
+//!   of 265 wire fields are already `untyped_extra`, and this is one more.
+//!   **The one exception, measured rather than assumed:** `put_attestation`
+//!   runs a per-dimension JSON Schema check on all three backends, so a
+//!   dimension whose schema sets `additionalProperties: false` cannot carry
+//!   [`SD_MEMBER`] until that schema is revised. An open schema needs nothing.
+//!   Both directions are asserted in `ingest_gate_proof`.
 //!
 //! # The tension inside #573 that salting forces
 //!
@@ -1184,6 +1189,61 @@ mod ingest_gate_proof {
             !msg.contains("redact") && !msg.contains("erasu"),
             "the refusal cannot tell an operator a lawful erasure from a tamper — \
              that is the whole of CIRISVerify#241: {msg}"
+        );
+    }
+
+    /// **The one gate an erasable envelope can fail, named so it is not
+    /// discovered in production.**
+    ///
+    /// `put_attestation` runs a per-dimension JSON Schema check on all three
+    /// backends (`validate_envelope_against_schema`, reached from
+    /// `memory.rs` / `sqlite.rs` / `postgres.rs` whenever the resolver has a
+    /// schema for the row's dimension). [`SD_MEMBER`] is an **additional
+    /// property**. So:
+    ///
+    /// - a dimension with an OPEN schema carries an erasable envelope today,
+    ///   with no schema change at all;
+    /// - a dimension whose schema sets `additionalProperties: false` **cannot**
+    ///   carry one until that schema is revised.
+    ///
+    /// This is the real boundary on "no wire break": the *canonicalization* and
+    /// *signature* planes need nothing, but a closed per-dimension schema is a
+    /// per-dimension revision. Asserted in both directions so a future closed
+    /// schema fails here rather than at a deployment.
+    #[test]
+    fn a_closed_dimension_schema_is_the_one_thing_that_refuses_an_erasable_envelope() {
+        use crate::federation::schema_resolver::validate_envelope_against_schema;
+
+        let (envelope, _) = seal(&header("schema-probe"), &erasable_members()).unwrap();
+
+        let open = serde_json::json!({
+            "type": "object",
+            "required": ["dimension"],
+            "properties": { "dimension": { "type": "string" } },
+        });
+        assert!(
+            validate_envelope_against_schema(&open, &envelope).is_ok(),
+            "an open per-dimension schema needs no revision to carry an erasable \
+             envelope"
+        );
+
+        let closed = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["dimension"],
+            "properties": {
+                "id": { "type": "string" },
+                "dimension": { "type": "string" },
+                "score": { "type": "number" },
+                "confidence": { "type": "number" },
+            },
+        });
+        let violations = validate_envelope_against_schema(&closed, &envelope)
+            .expect_err("a closed schema MUST refuse the commitment member");
+        assert!(
+            violations.iter().any(|v| v.contains(SD_MEMBER)),
+            "the refusal must name {SD_MEMBER} so an operator knows which schema \
+             to revise: {violations:?}"
         );
     }
 
