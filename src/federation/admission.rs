@@ -517,6 +517,25 @@ pub enum NamespaceConformanceReason {
     /// second spelling of a word the Constitution already chose.
     #[serde(rename = "namespace_family_unregistered")]
     FamilyUnregistered,
+
+    /// **CC 3.1.7 R2, Private Use** (CIRISPersist#571) — a row on the
+    /// `x_private:{anything}` range was offered at **federation tier**, which
+    /// the clause forbids *under any authority*.
+    ///
+    /// A distinct variant rather than a second use of [`Self::FamilyUnregistered`]
+    /// because the two say opposite things about the same missing row. R2(b)
+    /// means "nobody registered this and somebody should"; Private Use means
+    /// "nobody will ever register this, and that is correct" — the refusal is
+    /// about the row's TIER, never its registration. One name, one reading.
+    ///
+    /// Unlike its sibling, this token is **persist's coinage**: the clause
+    /// states the MUST without naming a refusal token, where R2(b) names
+    /// `namespace_family_unregistered` explicitly. Spelled in the clause's own
+    /// vocabulary ("private use", "federatable") so a CC ruling that later names
+    /// one has an obvious candidate; if CC chooses differently, this appends a
+    /// variant rather than re-spelling one.
+    #[serde(rename = "namespace_private_use_not_federatable")]
+    PrivateUseNotFederatable,
 }
 
 impl NamespaceConformanceReason {
@@ -530,8 +549,81 @@ impl NamespaceConformanceReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::FamilyUnregistered => "namespace_family_unregistered",
+            Self::PrivateUseNotFederatable => "namespace_private_use_not_federatable",
         }
     }
+}
+
+/// **CC 3.1.7 R2's Private Use range** — the one family prefix the Constitution
+/// reserves for private use, which carries no registry row by design.
+///
+/// > *"One family prefix is reserved for Private Use (`x_private:{anything}`)
+/// > and carries no registry row: private-use families MUST NOT admit at
+/// > federation tier under any authority and MUST NOT be promoted to a
+/// > registered family without minting a fresh name — the legitimate
+/// > unregistered range whose absence is what mints `X-`-convention squatting
+/// > (RFC 6648's lesson)."*
+///
+/// A **range**, not a family: it is checked with `starts_with` against this
+/// stem and it is deliberately absent from the manifest, so
+/// [`is_family_registered`](crate::federation::namespace::registry::is_family_registered)
+/// answers `false` for it forever. That is why it needs its own arm — every
+/// other R2 answer is derived from the manifest, and this one cannot be.
+///
+/// **And that is a residual worth naming, because it is R2's own failure mode
+/// turned on R2.** R2's enforcement-surface clause requires a substrate to
+/// consume the manifest rather than walk prose — but the Private Use range is
+/// stated ONLY in the CC 3.1.7 prose, and CC's generator reaches only the
+/// CC 3.1 tables. So every substrate enforcing this clause must hard-code the
+/// literal `"x_private:"` from prose, and nothing can detect two of them
+/// disagreeing. Persist cannot fix that from here: inventing a manifest row for
+/// a range CC says carries none would be worse. The ask on CC is a
+/// machine-readable range field in the generated manifest (a `_meta` key, not a
+/// family row, since it is not a family); until then this const is a prose
+/// transcription and is marked as one.
+pub const PRIVATE_USE_FAMILY_STEM: &str = "x_private:";
+
+/// **CC 3.1.7 R2, Private Use** — refuse an `x_private:*` namespace at
+/// federation tier; admit it everywhere else.
+///
+/// The asymmetry is the whole rule. Local tier ADMITS, because the range exists
+/// precisely so that unregistered work has somewhere legitimate to live: RFC
+/// 6648's lesson is that when there is no legitimate unregistered range, people
+/// mint squatted prefixes and those calcify into de-facto standards. Refusing
+/// `x_private:*` locally would recreate exactly the pressure the clause
+/// relieves. Federation tier REFUSES, unconditionally on the signer — *"under
+/// any authority"* leaves no identity, role, or co-scrub that buys a private-use
+/// row a wire.
+///
+/// `tier` is the tier the row **will be stored at**, so one call site covers
+/// both the direct federation-tier write and the promotion (which gates on the
+/// row as-it-will-be-stored). Pure — no directory lookup — so it sits in the
+/// cheap tier alongside R2(b).
+///
+/// The clause's second MUST — *"MUST NOT be promoted to a registered family
+/// without minting a fresh name"* — is a rule about **naming**, addressed to
+/// whoever mints the registered family; there is no row persist could refuse to
+/// express it, and refusing `x_private:` at federation tier is what makes the
+/// rename unavoidable in practice.
+///
+/// **The executed witness lives in
+/// [`crate::federation::regime`]** — three doors (local admits, promotion
+/// refused, direct federation-tier write refused) plus the consent-edge arm, on
+/// every backend. It sits there rather than here because that module is where
+/// the Private Use range was weighed as a home for `regime:*` and rejected; the
+/// ban is what makes that rejection consequential, so the judgement and its
+/// enforcement are read together.
+pub fn check_private_use_not_federatable(namespace: &str, tier: &str) -> Result<(), Error> {
+    if tier != crate::federation::types::attestation_tier::FEDERATION
+        || !namespace.starts_with(PRIVATE_USE_FAMILY_STEM)
+    {
+        return Ok(());
+    }
+    Err(Error::NamespacePrivateUseNotFederatable {
+        namespace: namespace.to_owned(),
+        family_stem: PRIVATE_USE_FAMILY_STEM,
+        reason: NamespaceConformanceReason::PrivateUseNotFederatable.as_str(),
+    })
 }
 
 /// **The R2(a) mint declaration** — every namespace family *persist itself
@@ -8200,6 +8292,22 @@ pub async fn check_reserved_prefix_admission(
     check_namespace_family_registered(at)?;
     if let Some(dim) = envelope_dimension(&row.attestation_envelope) {
         check_namespace_family_registered(dim)?;
+    }
+
+    // (CIRISPersist#571) — CC 3.1.7 R2's Private Use range: `x_private:*` MUST
+    // NOT admit at federation tier under any authority. The clause's sibling,
+    // and placed with it for the same reason: both answer "what does R2 say
+    // about a family with no row?", and the answers differ only in whether the
+    // absence is a gap (R2(b)) or the point (Private Use). Split across two
+    // call sites they would drift; here they are read together.
+    //
+    // `row.tier` is the tier the row WILL be stored at — `check_promotion_admission`
+    // passes the row as-it-will-be-stored — so this one placement covers the
+    // direct federation-tier write and the local→federation promotion both,
+    // on every backend, without a second gate.
+    check_private_use_not_federatable(at, &row.tier)?;
+    if let Some(dim) = envelope_dimension(&row.attestation_envelope) {
+        check_private_use_not_federatable(dim, &row.tier)?;
     }
 
     // Which (if any) identity-gated reserved prefix does the TYPE carry?

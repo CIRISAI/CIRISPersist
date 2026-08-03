@@ -158,6 +158,9 @@ pub struct ConsentSweepReport {
 }
 
 pub mod register;
+// CIRISPersist#571 — `regime:*` experimental-regime research artifacts:
+// the CC-blocked registry finding + the replication decision.
+pub mod regime;
 pub mod replication;
 pub mod replication_policy;
 pub mod rooting;
@@ -4795,6 +4798,46 @@ pub enum Error {
         reason: &'static str,
     },
 
+    /// (CIRISPersist#571, **CC 3.1.7 R2 Private Use**). A row on the
+    /// `x_private:{anything}` range was offered at **federation tier**.
+    ///
+    /// CC: *"One family prefix is reserved for Private Use (`x_private:{anything}`)
+    /// and carries no registry row: private-use families MUST NOT admit at
+    /// federation tier under any authority and MUST NOT be promoted to a
+    /// registered family without minting a fresh name — the legitimate
+    /// unregistered range whose absence is what mints `X-`-convention squatting
+    /// (RFC 6648's lesson)."*
+    ///
+    /// **This is the one refusal in the R2 family that is a TIER rule, not a
+    /// registration rule.** R2(b) refuses a governed family that nobody
+    /// registered; this refuses a family that is *legitimately* unregistered
+    /// and always will be. Sharing R2(b)'s error would have said the opposite
+    /// of what CC means about Private Use — the range is valid, its reach is
+    /// not — so it names its own branch
+    /// ([`admission::NamespaceConformanceReason::PrivateUseNotFederatable`]).
+    ///
+    /// **"Under any authority"** is why no identity, role, or co-scrub appears
+    /// in this check: there is nothing a signer can be that buys a private-use
+    /// row a federation tier. Local tier is untouched — refusing there would
+    /// delete the legitimate range CC created, which is the squatting failure
+    /// the clause exists to prevent.
+    #[error(
+        "namespace private use is not federatable (CC 3.1.7 R2): {namespace:?} is on the \
+         reserved Private Use range {family_stem:?}, which MUST NOT admit at federation tier \
+         under any authority — keep it local, or mint a fresh registered name (a private-use \
+         family is never promoted into a registered one)"
+    )]
+    NamespacePrivateUseNotFederatable {
+        /// The `attestation_type` or envelope `dimension` that was refused.
+        namespace: String,
+        /// The Private Use stem it sits on
+        /// ([`admission::PRIVATE_USE_FAMILY_STEM`]).
+        family_stem: &'static str,
+        /// Stable machine-readable reason token, via
+        /// [`admission::NamespaceConformanceReason::as_str`].
+        reason: &'static str,
+    },
+
     /// v10.3.0 (CIRISPersist#288, CC 3.4.5). A `capacity:*` attestation
     /// was self-emitted (`attesting_key_id == attested_key_id`). The
     /// Constitution's "Critical enforcement" rule: a `capacity:*` score
@@ -5749,6 +5792,9 @@ impl Error {
                 "federation_reserved_prefix_emitter_mismatch"
             }
             Error::NamespaceFamilyUnregistered { .. } => "federation_namespace_family_unregistered",
+            Error::NamespacePrivateUseNotFederatable { .. } => {
+                "federation_namespace_private_use_not_federatable"
+            }
             Error::EnvelopeSchemaViolation { .. } => "federation_envelope_schema_violation",
             Error::AccordHolderRequiresAttestationEvidence { .. } => {
                 "federation_accord_holder_requires_attestation_evidence"
