@@ -254,6 +254,31 @@ re-invented:
 - `admission::DELEGATION_SCOPE_SLASH` (#570 ask 2) for the authority, walked
   under `MODERATION_DUTY`, which is what `quarantine:` already gates on.
 
+**The first thing that should use it is #573's own sharpest case.** #573
+observes that CIRISServer#346's admin ops require `{delegation_id, reason}` in
+`HardCaseEvent.detail`, so *"the tombstone recording an infohazard's removal is
+itself an arbitrary-payload object with no erasure path — the removal record
+can carry the thing being removed."* **[TESTED]** — `reason` is not merely
+allowed there, it is *mandatory*: `AdminActionRefusal::{ReasonAbsent,
+ReasonMalformed}` refuse an admin-action row without a non-empty string.
+
+`hard_case_events` carries no `persist_row_hash` and no signature, so `reason`
+could simply be `UPDATE`d to null — no cryptography required. **That is exactly
+why the commitment is needed there anyway**, and it is the cleanest
+demonstration that the mint-time distinction is not about signatures:
+
+> #570's stated reason for the attribution is that *"a compromised authority
+> becomes survivable, because every act taken under it can be enumerated and
+> re-adjudicated."* If the reason can be nulled with no trace, it can also be
+> **substituted** with no trace — an authority rewriting its own justifications
+> after the fact, which is the same failure the attribution exists to prevent.
+> A salted commitment in `detail` and the reason held as a disclosure gives
+> both: the reason can be withheld, and it cannot be replaced.
+
+So the shape generalizes past the envelope plane. What an object is "sealed"
+*against* is not always a signature — sometimes it is only an audit claim — but
+the choice is the same one and it is still made at mint.
+
 **The blocking sub-question, and why the table is not in this cut:** *does a
 disclosure set replicate, and under which consent edge?* An erasable object's
 envelope replicates today, unchanged. Its disclosures do not, because there is
