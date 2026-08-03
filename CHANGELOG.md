@@ -144,6 +144,75 @@ The verify v12.1.0 capability matrix landed with #567. Two residues closed:
   admission, which is not a decision persist takes unilaterally. Same-name /
   different-substance, named in the table so the next reader does not spend the
   round trip finding it out.
+## [Unreleased] — #586: an absence claim is the only claim that rots while nobody touches it
+
+`namespace_supersets.json` is the vendored Registry-of-Record — what the conformance tests generate
+from and what downstream reads to decide what persist does and does not implement. Its
+`logical_defect` list carries **absence claims**, and by the time #586 was filed four had decayed
+with nobody noticing.
+
+A **presence** claim breaks its own build when the symbol moves: `evidence_cc_impl_pointers_resolve`
+proves that on every run. An **absence** claim — *"X does not exist"* — is true when written, and
+**nothing ever re-asks**.
+
+### The witness
+
+`manifest_absence_claims()` DERIVES the claim set by walking the whole manifest for a structural
+marker (`asymmetry_kind: "logical_defect"` **+** a `missing_dual` key), never by naming a section —
+so a re-vendor that relocates `duality_audit` loses none of them, and the derivation is not itself
+the section-walk heuristic CC 3.1.7 R2 forbids. Persist then declares, per claim, the symbols whose
+existence contradicts it (`PERSIST_AUTHORED_ABSENCE_FALSIFIERS`), and the gate resolves them with
+the **same definition predicate** `evidence_cc_impl_pointers_resolve` uses — now extracted as
+`source_defines` and shared, so the two validators are exact inverses over one predicate rather than
+two predicates over one question.
+
+- **Coverage is the load-bearing half and cannot rot**: the table must cover EXACTLY the derived
+  set, so a re-vendor that adds a claim fails the build until somebody states what would disprove it.
+- **A `falsified` entry is a proof**: its symbol must really be there.
+- **A `holds` entry is a tripwire, not a proof**, and says so.
+
+### What it deliberately does NOT check
+
+Only **structured** absence claims. The obvious wider gate — treat every `proposed:`-prefixed
+processor citation naming a `path#symbol` as "this symbol does not exist" — was tried and is
+**wrong**: of the 56 such citations resolving to a repo-local file, **29 name a symbol that exists on
+purpose**, because `proposed:` means *"does not process this field yet"*, not *"does not exist"*.
+Separating the two requires reading the parenthetical, and inferring a rule from a description field
+is the section-walk heuristic pointed at a different field. A narrow gate that fires beats a broad
+one that cannot.
+
+### Two claims the witness immediately falsifies
+
+- **`ownership:*` / WA-adjudicated reclaim** — *"CIRISPersist v21.4.0 contains zero
+  seizure/reclaim/ownerless handling"*. False since v21.8.0 (`federation::ownership_reclaim`), doubly
+  so after #578. The manifest's proposed fix (seed the WA key into `subject_key_ids` so rule 2
+  admits it) was **not** the road taken.
+- **`trust:*` / external witness at genesis** — *"genesis requires nothing but the root's own
+  signature"*. #557's `check_family_charter_admission` refuses a family charter below that family's
+  own quorum, at the write chokepoint.
+
+### The state the manifest could not express
+
+`PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES` gives *"gated here, uncatalogued there, deliberately
+admitting"* a home on the manifest surface: per family, which document DOES define it (CEG 0.3
+§5.6.8.3), why admitting it is a decision rather than a hole, and who owes the row. It must cover the
+R2 exception list exactly — so a fourth exception cannot be added as a bare stem — and it fails the
+moment the vendored registry registers any of the three, forcing the excuse's removal instead of
+letting it outlive its reason. **CIRISConstitution#77 has since landed on `rc3` (112 families of
+record, all three rows present); persist still vendors the 109-family cut, so that gate fires at the
+next registry re-vendor.**
+
+### Not re-vendored, and precisely why
+
+There is no generator, anywhere. `namespace_registry.json` has one (CIRISConstitution's
+`tools/build_cc_namespace.py`, which #590 re-ran); `namespace_supersets.json` has no counterpart in
+persist, CIRISConstitution or CIRISRegistry. It is the frozen output of a hand-driven semantic walk
+over a source tree that no longer exists, so "re-vendoring" would mean hand-editing findings —
+forging a research artifact exactly as hand-adding a registry row would forge a constitutional one.
+The correction therefore lands outside the file and gated, as every persist-authored correction to
+it does. #590's declared lag (`SEED_LAGS_REGISTRY_TRACKED_BY`) is untouched.
+
+Also: the manifest's four independent 2 MB `serde_json::Value` parses collapse to one shared `root()`.
 
 ## [26.0.0] — 2026-08-03 — #590/#589/#591/#567/#585/#580/#581: a promotion is a write, a registry row is a rule, and the checks that could not fail
 
