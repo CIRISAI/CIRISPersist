@@ -27443,6 +27443,10 @@ fn federation_err_to_py(e: crate::federation::Error) -> PyErr {
         // rather than as a substrate error the caller cannot act on.
         crate::federation::Error::ReservedPrefixEmitterMismatch { .. }
         | crate::federation::Error::NamespaceFamilyUnregistered { .. }
+        // (#571, CC 3.1.7 R2 Private Use) — offering an `x_private:*` row at
+        // federation tier is the same shape: the producer chose a range the
+        // Constitution keeps local, and only the producer can act on it.
+        | crate::federation::Error::NamespacePrivateUseNotFederatable { .. }
         | crate::federation::Error::CapacitySelfEmissionRejected { .. }
         | crate::federation::Error::AgeAssuranceSelfEmissionRejected { .. } => {
             PyValueError::new_err(kind)
