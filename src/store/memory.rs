@@ -9297,6 +9297,17 @@ mod tests {
             assert_per_peer_write_quota_is_wired(&backend, "mem").await;
     }
 
+    /// v24.4.0 (CIRISPersist#583): the quota's BYTE dimension is charged from
+    /// the real envelope, on this backend, through the real host API. Shares
+    /// the assertion body with the sqlite and postgres twins — a dimension
+    /// wired on two backends out of three is the #541 recurrence class.
+    #[tokio::test]
+    async fn quota_byte_dimension_is_wired_memory() {
+        let backend = MemoryBackend::new();
+        crate::federation::replication::admission::gate_order_test_support::
+            assert_byte_dimension_is_wired(&backend, "mem").await;
+    }
+
     /// v22.0.0 (CIRISPersist#543 finding 4) — WITNESS: the v3.4.0
     /// trust-weighted [`crate::federation::AdmissionGate`] now actually RUNS
     /// on the memory backend.

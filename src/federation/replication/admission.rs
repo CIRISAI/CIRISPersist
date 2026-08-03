@@ -152,6 +152,22 @@ impl AdmissionGate {
     }
 }
 
+// ─────────────────────── QUOTA CONSTANTS — BEGIN ───────────────────────
+//
+// v24.4.0 (CIRISPersist#583) — everything between this marker and the END
+// marker is **derivation-gated**. `tests::every_quota_constant_is_derived`
+// scans this block out of the source at test time and fails if a constant
+// here lacks a `**Bounds:**` line (what it bounds), a `**Derived:**` line
+// (why *that* value), or an entry in the gate's relationship table. The
+// relationships themselves — the identities and the inequalities the docs
+// below claim — are asserted in the same test.
+//
+// The reason is #583's framing: *a magic constant with no derivation is a
+// future incident.* Downstream WILL tune these numbers; the gate is what
+// keeps a tuned number honest, because tuning one of them now fails a test
+// that names the relationship it broke instead of silently un-bounding a
+// control.
+
 /// v22.0.0 (CIRISPersist#543 finding 4, AV-76) — how many attestation
 /// writes ONE peer may land per [`PER_PEER_ATTESTATION_WRITE_WINDOW`]: the
 /// **burst** allowance.
@@ -172,6 +188,19 @@ impl AdmissionGate {
 /// honest — and the day is now bounded by
 /// [`PER_PEER_SUSTAINED_WRITES_PER_WINDOW`], a second bucket charged by the
 /// same write.
+///
+/// v24.4.0 (CIRISPersist#583) — and it is now explicitly the **many-small**
+/// half of a two-dimensional control. A row count bounds the part of a
+/// write's cost that does not vary with its payload (two signatures, the
+/// hashes, the ids, the index entries); it is blind to the part that does,
+/// which is what [`PER_PEER_ATTESTATION_BYTES_PER_WINDOW`] is for.
+///
+/// **Bounds:** rows one peer may land in one burst window — the fixed
+/// per-row cost of storage, and the request rate the ingest path must serve.
+/// **Derived:** 600 / 60 s = 10 writes/second sustained from a single
+/// `attesting_key_id`; orders of magnitude above what any honest replication
+/// peer, genesis bake, or bulk-ingest loop produces, and far below what a
+/// bootstrap flooder needs to be interesting.
 pub const PER_PEER_ATTESTATION_WRITES_PER_WINDOW: u32 = 600;
 
 /// v22.0.0 (CIRISPersist#543 finding 4, AV-76) — the window
@@ -179,6 +208,13 @@ pub const PER_PEER_ATTESTATION_WRITES_PER_WINDOW: u32 = 600;
 /// the token bucket's refill period: tokens accrue continuously at
 /// `WRITES_PER_WINDOW / WINDOW`, so a peer that has been idle for a full
 /// window starts again with a full burst allowance.
+///
+/// **Bounds:** the horizon "too fast" is measured over — seconds, the
+/// timescale an operator or a peer can react on by slowing down.
+/// **Derived:** one minute is the shortest horizon on which a replication
+/// round's shape is legible; shorter and an honest catch-up round looks like
+/// a flood, longer and a flood looks like a round. Shared by BOTH metered
+/// dimensions ([`QuotaDimension`]) so a burst is one thing, not two.
 pub const PER_PEER_ATTESTATION_WRITE_WINDOW: Duration = Duration::from_secs(60);
 
 /// v24.3.0 (CIRISPersist#575) — how many attestation writes ONE peer may
@@ -210,13 +246,19 @@ pub const PER_PEER_ATTESTATION_WRITE_WINDOW: Duration = Duration::from_secs(60);
 /// and the second is the one an operator feels;
 /// `tests::one_peer_cannot_write_a_million_rows_in_a_day` asserts it.
 ///
-/// At the ~1.5 KiB a typical federation-tier row occupies that is ≈21 MiB /
-/// day / peer at steady state, which a volunteer node survives for years
-/// instead of days; at the
+/// At the ~1.5 KiB a typical federation-tier row occupies
+/// ([`TYPICAL_ATTESTATION_ENVELOPE_BYTES`]) that is ≈21 MiB / day / peer at
+/// steady state, which a volunteer node survives for years instead of days;
+/// at the
 /// [`MAX_ATTESTATION_ENVELOPE_BYTES`](crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES)
-/// worst case it is still 14 GiB/day, which is why #575 ask (a) — a BYTE
-/// dimension alongside the count — remains open and is the next thing this
-/// control needs. A row count is a proxy for storage, and a poor one.
+/// worst case it was still 14 GiB/day, which is why #575 ask (a) — a BYTE
+/// dimension alongside the count — was the next thing this control needed.
+/// A row count is a proxy for storage, and a poor one.
+///
+/// v24.4.0 (CIRISPersist#583) — **that dimension now exists**
+/// ([`PER_PEER_SUSTAINED_BYTES_PER_WINDOW`]), and the 14 GiB/day worst case
+/// is 211 MiB/day. This constant is unchanged and its job narrowed: it
+/// bounds *rows*, and rows are the many-small attack.
 ///
 /// # What it costs an honest peer
 ///
@@ -229,13 +271,151 @@ pub const PER_PEER_ATTESTATION_WRITE_WINDOW: Duration = Duration::from_secs(60);
 /// author with a six-figure history is the case this constant does throttle,
 /// and the honest fix for it is #575 ask (d) (recipient-authored per-peer
 /// policy), not a bigger substrate constant.
+///
+/// **Bounds:** rows one peer may land in a day — the fixed per-row storage
+/// cost, accumulated on the horizon a disk feels.
+/// **Derived:** `24 h/day × PER_PEER_ATTESTATION_WRITES_PER_WINDOW` — an
+/// honest author does not need a full honest burst more than once an hour,
+/// forever. Asserted as an identity by the derivation gate, so "tuning" this
+/// number without restating the burst it comes from fails a test.
 pub const PER_PEER_SUSTAINED_WRITES_PER_WINDOW: u32 = 14_400;
 
 /// v24.3.0 (CIRISPersist#575) — the window
 /// [`PER_PEER_SUSTAINED_WRITES_PER_WINDOW`] is measured over. One day: the
 /// horizon #575 stated the gap in ("864 000 rows **per day** per peer"), and
 /// the horizon on which a storage cost is felt.
+///
+/// **Bounds:** the horizon "too much, forever" is measured over — the one a
+/// disk fills on.
+/// **Derived:** one day: the horizon #575 stated the gap in ("864 000 rows
+/// **per day** per peer"), and short enough that a peer that overruns it is
+/// whole again tomorrow rather than banned. Shared by BOTH metered
+/// dimensions ([`QuotaDimension`]).
 pub const PER_PEER_SUSTAINED_WRITE_WINDOW: Duration = Duration::from_secs(86_400);
+
+/// v24.4.0 (CIRISPersist#583) — the size of a **typical federation-tier
+/// attestation envelope**, and the floor every write is charged on the byte
+/// dimension.
+///
+/// This number is not new: it is the one
+/// [`PER_PEER_SUSTAINED_WRITES_PER_WINDOW`]'s doc has cited since v24.3.0
+/// ("the ~1.5 KiB a typical federation-tier row occupies") to argue that
+/// 14 400 rows/day is ≈21 MiB/day. #583's point is that an argument made in
+/// prose from a number that is not in the program is an argument nothing
+/// checks. It is a program constant now, and the byte dimension is
+/// calibrated from it.
+///
+/// # Why it is also a FLOOR
+///
+/// The byte dimension measures the envelope, because the envelope is the
+/// attacker-controlled, unboundedly-variable part of a row. It is not the
+/// whole cost: a row also carries two signatures (an ML-DSA-65 scrub
+/// signature alone is ~4.4 KiB base64), hashes, ids and index entries, none
+/// of which the envelope sees. So a write is charged
+/// `max(envelope_bytes, TYPICAL_ATTESTATION_ENVELOPE_BYTES)` — no row costs
+/// less than a typical row, and an empty envelope is not free storage.
+///
+/// **Bounds:** the smallest storage cost the byte dimension will admit a
+/// write at, and the anchor the whole byte dimension is calibrated from.
+/// **Derived:** 1.5 KiB, the typical federation-tier row size already stated
+/// (and relied on) by the v24.3.0 sustained-rows derivation.
+pub const TYPICAL_ATTESTATION_ENVELOPE_BYTES: u64 = 1_536;
+
+/// v24.4.0 (CIRISPersist#583) — how many times a typical row's size a peer's
+/// **mean** row may reach before the byte dimension binds instead of the row
+/// dimension.
+///
+/// This is the whole trade the byte dimension makes, expressed as one
+/// number. At `1` the byte ceiling would be exactly the row ceiling in
+/// storage terms, and every peer whose rows are merely larger than typical
+/// would be throttled by a control aimed at storage floods — a second row
+/// control, and an AV-75 outage ("a control that refuses honest bulk
+/// replication is an outage, not a gate"). At `∞` the byte dimension does
+/// not exist, which is the #583 defect.
+///
+/// Ten says: a peer whose average row is up to ten typical rows is unmetered
+/// by bytes and still metered by rows; past that, storage is what it is
+/// spending and storage is what bounds it. The residual is stated rather
+/// than hidden — a peer with a genuine six-figure backlog of 100 KiB rows
+/// replays it slower than one with 1.5 KiB rows, and the honest fix for that
+/// is #575 ask (d) (signed, recipient-authored per-peer policy), not a
+/// bigger substrate constant.
+///
+/// **Bounds:** the mean row size at which the control switches from
+/// "you are writing too many rows" to "you are writing too much storage".
+/// **Derived:** ten typical rows — comfortably above any honest mean (the
+/// stated typical is the mean), and 64× below the single-row cap
+/// [`MAX_ATTESTATION_ENVELOPE_BYTES`](crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES),
+/// so the rows this control does bind on are the *few huge* ones.
+pub const QUOTA_BYTE_HEADROOM_MULTIPLE: u64 = 10;
+
+/// v24.4.0 (CIRISPersist#583) — the row size the byte dimension is
+/// calibrated against: `TYPICAL × HEADROOM` = 15 KiB.
+///
+/// Both byte constants below are this number times the corresponding row
+/// constant, so the byte dimension is the row dimension re-priced in storage
+/// and there is exactly ONE new free parameter in it
+/// ([`QUOTA_BYTE_HEADROOM_MULTIPLE`]) rather than two magic sizes.
+///
+/// **Bounds:** the per-row storage price the byte budgets are sized at.
+/// **Derived:** `TYPICAL_ATTESTATION_ENVELOPE_BYTES ×
+/// QUOTA_BYTE_HEADROOM_MULTIPLE` = 1 536 × 10 = 15 360.
+pub const QUOTA_CALIBRATION_ROW_BYTES: u64 = 15_360;
+
+/// v24.4.0 (CIRISPersist#583) — how many **bytes** ONE peer may land per
+/// [`PER_PEER_ATTESTATION_WRITE_WINDOW`]: the burst allowance on the second
+/// metered dimension, and the *few-huge* half of the control.
+///
+/// # The gap this closes
+///
+/// #583, quoting CIRISServer: *"600 rows of 100 B and 600 rows of 10 MB cost
+/// the same."* They did. `PeerBucket::spend` decremented a count and nothing
+/// in the quota path read a payload size, so a peer at its full row
+/// allowance could consume ~6 GB or ~60 KB and the substrate could not tell
+/// the difference — **inauthentic storage was invisible to the control that
+/// exists to bound it**. The single-envelope cap
+/// ([`MAX_ATTESTATION_ENVELOPE_BYTES`](crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES),
+/// CC#38 interim) bounds ONE row; nothing bounded the aggregate.
+///
+/// # Why a second dimension and not a smaller row count
+///
+/// Many-small and few-huge are different attacks. A row count bounds the
+/// fixed per-row cost (signatures, hashes, index entries) and is blind to
+/// the payload; a byte count bounds the payload and is blind to the fixed
+/// cost — 14 400 empty envelopes cost real disk that a byte ceiling sized
+/// for storage would wave through. **Each dimension bounds the part of the
+/// cost the other cannot see**, which is why both are metered on the same
+/// bucket and a write must clear both.
+///
+/// **Bounds:** bytes one peer may land in one burst window — the payload
+/// half of storage, on the seconds horizon.
+/// **Derived:** `PER_PEER_ATTESTATION_WRITES_PER_WINDOW ×
+/// QUOTA_CALIBRATION_ROW_BYTES` = 600 × 15 360 = 9 216 000 B (8.79 MiB/min,
+/// ≈150 KiB/s). Asserted as an identity by the derivation gate.
+pub const PER_PEER_ATTESTATION_BYTES_PER_WINDOW: u64 = 9_216_000;
+
+/// v24.4.0 (CIRISPersist#583) — how many **bytes** ONE peer may land per
+/// [`PER_PEER_SUSTAINED_WRITE_WINDOW`]: the sustained storage ceiling.
+///
+/// # What it is worth
+///
+/// The v24.3.0 sustained-rows constant left a stated worst case of
+/// **14 GiB/day/peer** (14 400 rows × the 1 MiB single-envelope cap). This
+/// makes that worst case **211 MiB/day/peer** — a 68× reduction — and the
+/// node-wide worst case 2.06 GiB/day
+/// ([`NODE_INGEST_BUDGET_MULTIPLE`] peers' worth), which is a volunteer
+/// node's disk over years rather than weeks. Honest traffic is nowhere near
+/// it: at the typical 1.5 KiB row the row dimension binds first, at 21
+/// MiB/day, and the byte budget is 90% unspent.
+///
+/// **Bounds:** bytes one peer may add to this node's disk in a day.
+/// **Derived:** `PER_PEER_SUSTAINED_WRITES_PER_WINDOW ×
+/// QUOTA_CALIBRATION_ROW_BYTES` = 14 400 × 15 360 = 221 184 000 B
+/// (210.9 MiB/day) — equivalently `24 × PER_PEER_ATTESTATION_BYTES_PER_WINDOW`,
+/// the same "one burst allowance per hour, forever" shape the sustained ROW
+/// constant is derived by. Both identities are asserted by the derivation
+/// gate.
+pub const PER_PEER_SUSTAINED_BYTES_PER_WINDOW: u64 = 221_184_000;
 
 /// v22.0.0 (CIRISPersist#543 finding 4, AV-76) — how many distinct peers
 /// one [`PeerWriteQuota`] tracks.
@@ -262,7 +442,82 @@ pub const PER_PEER_SUSTAINED_WRITE_WINDOW: Duration = Duration::from_secs(86_400
 ///    the cap was the multiplier — measured at 2 611 200, higher than
 ///    `cap × 600` precisely because defect 1 meant the cap did not bind.
 ///    Rotation now buys nothing: see [`UNTRACKED_TAIL_BUDGET_MULTIPLE`].
-pub const PER_PEER_QUOTA_TRACKED_PEERS_CAP: usize = 4096;
+///
+/// # v24.4.0 (CIRISPersist#583) — 4096 → 8192, and WHY a size is the fix
+///
+/// #583's second finding is the residue of that hard bound: *"once the table
+/// saturates with live-spending peers, no new bucket is created and an
+/// honest newcomer is demoted to the shared untracked tail the attacker is
+/// saturating."* True, and reachable — an adversary holding `CAP` buckets
+/// and touching all of them inside one sustained-token refill (6 s) makes
+/// every bucket non-full at once, so the prune frees nothing and whoever
+/// arrives next gets no individual budget.
+///
+/// The property to hold is #583's:
+///
+/// > **A peer with no history cannot degrade the service another peer
+/// > already had, and the eviction rule cannot be steered by the party it is
+/// > meant to bound.**
+///
+/// ## Why the eviction rule is NOT where the fix goes
+///
+/// #583 floats "evict by adversary-cost rather than by refill state". It is
+/// the wrong lever, and the reason is worth writing down because it is not
+/// obvious: **a fresh bucket is born FULL.** Therefore evicting a bucket
+/// that still holds a deficit *hands its owner its spent budget back* — a
+/// reset, which is exactly the primitive #575 closed. Evicting the emptiest
+/// maximises that gift to the flooder; evicting the fullest minimises it but
+/// still pays out (an identity that under-spends relative to the table
+/// becomes the eviction target and recovers what it spent); evicting the
+/// *oldest* is steerable by whoever writes most. The only eviction rule with
+/// a payout of exactly zero is "evict buckets whose eviction is a no-op",
+/// i.e. the full ones — which is what v24.3.0 already does. It is not
+/// improvable; it is optimal. Seeding a fresh bucket from the tail instead
+/// of full would unlock other rules, but then a rotation flood could evict
+/// an honest peer's full bucket and the honest peer would return to a
+/// *drained* one: a peer with no history degrading a peer that had service,
+/// which is the property inverted.
+///
+/// ## So the fix is a size, and it is derived
+///
+/// If the table is larger than any schedule can hold non-full, the prune can
+/// always free a slot and **the saturated branch is unreachable**. Every
+/// non-full bucket cost the adversary at least one write, every write is
+/// charged to the node budget, and one write keeps a bucket non-full for at
+/// most its own refill time. So the worst case over all write sizes is
+///
+/// ```text
+/// N_max = max over write costs c of
+///           min over (dimension, horizon) of
+///             (node_capacity + node_rate × w(c)) / c
+///         where w(c) = the longest refill of ONE write of cost c
+/// ```
+///
+/// which for the constants above peaks at **6 600** — the node burst
+/// capacity (10 × 600 = 6 000) plus what refills during one sustained row
+/// token's 6 s (600) — for every write cost from the typical row up to
+/// [`QUOTA_CALIBRATION_ROW_BYTES`], and falls away above it because a bigger
+/// payload buys a longer non-full window only by spending node BYTE budget
+/// faster than it buys. (That the two dimensions meet exactly at the
+/// calibration size is not a coincidence: it is what calibrating the byte
+/// budget off the row budget means.) 8192 is the next power of two above the
+/// peak, leaving ~24%
+/// headroom, and `tests::the_tracked_table_is_larger_than_any_flood_can_hold`
+/// re-derives `N_max` from the live constants by sweeping write costs, so
+/// raising [`NODE_INGEST_BUDGET_MULTIPLE`] or shrinking this cap fails a
+/// test that names the inequality it broke.
+///
+/// Memory: 8192 buckets × (a key id + 4 token pairs + an `Instant`) ≈ 1.5 MB
+/// per backend instance. Doubling the cap doubles a megabyte and closes a
+/// squeeze; that is the trade.
+///
+/// **Bounds:** the quota's own memory, AND (by being larger than any flood
+/// can occupy) the reachability of the tail-squeeze — a peer with no history
+/// always receives an individual budget.
+/// **Derived:** the next power of two above `N_max` = 6 600, the largest
+/// number of buckets the node budget can hold simultaneously non-full,
+/// swept over write costs by the derivation gate.
+pub const PER_PEER_QUOTA_TRACKED_PEERS_CAP: usize = 8192;
 
 /// v24.3.0 (CIRISPersist#575) — the **untracked tail is one peer**.
 ///
@@ -278,6 +533,13 @@ pub const PER_PEER_QUOTA_TRACKED_PEERS_CAP: usize = 4096;
 /// A per-identity budget over free identities is not a budget, whatever the
 /// tracking table does; the only thing that bounds it is an allowance that
 /// does not multiply.
+///
+/// **Bounds:** what every identity this node has never seen may spend,
+/// *together*, on every metered dimension.
+/// **Derived:** 1 — one peer's worth. Not a judgement about generosity: any
+/// value > 1 would still be a constant, and any value at all is fine as long
+/// as it does not scale with the number of identities, which is the only
+/// property that matters when identity is free.
 pub const UNTRACKED_TAIL_BUDGET_MULTIPLE: u32 = 1;
 
 /// v24.3.0 (CIRISPersist#575) — the node-wide federation-ingest ceiling, as
@@ -318,6 +580,17 @@ pub const UNTRACKED_TAIL_BUDGET_MULTIPLE: u32 = 1;
 /// fast" from "this node is full" and back off correctly; that discloses
 /// aggregate saturation, which is a real if small widening of the gate's
 /// information surface and is accepted for that reason.
+///
+/// **Bounds:** what the whole `put_attestation` federation-ingest plane may
+/// cost this node — 6 000 rows/min and 144 000 rows/day, and (v24.4.0,
+/// CIRISPersist#583) 87.9 MiB/min and 2.06 GiB/day of payload.
+/// **Derived:** ten peers writing at their individual ceiling,
+/// simultaneously, forever. A judgement, and the residual is on the record:
+/// a mesh needing more than ten saturated peers has outgrown a substrate
+/// constant and wants #575 ask (d). NOTE it is load-bearing twice — raising
+/// it also raises how many buckets a flood can hold non-full, so
+/// [`PER_PEER_QUOTA_TRACKED_PEERS_CAP`] must rise with it or the derivation
+/// gate fails.
 pub const NODE_INGEST_BUDGET_MULTIPLE: u32 = 10;
 
 /// v24.3.0 (CIRISPersist#575) — the **reserved admission class** budget, as
@@ -343,6 +616,14 @@ pub const NODE_INGEST_BUDGET_MULTIPLE: u32 = 10;
 /// consults no shared state by construction. Closing that is #575 ask (d).
 /// What ships here is strictly better than nothing: any flood not
 /// specifically shaped at the reserved class leaves objections a path.
+///
+/// **Bounds:** what the accord/objection family may spend, on a budget no
+/// ordinary traffic can consume — so a quota-compliant flood cannot become a
+/// censorship primitive against a kill-switch.
+/// **Derived:** 1 — one peer's worth. It has to be *some* finite number (a
+/// bypass would be a hole shaped exactly like the pure, forgeable class
+/// predicate that decides it), and one peer's ceiling is the smallest
+/// allowance that provably serves a real accord round.
 pub const RESERVED_CLASS_BUDGET_MULTIPLE: u32 = 1;
 
 /// v24.3.0 (CIRISPersist#575) — the dimension prefixes that put a row in the
@@ -374,7 +655,120 @@ pub const RESERVED_CLASS_BUDGET_MULTIPLE: u32 = 1;
 /// reference to `reverse_quorum::NAMESPACE_FAMILY`** so the prefix and the
 /// dimensions that ride it cannot drift apart. One predicate, one
 /// implementation; this is the exception that names its own end.
+///
+/// **Bounds:** which rows can reach the reserve — and therefore, since the
+/// reserve is budget ordinary traffic cannot use, how much of this node's
+/// admission capacity is unreachable to ordinary traffic.
+/// **Derived:** the two families #575 names as the ones that must never be
+/// crowded out (the accord kill-switch / lifecycle family, and #574's
+/// reverse-quorum objections) and nothing else — every added prefix is a
+/// cost as well as a protection.
 pub const RESERVED_CLASS_DIMENSION_PREFIXES: &[&str] = &["accord:", "objection:"];
+
+// ──────────────────────── QUOTA CONSTANTS — END ────────────────────────
+
+/// v24.4.0 (CIRISPersist#583) — **what the quota meters.** Closed, and the
+/// set is load-bearing: the implementation indexes its budgets and its
+/// per-write costs BY this enum, so a variant added here is a compile error
+/// everywhere a dimension must be priced, sized and refused — and
+/// `tests::every_metered_dimension_has_a_witness` fails until a witness
+/// drives a real refusal on it.
+///
+/// That mechanism is #583's actual lesson. The row dimension shipped in
+/// v22.0.0 without a byte sibling *because nothing asserted the set was
+/// complete*: there was no set, only a field. A taxonomy that a test can
+/// enumerate is one a reviewer can find a hole in.
+///
+/// # The two dimensions, and why neither subsumes the other
+///
+/// - [`Self::Rows`] bounds the part of a write's cost that does not vary
+///   with the payload: two signatures, hashes, ids, index entries, and the
+///   request the ingest path has to serve. Blind to payload size — 600 rows
+///   of 100 B and 600 rows of 10 MB cost it the same, which is #583.
+/// - [`Self::Bytes`] bounds the payload. Blind to the fixed cost — 14 400
+///   empty envelopes are free to it, and they are not free to the disk.
+///
+/// Many-small and few-huge are different attacks; each dimension bounds the
+/// part of the cost the other cannot see. Both are metered on the SAME
+/// bucket, and a write must clear both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaDimension {
+    /// One row, whatever it contains. The v22.0.0 dimension.
+    Rows,
+    /// The row's storage cost in bytes:
+    /// `max(envelope_bytes, TYPICAL_ATTESTATION_ENVELOPE_BYTES)`.
+    /// v24.4.0 (CIRISPersist#583).
+    Bytes,
+}
+
+impl QuotaDimension {
+    /// Every dimension, in declaration order. The index into a budget's
+    /// per-dimension spec and a write's per-dimension cost is
+    /// [`Self::index`], so this slice and those arrays cannot disagree.
+    pub const ALL: &'static [Self] = &[Self::Rows, Self::Bytes];
+
+    /// How many dimensions the quota meters. `[T; COUNT]` is how every
+    /// per-dimension array is sized, so adding a variant that is not counted
+    /// here does not compile.
+    pub const COUNT: usize = 2;
+
+    /// Dense index for the per-dimension arrays.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Rows => 0,
+            Self::Bytes => 1,
+        }
+    }
+
+    /// The stable program token, identical to the serde token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rows => "rows",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
+/// v24.4.0 (CIRISPersist#583) — **which budget** a write is charged against.
+/// Closed; the four #575 shipped, named so the refusal taxonomy can be
+/// generated from `budget × dimension × horizon` instead of hand-listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuotaBudget {
+    /// This author's own bucket. Fairness.
+    Peer,
+    /// The shared budget for identities with no bucket
+    /// ([`UNTRACKED_TAIL_BUDGET_MULTIPLE`]).
+    UntrackedTail,
+    /// The node-wide ordinary ceiling ([`NODE_INGEST_BUDGET_MULTIPLE`]).
+    /// Capacity.
+    Node,
+    /// The reserved admission class ([`RESERVED_CLASS_BUDGET_MULTIPLE`]).
+    Reserved,
+}
+
+impl QuotaBudget {
+    /// Every budget, in declaration order.
+    pub const ALL: &'static [Self] = &[Self::Peer, Self::UntrackedTail, Self::Node, Self::Reserved];
+}
+
+/// v24.4.0 (CIRISPersist#583) — **which horizon** a refusal came from. Every
+/// budget meters every dimension on both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuotaHorizon {
+    /// [`PER_PEER_ATTESTATION_WRITE_WINDOW`] — seconds. "Slow down."
+    Burst,
+    /// [`PER_PEER_SUSTAINED_WRITE_WINDOW`] — a day. "Too much, forever."
+    Sustained,
+}
+
+impl QuotaHorizon {
+    /// Both horizons, in refusal-precedence order (burst first: it is the
+    /// one that clears soonest, so it is the more actionable retry hint).
+    pub const ALL: &'static [Self] = &[Self::Burst, Self::Sustained];
+}
 
 /// v24.3.0 (CIRISPersist#575) — **WHICH budget refused** a write.
 ///
@@ -385,49 +779,97 @@ pub const RESERVED_CLASS_DIMENSION_PREFIXES: &[&str] = &["accord:", "objection:"
 /// its evidence sends the reader to the wrong layer.
 ///
 /// **Closed**, and every variant corresponds to exactly ONE condition in
-/// `PeerWriteQuota::check_at_class` — deliberately no `Other`, because a
+/// `PeerWriteQuota::charge` — deliberately no `Other`, because a
 /// catch-all reintroduces the disjunction one name deeper. Serde tokens are
 /// snake_case and [`Self::as_str`] returns the SAME token, so a consumer
 /// keys on a program constant and never on a message string. The token set
 /// is the downstream contract and this mapping is **APPEND-ONLY**: add
 /// variants, never re-spell one.
+///
+/// # v24.4.0 (CIRISPersist#583) — the set is now a PRODUCT
+///
+/// It is exactly `QuotaBudget × QuotaDimension × QuotaHorizon` (4 × 2 × 2 =
+/// 16), generated by [`Self::of`] and asserted complete by
+/// `tests::every_metered_dimension_has_a_witness`. The eight v24.3.0 tokens
+/// are the `Rows` half and keep their spelling **unchanged** — `peer_burst`,
+/// not `peer_rows_burst` — because downstream is already keying on them and
+/// the contract is append-only. The eight new ones carry `_bytes_`
+/// (`peer_bytes_burst`, `node_bytes_sustained`, …), which is what #583 asks
+/// for and what lets an operator tell a **row flood** from a **storage
+/// flood** without reading a message string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerQuotaRefusal {
-    /// This peer's own **burst** bucket is empty: more than
+    /// This peer's own **burst** bucket is out of ROW tokens: more than
     /// [`PER_PEER_ATTESTATION_WRITES_PER_WINDOW`] writes inside
     /// [`PER_PEER_ATTESTATION_WRITE_WINDOW`]. Slow down; the budget returns
     /// within seconds.
     PeerBurst,
-    /// This peer's own **sustained** bucket is empty: more than
+    /// This peer's own **sustained** bucket is out of ROW tokens: more than
     /// [`PER_PEER_SUSTAINED_WRITES_PER_WINDOW`] writes inside
     /// [`PER_PEER_SUSTAINED_WRITE_WINDOW`]. The burst was fine; the *day*
     /// is not. This is the refusal #575 exists to make possible.
     PeerSustained,
-    /// The shared **untracked tail**'s burst bucket is empty. The write came
-    /// from an `attesting_key_id` this quota holds no bucket for, and the
-    /// one-peer-sized tail budget that all such identities share is spent.
-    /// Rotating to another new identity does not help — that is the point.
+    /// The shared **untracked tail**'s burst bucket is out of ROW tokens.
+    /// The write came from an `attesting_key_id` this quota holds no bucket
+    /// for, and the one-peer-sized tail budget that all such identities
+    /// share is spent. Rotating to another new identity does not help —
+    /// that is the point.
     UntrackedTailBurst,
-    /// The shared **untracked tail**'s sustained bucket is empty. As
+    /// The shared **untracked tail**'s sustained ROW budget is spent. As
     /// [`Self::UntrackedTailBurst`], on the day horizon.
     UntrackedTailSustained,
-    /// The **node-wide** federation-ingest burst budget is empty
+    /// The **node-wide** federation-ingest burst ROW budget is spent
     /// ([`NODE_INGEST_BUDGET_MULTIPLE`] peers' worth). Not about this peer:
     /// the node is full. Distinguishable on purpose — a peer that cannot
     /// tell this from [`Self::PeerBurst`] cannot back off correctly.
     NodeBurst,
-    /// The **node-wide** federation-ingest sustained budget is empty. As
+    /// The **node-wide** federation-ingest sustained ROW budget is spent. As
     /// [`Self::NodeBurst`], on the day horizon.
     NodeSustained,
-    /// The **reserved class**'s burst budget is empty. Only rows in the
+    /// The **reserved class**'s burst ROW budget is spent. Only rows in the
     /// reserved class ([`RESERVED_CLASS_DIMENSION_PREFIXES`]) can spend it and
     /// only they can exhaust it — ordinary traffic never touches it, so this
     /// refusal means accord-class traffic itself is flooding.
     ReservedBurst,
-    /// The **reserved class**'s sustained budget is empty. As
+    /// The **reserved class**'s sustained ROW budget is spent. As
     /// [`Self::ReservedBurst`], on the day horizon.
     ReservedSustained,
+    /// v24.4.0 (CIRISPersist#583) — this peer's own **burst** BYTE budget is
+    /// spent: more than [`PER_PEER_ATTESTATION_BYTES_PER_WINDOW`] of payload
+    /// inside [`PER_PEER_ATTESTATION_WRITE_WINDOW`]. A **storage** flood,
+    /// not a row flood — the peer is well inside its row allowance and is
+    /// still costing too much disk. Distinguishable from
+    /// [`Self::PeerBurst`] precisely so an operator does not tune the wrong
+    /// number.
+    PeerBytesBurst,
+    /// v24.4.0 (CIRISPersist#583) — this peer's own **sustained** BYTE
+    /// budget is spent ([`PER_PEER_SUSTAINED_BYTES_PER_WINDOW`] in a day).
+    /// The one #583 exists to make possible: the day's *storage*, not the
+    /// day's rows.
+    PeerBytesSustained,
+    /// v24.4.0 (CIRISPersist#583) — the shared **untracked tail**'s burst
+    /// BYTE budget is spent. Identities this node has never seen have,
+    /// together, sent too much payload too fast; rotating does not help.
+    UntrackedTailBytesBurst,
+    /// v24.4.0 (CIRISPersist#583) — the shared **untracked tail**'s
+    /// sustained BYTE budget is spent. As
+    /// [`Self::UntrackedTailBytesBurst`], on the day horizon.
+    UntrackedTailBytesSustained,
+    /// v24.4.0 (CIRISPersist#583) — the **node-wide** burst BYTE budget is
+    /// spent. The node's federation-ingest write bandwidth is full; not
+    /// about this peer.
+    NodeBytesBurst,
+    /// v24.4.0 (CIRISPersist#583) — the **node-wide** sustained BYTE budget
+    /// is spent: this node has taken its day's federation-ingest storage.
+    NodeBytesSustained,
+    /// v24.4.0 (CIRISPersist#583) — the **reserved class**'s burst BYTE
+    /// budget is spent. Only accord/objection-class rows can reach it, so
+    /// this means accord-class traffic itself is a storage flood.
+    ReservedBytesBurst,
+    /// v24.4.0 (CIRISPersist#583) — the **reserved class**'s sustained BYTE
+    /// budget is spent. As [`Self::ReservedBytesBurst`], on the day horizon.
+    ReservedBytesSustained,
 }
 
 impl PeerQuotaRefusal {
@@ -445,6 +887,137 @@ impl PeerQuotaRefusal {
             Self::NodeSustained => "node_sustained",
             Self::ReservedBurst => "reserved_burst",
             Self::ReservedSustained => "reserved_sustained",
+            Self::PeerBytesBurst => "peer_bytes_burst",
+            Self::PeerBytesSustained => "peer_bytes_sustained",
+            Self::UntrackedTailBytesBurst => "untracked_tail_bytes_burst",
+            Self::UntrackedTailBytesSustained => "untracked_tail_bytes_sustained",
+            Self::NodeBytesBurst => "node_bytes_burst",
+            Self::NodeBytesSustained => "node_bytes_sustained",
+            Self::ReservedBytesBurst => "reserved_bytes_burst",
+            Self::ReservedBytesSustained => "reserved_bytes_sustained",
+        }
+    }
+
+    /// v24.4.0 (CIRISPersist#583) — **the taxonomy as a function**, not a
+    /// list. The refusal for one `(budget, dimension, horizon)` triple.
+    ///
+    /// This is the single place the product is spelled, so the enum cannot
+    /// quietly stop covering it: add a [`QuotaDimension`] and this match
+    /// stops compiling until the variants exist.
+    #[must_use]
+    pub const fn of(budget: QuotaBudget, dimension: QuotaDimension, horizon: QuotaHorizon) -> Self {
+        match (budget, dimension, horizon) {
+            (QuotaBudget::Peer, QuotaDimension::Rows, QuotaHorizon::Burst) => Self::PeerBurst,
+            (QuotaBudget::Peer, QuotaDimension::Rows, QuotaHorizon::Sustained) => {
+                Self::PeerSustained
+            }
+            (QuotaBudget::Peer, QuotaDimension::Bytes, QuotaHorizon::Burst) => Self::PeerBytesBurst,
+            (QuotaBudget::Peer, QuotaDimension::Bytes, QuotaHorizon::Sustained) => {
+                Self::PeerBytesSustained
+            }
+            (QuotaBudget::UntrackedTail, QuotaDimension::Rows, QuotaHorizon::Burst) => {
+                Self::UntrackedTailBurst
+            }
+            (QuotaBudget::UntrackedTail, QuotaDimension::Rows, QuotaHorizon::Sustained) => {
+                Self::UntrackedTailSustained
+            }
+            (QuotaBudget::UntrackedTail, QuotaDimension::Bytes, QuotaHorizon::Burst) => {
+                Self::UntrackedTailBytesBurst
+            }
+            (QuotaBudget::UntrackedTail, QuotaDimension::Bytes, QuotaHorizon::Sustained) => {
+                Self::UntrackedTailBytesSustained
+            }
+            (QuotaBudget::Node, QuotaDimension::Rows, QuotaHorizon::Burst) => Self::NodeBurst,
+            (QuotaBudget::Node, QuotaDimension::Rows, QuotaHorizon::Sustained) => {
+                Self::NodeSustained
+            }
+            (QuotaBudget::Node, QuotaDimension::Bytes, QuotaHorizon::Burst) => Self::NodeBytesBurst,
+            (QuotaBudget::Node, QuotaDimension::Bytes, QuotaHorizon::Sustained) => {
+                Self::NodeBytesSustained
+            }
+            (QuotaBudget::Reserved, QuotaDimension::Rows, QuotaHorizon::Burst) => {
+                Self::ReservedBurst
+            }
+            (QuotaBudget::Reserved, QuotaDimension::Rows, QuotaHorizon::Sustained) => {
+                Self::ReservedSustained
+            }
+            (QuotaBudget::Reserved, QuotaDimension::Bytes, QuotaHorizon::Burst) => {
+                Self::ReservedBytesBurst
+            }
+            (QuotaBudget::Reserved, QuotaDimension::Bytes, QuotaHorizon::Sustained) => {
+                Self::ReservedBytesSustained
+            }
+        }
+    }
+
+    /// Which dimension this refusal came from — a **row** flood or a
+    /// **storage** flood. v24.4.0 (CIRISPersist#583); the distinction is the
+    /// whole reason the byte tokens are separate names.
+    #[must_use]
+    pub const fn dimension(&self) -> QuotaDimension {
+        match self {
+            Self::PeerBurst
+            | Self::PeerSustained
+            | Self::UntrackedTailBurst
+            | Self::UntrackedTailSustained
+            | Self::NodeBurst
+            | Self::NodeSustained
+            | Self::ReservedBurst
+            | Self::ReservedSustained => QuotaDimension::Rows,
+            Self::PeerBytesBurst
+            | Self::PeerBytesSustained
+            | Self::UntrackedTailBytesBurst
+            | Self::UntrackedTailBytesSustained
+            | Self::NodeBytesBurst
+            | Self::NodeBytesSustained
+            | Self::ReservedBytesBurst
+            | Self::ReservedBytesSustained => QuotaDimension::Bytes,
+        }
+    }
+
+    /// Which budget refused. v24.4.0 (CIRISPersist#583).
+    #[must_use]
+    pub const fn budget(&self) -> QuotaBudget {
+        match self {
+            Self::PeerBurst
+            | Self::PeerSustained
+            | Self::PeerBytesBurst
+            | Self::PeerBytesSustained => QuotaBudget::Peer,
+            Self::UntrackedTailBurst
+            | Self::UntrackedTailSustained
+            | Self::UntrackedTailBytesBurst
+            | Self::UntrackedTailBytesSustained => QuotaBudget::UntrackedTail,
+            Self::NodeBurst
+            | Self::NodeSustained
+            | Self::NodeBytesBurst
+            | Self::NodeBytesSustained => QuotaBudget::Node,
+            Self::ReservedBurst
+            | Self::ReservedSustained
+            | Self::ReservedBytesBurst
+            | Self::ReservedBytesSustained => QuotaBudget::Reserved,
+        }
+    }
+
+    /// Which horizon refused — seconds or a day. v24.4.0 (CIRISPersist#583).
+    #[must_use]
+    pub const fn horizon(&self) -> QuotaHorizon {
+        match self {
+            Self::PeerBurst
+            | Self::UntrackedTailBurst
+            | Self::NodeBurst
+            | Self::ReservedBurst
+            | Self::PeerBytesBurst
+            | Self::UntrackedTailBytesBurst
+            | Self::NodeBytesBurst
+            | Self::ReservedBytesBurst => QuotaHorizon::Burst,
+            Self::PeerSustained
+            | Self::UntrackedTailSustained
+            | Self::NodeSustained
+            | Self::ReservedSustained
+            | Self::PeerBytesSustained
+            | Self::UntrackedTailBytesSustained
+            | Self::NodeBytesSustained
+            | Self::ReservedBytesSustained => QuotaHorizon::Sustained,
         }
     }
 
@@ -459,6 +1032,14 @@ impl PeerQuotaRefusal {
         Self::NodeSustained,
         Self::ReservedBurst,
         Self::ReservedSustained,
+        Self::PeerBytesBurst,
+        Self::PeerBytesSustained,
+        Self::UntrackedTailBytesBurst,
+        Self::UntrackedTailBytesSustained,
+        Self::NodeBytesBurst,
+        Self::NodeBytesSustained,
+        Self::ReservedBytesBurst,
+        Self::ReservedBytesSustained,
     ];
 }
 
@@ -517,106 +1098,309 @@ pub enum WriteAdmissionClass {
     Reserved,
 }
 
-/// v24.3.0 (CIRISPersist#575) — one budget's capacity and continuous refill
-/// rate on both horizons. Derived from the substrate constants by
-/// [`Self::for_multiple`]; there are no free-floating numbers below this
-/// line.
+/// One horizon of one dimension of one budget: a capacity and a continuous
+/// refill rate.
 #[derive(Debug, Clone, Copy)]
-struct BudgetSpec {
-    burst_capacity: f64,
-    burst_per_second: f64,
-    sustained_capacity: f64,
-    sustained_per_second: f64,
+struct HorizonSpec {
+    capacity: f64,
+    per_second: f64,
 }
 
-impl BudgetSpec {
-    /// `multiple` peers' worth of budget on both horizons.
-    fn for_multiple(multiple: u32) -> Self {
-        let m = f64::from(multiple);
-        let burst_capacity = f64::from(PER_PEER_ATTESTATION_WRITES_PER_WINDOW) * m;
-        let sustained_capacity = f64::from(PER_PEER_SUSTAINED_WRITES_PER_WINDOW) * m;
+impl HorizonSpec {
+    fn new(capacity: f64, window: Duration) -> Self {
         Self {
-            burst_capacity,
-            burst_per_second: burst_capacity / PER_PEER_ATTESTATION_WRITE_WINDOW.as_secs_f64(),
-            sustained_capacity,
-            sustained_per_second: sustained_capacity
-                / PER_PEER_SUSTAINED_WRITE_WINDOW.as_secs_f64(),
+            capacity,
+            per_second: capacity / window.as_secs_f64(),
         }
     }
 }
 
-/// One budget's token pair. Both are fractional so the refill is continuous
-/// rather than stepped at window boundaries, and one write spends one token
-/// from EACH — the burst horizon bounds the second, the sustained horizon
-/// bounds the day, and a write has to clear both.
+/// One dimension of one budget, on both horizons.
 #[derive(Debug, Clone, Copy)]
-struct PeerBucket {
+struct DimensionSpec {
+    burst: HorizonSpec,
+    sustained: HorizonSpec,
+}
+
+impl DimensionSpec {
+    fn horizon(&self, horizon: QuotaHorizon) -> &HorizonSpec {
+        match horizon {
+            QuotaHorizon::Burst => &self.burst,
+            QuotaHorizon::Sustained => &self.sustained,
+        }
+    }
+}
+
+/// v24.3.0 (CIRISPersist#575) — one budget's capacity and continuous refill
+/// rate on both horizons. Derived from the substrate constants by
+/// [`Self::for_multiple`]; there are no free-floating numbers below this
+/// line.
+///
+/// v24.4.0 (CIRISPersist#583) — indexed by [`QuotaDimension`]. The array is
+/// `[_; QuotaDimension::COUNT]` and `for_multiple` matches exhaustively on
+/// the enum, so **a dimension cannot be added without being sized**: the
+/// compiler asks for its capacities before the code builds.
+#[derive(Debug, Clone, Copy)]
+struct BudgetSpec {
+    dims: [DimensionSpec; QuotaDimension::COUNT],
+}
+
+impl BudgetSpec {
+    /// `multiple` peers' worth of budget, on every dimension and horizon.
+    fn for_multiple(multiple: u32) -> Self {
+        let m = f64::from(multiple);
+        #[allow(clippy::cast_precision_loss)]
+        let per_dim = |d: QuotaDimension| match d {
+            QuotaDimension::Rows => DimensionSpec {
+                burst: HorizonSpec::new(
+                    f64::from(PER_PEER_ATTESTATION_WRITES_PER_WINDOW) * m,
+                    PER_PEER_ATTESTATION_WRITE_WINDOW,
+                ),
+                sustained: HorizonSpec::new(
+                    f64::from(PER_PEER_SUSTAINED_WRITES_PER_WINDOW) * m,
+                    PER_PEER_SUSTAINED_WRITE_WINDOW,
+                ),
+            },
+            QuotaDimension::Bytes => DimensionSpec {
+                burst: HorizonSpec::new(
+                    PER_PEER_ATTESTATION_BYTES_PER_WINDOW as f64 * m,
+                    PER_PEER_ATTESTATION_WRITE_WINDOW,
+                ),
+                sustained: HorizonSpec::new(
+                    PER_PEER_SUSTAINED_BYTES_PER_WINDOW as f64 * m,
+                    PER_PEER_SUSTAINED_WRITE_WINDOW,
+                ),
+            },
+        };
+        let mut dims = [per_dim(QuotaDimension::Rows); QuotaDimension::COUNT];
+        for d in QuotaDimension::ALL {
+            dims[d.index()] = per_dim(*d);
+        }
+        Self { dims }
+    }
+
+    fn dim(&self, dimension: QuotaDimension) -> &DimensionSpec {
+        &self.dims[dimension.index()]
+    }
+}
+
+/// v24.4.0 (CIRISPersist#583) — what ONE write costs, per metered dimension.
+///
+/// Also indexed by [`QuotaDimension`] and built by an exhaustive match, so a
+/// new dimension must be *priced* as well as sized before anything compiles.
+/// That pair — priced and sized — is what "the quota meters this dimension"
+/// means mechanically, and it is what nothing asserted before #583.
+#[derive(Debug, Clone, Copy)]
+struct WriteCost {
+    per_dimension: [f64; QuotaDimension::COUNT],
+}
+
+impl WriteCost {
+    /// The cost of a write whose envelope serializes to `envelope_bytes`.
+    ///
+    /// Bytes are floored at [`TYPICAL_ATTESTATION_ENVELOPE_BYTES`]: the
+    /// envelope is the variable part of a row's storage cost, not the whole
+    /// of it (two signatures, hashes, ids and index entries ride along), so
+    /// an empty envelope is not free disk.
+    #[allow(clippy::cast_precision_loss)]
+    fn for_envelope_bytes(envelope_bytes: u64) -> Self {
+        let charged = envelope_bytes.max(TYPICAL_ATTESTATION_ENVELOPE_BYTES);
+        let price = |d: QuotaDimension| match d {
+            QuotaDimension::Rows => 1.0,
+            QuotaDimension::Bytes => charged as f64,
+        };
+        let mut per_dimension = [0.0; QuotaDimension::COUNT];
+        for d in QuotaDimension::ALL {
+            per_dimension[d.index()] = price(*d);
+        }
+        Self { per_dimension }
+    }
+
+    /// The cost of a write whose size the caller does not know — one typical
+    /// row. Used by the key-only [`PeerWriteQuota::check`] entry point, which
+    /// has no envelope: a caller that cannot say how big its row is is
+    /// charged the floor, never zero. A dimension with a free door is a
+    /// dimension that is not metered.
+    fn floor() -> Self {
+        Self::for_envelope_bytes(0)
+    }
+
+    fn of(&self, dimension: QuotaDimension) -> f64 {
+        self.per_dimension[dimension.index()]
+    }
+}
+
+/// One dimension's token pair inside one bucket.
+#[derive(Debug, Clone, Copy)]
+struct DimensionTokens {
     burst: f64,
     sustained: f64,
+}
+
+impl DimensionTokens {
+    fn horizon_mut(&mut self, horizon: QuotaHorizon) -> &mut f64 {
+        match horizon {
+            QuotaHorizon::Burst => &mut self.burst,
+            QuotaHorizon::Sustained => &mut self.sustained,
+        }
+    }
+
+    fn horizon(&self, horizon: QuotaHorizon) -> f64 {
+        match horizon {
+            QuotaHorizon::Burst => self.burst,
+            QuotaHorizon::Sustained => self.sustained,
+        }
+    }
+}
+
+/// One budget's tokens. Every count is fractional so the refill is
+/// continuous rather than stepped at window boundaries, and one write spends
+/// from EVERY (dimension, horizon) cell — the burst horizon bounds the
+/// second, the sustained horizon bounds the day, the row dimension bounds
+/// the fixed cost, the byte dimension bounds the payload, and a write has to
+/// clear all of them.
+#[derive(Debug, Clone, Copy)]
+struct PeerBucket {
+    tokens: [DimensionTokens; QuotaDimension::COUNT],
     last_seen: Instant,
 }
 
 impl PeerBucket {
     /// A budget at full allowance as of `now`.
     fn full(spec: &BudgetSpec, now: Instant) -> Self {
+        let mut tokens = [DimensionTokens {
+            burst: 0.0,
+            sustained: 0.0,
+        }; QuotaDimension::COUNT];
+        for d in QuotaDimension::ALL {
+            let s = spec.dim(*d);
+            tokens[d.index()] = DimensionTokens {
+                burst: s.burst.capacity,
+                sustained: s.sustained.capacity,
+            };
+        }
         Self {
-            burst: spec.burst_capacity,
-            sustained: spec.sustained_capacity,
+            tokens,
             last_seen: now,
         }
     }
 
-    /// Accrue tokens for the elapsed time, capped at capacity.
+    /// Accrue tokens for the elapsed time, capped at capacity, on every
+    /// dimension and horizon.
     fn refill(&mut self, spec: &BudgetSpec, now: Instant) {
         let elapsed = now.saturating_duration_since(self.last_seen).as_secs_f64();
-        self.burst = (self.burst + elapsed * spec.burst_per_second).min(spec.burst_capacity);
-        self.sustained =
-            (self.sustained + elapsed * spec.sustained_per_second).min(spec.sustained_capacity);
+        for d in QuotaDimension::ALL {
+            let s = *spec.dim(*d);
+            let t = &mut self.tokens[d.index()];
+            for h in QuotaHorizon::ALL {
+                let hs = s.horizon(*h);
+                let cell = t.horizon_mut(*h);
+                *cell = (*cell + elapsed * hs.per_second).min(hs.capacity);
+            }
+        }
         self.last_seen = now;
     }
 
-    /// `None` if one token is available on BOTH horizons; otherwise the
-    /// refusal, burst horizon first (it is the one that clears soonest, so
-    /// it is the more actionable retry hint when both are short).
+    /// `None` if `cost` is affordable in EVERY cell; otherwise the refusal
+    /// naming the first cell that cannot pay.
+    ///
+    /// Precedence: burst horizon before sustained (it is the one that clears
+    /// soonest, so it is the more actionable retry hint when both are
+    /// short), and within a horizon, dimensions in [`QuotaDimension::ALL`]
+    /// order — rows before bytes, which keeps every v24.3.0 refusal token
+    /// exactly where it was for row-bound traffic.
     fn refusal(
         &self,
         spec: &BudgetSpec,
-        burst_reason: PeerQuotaRefusal,
-        sustained_reason: PeerQuotaRefusal,
+        budget: QuotaBudget,
+        cost: &WriteCost,
     ) -> Option<PeerQuotaRefused> {
-        if self.burst < 1.0 {
-            return Some(PeerQuotaRefused {
-                reason: burst_reason,
-                retry_after_seconds: retry_after(1.0 - self.burst, spec.burst_per_second),
-            });
-        }
-        if self.sustained < 1.0 {
-            return Some(PeerQuotaRefused {
-                reason: sustained_reason,
-                retry_after_seconds: retry_after(1.0 - self.sustained, spec.sustained_per_second),
-            });
+        for h in QuotaHorizon::ALL {
+            for d in QuotaDimension::ALL {
+                let want = cost.of(*d);
+                let have = self.tokens[d.index()].horizon(*h);
+                if have < want {
+                    let hs = spec.dim(*d).horizon(*h);
+                    return Some(PeerQuotaRefused {
+                        reason: PeerQuotaRefusal::of(budget, *d, *h),
+                        retry_after_seconds: retry_after(want - have, hs.per_second),
+                    });
+                }
+            }
         }
         None
     }
 
     /// Spend one write. Only ever called after every budget the write
     /// touches has already been proven admissible — see the no-partial-charge
-    /// note on `PeerWriteQuota::check_at_class`.
-    fn spend(&mut self) {
-        self.burst -= 1.0;
-        self.sustained -= 1.0;
+    /// note on `PeerWriteQuota::charge`.
+    fn spend(&mut self, cost: &WriteCost) {
+        for d in QuotaDimension::ALL {
+            let want = cost.of(*d);
+            let t = &mut self.tokens[d.index()];
+            for h in QuotaHorizon::ALL {
+                *t.horizon_mut(*h) -= want;
+            }
+        }
     }
 
-    /// A budget at full allowance on both horizons carries no information a
-    /// fresh one wouldn't — the prune predicate.
+    /// A budget at full allowance on every dimension and horizon carries no
+    /// information a fresh one wouldn't — the prune predicate, and the ONLY
+    /// eviction predicate with a zero payout to the evicted party (see
+    /// [`PER_PEER_QUOTA_TRACKED_PEERS_CAP`] on why that is not improvable).
     fn is_full(&self, spec: &BudgetSpec) -> bool {
-        self.burst >= spec.burst_capacity && self.sustained >= spec.sustained_capacity
+        QuotaDimension::ALL.iter().all(|d| {
+            let s = spec.dim(*d);
+            let t = self.tokens[d.index()];
+            QuotaHorizon::ALL
+                .iter()
+                .all(|h| t.horizon(*h) >= s.horizon(*h).capacity)
+        })
     }
 }
 
 /// Seconds until `deficit` tokens have accrued at `per_second`, never 0.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn retry_after(deficit: f64, per_second: f64) -> u64 {
     (deficit / per_second).ceil().max(1.0) as u64
+}
+
+/// v24.4.0 (CIRISPersist#583) — the byte size of an attestation envelope, as
+/// the quota charges it.
+///
+/// Measured with a counting sink rather than by canonicalizing: the quota is
+/// the FIRST gate in `put_attestation` and it runs on unauthenticated input,
+/// so it must not allocate a second copy of an attacker-supplied payload —
+/// the same reasoning that keeps a disk write off the head of the admission
+/// chain ([`PeerWriteQuota::new`]). The caller has already paid to parse
+/// these bytes into a `Value`; measuring the re-serialization is strictly
+/// cheaper than the parse that produced it, and allocates nothing.
+///
+/// This is deliberately NOT
+/// [`ceg_produce_canonicalize`](crate::verify::canonical::ceg_produce_canonicalize)
+/// — the JCS bytes the producer signed, which
+/// [`check_envelope_size_admission`](crate::federation::admission::check_envelope_size_admission)
+/// measures a few gates later. The two agree to within JSON escaping and
+/// number formatting, and a quota wants a proportional cost signal, not a
+/// byte-exact accounting. The signed thing is the *sized* thing; the
+/// *charged* thing is what it costs to hold.
+fn envelope_charged_bytes(envelope: &serde_json::Value) -> u64 {
+    struct Counting(u64);
+    impl std::io::Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = Counting(0);
+    // Serializing a `Value` into a sink that never errors cannot fail; if it
+    // somehow did, the count so far is still a lower bound and the row is
+    // charged at least the floor.
+    let _ = serde_json::to_writer(&mut sink, envelope);
+    sink.0
 }
 
 /// v22.0.0 (CIRISPersist#543 finding 4, AV-76) — per-peer write quota for
@@ -690,6 +1474,18 @@ struct QuotaState {
     tail: PeerBucket,
     /// The reserved class's own budget ([`RESERVED_CLASS_BUDGET_MULTIPLE`]).
     reserved: PeerBucket,
+    /// v24.4.0 (CIRISPersist#583) — how many admitted writes were denied an
+    /// individual bucket because the table was saturated with non-full
+    /// peers: the **tail-squeeze counter**.
+    ///
+    /// By the [`PER_PEER_QUOTA_TRACKED_PEERS_CAP`] derivation this must stay
+    /// zero — the cap is sized above what any schedule can hold non-full, so
+    /// the prune can always free a slot. It is counted rather than asserted
+    /// because "unreachable by arithmetic over four constants" is a claim
+    /// that survives exactly as long as the four constants do, and a
+    /// deployment that has drifted should be able to SEE it rather than
+    /// silently demote newcomers to a contended commons.
+    slot_denials: u64,
 }
 
 impl Default for PeerWriteQuota {
@@ -754,6 +1550,7 @@ impl PeerWriteQuota {
                     &BudgetSpec::for_multiple(RESERVED_CLASS_BUDGET_MULTIPLE),
                     now,
                 ),
+                slot_denials: 0,
             }),
         }
     }
@@ -780,9 +1577,11 @@ impl PeerWriteQuota {
     /// Charge one attestation write. The call the three backends'
     /// `put_attestation` makes.
     ///
-    /// `Ok(())` — admitted, one token spent in every budget it touches.
+    /// `Ok(())` — admitted, and every dimension of every budget it touches
+    /// has been charged.
     /// `Err(`[`Error::RateLimited`](crate::federation::Error::RateLimited)`)`
-    /// — over quota; see [`Self::check_write_typed`] for WHICH budget.
+    /// — over quota; see [`Self::check_write_typed`] for WHICH budget and
+    /// WHICH dimension.
     pub fn check_write(
         &self,
         row: &crate::federation::types::Attestation,
@@ -800,13 +1599,22 @@ impl PeerWriteQuota {
         &self,
         row: &crate::federation::types::Attestation,
     ) -> Result<(), PeerQuotaRefused> {
-        self.check_at_class(&row.attesting_key_id, Self::classify(row), Instant::now())
+        self.charge(
+            &row.attesting_key_id,
+            Self::classify(row),
+            &WriteCost::for_envelope_bytes(envelope_charged_bytes(&row.attestation_envelope)),
+            Instant::now(),
+        )
     }
 
     /// Charge one ordinary-class write against `key_id`.
     ///
     /// Retained as the shape this method has had since v22.0.0 for callers
-    /// that hold a key and no row.
+    /// that hold a key and no row. v24.4.0 (CIRISPersist#583): such a caller
+    /// is charged [`WriteCost::floor`] on the byte dimension — one typical
+    /// row — because a size-free entry point into a size-metered control is
+    /// a door around the dimension, and the completeness gate exists to stop
+    /// exactly that.
     pub fn check(&self, key_id: &str) -> Result<(), crate::federation::Error> {
         self.check_at(key_id, Instant::now())
     }
@@ -819,26 +1627,42 @@ impl PeerWriteQuota {
             .map_err(Into::into)
     }
 
+    /// Clock-injected, class-injected, floor-cost check. The shape the unit
+    /// tests below have used since v22.0.0; the byte cost is
+    /// [`WriteCost::floor`].
+    fn check_at_class(
+        &self,
+        key_id: &str,
+        class: WriteAdmissionClass,
+        now: Instant,
+    ) -> Result<(), PeerQuotaRefused> {
+        self.charge(key_id, class, &WriteCost::floor(), now)
+    }
+
     /// The clock-injected core. Every other entry point funnels here, so
     /// there is exactly one place where a write is charged.
     ///
     /// # No partial charge
     ///
     /// An ordinary write touches TWO budgets (node-wide, plus this peer's or
-    /// the shared tail's). Both are proven admissible *before* either is
-    /// spent — a check that debited the node and then refused on the peer
-    /// would leak the node's budget to refused traffic, which is precisely
-    /// the amplification this control exists to close.
+    /// the shared tail's) on EVERY metered dimension. All of it is proven
+    /// admissible *before* anything is spent — a check that debited the node
+    /// and then refused on the peer would leak the node's budget to refused
+    /// traffic, which is precisely the amplification this control exists to
+    /// close. v24.4.0 (CIRISPersist#583) extends the same rule across
+    /// dimensions: a write that clears rows and fails bytes debits neither.
     ///
     /// # Refusal precedence
     ///
-    /// Node before peer/tail, and burst before sustained inside a budget.
-    /// The node verdict leads because it is the one the caller cannot fix by
-    /// slowing down, so it is the more useful thing to be told.
-    fn check_at_class(
+    /// Node before peer/tail; inside a budget, burst before sustained and
+    /// rows before bytes. The node verdict leads because it is the one the
+    /// caller cannot fix by slowing down, so it is the more useful thing to
+    /// be told.
+    fn charge(
         &self,
         key_id: &str,
         class: WriteAdmissionClass,
+        cost: &WriteCost,
         now: Instant,
     ) -> Result<(), PeerQuotaRefused> {
         let peer_spec = Self::peer_spec();
@@ -854,62 +1678,55 @@ impl PeerWriteQuota {
         // accord objection unwritable (#575's must-ship caveat).
         if class == WriteAdmissionClass::Reserved {
             st.reserved.refill(&reserved_spec, now);
-            if let Some(refused) = st.reserved.refusal(
-                &reserved_spec,
-                PeerQuotaRefusal::ReservedBurst,
-                PeerQuotaRefusal::ReservedSustained,
-            ) {
+            if let Some(refused) = st
+                .reserved
+                .refusal(&reserved_spec, QuotaBudget::Reserved, cost)
+            {
                 return Err(refused);
             }
-            st.reserved.spend();
+            st.reserved.spend(cost);
             return Ok(());
         }
 
         st.node.refill(&node_spec, now);
-        if let Some(refused) = st.node.refusal(
-            &node_spec,
-            PeerQuotaRefusal::NodeBurst,
-            PeerQuotaRefusal::NodeSustained,
-        ) {
+        if let Some(refused) = st.node.refusal(&node_spec, QuotaBudget::Node, cost) {
             return Err(refused);
         }
 
         // Tracked peer: its own budget, and it does not touch the tail.
         if let Some(bucket) = st.buckets.get_mut(key_id) {
             bucket.refill(&peer_spec, now);
-            if let Some(refused) = bucket.refusal(
-                &peer_spec,
-                PeerQuotaRefusal::PeerBurst,
-                PeerQuotaRefusal::PeerSustained,
-            ) {
+            if let Some(refused) = bucket.refusal(&peer_spec, QuotaBudget::Peer, cost) {
                 return Err(refused);
             }
-            bucket.spend();
-            st.node.spend();
+            bucket.spend(cost);
+            st.node.spend(cost);
             return Ok(());
         }
 
         // Untracked: the shared one-peer tail budget decides, and it decides
         // the same way for the millionth rotated identity as for the first.
         st.tail.refill(&tail_spec, now);
-        if let Some(refused) = st.tail.refusal(
-            &tail_spec,
-            PeerQuotaRefusal::UntrackedTailBurst,
-            PeerQuotaRefusal::UntrackedTailSustained,
-        ) {
+        if let Some(refused) = st
+            .tail
+            .refusal(&tail_spec, QuotaBudget::UntrackedTail, cost)
+        {
             return Err(refused);
         }
-        st.tail.spend();
-        st.node.spend();
+        st.tail.spend(cost);
+        st.node.spend(cost);
 
         // Admitted. Now — and only now — try to give this identity a bucket
         // of its own, so its second write is metered individually instead of
         // against everyone else's tail. A slot is a *convenience*, never a
         // budget: failing to get one costs the peer nothing this write.
         if st.buckets.len() >= PER_PEER_QUOTA_TRACKED_PEERS_CAP {
-            // Drop every bucket that has refilled to full on both horizons —
-            // exactly the set whose state carries no information a fresh
-            // bucket wouldn't.
+            // Drop every bucket that has refilled to full on every dimension
+            // and horizon — exactly the set whose state carries no
+            // information a fresh bucket wouldn't, and (see
+            // `PER_PEER_QUOTA_TRACKED_PEERS_CAP`) the only evictable set
+            // whose eviction pays the evicted party nothing. Any wider rule
+            // is a budget reset wearing a fairness costume.
             st.buckets.retain(|_, b| {
                 let mut probe = *b;
                 probe.refill(&peer_spec, now);
@@ -918,13 +1735,25 @@ impl PeerWriteQuota {
         }
         if st.buckets.len() < PER_PEER_QUOTA_TRACKED_PEERS_CAP {
             let mut fresh = PeerBucket::full(&peer_spec, now);
-            fresh.spend(); // this write, accounted in the peer's own budget too
+            fresh.spend(cost); // this write, accounted in the peer's own budget too
             st.buckets.insert(key_id.to_owned(), fresh);
+        } else {
+            // Saturated with live-spending peers and nothing was prunable:
+            // the #583 tail-squeeze. The write is still admitted (the tail
+            // paid for it) — refusing it would make an honest newcomer's
+            // FIRST contact the thing a flood breaks, which is the AV-75
+            // outage, not a gate. What is not acceptable is that it happens
+            // silently, so it is counted.
+            //
+            // By the `PER_PEER_QUOTA_TRACKED_PEERS_CAP` derivation this
+            // branch is UNREACHABLE: the table is sized above the largest
+            // number of buckets the node budget can hold non-full, so the
+            // prune above always frees at least one slot. A non-zero
+            // `slot_denials()` in a live deployment means that inequality no
+            // longer holds — which is the thing the derivation gate refuses
+            // to let happen in the tree.
+            st.slot_denials += 1;
         }
-        // else: saturated with live-spending peers and nothing was prunable.
-        // The write is admitted (the tail paid for it) and NO bucket is
-        // created — the table is a HARD bound, which is what #575 found it
-        // was not.
         Ok(())
     }
 
@@ -938,18 +1767,79 @@ impl PeerWriteQuota {
             .len()
     }
 
-    /// Remaining burst tokens in `key_id`'s own bucket, if it has one.
-    /// Test-only: the no-partial-charge invariant is not observable from
-    /// outcomes alone, and an invariant that can only be argued is one that
-    /// drifts.
+    /// v24.4.0 (CIRISPersist#583) — whether `key_id` currently has an
+    /// individual budget rather than sharing the untracked tail.
+    ///
+    /// The observable form of #583's honest-newcomer property: a peer with
+    /// no history must come out of first contact with a budget of its own,
+    /// whatever a flood is doing at the time.
+    pub fn tracks(&self, key_id: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .buckets
+            .contains_key(key_id)
+    }
+
+    /// v24.4.0 (CIRISPersist#583) — how many admitted writes were denied an
+    /// individual bucket because the tracked table was saturated with
+    /// non-full peers.
+    ///
+    /// **Must be 0.** See [`PER_PEER_QUOTA_TRACKED_PEERS_CAP`]: the cap is
+    /// derived to make this branch unreachable, and a deployment reading
+    /// non-zero here is one whose constants have drifted out of the
+    /// relationship the derivation gate asserts.
+    pub fn slot_denials(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .slot_denials
+    }
+
+    /// Remaining tokens in `key_id`'s own bucket for one dimension/horizon,
+    /// if it has one. Test-only: the no-partial-charge invariant is not
+    /// observable from outcomes alone, and an invariant that can only be
+    /// argued is one that drifts.
     #[cfg(test)]
-    fn peer_burst_tokens(&self, key_id: &str) -> Option<f64> {
+    fn peer_tokens(
+        &self,
+        key_id: &str,
+        dimension: QuotaDimension,
+        horizon: QuotaHorizon,
+    ) -> Option<f64> {
         self.state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .buckets
             .get(key_id)
-            .map(|b| b.burst)
+            .map(|b| b.tokens[dimension.index()].horizon(horizon))
+    }
+
+    /// Remaining burst ROW tokens — the v24.3.0 spelling, kept for the tests
+    /// that predate the byte dimension.
+    #[cfg(test)]
+    fn peer_burst_tokens(&self, key_id: &str) -> Option<f64> {
+        self.peer_tokens(key_id, QuotaDimension::Rows, QuotaHorizon::Burst)
+    }
+
+    /// `key_id`'s bucket **refilled to `now`**, cell by cell. Test-only: the
+    /// stored tokens are refilled lazily (only on a write that reaches the
+    /// tracked path), so a raw read is not comparable across a schedule in
+    /// which some writes are refused earlier in the chain. The
+    /// adversary-monotonicity property differentials against this.
+    #[cfg(test)]
+    fn peer_tokens_at(&self, key_id: &str, now: Instant) -> Option<PeerBucket> {
+        let peer_spec = Self::peer_spec();
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .buckets
+            .get(key_id)
+            .map(|b| {
+                let mut probe = *b;
+                probe.refill(&peer_spec, now);
+                probe
+            })
     }
 }
 
@@ -1226,6 +2116,75 @@ pub mod gate_order_test_support {
             "one peer's exhausted bucket must not spend another's — got {err:?}"
         );
     }
+
+    /// v24.4.0 (CIRISPersist#583) — the **BYTE dimension**, proven wired into
+    /// `put_attestation` on every backend.
+    ///
+    /// #583, quoting CIRISServer: *"600 rows of 100 B and 600 rows of 10 MB
+    /// cost the same."* The unit tests in this module's `tests` prove the
+    /// bucket arithmetic; this proves the real envelope reaches
+    /// `PeerWriteQuota::check_write` through the real host API on all three
+    /// backends. A dimension exercised only through a bypass certifies an
+    /// unreachable feature — the AV-77 lesson, which is why this lives beside
+    /// the row-quota witness rather than in the unit tests.
+    ///
+    /// Every row here is 900 KiB: comfortably under
+    /// [`MAX_ATTESTATION_ENVELOPE_BYTES`](crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES)
+    /// so the size gate admits it, and ~600 typical rows' worth of storage so
+    /// the peer's BYTE budget binds long before its ROW budget. The refusal
+    /// must name the byte dimension, because "you are writing too many rows"
+    /// and "you are writing too much storage" are different operator actions.
+    pub async fn assert_byte_dimension_is_wired<F>(dir: &F, tag: &str)
+    where
+        F: FederationDirectory + ?Sized,
+    {
+        let key_id = format!("av583{tag}");
+        let big = serde_json::json!({ "pad": "x".repeat(900 * 1024) });
+
+        let mut admitted = 0u32;
+        let mut refusal = None;
+        for _ in 0..super::PER_PEER_ATTESTATION_WRITES_PER_WINDOW {
+            let mut row = unverifiable_row(&key_id, attestation_tier::FEDERATION, "global");
+            row.attestation_envelope = big.clone();
+            let err = dir
+                .put_attestation(SignedAttestation { attestation: row })
+                .await
+                .expect_err("the `global` cohort_scope is never a wire value");
+            match err {
+                crate::federation::Error::RateLimited { reason, .. } => {
+                    refusal = Some(reason);
+                    break;
+                }
+                other => {
+                    assert_eq!(
+                        other.kind(),
+                        "federation_cohort_scope_rejected",
+                        "a 900 KiB envelope is under the single-row cap and must \
+                         fail on the closed-set cohort_scope — got {other:?}"
+                    );
+                    admitted += 1;
+                }
+            }
+        }
+
+        let refusal = refusal.expect(
+            "#583: 600 rows of 900 KiB (≈527 MiB) were all admitted by the \
+             quota — it meters ROWS ONLY and inauthentic STORAGE is invisible \
+             to the control that exists to bound it",
+        );
+        assert_eq!(
+            refusal.dimension(),
+            super::QuotaDimension::Bytes,
+            "a storage flood must be refused on the BYTE dimension so an \
+             operator can tell it from a row flood — got {refusal}"
+        );
+        assert!(
+            admitted < super::PER_PEER_ATTESTATION_WRITES_PER_WINDOW / 10,
+            "the byte budget bound only after {admitted} of \
+             {} rows at 900 KiB — that is not a storage bound",
+            super::PER_PEER_ATTESTATION_WRITES_PER_WINDOW,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1445,15 +2404,34 @@ mod tests {
         q.check_at_class(key, WriteAdmissionClass::Ordinary, now)
     }
 
-    /// The exact token-bucket ceiling over an interval: a write spends from
-    /// BOTH horizons, so the binding one is whichever admits fewer —
-    /// `min(capacity + rate × elapsed)` across the two. Rounded up by one so
-    /// the assertion cannot flake on the last fractional token.
-    fn ceiling(spec: &BudgetSpec, elapsed: Duration) -> u64 {
+    /// The exact token-bucket ceiling over an interval, in WRITES of cost
+    /// `cost`: a write spends from every horizon of every dimension, so the
+    /// binding cell is whichever admits fewest —
+    /// `min over cells of (capacity + rate × elapsed) / cost`. Rounded up by
+    /// one so the assertion cannot flake on the last fractional token.
+    ///
+    /// v24.4.0 (CIRISPersist#583) — the minimum now ranges over dimensions
+    /// as well as horizons, so a ceiling assertion cannot go stale by
+    /// ignoring a dimension the control has started metering.
+    fn ceiling_for(spec: &BudgetSpec, elapsed: Duration, cost: &WriteCost) -> u64 {
         let e = elapsed.as_secs_f64();
-        let burst = spec.burst_capacity + spec.burst_per_second * e;
-        let sustained = spec.sustained_capacity + spec.sustained_per_second * e;
-        burst.min(sustained).ceil() as u64
+        let mut best = f64::INFINITY;
+        for d in QuotaDimension::ALL {
+            let want = cost.of(*d);
+            if want <= 0.0 {
+                continue;
+            }
+            for h in QuotaHorizon::ALL {
+                let hs = spec.dim(*d).horizon(*h);
+                best = best.min((hs.capacity + hs.per_second * e) / want);
+            }
+        }
+        best.ceil() as u64
+    }
+
+    /// [`ceiling_for`] at the cost every clock-injected unit test charges.
+    fn ceiling(spec: &BudgetSpec, elapsed: Duration) -> u64 {
+        ceiling_for(spec, elapsed, &WriteCost::floor())
     }
 
     /// **GAP 1 — 864 000 rows/day/peer.** The v22 control was a burst
@@ -1492,7 +2470,7 @@ mod tests {
             "#575 gap 1: one peer landed {admitted} rows in a simulated day; \
              the sustained budget bounds it at {bound} (capacity {} + {} \
              rows/day). A burst bucket alone permits 864 000.",
-            spec.sustained_capacity,
+            spec.dim(QuotaDimension::Rows).sustained.capacity,
             PER_PEER_SUSTAINED_WRITES_PER_WINDOW,
         );
         // …and the ceiling is not vacuous: an honest peer's full burst still
@@ -1519,7 +2497,11 @@ mod tests {
     fn a_restart_is_worth_one_node_burst_not_a_sybil_multiple() {
         let quota = PeerWriteQuota::new(); // ← the restart
         let t0 = Instant::now();
-        let bound = node_budget().burst_capacity as u64;
+        let bound = node_budget()
+            .dim(QuotaDimension::Rows)
+            .burst
+            .capacity
+            .ceil() as u64;
 
         let mut admitted: u64 = 0;
         'flood: for i in 0..(PER_PEER_QUOTA_TRACKED_PEERS_CAP + 256) {
@@ -1999,6 +2981,1009 @@ mod tests {
             admitted_total > 1_000,
             "the harness admitted only {admitted_total} writes — it is not \
              exercising the control"
+        );
+    }
+
+    // ── v24.4.0 (CIRISPersist#583) — the byte dimension, the tail-squeeze,
+    //    and the three gates that outlive both fixes ────────────────────────
+
+    /// A federation-tier row whose envelope is exactly `envelope`.
+    fn row_with_envelope(
+        key: &str,
+        envelope: serde_json::Value,
+    ) -> crate::federation::types::Attestation {
+        crate::federation::types::Attestation {
+            attestation_id: "r".into(),
+            attesting_key_id: key.into(),
+            attested_key_id: key.into(),
+            attestation_type: "attestation:self_verify".into(),
+            weight: None,
+            asserted_at: chrono::Utc::now(),
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: key.into(),
+            scrub_timestamp: chrono::Utc::now(),
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: "self".into(),
+            tier: "federation".into(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+
+    /// A row whose envelope serializes to approximately `bytes`.
+    fn row_of_size(key: &str, bytes: usize) -> crate::federation::types::Attestation {
+        // `{"pad":"…"}` — 12 bytes of framing around the padding.
+        let pad = bytes.saturating_sub(12);
+        row_with_envelope(key, serde_json::json!({ "pad": "x".repeat(pad) }))
+    }
+
+    /// **FIX 1, RED-FIRST WITNESS (#583).** *"600 rows of 100 B and 600 rows
+    /// of 10 MB cost the same."* They did: `classify` keyed on the envelope's
+    /// dimension, `spend` decremented a count, and **nothing in the quota
+    /// path read a payload size** — so inauthentic *storage* was invisible to
+    /// the control that exists to bound it.
+    ///
+    /// Against v24.3.0 this fails on its first assertion: all three row sizes
+    /// admit exactly `PER_PEER_ATTESTATION_WRITES_PER_WINDOW`, including the
+    /// 10 MB one, and a peer at its full row allowance lands ~6 GB.
+    #[test]
+    fn a_ten_megabyte_row_must_not_cost_the_same_as_a_hundred_byte_row() {
+        // Capped: a rows-only quota admits 600 of ANY size, and 600 × 10 MB
+        // is 6 GB of serialization in a debug build. The caps are above every
+        // count a correct implementation can produce, so they change nothing
+        // green and turn a slow failure into a fast one.
+        let admits = |row: &crate::federation::types::Attestation, cap: u64| -> u64 {
+            let quota = PeerWriteQuota::new();
+            let mut n = 0u64;
+            while n < cap && quota.check_write_typed(row).is_ok() {
+                n += 1;
+            }
+            n
+        };
+
+        let small = row_of_size("byte-witness", 100);
+        let large = row_of_size("byte-witness", 900 * 1024);
+        let huge = row_of_size("byte-witness", 10 * 1024 * 1024);
+
+        let small_admitted = admits(
+            &small,
+            4 * u64::from(PER_PEER_ATTESTATION_WRITES_PER_WINDOW),
+        );
+        let large_admitted = admits(&large, 32);
+        let huge_admitted = admits(&huge, 4);
+
+        assert!(
+            large_admitted < 32 && large_admitted < small_admitted,
+            "#583: a 900 KiB row landed {large_admitted} times and a 100 B row \
+             {small_admitted} — a quota that meters ROWS ONLY cannot tell a \
+             storage flood from a row flood, so 600 × 100 B and 600 × 10 MB \
+             cost the same and ~6 GB is 'within quota'"
+        );
+        assert_eq!(
+            small_admitted,
+            u64::from(PER_PEER_ATTESTATION_WRITES_PER_WINDOW),
+            "small rows must still be bounded by the ROW dimension — the byte \
+             dimension must not become a second, tighter row control (AV-75)"
+        );
+        assert_eq!(
+            huge_admitted, 0,
+            "a single 10 MB row exceeds one peer's whole burst BYTE allowance \
+             ({PER_PEER_ATTESTATION_BYTES_PER_WINDOW} B) and must be refused \
+             outright"
+        );
+
+        // …and the refusal NAMES the dimension, so an operator can tell a row
+        // flood from a storage flood without reading a message string (#583,
+        // #565's contract).
+        let quota = PeerWriteQuota::new();
+        for _ in 0..32 {
+            if quota.check_write_typed(&large).is_err() {
+                break;
+            }
+        }
+        let refused = quota
+            .check_write_typed(&large)
+            .expect_err("the byte budget is spent");
+        assert_eq!(
+            refused.reason.dimension(),
+            QuotaDimension::Bytes,
+            "a storage flood must be refused on the BYTE dimension, got {}",
+            refused.reason
+        );
+        assert_eq!(refused.reason.as_str(), "peer_bytes_burst");
+        assert!(refused.retry_after_seconds >= 1);
+    }
+
+    /// The byte dimension is charged on the row's *actual* envelope, and the
+    /// floor is real: an empty envelope is not free storage, because the row
+    /// it rides on is not free storage (two signatures, hashes, ids,
+    /// indexes).
+    #[test]
+    fn the_byte_charge_is_the_envelope_floored_at_a_typical_row() {
+        assert_eq!(
+            envelope_charged_bytes(&serde_json::json!({})),
+            2,
+            "an empty envelope serializes to `{{}}`"
+        );
+        assert!(
+            envelope_charged_bytes(&serde_json::json!({ "pad": "x".repeat(4096) })) >= 4096,
+            "the charge must track the payload"
+        );
+        let floor = WriteCost::floor();
+        for d in QuotaDimension::ALL {
+            assert!(
+                floor.of(*d) > 0.0,
+                "no entry point may charge zero on a metered dimension — a \
+                 size-free door into a size-metered control is the {} \
+                 dimension not being metered",
+                d.as_str()
+            );
+        }
+        assert!(
+            (WriteCost::for_envelope_bytes(2).of(QuotaDimension::Bytes)
+                - TYPICAL_ATTESTATION_ENVELOPE_BYTES as f64)
+                .abs()
+                < f64::EPSILON,
+            "a tiny envelope is charged the typical-row floor"
+        );
+    }
+
+    /// **FIX 2, RED-FIRST WITNESS (#583).** The residue of the 4096-cap
+    /// inversion: *"once the table saturates with live-spending peers, no new
+    /// bucket is created and an honest newcomer is demoted to the shared
+    /// untracked tail the attacker is saturating."*
+    ///
+    /// The attack, in three phases:
+    ///
+    /// 1. the fleet acquires every slot it can (rate-limited by the shared
+    ///    tail, so this costs simulated minutes, not writes-out-of-nowhere);
+    /// 2. everything refills, and then the fleet touches every identity it
+    ///    holds **inside one sustained-token refill**, so no bucket is
+    ///    prunable at the instant that matters;
+    /// 3. an honest peer arrives.
+    ///
+    /// Against a 4096 cap the fleet holds all 4096 slots non-full — 4096 node
+    /// burst tokens out of 6000 buys it — the prune frees nothing, and the
+    /// newcomer is admitted with **no individual budget**, metered against
+    /// the very tail the fleet is saturating. Against the derived 8192 cap
+    /// the fleet cannot hold the table: the node budget it must spend to keep
+    /// buckets non-full runs out first, the prune always frees a slot, and
+    /// the newcomer's first contact still buys it a budget of its own.
+    #[test]
+    fn an_honest_newcomer_gets_its_own_budget_during_a_rotation_flood() {
+        let quota = PeerWriteQuota::new();
+        let t0 = Instant::now();
+        let mut at = t0;
+        let mut fleet: Vec<String> = Vec::new();
+
+        // Phase 1 — acquire slots. Bounded by simulated time, not by hope:
+        // the tail admits ~10 first contacts a second, so filling the table
+        // takes a quarter-hour whatever the cap is.
+        while fleet.len() < PER_PEER_QUOTA_TRACKED_PEERS_CAP
+            && at.duration_since(t0) < Duration::from_secs(7_200)
+        {
+            for _ in 0..16 {
+                if fleet.len() >= PER_PEER_QUOTA_TRACKED_PEERS_CAP {
+                    break;
+                }
+                let id = format!("fleet-{}", fleet.len());
+                if ord(&quota, &id, at).is_ok() {
+                    fleet.push(id);
+                } else {
+                    break;
+                }
+            }
+            at += Duration::from_secs(1);
+        }
+        assert!(
+            fleet.len() > PER_PEER_QUOTA_TRACKED_PEERS_CAP / 2,
+            "the fleet acquired only {} slots — the witness is not exercising \
+             saturation",
+            fleet.len()
+        );
+
+        // Phase 2 — let every budget refill, then squeeze: touch the whole
+        // fleet at ONE instant, so every bucket carries a deficit and nothing
+        // is prunable.
+        at += PER_PEER_ATTESTATION_WRITE_WINDOW * 2;
+        let mut touched = 0u64;
+        for id in &fleet {
+            if ord(&quota, id, at).is_ok() {
+                touched += 1;
+            }
+        }
+
+        // Phase 3 — the honest newcomer, one second later: long enough for
+        // the node budget to have a token for it, far short of the six
+        // seconds a spent bucket needs to become prunable. The squeeze is
+        // still on.
+        at += Duration::from_secs(1);
+        ord(&quota, "honest-newcomer", at)
+            .expect("the newcomer's first write must be admitted (the tail pays for it)");
+        assert!(
+            quota.tracks("honest-newcomer"),
+            "#583 tail-squeeze: an honest peer arriving during a flood was \
+             admitted but got NO individual budget — it is metered against the \
+             shared untracked tail the fleet is saturating. The fleet holds \
+             {} of {PER_PEER_QUOTA_TRACKED_PEERS_CAP} slots and touched \
+             {touched} of them in one instant; the table must be sized so \
+             that spend cannot cover it.",
+            fleet.len(),
+        );
+        assert_eq!(
+            quota.slot_denials(),
+            0,
+            "no write may be denied an individual budget: the tracked-table \
+             cap is derived to make that branch unreachable"
+        );
+    }
+
+    // ── GATE 1 — DIMENSIONAL COMPLETENESS ──────────────────────────────────
+
+    /// The write cost that makes `dim` the binding dimension.
+    ///
+    /// Rows bind at the floor (a typical row is 1/10th of the calibration
+    /// size, so the row budget runs out ten times sooner); bytes bind at four
+    /// calibration rows (so the byte budget runs out four times sooner than
+    /// the row budget). Both are derived from the constants, so a tuned
+    /// calibration re-derives the witness rather than stranding it.
+    fn witness_cost(dim: QuotaDimension) -> WriteCost {
+        match dim {
+            QuotaDimension::Rows => WriteCost::floor(),
+            QuotaDimension::Bytes => WriteCost::for_envelope_bytes(QUOTA_CALIBRATION_ROW_BYTES * 4),
+        }
+    }
+
+    /// Drive the quota until the `(budget, dimension, horizon)` cell refuses,
+    /// and return what it said. Panics — with the cell named — if no schedule
+    /// inside a simulated day gets there, which is what "this cell is metered
+    /// but nothing can witness it" looks like.
+    fn witness_refusal(
+        budget: QuotaBudget,
+        dim: QuotaDimension,
+        horizon: QuotaHorizon,
+    ) -> PeerQuotaRefusal {
+        let cost = witness_cost(dim);
+        let quota = PeerWriteQuota::new();
+        let t0 = Instant::now();
+        let mut at = t0;
+
+        let class = match budget {
+            QuotaBudget::Reserved => WriteAdmissionClass::Reserved,
+            _ => WriteAdmissionClass::Ordinary,
+        };
+        // Peer: one identity spends its own. Node: enough identities that no
+        // ONE of them can exhaust its own budget before the node's.
+        // UntrackedTail: a fresh identity every write. Reserved: its own
+        // class, which touches nothing else.
+        let keys: Vec<String> = match budget {
+            QuotaBudget::Peer => vec!["solo".into()],
+            QuotaBudget::Reserved => vec!["accord".into()],
+            QuotaBudget::Node => (0..(2 * NODE_INGEST_BUDGET_MULTIPLE))
+                .map(|i| format!("node-peer-{i}"))
+                .collect(),
+            QuotaBudget::UntrackedTail => Vec::new(),
+        };
+
+        let mut rotation = 0u64;
+        for _ in 0..256 {
+            let ended = loop {
+                if keys.is_empty() {
+                    rotation += 1;
+                    if let Err(refused) = quota.charge(&format!("rot-{rotation}"), class, &cost, at)
+                    {
+                        break refused.reason;
+                    }
+                } else {
+                    let mut refusal = None;
+                    for k in &keys {
+                        if let Err(refused) = quota.charge(k, class, &cost, at) {
+                            refusal = Some(refused.reason);
+                            break;
+                        }
+                    }
+                    if let Some(r) = refusal {
+                        break r;
+                    }
+                }
+            };
+            if ended.budget() == budget && ended.dimension() == dim && ended.horizon() == horizon {
+                return ended;
+            }
+            at += PER_PEER_ATTESTATION_WRITE_WINDOW;
+        }
+        panic!(
+            "no schedule reached the ({budget:?}, {}, {horizon:?}) refusal in \
+             256 windows — the quota meters that cell and nothing witnesses \
+             it. #583: the row dimension shipped without a byte sibling \
+             precisely because nothing asserted the set was complete.",
+            dim.as_str()
+        );
+    }
+
+    /// **GATE 1 — DIMENSIONAL COMPLETENESS (#583).**
+    ///
+    /// The refusal taxonomy is exactly `QuotaBudget × QuotaDimension ×
+    /// QuotaHorizon`, and **every cell of that product is driven to a real
+    /// refusal by a real schedule.** Three things fail here, in increasing
+    /// order of subtlety:
+    ///
+    /// 1. adding a [`QuotaDimension`] variant does not compile until it is
+    ///    sized ([`BudgetSpec::for_multiple`]), priced
+    ///    ([`WriteCost::for_envelope_bytes`]) and named
+    ///    ([`PeerQuotaRefusal::of`]) — the arrays are `[_;
+    ///    QuotaDimension::COUNT]` and the matches are exhaustive;
+    /// 2. it then fails the cardinality assertion below until the refusal
+    ///    variants exist;
+    /// 3. and it fails [`witness_refusal`] until a schedule can actually
+    ///    drive the new cells — which is the assertion that a *metered*
+    ///    dimension is a *reachable* one, the AV-77 lesson applied to a
+    ///    taxonomy.
+    ///
+    /// Point 3 is the one #583 is about. The row dimension shipped alone in
+    /// v22.0.0 not because anyone decided bytes did not matter but because
+    /// there was no set to be incomplete — only a field.
+    #[test]
+    fn every_metered_dimension_has_a_witness() {
+        assert_eq!(
+            QuotaDimension::ALL.len(),
+            QuotaDimension::COUNT,
+            "COUNT sizes every per-dimension array; it must equal ALL"
+        );
+        for (i, d) in QuotaDimension::ALL.iter().enumerate() {
+            assert_eq!(d.index(), i, "dimension indices must be dense and stable");
+        }
+        assert_eq!(
+            PeerQuotaRefusal::ALL.len(),
+            QuotaBudget::ALL.len() * QuotaDimension::ALL.len() * QuotaHorizon::ALL.len(),
+            "the refusal taxonomy must be the FULL product of budget × \
+             dimension × horizon — a metered dimension with no refusal token \
+             is a budget that refuses under someone else's name"
+        );
+
+        // The product and the enum are the same set, both ways.
+        let mut produced = std::collections::HashSet::new();
+        for b in QuotaBudget::ALL {
+            for d in QuotaDimension::ALL {
+                for h in QuotaHorizon::ALL {
+                    assert!(
+                        produced.insert(PeerQuotaRefusal::of(*b, *d, *h)),
+                        "two cells map to one refusal token"
+                    );
+                }
+            }
+        }
+        for r in PeerQuotaRefusal::ALL {
+            assert!(
+                produced.contains(r),
+                "{r} is in the taxonomy but no (budget, dimension, horizon) \
+                 produces it"
+            );
+            assert_eq!(
+                PeerQuotaRefusal::of(r.budget(), r.dimension(), r.horizon()),
+                *r,
+                "{r}'s accessors must round-trip through `of`"
+            );
+        }
+
+        // …and every cell has a WITNESS: a schedule that really refuses there.
+        for b in QuotaBudget::ALL {
+            for d in QuotaDimension::ALL {
+                for h in QuotaHorizon::ALL {
+                    let observed = witness_refusal(*b, *d, *h);
+                    assert_eq!(
+                        observed,
+                        PeerQuotaRefusal::of(*b, *d, *h),
+                        "witness for ({b:?}, {}, {h:?}) refused as {observed}",
+                        d.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    // ── GATE 2 — ADVERSARY MONOTONICITY ────────────────────────────────────
+
+    /// **GATE 2 — ADVERSARY MONOTONICITY (#583), property-style.**
+    ///
+    /// > A peer with no history cannot degrade the service another peer
+    /// > already had, and the eviction rule cannot be steered by the party it
+    /// > is meant to bound.
+    ///
+    /// A single scenario proves the least interesting case, so this drives a
+    /// deterministic pseudo-random adversary — rotation, deep drains,
+    /// byte-heavy writes, clock jumps, and a *squeeze* that touches the whole
+    /// held fleet at one instant — past the tracked-table cap so the eviction
+    /// path really runs, with one honest incumbent writing alongside. Four
+    /// invariants, re-checked as the run proceeds:
+    ///
+    /// 1. **No reset.** Every key's cumulative admitted writes stay inside
+    ///    the ceiling `capacity + rate × elapsed` its OWN bucket allows. An
+    ///    eviction that re-created a bucket carrying a deficit would hand
+    ///    that key its spent budget back and show up here immediately — which
+    ///    is why the prune may only drop buckets that are FULL.
+    /// 2. **The incumbent is untouched.** Its bucket is differentialled
+    ///    against a shadow driven only by its own writes and the clock. If
+    ///    the adversary could evict-and-reseed it, drain it, or age it
+    ///    differently, the two diverge.
+    /// 3. **No slot denial.** A peer with no history always leaves first
+    ///    contact with an individual budget.
+    /// 4. **The table stays bounded**, which is the memory half the cap
+    ///    exists for and must not be traded away for invariant 3.
+    #[test]
+    fn no_adversary_schedule_resets_itself_or_degrades_an_incumbent() {
+        let quota = PeerWriteQuota::new();
+        let peer_spec = peer_budget();
+        let t0 = Instant::now();
+        let mut at = t0;
+
+        // Deterministic RNG — a property harness whose schedule changes run
+        // to run tells you a different thing each time it is green.
+        let mut rng: u64 = 0x5833_4144_5645_5253;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let honest = "honest-incumbent";
+        let mut shadow = PeerBucket::full(&peer_spec, at);
+        let mut shadow_live = false;
+        // Cumulative cost per key, per dimension. Counting *writes* would not
+        // do: the adversary mixes cheap and byte-heavy rows on one identity,
+        // and the invariant is about what it SPENT, not how often.
+        let mut spent: HashMap<String, [f64; QuotaDimension::COUNT]> = HashMap::new();
+        let mut admitted: HashMap<String, u64> = HashMap::new();
+        let mut fleet: Vec<String> = Vec::new();
+        let mut squeezes = 0u64;
+        let mut evictions_seen = false;
+        let mut peak_tracked = 0usize;
+
+        let charge = |key: &str,
+                      cost: &WriteCost,
+                      at: Instant,
+                      spent: &mut HashMap<String, [f64; QuotaDimension::COUNT]>|
+         -> bool {
+            let ok = quota
+                .charge(key, WriteAdmissionClass::Ordinary, cost, at)
+                .is_ok();
+            if ok {
+                let elapsed = at.duration_since(t0).as_secs_f64();
+                let acc = spent
+                    .entry(key.to_owned())
+                    .or_insert([0.0; QuotaDimension::COUNT]);
+                // INVARIANT 1, checked on the key that just changed. A bucket
+                // starts full, so everything this key has EVER spent must fit
+                // inside `capacity + rate × elapsed` on every cell — an
+                // eviction that re-created a bucket carrying a deficit would
+                // hand it the difference back and break this immediately.
+                for d in QuotaDimension::ALL {
+                    acc[d.index()] += cost.of(*d);
+                    for h in QuotaHorizon::ALL {
+                        let hs = peer_spec.dim(*d).horizon(*h);
+                        let bound = hs.capacity + hs.per_second * elapsed;
+                        assert!(
+                            acc[d.index()] <= bound * (1.0 + 1e-9) + 1e-6,
+                            "#583 no-reset: {key} has spent {} on the ({}, \
+                             {h:?}) cell in {elapsed:.1}s, over the {bound} its \
+                             OWN bucket allows. An eviction that frees a bucket \
+                             carrying a deficit hands its owner the budget back \
+                             — which is why the prune may only drop FULL \
+                             buckets, and why 'evict by adversary cost' is a \
+                             reset primitive wearing a fairness costume.",
+                            acc[d.index()],
+                            d.as_str(),
+                        );
+                    }
+                }
+            }
+            ok
+        };
+
+        for step in 0..6_000u64 {
+            let r = next();
+
+            // The honest incumbent writes at a modest, steady rate. Its
+            // bucket is differentialled against a shadow that only ever sees
+            // the incumbent's own writes.
+            if r % 3 == 0 {
+                shadow.refill(&peer_spec, at);
+                if !shadow_live {
+                    shadow = PeerBucket::full(&peer_spec, at);
+                    shadow_live = true;
+                }
+                let cost = WriteCost::floor();
+                let real = quota.charge(honest, WriteAdmissionClass::Ordinary, &cost, at);
+                if real.is_ok() {
+                    shadow.spend(&cost);
+                    let n = admitted.entry(honest.to_owned()).or_default();
+                    *n += 1;
+                }
+                if let Some(bucket) = quota.peer_tokens_at(honest, at) {
+                    // INVARIANT 2 — cell by cell.
+                    for d in QuotaDimension::ALL {
+                        for h in QuotaHorizon::ALL {
+                            let mine = bucket.tokens[d.index()].horizon(*h);
+                            let theirs = shadow.tokens[d.index()].horizon(*h);
+                            assert!(
+                                (mine - theirs).abs() <= 1e-6 * theirs.abs().max(1.0),
+                                "#583 step {step}: the incumbent's own \
+                                 ({}, {h:?}) budget is {mine} where its own \
+                                 history says {theirs} — a peer with no \
+                                 history changed the service a peer already \
+                                 had",
+                                d.as_str(),
+                            );
+                        }
+                    }
+                } else {
+                    // Pruned because it was FULL — a no-op by construction,
+                    // and the only eviction this design permits. The shadow
+                    // must agree that it was full.
+                    let mut probe = shadow;
+                    probe.refill(&peer_spec, at);
+                    assert!(
+                        probe.is_full(&peer_spec),
+                        "#583 step {step}: the incumbent lost its bucket while \
+                         it still carried a deficit — that is an eviction the \
+                         adversary steered, and re-creating it full is a reset"
+                    );
+                    shadow_live = false;
+                }
+            }
+
+            // The adversary. Four shapes, chosen deterministically. Where a
+            // shape gets to pick a payload size it does, so the byte
+            // dimension is under attack as well as the row dimension.
+            let heavy =
+                WriteCost::for_envelope_bytes(QUOTA_CALIBRATION_ROW_BYTES * ((r >> 6) % 8 + 1));
+            let cost = if (r >> 4) % 3 == 0 {
+                heavy
+            } else {
+                WriteCost::floor()
+            };
+            match (r >> 12) % 32 {
+                // Rotate: brand-new identities, one write each — the shape
+                // that fills the table. Cheap rows on purpose: acquiring
+                // slots is what the flooder wants, and the cheapest row buys
+                // the most of them.
+                0..=15 => {
+                    for _ in 0..(1 + (r >> 16) % 24) {
+                        let id = format!("rot-{}", fleet.len());
+                        if charge(&id, &WriteCost::floor(), at, &mut spent) {
+                            fleet.push(id);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                // Deep-drain one held identity: the shape that keeps a bucket
+                // non-full for as long as possible per token.
+                16..=23 => {
+                    if !fleet.is_empty() {
+                        let id = fleet[((r >> 20) as usize) % fleet.len()].clone();
+                        for _ in 0..(1 + (r >> 24) % 200) {
+                            if !charge(&id, &cost, at, &mut spent) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Squeeze: touch the whole held fleet at ONE instant, so
+                // nothing is prunable when the next newcomer arrives.
+                24 => {
+                    squeezes += 1;
+                    let ids: Vec<String> = fleet.clone();
+                    for id in &ids {
+                        if !charge(id, &cost, at, &mut spent) {
+                            break;
+                        }
+                    }
+                    // …and a newcomer arrives into exactly that instant.
+                    let newcomer = format!("newcomer-{step}");
+                    if charge(&newcomer, &cost, at, &mut spent) {
+                        assert!(
+                            quota.tracks(&newcomer),
+                            "#583 step {step}: a newcomer admitted during a \
+                             squeeze got no individual budget — it is metered \
+                             against the very tail the fleet is saturating"
+                        );
+                        fleet.push(newcomer);
+                    }
+                }
+                // Idle: let things refill. An equal-clock schedule tests
+                // refills trivially.
+                _ => {}
+            }
+
+            at += match (r >> 32) % 16 {
+                0 => Duration::from_secs(1 + (r >> 36) % 900),
+                1..=3 => Duration::from_secs(1 + (r >> 40) % 7),
+                _ => Duration::from_millis((r >> 44) % 1_500),
+            };
+
+            // INVARIANTS 3 and 4.
+            assert_eq!(
+                quota.slot_denials(),
+                0,
+                "#583 step {step}: {} writes have been denied an individual \
+                 budget. The table must be sized above what any flood can hold \
+                 non-full ({} tracked, cap {PER_PEER_QUOTA_TRACKED_PEERS_CAP})",
+                quota.slot_denials(),
+                quota.tracked_peers(),
+            );
+            let tracked = quota.tracked_peers();
+            assert!(
+                tracked <= PER_PEER_QUOTA_TRACKED_PEERS_CAP,
+                "#583 step {step}: the tracked table holds {tracked}, past its \
+                 cap — invariant 3 must not be bought with unbounded memory"
+            );
+            if tracked < peak_tracked {
+                evictions_seen = true;
+            }
+            peak_tracked = peak_tracked.max(tracked);
+        }
+
+        // The harness has to have exercised the machinery, or every invariant
+        // above is vacuous.
+        assert!(
+            fleet.len() > PER_PEER_QUOTA_TRACKED_PEERS_CAP,
+            "the adversary only reached {} identities — it never made the \
+             tracked table choose",
+            fleet.len()
+        );
+        assert!(
+            evictions_seen,
+            "the prune never ran; the no-reset invariant was never tested \
+             against an actual eviction"
+        );
+        assert!(squeezes > 0, "the squeeze shape never fired");
+        assert!(
+            admitted.get(honest).copied().unwrap_or(0) > 100,
+            "the incumbent barely wrote; the differential is vacuous"
+        );
+    }
+
+    // ── GATE 3 — DERIVATION ────────────────────────────────────────────────
+
+    /// The quota block of this file, so the gate below can read the source it
+    /// is gating. `include_str!` resolves relative to this file.
+    const QUOTA_SOURCE: &str = include_str!("admission.rs");
+
+    /// Every `pub const` between the QUOTA CONSTANTS markers, paired with the
+    /// doc block immediately above it.
+    fn gated_constants() -> Vec<(String, String)> {
+        let begin = QUOTA_SOURCE
+            .find("QUOTA CONSTANTS — BEGIN")
+            .expect("the derivation-gated block must be marked");
+        let end = QUOTA_SOURCE
+            .find("QUOTA CONSTANTS — END")
+            .expect("the derivation-gated block must be closed");
+        assert!(begin < end, "the markers must bracket the block");
+
+        let mut out = Vec::new();
+        let mut doc = String::new();
+        for line in QUOTA_SOURCE[begin..end].lines() {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix("///") {
+                doc.push_str(rest);
+                doc.push('\n');
+            } else if let Some(rest) = t.strip_prefix("pub const ") {
+                let name = rest
+                    .split(|c: char| c == ':' || c.is_whitespace())
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                out.push((name, std::mem::take(&mut doc)));
+            } else if !t.starts_with("//") && !t.is_empty() {
+                doc.clear();
+            }
+        }
+        out
+    }
+
+    /// **GATE 3 — DERIVATION (#583).** Every quota number is traceable to a
+    /// stated rationale, and the constants and their documented bounds stay
+    /// in agreement.
+    ///
+    /// Three failure modes, all of them things a future tuner does:
+    ///
+    /// 1. **A new constant with no rationale.** The gate scans its own source
+    ///    for `pub const` items inside the marked block and requires each to
+    ///    carry a `**Bounds:**` line (what it bounds) and a `**Derived:**`
+    ///    line (why that value) — and to be named in `GATED` below, so a new
+    ///    number cannot arrive without someone writing down its relationship
+    ///    to the others.
+    /// 2. **A tuned number that breaks a stated identity.** The derived
+    ///    constants are written as literals *and* asserted equal to their
+    ///    derivations, so raising the byte budget without restating the
+    ///    calibration it comes from fails here rather than silently
+    ///    un-pricing storage.
+    /// 3. **A tuned number that breaks a stated inequality** — the byte
+    ///    dimension binding before the row dimension on honest traffic
+    ///    (AV-75), or a legal row becoming unaffordable to a budget it must
+    ///    pass through, which is a control that structurally cannot admit a
+    ///    row the layer above calls legal.
+    #[test]
+    fn every_quota_constant_is_derived() {
+        /// Every constant the relationships below account for. A constant in
+        /// the block and not in this list fails the gate.
+        const GATED: &[&str] = &[
+            "PER_PEER_ATTESTATION_WRITES_PER_WINDOW",
+            "PER_PEER_ATTESTATION_WRITE_WINDOW",
+            "PER_PEER_SUSTAINED_WRITES_PER_WINDOW",
+            "PER_PEER_SUSTAINED_WRITE_WINDOW",
+            "TYPICAL_ATTESTATION_ENVELOPE_BYTES",
+            "QUOTA_BYTE_HEADROOM_MULTIPLE",
+            "QUOTA_CALIBRATION_ROW_BYTES",
+            "PER_PEER_ATTESTATION_BYTES_PER_WINDOW",
+            "PER_PEER_SUSTAINED_BYTES_PER_WINDOW",
+            "PER_PEER_QUOTA_TRACKED_PEERS_CAP",
+            "UNTRACKED_TAIL_BUDGET_MULTIPLE",
+            "NODE_INGEST_BUDGET_MULTIPLE",
+            "RESERVED_CLASS_BUDGET_MULTIPLE",
+            "RESERVED_CLASS_DIMENSION_PREFIXES",
+        ];
+
+        let found = gated_constants();
+        assert_eq!(
+            found.len(),
+            GATED.len(),
+            "the derivation-gated block declares {} constants and the gate \
+             accounts for {}: {:?}",
+            found.len(),
+            GATED.len(),
+            found.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        );
+        for (name, doc) in &found {
+            assert!(
+                GATED.contains(&name.as_str()),
+                "`{name}` is a quota constant with no entry in the derivation \
+                 gate. A magic constant with no derivation is a future \
+                 incident (#583): name what it bounds, and assert its \
+                 relationship to the numbers it comes from."
+            );
+            assert!(
+                doc.contains("**Bounds:**"),
+                "`{name}` does not say what it BOUNDS"
+            );
+            assert!(
+                doc.contains("**Derived:**"),
+                "`{name}` does not say why THAT VALUE"
+            );
+        }
+
+        // ── the identities the docs claim ──────────────────────────────────
+        assert_eq!(
+            PER_PEER_SUSTAINED_WRITES_PER_WINDOW,
+            24 * PER_PEER_ATTESTATION_WRITES_PER_WINDOW,
+            "the sustained ROW ceiling is derived as one burst allowance per \
+             hour, forever — 24 × the burst"
+        );
+        assert_eq!(
+            PER_PEER_SUSTAINED_WRITE_WINDOW,
+            PER_PEER_ATTESTATION_WRITE_WINDOW * 60 * 24,
+            "the day horizon is 1440 burst windows"
+        );
+        assert_eq!(
+            QUOTA_CALIBRATION_ROW_BYTES,
+            TYPICAL_ATTESTATION_ENVELOPE_BYTES * QUOTA_BYTE_HEADROOM_MULTIPLE,
+            "the calibration row is TYPICAL × HEADROOM — one new free \
+             parameter in the byte dimension, not two magic sizes"
+        );
+        assert_eq!(
+            PER_PEER_ATTESTATION_BYTES_PER_WINDOW,
+            u64::from(PER_PEER_ATTESTATION_WRITES_PER_WINDOW) * QUOTA_CALIBRATION_ROW_BYTES,
+            "the burst BYTE ceiling is the burst ROW ceiling re-priced"
+        );
+        assert_eq!(
+            PER_PEER_SUSTAINED_BYTES_PER_WINDOW,
+            u64::from(PER_PEER_SUSTAINED_WRITES_PER_WINDOW) * QUOTA_CALIBRATION_ROW_BYTES,
+            "the sustained BYTE ceiling is the sustained ROW ceiling re-priced"
+        );
+        assert_eq!(
+            PER_PEER_SUSTAINED_BYTES_PER_WINDOW,
+            24 * PER_PEER_ATTESTATION_BYTES_PER_WINDOW,
+            "…and therefore also one burst allowance per hour, forever — the \
+             two derivations must agree"
+        );
+
+        // ── the inequalities the docs claim ────────────────────────────────
+        //
+        // Read through locals so the assertions are evaluated rather than
+        // const-folded away: `assert!(CONST >= 8)` is a compile-time tautology
+        // clippy rightly objects to, and a gate that disappears when the
+        // constant is right is not a gate on the constant being right.
+        let (headroom, typical, calibration) = (
+            QUOTA_BYTE_HEADROOM_MULTIPLE,
+            TYPICAL_ATTESTATION_ENVELOPE_BYTES,
+            QUOTA_CALIBRATION_ROW_BYTES,
+        );
+        let (node_mult, tail_mult, reserved_mult) = (
+            NODE_INGEST_BUDGET_MULTIPLE,
+            UNTRACKED_TAIL_BUDGET_MULTIPLE,
+            RESERVED_CLASS_BUDGET_MULTIPLE,
+        );
+        assert!(
+            headroom >= 8,
+            "AV-75: at less than ~8× the typical row the byte dimension binds \
+             on merely-larger-than-average honest traffic and becomes a second \
+             row control — a control that refuses honest bulk replication is \
+             an outage, not a gate"
+        );
+        assert!(
+            typical < calibration
+                && calibration
+                    < crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES as u64,
+            "the calibration row must sit strictly between the typical row \
+             (so honest traffic is row-bound) and the single-row cap (so the \
+             few-huge shape is byte-bound)"
+        );
+
+        // Affordability: a row the layer above calls legal must be payable by
+        // EVERY budget it can be charged against, or the quota structurally
+        // cannot admit it and the refusal is a lie about rate.
+        let smallest = UNTRACKED_TAIL_BUDGET_MULTIPLE
+            .min(RESERVED_CLASS_BUDGET_MULTIPLE)
+            .min(1);
+        let spec = BudgetSpec::for_multiple(smallest);
+        let legal_row = WriteCost::for_envelope_bytes(
+            crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES as u64,
+        );
+        for d in QuotaDimension::ALL {
+            for h in QuotaHorizon::ALL {
+                assert!(
+                    spec.dim(*d).horizon(*h).capacity >= legal_row.of(*d),
+                    "a maximum-size LEGAL row costs {} on the {} dimension and \
+                     the smallest budget's {h:?} capacity is {} — the quota \
+                     would refuse for ever a row the envelope-size gate calls \
+                     admissible",
+                    legal_row.of(*d),
+                    d.as_str(),
+                    spec.dim(*d).horizon(*h).capacity,
+                );
+            }
+        }
+
+        // The specs really read the constants (a spec that stopped would make
+        // every identity above true and every behaviour wrong).
+        let peer = BudgetSpec::for_multiple(1);
+        assert_eq!(
+            peer.dim(QuotaDimension::Rows).burst.capacity,
+            f64::from(PER_PEER_ATTESTATION_WRITES_PER_WINDOW)
+        );
+        assert_eq!(
+            peer.dim(QuotaDimension::Rows).sustained.capacity,
+            f64::from(PER_PEER_SUSTAINED_WRITES_PER_WINDOW)
+        );
+        assert_eq!(
+            peer.dim(QuotaDimension::Bytes).burst.capacity,
+            PER_PEER_ATTESTATION_BYTES_PER_WINDOW as f64
+        );
+        assert_eq!(
+            peer.dim(QuotaDimension::Bytes).sustained.capacity,
+            PER_PEER_SUSTAINED_BYTES_PER_WINDOW as f64
+        );
+
+        // The remaining multiples, and the reserved vocabulary.
+        assert!(
+            node_mult >= 1 && tail_mult >= 1 && reserved_mult >= 1,
+            "a budget multiple of zero is a budget that refuses everything"
+        );
+        assert!(
+            reserved_mult <= node_mult,
+            "the reserve is carved out of what this node can afford, not \
+             added on top of it"
+        );
+        assert!(!RESERVED_CLASS_DIMENSION_PREFIXES.is_empty());
+        for p in RESERVED_CLASS_DIMENSION_PREFIXES {
+            assert!(
+                p.ends_with(':'),
+                "`{p}` must be a namespace-family prefix, or it matches \
+                 dimensions nobody meant to reserve"
+            );
+        }
+    }
+
+    /// **GATE 3, the load-bearing half — the tracked-table cap is DERIVED**
+    /// from the node budget, and the tail-squeeze is unreachable because of
+    /// it rather than by luck (#583).
+    ///
+    /// Every non-full bucket cost the adversary at least one write; every
+    /// write is charged to the node budget; and one write keeps a bucket
+    /// non-full only for as long as its own deficit takes to refill. So the
+    /// number of buckets any schedule can hold simultaneously non-full is
+    ///
+    /// ```text
+    /// N(c) = min over (dimension, horizon) of
+    ///          (node_capacity + node_rate × w(c)) / c
+    ///   where w(c) = max over (dimension, horizon) of c / peer_rate
+    /// ```
+    ///
+    /// and the cap must exceed `max over c of N(c)`. This sweeps `c` over
+    /// every write shape an adversary can choose — payload sizes from a
+    /// typical row to the single-row cap, and 1..64 writes per bucket — and
+    /// re-derives the bound from the LIVE constants. Raising
+    /// [`NODE_INGEST_BUDGET_MULTIPLE`], lowering
+    /// [`PER_PEER_QUOTA_TRACKED_PEERS_CAP`], or re-pricing the byte dimension
+    /// downward all fail here, naming the inequality they broke.
+    #[test]
+    fn the_tracked_table_is_larger_than_any_flood_can_hold() {
+        let peer = BudgetSpec::for_multiple(1);
+        let node = BudgetSpec::for_multiple(NODE_INGEST_BUDGET_MULTIPLE);
+
+        let bound_for = |cost: &WriteCost| -> f64 {
+            // How long ONE write of this cost keeps a bucket non-full.
+            let mut w: f64 = 0.0;
+            for d in QuotaDimension::ALL {
+                let c = cost.of(*d);
+                if c <= 0.0 {
+                    continue;
+                }
+                for h in QuotaHorizon::ALL {
+                    w = w.max(c / peer.dim(*d).horizon(*h).per_second);
+                }
+            }
+            // How many such writes the node budget can supply inside it.
+            let mut n = f64::INFINITY;
+            for d in QuotaDimension::ALL {
+                let c = cost.of(*d);
+                if c <= 0.0 {
+                    continue;
+                }
+                for h in QuotaHorizon::ALL {
+                    let hs = node.dim(*d).horizon(*h);
+                    n = n.min((hs.capacity + hs.per_second * w) / c);
+                }
+            }
+            n
+        };
+
+        let mut worst = 0.0f64;
+        let mut worst_shape = (0u64, 0u64);
+        let max_envelope = crate::federation::admission::MAX_ATTESTATION_ENVELOPE_BYTES as u64;
+        for k in [1u64, 2, 4, 8, 16, 32, 64] {
+            let mut bytes = TYPICAL_ATTESTATION_ENVELOPE_BYTES / 4;
+            while bytes <= max_envelope * 2 {
+                let per_write = WriteCost::for_envelope_bytes(bytes);
+                #[allow(clippy::cast_precision_loss)]
+                let cost = WriteCost {
+                    per_dimension: [k as f64, per_write.of(QuotaDimension::Bytes) * k as f64],
+                };
+                let n = bound_for(&cost);
+                if n > worst {
+                    worst = n;
+                    worst_shape = (k, bytes);
+                }
+                bytes = (bytes * 3) / 2 + 1;
+            }
+        }
+
+        assert!(
+            worst.is_finite() && worst >= f64::from(NODE_INGEST_BUDGET_MULTIPLE),
+            "the bound came out vacuous ({worst}) — the sweep is not \
+             exercising anything"
+        );
+        assert!(
+            worst < PER_PEER_QUOTA_TRACKED_PEERS_CAP as f64,
+            "#583 tail-squeeze: a flood can hold {worst:.0} buckets \
+             simultaneously non-full (worst shape: {} writes of {} envelope \
+             bytes each) and the tracked table holds only \
+             {PER_PEER_QUOTA_TRACKED_PEERS_CAP}. At saturation the prune \
+             frees nothing and an honest newcomer is demoted to the shared \
+             tail the flood is saturating. The cap must exceed the bound: \
+             raise PER_PEER_QUOTA_TRACKED_PEERS_CAP, or lower \
+             NODE_INGEST_BUDGET_MULTIPLE — they are one number in two places.",
+            worst_shape.0,
+            worst_shape.1,
         );
     }
 }

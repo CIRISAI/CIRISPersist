@@ -19940,6 +19940,24 @@ mod tests {
             assert_per_peer_write_quota_is_wired(&backend, &tag).await;
     }
 
+    /// v24.4.0 (CIRISPersist#583) on POSTGRES: the quota's BYTE dimension is
+    /// charged from the real envelope, through the real host API. Every write
+    /// in the body is refused by the pure tier-1 `check_cohort_scope`, so
+    /// this costs the test DB nothing.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn quota_byte_dimension_is_wired_postgres() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let tag = uuid_like();
+        crate::federation::replication::admission::gate_order_test_support::
+            assert_byte_dimension_is_wired(&backend, &tag).await;
+    }
+
     /// #302 — accord live-quorum storage parity on postgres (shares the
     /// assertion body with memory + sqlite). A unique suffix scopes the
     /// fixtures so the shared test DB doesn't collide across runs.
