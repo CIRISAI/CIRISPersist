@@ -5,12 +5,29 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [25.1.0] — 2026-08-02 — #582: a tightened vocabulary needs a way to retire the old word
+## [25.1.0] — 2026-08-02 — #582/#578/#570/#583/#569: who may take a node, who may withhold it, what a quota can see — and a gate the floor narrowed mid-flight
+
+Five issues, and one release-shaped lesson. #569 was written against a genuinely open
+constitutional question at 18:17; CIRISConstitution ratified CC 3.4.5 the other way at
+19:56; the merge was held and the gate reworked before it shipped. CIRISVerify then cut
+v12.0.0 to match, and persist re-pinned onto it in the same cut. Four repos, under two
+hours, in the direction that protects the wire.
+
+- **#582** — verify re-pin + the reusable maintenance primitive that retires a word
+- **#578** — ownerless-reclaim authority moves off the accord roster to a CC 4.3 WA quorum
+- **#570** — admin-op primitives: the authority, the two things it authorizes, the attribution each carries
+- **#583** — the quota gets a byte dimension, and the tracked table gets sized
+- **#569** — consent-before-scoring stays on `capacity:*`, and now records why
+
+Also: CIRISVerify `v11.1.0` → `v12.0.0` (seven pins), and a fix for a wheel whose
+`Requires-Dist` had excluded the verify major its own Rust linked since v25.0.0.
+
+### #582: a tightened vocabulary needs a way to retire the old word
 
 CIRISVerify v11.1.0 re-pin (all seven sites), plus the reusable maintenance primitive the
 re-pin's data half actually needs.
 
-### The re-pin (`v11.0.0` → `v11.1.0`, seven sites, one commit)
+#### The re-pin (`v11.0.0` → `v11.1.0`, seven sites, one commit)
 
 `ciris-verify-core` / `ciris-crypto` / `ciris-keyring`, across the workspace and the three
 mobile target blocks. They move together or the graph splits into two `ciris_crypto` versions —
@@ -33,7 +50,7 @@ persist's own `wrap_algorithm` column string was already the snake_case form; th
 is verify's constant moving to meet it. `WrapAlgorithm`'s "pending CIRISRegistry ratification"
 doc block is now closed — CC 5.1 ratified it.
 
-### The real deliverable: `maintenance::vocabulary` — SUPERSEDE, never UPDATE
+#### The real deliverable: `maintenance::vocabulary` — SUPERSEDE, never UPDATE
 
 The identifier changing value is a **data** question, not a string-comparison one: new grants
 carry the conformant form, every already-stored one carries the alias, and CC 5.1 explicitly
@@ -81,7 +98,7 @@ is refused rather than fabricated; a structural composer is never superseded. A 
 row (replacement landed, composer refused) is detected **by content** on the next run and only
 the missing composer is emitted.
 
-### `federation::attestation_emit` — the emit recipe now has one implementation
+#### `federation::attestation_emit` — the emit recipe now has one implementation
 
 `canonicalize → hash → hybrid-sign → assemble → put_attestation` lived inside `Engine`, which
 exists only over the sqlite/postgres dispatch. A directory-generic sweep — or the in-memory
@@ -93,7 +110,7 @@ the chokepoint owns — #293 subject-id canonicality and #527 cohort_scope
 validate-never-default — moved with the body, so every emit path still enforces them
 identically.
 
-### Host-reachable
+#### Host-reachable
 
 `Engine::tighten_vocabulary` + the PyO3 `maintenance_tighten_vocabulary(target_json,
 dry_run=False)` binding, mirroring the rest of the maintenance cluster (JSON report across the
@@ -101,17 +118,17 @@ FFI, `maintenance_*` error kinds through `translate_error_kind`). The sweep is e
 memory / sqlite / postgres through one shared body, and separately through the Engine entry
 point — because a capability no host can call is not shipped.
 
-### Counts
+#### Counts
 
 sqlite 1600/1600 (was 1587) · sqlite+test-anchor 1605/1605 (was 1592) · postgres 1930/1930
 (was 1916) · clippy clean on `--features sqlite` and `--features "sqlite postgres server pyo3"`.
-## [Unreleased] — #578: who can take a node
+### #578: who can take a node
 
 > **Scope note.** This section covers **CIRISPersist#578 only**. The version line in
 > `Cargo.toml` is deliberately untouched — a sibling cut owns it, and this section will fold
 > into whatever release it lands in.
 
-### The ruling
+#### The ruling
 
 CIRISConstitution **rc3** rules the CC 3.2 ownerless-lock recovery path (resolving
 CIRISConstitution#43 item 2), and it differs from what v21.8.0 shipped. Persist committed to
@@ -149,7 +166,7 @@ node**, so it lands before any reclaim executes in production.
   loosens, the gate as a whole tightens by a wide margin — and the reason nothing is reclaimable
   is now an operator decision rather than a missing producer.
 
-### The single-act wall
+#### The single-act wall
 
 CC 3.2: *"Reclaim MUST NOT transfer incumbent → claimant in one act."* Made impossible on three
 independent levels, because one is a lapse away from being none:
@@ -164,7 +181,7 @@ independent levels, because one is a lapse away from being none:
    which rejects a different granter while any live binding remains. The claimant can only bind
    after the node has genuinely passed through the unowned state.
 
-### Two live defects the ceremony witness surfaced
+#### Two live defects the ceremony witness surfaced
 
 Both were invisible to the v21.8.0 tests because those called the gate function directly and
 never stored a row.
@@ -185,7 +202,7 @@ never stored a row.
   forever. A binding is now non-live if **any** admitted `withdraws`/`recants` references it.
   Two lists that disagreed about what *live* means; one list now.
 
-### V117 — rule 5 has never been storable
+#### V117 — rule 5 has never been storable
 
 `withdraws_admission_rule` has carried `CHECK (… BETWEEN 1 AND 4)` since V055. v21.8.0 added a
 fifth rule and stamped `5` on the rows it admitted — a value **both SQL backends refuse at
@@ -198,7 +215,7 @@ class. V117 widens the range to 5 on sqlite (table rebuild, V114's staging recip
 migration, on both backends. The value is load-bearing twice — as audit, and as the state
 `check_post_reclaim_rebinding_admission` reads back to know a node owes its own co-signature.
 
-### Authority is re-derived from this node's own verified state (#377)
+#### Authority is re-derived from this node's own verified state (#377)
 
 Nothing is caller-supplied. The roster is `active_family_members` of the pinned WA body
 (revocation-folded; membership changes need the family's own m-of-n, so a Sybil cannot seat
@@ -216,7 +233,7 @@ lapse out of a live set so absence cannot *block*, but on this path a smaller li
 it has captured. Counting against the full roster can only refuse more than CC requires, never
 admit more — the safe direction when the question is whether somebody else gets your node.
 
-### Two decisions CC leaves to the substrate — flagged, not buried
+#### Two decisions CC leaves to the substrate — flagged, not buried
 
 rc3 pins the ceremony and the authority; it does not pin *how the substrate is told either one*.
 Both choices below fail **closed** by default, so neither can make a seizure easier than CC
@@ -243,7 +260,7 @@ new gate there: a **remote** peer cannot seat itself (`put_family` is INSERT-onl
 `verify_membership_quorum`), while the host-local roster APIs are the node operator's own
 surface — the same trust boundary the accord family already sits behind.
 
-### Also
+#### Also
 
 - The **seizure** arm: rc3 is explicit that the same recovery path reaches a *live* wrongful
   binding admitted by front-run or fraud, so a seizure finding deliberately does **not** run the
@@ -266,7 +283,7 @@ surface — the same trust boundary the accord family already sits behind.
   (drop the card filter, drop the single-act wall, revert the withdraws fold, drop the step-4
   co-signature, drop issuer standing, gate only the refusing branch) each turn a witness red, so
   none of them is vacuously green.
-## [Unreleased] — #570 asks 2/3/5/4: the admin-op primitives
+### #570 asks 2/3/5/4: the admin-op primitives
 
 From CIRISServer's `FSD/MESH_CONFIG_AND_ADMIN_OPS.md` + `FSD/ADMIN_OPS_TAXONOMY.md` — six
 failure families observed on real meshes, four already instantiated on ours. Downstream verified
@@ -283,7 +300,7 @@ The other four interlock, and that is the design rather than a coincidence: **as
 authority, ask 5 and ask 4 are the two things it authorizes, ask 3 is the attribution each one
 carries.**
 
-### Ask 3 — `hard_case:admin_action` (done first; everything else leans on it)
+#### Ask 3 — `hard_case:admin_action` (done first; everything else leans on it)
 
 `delegation_id` appeared nowhere in `src/federation/hard_case.rs`. Every kind in that module
 named an *observed condition* — an SLA lapsed, a roster changed, a recipient had no keys. The
@@ -311,7 +328,7 @@ destroy the evidence of an act it *did* observe — the mistake `record_objectio
 to make with a late objection. The authority question is answered at the write door of the op
 itself, where it can be re-derived from this node's own state (#377).
 
-### Ask 2 — `DELEGATION_SCOPE_SLASH`
+#### Ask 2 — `DELEGATION_SCOPE_SLASH`
 
 The four existing duty scopes (`consent_revocation`, `moderate`, `takedown`, `review`) are all
 authorities to **emit**. Between "write a note" and the node-wide kill switch there was nothing
@@ -329,7 +346,7 @@ label, so `slash` gates a real door from the moment it exists: a new
 quarantine row through it, on the local door and the replication apply alike, on all three
 backends.
 
-### Ask 5 — the quarantine marker (`src/federation/quarantine.rs`)
+#### Ask 5 — the quarantine marker (`src/federation/quarantine.rs`)
 
 Tier 2 of the graded response set — the fediverse's *silence*, Tor's flag. Rows are **retained
 locally**, serving is **withheld**, and it is **reversible**.
@@ -384,7 +401,7 @@ What it does **not** consult, stated rather than implied: the per-plane `list_si
 identity cursors. Widening it there would make a quarantined key unresolvable and therefore make
 its own marker unverifiable — the fail-open direction wearing a fail-secure hat.
 
-### Ask 4 — `revoked_after`: time-bounded de-admission
+#### Ask 4 — `revoked_after`: time-bounded de-admission
 
 `federation_revocations` could express exactly one thing about a key's past: nothing. `revoked_at`
 and `effective_at` are both about the key *going forward*, so the only expressible response to a
@@ -431,7 +448,7 @@ So the bound is expressible, signed, replicated, and re-derivable, and enforceme
 consumer's read — the same place #234 already documented key revocation being applied. #570 ask 4
 makes that read able to say *from this instant* instead of only *ever*.
 
-### CC registration asks (noted, NOT re-vendored)
+#### CC registration asks (noted, NOT re-vendored)
 
 Two new namespace families, both currently resolving `AuthorityClass::ProducerSteward` (outside
 the vendored CC 1.0-rc2 manifest of 95 families), so they admit today and the ratification is
@@ -445,7 +462,7 @@ about making the authority explicit:
   the constant is persist's per the issue, but the duty vocabulary belongs in CC 4.5.5's
   target→duty-holder table.
 
-### Witnesses
+#### Witnesses
 
 **31 new tests under `--features sqlite`**, 33 with postgres. Per ask:
 
@@ -492,7 +509,7 @@ Certified: sqlite **1618/1618** (baseline 1587) · test-anchor **1623/1623** (ba
 postgres **1949/1949** (baseline 1916) · clippy `-D warnings` clean on `sqlite` and on
 `sqlite postgres server pyo3` · `cargo fmt --check` clean. `Cargo.toml`'s version line is
 untouched.
-## [Unreleased] — #583: the quota could not see storage, and the table could be squeezed
+### #583: the quota could not see storage, and the table could be squeezed
 
 > **Note.** This section is scoped to CIRISPersist#583 only. The version line in `Cargo.toml`
 > is owned by a sibling cut; this entry lands under `Unreleased` and moves under whatever
@@ -502,7 +519,7 @@ Two gaps in the v24.3.0 quota (#575), reported by CIRISServer. **Neither was ref
 were missed**, and the fix for each ships with a gate designed to fail if the *class* of
 mistake returns rather than only if the current numbers change.
 
-### 1. The byte dimension — `600 × 100 B` cost the same as `600 × 10 MB`
+#### 1. The byte dimension — `600 × 100 B` cost the same as `600 × 10 MB`
 
 `PeerWriteQuota` metered **rows only**. `classify` keyed on the envelope dimension and
 `spend` decremented a count; nothing in the quota path read a payload size. A peer at its
@@ -538,7 +555,7 @@ that a count cannot see, and **each dimension bounds the part of the cost the ot
 to**. The size is measured with a counting sink, never by canonicalizing: this gate runs
 first, on unauthenticated input, and must not allocate a copy of an attacker's payload.
 
-### 2. The tail-squeeze residue — and why the fix is a *size*, not an eviction rule
+#### 2. The tail-squeeze residue — and why the fix is a *size*, not an eviction rule
 
 v24.3.0 already closed the self-reset version (the prune drops only buckets refilled to
 **full**, and a flooder's own bucket is never full). What remained: once the table saturates
@@ -568,7 +585,7 @@ contact with an individual budget. `PeerWriteQuota::slot_denials()` counts the b
 — "unreachable by arithmetic over four constants" survives exactly as long as the four
 constants do, and a drifted deployment should be able to *see* it. Memory cost: ~1.5 MB.
 
-### The three gates — the deliverable that outlives the fixes
+#### The three gates — the deliverable that outlives the fixes
 
 1. **Dimensional completeness** (`every_metered_dimension_has_a_witness`). `QuotaDimension`
    is a closed enum; budgets are sized by `[_; QuotaDimension::COUNT]` and priced by an
@@ -603,7 +620,7 @@ an unreachable feature (AV-77).
 
 Refs: #583; #575 (shipped v24.3.0), #565 (the refusal-token contract),
 CIRISConstitution#38 (single-envelope cap).
-## [Unreleased] — #569: the consent gate stays on `capacity:*`, and now says why
+### #569: the consent gate stays on `capacity:*`, and now says why
 
 > **Scope note (like #574's):** this section covers **#569 only**. It was written in an isolated
 > worktree; `Cargo.toml`'s version line is owned by a sibling agent this cut, so nothing here
@@ -611,7 +628,7 @@ CIRISConstitution#38 (single-envelope cap).
 > picks the number. The version tokens in the code comments below (`v25.1.0`) are the author's
 > expectation, not a claim on the cut.
 
-### What happened, in order
+#### What happened, in order
 
 - **18:17** — #569 shipped a widening of the CC#46 consent-before-scoring gate: from `capacity:*`
   to every family CIRISVerify's registry classifies `ConsentClass::ConsensualReputation`. In
@@ -627,7 +644,7 @@ registry still labels those four `ConsensualReputation` and its own doc says the
 the subject's `analyze` consent"*; the Constitution says otherwise, and the Constitution is the
 floor. That disagreement is now a test, not a footnote (below).
 
-### Why the Constitution ruled the other way
+#### Why the Constitution ruled the other way
 
 - **Artifact-integrity verification** — `attestation:registry_consensus`,
   `attestation:license_validity`, `cert_validity:{authority}` (with `attestation:hardware_rooted`,
@@ -645,7 +662,7 @@ contradicts #569's own stated principle — *never gate abuse-response* — whic
 correctly to `detection:*` / `moderation:*` / `slashing:*` and then missed on the one adversarial
 family living inside verify's namespace.
 
-### Not a weakening — CC 3.4.5's reciprocity clause
+#### Not a weakening — CC 3.4.5's reciprocity clause
 
 > *"A subject that declines analysis cannot be scored; its `capacity:composite` is undefined and
 > MUST NOT be emitted; and every gate that requires a capacity verdict therefore **fails closed**
@@ -655,7 +672,7 @@ A declining subject is not scored **at all** — a stronger outcome than being s
 consent — while the planes that verify artifacts and report abuse, which never judged that
 subject's conduct, keep working.
 
-### The gated set
+#### The gated set
 
 | Family | Gated? | Source |
 |---|---|---|
@@ -670,7 +687,7 @@ subject's conduct, keep working.
 `consent_gated_family` is therefore a prefix test again, and it says in one place why every other
 family is absent.
 
-### What #569 got right, and the error one layer up
+#### What #569 got right, and the error one layer up
 
 #569 refused to hold a hand-copied list: it derived its set from
 `ciris_verify_core::federation_provenance::dim::lookup` rather than transcribing fourteen strings
@@ -682,7 +699,7 @@ calls the split *"a proposal from the measuring side, not a ruling"* — a phras
 own test doc. Verify knows what each dimension **is**; the Constitution decides what the substrate
 **does about it**. The machinery is preserved; the authority it obeys changed.
 
-### `verify_dimension_registry_is_the_only_enumeration` is now an adjudication record
+#### `verify_dimension_registry_is_the_only_enumeration` is now an adjudication record
 
 The pin test was not deleted — it got more valuable. It now asserts **both sides of a live
 disagreement**:
@@ -702,7 +719,7 @@ It is also the **only** place in this crate that reads verify's consent classifi
 every other consumer use `dim::ALL` / `dim::lookup` / `prefix` / `parameterized`, which are stable
 across a re-pin. That isolation is deliberate: whoever re-pins verify has one function to edit.
 
-### The measuring side agreed — CIRISVerify v12.0.0
+#### The measuring side agreed — CIRISVerify v12.0.0
 
 Filing this disagreement upstream resolved it. **CIRISVerify v12.0.0 removes `ConsentClass`
 entirely**, replacing it with `ConsentDisposition` tracking CC 3.4.5's ratified per-family
@@ -728,7 +745,7 @@ Worth recording, because it is the part #569 got right: verify's note back was *
 gate from the registry rather than transcribing a list was the right call and is what surfaced
 this — please keep doing that."* The instinct was sound; only the authority it trusted was wrong.
 
-### Kept from #569
+#### Kept from #569
 
 Re-verified after the narrowing rather than assumed:
 
@@ -750,7 +767,7 @@ Re-verified after the narrowing rather than assumed:
   3.3.1's `analyze` grant kind, which was never capacity-specific and is pinned to the consent
   grammar's `TransmissionPrinciple::Analyze` wire token.
 
-### Removed from #569
+#### Removed from #569
 
 - `ConsentGatedFamily::VerifyConsensualReputation` and every arm, const and assertion behind it.
 - The `dim::lookup` call inside `consent_gated_family` — the gate no longer asks the measuring
@@ -760,7 +777,7 @@ Re-verified after the narrowing rather than assumed:
   **`check_capacity_consent_admission`**. The gate is capacity-only again, so the original name is
   accurate — and a public rename downstream must adopt should buy something.
 
-### Breaking
+#### Breaking
 
 - `admission::capacity_claim_family` → **`consent_gated_claim`** (returns a typed
   `ConsentGatedClaim` naming WHICH rule, not a bare `&str`).
@@ -770,7 +787,7 @@ Re-verified after the narrowing rather than assumed:
 
 Clean break, no aliases (repo doctrine).
 
-### Tests
+#### Tests
 
 **Red-first, both directions, on the pre-rework code:**
 
@@ -814,7 +831,7 @@ build fails 17 unrelated tests under `cargo test`, because `federation::genesis`
 the genesis and canonical-gate tests, which assert the *production* anchor. nextest's
 process-per-test isolation is what makes the suite deterministic; it is the gate for a reason.
 
-### Out of scope, and named
+#### Out of scope, and named
 
 The **promote-path residual** is real, pre-existing, and now tracked as **CIRISPersist#589**:
 `attestation_promote` re-signs and flips `tier` without re-running any AV-76 tier-4 put-gate, so a
