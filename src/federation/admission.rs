@@ -2637,7 +2637,9 @@ fn delegation_valid_until_lapsed(
         .unwrap_or(false)
 }
 
-fn delegation_scope_set(envelope: &serde_json::Value) -> std::collections::HashSet<String> {
+pub(crate) fn delegation_scope_set(
+    envelope: &serde_json::Value,
+) -> std::collections::HashSet<String> {
     match envelope.get("scope") {
         Some(serde_json::Value::String(s)) => std::iter::once(s.clone()).collect(),
         Some(serde_json::Value::Array(arr)) => arr
@@ -3504,49 +3506,84 @@ pub async fn check_withdraws_admission(
     {
         return Ok(None);
     }
+    // v25.x (CIRISPersist#578, CIRISConstitution rc3 CC 3.2) — **the recovery
+    // gate, in BOTH directions.**
+    //
+    // rc3: *"A substrate MUST reject a rule-(2) or rule-(4) `withdraws`
+    // targeting a live owner-binding unless it carries a `wa_adjudication_ref`
+    // naming a CC 4.3 Wise-Authority quorum finding of abandonment or
+    // seizure. Without this gate a compromised node key withdraws its own
+    // owner and the single-owner invariant is worthless."*
+    //
+    // So the ceremony gate is consulted on BOTH branches below, and this is
+    // the load-bearing half: rules 2/3/4 ADMIT such a `withdraws` today, and
+    // the only reason that is not already a live self-liberation exploit is
+    // that persist's own owner-bindings carry no `subject_key_ids`. rc3 says a
+    // conformant binding MUST name K there — at which point rule 2 would hand
+    // K's key the power to shed its owner unilaterally. Gating the admitting
+    // branch closes that before the producer change lands, not after.
     match resolve_withdraws_admission_rule(directory, &row.attesting_key_id, &target).await {
-        Ok(rule) => Ok(Some(rule)),
-        Err(err) => {
-            // CIRISPersist#519 — the CC 3.2 "no permanent ownerless lock"
-            // reclaim MECHANISM ([`crate::federation::ownership_reclaim`]).
-            // None of rules 1-4 gave a THIRD PARTY authority to withdraw a
-            // LIVE `ownership:*` owner-binding — correct, and it MUST stay
-            // the default (a node whose owner is merely quiet is not up
-            // for grabs). But CC 3.2 also forbids a PERMANENT ownerless
-            // lock: an owner who is PROVABLY dead (their signed freshness
-            // floor has lapsed) must be reclaimable by a verified quorum.
-            // `check_ownership_reclaim_admission` is that sanctioned
-            // exception. v21.8.0 (CIRISPersist#519 activation) — persist now
-            // ships an ACTIVATED conservative DEFAULT policy (the
-            // HUMANITY_ACCORD holder quorum, resolved from persist's OWN
-            // registered accord holders, + a 180-day window) rather than the
-            // inert `None`, so the CC 3.2 "no permanent ownerless lock" MUST is
-            // satisfied by mechanism today; CIRISConstitution#43 ratifies/refines
-            // the window + authority. Activation is SAFE ahead of touch-claim
-            // producers because the abandonment test is fail-safe (an ABSENT
-            // freshness floor is never abandonment) — no node is reclaimable
-            // until it has demonstrably emitted freshness and then gone dark, so
-            // the pre-producer mesh (every floor absent) has ZERO reclaimable
-            // nodes. An empty accord roster (no holders resolved) yields an
-            // unmeetable threshold ⇒ every reclaim still `Refused` (fail-closed).
-            let reclaim_policy = super::ownership_reclaim::ReclaimPolicy::humanity_accord_default(
-                accord_holder_roster_key_ids(),
-            );
-            if super::ownership_reclaim::check_ownership_reclaim_admission(
-                directory,
-                row,
-                Some(&reclaim_policy),
-                chrono::Utc::now(),
-            )
-            .await?
-                == super::ownership_reclaim::ReclaimVerdict::Admit
-            {
-                return Ok(Some(
-                    super::ownership_reclaim::RECLAIM_WITHDRAWS_ADMISSION_RULE,
-                ));
+        Ok(rule) => {
+            // Rule 1 is the producer's own retraction and is never a reclaim.
+            // Rules 2/3/4 against a LIVE owner-binding are exactly what rc3
+            // gates.
+            if matches!(rule, 2..=4) && is_owner_binding_envelope(&target.attestation_envelope) {
+                if let Some(outcome) = run_recovery_ceremony_gate(directory, row, &target).await? {
+                    return outcome.map(Some);
+                }
             }
-            Err(err)
+            Ok(Some(rule))
         }
+        Err(err) => {
+            // None of rules 1-4 gave this issuer authority over a LIVE
+            // owner-binding — correct, and it MUST stay the default (a node
+            // whose owner is merely quiet is not up for grabs). CC 3.2 also
+            // forbids a PERMANENT ownerless lock, and the four-step ceremony
+            // is the sanctioned exception: recorded as rule 5.
+            match run_recovery_ceremony_gate(directory, row, &target).await? {
+                Some(outcome) => outcome.map(Some),
+                None => Err(err),
+            }
+        }
+    }
+}
+
+/// v25.x (CIRISPersist#578) — run the CC 3.2 four-step recovery ceremony gate
+/// against `row` (a `withdraws`) and `target` (its referenced attestation),
+/// translating the typed [`ReclaimVerdict`](super::ownership_reclaim::ReclaimVerdict)
+/// into the `withdraws`-admission shape.
+///
+/// `Ok(None)` means "not a reclaim candidate at all" — the caller's ordinary
+/// rule stands. `Ok(Some(Ok(5)))` admits under the recovery rule.
+/// `Ok(Some(Err(..)))` is a refusal that NAMES the failing ceremony step.
+async fn run_recovery_ceremony_gate(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    target: &super::Attestation,
+) -> Result<Option<Result<u8, Error>>, Error> {
+    let policy = super::ownership_reclaim::ReclaimPolicy::from_deployment_pin();
+    match super::ownership_reclaim::check_ownership_reclaim_admission(
+        directory,
+        row,
+        policy.as_ref(),
+        chrono::Utc::now(),
+    )
+    .await?
+    {
+        super::ownership_reclaim::ReclaimVerdict::Admit { .. } => Ok(Some(Ok(
+            super::ownership_reclaim::RECLAIM_WITHDRAWS_ADMISSION_RULE,
+        ))),
+        super::ownership_reclaim::ReclaimVerdict::Refused { reason, detail, .. } => {
+            Ok(Some(Err(Error::OwnershipReclaimRefused {
+                node_key_id: target.attested_key_id.clone(),
+                owner_binding_id: target.attestation_id.clone(),
+                reason,
+                detail,
+            })))
+        }
+        // Not a candidate (self-revocation by the incumbent, or a
+        // non-owner-binding target) — the ordinary rule stands.
+        super::ownership_reclaim::ReclaimVerdict::NotAReclaim => Ok(None),
     }
 }
 
@@ -3869,8 +3906,42 @@ async fn live_owner_binding_granters(
 ) -> Result<std::collections::BTreeSet<String>, Error> {
     let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let now = chrono::Utc::now();
-    for r in directory.list_attestations_for(node).await? {
+    let rows = directory.list_attestations_for(node).await?;
+
+    // v25.x (CIRISPersist#578) — **a binding withdrawn BY ANYONE the gate
+    // admitted is non-live**, not only one retracted by its own granter.
+    //
+    // The granter-scoped clause below cannot see the CC 3.2 recovery
+    // `withdraws`: it is issued by the node K (or K's recovery delegate),
+    // never by the incumbent owner. So without this set the ceremony's step 3
+    // would admit a `withdraws`, store it, and leave `owner_of(K)` STILL
+    // resolving to the incumbent — K would never pass through the unowned
+    // state, the "empty self cohort, fail-secure" clause would be prose, and
+    // step 4's single-owner gate would refuse the rightful claimant forever.
+    // Two lists that disagree about what "live" means; one list now.
+    //
+    // Authority is not re-litigated here: a stored `withdraws` has already
+    // been through `check_withdraws_admission`, which is where the recovery
+    // ceremony (or rules 1-4) authorized it.
+    let withdrawn: std::collections::HashSet<String> = rows
+        .iter()
+        .filter(|g| {
+            g.attestation_type == attestation_type::WITHDRAWS
+                || g.attestation_type == attestation_type::RECANTS
+        })
+        .filter_map(|g| {
+            crate::federation::precedence::references_attestation_id_from_envelope(
+                &g.attestation_envelope,
+            )
+            .map(str::to_owned)
+        })
+        .collect();
+
+    for r in rows {
         if r.attestation_type != attestation_type::DELEGATES_TO {
+            continue;
+        }
+        if withdrawn.contains(r.attestation_id.as_str()) {
             continue;
         }
         // Only OWNER-BINDING edges — the internal dimension OR the CC 2.4.1.2
@@ -4051,6 +4122,10 @@ pub async fn check_single_node_owner_admission(
             });
         }
     }
+    // v25.x (CIRISPersist#578, CC 3.2 ceremony step 4) — a node that has been
+    // through a reclaim owes its OWN co-signature on the fresh owner-binding.
+    // Hooked here so all three backends inherit it from one chokepoint.
+    super::ownership_reclaim::check_post_reclaim_rebinding_admission(directory, row).await?;
     Ok(())
 }
 
