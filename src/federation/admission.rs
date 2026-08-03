@@ -4590,6 +4590,182 @@ pub const QUARANTINE_DIMENSION_PREFIX: &str = "quarantine:";
 /// chain longer than 5 cannot confer a moderation duty.
 pub const MAX_MODERATION_DELEGATION_DEPTH: usize = 5;
 
+/// Which incoming `delegates_to` edges [`live_delegation_granters`] admits.
+/// The ONLY axis on which its four consumers differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DelegationEdgeFilter {
+    /// Every `delegates_to` — the §11.10 steward-binding clause (3).
+    AnyDelegation,
+    /// Only CC 1.13.3.3 / CC 3.2 owner-binding edges
+    /// ([`is_owner_binding_envelope`]) — the ownership projection.
+    OwnerBindingOnly,
+}
+
+/// **THE live incoming-`delegates_to` walk — one predicate, one impl**
+/// (CIRISPersist#584).
+///
+/// Returns the distinct `user`-role granters `U` of a **live**
+/// `delegates_to(U → subject)`. "Live" is the conjunction of five clauses, and
+/// the whole point of this function is that there is exactly one place where
+/// that conjunction is written down:
+///
+///   1. the row is a `delegates_to` matching `filter`;
+///   2. it has not been **retracted by anyone the write gate admitted** — an
+///      admitted `withdraws`/`recants` among `subject`'s incoming rows whose
+///      `references_attestation_id` names this edge;
+///   3. it has not been retracted by its own **granter** (a
+///      `withdraws`/`recants` among the granter's OUTGOING rows naming
+///      `subject` — the §11.10 edge-retraction model, which carries no
+///      `references_attestation_id`);
+///   4. its `expires_at` has not passed (SecReview F3); and
+///   5. its adult-incapacity `valid_until` has not lapsed (CC 3.4.12
+///      fail-to-liberty — a no-op for every other row shape).
+///
+/// # Why clause (2) is here and not only in the ownership projection
+///
+/// v25.x (CIRISPersist#578) added clause (2) to the ownership walk alone,
+/// because a CC 3.2 recovery `withdraws` is issued by the node K — never by
+/// the incumbent — so the granter-scoped clause (3) could not see it. The same
+/// blindness applied verbatim to the three STEWARD-binding walks
+/// ([`is_steward_bound`], [`steward_bindings_of`], [`steward_binding_chain`]):
+/// a `delegates_to` retracted under CEG §3.2.3 rule 2/3/4 — by its subject, by
+/// a canonical-bound claimant, or by a consent-revocation proxy — kept
+/// conferring stewardship (CIRISPersist#584).
+///
+/// Repairing that at ONE of those three sites is not an option: admission.rs
+/// states the invariant `is_steward_bound(k) ⟺ !steward_bindings_of(k).is_empty()`
+/// in prose (and the same for `steward_binding_chain`), and a per-site repair
+/// makes it FALSE — one side says *bound*, the other returns *empty*. Hence
+/// one walk, four thin callers. `nodes_stewarded_by` inherits it for free: it
+/// is defined by re-asking [`steward_bindings_of`].
+///
+/// # What clause (2) does NOT re-litigate
+///
+/// Authority. A stored `withdraws` has already passed
+/// [`check_withdraws_admission`] — which is where CEG §3.2.3 rules 1-4 and the
+/// CC 3.2 recovery ceremony decided whether its issuer had standing. Reading it
+/// back here and asking again would be a second, divergent copy of exactly the
+/// gate this function exists to stop duplicating.
+///
+/// # Reach — the honest bound
+///
+/// Clause (2) sees a retraction only where the substrate already indexes it:
+/// among `subject`'s INCOMING rows (`attested_key_id == subject`). A
+/// third-party retraction filed against some other key entirely is invisible
+/// to both clause (2) and clause (3) — and was equally invisible to #578. That
+/// is a reach limit of the row index, not of this fold; widening it means a
+/// per-granter fan-out read on every steward-binding check, which is a
+/// separate decision with its own cost.
+async fn live_delegation_granters(
+    directory: &dyn super::FederationDirectory,
+    subject: &str,
+    filter: DelegationEdgeFilter,
+) -> Result<std::collections::BTreeSet<String>, Error> {
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Per-walk memo: granter key_id → "is a live `user`-role anchor for
+    // `subject`" (resolves + carries `user` + has not retracted against
+    // `subject`). Bounds the granter-scoped reads by DISTINCT granters.
+    let mut granter_live: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
+    let now = chrono::Utc::now();
+    let rows = directory.list_attestations_for(subject).await?;
+
+    // (2) — a binding withdrawn BY ANYONE the gate admitted is non-live, not
+    // only one retracted by its own granter. Two lists that disagree about
+    // what "live" means; one list now.
+    let withdrawn: std::collections::HashSet<String> = rows
+        .iter()
+        .filter(|g| {
+            g.attestation_type == attestation_type::WITHDRAWS
+                || g.attestation_type == attestation_type::RECANTS
+        })
+        .filter_map(|g| {
+            crate::federation::precedence::references_attestation_id_from_envelope(
+                &g.attestation_envelope,
+            )
+            .map(str::to_owned)
+        })
+        .collect();
+
+    for r in rows {
+        // (1) shape.
+        if r.attestation_type != attestation_type::DELEGATES_TO {
+            continue;
+        }
+        // Only OWNER-BINDING edges for the ownership projection — the internal
+        // dimension OR the CC 2.4.1.2 `delegation_purpose: owner_binding`
+        // marker (v13.2.1 #378). This is what keeps ownership single-valued
+        // WITHOUT constraining act-on-behalf / hierarchy delegations (multi-
+        // parent per CC 4.5.13). Must match `check_single_node_owner_admission`
+        // exactly so the gate and the `owner_of` resolver agree on what an
+        // owner-binding IS.
+        if filter == DelegationEdgeFilter::OwnerBindingOnly
+            && !is_owner_binding_envelope(&r.attestation_envelope)
+        {
+            continue;
+        }
+        // (2) admitted retraction naming this edge.
+        if withdrawn.contains(r.attestation_id.as_str()) {
+            continue;
+        }
+        // (4) expiry — a lapsed delegation is not live.
+        if let Some(exp) = r.expires_at {
+            if exp <= now {
+                continue;
+            }
+        }
+        // (5) fail-to-liberty (CC 3.4.12): a lapsed adult-incapacity
+        // `valid_until` is not live; the adult auto-re-sovereigns. No-op for
+        // minor rows.
+        if delegation_valid_until_lapsed(&r.attestation_envelope, now) {
+            continue;
+        }
+        // Already established live for this granter — the remaining checks are
+        // granter-scoped, not edge-scoped, so a second edge from the same
+        // human costs no reads.
+        if out.contains(&r.attesting_key_id) {
+            continue;
+        }
+        // The two granter-scoped reads are memoized per walk: several edges
+        // from one human resolve its key + retraction history ONCE. That keeps
+        // the fan-out bounded by DISTINCT granters rather than by edges, which
+        // is what pays for `is_steward_bound` no longer short-circuiting on the
+        // first live edge (it must now agree with the enumerating readers, and
+        // agreement is the property CIRISPersist#584 is about).
+        if let Some(live) = granter_live.get(r.attesting_key_id.as_str()) {
+            if *live {
+                out.insert(r.attesting_key_id);
+            }
+            continue;
+        }
+        // A non-`user` granter cannot steward.
+        let is_user = directory
+            .lookup_public_key(&r.attesting_key_id)
+            .await?
+            .is_some_and(|g| identity_type::set_contains(&g.identity_type, identity_type::USER));
+        // (3) granter-scoped edge-retraction — the granter `withdraws`/
+        // `recants` a delegation against this recipient. The retraction is one
+        // of the granter's OUTGOING attestations whose `attested_key_id ==
+        // subject`.
+        let granter_retracted = is_user
+            && directory
+                .list_attestations_by(&r.attesting_key_id)
+                .await?
+                .into_iter()
+                .any(|g| {
+                    (g.attestation_type == attestation_type::WITHDRAWS
+                        || g.attestation_type == attestation_type::RECANTS)
+                        && g.attested_key_id == subject
+                });
+        let live = is_user && !granter_retracted;
+        granter_live.insert(r.attesting_key_id.clone(), live);
+        if live {
+            out.insert(r.attesting_key_id);
+        }
+    }
+    Ok(out)
+}
+
 /// v8.7.1 (CIRISPersist#233, CEG RC25/RC26 §5.6.8.10) — is key `k`
 /// **steward-bound**? A moderation chain ROOT must terminate in a real human
 /// (a `user`-role identity), never a free-floating agent/service key — the
@@ -4601,11 +4777,12 @@ pub const MAX_MODERATION_DELEGATION_DEPTH: usize = 5;
 ///      resolves `k` to an identity whose key is `user`-role (k is a
 ///      device/occurrence of a human identity); OR
 ///   3. ∃ a **live** `delegates_to(U → k)` with `U` a `user`-role key (a
-///      human delegated to k) — checked over k's INCOMING attestations
-///      ([`FederationDirectory::list_attestations_for`]). "Live" excludes a
-///      delegation the granter has `withdraws`/`recants`-retracted against
-///      `k` (the §11.10 edge-retraction model) AND one whose `expires_at`
-///      has passed (SecReview F3) — a revoked or lapsed edge confers no
+///      human delegated to k) — [`live_delegation_granters`], the ONE walk
+///      that owns what "live" means: not retracted by the granter (the §11.10
+///      edge-retraction model), not retracted by ANY admitted
+///      `withdraws`/`recants` naming the edge (CEG §3.2.3 rules 1-4 /
+///      CIRISPersist#584), not expired (SecReview F3), not adult-incapacity-
+///      lapsed (CC 3.4.12). A revoked or lapsed edge confers no
 ///      steward-binding.
 ///
 /// A key whose chain to a `user` identity cannot be shown is NOT
@@ -4644,54 +4821,15 @@ pub async fn is_steward_bound(
             }
         }
     }
-    // (3) a LIVE `delegates_to(U → k)` with U user-role. k's INCOMING
-    //     attestations name the granter as `attesting_key_id`. A delegation
-    //     edge confers steward-binding ONLY while genuinely live (SecReview
-    //     F3): skip it if (a) the granter has `withdraws`/`recants`-retracted
-    //     it (reusing the §11.10 edge-retraction bucketing the MODERATION_DUTY
-    //     walk uses — a retraction names the recipient `k` as
-    //     `attested_key_id`), or (b) the edge has expired (`expires_at <=
-    //     now`). A revoked/expired delegation must not confer standing.
-    let now = chrono::Utc::now();
-    for r in directory.list_attestations_for(k).await? {
-        if r.attestation_type != attestation_type::DELEGATES_TO {
-            continue;
-        }
-        // (b) expiry — a lapsed delegation is not live.
-        if let Some(exp) = r.expires_at {
-            if exp <= now {
-                continue;
-            }
-        }
-        // (b') fail-to-liberty — a lapsed adult-incapacity `valid_until` is
-        //      not live (CC 3.4.12; no-op for minor rows).
-        if delegation_valid_until_lapsed(&r.attestation_envelope, now) {
-            continue;
-        }
-        let Some(granter) = directory.lookup_public_key(&r.attesting_key_id).await? else {
-            continue;
-        };
-        if !identity_type::set_contains(&granter.identity_type, identity_type::USER) {
-            continue;
-        }
-        // (a) edge-retraction — skip if the granter `withdraws`/`recants` a
-        //     delegation against this recipient `k`. The retraction is one of
-        //     the granter's OUTGOING attestations whose `attested_key_id == k`.
-        let granter_retracted_k = directory
-            .list_attestations_by(&r.attesting_key_id)
+    // (3) a LIVE `delegates_to(U → k)` with U user-role — resolved by the ONE
+    //     live-delegation walk ([`live_delegation_granters`]), which owns every
+    //     liveness clause (retraction by the granter OR by any admitted
+    //     `withdraws` naming the edge, expiry, adult-incapacity lapse).
+    Ok(
+        !live_delegation_granters(directory, k, DelegationEdgeFilter::AnyDelegation)
             .await?
-            .into_iter()
-            .any(|g| {
-                (g.attestation_type == attestation_type::WITHDRAWS
-                    || g.attestation_type == attestation_type::RECANTS)
-                    && g.attested_key_id == k
-            });
-        if granter_retracted_k {
-            continue;
-        }
-        return Ok(true);
-    }
-    Ok(false)
+            .is_empty(),
+    )
 }
 
 /// #249 Cut B — the **enumeration** of [`is_steward_bound`]: the `user`-role
@@ -4703,13 +4841,15 @@ pub async fn is_steward_bound(
 ///   2. `k` is an occurrence of a `user`-role identity → that identity key;
 ///      AND/OR
 ///   3. each granter `U` of a **live** `delegates_to(U → k)` with `U`
-///      `user`-role (live = not `withdraws`/`recants`-retracted against `k`
-///      by `U`, and not expired) → `U`.
+///      `user`-role → `U`. Liveness is [`live_delegation_granters`]'s, not a
+///      copy of it (CIRISPersist#584).
 ///
 /// Consistency: `is_steward_bound(k)` ⟺ `!steward_bindings_of(k).is_empty()` —
 /// the predicate returns true iff ANY clause holds, and this returns the
 /// union of all satisfying anchors (deduped, sorted). An unbound `k` yields
-/// the empty set.
+/// the empty set. Clause (3) is now literally the same call in both, so the
+/// biconditional cannot drift; the memory / sqlite / postgres legs of
+/// `steward_liveness_test_support` assert it at every state transition.
 pub async fn steward_bindings_of(
     directory: &dyn super::FederationDirectory,
     k: &str,
@@ -4737,41 +4877,7 @@ pub async fn steward_bindings_of(
         }
     }
     // (3) each granter U of a LIVE delegates_to(U → k) with U user-role.
-    let now = chrono::Utc::now();
-    for r in directory.list_attestations_for(k).await? {
-        if r.attestation_type != attestation_type::DELEGATES_TO {
-            continue;
-        }
-        if let Some(exp) = r.expires_at {
-            if exp <= now {
-                continue;
-            }
-        }
-        // Fail-to-liberty (CC 3.4.12): a lapsed adult-incapacity `valid_until`
-        // is non-live; the adult auto-re-sovereigns. No-op for minor rows.
-        if delegation_valid_until_lapsed(&r.attestation_envelope, now) {
-            continue;
-        }
-        let Some(granter) = directory.lookup_public_key(&r.attesting_key_id).await? else {
-            continue;
-        };
-        if !identity_type::set_contains(&granter.identity_type, identity_type::USER) {
-            continue;
-        }
-        let granter_retracted_k = directory
-            .list_attestations_by(&r.attesting_key_id)
-            .await?
-            .into_iter()
-            .any(|g| {
-                (g.attestation_type == attestation_type::WITHDRAWS
-                    || g.attestation_type == attestation_type::RECANTS)
-                    && g.attested_key_id == k
-            });
-        if granter_retracted_k {
-            continue;
-        }
-        out.insert(r.attesting_key_id);
-    }
+    out.extend(live_delegation_granters(directory, k, DelegationEdgeFilter::AnyDelegation).await?);
     let mut out: Vec<String> = out.into_iter().collect();
     out.sort();
     Ok(out)
@@ -4851,96 +4957,19 @@ pub async fn nodes_stewarded_by(
 /// The distinct set of **live owner-binding granters** of `node` — the users
 /// `U` with a live `delegates_to(U → node)` carrying the CC 1.13.3.3 / CC 3.2
 /// owner-binding dimension ([`super::types::owner_binding::DIMENSION`]). The raw
-/// set behind [`owner_of`] + [`check_single_node_owner_admission`]; it applies
-/// the SAME liveness/retraction predicate as [`steward_bindings_of`]'s clause
-/// (3) — not-expired, not adult-incapacity-lapsed, live `user`-role granter, not
-/// `withdraws`/`recants`-retracted — restricted to the ownership dimension, so
-/// `owner_of(node)` is always a subset of `steward_bindings_of(node)`.
+/// set behind [`owner_of`] + [`check_single_node_owner_admission`].
+///
+/// Exactly [`live_delegation_granters`] restricted to the ownership dimension —
+/// not a parallel implementation of it. v25.x (CIRISPersist#578) wrote the
+/// admitted-`withdraws` clause HERE, and CIRISPersist#584 found the same fold
+/// unrepaired at the three steward-binding sites; the walk now lives in one
+/// place, so `owner_of(node) ⊆ steward_bindings_of(node)` holds by construction
+/// rather than by two functions being edited in step.
 async fn live_owner_binding_granters(
     directory: &dyn super::FederationDirectory,
     node: &str,
 ) -> Result<std::collections::BTreeSet<String>, Error> {
-    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let now = chrono::Utc::now();
-    let rows = directory.list_attestations_for(node).await?;
-
-    // v25.x (CIRISPersist#578) — **a binding withdrawn BY ANYONE the gate
-    // admitted is non-live**, not only one retracted by its own granter.
-    //
-    // The granter-scoped clause below cannot see the CC 3.2 recovery
-    // `withdraws`: it is issued by the node K (or K's recovery delegate),
-    // never by the incumbent owner. So without this set the ceremony's step 3
-    // would admit a `withdraws`, store it, and leave `owner_of(K)` STILL
-    // resolving to the incumbent — K would never pass through the unowned
-    // state, the "empty self cohort, fail-secure" clause would be prose, and
-    // step 4's single-owner gate would refuse the rightful claimant forever.
-    // Two lists that disagree about what "live" means; one list now.
-    //
-    // Authority is not re-litigated here: a stored `withdraws` has already
-    // been through `check_withdraws_admission`, which is where the recovery
-    // ceremony (or rules 1-4) authorized it.
-    let withdrawn: std::collections::HashSet<String> = rows
-        .iter()
-        .filter(|g| {
-            g.attestation_type == attestation_type::WITHDRAWS
-                || g.attestation_type == attestation_type::RECANTS
-        })
-        .filter_map(|g| {
-            crate::federation::precedence::references_attestation_id_from_envelope(
-                &g.attestation_envelope,
-            )
-            .map(str::to_owned)
-        })
-        .collect();
-
-    for r in rows {
-        if r.attestation_type != attestation_type::DELEGATES_TO {
-            continue;
-        }
-        if withdrawn.contains(r.attestation_id.as_str()) {
-            continue;
-        }
-        // Only OWNER-BINDING edges — the internal dimension OR the CC 2.4.1.2
-        // `delegation_purpose: owner_binding` marker (v13.2.1 #378). This is
-        // what keeps ownership single-valued WITHOUT constraining act-on-behalf
-        // / hierarchy delegations (multi-parent per CC 4.5.13). Must match
-        // `check_single_node_owner_admission` exactly so the gate and the
-        // `owner_of` resolver agree on what an owner-binding IS.
-        if !is_owner_binding_envelope(&r.attestation_envelope) {
-            continue;
-        }
-        if let Some(exp) = r.expires_at {
-            if exp <= now {
-                continue;
-            }
-        }
-        // Fail-to-liberty (CC 3.4.12): a lapsed adult-incapacity `valid_until`
-        // is non-live.
-        if delegation_valid_until_lapsed(&r.attestation_envelope, now) {
-            continue;
-        }
-        // A non-`user` granter cannot steward — mirror steward_bindings_of.
-        let Some(granter) = directory.lookup_public_key(&r.attesting_key_id).await? else {
-            continue;
-        };
-        if !identity_type::set_contains(&granter.identity_type, identity_type::USER) {
-            continue;
-        }
-        let granter_retracted = directory
-            .list_attestations_by(&r.attesting_key_id)
-            .await?
-            .into_iter()
-            .any(|g| {
-                (g.attestation_type == attestation_type::WITHDRAWS
-                    || g.attestation_type == attestation_type::RECANTS)
-                    && g.attested_key_id == node
-            });
-        if granter_retracted {
-            continue;
-        }
-        out.insert(r.attesting_key_id);
-    }
-    Ok(out)
+    live_delegation_granters(directory, node, DelegationEdgeFilter::OwnerBindingOnly).await
 }
 
 /// **CIRISConstitution#23 (CC 1.13.3.3 / CC 3.2) — the single responsible owner
@@ -6670,12 +6699,14 @@ pub async fn is_canonical_effective(
 /// order (so `!steward_binding_chain(k).is_empty()` ⟺ `is_steward_bound(k)`):
 ///   1. `k` is itself `user`-role → `[k]` (the key IS the human anchor).
 ///   2. `k` is an occurrence of a `user`-role identity → `[identity, k]`.
-///   3. a **live** `delegates_to(U → k)` with `U` `user`-role (not
-///      `withdraws`/`recants`-retracted against `k`, not expired) →
-///      `[U, k]`. The §11.10 steward-binding clause (3) is a DIRECT incoming
-///      edge (same as the predicate), so the delegated path is one hop; a
-///      multi-hop human→…→k steward-binding is not part of the predicate and
-///      is not synthesized here.
+///   3. a **live** `delegates_to(U → k)` with `U` `user`-role →
+///      `[U, k]`, liveness decided by [`live_delegation_granters`] — the same
+///      call [`is_steward_bound`] and [`steward_bindings_of`] make, so
+///      `!steward_binding_chain(k).is_empty() ⟺ is_steward_bound(k)` holds by
+///      construction (CIRISPersist#584). The §11.10 steward-binding clause (3)
+///      is a DIRECT incoming edge (same as the predicate), so the delegated
+///      path is one hop; a multi-hop human→…→k steward-binding is not part of
+///      the predicate and is not synthesized here.
 ///
 /// Returns the empty vec when `k` is not steward-bound (fail-closed, mirrors
 /// the predicate).
@@ -6707,44 +6738,13 @@ pub async fn steward_binding_chain(
     }
     // (3) a LIVE delegates_to(U → k) with U user-role — U → k. Lowest
     //     granter key_id first for a deterministic path when several humans
-    //     delegate to k (consistent with the sorted `steward_bindings_of`).
-    let now = chrono::Utc::now();
-    let mut anchors: Vec<String> = Vec::new();
-    for r in directory.list_attestations_for(key_id).await? {
-        if r.attestation_type != attestation_type::DELEGATES_TO {
-            continue;
-        }
-        if let Some(exp) = r.expires_at {
-            if exp <= now {
-                continue;
-            }
-        }
-        // Fail-to-liberty (CC 3.4.12): a lapsed adult-incapacity `valid_until`
-        // is non-live; the adult auto-re-sovereigns. No-op for minor rows.
-        if delegation_valid_until_lapsed(&r.attestation_envelope, now) {
-            continue;
-        }
-        let Some(granter) = directory.lookup_public_key(&r.attesting_key_id).await? else {
-            continue;
-        };
-        if !identity_type::set_contains(&granter.identity_type, identity_type::USER) {
-            continue;
-        }
-        let granter_retracted_k = directory
-            .list_attestations_by(&r.attesting_key_id)
-            .await?
-            .into_iter()
-            .any(|g| {
-                (g.attestation_type == attestation_type::WITHDRAWS
-                    || g.attestation_type == attestation_type::RECANTS)
-                    && g.attested_key_id == key_id
-            });
-        if granter_retracted_k {
-            continue;
-        }
-        anchors.push(r.attesting_key_id);
-    }
-    if let Some(anchor) = anchors.into_iter().min() {
+    //     delegate to k (consistent with the sorted `steward_bindings_of`);
+    //     the ONE live-delegation walk returns a BTreeSet, so `.first()` IS
+    //     that minimum. Liveness is NOT re-derived here — that is the whole
+    //     point of CIRISPersist#584.
+    let anchors =
+        live_delegation_granters(directory, key_id, DelegationEdgeFilter::AnyDelegation).await?;
+    if let Some(anchor) = anchors.into_iter().next() {
         return Ok(vec![anchor, key_id.to_owned()]);
     }
     Ok(Vec::new())
@@ -13111,5 +13111,539 @@ pub(crate) mod r2_test_support {
                 "conformant row {dim:?} must be stored"
             );
         }
+    }
+}
+
+/// (CIRISPersist#584) — the **steward-binding liveness** witness, run by the
+/// memory / sqlite / postgres suites against `&dyn FederationDirectory` so no
+/// backend can silently disagree about which `delegates_to` edges still confer
+/// stewardship. `suffix` scopes every fixture key so a run against a shared
+/// postgres test DB does not collide with a prior one.
+///
+/// Two properties, deliberately in ONE body because they constrain each other:
+///
+///  * **the biconditional** — `is_steward_bound(k)` ⟺
+///    `!steward_bindings_of(k).is_empty()` ⟺
+///    `!steward_binding_chain(k).is_empty()`. The repo asserts this in prose at
+///    three sites; here it is asserted at every state transition. A fold
+///    repaired at one site and not the others fails HERE — which is why the
+///    shared-predicate extraction is a correctness requirement, not hygiene.
+///  * **subject-revocation liveness** — a `delegates_to(U → K)` retracted by an
+///    admitted `withdraws` that its own granter `U` never issued (CEG §3.2.3
+///    rules 2/3/4) is NOT live, and confers no stewardship.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod steward_liveness_test_support {
+    use super::*;
+    use crate::federation::tier_ingest::test_support::{hybrid_pubkeys, sign_envelope};
+    use crate::federation::types::{
+        attestation_tier, attestation_type, cohort_scope, delegation_scope as ds, identity_type,
+    };
+    use crate::federation::{Attestation, FederationDirectory, SignedAttestation, SignedKeyRecord};
+    use chrono::Utc;
+
+    /// Register `key_id` carrying its REAL deterministic hybrid pubkeys and the
+    /// given `identity_type` set, so federation-tier ingest verifies rows it
+    /// signs.
+    async fn register(dir: &dyn FederationDirectory, key_id: &str, types: &[&str]) {
+        let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
+        let now = Utc::now();
+        dir.put_public_key(SignedKeyRecord {
+            record: crate::federation::KeyRecord {
+                key_id: key_id.to_owned(),
+                pubkey_ed25519_base64: ed_pk,
+                pubkey_ml_dsa_65_base64: mldsa_pk,
+                algorithm: crate::federation::types::algorithm::HYBRID.to_owned(),
+                identity_type: identity_type::join_set(types.iter().copied()),
+                identity_ref: key_id.to_owned(),
+                valid_from: now,
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "id": key_id }),
+                original_content_hash: "deadbeef".to_owned(),
+                scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+                scrub_signature_pqc: None,
+                scrub_key_id: key_id.to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .expect("register key");
+    }
+
+    /// A federation-tier row of `kind`, hybrid-signed by `signer` over
+    /// `envelope`. `attestation_id` is a real UUID — postgres types the column
+    /// as `uuid` and refuses anything else at the driver.
+    fn signed_row(
+        signer: &str,
+        attested: &str,
+        kind: &str,
+        envelope: serde_json::Value,
+    ) -> Attestation {
+        let (och, classical, pqc) = sign_envelope(signer, &envelope);
+        let ts = Utc::now();
+        Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: signer.to_owned(),
+            attested_key_id: attested.to_owned(),
+            attestation_type: kind.to_owned(),
+            weight: None,
+            asserted_at: ts,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: och,
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            scrub_key_id: signer.to_owned(),
+            scrub_timestamp: ts,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: Vec::new(),
+            withdraws_admission_rule: None,
+            cohort_scope: cohort_scope::FEDERATION.to_owned(),
+            tier: attestation_tier::FEDERATION.to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        }
+    }
+
+    /// A `delegates_to(granter → recipient)`. `subjects` fills
+    /// `subject_key_ids` — the CIRISConstitution rc3-conformant shape in which
+    /// a binding NAMES the key it is about, and the field CEG §3.2.3 rule 2
+    /// reads for subject self-revocation.
+    fn delegates_to(
+        granter: &str,
+        recipient: &str,
+        scope: &[&str],
+        subjects: &[&str],
+    ) -> Attestation {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut row = signed_row(
+            granter,
+            recipient,
+            attestation_type::DELEGATES_TO,
+            serde_json::json!({
+                "id": id,
+                "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            }),
+        );
+        row.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
+        row
+    }
+
+    fn withdraws_of(issuer: &str, attested: &str, target_attestation_id: &str) -> Attestation {
+        let id = uuid::Uuid::new_v4().to_string();
+        signed_row(
+            issuer,
+            attested,
+            attestation_type::WITHDRAWS,
+            serde_json::json!({
+                "id": id,
+                "references_attestation_id": target_attestation_id,
+            }),
+        )
+    }
+
+    /// The §11.10 **edge-retraction** shape: a granter's `withdraws` naming
+    /// only the recipient, with NO `references_attestation_id`. This is the
+    /// row only the granter-scoped clause can see — it is what keeps that
+    /// clause load-bearing after the admitted-`withdraws` clause lands, and a
+    /// witness that used the referencing shape here would let clause (3) be
+    /// deleted silently.
+    fn bare_edge_retraction(granter: &str, recipient: &str) -> Attestation {
+        let id = uuid::Uuid::new_v4().to_string();
+        signed_row(
+            granter,
+            recipient,
+            attestation_type::WITHDRAWS,
+            serde_json::json!({ "id": id }),
+        )
+    }
+
+    async fn store(dir: &dyn FederationDirectory, row: &Attestation) -> Result<(), Error> {
+        dir.put_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+    }
+
+    /// **THE BICONDITIONAL.** The three steward-binding readers are three
+    /// projections of ONE relation; asserting them together is what makes a
+    /// per-site fold repair impossible to land silently.
+    async fn assert_biconditional(
+        dir: &dyn FederationDirectory,
+        k: &str,
+        expect_bound: bool,
+        at: &str,
+    ) {
+        let bound = is_steward_bound(dir, k).await.expect("is_steward_bound");
+        let anchors = steward_bindings_of(dir, k)
+            .await
+            .expect("steward_bindings_of");
+        let chain = steward_binding_chain(dir, k)
+            .await
+            .expect("steward_binding_chain");
+        assert_eq!(
+            bound,
+            !anchors.is_empty(),
+            "[{at}] is_steward_bound({k}) <=> !steward_bindings_of({k}).is_empty() — the \
+             invariant admission.rs states in prose. bound={bound} anchors={anchors:?}"
+        );
+        assert_eq!(
+            bound,
+            !chain.is_empty(),
+            "[{at}] is_steward_bound({k}) <=> !steward_binding_chain({k}).is_empty(). \
+             bound={bound} chain={chain:?}"
+        );
+        assert_eq!(
+            bound, expect_bound,
+            "[{at}] {k} should be steward-bound={expect_bound}; anchors={anchors:?}"
+        );
+    }
+
+    /// The #584 behavioural witness. Run against every backend.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn exercise_steward_binding_liveness(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        let granter = format!("sb-granter-{suffix}");
+        let node = format!("sb-node-{suffix}");
+
+        register(dir, &granter, &[identity_type::USER]).await;
+        register(dir, &node, &[identity_type::NODE]).await;
+
+        // A node with no incoming edge is not steward-bound (clauses 1/2 never
+        // fire for a node key).
+        assert_biconditional(dir, &node, false, "no edges").await;
+
+        // ── the live delegation ──────────────────────────────────────────
+        // rc3-conformant: the binding NAMES the key it is about in
+        // `subject_key_ids`. That is the field CEG §3.2.3 rule 2 reads, and it
+        // is precisely what CIRISPersist#578's own comment says a conformant
+        // binding MUST carry.
+        let edge = delegates_to(
+            &granter,
+            &node,
+            &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+            &[&node],
+        );
+        store(dir, &edge).await.expect("delegates_to admitted");
+        assert_biconditional(dir, &node, true, "live edge").await;
+        assert_eq!(
+            steward_bindings_of(dir, &node).await.expect("anchors"),
+            vec![granter.clone()],
+            "the live edge's granter is the node's steward anchor"
+        );
+
+        // ── the subject-side revocation ──────────────────────────────────
+        // The SUBJECT of the delegation retracts it: CEG §3.2.3 rule 2
+        // (subject self-revocation), admitted by the real `withdraws` gate.
+        // The edge's own GRANTER never issued this — exactly the shape the
+        // granter-scoped fold cannot see.
+        let revocation = withdraws_of(&node, &node, &edge.attestation_id);
+        store(dir, &revocation)
+            .await
+            .expect("a rule-2 withdraws against the delegation must be ADMITTED");
+        let stored = dir
+            .get_attestation(&revocation.attestation_id)
+            .await
+            .expect("read")
+            .expect("the withdraws is stored");
+        assert_eq!(
+            stored.withdraws_admission_rule,
+            Some(2),
+            "the fixture must exercise the rule-2 (non-granter) arm — if this is None the \
+             withdraws was admitted unresolved and the witness proves nothing about authority"
+        );
+
+        // THE DEFECT (#584): the edge is dead, so nothing it conferred survives.
+        assert_biconditional(dir, &node, false, "subject-revoked edge").await;
+        assert!(
+            steward_bindings_of(dir, &node)
+                .await
+                .expect("anchors")
+                .is_empty(),
+            "a delegates_to retracted by an admitted withdraws its granter never issued must NOT \
+             confer stewardship — CIRISPersist#584, the second site of the fold CIRISPersist#578 \
+             repaired in live_owner_binding_granters"
+        );
+        // …and the outbound projection agrees, since it is defined by the same
+        // predicate (`n ∈ nodes_stewarded_by(U)` ⟺ `U ∈ steward_bindings_of(n)`).
+        assert!(
+            !nodes_stewarded_by(dir, &granter)
+                .await
+                .expect("nodes_stewarded_by")
+                .contains(&node),
+            "the inverse projection must not keep listing a node whose only edge is dead"
+        );
+
+        // ── the granter-scoped arm still works (no regression) ───────────
+        // Deliberately the BARE §11.10 edge-retraction, with no
+        // `references_attestation_id`: the new clause cannot see it, so this
+        // step fails if the granter-scoped clause is ever dropped as
+        // "subsumed". (It is not subsumed — the two clauses read different
+        // rows.)
+        let node2 = format!("sb-node2-{suffix}");
+        register(dir, &node2, &[identity_type::NODE]).await;
+        let edge2 = delegates_to(&granter, &node2, &[ds::INFRA_SERVE], &[]);
+        store(dir, &edge2).await.expect("second edge admitted");
+        assert_biconditional(dir, &node2, true, "second live edge").await;
+        store(dir, &bare_edge_retraction(&granter, &node2))
+            .await
+            .expect("the granter's own edge-retraction lands");
+        assert_biconditional(dir, &node2, false, "granter-retracted edge").await;
+
+        // ── an unrelated withdraws does not kill a live edge ─────────────
+        let node3 = format!("sb-node3-{suffix}");
+        register(dir, &node3, &[identity_type::NODE]).await;
+        let edge3 = delegates_to(&granter, &node3, &[ds::INFRA_SERVE], &[&node3]);
+        store(dir, &edge3).await.expect("third edge admitted");
+        let decoy = withdraws_of(&node3, &node3, &uuid::Uuid::new_v4().to_string());
+        store(dir, &decoy)
+            .await
+            .expect("a withdraws naming an absent target admits unresolved");
+        assert_biconditional(dir, &node3, true, "unrelated withdraws").await;
+        assert_eq!(
+            steward_bindings_of(dir, &node3).await.expect("anchors"),
+            vec![granter.clone()],
+            "a withdraws that references some OTHER attestation must not fold this edge away"
+        );
+    }
+
+    /// **THE BLAST RADIUS, witnessed rather than reasoned about**
+    /// (CIRISPersist#584).
+    ///
+    /// `check_no_moderator_federate_apply` scans `community_id` /
+    /// `community_key_id` / `cohort_key_id`, and #574 objection envelopes carry
+    /// `cohort_key_id` by design. It reaches [`is_steward_bound`]. So the
+    /// question the pre-flight scoping left open — *does the stricter fold
+    /// actually flip a live binding on the objection plane?* — has a concrete
+    /// answer, and this body is it:
+    ///
+    /// **Yes.** A community whose only authority root is a NODE key is
+    /// moderator-bearing solely by clause (3), and a subject-revoked
+    /// `delegates_to` takes its moderator away. Every subsequent
+    /// federation-tier row keyed on it — including the objection that is the
+    /// #574 brake and the ballot #591 escalates to — is refused
+    /// [`Error::CommunityHasNoModerator`].
+    ///
+    /// That is CC 4.5.4 / §11.11 rule 3 working as written ("better no group
+    /// than an unmoderated one"), and it is a REAL behaviour change: before
+    /// this cut the dead edge kept the community federating. It is asserted
+    /// here so it is a decision on the record, not a surprise in a deployment.
+    ///
+    /// Note the shape it does NOT touch: the existing #574 / #591 witnesses
+    /// roster `user`-role members, which self-anchor under clause (1) and never
+    /// consult the fold at all. The exposure is exactly node/agent-rostered
+    /// commons.
+    pub(crate) async fn exercise_objection_plane_blast_radius(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        use crate::federation::cohort::Cohort;
+        use crate::federation::reverse_quorum::{
+            objection_envelope, record_objection, ObjectionOutcome,
+        };
+        use crate::federation::types::CommunityMember;
+        use crate::federation::Community;
+
+        let steward = format!("op-steward-{suffix}");
+        let n1 = format!("op-n1-{suffix}");
+        let n2 = format!("op-n2-{suffix}");
+        let actor = format!("op-actor-{suffix}");
+        let community = format!("op-commons-{suffix}");
+
+        register(dir, &steward, &[identity_type::USER]).await;
+        register(dir, &n1, &[identity_type::NODE]).await;
+        register(dir, &n2, &[identity_type::NODE]).await;
+        register(dir, &actor, &[identity_type::USER]).await;
+        register(dir, &community, &[identity_type::USER]).await;
+
+        // The commons is rostered by NODE keys — legal (CC 3.2 requires each to
+        // be steward-bound, and each is) and the only shape where the fold is
+        // load-bearing.
+        let edges: Vec<Attestation> = [&n1, &n2]
+            .iter()
+            .map(|n| {
+                delegates_to(
+                    &steward,
+                    n,
+                    &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                    &[n],
+                )
+            })
+            .collect();
+        for e in &edges {
+            store(dir, e).await.expect("steward binds the node member");
+        }
+
+        let now = Utc::now();
+        dir.put_community(
+            crate::federation::tier_ingest::test_support::sign_community(
+                &n1,
+                Community {
+                    community_key_id: community.clone(),
+                    community_name: format!("node commons {suffix}"),
+                    members: [&n1, &n2]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, k)| CommunityMember {
+                            key_id: (*k).clone(),
+                            joined_at: now,
+                            role: Some(if i == 0 { "founder" } else { "member" }.to_owned()),
+                        })
+                        .collect(),
+                    founded_at: now,
+                    consensus_protocol: "reverse_quorum:1/2:3600".to_owned(),
+                    policy_blob: None,
+                    persist_row_hash: String::new(),
+                },
+            ),
+        )
+        .await
+        .expect("a node-rostered commons is admissible while its members are steward-bound");
+
+        // The commons act, taking effect on arrival (act-unless-objected).
+        let action = signed_row(
+            &actor,
+            &actor,
+            attestation_type::SCORES,
+            serde_json::json!({
+                "dimension": "testimonial_witness:commons_act:v1",
+                "payload": {"action": "the commons act under objection"},
+            }),
+        );
+        store(dir, &action).await.expect("the commons act lands");
+
+        assert_eq!(
+            no_moderator_federate_verdict(dir, &community)
+                .await
+                .expect("verdict")["admitted"],
+            serde_json::json!(true),
+            "while the bindings are live the commons has a moderator"
+        );
+
+        // ── the objection lands ──────────────────────────────────────────
+        let o1 = signed_row(
+            &n1,
+            &actor,
+            attestation_type::SCORES,
+            objection_envelope(
+                Cohort::Community,
+                &community,
+                &action.attestation_id,
+                "harms the commons",
+            ),
+        );
+        assert_eq!(
+            record_objection(dir, &o1).await.expect("record"),
+            ObjectionOutcome::Admitted,
+            "one member is the whole protective threshold"
+        );
+
+        // ── the subject revokes both bindings ────────────────────────────
+        for (n, e) in [(&n1, &edges[0]), (&n2, &edges[1])] {
+            store(dir, &withdraws_of(n, n, &e.attestation_id))
+                .await
+                .expect("the subject's rule-2 withdraws lands");
+            assert!(
+                !is_steward_bound(dir, n).await.expect("is_steward_bound"),
+                "the member's only binding is dead"
+            );
+        }
+
+        // ── and the objection plane goes dark for this commons ───────────
+        assert_eq!(
+            no_moderator_federate_verdict(dir, &community)
+                .await
+                .expect("verdict"),
+            serde_json::json!({
+                "admitted": false,
+                "community_known": true,
+                "reason": "federation_community_no_moderator",
+            }),
+            "§11.11 rule 3: a commons whose every authority root lost its binding must not \
+             continue at moderated capability"
+        );
+        let o2 = signed_row(
+            &n2,
+            &actor,
+            attestation_type::SCORES,
+            objection_envelope(
+                Cohort::Community,
+                &community,
+                &action.attestation_id,
+                "still harms the commons",
+            ),
+        );
+        let err = record_objection(dir, &o2)
+            .await
+            .expect_err("the apply-time moderator re-check must refuse it");
+        assert_eq!(
+            err.kind(),
+            "federation_community_no_moderator",
+            "the refusal must be the §11.11 gate NAMING itself, not some incidental error: {err}"
+        );
+        assert!(
+            dir.get_attestation(&o2.attestation_id)
+                .await
+                .expect("get")
+                .is_none(),
+            "verify-before-mutation: the refused objection left no row"
+        );
+        // The objection already recorded is EVIDENCE and is untouched — persist
+        // records an objection, it never sentences a row.
+        assert!(
+            dir.get_attestation(&o1.attestation_id)
+                .await
+                .expect("get")
+                .is_some(),
+            "the already-admitted objection survives its commons losing its moderator"
+        );
+
+        // ── THE STATE IS EXITABLE ────────────────────────────────────────
+        // The fail-secure floor must not be a one-way door — that is the
+        // permanent-lock failure CIRISPersist#578 exists to prevent, one plane
+        // over. The recovery act is a FRESH steward binding, a row about the
+        // NODE and not about the commons, so the §11.11 apply gate does not
+        // refuse the very act that lifts it.
+        store(
+            dir,
+            &delegates_to(
+                &steward,
+                &n1,
+                &[ds::INFRA_SERVE, ds::INFRA_NETWORK_PRESENCE],
+                &[&n1],
+            ),
+        )
+        .await
+        .expect("re-binding the node member is not itself keyed on the commons");
+        assert!(
+            is_steward_bound(dir, &n1).await.expect("is_steward_bound"),
+            "a fresh edge is live — the subject's withdraws named the OLD attestation_id, not the \
+             granter"
+        );
+        let o3 = signed_row(
+            &n2,
+            &actor,
+            attestation_type::SCORES,
+            objection_envelope(
+                Cohort::Community,
+                &community,
+                &action.attestation_id,
+                "the commons speaks again",
+            ),
+        );
+        assert_eq!(
+            record_objection(dir, &o3).await.expect("record"),
+            ObjectionOutcome::Admitted,
+            "with one authority root re-bound the commons federates again — the stricter fold is \
+             a gate, never a tombstone"
+        );
     }
 }

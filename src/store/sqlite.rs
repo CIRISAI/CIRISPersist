@@ -20256,6 +20256,31 @@ mod tests {
             .await;
     }
 
+    /// (CIRISPersist#584) — the SQLITE leg of the shared steward-binding
+    /// liveness witness (see the memory + postgres legs); all three call the
+    /// SAME `admission::steward_liveness_test_support` body.
+    #[tokio::test]
+    async fn steward_binding_liveness_parity_sqlite_584() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::steward_liveness_test_support::exercise_steward_binding_liveness(
+            &backend, "sq",
+        )
+        .await;
+    }
+
+    /// (CIRISPersist#584) — the SQLITE leg of the objection-plane blast-radius
+    /// witness (see the memory + postgres legs).
+    #[tokio::test]
+    async fn objection_plane_blast_radius_sqlite_584() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        crate::federation::admission::steward_liveness_test_support::exercise_objection_plane_blast_radius(
+            &backend, "sq",
+        )
+        .await;
+    }
+
     /// v25.1.0 (CIRISPersist#570 ask 4) — the sqlite leg of the shared
     /// revocation-history-bound witness. The bound is stored in a column
     /// (V118), so "it round-trips" is a per-backend claim, not a shared one.
