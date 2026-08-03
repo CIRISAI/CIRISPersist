@@ -5,6 +5,95 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased]
+
+### Changed — #568/#567: the "may I gate on this?" question moves out of prose and into the type
+
+CIRISVerify **v12.1.0** re-pin (seven `tag` sites; MINOR within major 12, so
+`version = "12"` and pyproject's `>=12.0.0,<13` are both unchanged — and
+`verify_pin_major_matches_the_wheel_requires_dist` is the gate that says so).
+Nothing broke. The whole delta is additive: one new module, four trait impls.
+
+v12.1.0 exists because persist asked for it. #569 gated on a classification
+verify described as *"a proposal from the measuring side, not a ruling"* — in
+prose, in a document persist's reader never opened. `classification::{Gating,
+Classification}` (CIRISVerify#238) makes every shipped classification state, in
+the type, whether a consumer may gate on it and on whose authority. Persist is
+its first consumer.
+
+- **`ClassificationStanding` / `classification_standing` / `standing_of::<C>()`**
+  (`federation::admission`) — the rule, stated once. `Gating::may_gate()`
+  answers half the question; the other half is *on whose authority*, which
+  `may_gate()` cannot answer. `Purpose` is genuinely `Normative` on an IETF
+  draft: gate-able for a trust-anchor store, and **not** a rule about what this
+  substrate admits. Normative-elsewhere is not normative here, so a classification
+  binds a persist gate only when it cites a document in
+  `PERSIST_RATIFYING_AUTHORITIES`. Fail-closed on every other status.
+- **The adjudication record reads through it.**
+  `verify_dimension_registry_is_the_only_enumeration` now pins
+  `standing_of::<ConsentDisposition>() == Binding { authority: "CC 3.4.5" }` —
+  the same paragraph `consent_gated_family` reads. The disagreement this record
+  was built to hold open has **resolved**, so its assertion changes shape with
+  it: the one-sided v11 sweep becomes a **two-sided agreement** over `dim::ALL`.
+  One ratified rule, two readers — a divergence is now a misreading to settle on
+  the document, not two sides doing their own jobs. The floor's own ruling stays
+  anchored separately, because the agreement sweep would stay green if *both*
+  sides moved together, which is exactly how a dependency bump could carry a
+  widening in.
+- **The other two statuses are exercised, not just shipped.**
+  `AndroidSecurityLevel` / `AppAttestEnvironment` pin to `NoStanding`: gating
+  admission on where a chain says a key lives makes hardware a **requirement**,
+  the inversion `hardware_attestation` refuses by design.
+
+### Documentation — #568: the v12.1.0 capability matrix, recorded where the deferral is
+
+- `federation::hardware_attestation`'s module doc carries verify's v12.1.0
+  matrix, so a reader deciding whether a gap is real does not need a round trip
+  to another repo. The old note was stale twice over: **CIRISVerify#32 is
+  CLOSED** (live tracker **#199**) and two of its three legs have shipped
+  (Android v10.8.0, Apple v11.0.0). **TPM EK remains deferred** and now points
+  at #199 — blocked upstream on vendor-root-**set** management, a different
+  problem from pinning one root.
+- `strongbox_backed` is documented as a **self-report**, stays shape-only, and
+  is now *falsifiable* via `AndroidAttestationVerdict::refutes`. A future
+  adopter wires refutation, never promotion.
+- `verify_member_fips_custody_against` no longer justifies its FIPS +
+  touch=always refusal as *"the same predicate CIRISServer's holder-admission
+  gate applies."* That was a claim about a repo persist does not compile,
+  checked by nothing and failing at nothing when it stops being true — the shape
+  `3634d85` removed from the neighbouring file, and the shape #545/#554 rode
+  into a live ceremony. The floor is #513's, the pinned root is ours, the walk
+  runs here.
+
+**#567 is NOT adopted and stays open** — deliberately, and *not* for a
+stability reason. Verify's answer was yes, and it holds up:
+`build_attestation_bundle.rs` is **byte-identical from v10.7.0 to v12.1.0**, so
+the wire shape has not moved in five minor releases. Persist can also pin all
+four inputs from its own directory — `presenter_member` and the accord anchors
+the way `verify_member_fips_custody_against` already does, and
+`pipeline_member` / `pipeline_record` from the `infra:attest` row, since
+verify's `MANIFEST_PUBLISH_SCOPE` **is** `infra:attest`, the role
+`check_infra_attest_role_admission` already gates on the same accord co-scrub.
+Nothing upstream blocks this.
+
+What blocks it is downstream, in persist, and it is one honest gap plus one
+undecided question:
+
+1. **There is nowhere to put it without a migration.** #567's first ask is
+   *storage + read surface*. `KeyRecord`'s only free-form slot,
+   `attestation_evidence`, is single-kind by construction — the custody path
+   refuses any object whose `kind` is not
+   `ACCORD_CUSTODY_ATTESTATION_KIND`. Carrying a bundle means a new plane.
+2. **"The announce / federation record" is one thing in the issue and two in
+   persist** — the `federation_keys` `KeyRecord` and the peer row are different
+   surfaces with different lifetimes, and the bundle is a claim about a *node's
+   running binary*, not about a key. Which one carries it decides the read
+   surface, and the issue does not settle it.
+
+Verifying at admission without carrying is not a half-bundle, it is a gate with
+no input; carrying without the verify is the thing the brief rightly calls worse
+than none. So: the reasoning goes on the issue and the issue stays open.
+
 ## [25.1.0] — 2026-08-02 — #582/#578/#570/#583/#569: who may take a node, who may withhold it, what a quota can see — and a gate the floor narrowed mid-flight
 
 Five issues, and one release-shaped lesson. #569 was written against a genuinely open
