@@ -35,6 +35,28 @@
 //! version of the gate gets stronger as the registry advances, instead of
 //! failing on it.
 //!
+//! # Why the walk still is not re-vendored (CIRISPersist#586)
+//!
+//! #586 asked for the walk to be re-run against post-#578 / post-#590 `main`,
+//! or for a precise statement of why it cannot be. It cannot be, and the reason
+//! is not scheduling: **there is no generator, anywhere.**
+//! `namespace_registry.json` has one — CIRISConstitution's
+//! `tools/build_cc_namespace.py`, which is what #590 re-ran.
+//! `namespace_supersets.json` has no counterpart in persist, in
+//! CIRISConstitution or in CIRISRegistry; it is the frozen output of a
+//! hand-driven semantic walk (CI six-axis rubric + per-family invariants) over
+//! a source tree that no longer exists. "Re-vendoring" it would mean
+//! hand-editing findings to match today's code, which forges a research
+//! artifact exactly as hand-adding a registry row would forge a constitutional
+//! one.
+//!
+//! So the correction lands the way every persist-authored correction to this
+//! file lands — OUTSIDE it, and GATED. What #586 adds is that the walk's
+//! ABSENCE findings now carry a witness ([`PERSIST_AUTHORED_ABSENCE_FALSIFIERS`]
+//! / [`tests::manifest_absence_claims_still_hold`]), so a finding shipping code
+//! has falsified fails the build instead of ageing quietly into a claim
+//! downstream still trusts.
+//!
 //! # What persist consumes today (and what it does not)
 //!
 //! This cut vendors the WHOLE manifest + wires the pieces persist can act on
@@ -268,6 +290,22 @@ fn parsed() -> &'static RawManifest {
     })
 }
 
+/// The whole vendored manifest as an untyped tree — the ONE
+/// [`serde_json::Value`] parse of `namespace_supersets.json`.
+///
+/// Every raw-section accessor ([`field_transforms`], [`invariant_registry`],
+/// [`families`]) and the section-INDEPENDENT absence-claim derivation
+/// ([`manifest_absence_claims`]) borrow out of this. Before CIRISPersist#586
+/// each accessor re-parsed the 2 MB file into its own `OnceLock`; the tree is
+/// immutable and `'static`, so one parse serves them all.
+fn root() -> &'static serde_json::Value {
+    static ROOT: OnceLock<serde_json::Value> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        serde_json::from_str(SUPERSETS_JSON)
+            .expect("vendored namespace_supersets.json is valid JSON")
+    })
+}
+
 /// The vendored manifest version string (`_meta.manifest_version`) — the
 /// provenance a downstream consumer pins against [`VENDORED_MANIFEST_VERSION`].
 pub fn manifest_version() -> &'static str {
@@ -329,14 +367,9 @@ pub fn persist_placement_fields() -> Vec<&'static str> {
 /// [`crate::federation::transform::validate_family_transform_rows`]), the
 /// ONE consumer of this accessor.
 pub fn field_transforms() -> &'static serde_json::Value {
-    static FIELD_TRANSFORMS: OnceLock<serde_json::Value> = OnceLock::new();
-    FIELD_TRANSFORMS.get_or_init(|| {
-        let root: serde_json::Value = serde_json::from_str(SUPERSETS_JSON)
-            .expect("vendored namespace_supersets.json is valid JSON");
-        root.get("field_transforms")
-            .cloned()
-            .expect("namespace_supersets.json carries a top-level field_transforms section")
-    })
+    root()
+        .get("field_transforms")
+        .expect("namespace_supersets.json carries a top-level field_transforms section")
 }
 
 /// (CIRISPersist#519 item 3) — the `invariant_registry` section: a dict
@@ -351,14 +384,9 @@ pub fn field_transforms() -> &'static serde_json::Value {
 /// [`crate::federation::invariant::admission_enforceable`]), the ONE
 /// consumer of this accessor.
 pub fn invariant_registry() -> &'static serde_json::Value {
-    static INVARIANT_REGISTRY: OnceLock<serde_json::Value> = OnceLock::new();
-    INVARIANT_REGISTRY.get_or_init(|| {
-        let root: serde_json::Value = serde_json::from_str(SUPERSETS_JSON)
-            .expect("vendored namespace_supersets.json is valid JSON");
-        root.get("invariant_registry")
-            .cloned()
-            .expect("namespace_supersets.json carries a top-level invariant_registry section")
-    })
+    root()
+        .get("invariant_registry")
+        .expect("namespace_supersets.json carries a top-level invariant_registry section")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -783,14 +811,9 @@ pub fn family_prefixes() -> Vec<&'static str> {
 /// vendored manifest; [`field_ci_axes_map`], [`load_bearing_trigger_families`]
 /// and [`family_prefixes`] are its only consumers.
 fn families() -> &'static serde_json::Value {
-    static FAMILIES: OnceLock<serde_json::Value> = OnceLock::new();
-    FAMILIES.get_or_init(|| {
-        let root: serde_json::Value = serde_json::from_str(SUPERSETS_JSON)
-            .expect("vendored namespace_supersets.json is valid JSON");
-        root.get("families")
-            .cloned()
-            .expect("namespace_supersets.json carries a top-level families section")
-    })
+    root()
+        .get("families")
+        .expect("namespace_supersets.json carries a top-level families section")
 }
 
 /// The bare wire-field name from an annotated `wire_fields` entry, e.g.
@@ -887,10 +910,513 @@ pub fn fusion_classification(field: &str) -> Option<(&'static str, &'static str)
         .map(|(_, kind, note)| (*kind, *note))
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// CIRISPersist#586 — THE ABSENCE WITNESS.
+//
+// A PRESENCE claim breaks its own build when the symbol moves:
+// `evidence_cc_impl_pointers_resolve` proves that on every run. An ABSENCE
+// claim — "X does not exist" — is true when written and nothing ever re-asks.
+// It is the only kind of claim in this manifest that rots while nobody touches
+// it, and by the time CIRISPersist#586 was filed FOUR had rotted:
+//
+//   `wa_adjudication_ref` has NO wire path    — false since v21.8.0, doubly so after #578
+//   `capacity_assurance:` has no registry row  — false since CC 1.0-rc3, closed by #590
+//   the CC generator walks only `### 3.1.N`    — fixed upstream; CC 3.1.7 R2 now forbids it
+//   three gated families are uncatalogued      — TRUE, and the manifest cannot say it
+//
+// Two of those already have witnesses, both built for other reasons and both
+// of the same shape — declare the absence in a const, and fail when it ends:
+// [`STILL_UNREGISTERED_COVERAGE_GAP`] (CIRISPersist#590) and
+// `UNREGISTERED_GATED_FAMILIES`' liveness twin. What was missing is the
+// GENERAL case: an enumeration that finds the NEXT absence claim without
+// anybody remembering to write a const for it.
+//
+// ## What can honestly be checked, and what cannot
+//
+// Only STRUCTURED absence claims. The manifest states absence three ways:
+//
+// 1. **Structured, and already witnessed** — `registry_coverage_gap.prefixes`
+//    ("these families carry no registry row"), gated by
+//    [`STILL_UNREGISTERED_COVERAGE_GAP`]; and a `field_processor_matrix` row
+//    whose `owner_component` or `processor` is the literal `UNASSIGNED` ("no
+//    component processes this field anywhere"), gated by
+//    [`KNOWN_UNASSIGNED_FIELDS`]. Note the second is much narrower than the
+//    185 rows the walk marks `status: "unassigned"` — that softer flag means
+//    "no LIVE processor for this field", and what makes it true is prose in
+//    the `proposed:` note, so it lands in category 3 below.
+// 2. **Structured, and witnessed HERE** — an object carrying
+//    `asymmetry_kind: "logical_defect"` together with a `missing_dual` key.
+//    `missing_dual` IS the absence marker: the object's whole content is
+//    "operation X on family F has no dual Y". Nine such objects in the 0.3.0
+//    cut, and the flagship rot (`ownership:*` / WA-adjudicated reclaim) is one
+//    of them.
+// 3. **Prose, and NOT checkable** — `primitive_gap_report`'s free-text lines,
+//    `invariant_registry` `primitive_constraint` narration, and the
+//    `processor` field's `proposed: …` design notes.
+//
+// Category 3 is where the temptation lives, and it must be refused. The
+// obvious move — treat every `proposed:`-prefixed processor citation naming a
+// `path#symbol` as "this symbol does not exist" — was tried and is WRONG:
+// of the 56 such citations that resolve to a repo-local file, **29 name a
+// symbol that exists on purpose**, because `proposed:` means "does not process
+// this field yet", not "does not exist". Separating
+// `proposed: admission.rs#check_reserved_prefix_admission — add a
+// health:liveness: arm` (extend an existing symbol) from
+// `proposed: admission.rs#reject_non_self_replication_grant (no existing
+// admission check found)` (a symbol that is genuinely absent) requires reading
+// the parenthetical. **Inferring a rule from a description field is the
+// section-walk heuristic CC 3.1.7 R2 forbids, pointed at a different field.**
+// A narrow gate that fires beats a broad one that cannot.
+//
+// ## The shape
+//
+// [`manifest_absence_claims`] DERIVES the claim set by walking the whole
+// document for the structural marker — never by naming a section, so a
+// re-vendor that moves `duality_audit` elsewhere still finds them. Persist
+// then declares, per claim, the symbols whose existence contradicts it
+// ([`PERSIST_AUTHORED_ABSENCE_FALSIFIERS`]), and
+// [`tests::manifest_absence_claims_still_hold`] resolves those symbols with
+// the SAME definition predicate `evidence_cc_impl_pointers_resolve` uses. The
+// two are exact inverses over one predicate: presence claims must resolve,
+// absence claims must not.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One **structured absence claim** derived from the vendored manifest: an
+/// object the walk classified `logical_defect` whose content is a missing dual.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AbsenceClaim {
+    /// `"{family}|{operation}"` — the stable key
+    /// [`PERSIST_AUTHORED_ABSENCE_FALSIFIERS`] is indexed by. Derived from the
+    /// claim's own content, so it survives the object moving in the document.
+    pub key: String,
+    /// The CC 3.1 family prefix the claim is about (`"ownership:*"`).
+    pub family: String,
+    /// The operation whose dual is missing (`"ownership bind"`).
+    pub operation: String,
+    /// What the manifest says does not exist (`"WA-adjudicated reclaim"`).
+    pub missing_dual: String,
+}
+
+/// The closed status vocabulary for a declared absence claim.
+///
+/// - `holds` — no declared falsifier resolves in persist's sources. The claim
+///   is still true as far as this repo can see.
+/// - `falsified` — at least one does. **The manifest is wrong on `main`**, and
+///   the entry is the correction owed at the next re-vendor — the same
+///   discipline `tests::DELETED_PENDING_REVENDOR` runs for a deleted citation.
+///
+/// Gated closed by [`tests::absence_claim_status_vocabulary_is_closed`].
+pub const ABSENCE_CLAIM_STATUSES: &[&str] = &["holds", "falsified"];
+
+/// CIRISPersist#586 — per derived [`AbsenceClaim`], the symbols whose presence
+/// in persist's own `src/` **contradicts** the claim.
+///
+/// `(claim_key, status, falsified_by, note)`. Recorded here rather than edited
+/// into `namespace_supersets.json` for the reason every `PERSIST_AUTHORED_*`
+/// table above is: the manifest is a vendored Registry-of-Record produced by a
+/// constitution-grounded walk with no generator to re-run, and hand-editing its
+/// findings would forge a research artifact exactly as hand-adding a registry
+/// row would forge a constitutional one (CIRISPersist#590's reasoning, applied
+/// to the sibling artifact).
+///
+/// # What each half of the gate is worth
+///
+/// **Coverage is the load-bearing half.** The table must cover EXACTLY the
+/// derived claim set ([`tests::every_absence_claim_declares_a_falsifier`]), so
+/// a re-vendor that adds a tenth gap fails the build until somebody states what
+/// would disprove it. That property cannot rot, because it is derived.
+///
+/// **A `falsified` entry is a proof.** Its symbol must really be there, or the
+/// entry is wrong in the other direction and the gate says so.
+///
+/// **A `holds` entry is a TRIPWIRE, not a proof.** It says: while this claim is
+/// recorded as true, none of these names may appear. It cannot prove the gap is
+/// still open — an implementer who picks a different name walks past it. Module
+/// names are preferred where closing the gap would earn its own module, because
+/// those are the names that stay predictable (`ownership_reclaim` is exactly
+/// what v21.8.0 called it, four minor versions before anyone noticed the
+/// manifest still said it did not exist).
+pub const PERSIST_AUTHORED_ABSENCE_FALSIFIERS: &[(&str, &str, &[&str], &str)] = &[
+    // ── FALSIFIED: the manifest is wrong on `main` today ──────────────────
+    (
+        "ownership:*|ownership bind",
+        "falsified",
+        &[
+            "ownership_reclaim",
+            "build_reclaim_withdraws_envelope",
+            "check_ownership_reclaim_admission",
+        ],
+        "THE ISSUE'S FLAGSHIP. The claim reads \"CIRISPersist v21.4.0 contains zero \
+         seizure/reclaim/ownerless handling\" — false since v21.8.0, which shipped the \
+         `federation::ownership_reclaim` module and started stamping withdraws-admission rule 5, \
+         and doubly false after CIRISPersist#578 re-pointed the authority at a CC 4.3 WA quorum \
+         re-derived from the pinned body's own charter, added the wa_adjudication:{state} family, \
+         and shipped V117 widening the withdraws_admission_rule CHECK to 1..=5 on sqlite and \
+         postgres — rule 5 had never actually been STORABLE. Note also that the road the \
+         manifest's minimal_fix proposed (seed the WA key_id into subject_key_ids so the existing \
+         rule-2 path admits it) was NOT taken: #578 built a distinct rule-5 ceremony and \
+         deliberately keeps the finding out of ownership:*, because CC 3.4 reserves that prefix \
+         to the live owner. Correction owed at the re-vendor.",
+    ),
+    (
+        "trust:*|trust charter genesis",
+        "falsified",
+        &["check_family_charter_admission"],
+        "The claim reads \"genesis requires nothing but the root's own signature\" while recovery \
+         requires an m-of-n pre-committed ceremony. CIRISPersist#557 closed that asymmetry for the \
+         shape it matters on: a trust:charter:v1 naming a constitutional family is refused at the \
+         write chokepoint unless its scrub set reaches that family's own threshold, re-derived \
+         from this node's stored roster and consensus_protocol — an external witness at genesis, \
+         which is precisely the dual the walk called missing. It is NOT closed for a single-key \
+         self-charter, which still needs only its own signature plus a pre-rotation commitment; \
+         the production trust root is quorum-rooted, so the case the manifest calls high-severity \
+         is the case that is now gated. Partial closure recorded as falsification because the \
+         claim as WRITTEN — genesis requires nothing but the root's own signature — is no longer \
+         true of any charter this substrate would accept as a root.",
+    ),
+    // ── HOLDS: still true, each with the tripwire that would end it ───────
+    (
+        "config:*|config set",
+        "holds",
+        &[
+            "delete_config",
+            "config_tombstone",
+            "check_config_delete_admission",
+        ],
+        "Persist gates `config:` as a reserved dimension prefix and CC registers config:{scope}, \
+         but persist has no config write API at all — the ConfigValue::Null tombstone the claim \
+         calls the invisible default path lives in a consumer repo. So the dual can be neither \
+         built nor falsified here; the tripwire fires the moment persist grows a config delete, \
+         which is the moment the question becomes persist's.",
+    ),
+    (
+        "trace:* / consent:*|consent grant promotion (local->federation, cohort_scope stamped)",
+        "holds",
+        &[
+            "narrow_stranded_scope_backlog",
+            "check_promoted_scope_narrowing",
+            "revoke_promoted_cohort_scope",
+        ],
+        "Still true, and the nearest shipping symbol says why: CIRISPersist#530's \
+         `repair_stranded_scope_backlog` is BROADEN-ONLY by construction, so it cannot be the \
+         cessation dual however close it looks. WEAK TRIPWIRE — the names here are persist's guess \
+         at what the narrowing counterpart would be called, and an implementer who spells it \
+         differently walks past this line.",
+    ),
+    (
+        "capacity_assurance:*|capacity_assurance valid_until admission bound",
+        "holds",
+        &[
+            "run_capacity_lapse_watch",
+            "run_capacity_assurance_lapse_sweep",
+            "capacity_lapse_event",
+        ],
+        "Still true. Admission refuses an over-long window and `capacity_state` consults liveness \
+         at READ time, which is exactly the \"depends on someone looking\" the claim names; the \
+         two reconcile loops persist does own (`run_deletion_window_watch`, \
+         `run_consent_sla_watch`) are the retention and SLA planes and neither flips a lapsed \
+         capacity binding non-live. WEAK TRIPWIRE, as above: guessed names for an unwritten sweep.",
+    ),
+    (
+        "scores:*|attestation_prefixes accept",
+        "holds",
+        &["check_grant_prefix_matchable", "reject_unmatchable_prefix"],
+        "Half-closed, and the half that closed is not this one. CIRISPersist#510's \
+         `parse_grant_payload` made the grant payload a closed grammar — unknown field, \
+         unconsentable kind, non-cohort_scope audience and empty-string prefix are all hard \
+         rejects — but a prefix that is well-formed and can never match any dimension (the claim's \
+         example is the wire-primitive name `scores:`) still parses, still signs, and still \
+         evaluates as a no-op in `covers`. The enforcement point the claim names is a consumer \
+         repo's; persist's own half is unbuilt.",
+    ),
+    (
+        "trace_summary:*|trace_summary derive",
+        "holds",
+        &[
+            "put_trace_summary",
+            "promote_trace_summary",
+            "invalidate_trace_summary",
+        ],
+        "Still true, by an accident that is worth naming: persist DERIVES a trace summary at read \
+         time (`get_trace_summary` projects trace_events) and never promotes one, so there is no \
+         standing row to leave behind when the source is tombstoned. The claim is about a \
+         promotable projection, and persist does not promote — the gap is unreachable rather than \
+         closed, and the tripwire is keyed on persist acquiring the write half.",
+    ),
+    (
+        "trace_manifest:*|trace_manifest content commitment",
+        "holds",
+        &["fetch_trace_manifest_content", "trace_manifest_retrieval"],
+        "Still true and verifiable in one place: `Ingest`'s oversize-trace path hashes the \
+         canonical bytes, records content_hash/byte_len/component_count, and DROPS the content. \
+         The fountain/blob plane persist owns stores content it was handed; nothing hands it \
+         these. CC 3.1.8.4's F-3 detector therefore still degrades to a bare existence hash for \
+         the longest reasoning runs, exactly as written.",
+    ),
+    (
+        "consent:*|consent:replication producer-side constraint enforcement",
+        "holds",
+        &[
+            "reject_non_self_replication_grant",
+            "reject_non_federation_scoped_replication_grant",
+        ],
+        "Still true, and this is the STRONGEST tripwire in the table because the names are not \
+         guessed: the manifest's own field_processor_matrix proposes both of them by name, at \
+         src/federation/admission.rs, with the parenthetical \"no existing admission check found; \
+         today enforced only by CIRISServer's producer-side emission discipline\". Whoever closes \
+         the gap is most likely implementing that proposal. Persist's own grant admission \
+         (`validate_grant_admission`) checks the payload GRAMMAR, never the witness_relation==self \
+         / cohort_scope==federation relationship the CC 3.4.7 three-actor pattern asks the \
+         substrate to re-derive.",
+    ),
+];
+
+/// Recursively collect every **structured absence claim** in `value`.
+///
+/// The marker is `asymmetry_kind == "logical_defect"` **and** a non-empty
+/// `missing_dual` string on the same object. Both are closed, structured
+/// manifest fields — `asymmetry_kind`'s vocabulary is already gated by
+/// [`tests::asymmetry_kind_vocabulary_is_closed`] — so nothing here reads
+/// prose.
+fn collect_absence_claims(value: &serde_json::Value, out: &mut Vec<AbsenceClaim>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let is_defect = map
+                .get("asymmetry_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("logical_defect");
+            let missing = map
+                .get("missing_dual")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let (true, Some(missing_dual)) = (is_defect, missing) {
+                let family = map
+                    .get("family")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let operation = map
+                    .get("operation")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                out.push(AbsenceClaim {
+                    key: format!("{family}|{operation}"),
+                    family: family.to_owned(),
+                    operation: operation.to_owned(),
+                    missing_dual: missing_dual.to_owned(),
+                });
+            }
+            for v in map.values() {
+                collect_absence_claims(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                collect_absence_claims(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// CIRISPersist#586 — every structured absence claim the vendored manifest
+/// makes, DERIVED by walking the whole document for the structural marker
+/// (`asymmetry_kind: "logical_defect"` + `missing_dual`).
+///
+/// Deliberately section-independent. Naming `duality_audit.logical_gaps` would
+/// make this gate a section walk — the CC 3.1.7 R2 anti-pattern — and would
+/// silently lose every claim a re-vendor relocates. Sorted and deduped by key.
+pub fn manifest_absence_claims() -> Vec<AbsenceClaim> {
+    let mut out = Vec::new();
+    collect_absence_claims(root(), &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The declared falsifier record for an [`AbsenceClaim::key`] —
+/// `(status, falsified_by, note)` — or `None` for an undeclared claim (a build
+/// failure under [`tests::every_absence_claim_declares_a_falsifier`]).
+pub fn absence_falsifier(
+    key: &str,
+) -> Option<(&'static str, &'static [&'static str], &'static str)> {
+    PERSIST_AUTHORED_ABSENCE_FALSIFIERS
+        .iter()
+        .find(|(k, _, _, _)| *k == key)
+        .map(|(_, status, syms, note)| (*status, *syms, *note))
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CIRISPersist#586 item 3 — GATED HERE, UNCATALOGUED THERE, DELIBERATELY
+// ADMITTING.
+//
+// CIRISPersist#590 found three families persist has gated since v3.0.0 that CC
+// Part 3 has never carried a row for — `content_rating:`, `content_class:`,
+// `cw_class:`, all CEG 0.3 §5.6.8.3 media-plane families — and parked them in
+// a Rust exception list so R2(b) would not refuse traffic the Constitution
+// never spoke about. That state is REAL, and the manifest has no vocabulary
+// for it: `registry_coverage_gap` says "live but rowless" about families the
+// WALK found, and these were never in the walk.
+//
+// It is also the fourth instance of this issue's class — an absence claim
+// ("CC has no row for this") that will rot the moment CC lands one, with
+// nothing re-asking. The difference is that this one is TRUE today, so what it
+// needs is not a correction but a representation that fails when it stops
+// being true.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// CIRISPersist#586 item 3 — the manifest-surface record for the families
+/// persist GATES that CC has never CATALOGUED, and admits anyway.
+///
+/// `(family_stem, source_of_record, why_admitted, tracked_by)`.
+///
+/// The set is not restated here: it is
+/// [`UNREGISTERED_GATED_FAMILIES`](crate::federation::admission::UNREGISTERED_GATED_FAMILIES),
+/// and [`tests::gated_uncatalogued_families_cover_the_admission_exception_list`]
+/// asserts this table covers it EXACTLY, so a fourth exception cannot be added
+/// to the admission gate without stating its provenance and its ask here. What
+/// this table adds is the three facts the exception list has nowhere to put:
+/// which document DOES define the family, why admitting it is a decision rather
+/// than a hole, and who owes the row.
+///
+/// # This state is already ending, and that is the point
+///
+/// CIRISConstitution ruled **#77** on the `rc3` line ("CEG 0.3 catalogue rows,
+/// 112 of record"): the generated registry upstream now carries
+/// `content_class:{class}`, `content_rating:{scheme}:{rating}` and
+/// `cw_class:{class}`. Persist still vendors the **109**-family cut
+/// CIRISPersist#590 took, so on THIS tree all three are genuinely uncatalogued
+/// and the exception list is still doing real work.
+///
+/// The next registry re-vendor ends that, and
+/// [`tests::gated_uncatalogued_families_are_still_gated_and_still_uncatalogued`]
+/// makes the ending mandatory rather than optional: it fails the moment the
+/// vendored registry registers any of these stems, forcing the line's removal
+/// here AND from the R2 exception list instead of letting a stale excuse
+/// outlive its reason. **That is the whole of CIRISPersist#586 in one test** —
+/// "CC has no row for this" was an absence claim, it decayed between the
+/// issue's filing and this cut, and nothing but this would have re-asked.
+///
+/// One thing the re-vendor must look at rather than rubber-stamp: persist gates
+/// the stem `content_rating:` and CC catalogues `content_rating:{scheme}:{rating}`,
+/// a two-parameter shape where persist's own doc says `{scheme}`. Stem-granular
+/// registration makes them agree for admission purposes; whether they agree
+/// about the VOCABULARY is a question for whoever lands the re-vendor.
+pub const PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES: &[(&str, &str, &str, &str)] = &[
+    (
+        "content_rating:",
+        "CEG 0.3 §5.6.8.3 / §11.5.3",
+        "trusted_publisher-emitted content-rating scheme; persist has gated the prefix since \
+         v3.0.0 and CC Part 3 has never carried a row for it. Refusing it under CC 3.1.7 R2(b) \
+         would reject conformant media-plane traffic on the strength of the Constitution's \
+         SILENCE — the fail-closed-and-wrong trade CIRISPersist#590 was opened to prevent.",
+        "CIRISConstitution#77",
+    ),
+    (
+        "content_class:",
+        "CEG 0.3 §5.6.8.3",
+        "substrate_persist-emitted content classification, same plane and same silence as \
+         content_rating:.",
+        "CIRISConstitution#77",
+    ),
+    (
+        "cw_class:",
+        "CEG 0.3 §5.6.8.3",
+        "substrate_persist-emitted content-warning class, same plane and same silence as \
+         content_rating:.",
+        "CIRISConstitution#77",
+    ),
+];
+
+/// The family stems persist gates that CC has never catalogued, with their
+/// provenance and tracking ask — see
+/// [`PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES`].
+pub fn gated_uncatalogued_families(
+) -> &'static [(&'static str, &'static str, &'static str, &'static str)] {
+    PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// **The ONE definition predicate.** Does `src` DEFINE `needle` — as a
+    /// function, type, trait, const, static, module, enum variant or struct
+    /// field — on a line that is not a comment?
+    ///
+    /// v24.3.0 (CIRISPersist#577) established the bar: resolve against a
+    /// DEFINITION, not a substring. The old check was `src.contains(sym)`,
+    /// which matches anywhere in the file INCLUDING DOC COMMENTS — so a symbol
+    /// that had been deleted still "resolved" as long as some `[\`Self::foo\`]`
+    /// link still named it. That is exactly how
+    /// `Engine::promote_attestation_with_transforms` sat in the registry as
+    /// evidence for CLM-nsproc-restrictions-op-strip-field-trace while no such
+    /// function existed anywhere in the crate: three doc comments kept it
+    /// alive. A check that cannot distinguish a definition from a mention is
+    /// not evidence, it is a spell-checker.
+    ///
+    /// CIRISPersist#586 made it SHARED. Two validators now ask this question in
+    /// opposite directions — [`evidence_cc_impl_pointers_resolve`] demands that
+    /// a cited symbol resolves, [`manifest_absence_claims_still_hold`] demands
+    /// that a declared-absent one does not — and two validators of one artifact
+    /// that answer "does this symbol exist?" with two different predicates are
+    /// how a repo ends up with a gate that passes on the evidence its sibling
+    /// rejects.
+    fn source_defines(src: &str, needle: &str) -> bool {
+        src.lines()
+            .map(str::trim_start)
+            // Definitions only: doc comments (`///`), inner docs (`//!`) and
+            // line comments cannot satisfy an evidence pointer.
+            .filter(|l| !l.starts_with("///") && !l.starts_with("//!") && !l.starts_with("//"))
+            .any(|l| {
+                [
+                    format!("fn {needle}"),
+                    format!("struct {needle}"),
+                    format!("enum {needle}"),
+                    format!("trait {needle}"),
+                    format!("type {needle}"),
+                    format!("const {needle}"),
+                    format!("static {needle}"),
+                    format!("mod {needle}"),
+                    // enum VARIANTS and struct fields: `Name {`, `Name(`,
+                    // `Name,` or `Name =` at the head of a trimmed line.
+                    format!("{needle} {{"),
+                    format!("{needle}("),
+                    format!("{needle},"),
+                    format!("{needle} ="),
+                ]
+                .iter()
+                .any(|pat| l.contains(pat.as_str()))
+            })
+    }
+
+    /// Every `src/**/*.rs` file in this crate as `(path, text)`.
+    fn persist_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    if let Ok(t) = std::fs::read_to_string(&p) {
+                        out.push((p.display().to_string(), t));
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut out,
+        );
+        out
+    }
 
     /// v21.10.0 (CIRISPersist#519 b5 / item 6) — the evidence loop's persist
     /// half: every `path#symbol` in the materialized `evidence/cc_impl.tsv`
@@ -937,37 +1463,8 @@ mod tests {
             // kept it alive. A check that cannot distinguish a definition from a
             // mention is not evidence, it is a spell-checker.
             let bare = sym.rsplit("::").next().unwrap_or(sym);
-            let defines = |needle: &str| {
-                src.lines()
-                    .map(str::trim_start)
-                    // Definitions only: doc comments (`///`), inner docs (`//!`)
-                    // and line comments cannot satisfy an evidence pointer.
-                    .filter(|l| {
-                        !l.starts_with("///") && !l.starts_with("//!") && !l.starts_with("//")
-                    })
-                    .any(|l| {
-                        [
-                            format!("fn {needle}"),
-                            format!("struct {needle}"),
-                            format!("enum {needle}"),
-                            format!("trait {needle}"),
-                            format!("type {needle}"),
-                            format!("const {needle}"),
-                            format!("static {needle}"),
-                            format!("mod {needle}"),
-                            // enum VARIANTS and struct fields: `Name {`, `Name(`,
-                            // `Name,` or `Name =` at the head of a trimmed line.
-                            format!("{needle} {{"),
-                            format!("{needle}("),
-                            format!("{needle},"),
-                            format!("{needle} ="),
-                        ]
-                        .iter()
-                        .any(|pat| l.contains(pat.as_str()))
-                    })
-            };
             assert!(
-                defines(sym) || defines(bare),
+                source_defines(&src, sym) || source_defines(&src, bare),
                 "evidence pointer {ps} has no DEFINITION in {path} — a cited processor was \
                  renamed or removed (a doc-comment mention does not count; \
                  re-materialize evidence/cc_impl.tsv)"
@@ -1390,9 +1887,7 @@ mod tests {
         // gets STRONGER as the registry advances, where the sha equality got
         // weaker: seven of the nine landed in rc3, and each one that lands
         // makes deleting its line mandatory.
-        let root: serde_json::Value =
-            serde_json::from_str(SUPERSETS_JSON).expect("supersets json parses");
-        let gap: Vec<&str> = root["registry_coverage_gap"]["prefixes"]
+        let gap: Vec<&str> = root()["registry_coverage_gap"]["prefixes"]
             .as_array()
             .expect("registry_coverage_gap.prefixes is an array")
             .iter()
@@ -1917,9 +2412,7 @@ mod tests {
     /// (a re-vendor that drops it regresses the modeling).
     #[test]
     fn read_write_default_duality_is_recorded() {
-        let root: serde_json::Value =
-            serde_json::from_str(SUPERSETS_JSON).expect("valid manifest json");
-        let closed = root
+        let closed = root()
             .get("duality_audit")
             .and_then(|d| d.get("known_closed_not_reported"))
             .and_then(|v| v.as_array())
@@ -1931,5 +2424,253 @@ mod tests {
             "duality_audit must record read<->write as a closed duality (CIRISPersist#532 gate 3 / \
              #527 cohort_scope read-vs-write default): {closed:?}"
         );
+    }
+
+    // ───────────────────── CIRISPersist#586: the absence witness ─────────
+
+    /// The derivation is real, non-vacuous, and STRUCTURAL.
+    ///
+    /// It also asserts the thing that makes this a derivation and not a list:
+    /// the claims are found by their marker anywhere in the document, so the
+    /// count matches an independent structural sweep rather than a pinned
+    /// number. A re-vendor that adds a defect adds a claim; a re-vendor that
+    /// moves `duality_audit` loses none.
+    #[test]
+    fn absence_claims_are_derived_from_the_whole_document() {
+        let claims = manifest_absence_claims();
+        assert!(
+            claims.len() >= 9,
+            "the 0.3.0 cut carries 9 structured absence claims, derivation found {} — a marker \
+             change would silently empty every gate below it",
+            claims.len()
+        );
+        for c in &claims {
+            assert!(
+                !c.family.is_empty() && !c.operation.is_empty() && !c.missing_dual.is_empty(),
+                "an absence claim with an empty component cannot be keyed or checked: {c:?}"
+            );
+            assert_eq!(c.key, format!("{}|{}", c.family, c.operation));
+        }
+        let keys: BTreeSet<&str> = claims.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(
+            keys.len(),
+            claims.len(),
+            "two absence claims share a key — the falsifier table cannot address them separately"
+        );
+        // Independent structural sweep: same marker, counted without the
+        // accessor, so a bug in `collect_absence_claims` cannot hide behind it.
+        let raw = SUPERSETS_JSON.matches("\"missing_dual\"").count();
+        assert_eq!(
+            claims.len(),
+            raw,
+            "the derivation found {} claims but the manifest carries {raw} `missing_dual` keys — \
+             either a missing_dual object is not classified logical_defect (report it; the walk \
+             contradicts itself) or the walk skipped one",
+            claims.len()
+        );
+    }
+
+    /// The status vocabulary is closed — every declared entry uses one of the
+    /// two words the gate can act on.
+    #[test]
+    fn absence_claim_status_vocabulary_is_closed() {
+        let closed: BTreeSet<&str> = ABSENCE_CLAIM_STATUSES.iter().copied().collect();
+        for (key, status, _, _) in PERSIST_AUTHORED_ABSENCE_FALSIFIERS {
+            assert!(
+                closed.contains(status),
+                "absence claim {key:?} declares status {status:?}, outside {closed:?}"
+            );
+        }
+    }
+
+    /// **THE COVERAGE HALF — the part that cannot rot.** The falsifier table
+    /// must cover EXACTLY the derived claim set.
+    ///
+    /// This is what makes the witness a class fix rather than four repairs.
+    /// A re-vendor that adds a tenth `logical_defect` + `missing_dual` object
+    /// fails this test until somebody writes down what would disprove it; a
+    /// re-vendor that RESOLVES one fails until the dead entry is deleted. There
+    /// is no path where a new absence claim enters the Registry-of-Record
+    /// unexamined, which is precisely the path all four instances took.
+    #[test]
+    fn every_absence_claim_declares_a_falsifier() {
+        let derived: BTreeSet<String> = manifest_absence_claims()
+            .into_iter()
+            .map(|c| c.key)
+            .collect();
+        let declared: BTreeSet<String> = PERSIST_AUTHORED_ABSENCE_FALSIFIERS
+            .iter()
+            .map(|(k, _, _, _)| (*k).to_owned())
+            .collect();
+        let undeclared: Vec<&String> = derived.difference(&declared).collect();
+        assert!(
+            undeclared.is_empty(),
+            "the vendored manifest makes absence claims nothing can check: {undeclared:?}. An \
+             \"X does not exist\" claim is true when written and NOTHING EVER RE-ASKS — that is \
+             the whole of CIRISPersist#586. Add an entry to PERSIST_AUTHORED_ABSENCE_FALSIFIERS \
+             naming the symbols whose presence would contradict it."
+        );
+        let stale: Vec<&String> = declared.difference(&derived).collect();
+        assert!(
+            stale.is_empty(),
+            "{stale:?} declare falsifiers for absence claims the manifest no longer makes — \
+             delete the entries; a stale falsifier hides the next real one"
+        );
+        for (key, _, syms, note) in PERSIST_AUTHORED_ABSENCE_FALSIFIERS {
+            assert!(
+                !syms.is_empty(),
+                "absence claim {key:?} declares no falsifier at all — an unfalsifiable claim is \
+                 not a finding, it is a sentence"
+            );
+            assert!(
+                note.len() > 40,
+                "absence claim {key:?} carries no reasoned note; the note is what a reader needs \
+                 when the tripwire fires"
+            );
+        }
+    }
+
+    /// **THE WITNESS.** A `logical_defect` entry naming a symbol-absence fails
+    /// the build if that symbol now exists.
+    ///
+    /// The exact inverse of [`evidence_cc_impl_pointers_resolve`], over the
+    /// same [`source_defines`] predicate: a PRESENCE claim must resolve, an
+    /// ABSENCE claim must not. Both directions, both asserted:
+    ///
+    /// - a claim recorded `holds` whose falsifier resolves — the manifest went
+    ///   stale and nobody noticed, the CIRISPersist#586 failure exactly;
+    /// - a claim recorded `falsified` whose falsifiers all vanished — the
+    ///   correction outlived its reason and must be re-examined, the same
+    ///   two-way discipline `DELETED_PENDING_REVENDOR` runs.
+    ///
+    /// # What it cannot do
+    ///
+    /// A `holds` entry is a tripwire keyed on names persist guessed; an
+    /// implementer who spells the closing symbol differently walks past it.
+    /// The guarantee here is one-directional and deliberately narrow — no
+    /// DECLARED falsifier may exist while the claim is recorded as true. The
+    /// undecidable half is carried by the coverage gate above, which does not
+    /// depend on guessing anything.
+    #[test]
+    fn manifest_absence_claims_still_hold() {
+        let sources = persist_sources();
+        assert!(
+            sources.len() > 50,
+            "source harvest collapsed ({} files) — the witness would pass vacuously",
+            sources.len()
+        );
+        let mut rotted: Vec<String> = Vec::new();
+        let mut resurrected: Vec<String> = Vec::new();
+        for claim in manifest_absence_claims() {
+            let Some((status, syms, _)) = absence_falsifier(&claim.key) else {
+                continue; // coverage is `every_absence_claim_declares_a_falsifier`'s job
+            };
+            let found: Vec<String> = syms
+                .iter()
+                .filter_map(|s| {
+                    sources
+                        .iter()
+                        .find(|(_, t)| source_defines(t, s))
+                        .map(|(p, _)| {
+                            let rel = p
+                                .rsplit_once("/src/")
+                                .map_or(p.as_str(), |(_, r)| r)
+                                .to_owned();
+                            format!("{s} (src/{rel})")
+                        })
+                })
+                .collect();
+            match (status, found.is_empty()) {
+                ("holds", false) => rotted.push(format!(
+                    "{} — manifest says {:?} does not exist, but persist defines {:?}",
+                    claim.key, claim.missing_dual, found
+                )),
+                ("falsified", true) => resurrected.push(format!(
+                    "{} — recorded as already-falsified, but none of {:?} is defined any more",
+                    claim.key, syms
+                )),
+                _ => {}
+            }
+        }
+        assert!(
+            rotted.is_empty() && resurrected.is_empty(),
+            "ABSENCE CLAIM DECAY (CIRISPersist#586). The vendored Registry-of-Record asserts a \
+             dual is MISSING while shipping code implements it — the map disagrees with the \
+             territory, and the map is what other repos trust.\n  ROTTED: {rotted:#?}\n  \
+             RESURRECTED: {resurrected:#?}\nFix by recording the falsification in \
+             PERSIST_AUTHORED_ABSENCE_FALSIFIERS (status `falsified` + the shipping symbol + the \
+             correction owed at the next re-vendor). Do NOT hand-edit \
+             namespace_supersets.json: it is a vendored walk with no generator, and editing its \
+             findings forges a research artifact."
+        );
+    }
+
+    /// CIRISPersist#586 item 3 — the manifest surface's record of the
+    /// gated-but-uncatalogued families covers the admission gate's exception
+    /// list EXACTLY.
+    ///
+    /// The list is the authority on WHICH families are admitted unregistered;
+    /// this table is the authority on WHY and WHO OWES THE ROW. Neither may
+    /// grow without the other, so a fourth exception cannot be slipped into the
+    /// R2 gate as a bare stem.
+    #[test]
+    fn gated_uncatalogued_families_cover_the_admission_exception_list() {
+        use crate::federation::admission::UNREGISTERED_GATED_FAMILIES;
+        let gate: BTreeSet<&str> = UNREGISTERED_GATED_FAMILIES.iter().copied().collect();
+        let recorded: BTreeSet<&str> = PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES
+            .iter()
+            .map(|(stem, _, _, _)| *stem)
+            .collect();
+        assert_eq!(
+            recorded, gate,
+            "PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES and UNREGISTERED_GATED_FAMILIES \
+             disagree. The exception list says WHICH families admit without a CC row; this table \
+             is the only place that says which document defines them, why admitting is a decision \
+             rather than a hole, and who owes the row. A stem in one and not the other is a \
+             deviation nobody can review."
+        );
+        for (stem, source, why, tracked) in PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES {
+            assert!(
+                source.contains("CEG") || source.contains("CC"),
+                "{stem:?} must name the document of record that DOES define it, got {source:?}"
+            );
+            assert!(
+                why.len() > 40,
+                "{stem:?} must say why admitting it is a decision, not a hole"
+            );
+            assert!(
+                tracked.contains('#'),
+                "{stem:?} must name the tracking ask that ends this state, got {tracked:?} — an \
+                 exception with no ask is a permanent carve-out wearing a temporary label"
+            );
+        }
+    }
+
+    /// CIRISPersist#586 item 3, the absence half — a family recorded as
+    /// "gated here, uncatalogued there" must still BE both.
+    ///
+    /// Same class as [`manifest_absence_claims_still_hold`]: "CC has no row for
+    /// this" is an absence claim, true when written, and nothing re-asks. Two
+    /// ways it rots, both fatal here: CC lands the row (the excuse outlived its
+    /// reason — delete the line and let R2 do its job), or persist stops gating
+    /// the family (the entry is now describing nothing).
+    #[test]
+    fn gated_uncatalogued_families_are_still_gated_and_still_uncatalogued() {
+        use crate::federation::admission::governed_family_stems;
+        use crate::federation::namespace::registry;
+        let governed: BTreeSet<String> = governed_family_stems().into_iter().collect();
+        for (stem, _, _, tracked) in PERSIST_AUTHORED_GATED_UNCATALOGUED_FAMILIES {
+            assert!(
+                governed.contains(*stem),
+                "{stem:?} is recorded as GATED-but-uncatalogued while persist no longer governs \
+                 it — the record describes nothing. Remove it here and from the R2 exception list."
+            );
+            assert!(
+                !registry::is_family_registered(stem),
+                "{stem:?} is recorded as uncatalogued but the vendored registry now REGISTERS it \
+                 ({tracked} landed) — delete the line here and in UNREGISTERED_GATED_FAMILIES so \
+                 CC 3.1.7 R2 judges it like every other family"
+            );
+        }
     }
 }

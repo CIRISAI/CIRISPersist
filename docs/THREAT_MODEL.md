@@ -2332,6 +2332,29 @@ consts and cross-repo citations are classified explicitly
 `DELETED_PENDING_REVENDOR`) so each exemption is a reviewable claim rather
 than a silent skip.
 
+**The inverse direction (CIRISPersist#586)**: a dead *presence* citation
+reads as discharged; a stale *absence* claim reads as an open hole that is
+in fact closed — and, worse, an absence claim can be the reason a control is
+switched OFF. `UNREGISTERED_GATED_FAMILIES` exists because CC catalogues no
+row for three gated families; the day CC lands one, that exemption stops
+being a courtesy and starts being an unreviewed bypass of CC 3.1.7 R2. The
+asymmetry is structural: a presence claim breaks its own build when the
+symbol moves, an absence claim is true when written and nothing re-asks.
+`manifest_absence_claims_still_hold` and
+`gated_uncatalogued_families_are_still_gated_and_still_uncatalogued`
+(`federation::namespace::supersets`) close it, over the *same* definition
+predicate the presence gate uses (`source_defines`, extracted and shared so
+the two validators cannot answer "does this symbol exist?" differently).
+Coverage is derived from the manifest, so a new absence claim cannot enter
+the Registry-of-Record without a declared falsifier. **Residual**: only
+STRUCTURED absence claims are gated — an `asymmetry_kind: logical_defect`
+object carrying `missing_dual`. Prose absence claims are not, deliberately:
+of the manifest's 56 repo-local `proposed:` citations, 29 name a symbol that
+exists on purpose, so classifying them needs the description field, and
+inferring a rule from a description is the section-walk heuristic CC 3.1.7
+R2 forbids. A `holds` entry is also a tripwire, not a proof — it fires on
+the names persist declared, not on every possible implementation.
+
 #### AV-75: Self-asserted privileged `identity_type` / roles
 
 **Attack**: `verify_key_registration` checks only the PoP self-signature.
