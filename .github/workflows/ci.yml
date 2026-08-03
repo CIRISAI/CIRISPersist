@@ -1028,6 +1028,26 @@ jobs:
       # error, where before it was silence.
       - name: feature-matrix coverage gate
         run: python3 scripts/ci_feature_matrix.py check
+      # CIRISPersist#595 — the FFI-surface gate. Same shape and same reason as
+      # the feature-matrix gate above: pure Python over src/ffi/ + the pinned
+      # taxonomy + the stub, ~0.3 s, no compilation, so it fails first and names
+      # the symbol.
+      #
+      # It enforces three things a green test suite cannot see. (1) Every
+      # PyO3-exported symbol is DESCRIBED in the stub — since v26.0.0 the wheel
+      # ships a PEP 561 `py.typed` marker, so an omitted method is reported to a
+      # consumer's type checker as NOT EXISTING, for API that works. (2) Every
+      # symbol is CLASSIFIED in scripts/ffi_taxonomy.tsv by the kind of wrong
+      # varying it causes (CIRISConstitution#83), so a reclassification is a
+      # visible one-line diff rather than an edit nobody reviews. (3) The four
+      # BINDING classes get stricter treatment than the rest — `structural` and
+      # `axiomatic` must be hand-written, `deontic` and `testimonial` must say
+      # what they cost.
+      #
+      # A pass means the stub is COMPLETE, not CORRECT: the types are derived
+      # from the Rust and are semantically unverified.
+      - name: FFI surface + taxonomy gate
+        run: python3 scripts/pyi_surface.py check
       # v2.0 — clippy over the shipped-shape feature set. NOT redundant with
       # the --all-features pass below: `dead_code` / `unused_imports` fire only
       # when a feature is OFF, so the narrow pass catches lints the total pass

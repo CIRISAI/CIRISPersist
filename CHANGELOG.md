@@ -5,6 +5,114 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased] — #595: the type stub describes the whole FFI surface, and says what breaks if you get each part wrong
+
+`python/ciris_persist/ciris_persist.pyi` documented **119 of 509** PyO3-exported symbols.
+
+That was harmless for the package's entire life, because **no type checker ever read it**: the wheel
+shipped no PEP 561 `py.typed` marker, so checkers skipped `ciris_persist` outright and every call
+inferred `Any`. #581 shipped the marker. The stub became load-bearing in one commit, and the drift
+became **worse than the absence it replaced**:
+
+- **before** — a checker skipped the package. A call to an undocumented method type-checked,
+  correctly, as unknown. Honest.
+- **after** — a checker reads an authoritative-looking stub omitting 390 real symbols and reports
+  calling them as **errors**. A server developer is told that working API does not exist.
+
+A wrong stub is worse than a missing one: a missing stub degrades to `Any` and the caller learns
+nothing; a wrong stub is *believed*. That risk was written into the CHANGELOG when the marker
+shipped. This is it landing.
+
+Measured on a `--strict` consumer file exercising thirty symbols across the surface: **29 errors
+before this cut, 0 after.** Every one of the 29 was mypy correctly reporting what the stub said, and
+the stub was wrong.
+
+### Added — `scripts/pyi_surface.py`: the gate, which is the durable half
+
+Shipping 390 stubs without a gate resets the clock on the same drift. The script derives the
+inventory from `src/ffi/**` — **the whole directory, not just `pyo3.rs`**, which is how
+`ReconsiderDosGuard` (a registered `#[pyclass]` living in `wheel_reconsider_dos.rs`) had been
+invisible to every count of this surface — and fails the build on any gap. Wired into CI's `lint`
+job beside `ci_feature_matrix.py check` (#585) and into the pre-commit hook, keyed off the files
+that can break it. Sub-second, no compilation, so it fails before a ten-minute build does.
+
+It honours `#[pyo3(name = ...)]` renames, `#[pyo3(signature = ...)]` defaults, `#[getter]`,
+`#[staticmethod]`, `#[new]`, and multi-line and generic signatures; it records `#[cfg(feature =
+...)]` gating as derived metadata, because a `.pyi` structurally cannot express build-conditional
+presence and 158 of these methods have it.
+
+Nine mutations were run against the gate — a new exported method, a classified-but-undescribed
+symbol, a hand-deleted stub entry, a stale pin row, an invented class name, a BINDING entry
+downgraded to generated output, a `deontic` door stripped of its docstring, a module-registered
+exception dropped from the stub, and a new `#[pyclass]` with no stub class. **All nine killed.**
+
+### Added — `scripts/ffi_taxonomy.tsv`: every symbol classified by the wrong that varying it causes
+
+Per CIRISConstitution#83, each symbol carries one class answering **"what different kind of wrong
+happens if I vary this?"** The class is **not derived from the name**: this surface is prefixed by
+subsystem (`cirisnode_`, `secrets_`, `tsdb_`), not by verb, so a prefix rule would have grouped
+`cirisnode_put_slashing_attestation` with `cirisnode_list_votes` and split it from `file_moderation`.
+It is pinned by hand, one row per symbol, so a reclassification is a visible one-line diff — the same
+shape as `MINTED_NAMESPACE_FAMILIES`, `family_rules.rs`, and `ci_feature_matrix.py`.
+
+The four **BINDING** classes get checks the descriptive ones do not. `structural` and `axiomatic`
+must be hand-written — "cannot vary" is not a claim a generator gets to make. `deontic` and
+`testimonial` must carry a docstring in the stub AND a `///` doc in the Rust, and may not be typed
+`-> Any`.
+
+That last rule is not pedantry. The `*_json` adjudicators return a JSON string on **both** arms, so
+the refusal `'{"eligible": false}'` is **truthy**. A stub saying `Any` invites
+`if engine.resolve_transit_eligibility_json(...)`, which permits exactly what the method refused.
+
+### Fixed — `Engine.__init__` was hand-written, and hand-written WRONG
+
+The stub declared `Engine(dsn, scrubber=None)`. The Rust `#[new]` requires `signing_key_id` and
+accepts eleven more parameters. A checker reading the old stub rejected **every correct
+construction** — the first line any consumer writes.
+
+### Fixed — symbols the `#[pymodule]` registers that never reached the package
+
+`ReconsiderDosGuard`, `ScoringFactorStream`, `persist_field_conformance`,
+`namespace_manifest_version` and `transform_algebra_hash` are registered on the native module but
+were absent from `ciris_persist/__init__.py`, so a consumer had to reach past the package with
+`from ciris_persist.ciris_persist import ...`. Same private-path-becomes-contract failure #581 fixed
+for the teardown surface, still open for these.
+
+Separately, the typed exception hierarchy (`PersistError` / `NotFound` / `Conflict` / `Transient` /
+`Permanent` / `EngineClosed` / `EngineConfigMismatch` / `EngineUsedAcrossFork`) was imported by
+`__init__.py` and declared by **no** stub entry — persist's own package failed a type check before a
+consumer ever reached it. The gate now checks every `m.add(...)` / `m.add_class(...)` name.
+
+### Fixed — a stale doc paragraph, and five undocumented FFI methods
+
+`persist_field_conformance` carried `register`'s doc as its first paragraph. Docs added for
+`envelope_vocabulary`, `trace_summary_extraction`, `corpus_shape`, and two iterator methods. Not
+cosmetic here: the stub derives its statement of each symbol from that first paragraph, and the gate
+refuses a `deontic` or `testimonial` symbol that has none.
+
+### A passing `check` means COMPLETE, not CORRECT
+
+Parameter names, arity, defaults and Python types are **derived** from the Rust — authoritative for
+the FFI boundary, since PyO3 generates the conversion from exactly those types. What is **not**
+verified is meaning: `-> str` is true and says nothing about the JSON schema inside the string.
+Entries marked `(derived)` carry that weaker claim. Read a green gate as *"no symbol is invisible to
+a consumer's type checker"*, never as *"the described types are right."*
+
+The `deontic` residual is stated rather than implied. 118 symbols are classified `deontic`; 23 are
+hand-written and 95 carry a derived one-line statement. The nine ADJUDICATORS — the ones whose
+refusal arm is a truthy Python value — are hand-written, each naming the misuse:
+`resolve_transit_eligibility_json`, `is_load_bearing_json` (three-valued, and `"unknown"` is not
+`"no"`), `is_named_moderator_json`, `is_steward_bound_json`, `check_no_moderator_federate_json`,
+`reachable_under_scope_with_reasons`, `cirisnode_process_takedown_admission_json`,
+`verify_skill_import_manifest_b64` (raises rather than returning falsy), and
+`service_token_revocation_check` (non-`None` means REVOKED — the polarity is inverted from the
+name). What the remaining 95 still lack is the JSON schema behind their `str`, which lives in Rust
+doc comments and is machine-checked against nothing. 49 symbols are `testimonial`, 11 hand-written. The gate guarantees each
+says *something* and returns a typed value; it does not guarantee the JSON schema behind that value
+is documented anywhere a checker can see.
+
+No migration. No Rust behaviour change beyond doc comments.
+
 ## [27.0.0] — 2026-08-03 — #519/#586/#579/#571/#592/#584: the rules persist enforces, enumerated — and four preconditions nothing was testing
 
 Six issues, and a pattern that only became visible with all six in one cut: **v26.0.0 shipped four
