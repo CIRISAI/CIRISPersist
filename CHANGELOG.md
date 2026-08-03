@@ -5,6 +5,107 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [25.1.0] — 2026-08-02 — #582: a tightened vocabulary needs a way to retire the old word
+
+CIRISVerify v11.1.0 re-pin (all seven sites), plus the reusable maintenance primitive the
+re-pin's data half actually needs.
+
+### The re-pin (`v11.0.0` → `v11.1.0`, seven sites, one commit)
+
+`ciris-verify-core` / `ciris-crypto` / `ciris-keyring`, across the workspace and the three
+mobile target blocks. They move together or the graph splits into two `ciris_crypto` versions —
+the exact failure #577 measured.
+
+Impact was two lines wide and both were **tests pinning a literal where a constant belonged**:
+
+- The §19.7 v3 aggregation vector (CIRISVerify#236) needed nothing. persist never pinned
+  `canonical_bytes_v3`'s bytes and never computes `n_eff` — `scores.rs` returns the
+  anti-collusion `n` and says so.
+- `KEY_GRANT_ALGORITHM_V2`'s **value** changed (CC 5.1 / CIRISVerify#234): the hyphenated
+  `x25519-mlkem768-…` became snake_case `x25519_mlkem768_…`. persist references it as a
+  constant everywhere and normalizes separators nowhere, so nothing in the write path broke —
+  but two round-trip tests asserted `json.contains("x25519-mlkem768-aes256-gcm-hkdf-sha256")`,
+  and a literal pinned in a test is a fixture claiming authority over a vocabulary it does not
+  own. Both now assert the constant, and one additionally asserts the hyphenated alias is
+  **never emitted**.
+
+persist's own `wrap_algorithm` column string was already the snake_case form; the convergence
+is verify's constant moving to meet it. `WrapAlgorithm`'s "pending CIRISRegistry ratification"
+doc block is now closed — CC 5.1 ratified it.
+
+### The real deliverable: `maintenance::vocabulary` — SUPERSEDE, never UPDATE
+
+The identifier changing value is a **data** question, not a string-comparison one: new grants
+carry the conformant form, every already-stored one carries the alias, and CC 5.1 explicitly
+closes the usual escape hatch (the hyphenated form MUST NOT be normalized before comparison —
+folding `-` → `_` would make two distinct wire identifiers compare equal and defeat the
+single-identifier rule outright).
+
+So this ships a **vocabulary tightening** sweep, patterned on the maintenance service idiom
+(typed report, per-phase counts, idempotent, every backend):
+
+```rust
+let target = VocabularyTightening::key_grant_algorithm_v2("payload.wrap_algorithm", family);
+let report = engine.tighten_vocabulary(&target, /* dry_run */ false).await?;
+```
+
+**The identifier is the first caller, not the feature.** Nothing about `wrap_algorithm` or the
+key-grant string is hardcoded: a tightening is `(family, field_path, non_conformant,
+conformant)`, and the next one — there will be one — is a call, not a new sweep. The named
+first-caller constructor takes both values from `ciris_crypto::key_grant` itself, so persist can
+never disagree with verify about either spelling.
+
+**Supersede, never update.** Stored attestations are signed over their canonical envelope bytes;
+rewriting a field in place leaves a row whose signature no longer covers its content — the
+preserve-set ≠ verified-set class #541 already cost this repo. Each affected row instead gets a
+freshly-signed **replacement** (the identical attestation with one field tightened) plus a
+**`supersedes` composer** naming the original. The old row survives, superseded, auditable, and
+CEG §6.1 precedence makes the replacement the consumer-visible head. No fourth retirement
+primitive beside `supersedes` / `withdraws` / `recants`.
+
+**Idempotent, and the idempotence hinge is worth naming.** After a successful sweep the original
+*still carries the non-conformant value* — it must, it is signed — so it still MATCHES. What
+stops the second run is the composer the first one emitted: `matched: 3, superseded: 0,
+already_retired: 2`. `wrote_nothing()` is a stated fact, not an absence.
+
+**Report, never silent.** `VocabularyTighteningReport` carries `examined` / `matched` /
+`superseded` / `replacements_emitted` / `skipped`, a per-reason skip histogram, a per-row action
+list, `scan_complete`, and wall-clock framing — so a run that did nothing is distinguishable
+from a run that never happened (the withhold-ledger inversion, CIRISEdge#433). `dry_run`
+classifies without writing a byte.
+
+**Fail-secure.** Ambiguity is skipped and reported, never guessed: a row attested by a key this
+node does not hold is not ours to supersede (a cross-attester composer opens a SECOND §6.1 chain
+rather than retiring anything); a row already retired stays retired; a non-traversable field path
+is refused rather than fabricated; a structural composer is never superseded. A partially-applied
+row (replacement landed, composer refused) is detected **by content** on the next run and only
+the missing composer is emitted.
+
+### `federation::attestation_emit` — the emit recipe now has one implementation
+
+`canonicalize → hash → hybrid-sign → assemble → put_attestation` lived inside `Engine`, which
+exists only over the sqlite/postgres dispatch. A directory-generic sweep — or the in-memory
+backend, which has no `Engine` at all — would have had to hand-roll it, and a hand-rolled copy
+is how a fixture certifies a path no host runs (AV-77). The backend-generic half moved to
+`federation::attestation_emit`; `Engine::emit_attestation` / `emit_attestation_self` call it and
+keep only the Engine-shaped step (the #509 promote-on-consent chokepoint). Both admission gates
+the chokepoint owns — #293 subject-id canonicality and #527 cohort_scope
+validate-never-default — moved with the body, so every emit path still enforces them
+identically.
+
+### Host-reachable
+
+`Engine::tighten_vocabulary` + the PyO3 `maintenance_tighten_vocabulary(target_json,
+dry_run=False)` binding, mirroring the rest of the maintenance cluster (JSON report across the
+FFI, `maintenance_*` error kinds through `translate_error_kind`). The sweep is exercised on
+memory / sqlite / postgres through one shared body, and separately through the Engine entry
+point — because a capability no host can call is not shipped.
+
+### Counts
+
+sqlite 1600/1600 (was 1587) · sqlite+test-anchor 1605/1605 (was 1592) · postgres 1930/1930
+(was 1916) · clippy clean on `--features sqlite` and `--features "sqlite postgres server pyo3"`.
+
 ## [25.0.0] — 2026-08-02 — #577: the verify pin was a mesh-wide ceiling
 
 **MAJOR because the dependency graph moves under every consumer**, not because persist's own

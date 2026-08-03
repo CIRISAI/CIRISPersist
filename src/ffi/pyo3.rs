@@ -25405,6 +25405,68 @@ impl PyEngine {
         })
     }
 
+    /// v25.1.0 (CIRISPersist#582) — Run one **vocabulary tightening**: retire
+    /// every federation-tier attestation carrying a non-conformant wire value
+    /// at a named envelope field, by emitting a tightened replacement plus a
+    /// `supersedes` composer naming the original. The old rows stay — signed,
+    /// superseded, auditable. Nothing is rewritten in place.
+    ///
+    /// `target_json` decodes to a `VocabularyTightening`:
+    ///
+    /// ```json
+    /// {
+    ///   "tightening_id": "cc-5.1-key-grant-algorithm-v2-snake-case",
+    ///   "citation": "CC 5.1 (class rule CC 3.3.2) / CIRISVerify#234",
+    ///   "family": {"kind": "prefix", "value": "key_grant:"},
+    ///   "field_path": "payload.wrap_algorithm",
+    ///   "non_conformant": "x25519-mlkem768-aes256-gcm-hkdf-sha256",
+    ///   "conformant": "x25519_mlkem768_aes256_gcm_hkdf_sha256"
+    /// }
+    /// ```
+    ///
+    /// `family.kind` is `"exact"` / `"prefix"` (with `value`) or `"any"`
+    /// (no `value`). Comparison against `non_conformant` is **exact** and is
+    /// never separator-normalized — folding `-` → `_` would make two distinct
+    /// wire identifiers compare equal and defeat CC 5.1's single-identifier
+    /// rule outright.
+    ///
+    /// `dry_run=True` examines and classifies but writes nothing. Returns a
+    /// JSON-encoded `VocabularyTighteningReport` — always, including for a run
+    /// that changed nothing, so a no-op is distinguishable from a run that
+    /// never happened. Requires the engine's composed hybrid signer (the
+    /// replacement rows are freshly signed).
+    #[pyo3(signature = (target_json, dry_run=false))]
+    fn maintenance_tighten_vocabulary(
+        &self,
+        py: Python<'_>,
+        target_json: &str,
+        dry_run: bool,
+    ) -> PyResult<String> {
+        self.ensure_usable()?;
+        catch_panic(|| {
+            let target: crate::maintenance::VocabularyTightening =
+                serde_json::from_str(target_json).map_err(|e| {
+                    PyValueError::new_err(format!("VocabularyTightening JSON decode: {e}"))
+                })?;
+            let runtime = self.runtime.clone();
+            let backend = self.engine_dispatch();
+            let signer = self.signer.clone();
+            let local_signer = self.local_signer.clone();
+            py.detach(move || {
+                let engine = crate::Engine::from_shared_with_local(backend, signer, local_signer);
+                runtime.block_on(async move {
+                    let report = engine
+                        .tighten_vocabulary(&target, dry_run)
+                        .await
+                        .map_err(|e| translate_error_kind(e.kind(), e.to_string()))?;
+                    serde_json::to_string(&report).map_err(|e| {
+                        PyRuntimeError::new_err(format!("VocabularyTighteningReport encode: {e}"))
+                    })
+                })
+            })
+        })
+    }
+
     /// v1.2.0 (CIRISPersist#48) — Run the maintenance umbrella:
     /// vacuum → archive_expired(SubstrateDefault). Returns a
     /// JSON-encoded `MaintenanceReport`. Prune is intentionally not

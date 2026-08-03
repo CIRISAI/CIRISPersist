@@ -117,9 +117,14 @@ pub fn unwrap_dek_json(recipient_x25519_priv_b64: &str, wrap_json: &str) -> PyRe
 /// Delegates to `ciris-crypto`'s `wrap_dek_for_recipient_v2` (v4.10.0).
 /// Returns a JSON string:
 ///
+/// The `algorithm` field carries `ciris_crypto::key_grant::KEY_GRANT_ALGORITHM_V2`
+/// verbatim — the snake_case identifier CC 5.1 ratified as *the single wire
+/// identifier* (CIRISVerify#234, adopted at v25.1.0). The hyphenated form this
+/// doc block used to show is a non-conformant alias.
+///
 /// ```json
 /// {
-///   "algorithm": "x25519-mlkem768-aes256-gcm-hkdf-sha256",
+///   "algorithm": "x25519_mlkem768_aes256_gcm_hkdf_sha256",
 ///   "ephemeral_x25519_public_key_b64": "...",
 ///   "ml_kem_ciphertext_b64": "...",
 ///   "nonce_b64": "...",
@@ -272,9 +277,12 @@ mod tests {
             &B64.encode(dek),
         )
         .expect("v2 wrap succeeds");
-        // The envelope advertises the v2 algorithm string.
+        // The envelope advertises the v2 algorithm string. Assert against the
+        // CONSTANT, never a spelling (v25.1.0 / #582, CC 5.1): the identifier
+        // is verify's to ratify, and pinning the literal here is what turns a
+        // vocabulary tightening into an unrelated red.
         assert!(
-            wrap_json.contains("x25519-mlkem768-aes256-gcm-hkdf-sha256"),
+            wrap_json.contains(KEY_GRANT_ALGORITHM_V2),
             "v2 envelope names the v2 algorithm: {wrap_json}"
         );
 
