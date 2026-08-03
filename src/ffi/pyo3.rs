@@ -12548,7 +12548,30 @@ impl PyEngine {
             let trace: CompleteTrace = serde_json::from_str(complete_trace_json)
                 .map_err(|e| PyValueError::new_err(format!("CompleteTrace JSON decode: {e}")))?;
             let runtime = self.runtime.clone();
-            match &self.backend {
+            // Read off the one field the response needs BEFORE the trace moves
+            // into the detached closure.
+            let schema_version = trace.trace_schema_version.as_str().to_owned();
+            // v25.x (CIRISPersist#580) — the whole verify runs with the GIL
+            // RELEASED. `TraceKeyDirectory::lookup` bridges the sync
+            // `PublicKeyDirectory` trait to the async backend with
+            // `runtime.block_on`, and until this detach existed that wait
+            // happened while CPython held the GIL: a stalled connection wedged
+            // the entire interpreter, not one thread, with no Rust-side error
+            // — and no watchdog could fire through it, because a watchdog needs
+            // the GIL to be scheduled. Same class as #572's teardown wedge, on
+            // the read path.
+            //
+            // The ENTIRE verify is inside the detach, not merely the lookup.
+            // #580 predicted that would deadlock, on the grounds that
+            // `PythonJsonDumpsCanonicalizer` needs the GIL inside the same
+            // call. It does not: that name describes the OUTPUT FORMAT it
+            // emulates (CPython's `json.dumps` escaping), not a call into
+            // CPython — it is a pure-Rust byte writer, and `src/verify/`
+            // contains no pyo3 reference at all. So the blocking half and the
+            // canonicalizing half are both GIL-free and neither needs hoisting.
+            // This is exactly the shape the sibling
+            // [`Self::verify_hybrid_via_directory`] already uses.
+            let verified = py.detach(move || match &self.backend {
                 #[cfg(feature = "postgres")]
                 BackendDispatch::Postgres(pg) => {
                     let key_dir = TraceKeyDirectory {
@@ -12556,10 +12579,6 @@ impl PyEngine {
                         runtime,
                     };
                     verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &key_dir)
-                        .map_err(|e| {
-                            tracing::warn!(error = %e, kind = e.kind(), "verify_trace rejected");
-                            PyValueError::new_err(e.kind())
-                        })?;
                 }
                 #[cfg(feature = "sqlite")]
                 BackendDispatch::Sqlite(sq) => {
@@ -12568,15 +12587,18 @@ impl PyEngine {
                         runtime,
                     };
                     verify_trace_via_directory(&trace, &PythonJsonDumpsCanonicalizer, &key_dir)
-                        .map_err(|e| {
-                            tracing::warn!(error = %e, kind = e.kind(), "verify_trace rejected");
-                            PyValueError::new_err(e.kind())
-                        })?;
                 }
-            }
+            });
+            // Error mapping stays OUTSIDE the detach: building a `PyErr` is
+            // CPython work, and doing it under a released GIL is the mirror of
+            // the bug being fixed.
+            verified.map_err(|e| {
+                tracing::warn!(error = %e, kind = e.kind(), "verify_trace rejected");
+                PyValueError::new_err(e.kind())
+            })?;
             let dict = PyDict::new(py);
             dict.set_item("verified", true)?;
-            dict.set_item("schema_version", trace.trace_schema_version.as_str())?;
+            dict.set_item("schema_version", schema_version)?;
             Ok(dict)
         })
     }
@@ -30096,6 +30118,382 @@ mod tests {
         assert!(
             crate::engine::teardown::wait_quiesced(WEDGE_HOLD * 4),
             "the retired runtime never finished winding down"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  v25.x (CIRISPersist#580) — the READ-path half of #572's rule.
+    // ─────────────────────────────────────────────────────────────
+
+    /// **The defect, isolated.** A `runtime.block_on` performed while the
+    /// GIL is held starves every other Python thread for the whole wait.
+    ///
+    /// This is what `Engine.verify_trace` did before #580: its
+    /// `TraceKeyDirectory::lookup` bridges the synchronous
+    /// `PublicKeyDirectory` trait to the async backend with `block_on`, and
+    /// nothing released the GIL around it. A stalled Postgres connection
+    /// there wedges the INTERPRETER, not one thread — and a watchdog cannot
+    /// fire through it, because a watchdog needs the GIL to be scheduled.
+    ///
+    /// Asserts the BAD behaviour on purpose, exactly as
+    /// `bare_runtime_drop_under_the_gil_wedges_the_interpreter` does for the
+    /// teardown half: it is the mechanism witness that
+    /// `directory_lookup_detached_from_the_gil_is_bounded` below is really
+    /// fixing something.
+    #[test]
+    #[serial_test::serial(gil_teardown)]
+    fn block_on_under_the_gil_starves_the_interpreter() {
+        Python::initialize();
+        let rt = Runtime::new().expect("tokio runtime");
+
+        let (held, t0, probe) = Python::attach(|_py| {
+            let probe = arm_gil_probe();
+            let t0 = std::time::Instant::now();
+            // Stands in for `TraceKeyDirectory::lookup` waiting on a
+            // connection that never comes back.
+            rt.block_on(async { tokio::time::sleep(WEDGE_HOLD).await });
+            assert!(
+                probe.try_recv().is_err(),
+                "probe attached while we still held the GIL"
+            );
+            (t0.elapsed(), t0, probe)
+        });
+
+        assert!(
+            held >= WEDGE_HOLD.mul_f64(0.7),
+            "the blocking wait should have taken the whole stall; it \
+             returned after {held:?}"
+        );
+        let acquired = probe
+            .recv()
+            .expect("probe thread must eventually attach")
+            .duration_since(t0);
+        assert!(
+            acquired >= WEDGE_HOLD.mul_f64(0.7),
+            "the GIL probe should have been starved for the whole blocking \
+             wait; it attached {acquired:?} after the wait began"
+        );
+    }
+
+    /// The same stall, with the GIL released around it — the #580 fix's
+    /// shape. The probe must get the GIL immediately, so a watchdog CAN
+    /// fire while a directory lookup is stuck.
+    #[test]
+    #[serial_test::serial(gil_teardown)]
+    fn directory_lookup_detached_from_the_gil_is_bounded() {
+        Python::initialize();
+        let rt = Runtime::new().expect("tokio runtime");
+
+        let (t0, probe) = Python::attach(|py| {
+            let probe = arm_gil_probe();
+            let t0 = std::time::Instant::now();
+            py.detach(|| rt.block_on(async { tokio::time::sleep(WEDGE_HOLD).await }));
+            (t0, probe)
+        });
+
+        let acquired = probe
+            .recv()
+            .expect("probe thread must attach")
+            .duration_since(t0);
+        assert!(
+            acquired < GIL_BOUND,
+            "the GIL probe was starved for {acquired:?} by a DETACHED \
+             blocking wait — the detach is not doing its job (#580)"
+        );
+    }
+
+    // ── the surface-wide gate ────────────────────────────────────────
+    //
+    // #580 asked which read paths call `block_on` while holding the GIL.
+    // The answer at the time was "exactly one" — but a textual sweep for
+    // `block_on` inside `#[pymethods]` bodies would have returned ZERO and
+    // missed it, because `verify_trace`'s body contains no `block_on` at
+    // all: it reaches one through the `TraceKeyDirectory` sync-trait shim.
+    // The same blind spot covers `accord_dispatch!`, whose `block_on` lives
+    // in the macro DEFINITION so every call site looks clean.
+    //
+    // So the gate is stated over the whole file with two named exceptions,
+    // and each exception is PAID FOR by its own clause below.
+
+    /// Blank out comments, string literals and char literals, preserving
+    /// length and newlines so byte offsets and line numbers stay valid.
+    /// Rust lifetimes (`'py`, `'static`) are not char literals and survive.
+    #[cfg(test)]
+    fn strip_rust_noise(s: &str) -> String {
+        let b: Vec<char> = s.chars().collect();
+        let mut out = b.clone();
+        let blank = |out: &mut Vec<char>, a: usize, z: usize| {
+            for c in out.iter_mut().take(z.min(b.len())).skip(a) {
+                if *c != '\n' {
+                    *c = ' ';
+                }
+            }
+        };
+        let mut i = 0usize;
+        while i < b.len() {
+            if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '/' {
+                let mut j = i;
+                while j < b.len() && b[j] != '\n' {
+                    j += 1;
+                }
+                blank(&mut out, i, j);
+                i = j;
+            } else if b[i] == '/' && i + 1 < b.len() && b[i + 1] == '*' {
+                let mut depth = 0usize;
+                let mut j = i;
+                while j < b.len() {
+                    if b[j] == '/' && j + 1 < b.len() && b[j + 1] == '*' {
+                        depth += 1;
+                        j += 2;
+                    } else if b[j] == '*' && j + 1 < b.len() && b[j + 1] == '/' {
+                        depth -= 1;
+                        j += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        j += 1;
+                    }
+                }
+                blank(&mut out, i, j);
+                i = j;
+            } else if b[i] == 'r' && i + 1 < b.len() && (b[i + 1] == '#' || b[i + 1] == '"') {
+                let mut h = 0usize;
+                let mut j = i + 1;
+                while j < b.len() && b[j] == '#' {
+                    h += 1;
+                    j += 1;
+                }
+                if j < b.len() && b[j] == '"' {
+                    let close: String = std::iter::once('"')
+                        .chain(std::iter::repeat_n('#', h))
+                        .collect();
+                    let rest: String = b[j + 1..].iter().collect();
+                    let k = rest.find(&close).map_or(b.len(), |k| {
+                        j + 1 + rest[..k].chars().count() + close.chars().count()
+                    });
+                    blank(&mut out, i, k);
+                    i = k;
+                } else {
+                    i += 1;
+                }
+            } else if b[i] == '"' {
+                let mut j = i + 1;
+                while j < b.len() {
+                    if b[j] == '\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if b[j] == '"' {
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                blank(&mut out, i, j);
+                i = j;
+            } else if b[i] == '\'' {
+                // char literal iff  'x'  or  '\x'  — otherwise a lifetime.
+                let is_char = (i + 2 < b.len() && b[i + 2] == '\'' && b[i + 1] != '\\')
+                    || (i + 3 < b.len() && b[i + 1] == '\\' && b[i + 3] == '\'');
+                if is_char {
+                    let z = if b[i + 1] == '\\' { i + 4 } else { i + 3 };
+                    blank(&mut out, i, z);
+                    i = z;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// Index just past the `}` matching the `{` at `open`.
+    #[cfg(test)]
+    fn match_brace(s: &[char], open: usize) -> usize {
+        let mut depth = 0usize;
+        let mut j = open;
+        while j < s.len() {
+            match s[j] {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return j + 1;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        s.len()
+    }
+
+    /// Index just past the `)` matching the first `(` at or after `from`.
+    #[cfg(test)]
+    fn match_paren(s: &[char], from: usize) -> usize {
+        let mut j = from;
+        while j < s.len() && s[j] != '(' {
+            j += 1;
+        }
+        let mut depth = 0usize;
+        while j < s.len() {
+            match s[j] {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return j + 1;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        s.len()
+    }
+
+    /// Byte-agnostic char-index → 1-based line number.
+    #[cfg(test)]
+    fn line_at(s: &[char], pos: usize) -> usize {
+        s.iter().take(pos).filter(|c| **c == '\n').count() + 1
+    }
+
+    /// All `(start, end)` char spans of `needle`-introduced brace blocks.
+    #[cfg(test)]
+    fn spans_of(s: &[char], flat: &str, needle: &str) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = flat[from..].find(needle) {
+            let at = flat[..from + rel].chars().count();
+            if let Some(off) = s[at..].iter().position(|c| *c == '{') {
+                out.push((at, match_brace(s, at + off)));
+            }
+            from += rel + needle.len();
+        }
+        out
+    }
+
+    /// v25.x (CIRISPersist#580) — **the surface-wide gate.** Every
+    /// `block_on` reachable from the PyO3 boundary must run with the GIL
+    /// released.
+    ///
+    /// Three clauses. The first states the rule; the other two exist to pay
+    /// for the first one's two exceptions, so the exceptions cannot quietly
+    /// become holes:
+    ///
+    /// 1. every non-test `block_on` is lexically inside a `py.detach`,
+    ///    EXCEPT inside the `TraceKeyDirectory` sync-trait shim (which holds
+    ///    no `Python` token and so cannot detach) and inside the
+    ///    `accord_dispatch!` macro definition (whose `block_on` is expanded
+    ///    at each call site, not executed where it is written);
+    /// 2. every `TraceKeyDirectory` CONSTRUCTION is inside a `py.detach` —
+    ///    this is what makes exception (1a) sound, and it is the clause that
+    ///    fails on pre-#580 code;
+    /// 3. every `accord_dispatch!` CALL SITE is inside a `py.detach` — what
+    ///    makes exception (1b) sound.
+    ///
+    /// Verified to discriminate: run against `main` before the #580 fix,
+    /// clause 2 reports both construction sites as unguarded.
+    #[test]
+    fn no_block_on_reaches_the_pyo3_boundary_holding_the_gil() {
+        let raw = include_str!("pyo3.rs");
+        let stripped = strip_rust_noise(raw);
+        let s: Vec<char> = stripped.chars().collect();
+
+        let test_mods = spans_of(&s, &stripped, "#[cfg(test)]\nmod ");
+        // A detach span runs to the matching CLOSE PAREN of `.detach(`, not to
+        // some following brace: `py.detach(|| runtime.block_on(x))` has no
+        // block at all, and brace-matching there would swallow an unrelated
+        // `{` further down the file and silently mark real offenders as
+        // guarded. The receiver must be exactly `py` — any other `.detach(`
+        // is not a GIL release and must not create a span.
+        let detaches: Vec<(usize, usize)> = {
+            let mut v = Vec::new();
+            let mut f = 0usize;
+            while let Some(rel) = stripped[f..].find(".detach(") {
+                let byte_at = f + rel;
+                let head = stripped[..byte_at].trim_end();
+                let receiver_is_py = head.ends_with("py")
+                    && !head[..head.len() - 2].ends_with(|c: char| c.is_alphanumeric() || c == '_');
+                if receiver_is_py {
+                    let at = stripped[..byte_at].chars().count();
+                    let open = at + ".detach".chars().count();
+                    v.push((at, match_paren(&s, open)));
+                }
+                f = byte_at + ".detach(".len();
+            }
+            v
+        };
+        let shim = spans_of(
+            &s,
+            &stripped,
+            "impl<B> crate::verify::PublicKeyDirectory for TraceKeyDirectory<B>",
+        );
+        let macro_def = spans_of(&s, &stripped, "macro_rules! accord_dispatch");
+
+        let inside =
+            |spans: &[(usize, usize)], p: usize| spans.iter().any(|(a, b)| *a <= p && p < *b);
+
+        // ── clause 1 ──
+        let mut offenders = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = stripped[from..].find("block_on(") {
+            let at = stripped[..from + rel].chars().count();
+            if !inside(&test_mods, at)
+                && !inside(&detaches, at)
+                && !inside(&shim, at)
+                && !inside(&macro_def, at)
+            {
+                offenders.push(line_at(&s, at));
+            }
+            from += rel + "block_on(".len();
+        }
+        assert!(
+            offenders.is_empty(),
+            "CIRISPersist#580 clause 1 — `block_on` reachable from the PyO3 \
+             boundary WITHOUT releasing the GIL, at pyo3.rs lines {offenders:?}. \
+             A blocking wait under the GIL wedges the whole interpreter and no \
+             watchdog can fire through it. Wrap the call in `py.detach(...)`."
+        );
+
+        // ── clause 2 — pays for exception (1a) ──
+        let mut ctor = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = stripped[from..].find("TraceKeyDirectory {") {
+            let at = stripped[..from + rel].chars().count();
+            if !inside(&test_mods, at) && !inside(&detaches, at) {
+                ctor.push(line_at(&s, at));
+            }
+            from += rel + 1;
+        }
+        assert!(
+            ctor.is_empty(),
+            "CIRISPersist#580 clause 2 — `TraceKeyDirectory` built OUTSIDE a \
+             `py.detach` at pyo3.rs lines {ctor:?}. Its `lookup` blocks on the \
+             runtime and it holds no `Python` token, so the ONLY place the GIL \
+             can be released is around its construction and use. This is the \
+             clause that fails on pre-#580 `verify_trace`."
+        );
+
+        // ── clause 3 — pays for exception (1b) ──
+        let mut sites = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel) = stripped[from..].find("accord_dispatch!") {
+            let at = stripped[..from + rel].chars().count();
+            if !inside(&test_mods, at) && !inside(&macro_def, at) && !inside(&detaches, at) {
+                sites.push(line_at(&s, at));
+            }
+            from += rel + 1;
+        }
+        assert!(
+            sites.is_empty(),
+            "CIRISPersist#580 clause 3 — `accord_dispatch!` invoked OUTSIDE a \
+             `py.detach` at pyo3.rs lines {sites:?}. The macro expands to \
+             `runtime.block_on(...)`, so a call site that does not detach blocks \
+             under the GIL even though its body mentions no `block_on`."
         );
     }
 

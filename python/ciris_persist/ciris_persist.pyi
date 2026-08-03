@@ -71,6 +71,34 @@ class Engine:
         regardless — for a hard process shutdown.
         """
 
+    def close_blocking(
+        self, timeout_seconds: float = 10.0, force: bool = False
+    ) -> str:
+        """v24.3.0 (CIRISPersist#572) — close and WAIT for teardown.
+
+        The bounded-wait sibling of :meth:`close`. Returns a token
+        naming what actually happened:
+
+        * ``"drained"`` — the tokio runtime and the backend pool are
+          fully wound down; nothing of this engine is still running.
+        * ``"deferred"`` — other live ``Engine`` handles (or an
+          operation still in flight on another thread) still
+          reference the cell, so teardown could not complete here.
+          It will finish when the last reference goes; poll with
+          :func:`engine_teardown_wait`.
+        * ``"timed_out"`` — teardown is still running after
+          ``timeout_seconds``.
+        * ``"no_engine"`` — nothing was pinned; a no-op.
+
+        **Check the return value.** A ``"deferred"`` that a caller
+        reads as success is how a test suite ends up asserting
+        against a half-torn-down engine.
+
+        The wait happens with the GIL RELEASED, so a watchdog thread
+        (pytest-timeout's thread method) can still fire while it
+        runs — that is the whole point of #572.
+        """
+
     @property
     def is_closed(self) -> bool:
         """v1.6.8 — ``True`` once :meth:`close` has run on this
@@ -1896,19 +1924,60 @@ class Engine:
         ``ConsistencyProof``."""
 
 
-def reset_engine() -> None:
+def reset_engine(timeout_seconds: float = 10.0) -> str:
     """v1.10.1 (CIRISPersist#88) — handle-free reset of the
     process-singleton engine.
 
     Closes and un-pins whatever engine is the current process
-    singleton, freeing the slot synchronously so the next
-    ``Engine(...)`` constructs cleanly with any config. Unlike
-    :meth:`Engine.close` it needs no ``Engine`` handle, so it
-    recovers the "orphan" case — a fixture that dropped its Python
-    reference without closing. A no-op when no engine is pinned;
-    idempotent and safe under repeated reset/construct cycles.
+    singleton so the next ``Engine(...)`` constructs cleanly with any
+    config. Unlike :meth:`Engine.close` it needs no ``Engine``
+    handle, so it recovers the "orphan" case — a fixture that
+    dropped its Python reference without closing. A no-op when no
+    engine is pinned; idempotent and safe under repeated
+    reset/construct cycles.
+
+    **v24.3.0 (CIRISPersist#572) — BEHAVIOURAL CHANGE, and it is the
+    reason this signature is worth reading.** This used to free the
+    slot *synchronously* and return ``None``. It now returns one of
+    ``"drained"`` / ``"deferred"`` / ``"timed_out"`` / ``"no_engine"``
+    (see :meth:`Engine.close_blocking`), and ``"deferred"`` is the
+    common case whenever another handle is still alive. Waiting
+    synchronously for teardown while holding the GIL is exactly the
+    wedge #572 fixed, so the wait is now bounded and reported rather
+    than silently performed.
+
+    A caller that wants the old "it is really gone now" guarantee
+    follows up with :func:`engine_teardown_wait`.
 
     Intended for consumer test-suite isolation (call it in fixture
     teardown) and as a deterministic teardown door for in-process
     cohabitation.
+    """
+
+
+def engine_teardown_wait(timeout_seconds: float = 10.0) -> str:
+    """v24.3.0 (CIRISPersist#572) — block until every in-flight engine
+    teardown has finished.
+
+    Returns ``"drained"`` if the process is quiescent (no teardown
+    still running) or ``"timed_out"`` if one is still going after
+    ``timeout_seconds``.
+
+    This is the second half of the fixture recipe #572 exists to
+    enable, replacing a ``time.sleep(0.2)`` guess::
+
+        reset_engine(); del engine; gc.collect(); engine_teardown_wait()
+
+    The wait is performed with the GIL released, so it cannot wedge
+    the interpreter and a watchdog can still fire through it.
+    """
+
+
+def engine_teardowns_in_flight() -> int:
+    """v24.3.0 (CIRISPersist#572) — how many engine teardowns are
+    still winding down, right now.
+
+    ``0`` means the process is quiescent. Cheap and non-blocking —
+    for assertions and diagnostics; use :func:`engine_teardown_wait`
+    when you want to *wait* rather than observe.
     """

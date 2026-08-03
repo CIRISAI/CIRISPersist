@@ -38,6 +38,8 @@ from .ciris_persist import (
     SUPPORTED_SCHEMA_VERSIONS,
     Transient,
     __version__,
+    engine_teardown_wait,
+    engine_teardowns_in_flight,
     reset_engine,
 )
 
@@ -57,6 +59,15 @@ __all__ = [
     "__version__",
     # v1.10.1 (CIRISPersist#88) — handle-free process-singleton reset.
     "reset_engine",
+    # v24.3.0 (CIRISPersist#572, re-exported per #581) — the bounded
+    # teardown surface. Without these on the PACKAGE, the fixture recipe
+    # #572 exists to enable has to be written
+    # `from ciris_persist.ciris_persist import engine_teardown_wait`,
+    # reaching past this package into the native module — which works, and
+    # teaches downstream to bypass the public API. That is how a private
+    # path becomes a de-facto contract.
+    "engine_teardown_wait",
+    "engine_teardowns_in_flight",
 ]
 
 # v3.12.2 (CIRISPersist#156) — diagnostic harness surface. Re-exported

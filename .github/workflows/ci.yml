@@ -220,7 +220,7 @@ jobs:
             sleep $((attempt * 5))
             [ "$attempt" = "3" ] && { echo "::error::pip install failed 3x"; exit 1; }
           done
-      - name: maturin develop (test-panic feature)
+      - name: maturin develop (test-panic + sqlite)
         if: matrix.substrate.name == 'core'
         run: |
           python -m venv .venv
@@ -232,7 +232,19 @@ jobs:
             sleep $((attempt * 5))
             [ "$attempt" = "3" ] && { echo "::error::pip install failed 3x"; exit 1; }
           done
-          maturin develop --features test-panic,pyo3 --release
+          # v25.x (CIRISPersist#580/#581) — `sqlite` added to the wheel.
+          #
+          # Without a substrate feature every engine-level test in
+          # `tests/python/` skips: fourteen in `test_sqlite_engine.py` that had
+          # NEVER run in CI, plus the three #580 added. A suite that skips is a
+          # report of coverage, not coverage — the same defect as the missing
+          # `py.typed` marker, at a different scale.
+          #
+          # Cost: one extra substrate compile on a leg that already builds a
+          # wheel, and this crate's sqlite backend is already compiled by the
+          # nextest step above on the same runner, so the marginal cost is the
+          # `--release` codegen for it rather than a cold build.
+          maturin develop --features test-panic,pyo3,sqlite --release
       - name: pytest tests/python/
         if: matrix.substrate.name == 'core'
         run: |

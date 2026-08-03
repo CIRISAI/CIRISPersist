@@ -5,7 +5,150 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
-## [25.1.0] — 2026-08-02 — #582/#578/#570/#583/#569: who may take a node, who may withhold it, what a quota can see — and a gate the floor narrowed mid-flight
+## [Unreleased] — #580/#581: the read path stops wedging the interpreter, and the Python surface says what the Rust does
+
+Two issues, one shape: **the Rust side is right and the Python side does not reflect it.**
+
+### #580 — `verify_trace` blocked under the GIL
+
+`Engine.verify_trace` reached `runtime.block_on` through `TraceKeyDirectory::lookup` — the shim
+that bridges the synchronous `PublicKeyDirectory` trait to the async backend — with nothing
+releasing the GIL. That is #572's teardown wedge on the read path: a stalled connection there
+wedges the **interpreter**, not one thread, with no Rust-side error, and no watchdog can fire
+through it because a watchdog needs the GIL to be scheduled.
+
+**Two corrections to the issue, both load-bearing.**
+
+The issue said the fix "is not a simple wrap" because `PythonJsonDumpsCanonicalizer` "needs the
+GIL inside the same call", so wrapping the method would "deadlock on the canonicalizer instead —
+trading one wedge for another", and that hoisting the lookups out would be "a real refactor of
+`verify_trace_via_directory`'s control flow".
+
+Neither holds. `PythonJsonDumpsCanonicalizer` is a **pure-Rust byte writer** — the name describes
+the output format it emulates (CPython's `json.dumps` escaping), not a call into CPython — and
+`src/verify/` contains **no pyo3 reference at all**. And `verify_trace_via_directory` is already
+`lookup(); then verify()`: one lookup, strictly before any canonicalization, nothing interleaved.
+So the fix is the simple wrap the issue ruled out, and it is the same shape the sibling
+`verify_hybrid_via_directory` has used all along.
+
+### The sweep, and why a textual one would have returned zero
+
+The issue asked which read paths call `block_on` while holding the GIL, and proposed the
+mechanical test "any `#[pymethods]` fn that reaches `block_on` without an enclosing `py.detach`".
+Run textually, that test **returns zero and misses this bug** — `verify_trace`'s body contains no
+`block_on` at all. Two blind spots produce that:
+
+- **sync-trait shims** — the `block_on` is in `TraceKeyDirectory::lookup`, a trait impl elsewhere
+  in the file;
+- **macros** — `accord_dispatch!` expands to `runtime.block_on(...)`, so all 12 of its call sites
+  look clean too.
+
+Swept with those covered: **505 PyO3 entry points; 389 reach `block_on` directly and every one is
+already inside a `py.detach`; 12 `accord_dispatch!` call sites, all detached; 6 helper bridges in
+`impl PyEngine`, all detaching internally; and exactly one unguarded path — `verify_trace`.** The
+issue's worry that "a second instance found and left is how this became two issues instead of one"
+is answered: mechanically, there is no second instance.
+
+That sweep is now a **permanent gate** (`no_block_on_reaches_the_pyo3_boundary_holding_the_gil`),
+stated in three clauses over the whole file. Clause 1 is the rule; clauses 2 and 3 exist to pay for
+clause 1's two exceptions so they cannot quietly become holes — clause 2 requires every
+`TraceKeyDirectory` construction to be inside a `py.detach` (this is the clause that fails on
+pre-#580 code), clause 3 the same for every `accord_dispatch!` call site. Each clause was mutation-
+tested to fire, naming the offending line.
+
+### #581 — the teardown API on the package surface
+
+`engine_teardown_wait` and `engine_teardowns_in_flight` are now re-exported from
+`python/ciris_persist/__init__.py` (import + `__all__`), so the fixture recipe #572 exists to
+enable no longer has to be written `from ciris_persist.ciris_persist import …`, reaching past the
+package into the native module — which works, and teaches downstream to bypass the public API.
+
+The `.pyi` gains stubs for those two and for `Engine.close_blocking` — and **fixes one that was
+actively wrong**. `reset_engine` was declared `def reset_engine() -> None`: wrong arity *and*
+wrong return type, documenting pre-v24.3.0 behaviour ("freeing the slot synchronously"). It takes
+`timeout_seconds` and returns `"drained"` / `"deferred"` / `"timed_out"` / `"no_engine"` — and that
+return value is the only way a caller learns teardown was **deferred** rather than done.
+
+**A wrong stub is worse than a missing one.** A missing stub degrades to `Any` and the caller
+learns nothing; a wrong stub is *believed*, and a caller obeying this one would never check the
+value that tells them teardown had not finished.
+
+### …and the stubs had never been read by anything
+
+Checking that claim turned up a bigger one. The package shipped **no PEP 561 `py.typed` marker**,
+and without it every type checker skips a package's inline stubs outright — mypy says *"Skipping
+analyzing `ciris_persist`: module is installed, but missing library stubs or py.typed marker"*.
+The `.pyi` has always shipped in the wheel (confirmed by unzipping one); the marker never has. So
+the whole ~1900-line stub file, not just the three symbols #581 asked for, has never once been
+read by a consumer's type checker.
+
+Fixed with the one empty file that makes it real, verified end to end: a wheel built with the
+marker ships `ciris_persist/py.typed`, and mypy then resolves `reset_engine() -> str` and flags a
+deliberate `int` mis-assignment that it had previously ignored. A pytest guard asserts the marker
+is present so it cannot silently disappear again.
+
+**Stated plainly, because it is a risk we are taking knowingly: that one empty file converts
+~1900 lines of stub from inert to load-bearing in a single commit, and none of it has ever been
+checked against the runtime.** Every annotation in that file was unverifiable-by-construction
+until now — which is precisely why a wrong one survived: nothing *could* have caught it. #581
+audited the four teardown entry points and no more. The rest is now believed by every downstream
+type checker and remains unaudited; assume errors of the `reset_engine` kind are in there, and
+treat a stub mismatch report from a consumer as a real bug rather than a checker artefact.
+
+The natural next step is running mypy against the stubs in CI so the file stops being trusted on
+faith. **Not added here**, and the cost is the reason to decide it deliberately rather than as a
+rider: a meaningful check is not `mypy python/` (the stubs are syntactically fine — that is how
+they got this way) but a stub-vs-runtime conformance pass over ~1900 lines, which will surface an
+unknown number of pre-existing mismatches on its first run and block the leg until each is
+triaged. That is a scoped piece of work, not a one-line CI addition.
+
+**A stub is a claim about a callable surface, so the claim is checked against a built wheel.**
+`tests/python/test_teardown_surface.py` imports the package (not the native module), asserts each
+symbol is present *and in `__all__`*, calls each one and asserts its return contract, runs the
+full `reset_engine(); gc.collect(); engine_teardown_wait()` recipe end to end, and parses the
+shipped `.pyi` to assert it describes the functions that actually exist. Verified by running
+`maturin develop` + `pytest tests/python/` locally, which is what CI does; both halves were shown
+red-first by reverting the re-exports and the stub.
+
+### Coverage the change needed and did not have
+
+The FFI `verify_trace` wrapper had **no behavioural test of any kind** — the inner
+`crate::verify::verify_trace` tests exercise the pure function, not the boundary — so the
+restructure's only guard would have been "it compiles". `tests/python/test_verify_trace_gil.py`
+drives it through a real wheel: the reject path (unknown key → returns from inside the detach,
+maps to `ValueError` outside it), the malformed-input path (raises before the detach is entered),
+and ten calls in a row, because a detach that is entered but not correctly exited hangs on the
+*second* call rather than the first.
+
+Stated honestly: these are **behaviour-preservation guards, not defect witnesses** — verified by
+reverting the fix, rebuilding and re-running, and they pass either way, which is the point (the
+fix changes no observable behaviour). The defect witnesses are the GIL-probe pair and the gate.
+
+While writing them, the fixture's `except Exception` skip swallowed a `RuntimeError` from a
+malformed DSN and turned all three into silent skips that reported as a green run. The skip is now
+the narrow house form (`ValueError` naming both `sqlite` and `feature`, everything else
+re-raised). **A test that skips itself on any failure is worse than no test: it looks like
+coverage.**
+
+### A gap in the local verification matrix
+
+The `sqlite`, `sqlite test-anchor` and `sqlite postgres` suites do **not** compile `src/ffi/pyo3.rs`,
+so none of them execute the new Rust tests — their counts are unchanged at 1645 / 1650 / 1979,
+which is how the gap was noticed. CI is fine for the Rust half (every `ci.yml` substrate leg carries
+`pyo3`); it is the local baseline commands that cannot certify FFI work. The certifying local run
+is the CI-equivalent `--features "postgres server pyo3 sqlite"` — 2072 passed there, and the three
+new Rust tests are in it by name.
+
+CI's python leg also built `maturin develop --features test-panic,pyo3` with no substrate feature,
+so **every engine-level Python test skipped in CI** — the fourteen already in
+`test_sqlite_engine.py`, which had therefore never once run there, plus the three added here.
+`sqlite` is now in that build. Runner cost: one extra substrate in a `--release` wheel on a leg
+that already builds one, on a runner whose nextest step has already compiled the sqlite backend in
+the same job — so the marginal cost is that backend's release codegen, not a cold build. If it
+turns out to push the leg past its timeout, the fallback is to drop `--release` from that wheel
+rather than to drop the feature.
+
+
 
 Five issues, and one release-shaped lesson. #569 was written against a genuinely open
 constitutional question at 18:17; CIRISConstitution ratified CC 3.4.5 the other way at
