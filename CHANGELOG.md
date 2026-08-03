@@ -5,6 +5,149 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased] — #589: a row does not escape a put-gate by entering at the local tier
+
+`Engine::attestation_promote` re-signed a row and flipped `tier` local→federation while
+running **no** put-gate at all. It validated `cohort_scope`, refused `(federation, self)`,
+and was idempotent on an already-federation row — and that was the whole of it. So every
+tier-4 gate that no-ops at the local tier had never once been asked about a promoted row,
+which is the moment those rows become federation-tier.
+
+CC 3.4.5's reciprocity clause is what makes this a **MUST violation** rather than a gap:
+a subject that declines analysis *"cannot be scored; its `capacity:composite` is undefined
+and MUST NOT be emitted"*. The two-step below minted exactly that row, and because
+`capacity:composite` is `min` over five factors (CC 3.1.8.1), one leaked row certifies five.
+
+**AV-83.** (Not AV-82 — #569's adjudication took that number in v25.1.0.)
+
+### Red first: the premise was executed before anything was fixed
+
+The issue asserted this from code reading. Run on all three backends plus the public
+`Engine` surface, before any fix:
+
+```
+CONTROL  direct federation-tier capacity:composite:v1 about a silent subject
+         -> ConsentGateRefused { family: Capacity, stance: Unspecified }
+(1)      the SAME claim at tier='local'   -> Ok(())
+(2)      promote_attestation              -> Ok(true)
+(3)      read back                        -> tier=federation, capacity:composite:v1,
+                                             no analyze grant anywhere
+```
+
+Identical on memory, sqlite and postgres, and identical through
+`Engine::attestation_promote`.
+
+### The sharp part: the rule existed, behind a door the attack does not use
+
+`check_local_tier_eligibility` has declared `capacity:*` ineligible for the local tier
+since v4.4.0. It runs on `attestation_insert_local` / `attestation_upsert_local` and
+nowhere else — never on `put_attestation`, which accepts `tier = "local"` on every backend.
+The correct rule was written, tested and shipped, and the attack simply walked around it.
+Third occurrence of the SHIPPED-means-host-reachable class, after AV-77 and #444's route
+table.
+
+### Two chokepoints, because they close different things
+
+**1. `check_capacity_never_local` — the symptom, at the door where the row is born.**
+The capacity arm is lifted out of `check_local_tier_eligibility` into one predicate both
+doors ask, rather than a second copy of the condition (two validators for one artifact
+MUST share one predicate). Wired into `put_attestation` at AV-76 tier 1 on all three
+backends, asking BOTH wire shapes — `dimension` and the type-keyed form — because
+answering one shape is the AV-74 mistake at a new address. The refusal names the
+**local-tier** rule, not consent: the row would be inadmissible even with a live `analyze`
+grant, and a refusal that names the wrong rule sends the reader to the wrong layer.
+
+**2. `check_promotion_admission` — the class.** The tier-4 authority stack, re-run against
+the row a promotion is about to store (`tier = federation` plus the new placement — gating
+the pre-promotion shape would ask every tier-sensitive gate the question it already no-ops
+on). Called from every backend's `promote_attestation` AND `promote_attestation_transformed`
+before any mutation, so `Engine::attestation_promote`,
+`Engine::promote_attestation_with_transforms`, `promote_consented_backlog`, the pyo3
+wrapper and the FFI capsule all inherit it without a call site of their own.
+
+The membership rule, stated once:
+
+> A promotion re-runs every tier-4 gate whose verdict is a function of state that can have
+> changed since the local write, and that neither mutates the row nor assumes the row is
+> not yet stored.
+
+In: the CC 3.4.5 consent gate and no-moderator-federate (both tier-sensitive — the
+promotion is the first time either is ever asked); AV-77 de-admission, the
+moderation/review/quarantine duty gate, reserved-prefix, node-agency and
+user-target-steward (all time-varying, all read-only). Out, with reasons: the §6.1 dedup
+short-circuit (it is an early ACCEPT, and a promotion is not a new row — the AV-76 hole in
+its original shape), `check_withdraws_admission` (it stamps a hash-covered field the
+promoted row already carries), and `check_single_node_owner_admission` (its own doc pins
+"the incoming row is NOT yet stored", which is false here).
+
+Closing only the capacity arm would have left AV-77, AV-45 and the moderation gates exactly
+as they were for every other family. The witness proves the difference: a row written while
+its author was in good standing, promoted **after** this node de-admits that author, is now
+refused — and nothing about `capacity:*` is involved.
+
+### The promotion primitive now carries its placement
+
+`FederationDirectory::promote_attestation` and `promote_attestation_transformed` take
+`cohort_scope`, written in the same statement as the tier flip. The old shape was a
+separate `set_attestation_cohort_scope` call the caller made first ("placement before
+tier"), which was safe only while promotion could not refuse on authority grounds. Once it
+could, a refused promotion had **already** rewritten `cohort_scope` and `persist_row_hash`
+— a verify-before-mutation (AV-9) violation.
+
+The substrate state machine caught it within one run of the gate landing, as an I2a
+failure: *"a REFUSED op must leave every existing row byte-identical"*, shrunk to
+`UnsignedLocalWrite(self)` then `Promote(scope: Family)`. That is the differential oracle
+doing precisely what it exists for — the fix's own ordering bug, found by the harness
+rather than by review.
+
+This also means `(federation, self)` — the #315 dead-plane state — is now refused by the
+**primitive** rather than only by `Engine::attestation_promote`, so a caller reaching the
+directory directly can no longer mint it.
+
+### AV-45 is deliberately NOT in the promotion gate — and that is recorded as a residual
+
+#589 names AV-45 as part of the bypassed class, and it is left out on purpose.
+
+An attestation carries a `cohort_scope` with no `cohort_target_id`, so AV-45's predicate
+refuses `family` / `community` whenever the target is `None` — which, on this table, is
+always. Running it at promote would therefore not *check* a placement; it would make
+family/community placements **unreachable** and delete the #519/#510 audience plane. That
+is a product amputation wearing a security fix's clothes.
+
+The provenance also differs, which is why the asymmetry is defensible rather than merely
+convenient: AV-45 at `put_attestation` polices an inbound row from a peer asserting a
+cohort label persist cannot verify, whereas a promotion republishes a row this node itself
+authored, at an audience taken from this node's own signed consent grant.
+
+What remains true is that **persist cannot prove a family/community placement on any
+path**. Closing that is a schema change — give the row a `cohort_target_id` and AV-45
+becomes answerable at both doors — not a gate change, and it is filed separately rather
+than smuggled in here. `promotion_does_not_prove_cohort_membership_589` is the executed
+witness, so the residual cannot quietly become untrue in either direction.
+
+### Witnesses
+
+**B8**, added to the `{gate} × {backend}` bootstrap-admission matrix and run on all three
+backends: the local-tier `capacity:*` write is refused naming the local-tier rule; the
+type-keyed shape is refused too; an ordinary local row still admits and still promotes (a
+rule, not a lockdown); a de-admitted author's row is refused at promotion; a refused
+promotion leaves the row byte-identical; and `(federation, self)` is refused by the
+primitive. Plus the engine-level witness on the exact issue path, and two unit witnesses
+pinning the one-predicate-two-doors property and the residual.
+
+### Breaking
+
+- `FederationDirectory::promote_attestation` and
+  `FederationDirectory::promote_attestation_transformed` take a `cohort_scope` argument.
+  Callers that previously called `set_attestation_cohort_scope` first should drop that call
+  and pass the placement instead — doing both is harmless but leaves the pre-stamp window.
+- `put_attestation` now refuses a `tier = "local"` row carrying a `capacity:*` dimension or
+  attestation type, on all three backends. Such a row was never admissible under CEG §7.5;
+  the door merely was not asking.
+
+Threat model: **AV-83**. Refs: CC 3.4.5 (reciprocity clause) · CC 3.1.8.1 · AV-45 / AV-62 /
+AV-76 / AV-77 / AV-79 · #444 · #519 / #510 / #315 · #543 · #569.
+
 ## [25.1.0] — 2026-08-02 — #582/#578/#570/#583/#569: who may take a node, who may withhold it, what a quota can see — and a gate the floor narrowed mid-flight
 
 Five issues, and one release-shaped lesson. #569 was written against a genuinely open

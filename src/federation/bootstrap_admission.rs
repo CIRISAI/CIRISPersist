@@ -1037,5 +1037,61 @@ pub mod test_support {
             format!("{err}").contains("self"),
             "({tag}) B8: the refusal names the placement: {err}"
         );
+
+        // ── (g) THE LEGACY ROW — why the consent arm is not dead code. ──
+        // Arm (a) means a `capacity:*` row can no longer ENTER the local tier,
+        // so no sequence starting from an empty corpus can drive one into
+        // `check_promotion_admission`'s consent arm. That is a fair question to
+        // ask of any gate ("SHIPPED means host-reachable", read in reverse: an
+        // arm nothing can reach is an arm nobody proves), and it has a concrete
+        // answer rather than a defence-in-depth hand-wave.
+        //
+        // Every release up to and including v25.1.0 ADMITTED local-tier
+        // `capacity:*` through `put_attestation`. Deployments therefore hold
+        // exactly these rows already, and the upgrade does not delete them —
+        // the local door closing does nothing about a row that is already
+        // inside. The promotion gate is what stops those rows federating, and
+        // it is the arm that enforces the CC 3.4.5 MUST directly.
+        //
+        // Driven against the gate itself: manufacturing the row through the
+        // storage layer would need a different bypass on each backend, and what
+        // needs proving is the VERDICT — which every backend answers through
+        // this one shared predicate, so it is checked on all three here.
+        let mut legacy = scores_row(&uuid::Uuid::new_v4().to_string(), &bystander, &subject, DIM);
+        legacy.tier = attestation_tier::FEDERATION.to_owned();
+        legacy.cohort_scope = cohort_scope::FEDERATION.to_owned();
+        let err = crate::federation::admission::check_promotion_admission(dir, &legacy, None)
+            .await
+            .expect_err(
+                "({tag}) B8: promoting a pre-v25.2.0 local capacity row must be refused — \
+                 CC 3.4.5: its capacity:composite MUST NOT be emitted",
+            );
+        assert!(
+            matches!(&err, crate::federation::Error::ConsentGateRefused(r)
+                if r.family == crate::federation::ConsentGatedFamily::Capacity
+                    && r.dimension == DIM),
+            "({tag}) B8: and the refusal names the CAPACITY consent rule: {err:?}"
+        );
+
+        // The same row with the subject's live `analyze` grant admits — the
+        // arm is the CONSENT rule, not a blanket ban on promoting capacity.
+        dir.put_attestation(SignedAttestation {
+            attestation: consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &bystander,
+                &format!(
+                    "{}:v1",
+                    crate::federation::consent::consent_dimension::STATE_GRANTED_PREFIX
+                ),
+                &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
+                chrono::Utc::now() - chrono::Duration::seconds(60),
+            ),
+        })
+        .await
+        .expect("({tag}) B8: the subject's own analyze grant admits");
+        crate::federation::admission::check_promotion_admission(dir, &legacy, None)
+            .await
+            .expect("({tag}) B8: with a live analyze grant the same promotion is admitted");
     }
 }
