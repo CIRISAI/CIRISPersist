@@ -35,16 +35,70 @@
 //! commitments — enumerated in full, together with what it deliberately
 //! defers and why, on `HardwareAttestationPolicy::check_generation_custody`.
 //!
-//! Persist does NOT do active chain validation (cert-chain to
-//! Google root for Android, EK cert validation for TPM, JWT-verify
-//! Play Integrity, App Attest assertion against Apple's roots). That's
-//! CIRISVerify#32 Ask 5's local-chain-validation surface, which
-//! Verify v3.0.1 has NOT shipped — `play_integrity.rs` / `tpm_attest.rs` /
-//! `app_attest.rs` are request/response types that route through the
-//! registry today. Persist's structural check ensures the evidence
-//! shape is right + the nonce is fresh; registry-side validation (or
-//! Verify#32 Ask 5 when shipping) does the chain verification.
-//! Persist's storage of the evidence preserves the audit trail.
+//! **At THIS call site persist does not walk a device-attestation chain**
+//! (cert-chain to the Google root for Android, EK-cert validation for TPM,
+//! JWT-verify of Play Integrity, App Attest assertion against Apple's
+//! roots). The structural check here ensures the evidence *shape* is right
+//! and the nonce is fresh, and persist's storage of the evidence preserves
+//! the audit trail. What is available to change that, and what genuinely
+//! is not, is the matrix below.
+//!
+//! Note the deliberate asymmetry with the **PIV custody** walk: that one is
+//! not deferred anywhere. It runs in this crate, against the pinned Yubico
+//! root, on the canonical-role gate — see
+//! `HardwareAttestationPolicy::check_generation_custody`, which corrects a
+//! note that used to point at another repo.
+//!
+//! # CIRISVerify v12.1.0 capability matrix — what is adoptable, what is not
+//!
+//! Recorded here (CIRISPersist#568) so a reader deciding whether a gap is
+//! real does not need a round trip to another repo. Verify posted this
+//! against the v12.1.0 release; persist pins v12.1.0.
+//!
+//! | Capability | Status | Entry point |
+//! |---|---|---|
+//! | YubiKey PIV custody | shipped, hardware-validated | `verify_accord_custody_attestation` / `verify_yubikey_piv_attestation` |
+//! | Android Key Attestation | shipped **v10.8.0** | `device_attestation::verify_android_key_attestation{,_with_store}` |
+//! | Apple App Attest | shipped **v11.0.0** | `device_attestation::verify_apple_app_attest{,_with_store}` |
+//! | **TPM EK** | **STILL DEFERRED** | — the last open leg of **CIRISVerify#199** |
+//! | Pinned vendor roots | verify now bakes them | `trust_anchor_store::baked` — Yubico, Google ×2, Apple |
+//! | Constrained anchor store | shipped v10.9.0–v10.11.0 | `TrustAnchorStore::resolve(purpose, environment)` |
+//! | Presenter binding (build) | shipped v10.7.0 | `verify_build_attestation_bundle` (CIRISPersist#567) |
+//!
+//! So the old note here — *"CIRISVerify#32 Ask 5's local-chain-validation
+//! surface, which Verify v3.0.1 has NOT shipped"* — was stale twice over:
+//! **CIRISVerify#32 is CLOSED** (the live tracker is **CIRISVerify#199**),
+//! and two of its three legs have shipped. Persist's deferral stands, but
+//! it is now a *choice* rather than an absence, and only the TPM EK leg is
+//! genuinely unavailable — blocked upstream on vendor-root-**set**
+//! management, which is a different problem from pinning one root.
+//!
+//! # The measurement/gate inversion this module must not make
+//!
+//! Verify's device-attestation validators are deliberately **measurements
+//! and over-claim refuters, not gates**: absence of an attestation is not a
+//! failure, and a `Software` security level is a valid measurement. As of
+//! v12.1.0 the types say so themselves —
+//! `AndroidSecurityLevel` and `AppAttestEnvironment` implement
+//! `ciris_verify_core::classification::Classification` returning
+//! `Gating::Measurement`, so `may_gate()` is **false** for both. Persist
+//! encodes that rule once, in
+//! [`super::admission::classification_standing`], and pins those two
+//! verdicts to `NoStanding` in a test. Adopting the Android or Apple leg
+//! here therefore widens the *evidence*, never the *requirement* — the
+//! `SoftwareOnly` floor below stays the one structural line.
+//!
+//! # `strongbox_backed` is a SELF-REPORT, and it is now falsifiable
+//!
+//! Persist's structural check requires the Android variant to carry
+//! `strongbox_backed`, and `platform_to_hardware_type` reads it to pick
+//! `AndroidStrongbox` vs `AndroidKeystore`. That flag is the peer's own
+//! claim and is **not authoritative** — shape-only, which is why the
+//! deferral above is correct rather than merely convenient. It is no longer
+//! *uncheckable*, though: verify's `AndroidAttestationVerdict::refutes(claimed_class)`
+//! fires iff a peer claims stronger custody than the chain measures. A
+//! future adopter wires refutation (a peer caught over-claiming), never
+//! promotion (a self-reported flag becoming trusted).
 //!
 //! # Why the `SoftwareOnly` floor is the ONE thing Verify draws
 //!

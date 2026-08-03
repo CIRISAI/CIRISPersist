@@ -94,6 +94,7 @@
 //! policy; persist's backends instantiate it once and consult it
 //! on every `put_attestation`.
 
+use ciris_verify_core::classification::{Classification, Gating};
 use serde::{Deserialize, Serialize};
 
 use super::types::{attestation_type, identity_type};
@@ -2069,12 +2070,26 @@ impl std::fmt::Display for ConsentGatedFamily {
 /// [`dim::lookup`](ciris_verify_core::federation_provenance::dim::lookup) —
 /// the correct instinct, and the #541 / #532 / #574 lesson applied. Its error
 /// was one layer up: it treated verify's classification as a *ruling*, when
-/// verify itself calls the split **"a proposal from the measuring side, not a
-/// ruling"**. Verify knows what each dimension IS; the Constitution decides
-/// what the substrate does about it. So this predicate reads the floor, not
-/// the measuring side — and [`tests::verify_dimension_registry_is_the_only_enumeration`]
-/// is the adjudication record that keeps the two visible to each other, going
-/// red if EITHER moves.
+/// verify itself called the split **"a proposal from the measuring side, not a
+/// ruling"** — in prose, in a document persist's reader never opened. Verify
+/// knows what each dimension IS; the Constitution decides what the substrate
+/// does about it. So this predicate reads the floor, not the measuring side —
+/// and [`tests::verify_dimension_registry_is_the_only_enumeration`] is the
+/// adjudication record that keeps the two visible to each other, going red if
+/// EITHER moves.
+///
+/// # (#568): the answer now lives in the type
+///
+/// CIRISVerify v12.1.0's `classification::{Gating, Classification}` — asked
+/// for by persist (CIRISVerify#238) precisely because of the above — makes
+/// each shipped classification state whether a consumer may gate on it, and
+/// on whose authority. `ConsentDisposition` declares
+/// `Normative { authority: "CC 3.4.5" }`: **the same document this predicate
+/// reads.** The adjudication record now asks
+/// [`standing_of`]`::<ConsentDisposition>()` rather than asking a human to
+/// remember which side was measuring, and — because both sides now cite one
+/// ratified rule — it requires them to AGREE family-by-family instead of
+/// asserting one side alone.
 ///
 /// # Not a weakening (CC 3.4.5, reciprocity clause)
 ///
@@ -2096,6 +2111,99 @@ pub fn consent_gated_family(dimension: &str) -> Option<ConsentGatedFamily> {
     // role-gated abuse-response family outside it (`detection:*` /
     // `moderation:*` / `slashing:*`, `revocation:peer_admission:v1`).
     None
+}
+
+/// (CIRISPersist#568) — the ratifying documents **persist's own floor
+/// reads**, and therefore the only authorities a CIRISVerify classification
+/// may cite and still bind a persist gate.
+///
+/// A classification that is [`Gating::Normative`] is gate-able *somewhere* —
+/// but "normative" is meaningless without asking *on whose authority*. Verify
+/// may legitimately track a document persist does not: `Purpose` cites
+/// `draft-ietf-rats-concise-ta-stores-02`, an IETF draft, which is the right
+/// authority for a trust-anchor-store vocabulary and NOT a rule about what
+/// this substrate admits. Importing that as a persist gate would be the #569
+/// mistake wearing a citation.
+///
+/// So the list is short and every entry is a document persist can be held to.
+/// Adding one is a claim that persist's behaviour is answerable to it.
+pub const PERSIST_RATIFYING_AUTHORITIES: &[&str] = &["CC 3.4.5"];
+
+/// (CIRISPersist#568 / CIRISVerify#238) — what standing a
+/// CIRISVerify classification has **here**, in persist.
+///
+/// Three-valued because "may I gate on this?" has three honest answers, and
+/// #569 shipped because only two were ever considered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassificationStanding {
+    /// Verify declares it [`Gating::Normative`] **and** names an authority in
+    /// [`PERSIST_RATIFYING_AUTHORITIES`]. Verify's reading and persist's
+    /// reading are then two readings of ONE ratified document: they must
+    /// agree, and a divergence is a misreading to settle on the document —
+    /// not a disagreement to hold open.
+    Binding {
+        /// The ratifying document both sides are reading.
+        authority: &'static str,
+    },
+    /// Verify declares it [`Gating::Normative`], but on an authority persist's
+    /// floor does not read. Gate-able in verify's world; evidence in ours.
+    /// Adopting it means first deciding that persist is answerable to that
+    /// document — a deliberate edit to [`PERSIST_RATIFYING_AUTHORITIES`].
+    ForeignAuthority {
+        /// The document verify cites, which persist's floor does not.
+        authority: &'static str,
+    },
+    /// [`Gating::may_gate`] is false — a measurement or an unratified
+    /// proposal. Verify's own type says a consumer MUST NOT gate on it.
+    /// Persist may compose policy *over* it; persist may never take it AS
+    /// policy. This is the arm `ConsentDisposition` occupied at v11.0.0, when
+    /// nothing in the type said so and CIRISPersist#569 read it as a ruling.
+    NoStanding,
+}
+
+/// (CIRISPersist#568 / CIRISVerify#238) — the rule, applied to one
+/// [`Gating`].
+///
+/// Fail-closed in both directions that matter: anything verify does not mark
+/// gate-able is [`ClassificationStanding::NoStanding`], and any future
+/// gate-able status verify invents that is not `Normative` also lands there
+/// rather than being silently honoured.
+#[must_use]
+pub fn classification_standing(gating: Gating) -> ClassificationStanding {
+    // The type answers the first half. Persist does not re-derive it from
+    // variant names — re-deriving policy from a name is exactly what #569 did.
+    if !gating.may_gate() {
+        return ClassificationStanding::NoStanding;
+    }
+    match gating {
+        Gating::Normative { authority } if PERSIST_RATIFYING_AUTHORITIES.contains(&authority) => {
+            ClassificationStanding::Binding { authority }
+        }
+        Gating::Normative { authority } => ClassificationStanding::ForeignAuthority { authority },
+        // Unreachable while `may_gate()` is true only for `Normative`. Kept so
+        // that if verify ever widens `may_gate()`, the new status arrives here
+        // as NoStanding rather than as an unhandled ruling.
+        Gating::Measurement | Gating::Proposal { .. } => ClassificationStanding::NoStanding,
+    }
+}
+
+/// (CIRISPersist#568 / CIRISVerify#238) — **ask the type, not the
+/// prose**: what standing does the classification `C` have in persist?
+///
+/// The whole point of `ciris_verify_core::classification`. The call site names
+/// the verify TYPE and gets back persist's verdict; nobody has to find the
+/// sentence in another repo's document that said whether it was a ruling.
+///
+/// ```ignore
+/// use ciris_verify_core::federation_provenance::dim::ConsentDisposition;
+/// assert_eq!(
+///     standing_of::<ConsentDisposition>(),
+///     ClassificationStanding::Binding { authority: "CC 3.4.5" },
+/// );
+/// ```
+#[must_use]
+pub fn standing_of<C: Classification>() -> ClassificationStanding {
+    classification_standing(C::gating())
 }
 
 /// v25.1.0 (CIRISPersist#569) — the consent-gated claim a row makes, on
@@ -5324,9 +5432,28 @@ pub const CANONICAL_MIN_COSCRUBBERS: usize = 3;
 /// member's PINNED directory pubkeys), the 9c cert chains to the pinned
 /// [`YUBICO_ATTESTATION_ROOT_1_DER`] (every link a real signature verify),
 /// the attested key IS the member's federation Ed25519 key, and the Yubico
-/// extensions mark **FIPS-certified + touch=always** — the same predicate
-/// CIRISServer's holder-admission gate applies. Fail-closed: absent/
+/// extensions mark **FIPS-certified + touch=always**. Fail-closed: absent/
 /// malformed/unverifiable evidence ⇒ `Err` ⇒ the member does not count.
+///
+/// # The authority is #513, not a sibling's behaviour (corrected #568)
+///
+/// This note used to end *"— the same predicate CIRISServer's holder-admission
+/// gate applies."* That is a claim about a repo persist does not compile, it
+/// was never checked by anything here, and nothing would fail if it stopped
+/// being true — the exact shape #545/#554 turned into a live ceremony and the
+/// shape [`super::hardware_attestation`]'s custody note was rewritten to
+/// remove. Deleted rather than re-verified: **the floor is persist's own**
+/// (CIRISPersist#513), the pinned root is persist's own
+/// ([`YUBICO_ATTESTATION_ROOT_1_DER`]), and the walk runs here. Whether a
+/// sibling happens to agree is not this gate's warrant.
+///
+/// Noted under CIRISPersist#568's classification sweep: the two booleans
+/// gated here are verify **measurements** of a certificate's extensions, and
+/// the decision to refuse on them is persist's. `ciris-keyring` /
+/// `accord_custody_attestation` ship no
+/// [`Classification`] impl, so [`standing_of`] cannot be asked about them —
+/// the discipline is held by this comment, which is strictly weaker than the
+/// typed answer `ConsentDisposition` now gives.
 ///
 /// **Honest scope (encode, don't paper over — #513):** the FIPS attestation
 /// covers the **Ed25519 (classical) half** of the hybrid identity; the
@@ -8907,7 +9034,30 @@ mod tests {
     /// that touches the version-dependent surface of
     /// `ciris_verify_core::federation_provenance::dim`, so whoever re-pins
     /// verify has one function to edit rather than a scatter (see the
-    /// **v12.0.0** block below).
+    /// **v12.1.0** block below).
+    ///
+    /// # (#568): the disagreement RESOLVED, and it resolved in the type
+    ///
+    /// At v11.x this record held two sides apart. At **v12.1.0 they cite the
+    /// same document.** `ConsentDisposition` now implements
+    /// `ciris_verify_core::classification::Classification` and declares
+    /// `Normative { authority: "CC 3.4.5" }` — the very paragraph persist's
+    /// [`consent_gated_family`] reads. So the question this test used to
+    /// answer by prose ("is verify ruling or measuring here?") is answered by
+    /// the type, via [`standing_of`]`::<ConsentDisposition>()`, and the shape
+    /// of the assertion changes with the answer:
+    ///
+    /// - [`ClassificationStanding::Binding`] — one ratified rule, two readers.
+    ///   They must **AGREE family-by-family**, in both directions. A
+    ///   divergence is no longer "two sides doing their own jobs"; it is one
+    ///   of them misreading CC 3.4.5, and it gets settled on the document.
+    /// - [`ClassificationStanding::NoStanding`] / `ForeignAuthority` — verify
+    ///   is measuring, proposing, or citing a document persist's floor does
+    ///   not read. Persist's gate stands alone and nothing here is imported.
+    ///
+    /// The standing itself is pinned, so a demotion back to `Proposal` — or a
+    /// re-citation to some other authority — reopens the adjudication instead
+    /// of quietly relaxing this record into the weaker one-sided form it had.
     ///
     /// # The disagreement, as it stood at v11.x
     ///
@@ -8947,7 +9097,16 @@ mod tests {
     /// Neither direction may arrive as a side-effect of a dependency bump.
     #[test]
     fn verify_dimension_registry_is_the_only_enumeration() {
-        use ciris_verify_core::federation_provenance::dim;
+        use ciris_verify_core::federation_provenance::dim::{self, ConsentDisposition};
+
+        // The dimension shape the gate actually sees, for a registry entry.
+        let probe_for = |spec: &dim::DimensionSpec| {
+            if spec.parameterized {
+                format!("{}probe:v1", spec.prefix)
+            } else {
+                spec.prefix.to_owned()
+            }
+        };
 
         // CC part_3's 15 rows; 14 verify FAMILIES (the locale leaf is a
         // sub-form of `provenance:build_manifest:`, not its own family), of
@@ -8969,52 +9128,86 @@ mod tests {
         );
 
         // ─────────────────────────────────────────────────────────────────
-        // THE MEASURING SIDE'S CLASSIFICATION — the ONLY version-dependent
-        // read of verify's registry in this crate. Everything else here and
-        // in B7 uses `dim::ALL` / `dim::lookup` / `prefix` / `parameterized`,
-        // which were stable across the re-pin.
+        // MAY PERSIST GATE ON THIS AT ALL? **ASK THE TYPE** (#568).
         //
-        // **Now pinned against ciris-verify-core v12.0.0**, which verify
-        // shipped in response to this rework (CIRISVerify#238) and which
-        // agrees with CC 3.4.5 on all fourteen families:
+        // This is the question #569 got wrong, and it got it wrong honestly:
+        // at v11.x nothing in `ConsentClass` said whether it was a ruling or a
+        // proposal — the sentence that said so lived in another repo's prose.
+        // CIRISVerify#238 (which persist filed) fixed the class, and v12.1.0
+        // ships `classification::{Gating, Classification}`. Persist is its
+        // first consumer, and this is the call site.
+        //
+        // `Normative { authority: "CC 3.4.5" }` is the answer we pin: verify's
+        // classification tracks the SAME ratified paragraph `consent_gated_
+        // family` reads. Not "verify agrees with us" — one document, two
+        // readers. That is what makes the two-sided assertion below correct.
+        // ─────────────────────────────────────────────────────────────────
+        assert_eq!(
+            standing_of::<ConsentDisposition>(),
+            ClassificationStanding::Binding {
+                authority: "CC 3.4.5"
+            },
+            "verify's `ConsentDisposition` no longer declares itself NORMATIVE on CC 3.4.5 \
+             (it now says {:?}). The adjudication basis of this record changed, so re-open \
+             it rather than re-pinning through: if verify demoted it to Measurement or \
+             Proposal, persist's gate stands ALONE on CC 3.4.5 and the agreement assertion \
+             below must go back to the one-sided v11 form; if verify re-cited some OTHER \
+             authority, decide whether persist's floor is answerable to that document \
+             before adding it to PERSIST_RATIFYING_AUTHORITIES. Gating on an unratified \
+             proposal is the defect CIRISPersist#569 shipped and CIRISVerify#238 corrected.",
+            <ConsentDisposition as Classification>::gating()
+        );
+
+        // ── ONE RULE, TWO READERS — so they must AGREE, both directions ──
+        // The ONLY version-dependent read of verify's registry in this crate.
+        // Everything else here and in B7 uses `dim::ALL` / `dim::lookup` /
+        // `prefix` / `parameterized`, which were stable across the re-pin.
+        //
+        // Pinned against ciris-verify-core v12.1.0, which agrees with CC 3.4.5
+        // on all fourteen families:
         //
         //   * `ConsentClass`         -> `ConsentDisposition`
         //   * `ConsensualReputation` -> `ArtifactVerification` / `AbuseResponse`
-        //   * the predicate is now a METHOD, `spec.is_consent_gated()`,
-        //     deliberately not an implicit property of a variant name, "so the
-        //     wrong gate cannot be re-derived from variant names" — which is
-        //     exactly the mistake #569 made.
+        //   * the predicate is a METHOD, `spec.is_consent_gated()`, deliberately
+        //     not an implicit property of a variant name, "so the wrong gate
+        //     cannot be re-derived from variant names" — exactly #569's mistake.
         //
-        // The v11 form pinned four prefixes BY NAME. This one sweeps the whole
-        // registry, so it fires if verify ever re-gates ANY family rather than
-        // only if one of four named prefixes moves. Strictly stronger, and it
-        // was verify's own proposal.
-        // ─────────────────────────────────────────────────────────────────
+        // The v11 form pinned four prefixes BY NAME and asserted only that
+        // verify gated none. This sweeps the whole registry and asserts the two
+        // readings MATCH — so a divergence in EITHER direction (verify gates
+        // what persist does not, or persist gates what verify does not) is a
+        // misreading of one document, and gets settled there.
         for spec in dim::ALL {
-            assert!(
-                !spec.consent_disposition.is_consent_gated(),
-                "verify now consent-gates `{}`, but CC 3.4.5 gates NO verify-owned family — \
-                 consent-before-scoring binds the family that judges agents (`capacity:*`), \
-                 never the families that verify artifacts. Do NOT follow the measuring side \
-                 here: re-read CC 3.4.5's per-family disposition and adjudicate. Following \
-                 verify's classification over the floor's ruling is precisely the defect \
-                 CIRISPersist#569 shipped and CIRISVerify#238 corrected.",
-                spec.prefix
+            let probe = probe_for(spec);
+            assert_eq!(
+                spec.consent_disposition.is_consent_gated(),
+                consent_gated_family(&probe).is_some(),
+                "verify and persist read CC 3.4.5 differently on `{}`: verify says gated={}, \
+                 persist says gated={}. Both now cite the SAME ratified paragraph (verify's \
+                 ConsentDisposition declares Normative(\"CC 3.4.5\")), so this is not a \
+                 disagreement to hold open — one of the two is misreading the document. \
+                 Re-read CC 3.4.5's paragraph headed \"Disposition of the CC 2.3.2 \
+                 verification families under this rule (per family)\" and settle it THERE. \
+                 The rule: consent-before-scoring binds the family that judges agents \
+                 (`capacity:*`), never the families that verify artifacts.",
+                spec.prefix,
+                spec.consent_disposition.is_consent_gated(),
+                consent_gated_family(&probe).is_some()
             );
         }
 
         // ── THE FLOOR'S RULING — persist gates NONE of verify's namespace ──
-        // Over the WHOLE registry, not just the four above: a CC amendment
-        // moving any family across the line, or a re-widening of the gate,
-        // lands here. Probed through the one predicate the gate itself calls,
-        // on the real dimension shape, so this asserts shipped behaviour and
-        // not a restatement of the source.
+        // Over the WHOLE registry: a CC amendment moving any family across the
+        // line, or a re-widening of the gate, lands here. Probed through the
+        // one predicate the gate itself calls, on the real dimension shape, so
+        // this asserts shipped behaviour and not a restatement of the source.
+        //
+        // NOT redundant with the agreement sweep above: that one would stay
+        // green if BOTH sides moved together, which is precisely how a
+        // dependency bump could carry a widening in. This one is anchored to
+        // the floor alone.
         for spec in dim::ALL {
-            let probe = if spec.parameterized {
-                format!("{}probe:v1", spec.prefix)
-            } else {
-                spec.prefix.to_owned()
-            };
+            let probe = probe_for(spec);
             assert_eq!(
                 consent_gated_family(&probe),
                 None,
@@ -9066,6 +9259,101 @@ mod tests {
                 !spec.parameterized && spec.prefix == *m,
                 "{m} resolves to a DIFFERENT registry family ({}) — the two lists have drifted",
                 spec.prefix
+            );
+        }
+    }
+
+    /// (CIRISPersist#568 / CIRISVerify#238) — the rule that decides
+    /// whether ANY verify classification may bind a persist gate, exercised on
+    /// all three statuses plus the case the statuses alone do not cover.
+    ///
+    /// [`verify_dimension_registry_is_the_only_enumeration`] only ever sees one
+    /// status at a time; without this, the other arms would be shipped and
+    /// never run. Each case is a real failure mode:
+    ///
+    /// - `Measurement` — device-attestation verdicts. A consumer that gates
+    ///   admission on `AndroidSecurityLevel` has made hardware a REQUIREMENT,
+    ///   the exact inversion verify's own docs warn against, and the inversion
+    ///   persist's `hardware_attestation` module deliberately refuses.
+    /// - `Proposal` — the arm `ConsentDisposition` occupied at v11.0.0. #569.
+    /// - `Normative` on a **foreign** authority — the case `may_gate()` alone
+    ///   cannot answer. `Purpose` is genuinely normative on an IETF draft; that
+    ///   makes it gate-able for a trust-anchor store, not a rule about what
+    ///   this substrate admits. "Normative" without "on whose authority" is
+    ///   the same ambiguity one level up.
+    #[test]
+    fn only_a_ratified_authority_persist_reads_may_bind_a_gate() {
+        use ciris_verify_core::device_attestation::{AndroidSecurityLevel, AppAttestEnvironment};
+        use ciris_verify_core::trust_anchor_store::Purpose;
+
+        assert_eq!(
+            classification_standing(Gating::Normative {
+                authority: "CC 3.4.5"
+            }),
+            ClassificationStanding::Binding {
+                authority: "CC 3.4.5"
+            }
+        );
+        assert_eq!(
+            classification_standing(Gating::Measurement),
+            ClassificationStanding::NoStanding,
+            "a measurement is an INPUT to policy, never policy"
+        );
+        assert_eq!(
+            classification_standing(Gating::Proposal {
+                tracking: "CIRISVerify#238"
+            }),
+            ClassificationStanding::NoStanding,
+            "an unratified proposal has no standing at all — this is the #569 arm"
+        );
+        assert_eq!(
+            classification_standing(Gating::Normative {
+                authority: "some-other-repos-charter"
+            }),
+            ClassificationStanding::ForeignAuthority {
+                authority: "some-other-repos-charter"
+            },
+            "normative elsewhere is not normative here: persist's floor must be answerable \
+             to a document before a classification citing it can bind a persist gate"
+        );
+
+        // Against the classifications verify actually ships, so this cannot
+        // drift into testing only hand-built `Gating` values.
+        assert_eq!(
+            standing_of::<AndroidSecurityLevel>(),
+            ClassificationStanding::NoStanding,
+            "where the chain says a key lives is a MEASUREMENT — gating admission on it \
+             would make hardware a requirement, which persist's hardware_attestation module \
+             refuses by design (the SoftwareOnly floor is the one structural line)"
+        );
+        assert_eq!(
+            standing_of::<AppAttestEnvironment>(),
+            ClassificationStanding::NoStanding,
+            "production-vs-development is reported, never enforced"
+        );
+        assert_eq!(
+            standing_of::<Purpose>(),
+            ClassificationStanding::ForeignAuthority {
+                authority: "draft-ietf-rats-concise-ta-stores-02"
+            },
+            "the CoTS purpose vocabulary is normative on an IETF draft — correct for a \
+             trust-anchor store, and NOT a rule about what this substrate admits. If persist \
+             ever adopts constrained anchor resolution it adds that draft to \
+             PERSIST_RATIFYING_AUTHORITIES deliberately, in the change that adopts it."
+        );
+
+        // And the rule is exactly `may_gate()` plus the authority question —
+        // no persist-side re-derivation from variant names (#569's method).
+        for g in [
+            Gating::Measurement,
+            Gating::Proposal {
+                tracking: "CIRISVerify#238",
+            },
+        ] {
+            assert!(!g.may_gate());
+            assert_eq!(
+                classification_standing(g),
+                ClassificationStanding::NoStanding
             );
         }
     }
