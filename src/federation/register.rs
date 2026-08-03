@@ -772,6 +772,789 @@ where
     Ok(outcome)
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+//  #570 ask 4 — time-bounded de-admission
+// ─────────────────────────────────────────────────────────────────────────
+
+/// v25.1.0 (CIRISPersist#570 ask 4) — **WHICH branch refused** a revocation's
+/// history bound
+/// ([`Revocation::revoked_after`](super::types::Revocation::revoked_after)).
+///
+/// Closed, snake_case serde tokens, [`Self::as_str`] returning the SAME token,
+/// no catch-all — the [`KeyRefusalReason`] discipline. **The token set is the
+/// downstream contract and this mapping is APPEND-ONLY.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevocationBoundRefusal {
+    /// The typed row carries a bound and the SIGNED `revocation_envelope`
+    /// does not. The bound decides which of a key's history stands, so an
+    /// unsigned one is a free lunch for anyone who can touch the row between
+    /// the signer and the store — the #541 preserve-set-equals-verified-set
+    /// class, on the field where it would be most valuable to exploit.
+    EnvelopeBoundAbsent,
+    /// The signed envelope carries a bound and the typed projection does not.
+    /// The mirror direction: the signer said "from Tuesday", the row says
+    /// "everything", and the row is what the fold reads. Refused rather than
+    /// repaired — a substrate that silently rewrites the typed value to match
+    /// is a substrate whose stored rows no longer mean what they say.
+    TypedBoundAbsent,
+    /// Both carry a bound and they disagree. Whatever was intended, one of
+    /// them is not what was signed.
+    TypedBoundDiverges,
+    /// The envelope's `revoked_after` is not an RFC-3339 timestamp.
+    BoundNotRfc3339,
+    /// The bound is AFTER [`Revocation::effective_at`](super::types::Revocation::effective_at)
+    /// — "this key is de-admitted from Monday, but everything it said through
+    /// Friday stands". Incoherent: it would leave three days of statements
+    /// standing on a key the same row says was already out. A bound is
+    /// at-or-before the instant the revocation takes effect.
+    BoundAfterEffective,
+}
+
+impl RevocationBoundRefusal {
+    /// The **stable program token** — identical to the serde token.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::EnvelopeBoundAbsent => "envelope_bound_absent",
+            Self::TypedBoundAbsent => "typed_bound_absent",
+            Self::TypedBoundDiverges => "typed_bound_diverges",
+            Self::BoundNotRfc3339 => "bound_not_rfc3339",
+            Self::BoundAfterEffective => "bound_after_effective",
+        }
+    }
+
+    /// Every variant, in declaration order — the closed set.
+    pub const ALL: &'static [Self] = &[
+        Self::EnvelopeBoundAbsent,
+        Self::TypedBoundAbsent,
+        Self::TypedBoundDiverges,
+        Self::BoundNotRfc3339,
+        Self::BoundAfterEffective,
+    ];
+}
+
+impl std::fmt::Display for RevocationBoundRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<RevocationBoundRefusal> for Error {
+    fn from(reason: RevocationBoundRefusal) -> Self {
+        Error::RevocationBoundInvalid { reason }
+    }
+}
+
+/// The signed-envelope key carrying the history bound. The typed
+/// [`Revocation::revoked_after`](super::types::Revocation::revoked_after) must
+/// mirror it exactly.
+pub const REVOKED_AFTER_ENVELOPE_FIELD: &str = "revoked_after";
+
+/// v25.1.0 (CIRISPersist#570 ask 4) — **the history-bound gate.** Run at the
+/// top of every backend's `put_revocation`, before the row is hashed and
+/// before INSERT (verify-before-mutation, AV-9), so a refused bound leaves no
+/// row.
+///
+/// A revocation with no bound on either side passes untouched — that is the
+/// pre-v25.1 shape and it still means all-or-nothing.
+///
+/// # What this gate is for
+///
+/// The bound is the only field on the revocation plane that makes some of a
+/// revoked key's corpus keep standing. Everything else on the row makes things
+/// *less* admissible; this one makes things *more*. That asymmetry is why it
+/// is checked against the signature rather than merely stored: an unsigned
+/// leniency field is an attacker's field.
+pub fn check_revocation_bound(
+    row: &super::types::Revocation,
+) -> Result<(), RevocationBoundRefusal> {
+    let envelope_bound = match row.revocation_envelope.get(REVOKED_AFTER_ENVELOPE_FIELD) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let s = v.as_str().ok_or(RevocationBoundRefusal::BoundNotRfc3339)?;
+            let parsed = chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|_| RevocationBoundRefusal::BoundNotRfc3339)?
+                .with_timezone(&chrono::Utc);
+            Some(parsed)
+        }
+    };
+    match (row.revoked_after, envelope_bound) {
+        (None, None) => return Ok(()),
+        (Some(_), None) => return Err(RevocationBoundRefusal::EnvelopeBoundAbsent),
+        (None, Some(_)) => return Err(RevocationBoundRefusal::TypedBoundAbsent),
+        (Some(typed), Some(signed)) => {
+            if typed != signed {
+                return Err(RevocationBoundRefusal::TypedBoundDiverges);
+            }
+            if typed > row.effective_at {
+                return Err(RevocationBoundRefusal::BoundAfterEffective);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v25.1.0 (CIRISPersist#570 ask 4) — what this node's held revocations say
+/// about a statement `key_id` made at `statement_at`.
+///
+/// A derived STATE, not a sentence: a pure function of the revocation rows
+/// this node holds, recomputed at read time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStatementStanding {
+    /// No revocation this node holds covers the statement — either the key is
+    /// not revoked here, or every revocation against it is history-bounded at
+    /// or after the statement's instant. The key's honest past.
+    Stands,
+    /// At least one revocation covers the statement, and it is
+    /// history-bounded: this key said this AFTER the bound.
+    SuspectAfterBound,
+    /// At least one UNBOUNDED revocation covers the key. Everything it ever
+    /// said is in doubt, because the revocation declined to say otherwise —
+    /// the pre-#570 shape, now nameable.
+    SuspectUnbounded,
+}
+
+impl KeyStatementStanding {
+    /// The stable program token — identical to the serde token.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stands => "stands",
+            Self::SuspectAfterBound => "suspect_after_bound",
+            Self::SuspectUnbounded => "suspect_unbounded",
+        }
+    }
+
+    /// Does this standing put the statement in doubt?
+    #[must_use]
+    pub const fn is_suspect(&self) -> bool {
+        !matches!(self, Self::Stands)
+    }
+}
+
+/// The read-time answer, with the evidence that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KeyStatementFold {
+    /// The key the fold is about.
+    pub key_id: String,
+    /// The statement instant asked about.
+    pub statement_at: chrono::DateTime<chrono::Utc>,
+    /// The derived standing.
+    pub standing: KeyStatementStanding,
+    /// The `revocation_id`s that COVER the statement, sorted. The fold names
+    /// its evidence; an empty list is the whole reason `Stands` is `Stands`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub covered_by: Vec<String>,
+    /// How many revocations against this key were considered (in effect as of
+    /// `now`), covering or not. `covered_by.len() < considered` is exactly the
+    /// case #570 ask 4 makes expressible.
+    pub considered: usize,
+}
+
+/// v25.1.0 (CIRISPersist#570 ask 4) — **the pure fold**: a function of
+/// `(key_id, revocations, statement_at, now)` and nothing else.
+///
+/// A revocation is CONSIDERED iff it names `key_id` and has taken effect
+/// (`effective_at <= now`) — a future-dated de-admission has not happened yet.
+/// A considered revocation COVERS the statement iff
+/// [`Revocation::suspects_statement_at`](super::types::Revocation::suspects_statement_at).
+///
+/// Standing is the **most severe** covering verdict: one unbounded revocation
+/// makes the whole corpus suspect however many bounded ones sit beside it.
+/// Restrictions compose; leniencies do not — the same rule the mesh-config
+/// plane will need when its authority is named.
+#[must_use]
+pub fn fold_key_statement_standing(
+    key_id: &str,
+    revocations: &[super::types::Revocation],
+    statement_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> KeyStatementFold {
+    let considered: Vec<&super::types::Revocation> = revocations
+        .iter()
+        .filter(|r| r.revoked_key_id == key_id && r.effective_at <= now)
+        .collect();
+    let mut covered_by: Vec<String> = Vec::new();
+    let mut any_unbounded = false;
+    for r in &considered {
+        if r.suspects_statement_at(statement_at) {
+            covered_by.push(r.revocation_id.clone());
+            if !r.is_history_bounded() {
+                any_unbounded = true;
+            }
+        }
+    }
+    covered_by.sort();
+    let standing = if covered_by.is_empty() {
+        KeyStatementStanding::Stands
+    } else if any_unbounded {
+        KeyStatementStanding::SuspectUnbounded
+    } else {
+        KeyStatementStanding::SuspectAfterBound
+    };
+    KeyStatementFold {
+        key_id: key_id.to_owned(),
+        statement_at,
+        standing,
+        covered_by,
+        considered: considered.len(),
+    }
+}
+
+/// v25.1.0 (CIRISPersist#570 ask 4) — **the read-time answer**, re-derived
+/// from the revocations THIS node holds
+/// ([`revocations_for`](FederationDirectory::revocations_for)), never from a
+/// caller-supplied verdict (#377).
+///
+/// # Which read paths honour the bound, stated rather than implied
+///
+/// This function, and
+/// [`Engine::resolve_key_statement_standing`](crate::Engine::resolve_key_statement_standing)
+/// which exposes it to hosts. That is the honest list, and the reason it is
+/// short is worth writing down rather than papering over:
+///
+/// - **Signature verification cannot honour it.** `verify_hybrid` and
+///   [`verify_envelope_hybrid_signature`](super::verify_envelope_hybrid_signature)
+///   answer a mathematical question — do these bytes carry this key's
+///   signature. A compromised key's signature still verifies; that is what
+///   makes compromise dangerous. Wiring a revocation lookup into the verifier
+///   would conflate integrity with admission, which this repo has one recorded
+///   defect class for already.
+/// - **The `list_signed_*_since` replication cursors do not honour it.** They
+///   serve byte-faithful signed rows so a peer can re-verify them itself; a
+///   node that silently dropped a revoked key's history from the wire would be
+///   imposing ITS revocation policy on every subscriber, which is precisely
+///   the "exit is real / config may restrict, never expand" line #570 draws
+///   for the mesh-config plane. Peers apply their own fold on what they hold.
+/// - **`put_attestation` does not honour it.** Refusing to ingest a
+///   compromised key's older rows would destroy the evidence needed to
+///   adjudicate the compromise. Store everything, adjudicate carefully.
+///
+/// So the bound is **expressible, signed, replicated, and re-derivable**, and
+/// the enforcement point is the consumer's read — which is the same place
+/// `#234` already documented key revocation being applied (`revocations_for` +
+/// the row's `valid_until`). #570 ask 4 makes that read able to say *from this
+/// instant* instead of only *ever*.
+pub async fn resolve_key_statement_standing<F>(
+    directory: &F,
+    key_id: &str,
+    statement_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<KeyStatementFold, Error>
+where
+    F: FederationDirectory + ?Sized,
+{
+    let revocations = match directory.revocations_for(key_id).await {
+        Ok(rows) => rows,
+        Err(Error::Unsupported { .. }) => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    Ok(fold_key_statement_standing(
+        key_id,
+        &revocations,
+        statement_at,
+        now,
+    ))
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+    use chrono::{DateTime, Duration, Utc};
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        s.parse().expect("rfc3339")
+    }
+
+    fn rev(
+        id: &str,
+        key: &str,
+        effective_at: &str,
+        bound: Option<&str>,
+    ) -> super::super::types::Revocation {
+        let revoked_after = bound.map(ts);
+        let mut envelope = serde_json::json!({ "revoked_key_id": key });
+        if let Some(b) = bound {
+            envelope[REVOKED_AFTER_ENVELOPE_FIELD] = serde_json::json!(b);
+        }
+        super::super::types::Revocation {
+            revocation_id: id.to_owned(),
+            revoked_key_id: key.to_owned(),
+            revoking_key_id: "k-admin".to_owned(),
+            reason: None,
+            revoked_at: ts(effective_at),
+            effective_at: ts(effective_at),
+            revocation_envelope: envelope,
+            original_content_hash: "00".to_owned(),
+            scrub_signature_classical: "c2ln".to_owned(),
+            scrub_signature_pqc: None,
+            scrub_key_id: "k-admin".to_owned(),
+            scrub_timestamp: ts(effective_at),
+            pqc_completed_at: None,
+            observed_region: "us".to_owned(),
+            revoked_after,
+            persist_row_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn bound_refusal_tokens_match_serde_and_are_unique() {
+        let mut tokens: Vec<&str> = RevocationBoundRefusal::ALL
+            .iter()
+            .map(|r| r.as_str())
+            .collect();
+        for reason in RevocationBoundRefusal::ALL {
+            let json = serde_json::to_string(reason).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", reason.as_str()));
+            let back: RevocationBoundRefusal = serde_json::from_str(&json).expect("round-trip");
+            assert_eq!(&back, reason);
+        }
+        let n = tokens.len();
+        tokens.sort_unstable();
+        tokens.dedup();
+        assert_eq!(tokens.len(), n);
+    }
+
+    #[test]
+    fn an_unbounded_revocation_still_admits_unchanged() {
+        // The pre-v25.1 shape must keep passing byte-for-byte, and must keep
+        // meaning all-or-nothing.
+        let r = rev("r-1", "k-bad", "2026-08-02T10:00:00Z", None);
+        check_revocation_bound(&r).expect("no bound on either side is the old shape");
+        assert!(!r.is_history_bounded());
+        assert!(r.suspects_statement_at(ts("2020-01-01T00:00:00Z")));
+        assert!(r.suspects_statement_at(ts("2030-01-01T00:00:00Z")));
+        // And it hashes as if the field did not exist (serde skips `None`).
+        let json = serde_json::to_value(&r).expect("serialize");
+        assert!(
+            json.get("revoked_after").is_none(),
+            "a None bound must be skipped from canonical bytes so pre-v25.1 \
+             rows and explicit unbounded rows hash identically"
+        );
+    }
+
+    #[test]
+    fn the_bound_must_be_signed_in_both_directions() {
+        // Typed bound, no envelope bound — the forgeable-leniency attack.
+        let mut r = rev("r-1", "k-bad", "2026-08-02T10:00:00Z", None);
+        r.revoked_after = Some(ts("2026-08-01T00:00:00Z"));
+        assert_eq!(
+            check_revocation_bound(&r),
+            Err(RevocationBoundRefusal::EnvelopeBoundAbsent)
+        );
+        // Envelope bound, no typed bound — the row would not mean what was
+        // signed.
+        let mut r = rev("r-1", "k-bad", "2026-08-02T10:00:00Z", None);
+        r.revocation_envelope[REVOKED_AFTER_ENVELOPE_FIELD] =
+            serde_json::json!("2026-08-01T00:00:00Z");
+        assert_eq!(
+            check_revocation_bound(&r),
+            Err(RevocationBoundRefusal::TypedBoundAbsent)
+        );
+        // Both present, disagreeing.
+        let mut r = rev(
+            "r-1",
+            "k-bad",
+            "2026-08-02T10:00:00Z",
+            Some("2026-08-01T00:00:00Z"),
+        );
+        r.revoked_after = Some(ts("2026-07-01T00:00:00Z"));
+        assert_eq!(
+            check_revocation_bound(&r),
+            Err(RevocationBoundRefusal::TypedBoundDiverges)
+        );
+        // Envelope bound is not a timestamp.
+        let mut r = rev(
+            "r-1",
+            "k-bad",
+            "2026-08-02T10:00:00Z",
+            Some("2026-08-01T00:00:00Z"),
+        );
+        r.revocation_envelope[REVOKED_AFTER_ENVELOPE_FIELD] = serde_json::json!("last tuesday");
+        assert_eq!(
+            check_revocation_bound(&r),
+            Err(RevocationBoundRefusal::BoundNotRfc3339)
+        );
+        let mut r = rev(
+            "r-1",
+            "k-bad",
+            "2026-08-02T10:00:00Z",
+            Some("2026-08-01T00:00:00Z"),
+        );
+        r.revocation_envelope[REVOKED_AFTER_ENVELOPE_FIELD] = serde_json::json!(1_754_000_000);
+        assert_eq!(
+            check_revocation_bound(&r),
+            Err(RevocationBoundRefusal::BoundNotRfc3339)
+        );
+    }
+
+    #[test]
+    fn a_bound_after_the_effective_instant_is_incoherent() {
+        let r = rev(
+            "r-1",
+            "k-bad",
+            "2026-08-02T10:00:00Z",
+            Some("2026-08-05T00:00:00Z"),
+        );
+        assert_eq!(
+            check_revocation_bound(&r),
+            Err(RevocationBoundRefusal::BoundAfterEffective)
+        );
+        // At the effective instant exactly is fine (the common "revoke now,
+        // everything up to now stands" shape).
+        let r = rev(
+            "r-1",
+            "k-bad",
+            "2026-08-02T10:00:00Z",
+            Some("2026-08-02T10:00:00Z"),
+        );
+        check_revocation_bound(&r).expect("bound == effective_at is coherent");
+    }
+
+    #[test]
+    fn the_comparator_leaves_the_boundary_instant_standing() {
+        let r = rev(
+            "r-1",
+            "k-bad",
+            "2026-08-02T10:00:00Z",
+            Some("2026-08-02T09:00:00Z"),
+        );
+        assert!(
+            !r.suspects_statement_at(ts("2026-08-02T08:59:59Z")),
+            "Monday survives — the whole point of the bound"
+        );
+        assert!(
+            !r.suspects_statement_at(ts("2026-08-02T09:00:00Z")),
+            "the boundary instant itself stands: a bound says AFTER this"
+        );
+        assert!(r.suspects_statement_at(ts("2026-08-02T09:00:01Z")));
+    }
+
+    #[test]
+    fn the_fold_names_its_evidence_and_takes_the_most_severe_verdict() {
+        let now = ts("2026-08-10T00:00:00Z");
+        let bounded = rev(
+            "r-bounded",
+            "k-bad",
+            "2026-08-02T10:00:00Z",
+            Some("2026-08-02T09:00:00Z"),
+        );
+        let unbounded = rev("r-all", "k-bad", "2026-08-03T10:00:00Z", None);
+
+        // Only the bounded revocation: Monday stands.
+        let f = fold_key_statement_standing(
+            "k-bad",
+            std::slice::from_ref(&bounded),
+            ts("2026-08-01T00:00:00Z"),
+            now,
+        );
+        assert_eq!(f.standing, KeyStatementStanding::Stands);
+        assert!(!f.standing.is_suspect());
+        assert!(f.covered_by.is_empty());
+        assert_eq!(
+            f.considered, 1,
+            "a revocation that did not cover is still evidence the fold saw"
+        );
+
+        // …and Wednesday does not.
+        let f = fold_key_statement_standing(
+            "k-bad",
+            std::slice::from_ref(&bounded),
+            ts("2026-08-02T12:00:00Z"),
+            now,
+        );
+        assert_eq!(f.standing, KeyStatementStanding::SuspectAfterBound);
+        assert_eq!(f.covered_by, vec!["r-bounded".to_owned()]);
+
+        // One unbounded revocation beside it makes the whole corpus suspect —
+        // restrictions compose, leniencies do not.
+        let f = fold_key_statement_standing(
+            "k-bad",
+            &[bounded.clone(), unbounded.clone()],
+            ts("2026-08-01T00:00:00Z"),
+            now,
+        );
+        assert_eq!(f.standing, KeyStatementStanding::SuspectUnbounded);
+        assert_eq!(f.covered_by, vec!["r-all".to_owned()]);
+        assert_eq!(f.considered, 2);
+    }
+
+    #[test]
+    fn a_future_dated_revocation_is_not_yet_considered() {
+        let now = ts("2026-08-01T00:00:00Z");
+        let future = rev("r-1", "k-bad", "2026-09-01T00:00:00Z", None);
+        let f = fold_key_statement_standing("k-bad", &[future], ts("2026-07-01T00:00:00Z"), now);
+        assert_eq!(f.standing, KeyStatementStanding::Stands);
+        assert_eq!(f.considered, 0);
+    }
+
+    #[test]
+    fn another_keys_revocation_does_not_reach_this_one() {
+        let now = ts("2026-08-10T00:00:00Z");
+        let other = rev("r-1", "k-other", "2026-08-02T10:00:00Z", None);
+        let f = fold_key_statement_standing("k-bad", &[other], ts("2026-08-05T00:00:00Z"), now);
+        assert_eq!(f.standing, KeyStatementStanding::Stands);
+        assert_eq!(f.considered, 0);
+    }
+
+    #[test]
+    fn standing_tokens_are_stable() {
+        for s in [
+            KeyStatementStanding::Stands,
+            KeyStatementStanding::SuspectAfterBound,
+            KeyStatementStanding::SuspectUnbounded,
+        ] {
+            let json = serde_json::to_string(&s).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", s.as_str()));
+        }
+        assert!(!KeyStatementStanding::Stands.is_suspect());
+        assert!(KeyStatementStanding::SuspectAfterBound.is_suspect());
+        assert!(KeyStatementStanding::SuspectUnbounded.is_suspect());
+        // The bound must not be reachable by an all-or-nothing sentinel: a
+        // caller that means "everything is suspect" writes None, never a
+        // far-past timestamp that a later fold could mistake for leniency.
+        assert_ne!(
+            KeyStatementStanding::SuspectUnbounded,
+            KeyStatementStanding::SuspectAfterBound
+        );
+        let _ = Duration::seconds(1);
+    }
+}
+
+/// The #570 ask-4 behavioural witness, run by the sqlite / postgres / memory
+/// suites against `&dyn FederationDirectory` so the three backends cannot
+/// silently diverge on the history bound. `suffix` scopes every fixture key.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod bound_test_support {
+    use super::*;
+    use chrono::{DateTime, Duration, Utc};
+
+    /// Register `key_id` with its REAL deterministic hybrid pubkeys, so the
+    /// revocation's scrub signature verifies against this node's directory
+    /// (`verify_revocation_admission` runs before the bound gate).
+    async fn register_key(dir: &dyn FederationDirectory, key_id: &str) {
+        let (ed_pk, mldsa_pk) =
+            crate::federation::tier_ingest::test_support::hybrid_pubkeys(key_id);
+        let now = Utc::now();
+        dir.put_public_key(super::super::SignedKeyRecord {
+            record: KeyRecord {
+                key_id: key_id.to_owned(),
+                pubkey_ed25519_base64: ed_pk,
+                pubkey_ml_dsa_65_base64: mldsa_pk,
+                algorithm: algorithm::HYBRID.to_owned(),
+                identity_type: super::super::types::identity_type::USER.to_owned(),
+                identity_ref: key_id.to_owned(),
+                valid_from: now,
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "id": key_id }),
+                original_content_hash: "deadbeef".to_owned(),
+                scrub_signature_classical: "c2lnbmF0dXJl".to_owned(),
+                scrub_signature_pqc: None,
+                scrub_key_id: key_id.to_owned(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .expect("register key");
+    }
+
+    /// A signed revocation of `revoked` by `revoker`, optionally carrying a
+    /// history bound. `envelope_bound` / `typed_bound` are separated so the
+    /// witness can drive the divergence branches.
+    fn signed_revocation(
+        revoker: &str,
+        revoked: &str,
+        effective_at: DateTime<Utc>,
+        envelope_bound: Option<DateTime<Utc>>,
+        typed_bound: Option<DateTime<Utc>>,
+    ) -> super::super::SignedRevocation {
+        let mut envelope = serde_json::json!({
+            "revoked_key_id": revoked,
+            "revoking_key_id": revoker,
+            "effective_at": effective_at.to_rfc3339(),
+        });
+        if let Some(b) = envelope_bound {
+            envelope[REVOKED_AFTER_ENVELOPE_FIELD] = serde_json::json!(b.to_rfc3339());
+        }
+        let (och, ed_sig, pqc_sig) =
+            crate::federation::tier_ingest::test_support::sign_envelope(revoker, &envelope);
+        super::super::SignedRevocation {
+            revocation: super::super::types::Revocation {
+                revocation_id: uuid::Uuid::new_v4().to_string(),
+                revoked_key_id: revoked.to_owned(),
+                revoking_key_id: revoker.to_owned(),
+                reason: Some("compromise".to_owned()),
+                revoked_at: effective_at,
+                effective_at,
+                revocation_envelope: envelope,
+                original_content_hash: och,
+                scrub_signature_classical: ed_sig,
+                scrub_signature_pqc: pqc_sig,
+                scrub_key_id: revoker.to_owned(),
+                scrub_timestamp: effective_at,
+                pqc_completed_at: None,
+                observed_region: crate::federation::verify_coord::region::US.to_owned(),
+                revoked_after: typed_bound,
+                persist_row_hash: String::new(),
+            },
+        }
+    }
+
+    /// **The #570 ask-4 witness:**
+    ///
+    /// 1. a typed bound with NO signed bound is REFUSED naming
+    ///    `envelope_bound_absent` — the forgeable-leniency branch;
+    /// 2. a bound later than `effective_at` is REFUSED;
+    /// 3. a properly signed bound ROUND-TRIPS through the backend column;
+    /// 4. the fold leaves the key's PRIOR statements standing and marks only
+    ///    what came after the bound suspect — the whole point of ask 4;
+    /// 5. an UNBOUNDED revocation beside it makes the whole corpus suspect
+    ///    (restrictions compose; leniencies do not).
+    pub(crate) async fn exercise_revocation_bound(dir: &dyn FederationDirectory, suffix: &str) {
+        let admin = format!("rb-admin-{suffix}");
+        let victim = format!("rb-victim-{suffix}");
+        register_key(dir, &admin).await;
+        register_key(dir, &victim).await;
+
+        // Anti-rollback keys on scrub_timestamp per revoked key, so the two
+        // revocations this witness stores must advance. Everything is anchored
+        // in the PAST so that both `effective_at`s have arrived by the time
+        // the fold runs — a future-dated revocation is deliberately not
+        // considered, and anchoring at `now` would make that correct behaviour
+        // look like a bug on a fast machine.
+        let compromise = Utc::now() - Duration::hours(24);
+        let monday = compromise - Duration::hours(48);
+        let after = compromise + Duration::hours(1);
+
+        // ── (1) typed bound, unsigned ⇒ refused.
+        let forged = signed_revocation(&admin, &victim, compromise, None, Some(monday));
+        let err = dir
+            .put_revocation(forged)
+            .await
+            .expect_err("an unsigned leniency field is an attacker's field");
+        assert_eq!(
+            err.kind(),
+            "federation_revocation_bound_invalid",
+            "({suffix})"
+        );
+        assert!(
+            matches!(
+                err,
+                Error::RevocationBoundInvalid {
+                    reason: RevocationBoundRefusal::EnvelopeBoundAbsent
+                }
+            ),
+            "({suffix}) the refusal names the branch"
+        );
+
+        // ── (2) a bound AFTER effective_at is incoherent ⇒ refused.
+        let incoherent = signed_revocation(
+            &admin,
+            &victim,
+            compromise,
+            Some(compromise + Duration::days(3)),
+            Some(compromise + Duration::days(3)),
+        );
+        assert!(
+            matches!(
+                dir.put_revocation(incoherent).await,
+                Err(Error::RevocationBoundInvalid {
+                    reason: RevocationBoundRefusal::BoundAfterEffective
+                })
+            ),
+            "({suffix}) a key cannot be out from Monday and stood behind through Friday"
+        );
+
+        // Nothing was written by either refusal.
+        assert!(
+            dir.revocations_for(&victim)
+                .await
+                .expect("revocations_for")
+                .is_empty(),
+            "({suffix}) verify-before-mutation on the bound gate"
+        );
+
+        // ── (3) a properly signed bound round-trips.
+        let bounded = signed_revocation(
+            &admin,
+            &victim,
+            compromise,
+            Some(compromise),
+            Some(compromise),
+        );
+        dir.put_revocation(bounded)
+            .await
+            .expect("a signed, coherent bound admits");
+        let stored = dir.revocations_for(&victim).await.expect("revocations_for");
+        assert_eq!(stored.len(), 1, "({suffix})");
+        assert!(
+            stored[0].is_history_bounded(),
+            "({suffix}) the bound survived the column round-trip"
+        );
+        assert_eq!(
+            stored[0].revoked_after.map(|t| t.timestamp()),
+            Some(compromise.timestamp()),
+            "({suffix}) to the second"
+        );
+
+        // ── (4) the fold: Monday stands, after-the-bound does not.
+        let monday_fold = resolve_key_statement_standing(dir, &victim, monday, Utc::now())
+            .await
+            .expect("resolve");
+        assert_eq!(
+            monday_fold.standing,
+            KeyStatementStanding::Stands,
+            "({suffix}) THE POINT OF ASK 4: the key's honest history survives \
+             a compromise discovered later"
+        );
+        assert_eq!(monday_fold.considered, 1, "({suffix})");
+        assert!(monday_fold.covered_by.is_empty(), "({suffix})");
+
+        let after_fold = resolve_key_statement_standing(dir, &victim, after, Utc::now())
+            .await
+            .expect("resolve");
+        assert_eq!(
+            after_fold.standing,
+            KeyStatementStanding::SuspectAfterBound,
+            "({suffix})"
+        );
+        assert_eq!(
+            after_fold.covered_by.len(),
+            1,
+            "({suffix}) names its evidence"
+        );
+
+        // ── (5) one UNBOUNDED revocation beside it and the whole corpus goes.
+        let unbounded = signed_revocation(
+            &admin,
+            &victim,
+            compromise + Duration::seconds(1),
+            None,
+            None,
+        );
+        dir.put_revocation(unbounded)
+            .await
+            .expect("the pre-v25.1 all-or-nothing shape still admits");
+        let monday_again = resolve_key_statement_standing(dir, &victim, monday, Utc::now())
+            .await
+            .expect("resolve");
+        assert_eq!(
+            monday_again.standing,
+            KeyStatementStanding::SuspectUnbounded,
+            "({suffix}) restrictions compose; leniencies do not"
+        );
+        assert_eq!(monday_again.considered, 2, "({suffix})");
+    }
+}
+
 #[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
 mod tests {
     //! v8.8.0 (CIRISPersist#234) — the §5.6.8.15 admission-gate matrix,
@@ -1160,6 +1943,8 @@ mod tests {
             scrub_timestamp: now,
             pqc_completed_at: None,
             observed_region: crate::federation::verify_coord::region::US.to_owned(),
+            // #570 ask 4 — unbounded: this fixture revokes the whole history.
+            revoked_after: None,
             persist_row_hash: String::new(),
         };
         engine

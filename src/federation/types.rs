@@ -772,6 +772,16 @@ pub mod delegation_scope {
     /// `review` — the §11.10 reconsideration/review duty. Aliases
     /// [`crate::federation::admission::DELEGATION_SCOPE_REVIEW`] by value.
     pub const SCOPE_REVIEW: &str = crate::federation::admission::DELEGATION_SCOPE_REVIEW;
+    /// v25.1.0 (CIRISPersist#570 ask 2) — `slash`, the tier-3/4 REMOVAL duty
+    /// (CC 6.1.2). Aliases
+    /// [`crate::federation::admission::DELEGATION_SCOPE_SLASH`] by value.
+    ///
+    /// The other three producer aliases confer an authority to EMIT; this one
+    /// confers the authority to take away — quarantine
+    /// ([`crate::federation::quarantine`]) and time-bounded de-admission.
+    /// Stamp it on a `delegates_to` exactly as the other three are stamped;
+    /// the duty walk matches it under the same policy.
+    pub const SCOPE_SLASH: &str = crate::federation::admission::DELEGATION_SCOPE_SLASH;
 
     /// CC 1.13.5 — the legacy **unprefixed** agency kinds (the pre-split
     /// `self_at_login` agency profile + `reason`/`decide`) that MUST also
@@ -1799,6 +1809,44 @@ pub struct Revocation {
     )]
     pub observed_region: String,
 
+    /// v25.1.0 (CIRISPersist#570 ask 4; CIRISServer `FSD/ADMIN_OPS_TAXONOMY.md`
+    /// family 2b) — **the history bound.** The last instant this key's
+    /// statements are still stood behind: a statement asserted at or before
+    /// `revoked_after` survives the revocation; one asserted after it is
+    /// suspect.
+    ///
+    /// `None` is today's meaning and stays the default: **all-or-nothing**.
+    /// Nothing in the row scopes the history, so a consumer either keeps
+    /// everything the key ever said or drops it, and the honest reading of an
+    /// unbounded revocation is that the whole corpus is in doubt.
+    ///
+    /// # Why the bound has to exist
+    ///
+    /// A key is compromised on Tuesday. The only expressible response today
+    /// destroys Monday too — every honest signature the key ever made, every
+    /// row that depended on one. DigiNotar is the precedent: the long tail of
+    /// a total revocation is measured in the things that were fine and died
+    /// anyway. `revoked_after: Tuesday 09:00` says *from this instant*, and
+    /// Monday survives.
+    ///
+    /// # It is SIGNED, not decorative
+    ///
+    /// The bound decides which of a key's history stands, so it is exactly the
+    /// field an attacker wants to move. It is therefore **envelope-bound**:
+    /// [`check_revocation_bound`](crate::federation::register::check_revocation_bound)
+    /// refuses any row whose typed `revoked_after` is not mirrored, to the
+    /// second, by a `revoked_after` in the signed `revocation_envelope` — the
+    /// preserve-set-equals-verified-set discipline (#541), applied before the
+    /// bound could ever be relied on. A revocation with a typed bound and no
+    /// envelope bound is not a lenient revocation, it is a forged one.
+    ///
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`: a `None`
+    /// bound is skipped from canonical bytes, so pre-v25.1 rows and explicit
+    /// unbounded rows hash identically — the same backward-compat discipline
+    /// [`Self::observed_region`] uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_after: Option<DateTime<Utc>>,
+
     /// **Server-computed.** See [`KeyRecord::persist_row_hash`].
     pub persist_row_hash: String,
 }
@@ -1836,6 +1884,39 @@ impl Revocation {
     /// SHA-256 of the canonical revocation envelope.
     pub fn canonical_bytes_hash(&self) -> &str {
         &self.original_content_hash
+    }
+
+    /// v25.1.0 (CIRISPersist#570 ask 4) — **THE history comparator.** Does
+    /// this revocation put a statement made at `statement_at` in doubt?
+    ///
+    /// The ONE predicate every history fold composes, so "does the bound
+    /// cover this row?" can never mean two things in two places (rule #9).
+    ///
+    /// - **unbounded** ([`Self::revoked_after`] is `None`) — `true` for every
+    ///   instant. All-or-nothing, which is what an unbounded revocation has
+    ///   always meant; making that explicit is half the point of the field.
+    /// - **bounded** — `true` iff `statement_at > revoked_after`. At-or-before
+    ///   the bound survives. The boundary instant itself survives: a bound
+    ///   says *after this*, and a compromise discovered at T does not
+    ///   retroactively poison the signature made exactly at T.
+    ///
+    /// Independent of [`Self::effective_at`] on purpose. `effective_at` is
+    /// about the KEY going forward (from when is it not admitted); this is
+    /// about STATEMENTS looking back (which of what it already said stands).
+    /// Fusing them is the axis-fusion class — one name, two questions.
+    #[must_use]
+    pub fn suspects_statement_at(&self, statement_at: DateTime<Utc>) -> bool {
+        match self.revoked_after {
+            None => true,
+            Some(bound) => statement_at > bound,
+        }
+    }
+
+    /// Is this revocation **history-bounded** — does it leave any of the key's
+    /// past standing?
+    #[must_use]
+    pub fn is_history_bounded(&self) -> bool {
+        self.revoked_after.is_some()
     }
 }
 
@@ -3527,6 +3608,23 @@ mod tests {
             delegation_scope::SCOPE_REVIEW,
             crate::federation::admission::DELEGATION_SCOPE_REVIEW
         );
+        // #570 ask 2 — the removal duty joins the same alias discipline.
+        assert_eq!(delegation_scope::SCOPE_SLASH, "slash");
+        assert_eq!(
+            delegation_scope::SCOPE_SLASH,
+            crate::federation::admission::DELEGATION_SCOPE_SLASH
+        );
+        // …and is DISTINCT from all four emit duties — an authority to write
+        // a note must never be readable as an authority to take something
+        // away (the axis-fusion class: one name, two questions).
+        for emit in [
+            delegation_scope::SCOPE_MODERATE,
+            delegation_scope::SCOPE_TAKEDOWN,
+            delegation_scope::SCOPE_REVIEW,
+            crate::federation::admission::DELEGATION_SCOPE_CONSENT_REVOCATION,
+        ] {
+            assert_ne!(delegation_scope::SCOPE_SLASH, emit);
+        }
     }
 
     fn fixture_key_record() -> KeyRecord {

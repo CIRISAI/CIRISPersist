@@ -69,6 +69,79 @@ pub mod kind {
     /// atomically with the deletes (no audit-without-erasure, no
     /// erasure-without-audit).
     pub const TRACE_ERASURE: &str = "trace_erasure";
+
+    /// v25.1.0 (CIRISPersist#570 ask 3; CIRISServer `FSD/ADMIN_OPS_TAXONOMY.md`)
+    /// — **an authority DID something.**
+    ///
+    /// Every other kind in this module names an *observed condition*: an SLA
+    /// lapsed, a roster changed, a recipient had no keys. This one names an
+    /// *act*, and it is the only kind whose `detail` is **required** to carry
+    /// the authority the act was performed under — see
+    /// [`check_admin_action_attribution`](super::check_admin_action_attribution).
+    ///
+    /// Downstream's reasoning is the requirement, verbatim: *an admin action
+    /// that does not carry its own authority is indistinguishable from an
+    /// unauthorized one once the actor is gone.* The value of the attribution
+    /// is not that it proves the act was legitimate — it is that a
+    /// **compromised** authority becomes survivable, because every act taken
+    /// under it can be enumerated by
+    /// [`list_hard_case_events`](crate::federation::FederationDirectory::list_hard_case_events)
+    /// and re-adjudicated. Without it, "which of these did the real holder
+    /// do?" has no answer at all.
+    ///
+    /// **Open suffix vocabulary**, exactly like the rest of this module: the
+    /// bare token is admissible and so is any `admin_action:{op}` refinement
+    /// (see [`ADMIN_ACTION_PREFIX`] and
+    /// [`admin_op`](super::admin_op) for the named-here canonical ops).
+    /// Persist observes; it does not sentence. Recording that an authority
+    /// quarantined a key says nothing about whether it should have.
+    pub const ADMIN_ACTION: &str = "admin_action";
+
+    /// The open-suffix form of [`ADMIN_ACTION`] — `admin_action:{op}`. A kind
+    /// bearing this prefix carries the SAME attribution requirement as the
+    /// bare token; the suffix only tells a reader *which* op without forcing
+    /// them to parse `detail`.
+    pub const ADMIN_ACTION_PREFIX: &str = "admin_action:";
+}
+
+/// Named-here canonical `admin_action:{op}` suffixes (CIRISPersist#570). Open
+/// vocabulary — a substrate op that needs an attributed record uses one of
+/// these or mints its own; the attribution gate does not consult this list.
+pub mod admin_op {
+    /// An authority withheld a key's rows from serving
+    /// ([`quarantine`](crate::federation::quarantine), #570 ask 5). Tier 2 of
+    /// the graded response set.
+    pub const QUARANTINE: &str = "quarantine";
+    /// An authority RELEASED a quarantine — the reversal. Recorded as its own
+    /// act because "who lifted it, under what authority" is the question that
+    /// matters when a release turns out to have been the hostile step.
+    pub const QUARANTINE_RELEASE: &str = "quarantine_release";
+    /// An authority de-admitted a key, optionally time-bounded
+    /// ([`Revocation::revoked_after`](crate::federation::Revocation::revoked_after),
+    /// #570 ask 4).
+    pub const DE_ADMISSION: &str = "de_admission";
+}
+
+/// The `detail` keys an [`kind::ADMIN_ACTION`] row MUST carry. Named here so
+/// the emitter and the gate cannot disagree about where the attribution lives.
+pub mod admin_field {
+    /// The `delegates_to` attestation id the acting authority acted UNDER —
+    /// the chain that conferred the duty (for #570 ask 5 / ask 4, a
+    /// [`slash`](crate::federation::admission::DELEGATION_SCOPE_SLASH)-bearing
+    /// one).
+    ///
+    /// Recorded, not resolved — see
+    /// [`check_admin_action_attribution`](super::check_admin_action_attribution)
+    /// on why admission does not require the named delegation to be *held*
+    /// here.
+    pub const DELEGATION_ID: &str = "delegation_id";
+    /// Free text: WHY. Recorded, never interpreted — persist does not
+    /// adjudicate an admin's reasons, it only refuses to let them go
+    /// unrecorded.
+    pub const REASON: &str = "reason";
+    /// WHICH op (see [`admin_op`](super::admin_op)). Optional: the kind
+    /// suffix already carries it when one is used.
+    pub const OP: &str = "op";
 }
 
 /// A recorded `hard_case:*` observability event.
@@ -93,6 +166,210 @@ pub struct HardCaseEvent {
     pub detail: serde_json::Value,
     /// When persist observed the condition.
     pub emitted_at: DateTime<Utc>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  #570 ask 3 — the attribution gate
+// ─────────────────────────────────────────────────────────────────────────
+
+/// v25.1.0 (CIRISPersist#570 ask 3) — **WHICH branch refused** an
+/// [`kind::ADMIN_ACTION`] record.
+///
+/// Closed, snake_case serde tokens, [`Self::as_str`] returning the SAME token,
+/// and deliberately no `Other`/`Unspecified` catch-all — the
+/// [`KeyRefusalReason`](crate::federation::register::KeyRefusalReason)
+/// discipline #565 shipped and [`PeerQuotaRefusal`](crate::federation::PeerQuotaRefusal)
+/// repeated. "The attribution was bad" is not an answer an operator can act
+/// on; "`reason_absent`" is.
+///
+/// **The token set is the downstream contract and this mapping is
+/// APPEND-ONLY.** Add variants; never re-spell one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminActionRefusal {
+    /// `detail` is not a JSON object, so it cannot carry the attribution at
+    /// all. Distinguished from the two `*_absent` branches because the fix is
+    /// different: the emitter is building the wrong shape, not omitting a key.
+    DetailNotAnObject,
+    /// [`admin_field::DELEGATION_ID`] is missing (or JSON `null`). The act
+    /// names no authority — the exact condition #570 ask 3 exists to refuse.
+    DelegationIdAbsent,
+    /// [`admin_field::DELEGATION_ID`] is present but is not a non-empty
+    /// string. `""` and `0` are absence wearing a key; admitting them would
+    /// make the requirement satisfiable by anything.
+    DelegationIdMalformed,
+    /// [`admin_field::REASON`] is missing (or JSON `null`).
+    ReasonAbsent,
+    /// [`admin_field::REASON`] is present but is not a non-empty string.
+    ReasonMalformed,
+}
+
+impl AdminActionRefusal {
+    /// The **stable program token** — identical to the serde token, so a
+    /// consumer reading the wire and a consumer holding the typed value key on
+    /// the same constant.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::DetailNotAnObject => "detail_not_an_object",
+            Self::DelegationIdAbsent => "delegation_id_absent",
+            Self::DelegationIdMalformed => "delegation_id_malformed",
+            Self::ReasonAbsent => "reason_absent",
+            Self::ReasonMalformed => "reason_malformed",
+        }
+    }
+
+    /// Which `detail` key the refusal is about, or `None` for
+    /// [`Self::DetailNotAnObject`] (which is about `detail` itself).
+    #[must_use]
+    pub const fn field(&self) -> Option<&'static str> {
+        match self {
+            Self::DetailNotAnObject => None,
+            Self::DelegationIdAbsent | Self::DelegationIdMalformed => {
+                Some(admin_field::DELEGATION_ID)
+            }
+            Self::ReasonAbsent | Self::ReasonMalformed => Some(admin_field::REASON),
+        }
+    }
+
+    /// Every variant, in declaration order — the closed set.
+    pub const ALL: &'static [Self] = &[
+        Self::DetailNotAnObject,
+        Self::DelegationIdAbsent,
+        Self::DelegationIdMalformed,
+        Self::ReasonAbsent,
+        Self::ReasonMalformed,
+    ];
+}
+
+impl std::fmt::Display for AdminActionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<AdminActionRefusal> for crate::federation::Error {
+    fn from(reason: AdminActionRefusal) -> Self {
+        crate::federation::Error::AdminActionUnattributed { reason }
+    }
+}
+
+/// Is `kind` an attributed admin-action kind? True for the bare
+/// [`kind::ADMIN_ACTION`] and for any [`kind::ADMIN_ACTION_PREFIX`] refinement
+/// — the open suffix vocabulary this module uses everywhere else.
+#[must_use]
+pub fn is_admin_action(kind: &str) -> bool {
+    kind == kind::ADMIN_ACTION || kind.starts_with(kind::ADMIN_ACTION_PREFIX)
+}
+
+/// v25.1.0 (CIRISPersist#570 ask 3) — **the attribution gate.** A no-op for
+/// every kind that is not an admin action; for an admin action, both
+/// [`admin_field::DELEGATION_ID`] and [`admin_field::REASON`] MUST be present
+/// as non-empty strings or the record is refused naming WHICH.
+///
+/// Called at the top of every backend's
+/// [`record_hard_case`](crate::federation::FederationDirectory::record_hard_case)
+/// — verify-before-mutation (AV-9), so a refused record leaves no row.
+///
+/// # Why the gate is structural, and not a resolution of `delegation_id`
+///
+/// It would be easy to also require that the named `delegates_to` row is one
+/// this node **holds**, and tempting to call that stronger. It is not: an
+/// admin-action record is *evidence*, and a node that has not yet received the
+/// delegation row would then destroy the evidence of an act it did observe —
+/// the same mistake
+/// [`record_objection`](crate::federation::reverse_quorum::record_objection)
+/// deliberately does not make with a late objection. Store everything, adjudicate
+/// carefully.
+///
+/// The authority question is answered where it belongs and where it can be
+/// re-derived from this node's own verified state (#377): at the **write door
+/// of the op itself**. A quarantine marker cannot be admitted without a live
+/// [`slash`](crate::federation::admission::DELEGATION_SCOPE_SLASH)-scoped chain
+/// (`check_delegated_duty_scores_admission`); the `hard_case` row beside it
+/// says which chain that was. This gate's job is only to guarantee the
+/// question is *askable later*.
+pub fn check_admin_action_attribution(event: &HardCaseEvent) -> Result<(), AdminActionRefusal> {
+    if !is_admin_action(&event.kind) {
+        return Ok(());
+    }
+    let Some(detail) = event.detail.as_object() else {
+        return Err(AdminActionRefusal::DetailNotAnObject);
+    };
+    for (key, absent, malformed) in [
+        (
+            admin_field::DELEGATION_ID,
+            AdminActionRefusal::DelegationIdAbsent,
+            AdminActionRefusal::DelegationIdMalformed,
+        ),
+        (
+            admin_field::REASON,
+            AdminActionRefusal::ReasonAbsent,
+            AdminActionRefusal::ReasonMalformed,
+        ),
+    ] {
+        match detail.get(key) {
+            None | Some(serde_json::Value::Null) => return Err(absent),
+            Some(v) => {
+                if !v.as_str().is_some_and(|s| !s.trim().is_empty()) {
+                    return Err(malformed);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `admin_action:{op}` kind for `op` (see [`admin_op`]).
+#[must_use]
+pub fn admin_action_kind(op: &str) -> String {
+    format!("{}{op}", kind::ADMIN_ACTION_PREFIX)
+}
+
+/// Deterministic `event_id` for an [`kind::ADMIN_ACTION`] emission — keyed on
+/// `(op, target, whole-second instant)`, matching [`watch_event_id`]'s
+/// idempotency window. Re-recording the same act at the same logical instant
+/// is a no-op; a genuinely later act is a distinct event.
+#[must_use]
+pub fn admin_action_event_id(op: &str, target_key_id: &str, at: DateTime<Utc>) -> String {
+    format!(
+        "{}{op}:{target_key_id}:{}",
+        kind::ADMIN_ACTION_PREFIX,
+        at.timestamp()
+    )
+}
+
+/// Build the attributed admin-action event a substrate op records beside its
+/// write (CIRISPersist#570 ask 3). One source of truth so all three backends
+/// produce a byte-identical row, exactly as
+/// [`membership_removed_event`] does for the roster planes.
+///
+/// The returned event always clears [`check_admin_action_attribution`] when
+/// `delegation_id` and `reason` are non-empty — the builder cannot *stop* a
+/// caller passing empties, and deliberately does not try: the gate at the
+/// write door is the one that has to hold, because a replicated or
+/// hand-assembled event never passes through here.
+#[must_use]
+pub fn admin_action_event(
+    op: &str,
+    target_key_id: &str,
+    subject_key_id: Option<&str>,
+    delegation_id: &str,
+    reason: &str,
+    at: DateTime<Utc>,
+) -> HardCaseEvent {
+    HardCaseEvent {
+        event_id: admin_action_event_id(op, target_key_id, at),
+        kind: admin_action_kind(op),
+        target_key_id: Some(target_key_id.to_owned()),
+        subject_key_id: subject_key_id.map(str::to_owned),
+        detail: serde_json::json!({
+            admin_field::OP: op,
+            admin_field::DELEGATION_ID: delegation_id,
+            admin_field::REASON: reason,
+        }),
+        emitted_at: at,
+    }
 }
 
 /// Filter for [`list_hard_case_events`](crate::federation::FederationDirectory::list_hard_case_events)
@@ -363,5 +640,192 @@ mod tests {
         // Scope separates a self-add exclusion from a family-add exclusion.
         assert_ne!(a, recipient_excluded_event_id("family", "occ-bare", t0));
         assert!(a.starts_with(kind::RECIPIENT_EXCLUDED));
+    }
+
+    // ── #570 ask 3 — the attribution gate ────────────────────────────
+
+    fn ev(kind: &str, detail: serde_json::Value) -> HardCaseEvent {
+        HardCaseEvent {
+            event_id: "e1".into(),
+            kind: kind.into(),
+            target_key_id: Some("k-target".into()),
+            subject_key_id: None,
+            detail,
+            emitted_at: "2026-08-02T10:00:00Z".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn admin_action_refusal_tokens_match_serde_and_are_unique() {
+        let mut tokens: Vec<&str> = AdminActionRefusal::ALL.iter().map(|r| r.as_str()).collect();
+        for reason in AdminActionRefusal::ALL {
+            let json = serde_json::to_string(reason).expect("serialize");
+            assert_eq!(
+                json,
+                format!("\"{}\"", reason.as_str()),
+                "serde token and as_str MUST be the same spelling — the whole \
+                 point of #565's discipline is that a consumer keys on one \
+                 constant"
+            );
+            let back: AdminActionRefusal = serde_json::from_str(&json).expect("round-trip");
+            assert_eq!(&back, reason);
+        }
+        let n = tokens.len();
+        tokens.sort_unstable();
+        tokens.dedup();
+        assert_eq!(tokens.len(), n, "tokens must be distinct");
+    }
+
+    #[test]
+    fn a_non_admin_kind_is_not_touched_by_the_attribution_gate() {
+        // Every pre-existing kind carries whatever detail its emitter chose;
+        // #570 ask 3 must not retroactively require attribution of an
+        // OBSERVED CONDITION. That distinction is the whole taxonomy.
+        for k in [
+            kind::CONSENT_SLA_BREACH,
+            kind::FAMILY_MEMBERSHIP_CHANGE,
+            kind::RECIPIENT_EXCLUDED,
+            kind::TRACE_ERASURE,
+        ] {
+            assert!(!is_admin_action(k));
+            check_admin_action_attribution(&ev(k, serde_json::json!({})))
+                .expect("an observed condition needs no delegation");
+        }
+        // …and a kind that merely CONTAINS the token is not one either.
+        assert!(!is_admin_action("not_an_admin_action"));
+    }
+
+    #[test]
+    fn the_bare_kind_and_every_suffix_carry_the_same_requirement() {
+        for k in [
+            kind::ADMIN_ACTION.to_owned(),
+            admin_action_kind(admin_op::QUARANTINE),
+            admin_action_kind(admin_op::QUARANTINE_RELEASE),
+            admin_action_kind(admin_op::DE_ADMISSION),
+            admin_action_kind("some_future_op"),
+        ] {
+            assert!(is_admin_action(&k), "{k} must be an admin action");
+            assert_eq!(
+                check_admin_action_attribution(&ev(&k, serde_json::json!({}))),
+                Err(AdminActionRefusal::DelegationIdAbsent),
+                "the open suffix vocabulary must not open an attribution hole"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_which_field_is_missing() {
+        let k = admin_action_kind(admin_op::QUARANTINE);
+        let cases: &[(serde_json::Value, AdminActionRefusal)] = &[
+            (
+                serde_json::json!({}),
+                AdminActionRefusal::DelegationIdAbsent,
+            ),
+            (
+                serde_json::json!({ "delegation_id": serde_json::Value::Null, "reason": "r" }),
+                AdminActionRefusal::DelegationIdAbsent,
+            ),
+            (
+                serde_json::json!({ "delegation_id": "att-1" }),
+                AdminActionRefusal::ReasonAbsent,
+            ),
+            (
+                serde_json::json!({ "delegation_id": "att-1", "reason": serde_json::Value::Null }),
+                AdminActionRefusal::ReasonAbsent,
+            ),
+            // `""` and a non-string are absence wearing a key.
+            (
+                serde_json::json!({ "delegation_id": "", "reason": "r" }),
+                AdminActionRefusal::DelegationIdMalformed,
+            ),
+            (
+                serde_json::json!({ "delegation_id": "   ", "reason": "r" }),
+                AdminActionRefusal::DelegationIdMalformed,
+            ),
+            (
+                serde_json::json!({ "delegation_id": 7, "reason": "r" }),
+                AdminActionRefusal::DelegationIdMalformed,
+            ),
+            (
+                serde_json::json!({ "delegation_id": "att-1", "reason": "" }),
+                AdminActionRefusal::ReasonMalformed,
+            ),
+            (
+                serde_json::json!({ "delegation_id": "att-1", "reason": ["r"] }),
+                AdminActionRefusal::ReasonMalformed,
+            ),
+            (
+                serde_json::json!("not an object"),
+                AdminActionRefusal::DetailNotAnObject,
+            ),
+        ];
+        for (detail, expect) in cases {
+            assert_eq!(
+                check_admin_action_attribution(&ev(&k, detail.clone())),
+                Err(*expect),
+                "detail {detail} must refuse with {expect}"
+            );
+        }
+        // And the happy path.
+        check_admin_action_attribution(&ev(
+            &k,
+            serde_json::json!({ "delegation_id": "att-1", "reason": "spam flood" }),
+        ))
+        .expect("a fully attributed admin action admits");
+    }
+
+    #[test]
+    fn refusal_field_points_at_the_key_the_operator_must_fix() {
+        assert_eq!(
+            AdminActionRefusal::DelegationIdAbsent.field(),
+            Some(admin_field::DELEGATION_ID)
+        );
+        assert_eq!(
+            AdminActionRefusal::ReasonMalformed.field(),
+            Some(admin_field::REASON)
+        );
+        assert_eq!(AdminActionRefusal::DetailNotAnObject.field(), None);
+    }
+
+    #[test]
+    fn the_builder_produces_an_event_that_clears_its_own_gate() {
+        let at: DateTime<Utc> = "2026-08-02T10:00:00Z".parse().unwrap();
+        let e = admin_action_event(
+            admin_op::QUARANTINE,
+            "k-bad",
+            Some("k-admin"),
+            "att-delegation-1",
+            "sustained spam",
+            at,
+        );
+        check_admin_action_attribution(&e).expect("the builder's own shape admits");
+        assert_eq!(e.kind, "admin_action:quarantine");
+        assert_eq!(e.target_key_id.as_deref(), Some("k-bad"));
+        assert_eq!(e.subject_key_id.as_deref(), Some("k-admin"));
+        assert_eq!(
+            e.detail[admin_field::DELEGATION_ID].as_str(),
+            Some("att-delegation-1")
+        );
+        // Idempotent on the whole-second instant; distinct per op + target.
+        assert_eq!(
+            e.event_id,
+            admin_action_event_id(admin_op::QUARANTINE, "k-bad", at)
+        );
+        assert_ne!(
+            e.event_id,
+            admin_action_event_id(admin_op::DE_ADMISSION, "k-bad", at)
+        );
+        assert_ne!(
+            e.event_id,
+            admin_action_event_id(admin_op::QUARANTINE, "k-other", at)
+        );
+        assert_ne!(
+            e.event_id,
+            admin_action_event_id(
+                admin_op::QUARANTINE,
+                "k-bad",
+                at + chrono::Duration::seconds(1)
+            )
+        );
     }
 }

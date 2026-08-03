@@ -5,6 +5,233 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased] — #570 asks 2/3/5/4: the admin-op primitives
+
+From CIRISServer's `FSD/MESH_CONFIG_AND_ADMIN_OPS.md` + `FSD/ADMIN_OPS_TAXONOMY.md` — six
+failure families observed on real meshes, four already instantiated on ours. Downstream verified
+before filing that **none of the five asks existed**: "quarantine" was prose in a doc comment
+rejecting the *concept* (store-then-quarantine is non-conformant), never a marker.
+
+**Ask 1 — the `mesh_config` plane — is deliberately NOT built.** CC 4.2.1 scopes accord
+signatures to `EmergencyShutdown` alone, so nobody may sign a `mesh_config` row today.
+CIRISConstitution#57 is open on exactly that. Shipping the plane before its authority is named
+means the authority gets retrofitted from whatever the code happened to do — which is precisely
+how `consensus_protocol` became a stored label nobody read. Held on CIRISConstitution#57.
+
+The other four interlock, and that is the design rather than a coincidence: **ask 2 is the
+authority, ask 5 and ask 4 are the two things it authorizes, ask 3 is the attribution each one
+carries.**
+
+### Ask 3 — `hard_case:admin_action` (done first; everything else leans on it)
+
+`delegation_id` appeared nowhere in `src/federation/hard_case.rs`. Every kind in that module
+named an *observed condition* — an SLA lapsed, a roster changed, a recipient had no keys. The
+new one names an *act*, and it is the only kind whose `detail` is required at admission:
+`{delegation_id, reason}`, both non-empty strings, or the record is refused.
+
+Downstream's reasoning is the requirement: *an admin action that does not carry its own
+authority is indistinguishable from an unauthorized one once the actor is gone.* The value is
+not that the attribution proves legitimacy — it is that a **compromised** authority becomes
+survivable, because every act taken under it can be enumerated and re-adjudicated.
+
+- `kind::ADMIN_ACTION` + `kind::ADMIN_ACTION_PREFIX` — **open suffix vocabulary**, matching the
+  module's existing idiom. `admin_action`, `admin_action:quarantine`, `admin_action:de_admission`
+  all carry the same requirement; the suffix only saves a reader parsing `detail`.
+- `AdminActionRefusal` — five variants, closed, append-only `as_str` tokens:
+  `detail_not_an_object` · `delegation_id_absent` · `delegation_id_malformed` ·
+  `reason_absent` · `reason_malformed`. Plus `.field()`, so the refusal points at the key to fix.
+- New `Error::AdminActionUnattributed { reason }`, `kind()` =
+  `federation_admin_action_unattributed`.
+- Gate wired into **all three backends'** `record_hard_case`, before any write (AV-9).
+
+**The gate is structural, and deliberately does not resolve `delegation_id` against held rows.**
+Requiring the named delegation to be present here would make a node that had not yet received it
+destroy the evidence of an act it *did* observe — the mistake `record_objection` already declines
+to make with a late objection. The authority question is answered at the write door of the op
+itself, where it can be re-derived from this node's own state (#377).
+
+### Ask 2 — `DELEGATION_SCOPE_SLASH`
+
+The four existing duty scopes (`consent_revocation`, `moderate`, `takedown`, `review`) are all
+authorities to **emit**. Between "write a note" and the node-wide kill switch there was nothing
+that could take anything away.
+
+`slash` is that rung, with identical wire acceptance (bare string OR array-set) and the identical
+walk (`DelegationWalkPolicy::MODERATION_DUTY` — ⊆-parent attenuation, `sub_delegation`-gated
+deputization, `withdraws`-retracted edges skipped, depth ≤ 5, rooted at a steward-bound duty
+holder). There is deliberately no laxer path for the harsher op. Also aliased producer-side as
+`types::delegation_scope::SCOPE_SLASH`, joining the existing three.
+
+**It is not a decoration.** The #333 lesson is that a conferral nothing gates on is a stored
+label, so `slash` gates a real door from the moment it exists: a new
+`QUARANTINE_DIMENSION_PREFIX` arm in `check_delegated_duty_scores_admission` routes every
+quarantine row through it, on the local door and the replication apply alike, on all three
+backends.
+
+### Ask 5 — the quarantine marker (`src/federation/quarantine.rs`)
+
+Tier 2 of the graded response set — the fediverse's *silence*, Tor's flag. Rows are **retained
+locally**, serving is **withheld**, and it is **reversible**.
+
+A **marker, not a command** — the Usenet cancel-wars → NoCeM lesson, and the same rule #574's
+objection followed one release ago. Two `scores` dimensions (`quarantine:withheld:v1` /
+`quarantine:released:v1`), never a `withdraws`: nothing mutates on arrival, the effect is
+entirely a read-time fold a reader may honour, and the marker travels on the ordinary attestation
+plane so a node partitioned when it was raised converges when the row lands.
+
+- `fold_quarantine` — pure, newest-wins by `(asserted_at, withhold-beats-release,
+  attestation_id)`. Both extra components are load-bearing, and the middle one was a real defect
+  caught in review: `asserted_at` alone is not a total order, and a hostile author constructs the
+  tie deliberately — raise and release at the same timestamp and let each node pick its own
+  answer. Determinism alone is satisfiable by "highest `attestation_id` wins", which hands the
+  escape to whoever picks their own id. **At a tie the RESTRICTION wins**: a withhold is
+  recoverable by a later release; a wrongly-lifted quarantine is recoverable by nothing. The id
+  breaks only the remaining tie between two markers of the same kind, so the fold stays a pure
+  function of the row *set*.
+- A future-dated marker governs in **neither** direction — nobody pre-schedules their own
+  release out of a quarantine that has not been raised.
+- `QuarantineState::Released` is deliberately distinct from `NotQuarantined`: "never withheld"
+  and "withheld and released" are different facts about a key.
+- `QuarantineRefusalReason` — eight closed, append-only tokens: `dimension_mismatch` ·
+  `malformed_envelope` · `unattributed` · `not_filed_against_subject` · `subject_key_unknown` ·
+  `unverifiable_signature` · `slash_unauthorized` · `marker_unknown`.
+- The fold names its evidence: state, governing marker, who decided, the `delegation_id` they
+  acted under, the grounds, and **every** marker about the key. Evidence, not verdict — persist
+  never says the quarantined key did anything wrong.
+
+**Two serve paths now consult it, both host-reachable:**
+
+1. `Engine::serve_blob_to_peer` — if **ANY** local holder of the blob is withheld, the serve is
+   refused with the new `BlobError::QuarantineWithheld { key_id }` (`blob_quarantine_withheld`).
+   ANY rather than ALL: withholding is the restrictive direction, and a graded response that
+   fails open under ambiguity is not a response.
+2. `list_attestation_log` on **all three backends** — the `#455` relay read, filtered through
+   `filter_withheld_rows`.
+
+Two properties that are not obvious, both pinned by the witness. **The marker plane is never
+withheld** — a row on a quarantine dimension passes unconditionally, because a marker that stops
+replicating cannot be folded by the rest of the mesh, and a *release* that stops replicating
+makes a quarantine permanent by accident. And **`next_cursor` is computed before the filter**, so
+a fully-withheld page still advances the walk instead of stalling it forever; pages may come back
+short.
+
+Because the `slash` gate runs inside `put_attestation`, **held implies authorized** — the serve
+filter does not re-walk the delegation graph per page, and it is not trusting the row, it is
+trusting the gate that let the row exist here.
+
+What it does **not** consult, stated rather than implied: the per-plane `list_signed_*_since`
+identity cursors. Widening it there would make a quarantined key unresolvable and therefore make
+its own marker unverifiable — the fail-open direction wearing a fail-secure hat.
+
+### Ask 4 — `revoked_after`: time-bounded de-admission
+
+`federation_revocations` could express exactly one thing about a key's past: nothing. `revoked_at`
+and `effective_at` are both about the key *going forward*, so the only expressible response to a
+key compromise destroyed the key's entire honest history. DigiNotar is the precedent — the long
+tail of a total revocation is measured in the things that were fine and died anyway.
+
+`Revocation::revoked_after: Option<DateTime<Utc>>` is the last instant the key's statements are
+still stood behind. `None` remains the default and keeps meaning all-or-nothing; `skip_serializing_if`
+keeps pre-v25.1 rows and explicit unbounded rows hashing identically. **V118** on sqlite (TEXT)
+and postgres (TIMESTAMPTZ).
+
+**The bound is SIGNED, not merely stored.** It is the only field on the revocation plane that
+makes part of a revoked key's corpus keep standing — every other field makes things *less*
+admissible, this one makes things *more*, and an unsigned leniency field is an attacker's field.
+`check_revocation_bound` runs on all three backends before the row is hashed and before INSERT:
+the typed value must be mirrored to the second by a `revoked_after` in the SIGNED
+`revocation_envelope`, and must not be later than `effective_at`. `RevocationBoundRefusal` —
+five closed tokens: `envelope_bound_absent` · `typed_bound_absent` · `typed_bound_diverges` ·
+`bound_not_rfc3339` · `bound_after_effective`. New
+`Error::RevocationBoundInvalid { reason }` (`federation_revocation_bound_invalid`).
+
+One comparator, `Revocation::suspects_statement_at`, and one fold,
+`resolve_key_statement_standing` → `Stands` / `SuspectAfterBound` / `SuspectUnbounded`. Standing
+is the **most severe** covering verdict: one unbounded revocation makes the whole corpus suspect
+however many bounded ones sit beside it — restrictions compose, leniencies do not. The boundary
+instant itself stands (a bound says *after* this).
+
+**Which read paths honour the bound — the honest list, because the ask asked for it rather than
+a half-ship.** `resolve_key_statement_standing` and `Engine::resolve_key_statement_standing`.
+That is all, and each omission is a decision:
+
+- **Signature verification cannot honour it.** `verify_hybrid` answers a mathematical question;
+  a compromised key's signature still verifies, which is what makes compromise dangerous. Wiring
+  a revocation lookup into the verifier conflates integrity with authority — a class this repo
+  already has one recorded defect for.
+- **The `list_signed_*_since` cursors do not honour it.** They serve byte-faithful rows so peers
+  can re-verify; silently dropping a revoked key's history would impose THIS node's revocation
+  policy on every subscriber — the same "restrict, never expand / exit is real" line #570 draws
+  for ask 1.
+- **`put_attestation` does not honour it.** Refusing a compromised key's older rows destroys the
+  evidence needed to adjudicate the compromise.
+
+So the bound is expressible, signed, replicated, and re-derivable, and enforcement is at the
+consumer's read — the same place #234 already documented key revocation being applied. #570 ask 4
+makes that read able to say *from this instant* instead of only *ever*.
+
+### CC registration asks (noted, NOT re-vendored)
+
+Two new namespace families, both currently resolving `AuthorityClass::ProducerSteward` (outside
+the vendored CC 1.0-rc2 manifest of 95 families), so they admit today and the ratification is
+about making the authority explicit:
+
+- **`quarantine:{state}`** — owning component `node`, CC §3.1.9.2, reserved rule
+  *slash-duty-holder-only*, which is exactly the gate `check_delegated_duty_scores_admission`
+  already enforces. (Sits alongside #574's still-open `objection:{state}` →
+  CIRISConstitution#67.)
+- **`slash`** as a ratified delegated-duty scope beside `moderate` / `takedown` / `review` —
+  the constant is persist's per the issue, but the duty vocabulary belongs in CC 4.5.5's
+  target→duty-holder table.
+
+### Witnesses
+
+**31 new tests under `--features sqlite`**, 33 with postgres. Per ask:
+
+| ask | pure/unit | backend witness |
+|---|---|---|
+| 3 — attributed `admin_action` | 6 in `hard_case::tests` | step (9) of `exercise_admin_ops` |
+| 2 — `slash` scope | `both_dimensions_sit_under_the_gated_prefix`; the `types.rs` alias test extended to pin `slash` DISTINCT from all four emit duties | steps (4) + (8) of `exercise_admin_ops` |
+| 5 — quarantine | 13 in `quarantine::tests` | steps (1)–(8) of `exercise_admin_ops` |
+| 4 — `revoked_after` | 9 in `register::bound_tests` | `exercise_revocation_bound` |
+
+Two shared bodies, run by all three backends (memory / sqlite / postgres):
+
+- `quarantine::test_support::exercise_admin_ops` — nine properties across asks 2/3/5. Notably: a
+  `moderate`-only delegate **cannot** quarantine and a `slash`-bearing one **can** (scope
+  isolation, on the removal duty); the withheld actor's row disappears from the relay read while
+  `get_attestation` still returns it (retained, not deleted); the marker itself keeps being
+  served; a release restores serving with both acts still in the corpus; and `record_hard_case`
+  refuses an unattributed admin action naming `reason_absent` while writing no row.
+- `register::bound_test_support::exercise_revocation_bound` — the forgeable-leniency branch, the
+  incoherent-bound branch, the column round-trip, and the fold leaving Monday standing while a
+  Tuesday compromise takes only Tuesday.
+
+Memory runs both. It has no column to round-trip through for ask 4, which is exactly why it runs:
+the admission gate must be backend-symmetric even where the storage is not — the lesson that cost
+this repo seven releases. It is also the only backend holding a lock across the read the serve
+filter re-enters, so it is where that filter was easiest to deadlock (the guard is block-scoped,
+not merely `drop()`ed — a dropped guard still keeps the future non-`Send`).
+
+**Red-first, verified by mutation.** Each of the four mechanisms was removed and the named
+assertion watched to fail before being restored:
+
+| mutation | test that goes red | assertion |
+|---|---|---|
+| delete the `QUARANTINE_DIMENSION_PREFIX` arm in `check_delegated_duty_scores_admission` | `admin_ops_parity_sqlite_570` | *"`slash` is a gate, not a stored label — the #333 lesson"* |
+| drop `filter_withheld_rows` from `list_attestation_log` | `admin_ops_parity_sqlite_570` | *"THE SERVE CONSULT: the actor's row is withheld"* |
+| drop `check_admin_action_attribution` from `record_hard_case` | `admin_ops_parity_memory_570` | *"an unattributed admin action is refused"* |
+| drop `check_revocation_bound` from `put_revocation` | `revocation_bound_parity_memory_570` | *"an unsigned leniency field is an attacker's field"* |
+
+One real defect was caught this way rather than shipped: the fold's same-instant tie-break
+originally resolved toward *release*, which is fail-open under a deliberately constructed
+collision. See ask 5 above.
+
+Certified: sqlite **1618/1618** (baseline 1587) · test-anchor **1623/1623** (baseline 1592) ·
+postgres **1949/1949** (baseline 1916) · clippy `-D warnings` clean on `sqlite` and on
+`sqlite postgres server pyo3` · `cargo fmt --check` clean. `Cargo.toml`'s version line is
+untouched.
+
 ## [25.0.0] — 2026-08-02 — #577: the verify pin was a mesh-wide ceiling
 
 **MAJOR because the dependency graph moves under every consumer**, not because persist's own

@@ -150,6 +150,9 @@ pub mod register;
 pub mod replication;
 pub mod replication_policy;
 pub mod rooting;
+// v25.1.0 (CIRISPersist#570 ask 5) — quarantine: withhold from serving.
+// Tier 2 of the graded response set; a marker, never a command.
+pub mod quarantine;
 // v24.3.0 (CIRISPersist#574) — reverse quorum: the commons' brake.
 // 1-of-N to protect, m-of-n to undo.
 pub mod reverse_quorum;
@@ -256,8 +259,16 @@ pub use goal::{
     MetaGoalAlignment,
 };
 pub use hard_case::{
-    ConsentPromotionOverdueRow, ConsentState, ConsentWatchReport, HardCaseEvent, HardCaseFilter,
+    check_admin_action_attribution, AdminActionRefusal, ConsentPromotionOverdueRow, ConsentState,
+    ConsentWatchReport, HardCaseEvent, HardCaseFilter,
 };
+// v25.1.0 (CIRISPersist#570 ask 5) — the quarantine marker plane. Exported
+// beside the refusal taxonomies above; downstream keys on the `as_str` tokens.
+pub use quarantine::{
+    fold_quarantine, is_withheld, resolve_quarantine, QuarantineFold, QuarantineOutcome,
+    QuarantineRefusalReason, QuarantineState,
+};
+// v25.1.0 (CIRISPersist#570 ask 4) — the time-bounded de-admission fold.
 pub use hardware_attestation::{HardwareAttestationPolicy, DEFAULT_MAX_NONCE_AGE};
 pub use identity_aggregate::{
     ContentKemIdentity, LocalIdentityAggregate, LOCAL_IDENTITY_AGGREGATE_VERSION,
@@ -275,6 +286,10 @@ pub use perceptual_hash::{
     NullPerceptualHashMatcher, OnMatchPolicy, PerceptualHashMatcher, SharedMatcher,
 };
 pub use register::verify_key_registration;
+pub use register::{
+    check_revocation_bound, resolve_key_statement_standing, KeyStatementFold, KeyStatementStanding,
+    RevocationBoundRefusal,
+};
 pub use replication::{
     aggregate_trust_score, classify_free_bytes, parse_human_bytes, withdraws_attestation_envelope,
     AdmissionGate, ByteParseError, CacheMode, DiskPressureConfig, DiskPressureMonitor,
@@ -4556,6 +4571,32 @@ pub enum Error {
     #[error("conflicts with existing row: {0}")]
     Conflict(String),
 
+    /// v25.1.0 (CIRISPersist#570 ask 3) — a
+    /// [`hard_case::kind::ADMIN_ACTION`] record did not carry the authority
+    /// it was taken under. An admin action that does not carry its own
+    /// authority is indistinguishable from an unauthorized one once the actor
+    /// is gone; `reason` names WHICH half of the attribution is missing so an
+    /// operator fixes the emitter rather than guessing. Consumers key on
+    /// [`AdminActionRefusal::as_str`] — a program constant, never this text.
+    #[error("admin_action hard_case refused ({reason}): unattributed")]
+    AdminActionUnattributed {
+        /// WHICH branch refused.
+        reason: AdminActionRefusal,
+    },
+
+    /// v25.1.0 (CIRISPersist#570 ask 4) — a revocation's history bound
+    /// ([`Revocation::revoked_after`]) failed admission: it is not mirrored in
+    /// the SIGNED envelope, the two disagree, it does not parse, or it is
+    /// later than `effective_at`. The bound is the one field on the revocation
+    /// plane that makes part of a revoked key's corpus keep standing, so an
+    /// unsigned or incoherent one is refused rather than stored. Consumers key
+    /// on [`RevocationBoundRefusal::as_str`].
+    #[error("revocation history bound refused ({reason})")]
+    RevocationBoundInvalid {
+        /// WHICH branch refused.
+        reason: RevocationBoundRefusal,
+    },
+
     /// v17.9.0 (CIRISConstitution#38 interim) — the attestation envelope's
     /// canonical (JCS) bytes exceed
     /// [`admission::MAX_ATTESTATION_ENVELOPE_BYTES`]. The CEG had NO size
@@ -5575,6 +5616,8 @@ impl Error {
             Error::SignatureInvalid(_) => "federation_signature_invalid",
             Error::RateLimited { .. } => "federation_rate_limited",
             Error::Conflict(_) => "federation_conflict",
+            Error::AdminActionUnattributed { .. } => "federation_admin_action_unattributed",
+            Error::RevocationBoundInvalid { .. } => "federation_revocation_bound_invalid",
             Error::EnvelopeTooLarge { .. } => "federation_envelope_too_large",
             Error::TraceDimensionInvalid { .. } => "federation_trace_dimension_invalid",
             Error::CharterInvalid { .. } => "federation_charter_invalid",
