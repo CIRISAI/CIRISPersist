@@ -111,6 +111,12 @@ pub mod envelope;
 // adoption, not built here). See `namespace/namespace_supersets.json` §
 // `freshness_floor`.
 pub mod deletion_window;
+// CIRISPersist#573 / CIRISVerify#241 / CIRISConstitution#78 — erasability is a
+// MINT-time property. An object is either SEALED (payload inside the signed
+// envelope, permanent by arithmetic) or ERASABLE (payload beside it as salted
+// disclosures, erasable without touching a single signed byte). The module doc
+// carries the containment ruling and the evidence for it.
+pub mod erasable;
 pub mod freshness;
 // v24.2.0 (CIRISPersist#564 stage 1) — the reachability primitive: is a CEG
 // object load-bearing on THIS node? Read-only, fail-secure, and gated for
