@@ -3417,6 +3417,23 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         // backstop for direct-SQL bypass.
         crate::federation::admission::check_cohort_scope(&row.cohort_scope)?;
 
+        // v25.2.0 (CIRISPersist#589 / AV-83) — `capacity:*` IS NEVER LOCAL.
+        // The rule is v4.4.0's (CEG §7.5 anti-Goodhart / AV-62) and it was
+        // already written and tested — but only inside
+        // `check_local_tier_eligibility`, which runs on
+        // `attestation_insert_local` / `attestation_upsert_local` and NOT
+        // here, while THIS door accepts a `tier = "local"` row. The correct
+        // rule was shipped behind a door the attack does not use. Pure
+        // function of (tier, attestation_type, dimension) ⇒ tier 1; a REFUSAL,
+        // never an accept, so an early position is safe (AV-76). Both wire
+        // shapes are asked. Backend-symmetric with memory + postgres.
+        if row.tier == crate::federation::types::attestation_tier::LOCAL {
+            crate::federation::admission::check_capacity_never_local(
+                &row.attestation_type,
+                crate::federation::admission::envelope_dimension(&row.attestation_envelope),
+            )?;
+        }
+
         // v18.1.0 (CIRISPersist#473 followup) — the `trace:*`
         // Information-Type validator: self-emission polarity
         // (`attesting_key_id` ∈ `subject_key_ids`) plus the inline-trace /
@@ -8106,6 +8123,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn promote_attestation(
         &self,
         attestation_id: &str,
+        cohort_scope: &str,
         scrub_signature_classical: &str,
         scrub_signature_pqc: Option<&str>,
         original_content_hash_hex: &str,
@@ -8126,7 +8144,28 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let och = hex::decode(original_content_hash_hex).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
+        // v25.2.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE.
+        // Before this, promotion re-signed a row and flipped `tier` without
+        // running ANY tier-4 put-gate, so every gate that no-ops at the local
+        // tier had never been asked about a promoted row. Gated on the
+        // POST-promotion shape (`tier = federation` + the NEW cohort_scope) —
+        // the pre-promotion shape is exactly the one those gates no-op on.
+        // Verify-before-mutation (AV-9): ahead of the single UPDATE that
+        // carries BOTH the tier flip and the placement, so a refused promotion
+        // leaves the row byte-identical at `local`.
+        {
+            let mut as_promoted = row.clone();
+            as_promoted.tier = attestation_tier::FEDERATION.to_string();
+            as_promoted.cohort_scope = cohort_scope.to_owned();
+            crate::federation::admission::check_promotion_admission(
+                self,
+                &as_promoted,
+                self.self_key_id().as_deref(),
+            )
+            .await?;
+        }
         let now = scrub_timestamp;
+        row.cohort_scope = cohort_scope.to_owned();
         row.original_content_hash = original_content_hash_hex.to_owned();
         row.scrub_signature_classical = scrub_signature_classical.to_owned();
         row.scrub_signature_pqc = scrub_signature_pqc.map(|s| s.to_owned());
@@ -8158,6 +8197,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let ts = now.to_rfc3339();
         let pqc_completed = row.pqc_completed_at.map(|t| t.to_rfc3339());
         let new_hash_for_db = new_hash.clone();
+        let scope = cohort_scope.to_owned();
         let n = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
@@ -8165,7 +8205,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                  SET original_content_hash = ?1, scrub_signature_classical = ?2, \
                      scrub_signature_pqc = ?3, scrub_key_id = ?4, scrub_timestamp = ?5, \
                      pqc_completed_at = ?6, persist_row_hash = ?7, tier = 'federation', \
-                     promoted_at = ?5, additional_scrubs = '[]' \
+                     promoted_at = ?5, additional_scrubs = '[]', cohort_scope = ?9 \
                  WHERE attestation_id = ?8 AND tier = 'local'",
                 rusqlite::params![
                     och,
@@ -8175,7 +8215,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     ts,
                     pqc_completed,
                     new_hash_for_db,
-                    id
+                    id,
+                    scope
                 ],
             )
         })()
@@ -8228,6 +8269,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
     async fn promote_attestation_transformed(
         &self,
         attestation_id: &str,
+        cohort_scope: &str,
         envelope_json: &serde_json::Value,
         scrub_signature_classical: &str,
         scrub_signature_pqc: Option<&str>,
@@ -8251,7 +8293,25 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let och = hex::decode(original_content_hash_hex).map_err(|e| {
             crate::federation::Error::InvalidArgument(format!("original_content_hash hex: {e}"))
         })?;
+        // v25.2.0 (CIRISPersist#589 / AV-83) — THE PROMOTION ADMISSION GATE,
+        // over the TRANSFORMED envelope: a #510 restriction pipeline changes
+        // the bytes this row will federate as, so the gate must read the
+        // stripped envelope (its `dimension` is what every family-keyed gate
+        // classifies on) and not the pre-transform one.
+        {
+            let mut as_promoted = row.clone();
+            as_promoted.attestation_envelope = envelope_json.clone();
+            as_promoted.tier = attestation_tier::FEDERATION.to_string();
+            as_promoted.cohort_scope = cohort_scope.to_owned();
+            crate::federation::admission::check_promotion_admission(
+                self,
+                &as_promoted,
+                self.self_key_id().as_deref(),
+            )
+            .await?;
+        }
         let now = scrub_timestamp;
+        row.cohort_scope = cohort_scope.to_owned();
         row.attestation_envelope = envelope_json.clone();
         row.original_content_hash = original_content_hash_hex.to_owned();
         row.scrub_signature_classical = scrub_signature_classical.to_owned();
@@ -8289,6 +8349,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
         let scrub_key = scrub_key_id.to_owned();
         let ts = now.to_rfc3339();
         let pqc_completed = row.pqc_completed_at.map(|t| t.to_rfc3339());
+        let scope = cohort_scope.to_owned();
         let n = (move || -> Result<usize, rusqlite::Error> {
             let conn = conn.lock();
             conn.execute(
@@ -8297,7 +8358,7 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                      scrub_signature_classical = ?3, scrub_signature_pqc = ?4, \
                      scrub_key_id = ?5, scrub_timestamp = ?6, pqc_completed_at = ?7, \
                      persist_row_hash = ?8, tier = 'federation', promoted_at = ?6, \
-                     additional_scrubs = '[]' \
+                     additional_scrubs = '[]', cohort_scope = ?10 \
                  WHERE attestation_id = ?9 AND tier = 'local'",
                 rusqlite::params![
                     envelope_text,
@@ -8308,7 +8369,8 @@ impl crate::federation::FederationDirectory for SqliteBackend {
                     ts,
                     pqc_completed,
                     new_hash,
-                    id
+                    id,
+                    scope
                 ],
             )
         })()
@@ -28440,6 +28502,7 @@ mod tests {
         // promote → projection flips to federation, now visible at default tier
         be.promote_attestation(
             &local_id,
+            crate::federation::types::cohort_scope::FEDERATION,
             "c2ln",
             None,
             "abcdef01",
@@ -38903,6 +38966,21 @@ mod tests {
         backend.run_migrations().await.unwrap();
         crate::federation::bootstrap_admission::test_support::exercise_verify_families_are_not_consent_gated(
             &backend, "sq569",
+        )
+        .await;
+    }
+
+    /// #589 B8 / AV-83 — the promotion admission gate + "capacity is never
+    /// local", on sqlite. Shared exercise body with memory + postgres.
+    #[tokio::test]
+    async fn promotion_admission_gate_sqlite_589() {
+        let backend = SqliteBackend::open_in_memory().await.unwrap();
+        backend.run_migrations().await.unwrap();
+        backend.set_self_key_id(Some("sq589-self".to_string()));
+        crate::federation::bootstrap_admission::test_support::exercise_promotion_admission_gate(
+            &backend,
+            "sq589-self",
+            "sq589",
         )
         .await;
     }

@@ -1539,15 +1539,11 @@ pub fn check_local_tier_eligibility(
              — got '{cohort_scope}'"
         )));
     }
-    // (1) capacity:* — never local (anti-Goodhart §7.5 / AV-62).
-    if dimension.is_some_and(|d| d.starts_with("capacity:")) {
-        return Err(Error::InvalidArgument(
-            "capacity:* attestations are ineligible for the local tier (CEG §7.5 \
-             anti-Goodhart, AV-62): capacity is third-party-attested — federation-tier, \
-             signed, attesting_key_id != attested_key_id"
-                .to_string(),
-        ));
-    }
+    // (1) capacity:* — never local (anti-Goodhart §7.5 / AV-62). The rule
+    // itself lives in [`check_capacity_never_local`] so that `put_attestation`
+    // — the OTHER door onto the local tier — asks the identical predicate
+    // rather than a second copy of it (CIRISPersist#589 / AV-83).
+    check_capacity_never_local(attestation_type, dimension)?;
     // (2) subject-side revocation — admitted as TRANSIT (§10.1.3, AV-61):
     // the backend hybrid-verifies before storing, marks it transit, and the
     // consent-SLA watcher drives it to promotion / overdue-flag.
@@ -1560,6 +1556,248 @@ pub fn check_local_tier_eligibility(
         return Ok(LocalTierDisposition::TransitRevocation);
     }
     Ok(LocalTierDisposition::Durable)
+}
+
+/// v25.2.0 (CIRISPersist#589, AV-83) — **`capacity:*` IS NEVER LOCAL**, stated
+/// once and asked at BOTH doors onto the local tier.
+///
+/// # Why this is its own function
+///
+/// The rule is v4.4.0's (CEG §7.5 anti-Goodhart / AV-62) and it was already
+/// written, tested and shipped — inside [`check_local_tier_eligibility`], which
+/// runs on `attestation_insert_local` / `attestation_upsert_local` and **only**
+/// there. `put_attestation` accepts a `tier = "local"` row on every backend and
+/// never consulted it, so the correct rule sat behind a door the attack does
+/// not use: CIRISPersist#589, the third occurrence of the
+/// [SHIPPED-means-host-reachable class](https://github.com/CIRISAI/CIRISPersist/issues/444)
+/// after AV-77 and #444's route table.
+///
+/// Lifting the arm out (rather than copy-pasting the condition into
+/// `put_attestation`) is the one-predicate-one-implementation rule: two
+/// validators for one artifact MUST share one predicate, or they drift and the
+/// weaker one becomes the real policy.
+///
+/// # Both wire shapes
+///
+/// Reputation rides `attestation_type = scores` with the family in
+/// `dimension`, but the type-keyed shape (`attestation_type = capacity:*`)
+/// exists too, and #543 finding 2 was exactly a guard that saw one of them.
+/// This asks both, in the same precedence [`consent_gated_claim`] uses
+/// (dimension first — it is the axis the emit path actually writes).
+///
+/// # Why the refusal says "never local" and not "no consent"
+///
+/// A local-tier row is not an emission, so the CC 3.4.5 consent gate has
+/// nothing to bind to yet and deliberately no-ops there. Widening THAT gate to
+/// cover local rows would refuse this row with a "no consent" message, which is
+/// a true statement about the wrong rule: the row would be inadmissible even
+/// with a live `analyze` grant, because capacity is third-party-attested and
+/// the local tier's self-write → self-read → deferred-signature shape is the
+/// §7.5 forbidden loop. A refusal that names the wrong rule sends the reader to
+/// the wrong layer (#575).
+pub fn check_capacity_never_local(
+    attestation_type: &str,
+    dimension: Option<&str>,
+) -> Result<(), Error> {
+    let claimed = dimension
+        .filter(|d| d.starts_with(CAPACITY_FAMILY_PREFIX))
+        .or(Some(attestation_type).filter(|t| t.starts_with(CAPACITY_FAMILY_PREFIX)));
+    let Some(claimed) = claimed else {
+        return Ok(());
+    };
+    Err(Error::InvalidArgument(format!(
+        "capacity:* attestations are ineligible for the local tier (CEG §7.5 \
+         anti-Goodhart, AV-62): capacity is third-party-attested — federation-tier, \
+         signed, attesting_key_id != attested_key_id — got '{claimed}'"
+    )))
+}
+
+/// v25.2.0 (CIRISPersist#589, AV-83) — **THE PROMOTION ADMISSION GATE**: the
+/// tier-4 authority stack, re-run against the row a promotion is about to
+/// store.
+///
+/// # The hole this closes
+///
+/// `Engine::attestation_promote` and the backends' `promote_attestation` /
+/// `promote_attestation_transformed` re-sign a row and flip `tier`
+/// local→federation. Before this gate they ran **no** put-gate at all: the
+/// promote path validated `cohort_scope`, refused `(federation, self)`, and was
+/// idempotent on an already-federation row, and that was the whole of it.
+///
+/// So every tier-4 gate that is a no-op at the local tier had never been asked
+/// about a promoted row — and promotion is the moment those rows become
+/// federation-tier. The consent gate is the sharpest instance and the reason
+/// this is a **MUST** violation rather than a gap: CC 3.4.5's reciprocity
+/// clause says a subject that declines analysis *"cannot be scored; its
+/// `capacity:composite` is undefined and MUST NOT be emitted"*, and promote
+/// could mint exactly that row. Because `capacity:composite` is `min` over five
+/// factors ([CC 3.1.8.1](https://github.com/CIRISAI/CIRISConstitution)), one
+/// leaked row certifies five.
+///
+/// # The rule for what belongs here
+///
+/// > A promotion re-runs every tier-4 gate whose verdict is a function of state
+/// > that can have changed since the local write, and that neither mutates the
+/// > row nor assumes the row is not yet stored.
+///
+/// Both halves of that sentence are load-bearing. The first admits the gates a
+/// promotion is genuinely the FIRST (or a fresh) opportunity to face. The
+/// second excludes three gates whose preconditions are false here — see
+/// "Deliberately not re-run" below — because re-running a gate outside its
+/// stated precondition is how a fix becomes the next defect.
+///
+/// # What it re-runs
+///
+/// **Tier-sensitive** — these no-op at `tier = "local"`, so the promotion is
+/// the first time they are ever asked:
+///
+/// 1. [`check_capacity_consent_admission`] — CC 3.4.5 consent-before-scoring.
+/// 2. [`check_no_moderator_federate_apply`] — CC 4.5.4 / §11.11: a
+///    federation-tier row keyed on a community whose last live `moderate`
+///    holder is gone.
+///
+/// **Time-varying authority** — the verdict at the local write does not bind at
+/// promotion, and all of these are read-only:
+///
+/// 3. [`check_peer_deadmission`] — AV-77. The node may have de-admitted the
+///    row's author in between; a promotion that ignores that would republish
+///    the author's claims out of a sanction the node has already declared.
+/// 4. [`check_delegated_duty_scores_admission`] — the moderation / review /
+///    quarantine duty delegation may have expired or been withdrawn.
+/// 5. [`check_reserved_prefix_admission`] — carries AV-62/74's dimension-keyed
+///    self-emission arm, and keys on the attester's `identity_type`, which a
+///    role withdrawal can change.
+/// 6. [`check_node_agency_admission`] /
+///    [`check_user_target_steward_binding_admission`] — the recipient's
+///    identity type and the minor/adult proofs behind them are directory state
+///    that moves.
+///
+/// # Ordering
+///
+/// Ordered cheapest-refusal-first within the constraint that nothing here may
+/// return early to ACCEPT — every arm either refuses or falls through to the
+/// next. That is the AV-76 tier-4b lesson stated as a precondition rather than
+/// re-learned: *a short-circuit may return early to refuse, never to accept.*
+/// There is no dedup arm here for exactly that reason.
+///
+/// # AV-45 is deliberately NOT here, and this is the residual
+///
+/// A promotion stamps a `cohort_scope`, which looks like the fresh membership
+/// claim [`check_write_cohort_scope_for`](super::FederationDirectory::check_write_cohort_scope_for)
+/// exists to police — and #589 named AV-45 as part of the bypassed class. It is
+/// left out on purpose, and the reasoning is recorded here rather than in a
+/// commit message because the next reader will ask.
+///
+/// Attestations carry a `cohort_scope` label but **no** `cohort_target_id`, so
+/// [`DimensionAdmissionPolicy::check_write_cohort_scope`] refuses `family` /
+/// `community` whenever the target is `None` — which, on this table, is always.
+/// Running AV-45 here would therefore not *check* a promotion's placement, it
+/// would make `family` / `community` placements **unreachable**: every
+/// `attestation_promote(id, "community")` and every #510
+/// `consent:replication:v1` grant naming `audience: community | family` would
+/// refuse. Promotion is the only door those placements have ever had, so
+/// "enforce AV-45 here" reduces to "delete the #519/#510 audience plane". That
+/// is a product amputation wearing a security fix's clothes, and it is not
+/// this issue's defect.
+///
+/// The provenance also differs, which is why the asymmetry is defensible rather
+/// than merely convenient. AV-45 at `put_attestation` polices an INBOUND row
+/// from a peer asserting a cohort label persist cannot verify. A promotion
+/// re-publishes a row this node itself authored (local tier IS producer
+/// authority) at an audience taken from this node's OWN signed consent grant —
+/// a self-declaration about its own content's visibility, not a claim about
+/// someone else's cohort.
+///
+/// What remains true, and is the residual: persist cannot *prove* a
+/// family/community placement on any path, because the row has nowhere to name
+/// the family or community it means. Closing that is a SCHEMA question — give
+/// the row a `cohort_target_id` and AV-45 becomes answerable at both doors —
+/// not a gate question, and it is tracked as its own defect rather than
+/// smuggled in here. [`tests::promotion_does_not_prove_cohort_membership_589`]
+/// is the executed witness that the residual is real, so it cannot quietly
+/// become untrue in either direction.
+///
+/// # Deliberately NOT re-run, and why
+///
+/// - **The §6.1 dedup short-circuit (tier 4b).** It is an early ACCEPT, and a
+///   promotion is not a new row; running it here would skip everything after
+///   it. This is the AV-76 hole in its original shape.
+/// - **[`check_withdraws_admission`].** It STAMPS `withdraws_admission_rule`,
+///   a hash-covered field, and the promoted `persist_row_hash` already covers
+///   the value the local write resolved. Re-running it would let a
+///   later-changing delegation silently rewrite a stored row's audit metadata.
+/// - **[`check_single_node_owner_admission`].** Its own doc pins the
+///   precondition: *"The incoming row is NOT yet stored (this runs
+///   pre-insert)"*. At promotion the row IS stored, so the incumbent set it
+///   walks is no longer the set it was written to reason about.
+/// - **The trust-charter gates.** Same class: they classify a row entering the
+///   corpus, and a promoted row is already in it.
+///
+/// # Where it is called
+///
+/// Every backend's `promote_attestation` AND `promote_attestation_transformed`,
+/// **before any mutation** (verify-before-mutation, AV-9) and — on the memory
+/// backend — before the state lock is taken, since every gate here reads the
+/// directory through the same lock. One chokepoint per backend means
+/// `Engine::attestation_promote`, `Engine::promote_attestation_with_transforms`,
+/// `promote_consented_backlog`, the pyo3 wrapper and the FFI capsule all
+/// inherit it without a call site of their own.
+///
+/// `row` MUST be the row **as it will be stored** — `tier = "federation"`, the
+/// post-promotion `cohort_scope`, and (for the transformed path) the
+/// TRANSFORMED envelope. Gating the pre-promotion shape would ask every
+/// tier-sensitive gate the question it already no-ops on.
+pub async fn check_promotion_admission(
+    directory: &dyn super::FederationDirectory,
+    row: &super::Attestation,
+    self_key_id: Option<&str>,
+) -> Result<(), Error> {
+    // The placement itself must be a legal, federation-visible value. Pure,
+    // free, and a REFUSAL — so it leads. `(federation, self)` is the #315
+    // incoherent state (substrate-local-only scope on a replicate-me tier; the
+    // offer filter drops it), refused here so every caller of the primitive
+    // inherits the rule, not just `Engine::attestation_promote`.
+    if !crate::federation::types::cohort_scope::is_valid(&row.cohort_scope)
+        || row.cohort_scope == crate::federation::types::cohort_scope::SELF
+    {
+        return Err(Error::InvalidArgument(format!(
+            "promotion placement {:?} is not a valid federation-visible cohort_scope \
+             (self / invalid rejected — CIRISPersist#519/#315)",
+            row.cohort_scope
+        )));
+    }
+
+    // AV-77 — a de-admitted author's rows are refused before any walk runs, so
+    // a sanctioned peer also sheds the amplification cost (same posture as
+    // `put_attestation`'s tier-4 placement).
+    if let Some(me) = self_key_id {
+        check_peer_deadmission(directory, row, me).await?;
+    }
+
+    // AV-62/74 — reserved-prefix + the dimension-keyed capacity self-emission
+    // arm. Kept IMMEDIATELY ahead of the consent gate for the same reason
+    // `put_attestation` does: a SELF-attested capacity row must be reported as
+    // self-emission, not shadowed by "no consent".
+    check_reserved_prefix_admission(directory, row).await?;
+
+    // CC 3.4.5 — CONSENT BEFORE SCORING. The MUST this issue is rated on.
+    check_capacity_consent_admission(directory, row).await?;
+
+    // §11.10 moderation / reconsideration / quarantine duty.
+    check_delegated_duty_scores_admission(directory, row).await?;
+
+    // CC 4.4.3.4.3 — infrastructure must not have agency.
+    check_node_agency_admission(directory, row).await?;
+
+    // CC 3.2 / CC 1.15.6 — a `delegates_to` onto a `user` target is admissible
+    // only as minor-guardianship.
+    check_user_target_steward_binding_admission(directory, row).await?;
+
+    // CC 4.5.4 / §11.11 — a federation apply step keyed on a moderator-less
+    // community. Tier-sensitive, and now reached for the first time.
+    check_no_moderator_federate_apply(directory, row).await?;
+
+    Ok(())
 }
 
 /// v19.0.0 (CIRISPersist#486) — lift the **envelope-attested** roles into
@@ -2021,29 +2259,33 @@ impl From<ConsentGateRefused> for Error {
 ///   on all three backends, not merely asserted here.
 /// - **Local-tier rows.** A local-tier row is not an EMISSION — it is this
 ///   node's own working state, un-replicated, so consent-to-publish has
-///   nothing to bind to yet. This arm is LOAD-BEARING, not redundant, and the
-///   distinction matters: [`check_local_tier_eligibility`] does declare
-///   `capacity:*` ineligible for the local tier, but it runs ONLY on
-///   `attestation_insert_local` / `attestation_upsert_local` — **not on
-///   `put_attestation`**, which accepts a `tier = "local"` row on every
-///   backend (the `substrate_machine` alphabet draws `Tier::Local` against
-///   every family and those rows admit). So the local-tier `capacity:*` row
-///   is reachable here, and this arm is what lets it through.
+///   nothing to bind to yet. This arm is LOAD-BEARING, not redundant, and it
+///   is safe to keep **because a `capacity:*` row can no longer be local at
+///   all**: [`check_capacity_never_local`] is now asked at BOTH doors onto the
+///   local tier — [`check_local_tier_eligibility`] (as before) and, since
+///   v25.2.0, `put_attestation`, which accepts a `tier = "local"` row on every
+///   backend and used to skip the rule entirely.
 ///
-///   The residual is therefore real and named rather than papered over, and it
-///   is tracked as **CIRISPersist#589**: a local-tier `capacity:*` row written
-///   via `put_attestation` and then `attestation_promote`d becomes a
-///   federation-tier `capacity:*` row that never faced this gate. That is the
-///   PROMOTE path's pre-existing shape —
-///   it re-signs and flips `tier` without re-running ANY tier-4 put-gate, so
-///   it equally bypasses AV-45, AV-77 and the moderation gates — but note the
-///   asymmetry with this gate's own sibling: [`check_capacity_not_self_attested`]
-///   is NOT tier-gated, so self-emission is caught on a local row and missing
-///   consent is not. Closing it belongs at the chokepoint (either
-///   `put_attestation` enforcing [`check_local_tier_eligibility`], or promote
-///   re-running the tier-4 stack), not by widening this gate to refuse
-///   local-tier rows with a "no consent" message when the accurate refusal is
-///   "capacity is never local".
+///   That was **CIRISPersist#589 / AV-83**, and it was rated a MUST violation
+///   rather than a gap: a local-tier `capacity:*` row written via
+///   `put_attestation` and then `attestation_promote`d became a federation-tier
+///   `capacity:*` row that never faced this gate — CC 3.4.5's reciprocity
+///   clause forbids exactly that artifact. It is closed at two chokepoints, on
+///   purpose, because they close different things:
+///
+///   - `put_attestation` asking [`check_capacity_never_local`] closes the
+///     SYMPTOM at the door where the row is born, with the accurate refusal
+///     ("capacity is never local", not "no consent");
+///   - [`check_promotion_admission`] re-running the tier-4 stack closes the
+///     CLASS — promote equally bypassed AV-45, AV-77 and the moderation gates
+///     for every other family, and the capacity arm alone would have left all
+///     of that open.
+///
+///   Note the asymmetry this gate's own sibling still carries, and it is
+///   deliberate: [`check_capacity_not_self_attested`] is NOT tier-gated, so
+///   self-emission was caught on a local row when missing consent was not.
+///   Two halves of one anti-Goodhart wall, enforced at different tiers,
+///   because they answer different questions.
 /// - **Self-attestation.** `attesting_key_id == attested_key_id` is AV-62/74's
 ///   rule and is refused UPSTREAM, by
 ///   [`check_capacity_not_self_attested`] inside
@@ -7863,6 +8105,102 @@ mod tests {
 
     fn default_policy() -> DimensionAdmissionPolicy {
         DimensionAdmissionPolicy::default()
+    }
+
+    /// v25.2.0 (CIRISPersist#589 / AV-83) — **THE RESIDUAL, EXECUTED.**
+    ///
+    /// [`check_promotion_admission`] deliberately does NOT run AV-45, and its
+    /// doc says why: on this table AV-45 cannot ASK the question (an
+    /// attestation carries a `cohort_scope` with no `cohort_target_id`), so
+    /// running it would not check a promotion's placement, it would make
+    /// `family` / `community` placements unreachable and delete the #519/#510
+    /// audience plane.
+    ///
+    /// A residual recorded only in prose is a residual that quietly becomes
+    /// untrue in one direction or the other — either someone "fixes" it by
+    /// wiring AV-45 in and silently amputates the audience plane, or the
+    /// underlying predicate changes and the prose keeps claiming a hole that
+    /// closed. This asserts the exact shape of what is and is not proven, so
+    /// BOTH drifts land as a red test with this comment attached.
+    ///
+    /// The two halves:
+    ///
+    /// 1. AV-45's predicate refuses `family` / `community` **whenever the
+    ///    target is `None`**, which on an attestation is always — so it is a
+    ///    predicate about a field this row does not have. That is why closing
+    ///    the residual is a SCHEMA change (give the row a `cohort_target_id`),
+    ///    not a gate change.
+    /// 2. It admits `self` and every broad belonging-tier with no membership
+    ///    read at all — so for the placements a promotion overwhelmingly uses,
+    ///    there is nothing AV-45 would have added.
+    #[test]
+    fn promotion_does_not_prove_cohort_membership_589() {
+        use crate::federation::types::cohort_scope as cs;
+        use crate::scope::CallerAdmission;
+
+        // A writer belonging to NOTHING — the honest state of a promoting node
+        // as far as this table can express it.
+        let unaffiliated = CallerAdmission::from_resolved(
+            "occ-589".to_owned(),
+            "id-589".to_owned(),
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+        );
+
+        // (1) The two targeted scopes are refused for want of a TARGET, not for
+        // want of membership — pass a real family id and it is still refused,
+        // because the row has no field to carry it.
+        for scope in [cs::FAMILY, cs::COMMUNITY] {
+            assert!(
+                DimensionAdmissionPolicy::check_write_cohort_scope(&unaffiliated, scope, None)
+                    .is_err(),
+                "#589 residual: {scope} is refused with no target — the row cannot name one"
+            );
+        }
+
+        // (2) …and the placements a promotion actually lands at are admitted
+        // unconditionally, so AV-45 would contribute no check there.
+        for scope in [
+            cs::SELF,
+            cs::AFFILIATIONS,
+            cs::SPECIES,
+            cs::BIOSPHERE,
+            cs::FEDERATION,
+        ] {
+            assert!(
+                DimensionAdmissionPolicy::check_write_cohort_scope(&unaffiliated, scope, None)
+                    .is_ok(),
+                "#589 residual: {scope} passes with no membership read"
+            );
+        }
+    }
+
+    /// v25.2.0 (CIRISPersist#589 / AV-83) — the "capacity is never local" rule
+    /// is ONE predicate, asked on BOTH wire shapes, and
+    /// [`check_local_tier_eligibility`] routes through it rather than holding a
+    /// second copy. Two validators for one artifact MUST share one predicate.
+    #[test]
+    fn capacity_never_local_is_one_predicate_both_shapes_589() {
+        use crate::federation::types::{attestation_type::SCORES, cohort_scope::SELF};
+
+        // Dimension-keyed (the shape reputation actually travels in).
+        assert!(check_capacity_never_local(SCORES, Some("capacity:composite:v1")).is_err());
+        // Type-keyed (the other real shape — #543 finding 2's lesson).
+        assert!(check_capacity_never_local("capacity:composite", None).is_err());
+        // `capacity_assurance:*` is a DIFFERENT, role-gated family: the next
+        // byte after `capacity` is `_`, so the prefix must not match it.
+        assert!(check_capacity_never_local(SCORES, Some("capacity_assurance:x:v1")).is_ok());
+        assert!(check_capacity_never_local(SCORES, Some("trust:demo:v1")).is_ok());
+
+        // The local-tier gate reaches the SAME verdict through the SAME
+        // function — not a copy of the condition.
+        let err =
+            check_local_tier_eligibility(SCORES, Some("capacity:composite:v1"), "a", &[], SELF)
+                .expect_err("capacity is never local");
+        assert!(
+            format!("{err}").contains("local tier"),
+            "both doors give the same refusal: {err}"
+        );
     }
 
     /// v22.0.0 (CIRISPersist#543 finding 3) — **THE DRIFT-PROOF COVERAGE

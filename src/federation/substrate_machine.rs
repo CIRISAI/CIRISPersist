@@ -1111,31 +1111,29 @@ pub mod test_support {
                     }
                 }
             };
-            if let Err(e) = self
-                .dir
-                .set_attestation_cohort_scope(&target, op.cohort_scope.as_str())
-                .await
-            {
-                return OpOutcome {
-                    admitted: false,
-                    error_kind: Some(e.kind()),
-                    row_id: Some(target),
-                    stored: None,
-                    referenced: None,
-                    selector_note: None,
-                };
-            }
             // Sign the row's CURRENT envelope with the row's OWN attesting key
             // — the produce-path contract (`Engine::attestation_promote` signs
             // canonical(envelope) with the node's signer and stamps its derived
             // key id). Using the row's attester keeps `scrub_key_id`'s FK and
             // the ingest gate's pubkey resolution coherent without an Engine.
+            //
+            // v25.2.0 (CIRISPersist#589 / AV-83) — the separate
+            // `set_attestation_cohort_scope` call that used to precede this is
+            // gone, because the primitive now CARRIES the placement. This
+            // harness found the reason: once `promote_attestation` could refuse
+            // on authority grounds, the old two-step left a refused promotion
+            // having already rewritten `cohort_scope` + `persist_row_hash`, and
+            // I2a ("a REFUSED op must leave every existing row byte-identical")
+            // failed on `Promote{scope: Community}` and on
+            // `Promote{scope: Family}` within one run. The harness mirrors the
+            // primitive, so it mirrors the fix — one gated write.
             let (hash, classical, pqc) =
                 ts::sign_envelope(&row.attesting_key_id, &row.attestation_envelope);
             let res = self
                 .dir
                 .promote_attestation(
                     &target,
+                    op.cohort_scope.as_str(),
                     &classical,
                     pqc.as_deref(),
                     &hash,

@@ -34,6 +34,7 @@
 //! | B4 | A row that will fail crypto verification is rejected before it can spend DB walks | Bootstrap amplification: cheap requests doing expensive work |
 //! | B5 | A federation-tier `capacity:*` score about S from P needs a live `analyze` consent from S covering P | An admitted stranger publishing a reputation verdict about someone who never authorized it (CIRISConstitution#46) |
 //! | B7 | B5's gate is `capacity:*` and NOTHING else: the verify-owned artifact-integrity and adversarial-detector families admit with the subject silent (CC 3.4.5) | An adversary opting out of `rollback_detected:*` by declining `analyze`, and integrity verification stopping at the forger's own consent (CIRISPersist#569, adjudicated) |
+//! | B8 | A row does not escape a put-gate by entering at the local tier and being PROMOTED, and `capacity:*` never reaches the local tier on any door | Minting the `capacity:composite` CC 3.4.5 says MUST NOT be emitted — and, for every other family, laundering a row past AV-45/AV-77/moderation through the promote path (CIRISPersist#589 / AV-83) |
 //!
 //! Each invariant is stated as ONE sentence on purpose. A gate whose property
 //! cannot be stated in one sentence is a gate nobody can review.
@@ -779,5 +780,318 @@ pub mod test_support {
         })
         .await
         .expect("({tag}) AV-77: de-admitting one peer must not affect another");
+    }
+
+    /// **B8 (CIRISPersist#589 / AV-83) — a PROMOTION faces the tier-4 stack,
+    /// and `capacity:*` never reaches the local tier at all.**
+    ///
+    /// # The hole this closes
+    ///
+    /// `Engine::attestation_promote` and the backends' `promote_attestation` /
+    /// `promote_attestation_transformed` re-signed a row and flipped `tier`
+    /// local→federation while running **no** put-gate whatsoever. Every gate
+    /// that no-ops at the local tier had therefore never been asked about a
+    /// promoted row, and promotion is the moment those rows become
+    /// federation-tier.
+    ///
+    /// CC 3.4.5's reciprocity clause is what turned that from a gap into a
+    /// **MUST** violation: a subject that declines analysis *"cannot be scored;
+    /// its `capacity:composite` is undefined and MUST NOT be emitted"*. The
+    /// two-step below minted exactly that row, and because `capacity:composite`
+    /// is `min` over five factors, one leaked row certifies five.
+    ///
+    /// The sharp part, and the reason this is the SHIPPED-means-host-reachable
+    /// class a third time (after AV-77 and #444's route table): the rule
+    /// *"capacity is never local"* was already written, tested and shipped in
+    /// [`crate::federation::admission::check_local_tier_eligibility`] — behind a
+    /// door the attack does not use. `put_attestation` accepts `tier = "local"`
+    /// on every backend and never called it.
+    ///
+    /// # What it pins, on every backend
+    ///
+    /// (a) the local-tier `capacity:*` write is REFUSED, and the refusal names
+    /// the LOCAL-TIER rule rather than consent — the accurate rule, since the
+    /// row would be inadmissible even with a live grant; (b) the TYPE-keyed
+    /// wire shape is refused too (one-shape answers are the AV-74 mistake at a
+    /// new address); (c) an ordinary local row still admits and still promotes,
+    /// so the gate is a rule and not a lockdown; (d) THE CLASS, not the
+    /// symptom: a row whose author this node de-admits AFTER the local write is
+    /// refused at promotion — AV-77 reaching the promote door, which it never
+    /// did before, and which no amount of capacity-specific fixing would have
+    /// closed; (e) a REFUSED promotion leaves the row BYTE-IDENTICAL (AV-9),
+    /// which is the property the old `set_attestation_cohort_scope`-then-promote
+    /// two-step could not hold once promotion could refuse; and (f) the
+    /// incoherent `(federation, self)` placement is refused by the PRIMITIVE,
+    /// not merely by `Engine::attestation_promote`, so a caller that skips the
+    /// Engine cannot mint the #315 dead-plane row.
+    pub async fn exercise_promotion_admission_gate(
+        dir: &dyn FederationDirectory,
+        self_key_id: &str,
+        tag: &str,
+    ) {
+        use crate::federation::admission::PEER_DEADMISSION_DIMENSION;
+        use crate::federation::types::{attestation_tier, cohort_scope};
+
+        // Invocation-unique — the postgres arm shares a long-lived database.
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let attester = format!("{tag}-p589-{run}"); // P — the scorer
+        let subject = format!("{tag}-s589-{run}"); // S — the scored, and silent
+        for k in [self_key_id, &attester, &subject] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(dir, k).await;
+        }
+        const DIM: &str = "capacity:composite:v1";
+
+        // Build a LOCAL-tier row: the shape `put_attestation` used to admit.
+        let local_row = |id: &str, dimension: &str, att_type: Option<&str>| {
+            let mut row = scores_row(id, &attester, &subject, dimension);
+            if let Some(t) = att_type {
+                row.attestation_type = t.to_owned();
+            }
+            row.tier = attestation_tier::LOCAL.to_owned();
+            row.cohort_scope = cohort_scope::SELF.to_owned();
+            row
+        };
+
+        // ── (a) THE DOOR IS SHUT — capacity:* is never local. ──────────
+        let err = dir
+            .put_attestation(SignedAttestation {
+                attestation: local_row(&uuid::Uuid::new_v4().to_string(), DIM, None),
+            })
+            .await
+            .expect_err(
+                "({tag}) B8: a tier='local' capacity:* row must be REFUSED by put_attestation \
+                 — this is the #589 open door",
+            );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("local tier") && msg.contains(DIM),
+            "({tag}) B8: the refusal must name the LOCAL-TIER rule and the dimension \
+             (not 'no consent' — the row is inadmissible even WITH a grant): {msg}"
+        );
+        assert_eq!(
+            err.kind(),
+            "federation_invalid_argument",
+            "({tag}) B8: every backend refuses at the SAME error kind: {err:?}"
+        );
+
+        // ── (b) BOTH WIRE SHAPES — the type-keyed form too. ────────────
+        dir.put_attestation(SignedAttestation {
+            attestation: local_row(
+                &uuid::Uuid::new_v4().to_string(),
+                "trust:demo:v1",
+                Some("capacity:composite"),
+            ),
+        })
+        .await
+        .expect_err(
+            "({tag}) B8: the TYPE-keyed capacity shape is refused at the local tier too \
+             — answering one shape is the AV-74 mistake at a new address",
+        );
+
+        // ── (c) NOT A LOCKDOWN — an ordinary local row admits AND promotes.
+        let ok_id = uuid::Uuid::new_v4().to_string();
+        let ok_row = local_row(&ok_id, "trust:demo:v1", None);
+        let (ok_och, ok_sc, ok_sp) = (
+            ok_row.original_content_hash.clone(),
+            ok_row.scrub_signature_classical.clone(),
+            ok_row.scrub_signature_pqc.clone(),
+        );
+        dir.put_attestation(SignedAttestation {
+            attestation: ok_row,
+        })
+        .await
+        .expect("({tag}) B8: an ordinary local row still admits");
+        assert!(
+            dir.promote_attestation(
+                &ok_id,
+                cohort_scope::FEDERATION,
+                &ok_sc,
+                ok_sp.as_deref(),
+                &ok_och,
+                &attester,
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("({tag}) B8: an ordinary promotion still succeeds"),
+            "({tag}) B8: and it flips the tier"
+        );
+
+        // Arm (f)'s row belongs to a SECOND author who is never de-admitted, so
+        // that arm proves the placement rule and only the placement rule. Using
+        // `attester` would make it refusable for two independent reasons at
+        // once, and the assertion would then silently depend on which gate runs
+        // first — a witness that passes for a reason it does not name.
+        let bystander = format!("{tag}-b589-{run}");
+        crate::federation::tier_ingest::test_support::register_hybrid_key(dir, &bystander).await;
+        let self_id = uuid::Uuid::new_v4().to_string();
+        let mut self_row = scores_row(&self_id, &bystander, &subject, "trust:demo:v1");
+        self_row.tier = attestation_tier::LOCAL.to_owned();
+        self_row.cohort_scope = cohort_scope::SELF.to_owned();
+        let (s_och, s_sc, s_sp) = (
+            self_row.original_content_hash.clone(),
+            self_row.scrub_signature_classical.clone(),
+            self_row.scrub_signature_pqc.clone(),
+        );
+        dir.put_attestation(SignedAttestation {
+            attestation: self_row,
+        })
+        .await
+        .expect("({tag}) B8: arm (f)'s local row admits");
+
+        // ── (d) THE CLASS, NOT THE SYMPTOM ────────────────────────────
+        // A local row written while its author was in good standing, promoted
+        // AFTER this node de-admits that author. Before AV-83 the promotion
+        // sailed through: AV-77 lives in `put_attestation` and promote called
+        // nothing. Nothing about `capacity:*` is involved — closing only the
+        // capacity arm would have left this exactly as it was.
+        let doomed_id = uuid::Uuid::new_v4().to_string();
+        let doomed = local_row(&doomed_id, "trust:demo:v1", None);
+        let (d_och, d_sc, d_sp) = (
+            doomed.original_content_hash.clone(),
+            doomed.scrub_signature_classical.clone(),
+            doomed.scrub_signature_pqc.clone(),
+        );
+        dir.put_attestation(SignedAttestation {
+            attestation: doomed,
+        })
+        .await
+        .expect("({tag}) B8: the local write lands while the author is in good standing");
+        let before = dir
+            .get_attestation(&doomed_id)
+            .await
+            .expect("read back")
+            .expect("row");
+
+        dir.put_attestation(SignedAttestation {
+            attestation: scores_row(
+                &uuid::Uuid::new_v4().to_string(),
+                self_key_id,
+                &attester,
+                PEER_DEADMISSION_DIMENSION,
+            ),
+        })
+        .await
+        .expect("({tag}) B8: a node may always author its own de-admission");
+
+        let err = dir
+            .promote_attestation(
+                &doomed_id,
+                cohort_scope::FEDERATION,
+                &d_sc,
+                d_sp.as_deref(),
+                &d_och,
+                &attester,
+                chrono::Utc::now(),
+            )
+            .await
+            .expect_err(
+                "({tag}) B8: promoting a DE-ADMITTED author's row must be refused — AV-77 \
+                 reaching the promote door for the first time",
+            );
+        assert!(
+            format!("{err}").contains("de-admitted"),
+            "({tag}) B8: the refusal names the de-admission: {err}"
+        );
+
+        // ── (e) A REFUSED PROMOTION MUTATES NOTHING (AV-9). ────────────
+        // The property the old pre-stamp two-step could not hold: it rewrote
+        // `cohort_scope` + `persist_row_hash` before promotion could refuse.
+        let after = dir
+            .get_attestation(&doomed_id)
+            .await
+            .expect("read back")
+            .expect("row");
+        assert_eq!(
+            after.tier,
+            attestation_tier::LOCAL,
+            "({tag}) B8: a refused promotion leaves the row at its original tier"
+        );
+        assert_eq!(
+            after.cohort_scope, before.cohort_scope,
+            "({tag}) B8: and does NOT stamp the target placement"
+        );
+        assert_eq!(
+            after.persist_row_hash, before.persist_row_hash,
+            "({tag}) B8: byte-identical — the substrate state machine's I2a, at unit scale"
+        );
+
+        // ── (f) THE PRIMITIVE OWNS THE PLACEMENT RULE. ────────────────
+        // `(federation, self)` is the #315 incoherent state. It was refused by
+        // `Engine::attestation_promote` only, so any caller reaching the
+        // directory directly could mint it. Authored by `bystander`, who is in
+        // good standing, so the ONLY reason this promotion can be refused is
+        // the placement itself.
+        let err = dir
+            .promote_attestation(
+                &self_id,
+                cohort_scope::SELF,
+                &s_sc,
+                s_sp.as_deref(),
+                &s_och,
+                &bystander,
+                chrono::Utc::now(),
+            )
+            .await
+            .expect_err("({tag}) B8: (federation, self) is refused by the primitive itself");
+        assert!(
+            format!("{err}").contains("self"),
+            "({tag}) B8: the refusal names the placement: {err}"
+        );
+
+        // ── (g) THE LEGACY ROW — why the consent arm is not dead code. ──
+        // Arm (a) means a `capacity:*` row can no longer ENTER the local tier,
+        // so no sequence starting from an empty corpus can drive one into
+        // `check_promotion_admission`'s consent arm. That is a fair question to
+        // ask of any gate ("SHIPPED means host-reachable", read in reverse: an
+        // arm nothing can reach is an arm nobody proves), and it has a concrete
+        // answer rather than a defence-in-depth hand-wave.
+        //
+        // Every release up to and including v25.1.0 ADMITTED local-tier
+        // `capacity:*` through `put_attestation`. Deployments therefore hold
+        // exactly these rows already, and the upgrade does not delete them —
+        // the local door closing does nothing about a row that is already
+        // inside. The promotion gate is what stops those rows federating, and
+        // it is the arm that enforces the CC 3.4.5 MUST directly.
+        //
+        // Driven against the gate itself: manufacturing the row through the
+        // storage layer would need a different bypass on each backend, and what
+        // needs proving is the VERDICT — which every backend answers through
+        // this one shared predicate, so it is checked on all three here.
+        let mut legacy = scores_row(&uuid::Uuid::new_v4().to_string(), &bystander, &subject, DIM);
+        legacy.tier = attestation_tier::FEDERATION.to_owned();
+        legacy.cohort_scope = cohort_scope::FEDERATION.to_owned();
+        let err = crate::federation::admission::check_promotion_admission(dir, &legacy, None)
+            .await
+            .expect_err(
+                "({tag}) B8: promoting a pre-v25.2.0 local capacity row must be refused — \
+                 CC 3.4.5: its capacity:composite MUST NOT be emitted",
+            );
+        assert!(
+            matches!(&err, crate::federation::Error::ConsentGateRefused(r)
+                if r.family == crate::federation::ConsentGatedFamily::Capacity
+                    && r.dimension == DIM),
+            "({tag}) B8: and the refusal names the CAPACITY consent rule: {err:?}"
+        );
+
+        // The same row with the subject's live `analyze` grant admits — the
+        // arm is the CONSENT rule, not a blanket ban on promoting capacity.
+        dir.put_attestation(SignedAttestation {
+            attestation: consent_scope_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &subject,
+                &bystander,
+                &format!(
+                    "{}:v1",
+                    crate::federation::consent::consent_dimension::STATE_GRANTED_PREFIX
+                ),
+                &[crate::federation::admission::ANALYZE_CONSENT_SCOPE],
+                chrono::Utc::now() - chrono::Duration::seconds(60),
+            ),
+        })
+        .await
+        .expect("({tag}) B8: the subject's own analyze grant admits");
+        crate::federation::admission::check_promotion_admission(dir, &legacy, None)
+            .await
+            .expect("({tag}) B8: with a live analyze grant the same promotion is admitted");
     }
 }

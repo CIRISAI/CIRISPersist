@@ -2981,26 +2981,23 @@ impl Engine {
             return Ok(false); // idempotent
         }
 
-        // PLACEMENT BEFORE TIER: stamp the target cohort_scope on the row while
-        // it is still `local`, so it is never observable as `(federation,
-        // <stale scope>)`. `promote_attestation` below re-reads the row, so the
-        // new scope lands in the promoted `persist_row_hash`. A mid-sequence
+        // v25.2.0 (CIRISPersist#589 / AV-83) — PLACEMENT IS CARRIED, NOT
+        // PRE-STAMPED. This used to call `set_attestation_cohort_scope` here,
+        // before `promote_attestation`, on the reasoning that "a mid-sequence
         // failure leaves a coherent `(local, <new scope>)` row that a retry
-        // completes.
-        if row.cohort_scope != cohort_scope {
-            match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(b) => {
-                    b.set_attestation_cohort_scope(attestation_id, cohort_scope)
-                        .await?
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(b) => {
-                    b.set_attestation_cohort_scope(attestation_id, cohort_scope)
-                        .await?
-                }
-            }
-        }
+        // completes". That was true only while promotion could fail for
+        // mechanical reasons alone. `promote_attestation` now runs
+        // `check_promotion_admission`, so a promotion can be REFUSED on
+        // authority grounds — and a pre-stamp would leave the refused row with
+        // a mutated `cohort_scope` and `persist_row_hash`, which is a
+        // verify-before-mutation (AV-9) violation. The substrate state machine
+        // caught exactly that as an I2a failure ("a REFUSED op must leave every
+        // existing row byte-identical") within one run of the gate landing.
+        //
+        // The placement now rides the primitive itself, landing in the SAME
+        // statement as the tier flip — so the row goes from `(local, old)` to
+        // `(federation, new)` with no intermediate state and no partial
+        // application on refusal.
 
         // 2. Canonicalize the envelope (produce gate → JCS post-cut) + hash.
         let canonical = crate::verify::canonical::ceg_produce_canonicalize(
@@ -3036,6 +3033,7 @@ impl Engine {
             BackendDispatch::Postgres(b) => {
                 b.promote_attestation(
                     attestation_id,
+                    cohort_scope,
                     &classical_b64,
                     Some(&pqc_b64),
                     &original_content_hash_hex,
@@ -3048,6 +3046,7 @@ impl Engine {
             BackendDispatch::Sqlite(b) => {
                 b.promote_attestation(
                     attestation_id,
+                    cohort_scope,
                     &classical_b64,
                     Some(&pqc_b64),
                     &original_content_hash_hex,
@@ -3490,28 +3489,20 @@ impl Engine {
         // v21.5.0 (CIRISPersist#519) — placement carriage, same contract as
         // `attestation_promote`: the transform path is also a placement-
         // touching promotion, so it carries `cohort_scope` and rejects the
-        // incoherent `(federation, self)`. Stamp the scope before the
-        // transformed tier-flip re-reads the row.
+        // incoherent `(federation, self)`.
+        //
+        // v25.2.0 (CIRISPersist#589 / AV-83) — the separate
+        // `set_attestation_cohort_scope` pre-stamp is GONE for the same reason
+        // it is gone from `attestation_promote`: promotion can now be REFUSED
+        // by `check_promotion_admission`, and a pre-stamp would leave a refused
+        // row mutated (AV-9). The placement rides
+        // `promote_attestation_transformed` and lands with the tier flip.
         if !cs::is_valid(cohort_scope) || cohort_scope == cs::SELF {
             return Err(crate::federation::Error::InvalidArgument(format!(
                 "promote_attestation_with_transforms: cohort_scope {cohort_scope:?} is not a \
                  valid federation-visible placement (self / invalid rejected — \
                  CIRISPersist#519/#315)"
             )));
-        }
-        if row.cohort_scope != cohort_scope {
-            match &self.backend {
-                #[cfg(feature = "postgres")]
-                BackendDispatch::Postgres(b) => {
-                    b.set_attestation_cohort_scope(&row.attestation_id, cohort_scope)
-                        .await?
-                }
-                #[cfg(feature = "sqlite")]
-                BackendDispatch::Sqlite(b) => {
-                    b.set_attestation_cohort_scope(&row.attestation_id, cohort_scope)
-                        .await?
-                }
-            }
         }
 
         let transformed = pipeline.apply_all(&row.attestation_envelope).map_err(|e| {
@@ -3546,6 +3537,7 @@ impl Engine {
             BackendDispatch::Postgres(b) => {
                 b.promote_attestation_transformed(
                     &row.attestation_id,
+                    cohort_scope,
                     &transformed,
                     &classical_b64,
                     Some(&pqc_b64),
@@ -3559,6 +3551,7 @@ impl Engine {
             BackendDispatch::Sqlite(b) => {
                 b.promote_attestation_transformed(
                     &row.attestation_id,
+                    cohort_scope,
                     &transformed,
                     &classical_b64,
                     Some(&pqc_b64),
@@ -11109,6 +11102,215 @@ mod tests {
             after.scrub_signature_classical
         );
         assert_eq!(after2.promoted_at, after.promoted_at);
+    }
+
+    /// #589 / AV-83 — the exact issue path, end to end through the PUBLIC
+    /// `Engine::attestation_promote` surface, now shut at both doors.
+    ///
+    /// The attack was: `put_attestation` a `tier = "local"`
+    /// `capacity:composite:v1` row about a subject that has granted nothing —
+    /// which every backend admitted, because `put_attestation` never asked
+    /// `check_local_tier_eligibility` — then `attestation_promote` it, which
+    /// ran no put-gate at all, and read back a federation-tier
+    /// `capacity:composite` row for a declining subject. CC 3.4.5: *"its
+    /// `capacity:composite` is undefined and MUST NOT be emitted"*.
+    ///
+    /// Pins that the FIRST step is now refused (so the sequence has no
+    /// starting position), that the refusal names the local-tier rule rather
+    /// than consent, and that a NON-capacity local row still promotes — the
+    /// gate is a rule, not a lockdown.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn attestation_promote_cannot_launder_capacity_589() {
+        use crate::federation::types::{attestation_tier, cohort_scope};
+        use crate::federation::{FederationDirectory, SignedAttestation};
+
+        let signer = pqc_signer("occ589");
+        let node = signer.derived_key_id();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        seed_promote_key(&sq, &node).await;
+
+        let attester = "p589-attester".to_string();
+        let subject = "s589-subject".to_string();
+        for k in [&attester, &subject] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(&*sq, k).await;
+        }
+        const DIM: &str = "capacity:composite:v1";
+        let local_capacity = |id: &str| {
+            let mut row = crate::federation::bootstrap_admission::test_support::scores_row(
+                id, &attester, &subject, DIM,
+            );
+            row.tier = attestation_tier::LOCAL.to_owned();
+            row.cohort_scope = cohort_scope::SELF.to_owned();
+            row
+        };
+
+        // CONTROL — the DIRECT federation-tier write is refused by the CC 3.4.5
+        // consent gate. That was always true; it is the rule the promote path
+        // was routing around.
+        let direct = sq
+            .put_attestation(SignedAttestation {
+                attestation: crate::federation::bootstrap_admission::test_support::scores_row(
+                    &uuid::Uuid::new_v4().to_string(),
+                    &attester,
+                    &subject,
+                    DIM,
+                ),
+            })
+            .await
+            .expect_err("control: the direct federation-tier write is refused");
+        assert_eq!(direct.kind(), "federation_consent_gate_refused");
+
+        // (1) THE LOCAL DOOR IS SHUT. The laundering sequence has no step one.
+        let err = sq
+            .put_attestation(SignedAttestation {
+                attestation: local_capacity(&uuid::Uuid::new_v4().to_string()),
+            })
+            .await
+            .expect_err("#589: the tier='local' capacity row must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("local tier") && msg.contains(DIM),
+            "#589: the refusal names the LOCAL-TIER rule, not consent: {msg}"
+        );
+
+        // (2) NOT A LOCKDOWN — a non-capacity local row still promotes through
+        // the same public surface, and lands with the placement it was given.
+        let ok_id = uuid::Uuid::new_v4().to_string();
+        let mut ok_row = crate::federation::bootstrap_admission::test_support::scores_row(
+            &ok_id,
+            &attester,
+            &subject,
+            "trust:demo:v1",
+        );
+        ok_row.tier = attestation_tier::LOCAL.to_owned();
+        ok_row.cohort_scope = cohort_scope::SELF.to_owned();
+        sq.put_attestation(SignedAttestation {
+            attestation: ok_row,
+        })
+        .await
+        .expect("#589: an ordinary local row still admits");
+        assert!(
+            engine
+                .attestation_promote(&ok_id, cohort_scope::FEDERATION)
+                .await
+                .expect("#589: an ordinary promotion still succeeds"),
+            "#589: the tier flips"
+        );
+        let after = sq.get_attestation(&ok_id).await.unwrap().expect("row");
+        assert_eq!(after.tier, attestation_tier::FEDERATION);
+        assert_eq!(
+            after.cohort_scope,
+            cohort_scope::FEDERATION,
+            "#589: the placement rides the primitive and lands with the tier flip"
+        );
+    }
+
+    /// #589 / AV-83 — **`Engine::attestation_promote` does not PRE-STAMP the
+    /// placement**, so a promotion refused on authority grounds leaves the row
+    /// byte-identical (AV-9).
+    ///
+    /// Until v25.2.0 the engine called `set_attestation_cohort_scope` first and
+    /// `promote_attestation` second, on the reasoning that a mid-sequence
+    /// failure left a coherent `(local, <new scope>)` row for a retry to
+    /// complete. That held only while promotion could not REFUSE. Once
+    /// `check_promotion_admission` landed, the pre-stamp meant a refused
+    /// promotion had already rewritten `cohort_scope` and `persist_row_hash`.
+    ///
+    /// The substrate state machine found it (I2a), but found it *through* an
+    /// AV-45 refusal that the shipped gate deliberately does not perform — so
+    /// with the fix as shipped, the harness only rediscovers this hazard when
+    /// its random search happens to pair a scope-CHANGING `Promote` with a
+    /// refusing one. A probabilistic witness for an ordering rule is not a
+    /// witness. This drives the refusal deterministically: a de-admitted
+    /// author, a requested placement that DIFFERS from the row's current one,
+    /// and an assertion on every field the pre-stamp used to move.
+    ///
+    /// Re-deriving the mutation is the point of the test: restoring the
+    /// pre-stamp in `attestation_promote` turns this red and nothing else in
+    /// the suite red.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn attestation_promote_refusal_does_not_prestamp_placement_589() {
+        use crate::federation::types::{attestation_tier, cohort_scope};
+        use crate::federation::{FederationDirectory, SignedAttestation};
+
+        let signer = pqc_signer("occ589ps");
+        let node = signer.derived_key_id();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.set_self_key_id(Some(node.clone()));
+
+        let attester = "p589ps-attester".to_string();
+        let subject = "s589ps-subject".to_string();
+        // The node registers with the DETERMINISTIC hybrid pubkeys (not
+        // `seed_promote_key`'s classical-only record): it has to author a real,
+        // hybrid-verifiable de-admission row below, and it is also the
+        // promotion's `scrub_key_id` FK.
+        for k in [&node, &attester, &subject] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(&*sq, k).await;
+        }
+
+        // A local row at `self` — so the requested `federation` placement is a
+        // real change, and a pre-stamp would be visible.
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut row = crate::federation::bootstrap_admission::test_support::scores_row(
+            &id,
+            &attester,
+            &subject,
+            "trust:demo:v1",
+        );
+        row.tier = attestation_tier::LOCAL.to_owned();
+        row.cohort_scope = cohort_scope::SELF.to_owned();
+        sq.put_attestation(SignedAttestation { attestation: row })
+            .await
+            .expect("#589: the local row admits while its author is in good standing");
+        let before = sq.get_attestation(&id).await.unwrap().expect("row");
+        assert_eq!(before.cohort_scope, cohort_scope::SELF);
+
+        // The node de-admits the author. AV-77 now refuses the promotion — a
+        // refusal that arrives from INSIDE the primitive, which is exactly
+        // where the old ordering had already mutated by the time it fired.
+        sq.put_attestation(SignedAttestation {
+            attestation: crate::federation::bootstrap_admission::test_support::scores_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &node,
+                &attester,
+                crate::federation::admission::PEER_DEADMISSION_DIMENSION,
+            ),
+        })
+        .await
+        .expect("#589: a node may always author its own de-admission");
+
+        let err = engine
+            .attestation_promote(&id, cohort_scope::FEDERATION)
+            .await
+            .expect_err("#589: promoting a de-admitted author's row is refused");
+        assert!(
+            format!("{err}").contains("de-admitted"),
+            "#589: the refusal names the de-admission: {err}"
+        );
+
+        let after = sq.get_attestation(&id).await.unwrap().expect("row");
+        assert_eq!(
+            after.cohort_scope,
+            cohort_scope::SELF,
+            "#589: THE PRE-STAMP IS GONE — a refused promotion must not move cohort_scope"
+        );
+        assert_eq!(
+            after.tier,
+            attestation_tier::LOCAL,
+            "#589: and must not move the tier"
+        );
+        assert_eq!(
+            after.persist_row_hash, before.persist_row_hash,
+            "#589: byte-identical (AV-9 / the state machine's I2a, made deterministic)"
+        );
     }
 
     // ── v21.2.0 (CIRISPersist#509 FLOOR) — "the payload follows the

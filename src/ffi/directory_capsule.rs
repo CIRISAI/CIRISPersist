@@ -3262,6 +3262,7 @@ impl FederationDirectory for OpsDirectory {
     async fn promote_attestation(
         &self,
         attestation_id: &str,
+        cohort_scope: &str,
         scrub_signature_classical: &str,
         scrub_signature_pqc: Option<&str>,
         original_content_hash_hex: &str,
