@@ -20642,6 +20642,25 @@ mod tests {
         .await;
     }
 
+    /// (CIRISPersist#593) — the POSTGRES leg of the shared moderation-duty walk
+    /// liveness witness (see the sqlite + memory legs); all three call the SAME
+    /// `admission::moderation_walk_liveness_test_support` body.
+    #[tokio::test]
+    #[serial_test::serial(postgres)]
+    async fn moderation_walk_liveness_parity_postgres_593() {
+        let Some(dsn) = pg_dsn() else {
+            eprintln!("skipping: CIRIS_PERSIST_TEST_PG_URL unset");
+            return;
+        };
+        let backend = PostgresBackend::connect(&dsn).await.expect("connect");
+        backend.run_migrations().await.expect("migrations run");
+        let suffix = uuid_like();
+        crate::federation::admission::moderation_walk_liveness_test_support::exercise_moderation_walk_liveness(
+            &backend, &suffix,
+        )
+        .await;
+    }
+
     /// (CIRISPersist#584) — the POSTGRES leg of the objection-plane
     /// blast-radius witness (see the sqlite + memory legs).
     #[tokio::test]

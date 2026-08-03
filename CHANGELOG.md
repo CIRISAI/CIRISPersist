@@ -5,6 +5,126 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased]
+
+### #593: a subject-revoked `delegates_to` stops conferring a moderation duty — and the three copies of that walk become one
+
+`#578` (ownership) and `#584` (stewardship) each repaired a fold that consulted **only the granter's
+own** retraction when deciding whether a `delegates_to` was still live. The three forward BFS walks
+under `DelegationWalkPolicy::MODERATION_DUTY` carried the same fold — occurrence three, one plane
+over. A `delegates_to` retracted under CEG §3.2.3 rule 2/3/4 (by its subject, by a canonical-bound
+claimant, by a consent-revocation proxy) kept conferring `moderate` / `takedown` / `review`.
+
+#### The fix is the extraction, and here that is a correctness requirement
+
+`admission.rs` states, in prose, **five** invariants across those three walks — the brief predicted
+four:
+
+1. `reachable_under_scope_with_reasons` returns `Reachable` "in exactly the cases the `bool` form
+   returns `true`";
+2. `enumerate_scoped_delegation_reach` is the "identical BFS to the predicate … so the two never
+   diverge on reachability";
+3. `reachable_under_scope` is a "thin wrapper … no change to the attenuation/depth/withdraws
+   semantics";
+4. **`is_named_moderator(k, …)` ⟺ `k ∈ moderators_of(…)`** "because both compose … the SAME
+   scoped-reach walk" — and they did not: the predicate composed copy 1, the enumerator copy 3;
+5. `appointed_moderators_of` — "one reachability predicate, two root sets — never two walks that
+   could drift".
+
+Not one is checked by the build. Repairing one copy makes them false while the tree stays green;
+the witness demonstrates exactly that, twice (see the mutation table below). All three are now
+`scoped_delegation_reach` — one body, three thin projections — so the five hold structurally.
+
+The retraction **fold** is now `retracted_edge_ids`, shared with `live_delegation_granters`: one
+predicate, one impl, across both planes. It takes a row slice rather than doing its own read, so
+neither plane inherits the other's access pattern.
+
+#### The short-circuit survived the extraction — measured, not assumed
+
+The predicate returns at the first edge into `targets`. The enumerating caller gets a full walk out
+of the same body by passing an **empty** `targets`, which no edge can be in. `#584` had to give its
+up-walk's short-circuit away to make its four readers agree; this extraction did not. On a
+`founder → deputy → leaf → tail` chain the predicate probing `deputy` issues **1** granter read and
+the enumerator issues **4** — the contrast is the proof.
+
+#### Read cost — the measured number, not the estimate
+
+`#584`'s cheapening trick does **not** transfer: it skipped the extra read when the granter was not
+`user`-role, because only a `user` can steward. Any recipient's incoming edge can be revoked, so
+there is no analogous precondition here. What pays instead is placement and memoization — the clause
+runs **last**, after scope, granter-retraction and `⊆`-attenuation have pruned, and memoizes per
+**recipient**.
+
+Counted at the substrate (`MemoryBackend::attestation_read_counts`), on a
+`founder → deputy → leaf` probe: **(2 by, 0 for) → (2 by, 2 for)**. Two reads become four — exactly
+the 2× ceiling, and never a per-hop fan-out. Five parallel `moderate` edges from one granter to one
+deputy cost **one** incoming read, not five.
+
+#### Reach — the honest bound, restated rather than inherited
+
+A retraction is visible only where the substrate INDEXES it: among the recipient's INCOMING rows
+(`attested_key_id == recipient`) or the granter's OUTGOING rows. A retraction filed against some
+third key entirely is invisible to this walk — as it was to `#578` and `#584`. Widening that means a
+per-granter fan-out read on every hop: a separate decision with its own cost.
+
+#### BEHAVIOUR CHANGE — moderation authority shrinks (adoption note for edge and server)
+
+Read-time only. No migration, no stored-data change: previously-admitted rows simply stop resolving
+as live duty edges. Any chain containing a hop retracted by an admitted `withdraws` its granter never
+issued loses the duty, on all three backends. The surfaces that change:
+
+- `reachable_under_scope` — `true` → `false`;
+- `reachable_under_scope_with_reasons` — `Reachable` → `RetractedAtRoot` when the retracted edge is
+  the edge TO the target, `SignerUnreached` when it is further up the chain;
+- `is_named_moderator`, `moderators_of`, `appointed_moderators_of` — the delegate and everything
+  downstream of it leave the set; the steward-bound root does not;
+- `check_moderation_admission` — the write chokepoint. `moderation:*` / `reconsideration:*` /
+  `quarantine:*` `scores` rows authored via such a chain start being refused
+  `federation_delegated_scope_unauthorized` at `put_attestation`.
+
+`RetractedAtRoot`'s doc now says what it always meant: *the edge to the target is retracted*, by
+whoever had standing. The name is historical, not a scope limit.
+
+Consent-revocation proxy authority is **UNCHANGED** this cut — see below.
+
+#### Deliberately not widened: the consent-revocation plane (`#594`)
+
+The new clause is gated on the existing `policy.skip_withdrawn_edges`, so
+`DelegationWalkPolicy::CONSENT_REVOCATION` stays byte-identical, as its doc pins. That plane has the
+same defect in a stronger form — with `skip_withdrawn_edges = false` it consults **no** retraction at
+all, not even the granter's own — and it is filed as `#594` rather than folded in, for the reason
+`#578` did not fold in `#584`: separate plane, separate adopters, its own adoption note. Both facts
+are asserted in the witness, so widening the gate by accident goes red. **That block is `#594`'s
+tripwire; when `#594` lands, retarget it, do not delete it.**
+
+#### Witnesses (memory · sqlite · postgres, one shared body through the real `put_attestation`)
+
+- `moderation_walk_liveness_parity_*_593` — both biconditionals asserted at **every** state
+  transition, plus subject-revocation liveness, the granter-scoped non-regression (a BARE
+  edge-retraction carrying no `references_attestation_id`, which the new clause cannot see, so
+  neither clause can be deleted as redundant), a decoy `withdraws` naming an absent attestation,
+  scope isolation, and the `#594` pin. The subject's `withdraws` is admitted under rule 2 by the
+  real gate and the witness asserts `withdraws_admission_rule == Some(2)`, so it cannot degrade into
+  an unresolved-authority row that proves nothing.
+- `moderation_walk_read_cost_memory_593` — the four read counts above, and the short-circuit.
+
+Every clause is pinned by a mutation that reddens a specific assertion:
+
+| mutation | red at |
+|---|---|
+| drop the incoming-retraction clause | the roster after the subject-revoked hop (and the measured cost, `(2,0)`) |
+| drop the granter-scoped clause | the bare-edge-retraction non-regression |
+| repair the predicate but not the enumerator | biconditional 1 — `is_named_moderator(deputy)=false`, `deputy ∈ moderators_of()` |
+| repair predicate + enumerator but not the with-reasons walk | biconditional 2 — `reachable_under_scope=false`, verdict `Reachable` |
+| apply the clause under `CONSENT_REVOCATION` too | the `#594` pin |
+| short-circuit on an empty `targets` | the enumerator returns one key, and biconditional 1 breaks |
+| key the memo on the granter instead of the recipient | the roster after the subject-revoked hop |
+
+#### Added — `MemoryBackend::attestation_read_counts` / `reset_attestation_read_counts`
+
+Directory-read counters, so a walk's read cost is a measurement rather than an estimate. Two relaxed
+atomic increments inside methods that already take the state mutex.
+
 ## [27.0.0] — 2026-08-03 — #519/#586/#579/#571/#592/#584: the rules persist enforces, enumerated — and four preconditions nothing was testing
 
 Six issues, and a pattern that only became visible with all six in one cut: **v26.0.0 shipped four

@@ -3895,6 +3895,301 @@ impl DelegationWalkPolicy {
     };
 }
 
+/// (CIRISPersist#593) — the **admitted-retraction fold**: which
+/// `attestation_id`s does this row slice retract by NAME?
+///
+/// One predicate, one impl (the standing rule). A `withdraws` / `recants` that
+/// carries `references_attestation_id` names the exact edge it kills; that is
+/// the shape CEG §3.2.3 rules 2/3/4 produce (subject self-revocation, a
+/// canonical-bound claimant, a consent-revocation proxy) and it is the shape
+/// the GRANTER-scoped fold structurally cannot see — the granter never issued
+/// it, so it is not among the granter's out-rows.
+///
+/// Deliberately takes a row SLICE rather than doing its own read.
+/// [`live_delegation_granters`] already holds `subject`'s incoming rows; the
+/// scoped-delegation BFS memoizes one read per distinct recipient. Extracting
+/// the FOLD and not the READ is what lets both planes share one definition of
+/// "retracted by name" without either inheriting the other's access pattern.
+fn retracted_edge_ids(rows: &[super::Attestation]) -> std::collections::HashSet<String> {
+    rows.iter()
+        .filter(|g| {
+            g.attestation_type == attestation_type::WITHDRAWS
+                || g.attestation_type == attestation_type::RECANTS
+        })
+        .filter_map(|g| {
+            crate::federation::precedence::references_attestation_id_from_envelope(
+                &g.attestation_envelope,
+            )
+            .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// (CIRISPersist#593) — everything the ONE scoped-delegation BFS observes.
+///
+/// The three former copies of that BFS each needed a different projection of
+/// the same walk: a `bool` (did we reach a target?), a set (which keys did we
+/// reach?), and a classified refusal. They are all here, so the walk can be
+/// written once.
+#[derive(Debug, Default)]
+struct ScopedReach {
+    /// Every recipient of a traversable edge — the enumerating projection.
+    /// Truncated when the walk short-circuits on `hit_target`, which is sound
+    /// because the only caller that reads it passes an EMPTY `targets` and so
+    /// never short-circuits.
+    ///
+    /// Filled on every walk, including the two that discard it. It ranges over
+    /// the same key space as the `visited` cycle-guard the walk already
+    /// allocates, so recording it costs at most one more set of that size —
+    /// never a second traversal.
+    reached: std::collections::HashSet<String>,
+    /// Did a traversable edge land on a key in `targets`?
+    hit_target: bool,
+    /// Did the issuer emit ANY `delegates_to` at all (pre-gate)?
+    issuer_emitted_delegation: bool,
+    /// Was an edge TO a target skipped because it is retracted — by its
+    /// granter, or by an admitted `withdraws` naming it?
+    target_edge_retracted: bool,
+    /// Was an edge TO a target skipped because it does not carry `scope_token`?
+    target_edge_missing_scope: bool,
+}
+
+/// **THE §11.10 scoped-`delegates_to` walk — one BFS, three callers**
+/// (CIRISPersist#593).
+///
+/// Does a `delegates_to` chain from `issuer` reach a key in `targets` where
+/// every edge on the path carries `scope_token`, under `policy`? And, in the
+/// same pass, which keys does it reach and — when it does not reach a target —
+/// why not?
+///
+/// # Why one body and not three
+///
+/// This BFS used to exist three times: as
+/// [`issuer_reaches_target_via_scoped_delegation`] (the predicate), as
+/// [`reachable_under_scope_with_reasons`] (the classified refusal) and as
+/// [`enumerate_scoped_delegation_reach`] (the enumeration). admission.rs states
+/// in prose, at five sites, that they agree:
+///
+///   1. `reachable_under_scope_with_reasons` returns `Reachable` "in exactly
+///      the cases the `bool` form returns `true`";
+///   2. `enumerate_scoped_delegation_reach` is the "identical BFS to the
+///      predicate … so the two never diverge on reachability";
+///   3. [`reachable_under_scope`] is a "thin wrapper … no change to the
+///      attenuation/depth/withdraws semantics";
+///   4. **`is_named_moderator(k, …)` ⟺ `k ∈ moderators_of(…)`** "because both
+///      compose … the SAME scoped-reach walk" — and they did not: the predicate
+///      composed copy 1, the enumerator copy 3;
+///   5. [`appointed_moderators_of`] — "one reachability predicate, two root
+///      sets — never two walks that could drift".
+///
+/// Not one of those five is checked by the build. Repairing the #593 fold at
+/// one copy and not the others would have made every one of them FALSE while
+/// the tree stayed green — the same reason CIRISPersist#584 extracted
+/// [`live_delegation_granters`] before repairing it. Now they hold
+/// structurally: same body, same gates, same order.
+///
+/// # The short-circuit is preserved, not traded away
+///
+/// The predicate returns at the FIRST edge into `targets`. So does this. The
+/// enumerating caller gets a full walk out of the same body by passing an
+/// **empty** `targets`, which no edge can ever be in — so `hit_target` never
+/// fires and the walk runs to exhaustion. (#584 had to give its up-walk's
+/// short-circuit away to make its four readers agree; this one does not.)
+///
+/// # The retraction gates — two of them, reading two different row sets
+///
+/// Under `policy.skip_withdrawn_edges` an edge is skipped when EITHER:
+///
+///   * its granter retracted it — a `withdraws`/`recants` among the granter's
+///     OUTGOING rows naming the recipient (the §11.10 edge-retraction model,
+///     which carries no `references_attestation_id`); OR
+///   * **(CIRISPersist#593)** an admitted `withdraws`/`recants` among the
+///     RECIPIENT's incoming rows names this edge by
+///     `references_attestation_id` — CEG §3.2.3 rules 2/3/4, which the granter
+///     by definition never issued.
+///
+/// The second clause is the whole point of this cut: without it a
+/// subject-revoked `delegates_to` kept conferring `moderate` / `takedown` /
+/// `review`. The two clauses read DIFFERENT rows, so neither subsumes the
+/// other and neither may be deleted as redundant.
+///
+/// The clause does not re-litigate AUTHORITY. A stored `withdraws` already
+/// passed [`check_withdraws_admission`], which is where CEG §3.2.3 rules 1-4
+/// decided whether its issuer had standing.
+///
+/// # Reach — the honest bound
+///
+/// A retraction is visible only where the substrate INDEXES it: among the
+/// recipient's INCOMING rows (`attested_key_id == recipient`) or the granter's
+/// OUTGOING rows. A retraction filed against some third key entirely is
+/// invisible to this walk — as it was to CIRISPersist#578 and #584. Widening
+/// that means a per-granter fan-out read on every hop, which is a separate
+/// decision with its own cost.
+///
+/// # Cost
+///
+/// One `list_attestations_by` per dequeued node (unchanged), plus — under
+/// `skip_withdrawn_edges` only — one `list_attestations_for` per DISTINCT
+/// recipient of an edge that survived the type, scope, granter-retraction and
+/// `⊆`-attenuation gates. Memoized for the whole walk, so a root with twenty
+/// `moderate` edges to one deputy costs ONE extra read, and placed LAST so
+/// pruned edges pay nothing. CIRISPersist#584's trick — skip the read when the
+/// granter is not `user`-role — does NOT transfer: any recipient's incoming
+/// edge can be revoked, so there is no analogous precondition. The bound is
+/// therefore ≤ 2× the reads of the pre-#593 walk, never a per-edge fan-out.
+async fn scoped_delegation_reach(
+    directory: &dyn super::FederationDirectory,
+    issuer: &str,
+    targets: &std::collections::HashSet<String>,
+    scope_token: &str,
+    max_depth: usize,
+    policy: DelegationWalkPolicy,
+) -> Result<ScopedReach, Error> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let mut out = ScopedReach::default();
+    let effective_depth = max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH);
+    if effective_depth == 0 {
+        return Ok(out);
+    }
+    // Per-node walk state. `parent_scope` is the scope-set of the edge that
+    // reached `key` (the root `issuer` has `None` — no incoming edge);
+    // `parent_sub_delegation` is whether that incoming edge granted
+    // deputization. Under §11.10 (`enforce_attenuation_and_sub_delegation`)
+    // these gate traversal; under consent_revocation they are inert.
+    struct Node {
+        key: String,
+        depth: usize,
+        parent_scope: Option<HashSet<String>>,
+        parent_sub_delegation: bool,
+    }
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<Node> = VecDeque::new();
+    // Per-walk memo for the #593 clause: recipient key_id → the set of
+    // attestation_ids retracted BY NAME among that recipient's incoming rows.
+    // Keyed on the RECIPIENT, not the granter — the retraction is indexed
+    // against the key the edge is about.
+    let mut incoming_retracted: HashMap<String, HashSet<String>> = HashMap::new();
+    queue.push_back(Node {
+        key: issuer.to_owned(),
+        depth: 0,
+        parent_scope: None,
+        parent_sub_delegation: false,
+    });
+    visited.insert(issuer.to_owned());
+
+    while let Some(node) = queue.pop_front() {
+        if node.depth >= effective_depth {
+            continue;
+        }
+        // §11.10 deputization gate: a NON-root granter (one reached via an
+        // incoming edge) may only further-delegate if that incoming edge
+        // granted `sub_delegation`. The root duty-holder holds the duty
+        // natively and is exempt (`parent_scope == None`).
+        if policy.enforce_attenuation_and_sub_delegation
+            && node.parent_scope.is_some()
+            && !node.parent_sub_delegation
+        {
+            continue;
+        }
+        let rows = directory.list_attestations_by(&node.key).await?;
+        // §11.10: bucket this granter's `withdraws`/`recants` retractions by
+        // recipient so a revoked edge invalidates the downstream chain
+        // (UCAN-style; topology's edge-retraction model). Inert for
+        // consent_revocation (`skip_withdrawn_edges == false`).
+        let mut retracted: HashSet<String> = HashSet::new();
+        if policy.skip_withdrawn_edges {
+            for r in &rows {
+                if r.attestation_type == attestation_type::WITHDRAWS
+                    || r.attestation_type == attestation_type::RECANTS
+                {
+                    retracted.insert(r.attested_key_id.clone());
+                }
+            }
+        }
+        let is_issuer = node.depth == 0;
+        for r in rows {
+            if r.attestation_type != attestation_type::DELEGATES_TO {
+                continue;
+            }
+            if is_issuer {
+                out.issuer_emitted_delegation = true;
+            }
+            let to_target = targets.contains(&r.attested_key_id);
+            // Scope gate (first — a `consent_revocation`-only edge probed for
+            // `takedown` is not traversable at all; the load-bearing
+            // scope-isolation property).
+            if !delegation_scope_grants(&r.attestation_envelope, scope_token) {
+                if to_target {
+                    out.target_edge_missing_scope = true;
+                }
+                continue;
+            }
+            // Retraction gate (a): the granter retracted its own edge.
+            if policy.skip_withdrawn_edges && retracted.contains(&r.attested_key_id) {
+                if to_target {
+                    out.target_edge_retracted = true;
+                }
+                continue;
+            }
+            // §11.10 `⊆`-parent attenuation: the child edge's scope-set must be
+            // a subset of the parent edge's scope-set (restate-or-attenuate,
+            // never expand). The root's first out-edge has no parent edge to
+            // attenuate against. A pruned edge here is neither a clean
+            // missing-scope nor a retraction — the duty simply cannot validly
+            // flow down this path; it contributes only to a `SignerUnreached`.
+            if policy.enforce_attenuation_and_sub_delegation {
+                if let Some(parent_scope) = &node.parent_scope {
+                    let child_scope = delegation_scope_set(&r.attestation_envelope);
+                    if !child_scope.is_subset(parent_scope) {
+                        continue;
+                    }
+                }
+            }
+            // Retraction gate (b) — THE CIRISPersist#593 CLAUSE. An admitted
+            // `withdraws`/`recants` among the RECIPIENT's incoming rows that
+            // names THIS edge kills it, whoever issued it. Placed LAST so only
+            // edges that survived every cheaper gate pay a read, and memoized
+            // per recipient so the fan-out is bounded by distinct recipients
+            // rather than by edges.
+            if policy.skip_withdrawn_edges {
+                if !incoming_retracted.contains_key(&r.attested_key_id) {
+                    let incoming = directory.list_attestations_for(&r.attested_key_id).await?;
+                    incoming_retracted
+                        .insert(r.attested_key_id.clone(), retracted_edge_ids(&incoming));
+                }
+                if incoming_retracted[&r.attested_key_id].contains(&r.attestation_id) {
+                    if to_target {
+                        out.target_edge_retracted = true;
+                    }
+                    continue;
+                }
+            }
+            // The edge is traversable. Record the recipient (the enumerating
+            // projection) BEFORE the short-circuit, so the two never disagree
+            // about what a reached key is.
+            out.reached.insert(r.attested_key_id.clone());
+            // A scope-bearing delegation edge to a target key is sufficient —
+            // delegated duty established along the path.
+            if to_target {
+                out.hit_target = true;
+                return Ok(out);
+            }
+            if !visited.contains(&r.attested_key_id) && node.depth + 1 < effective_depth {
+                visited.insert(r.attested_key_id.clone());
+                queue.push_back(Node {
+                    key: r.attested_key_id,
+                    depth: node.depth + 1,
+                    parent_scope: Some(delegation_scope_set(&r.attestation_envelope)),
+                    parent_sub_delegation: delegation_grants_sub_delegation(
+                        &r.attestation_envelope,
+                    ),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3) — does `issuer` reach
 /// any key in `targets` via a `delegates_to` chain where **every edge
 /// on the path carries `consent_revocation` scope**? This is the
@@ -3953,6 +4248,11 @@ async fn issuer_reaches_target_via_consent_revocation_delegation(
 /// traversable — this is the load-bearing scope-isolation property
 /// (CIRISRegistry#90: "and only then"). Cycle-guarded on the granter key
 /// and bounded by [`MAX_WITHDRAWS_DELEGATION_DEPTH`].
+///
+/// (CIRISPersist#593) A thin projection of [`scoped_delegation_reach`] — the
+/// ONE body all three scoped-delegation walks share. It still returns at the
+/// FIRST edge into `targets`; the short-circuit was preserved by the
+/// extraction, not traded for it.
 async fn issuer_reaches_target_via_scoped_delegation(
     directory: &dyn super::FederationDirectory,
     issuer: &str,
@@ -3961,102 +4261,11 @@ async fn issuer_reaches_target_via_scoped_delegation(
     max_depth: usize,
     policy: DelegationWalkPolicy,
 ) -> Result<bool, Error> {
-    use std::collections::{HashSet, VecDeque};
-    let effective_depth = max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH);
-    if effective_depth == 0 {
-        return Ok(false);
-    }
-    // Per-node walk state. `parent_scope` is the scope-set of the edge
-    // that reached `key` (the root `issuer` has `None` — no incoming
-    // edge); `parent_sub_delegation` is whether that incoming edge granted
-    // deputization. Under §11.10 (`enforce_attenuation_and_sub_delegation`)
-    // these gate traversal; under consent_revocation they are inert.
-    struct Node {
-        key: String,
-        depth: usize,
-        parent_scope: Option<HashSet<String>>,
-        parent_sub_delegation: bool,
-    }
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<Node> = VecDeque::new();
-    queue.push_back(Node {
-        key: issuer.to_owned(),
-        depth: 0,
-        parent_scope: None,
-        parent_sub_delegation: false,
-    });
-    visited.insert(issuer.to_owned());
-
-    while let Some(node) = queue.pop_front() {
-        if node.depth >= effective_depth {
-            continue;
-        }
-        // §11.10 deputization gate: a NON-root granter (one reached via an
-        // incoming edge) may only further-delegate if that incoming edge
-        // granted `sub_delegation`. The root duty-holder holds the duty
-        // natively and is exempt (`parent_scope == None`).
-        if policy.enforce_attenuation_and_sub_delegation
-            && node.parent_scope.is_some()
-            && !node.parent_sub_delegation
-        {
-            continue;
-        }
-        let rows = directory.list_attestations_by(&node.key).await?;
-        // §11.10: bucket this granter's `withdraws`/`recants` retractions
-        // by recipient so a revoked edge invalidates the downstream chain
-        // (UCAN-style; topology's edge-retraction model). Inert for
-        // consent_revocation (`skip_withdrawn_edges == false`).
-        let mut retracted: HashSet<String> = HashSet::new();
-        if policy.skip_withdrawn_edges {
-            for r in &rows {
-                if r.attestation_type == attestation_type::WITHDRAWS
-                    || r.attestation_type == attestation_type::RECANTS
-                {
-                    retracted.insert(r.attested_key_id.clone());
-                }
-            }
-        }
-        for r in rows {
-            if r.attestation_type != attestation_type::DELEGATES_TO {
-                continue;
-            }
-            if !delegation_scope_grants(&r.attestation_envelope, scope_token) {
-                continue;
-            }
-            if policy.skip_withdrawn_edges && retracted.contains(&r.attested_key_id) {
-                continue;
-            }
-            // §11.10 `⊆`-parent attenuation: the child edge's scope-set
-            // must be a subset of the parent edge's scope-set
-            // (restate-or-attenuate, never expand). The root's first
-            // out-edge has no parent edge to attenuate against.
-            if policy.enforce_attenuation_and_sub_delegation {
-                if let Some(parent_scope) = &node.parent_scope {
-                    let child_scope = delegation_scope_set(&r.attestation_envelope);
-                    if !child_scope.is_subset(parent_scope) {
-                        continue;
-                    }
-                }
-            }
-            // A scope-bearing delegation edge to a target key is
-            // sufficient — delegated duty established along the path.
-            if targets.contains(&r.attested_key_id) {
-                return Ok(true);
-            }
-            if !visited.contains(&r.attested_key_id) && node.depth + 1 < effective_depth {
-                visited.insert(r.attested_key_id.clone());
-                queue.push_back(Node {
-                    key: r.attested_key_id,
-                    depth: node.depth + 1,
-                    parent_scope: Some(delegation_scope_set(&r.attestation_envelope)),
-                    parent_sub_delegation: delegation_grants_sub_delegation(
-                        &r.attestation_envelope,
-                    ),
-                });
-            }
-        }
-    }
-    Ok(false)
+    Ok(
+        scoped_delegation_reach(directory, issuer, targets, scope_token, max_depth, policy)
+            .await?
+            .hit_target,
+    )
 }
 
 /// #249 Cut B — the **public** scoped-delegation reachability primitive
@@ -4123,10 +4332,17 @@ pub enum ReachabilityVerdict {
     /// every edge carries `scope` (§11.10 attenuation/deputization
     /// satisfied) and no edge on the path is withdrawn/recanted.
     Reachable,
-    /// A scope-bearing `delegates_to` edge to the target exists, but its
-    /// granter has `withdraws`/`recants`-retracted it (UCAN-style edge
-    /// retraction). Named for the depth-1 login case where the issuer
-    /// (root) retracts its own edge to the target.
+    /// A scope-bearing `delegates_to` edge to the target exists, but it has
+    /// been `withdraws`/`recants`-retracted (UCAN-style edge retraction).
+    /// Named for the depth-1 login case where the issuer (root) retracts its
+    /// own edge to the target.
+    ///
+    /// (CIRISPersist#593) It is NOT limited to that case, and it is no longer
+    /// limited to a retraction the GRANTER issued: it also covers an admitted
+    /// `withdraws`/`recants` among the target's incoming rows naming the edge
+    /// by `references_attestation_id` — CEG §3.2.3 rules 2/3/4, which the
+    /// granter by definition never issued. The name is historical; the verdict
+    /// means *the edge to the target is retracted*, by whoever had standing.
     RetractedAtRoot,
     /// A `delegates_to` edge to the target exists but does NOT grant the
     /// required `scope`.
@@ -4176,6 +4392,9 @@ pub enum ReachabilityVerdict {
 /// [`reachable_under_scope`]: this returns
 /// [`Reachable`](ReachabilityVerdict::Reachable) in exactly the cases the
 /// `bool` form returns `true`. Only the classification of the "no" is new.
+/// (CIRISPersist#593) That is now STRUCTURAL — both run
+/// [`scoped_delegation_reach`], the one shared body — rather than a claim about
+/// two hand-mirrored copies.
 ///
 /// [`MODERATION_DUTY`]: DelegationWalkPolicy::MODERATION_DUTY
 pub async fn reachable_under_scope_with_reasons(
@@ -4185,120 +4404,42 @@ pub async fn reachable_under_scope_with_reasons(
     scope: &str,
     max_depth: usize,
 ) -> Result<ReachabilityVerdict, Error> {
-    use std::collections::{HashSet, VecDeque};
-    let policy = DelegationWalkPolicy::MODERATION_DUTY;
-    let effective_depth = max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH);
-    if effective_depth == 0 {
+    // A zero effective depth is `SignerUnreached`, NOT `NoTrustRoots` — the
+    // walk never got far enough to learn whether the issuer emitted anything.
+    // Kept explicit here because the shared walk cannot distinguish the two
+    // from its (all-false) zero-depth result.
+    if max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH) == 0 {
         return Ok(ReachabilityVerdict::SignerUnreached);
     }
-    // Same per-node walk state as the predicate walk; see
-    // `issuer_reaches_target_via_scoped_delegation`.
-    struct Node {
-        key: String,
-        depth: usize,
-        parent_scope: Option<HashSet<String>>,
-        parent_sub_delegation: bool,
+    let targets: std::collections::HashSet<String> =
+        std::iter::once(target_key_id.to_owned()).collect();
+    // (CIRISPersist#593) The SAME body the `bool` walk runs — which is what
+    // makes the byte-identical claim above structural rather than aspirational.
+    // A substrate read failure is the one contract difference: the predicate
+    // propagates it, this classifies it.
+    let reach = match scoped_delegation_reach(
+        directory,
+        issuer_key_id,
+        &targets,
+        scope,
+        max_depth,
+        DelegationWalkPolicy::MODERATION_DUTY,
+    )
+    .await
+    {
+        Ok(reach) => reach,
+        Err(_) => return Ok(ReachabilityVerdict::SubstrateUnavailable),
+    };
+    if reach.hit_target {
+        return Ok(ReachabilityVerdict::Reachable);
     }
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<Node> = VecDeque::new();
-    queue.push_back(Node {
-        key: issuer_key_id.to_owned(),
-        depth: 0,
-        parent_scope: None,
-        parent_sub_delegation: false,
-    });
-    visited.insert(issuer_key_id.to_owned());
-
-    // Observations that classify a "no" — see the precedence in the
-    // doc comment. None of these influence the reachability decision
-    // itself (that stays identical to the predicate walk).
-    let mut issuer_emitted_delegation = false;
-    let mut saw_target_edge_retracted = false;
-    let mut saw_target_edge_missing_scope = false;
-
-    while let Some(node) = queue.pop_front() {
-        if node.depth >= effective_depth {
-            continue;
-        }
-        if policy.enforce_attenuation_and_sub_delegation
-            && node.parent_scope.is_some()
-            && !node.parent_sub_delegation
-        {
-            continue;
-        }
-        let rows = match directory.list_attestations_by(&node.key).await {
-            Ok(rows) => rows,
-            Err(_) => return Ok(ReachabilityVerdict::SubstrateUnavailable),
-        };
-        let mut retracted: HashSet<String> = HashSet::new();
-        if policy.skip_withdrawn_edges {
-            for r in &rows {
-                if r.attestation_type == attestation_type::WITHDRAWS
-                    || r.attestation_type == attestation_type::RECANTS
-                {
-                    retracted.insert(r.attested_key_id.clone());
-                }
-            }
-        }
-        let is_issuer = node.depth == 0;
-        for r in rows {
-            if r.attestation_type != attestation_type::DELEGATES_TO {
-                continue;
-            }
-            if is_issuer {
-                issuer_emitted_delegation = true;
-            }
-            let to_target = r.attested_key_id == target_key_id;
-            // Scope gate (checked first, mirroring the predicate walk).
-            if !delegation_scope_grants(&r.attestation_envelope, scope) {
-                if to_target {
-                    saw_target_edge_missing_scope = true;
-                }
-                continue;
-            }
-            // Retraction gate.
-            if policy.skip_withdrawn_edges && retracted.contains(&r.attested_key_id) {
-                if to_target {
-                    saw_target_edge_retracted = true;
-                }
-                continue;
-            }
-            // ⊆-parent attenuation gate. A pruned edge here is neither a
-            // clean missing-scope nor a retraction — the duty just cannot
-            // validly flow down this path; it contributes only to a
-            // SignerUnreached "no".
-            if policy.enforce_attenuation_and_sub_delegation {
-                if let Some(parent_scope) = &node.parent_scope {
-                    let child_scope = delegation_scope_set(&r.attestation_envelope);
-                    if !child_scope.is_subset(parent_scope) {
-                        continue;
-                    }
-                }
-            }
-            if to_target {
-                return Ok(ReachabilityVerdict::Reachable);
-            }
-            if !visited.contains(&r.attested_key_id) && node.depth + 1 < effective_depth {
-                visited.insert(r.attested_key_id.clone());
-                queue.push_back(Node {
-                    key: r.attested_key_id,
-                    depth: node.depth + 1,
-                    parent_scope: Some(delegation_scope_set(&r.attestation_envelope)),
-                    parent_sub_delegation: delegation_grants_sub_delegation(
-                        &r.attestation_envelope,
-                    ),
-                });
-            }
-        }
-    }
-
-    if saw_target_edge_retracted {
+    if reach.target_edge_retracted {
         return Ok(ReachabilityVerdict::RetractedAtRoot);
     }
-    if saw_target_edge_missing_scope {
+    if reach.target_edge_missing_scope {
         return Ok(ReachabilityVerdict::MissingScope);
     }
-    if !issuer_emitted_delegation {
+    if !reach.issuer_emitted_delegation {
         return Ok(ReachabilityVerdict::NoTrustRoots);
     }
     Ok(ReachabilityVerdict::SignerUnreached)
@@ -4318,6 +4459,11 @@ pub async fn reachable_under_scope_with_reasons(
 /// `parent_scope` / `parent_sub_delegation` walk state), so the two never
 /// diverge on reachability — this one simply records the visited recipients
 /// instead of short-circuiting on a target match.
+///
+/// (CIRISPersist#593) "Identical" is now literal: this is
+/// [`scoped_delegation_reach`] with an **empty** `targets` set. No edge can be
+/// in the empty set, so the shared short-circuit never fires and the walk runs
+/// to exhaustion — full enumeration out of the very body the predicate uses.
 async fn enumerate_scoped_delegation_reach(
     directory: &dyn super::FederationDirectory,
     issuer: &str,
@@ -4325,88 +4471,16 @@ async fn enumerate_scoped_delegation_reach(
     max_depth: usize,
     policy: DelegationWalkPolicy,
 ) -> Result<std::collections::HashSet<String>, Error> {
-    use std::collections::{HashSet, VecDeque};
-    let effective_depth = max_depth.min(MAX_WITHDRAWS_DELEGATION_DEPTH);
-    let mut reached: HashSet<String> = HashSet::new();
-    if effective_depth == 0 {
-        return Ok(reached);
-    }
-    struct Node {
-        key: String,
-        depth: usize,
-        parent_scope: Option<HashSet<String>>,
-        parent_sub_delegation: bool,
-    }
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<Node> = VecDeque::new();
-    queue.push_back(Node {
-        key: issuer.to_owned(),
-        depth: 0,
-        parent_scope: None,
-        parent_sub_delegation: false,
-    });
-    visited.insert(issuer.to_owned());
-
-    while let Some(node) = queue.pop_front() {
-        if node.depth >= effective_depth {
-            continue;
-        }
-        // §11.10 deputization gate (identical to the predicate walk): a
-        // non-root granter may only further-delegate if its incoming edge
-        // granted `sub_delegation`.
-        if policy.enforce_attenuation_and_sub_delegation
-            && node.parent_scope.is_some()
-            && !node.parent_sub_delegation
-        {
-            continue;
-        }
-        let rows = directory.list_attestations_by(&node.key).await?;
-        let mut retracted: HashSet<String> = HashSet::new();
-        if policy.skip_withdrawn_edges {
-            for r in &rows {
-                if r.attestation_type == attestation_type::WITHDRAWS
-                    || r.attestation_type == attestation_type::RECANTS
-                {
-                    retracted.insert(r.attested_key_id.clone());
-                }
-            }
-        }
-        for r in rows {
-            if r.attestation_type != attestation_type::DELEGATES_TO {
-                continue;
-            }
-            if !delegation_scope_grants(&r.attestation_envelope, scope_token) {
-                continue;
-            }
-            if policy.skip_withdrawn_edges && retracted.contains(&r.attested_key_id) {
-                continue;
-            }
-            if policy.enforce_attenuation_and_sub_delegation {
-                if let Some(parent_scope) = &node.parent_scope {
-                    let child_scope = delegation_scope_set(&r.attestation_envelope);
-                    if !child_scope.is_subset(parent_scope) {
-                        continue;
-                    }
-                }
-            }
-            // Record the reached recipient. The cycle guard (`visited`)
-            // ensures we never enqueue a key twice; `reached` accumulates
-            // every recipient regardless of further traversal.
-            reached.insert(r.attested_key_id.clone());
-            if !visited.contains(&r.attested_key_id) && node.depth + 1 < effective_depth {
-                visited.insert(r.attested_key_id.clone());
-                queue.push_back(Node {
-                    key: r.attested_key_id,
-                    depth: node.depth + 1,
-                    parent_scope: Some(delegation_scope_set(&r.attestation_envelope)),
-                    parent_sub_delegation: delegation_grants_sub_delegation(
-                        &r.attestation_envelope,
-                    ),
-                });
-            }
-        }
-    }
-    Ok(reached)
+    Ok(scoped_delegation_reach(
+        directory,
+        issuer,
+        &std::collections::HashSet::new(),
+        scope_token,
+        max_depth,
+        policy,
+    )
+    .await?
+    .reached)
 }
 
 /// v6.4.0 (CIRISPersist#146 Ask 2, CEG §3.2.3 / §8.1.11.2) — the
@@ -4907,20 +4981,10 @@ async fn live_delegation_granters(
 
     // (2) — a binding withdrawn BY ANYONE the gate admitted is non-live, not
     // only one retracted by its own granter. Two lists that disagree about
-    // what "live" means; one list now.
-    let withdrawn: std::collections::HashSet<String> = rows
-        .iter()
-        .filter(|g| {
-            g.attestation_type == attestation_type::WITHDRAWS
-                || g.attestation_type == attestation_type::RECANTS
-        })
-        .filter_map(|g| {
-            crate::federation::precedence::references_attestation_id_from_envelope(
-                &g.attestation_envelope,
-            )
-            .map(str::to_owned)
-        })
-        .collect();
+    // what "live" means; one list now. (CIRISPersist#593 lifted the fold itself
+    // into [`retracted_edge_ids`], which the scoped-delegation BFS shares — the
+    // same defect, one plane over, so the same predicate.)
+    let withdrawn = retracted_edge_ids(&rows);
 
     for r in rows {
         // (1) shape.
@@ -7425,6 +7489,12 @@ pub async fn is_named_moderator(
 /// predicate: `is_named_moderator(k, …)` ⟺ `k ∈ moderators_of(…)`, because
 /// both compose the SAME authority set, the SAME steward-binding gate, and the
 /// SAME scoped-reach walk.
+///
+/// (CIRISPersist#593) The last of those three was a claim about two hand-mirrored
+/// BFS copies until #593 collapsed them into [`scoped_delegation_reach`] — a fold
+/// repaired in the predicate and not the enumerator falsified this `⟺` while the
+/// build stayed green. `moderation_walk_liveness_parity_*_593` asserts it at
+/// every state transition, so it cannot silently become false again.
 ///
 /// Fail-closed: an unknown community / no steward-bound authority yields the
 /// empty set (no named moderators), never an error.
@@ -13470,7 +13540,7 @@ pub(crate) mod steward_liveness_test_support {
     /// Register `key_id` carrying its REAL deterministic hybrid pubkeys and the
     /// given `identity_type` set, so federation-tier ingest verifies rows it
     /// signs.
-    async fn register(dir: &dyn FederationDirectory, key_id: &str, types: &[&str]) {
+    pub(crate) async fn register(dir: &dyn FederationDirectory, key_id: &str, types: &[&str]) {
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
         let now = Utc::now();
         dir.put_public_key(SignedKeyRecord {
@@ -13504,7 +13574,7 @@ pub(crate) mod steward_liveness_test_support {
     /// A federation-tier row of `kind`, hybrid-signed by `signer` over
     /// `envelope`. `attestation_id` is a real UUID — postgres types the column
     /// as `uuid` and refuses anything else at the driver.
-    fn signed_row(
+    pub(crate) fn signed_row(
         signer: &str,
         attested: &str,
         kind: &str,
@@ -13561,7 +13631,11 @@ pub(crate) mod steward_liveness_test_support {
         row
     }
 
-    fn withdraws_of(issuer: &str, attested: &str, target_attestation_id: &str) -> Attestation {
+    pub(crate) fn withdraws_of(
+        issuer: &str,
+        attested: &str,
+        target_attestation_id: &str,
+    ) -> Attestation {
         let id = uuid::Uuid::new_v4().to_string();
         signed_row(
             issuer,
@@ -13580,7 +13654,7 @@ pub(crate) mod steward_liveness_test_support {
     /// clause load-bearing after the admitted-`withdraws` clause lands, and a
     /// witness that used the referencing shape here would let clause (3) be
     /// deleted silently.
-    fn bare_edge_retraction(granter: &str, recipient: &str) -> Attestation {
+    pub(crate) fn bare_edge_retraction(granter: &str, recipient: &str) -> Attestation {
         let id = uuid::Uuid::new_v4().to_string();
         signed_row(
             granter,
@@ -13590,7 +13664,10 @@ pub(crate) mod steward_liveness_test_support {
         )
     }
 
-    async fn store(dir: &dyn FederationDirectory, row: &Attestation) -> Result<(), Error> {
+    pub(crate) async fn store(
+        dir: &dyn FederationDirectory,
+        row: &Attestation,
+    ) -> Result<(), Error> {
         dir.put_attestation(SignedAttestation {
             attestation: row.clone(),
         })
@@ -13970,6 +14047,611 @@ pub(crate) mod steward_liveness_test_support {
             ObjectionOutcome::Admitted,
             "with one authority root re-bound the commons federates again — the stricter fold is \
              a gate, never a tombstone"
+        );
+    }
+}
+
+/// (CIRISPersist#593) — the **moderation-duty walk liveness** witness, run by
+/// the memory / sqlite / postgres suites against `&dyn FederationDirectory`.
+///
+/// The property: a `delegates_to` on a moderation chain that has been retracted
+/// by an admitted `withdraws` its own GRANTER never issued (CEG §3.2.3 rules
+/// 2/3/4 — subject self-revocation, canonical-bound claimant, consent-revocation
+/// proxy) confers no `moderate` / `takedown` / `review` duty. Before this cut it
+/// did, through all five readers: [`reachable_under_scope`],
+/// [`reachable_under_scope_with_reasons`], [`is_named_moderator`],
+/// [`moderators_of`] / [`appointed_moderators_of`], and the write chokepoint
+/// [`check_moderation_admission`].
+///
+/// The witness asserts TWO biconditionals at every state transition, not because
+/// they are interesting on their own but because they are what makes a per-site
+/// repair impossible to land silently — each spans a DIFFERENT pair of the three
+/// walks that were three copies before [`scoped_delegation_reach`]:
+///
+///   * `is_named_moderator(k, …)` ⟺ `k ∈ moderators_of(…)` — the predicate
+///     projection against the enumerating projection.
+///   * `reachable_under_scope(…)` ⟺ `reachable_under_scope_with_reasons(…) ==
+///     Reachable` — the predicate projection against the classifying one.
+///
+/// Together they pin all three former copies against each other. Repair one and
+/// not the others and one of the two goes red; both failures are exercised as
+/// mutations and recorded in the CHANGELOG.
+#[cfg(all(test, any(feature = "sqlite", feature = "postgres")))]
+pub(crate) mod moderation_walk_liveness_test_support {
+    use super::steward_liveness_test_support::{
+        bare_edge_retraction, register, signed_row, store, withdraws_of,
+    };
+    use super::*;
+    use crate::federation::tier_ingest::test_support::sign_community;
+    use crate::federation::types::{attestation_type, consensus_protocol, identity_type};
+    use crate::federation::types::{Community, CommunityMember};
+    use crate::federation::{Attestation, FederationDirectory};
+    use chrono::Utc;
+
+    /// A `delegates_to(granter → recipient)` on the §11.10 moderation plane.
+    /// Distinct from the steward witness's helper only in carrying an explicit
+    /// `sub_delegation` flag — the §13.3 deputization gate the moderation walk
+    /// enforces and the steward walk does not.
+    fn moderation_edge(
+        granter: &str,
+        recipient: &str,
+        scope: &[&str],
+        subjects: &[&str],
+        sub_delegation: bool,
+    ) -> Attestation {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut row = signed_row(
+            granter,
+            recipient,
+            attestation_type::DELEGATES_TO,
+            serde_json::json!({
+                "id": id,
+                "scope": scope.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+                "sub_delegation": sub_delegation,
+            }),
+        );
+        row.subject_key_ids = subjects.iter().map(|s| (*s).to_owned()).collect();
+        row
+    }
+
+    /// A `founder_only` commons rooted at a single steward-bound founder. The
+    /// strict protocol is deliberate: under `founder_only` the community
+    /// authority set and the founder set COINCIDE, so [`moderators_of`] and
+    /// [`appointed_moderators_of`] must return the same list — the cheapest
+    /// available pin on the "two root sets, one walk" invariant.
+    async fn commons(dir: &dyn FederationDirectory, community: &str, founder: &str, suffix: &str) {
+        let now = Utc::now();
+        dir.put_community(sign_community(
+            founder,
+            Community {
+                community_key_id: community.to_owned(),
+                community_name: format!("moderation commons {suffix}"),
+                members: vec![CommunityMember {
+                    key_id: founder.to_owned(),
+                    joined_at: now,
+                    role: Some(MEMBER_ROLE_FOUNDER.to_owned()),
+                }],
+                founded_at: now,
+                consensus_protocol: consensus_protocol::FOUNDER_ONLY.to_owned(),
+                policy_blob: None,
+                persist_row_hash: String::new(),
+            },
+        ))
+        .await
+        .expect("a founder-rooted commons is admissible");
+    }
+
+    /// **BICONDITIONAL 1** — the predicate walk against the enumerating walk.
+    /// Returns the roster so the caller can assert membership directly.
+    async fn assert_moderator_agreement(
+        dir: &dyn FederationDirectory,
+        community: &str,
+        duty: &str,
+        keys: &[&str],
+        at: &str,
+    ) -> Vec<String> {
+        let roster = moderators_of(dir, community, duty)
+            .await
+            .expect("moderators_of");
+        let appointed = appointed_moderators_of(dir, community, duty)
+            .await
+            .expect("appointed_moderators_of");
+        assert_eq!(
+            roster, appointed,
+            "[{at}] under `founder_only` the authority set IS the founder set, so \
+             moderators_of == appointed_moderators_of — the invariant `appointed_moderators_of` \
+             states in prose (one reachability predicate, two root sets)"
+        );
+        for k in keys {
+            let named = is_named_moderator(dir, k, community, duty)
+                .await
+                .expect("is_named_moderator");
+            assert_eq!(
+                named,
+                roster.iter().any(|m| m == k),
+                "[{at}] is_named_moderator({k}) <=> {k} ∈ moderators_of() — THE biconditional \
+                 admission.rs states in prose over TWO different walks. named={named} \
+                 roster={roster:?}"
+            );
+        }
+        roster
+    }
+
+    /// **BICONDITIONAL 2** — the `bool` walk against the with-reasons walk.
+    /// Returns the typed verdict so the caller can assert the classification.
+    async fn assert_reach_agreement(
+        dir: &dyn FederationDirectory,
+        issuer: &str,
+        target: &str,
+        scope: &str,
+        at: &str,
+    ) -> ReachabilityVerdict {
+        let flag =
+            reachable_under_scope(dir, issuer, target, scope, MAX_MODERATION_DELEGATION_DEPTH)
+                .await
+                .expect("reachable_under_scope");
+        let verdict = reachable_under_scope_with_reasons(
+            dir,
+            issuer,
+            target,
+            scope,
+            MAX_MODERATION_DELEGATION_DEPTH,
+        )
+        .await
+        .expect("reachable_under_scope_with_reasons");
+        assert_eq!(
+            flag,
+            verdict == ReachabilityVerdict::Reachable,
+            "[{at}] reachable_under_scope({issuer} -> {target}, {scope}) <=> \
+             reachable_under_scope_with_reasons(..) == Reachable — the byte-identical claim \
+             admission.rs makes over TWO different walks. flag={flag} verdict={verdict:?}"
+        );
+        verdict
+    }
+
+    /// The #593 behavioural witness. Run against every backend.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn exercise_moderation_walk_liveness(
+        dir: &dyn FederationDirectory,
+        suffix: &str,
+    ) {
+        let duty = DELEGATION_SCOPE_MODERATE;
+        let founder = format!("mw-founder-{suffix}");
+        let deputy = format!("mw-deputy-{suffix}");
+        let leaf = format!("mw-leaf-{suffix}");
+        let community = format!("mw-commons-{suffix}");
+
+        // The identity types are forced by the two `delegates_to` gates that
+        // bracket the moderation plane, and getting them wrong makes the
+        // fixture unstoreable rather than merely unrealistic:
+        //   * the RECIPIENT of a duty edge may not be `user`-role — a
+        //     `user → user` delegation is a steward-binding and CC 3.2 admits
+        //     it only for a proven minor or an attested-incapacitated adult
+        //     (`check_user_target_steward_binding_admission`);
+        //   * nor `node`-only — CC 4.4.3.4.3 confines a node delegate to
+        //     `infra:*` scopes, so a `moderate` edge to one is refused
+        //     (`check_node_agency_admission`).
+        // `primitive` is the shape the existing §11.11 fixtures use, and the
+        // ROOT must be `user` because §11.11 requires a steward-bound authority.
+        register(dir, &founder, &[identity_type::USER]).await;
+        register(dir, &community, &[identity_type::USER]).await;
+        for k in [&deputy, &leaf] {
+            register(dir, k, &[identity_type::PRIMITIVE]).await;
+        }
+        commons(dir, &community, &founder, suffix).await;
+        assert!(
+            is_steward_bound(dir, &founder)
+                .await
+                .expect("is_steward_bound"),
+            "the `user`-role founder self-anchors — §11.11 requires a steward-bound authority root"
+        );
+
+        // ── the live moderation chain ────────────────────────────────────
+        // founder →(moderate, sub_delegation) deputy →(moderate) leaf.
+        let e_fd = moderation_edge(&founder, &deputy, &[duty], &[&deputy], true);
+        let e_dl = moderation_edge(&deputy, &leaf, &[duty], &[&leaf], false);
+        store(dir, &e_fd).await.expect("founder -> deputy admitted");
+        store(dir, &e_dl).await.expect("deputy -> leaf admitted");
+
+        let roster = assert_moderator_agreement(
+            dir,
+            &community,
+            duty,
+            &[&founder, &deputy, &leaf],
+            "live chain",
+        )
+        .await;
+        assert_eq!(
+            roster,
+            {
+                let mut want = vec![founder.clone(), deputy.clone(), leaf.clone()];
+                want.sort();
+                want
+            },
+            "the whole live chain is the named-moderator set"
+        );
+        assert_eq!(
+            assert_reach_agreement(dir, &founder, &deputy, duty, "live chain").await,
+            ReachabilityVerdict::Reachable
+        );
+        assert_eq!(
+            assert_reach_agreement(dir, &founder, &leaf, duty, "live chain").await,
+            ReachabilityVerdict::Reachable
+        );
+        for k in [&deputy, &leaf] {
+            check_moderation_admission(
+                dir,
+                k,
+                &std::iter::once(founder.clone()).collect(),
+                duty,
+                "content:deadbeef",
+            )
+            .await
+            .expect("the write chokepoint admits a live delegated moderator");
+        }
+
+        // ── the SUBJECT revokes the founder → deputy edge ────────────────
+        // CEG §3.2.3 rule 2. The edge's own granter never issued it — exactly
+        // the row the granter-scoped fold cannot see.
+        let revocation = withdraws_of(&deputy, &deputy, &e_fd.attestation_id);
+        store(dir, &revocation)
+            .await
+            .expect("a rule-2 withdraws against the delegation must be ADMITTED");
+        let stored = dir
+            .get_attestation(&revocation.attestation_id)
+            .await
+            .expect("read")
+            .expect("the withdraws is stored");
+        assert_eq!(
+            stored.withdraws_admission_rule,
+            Some(2),
+            "the fixture must exercise the rule-2 (non-granter) arm — if this is None the \
+             withdraws was admitted unresolved and the witness proves nothing about authority"
+        );
+
+        // ── THE DEFECT (#593): everything downstream of a dead edge is dead ──
+        let roster = assert_moderator_agreement(
+            dir,
+            &community,
+            duty,
+            &[&founder, &deputy, &leaf],
+            "subject-revoked hop",
+        )
+        .await;
+        assert_eq!(
+            roster,
+            vec![founder.clone()],
+            "a delegates_to retracted by an admitted withdraws its granter never issued must NOT \
+             confer a moderation duty — CIRISPersist#593, the third site of the fold #578 and \
+             #584 each closed on their own plane. roster={roster:?}"
+        );
+        assert_eq!(
+            assert_reach_agreement(dir, &founder, &deputy, duty, "subject-revoked hop").await,
+            ReachabilityVerdict::RetractedAtRoot,
+            "the retracted edge IS the edge to this target, so the with-reasons walk must name \
+             the retraction — including the retraction the granter never issued"
+        );
+        assert_eq!(
+            assert_reach_agreement(dir, &founder, &leaf, duty, "subject-revoked hop").await,
+            ReachabilityVerdict::SignerUnreached,
+            "the retracted edge is NOT the edge to `leaf`, so the classification is \
+             SignerUnreached — the founder emitted delegation, and no live scoped path reaches"
+        );
+        for k in [&deputy, &leaf] {
+            let err = check_moderation_admission(
+                dir,
+                k,
+                &std::iter::once(founder.clone()).collect(),
+                duty,
+                "content:deadbeef",
+            )
+            .await
+            .expect_err("the write chokepoint must refuse a dead delegated chain");
+            assert_eq!(
+                err.kind(),
+                "federation_delegated_scope_unauthorized",
+                "the refusal must be the §11.10 gate NAMING itself: {err}"
+            );
+        }
+
+        // ── the granter-scoped arm is NOT subsumed ───────────────────────
+        // A BARE §11.10 edge-retraction carries no `references_attestation_id`,
+        // so the new incoming clause cannot see it. This step goes red if the
+        // granter-scoped clause is ever deleted as redundant.
+        let d2 = format!("mw-deputy2-{suffix}");
+        let c2 = format!("mw-commons2-{suffix}");
+        let f2 = format!("mw-founder2-{suffix}");
+        for k in [&f2, &c2] {
+            register(dir, k, &[identity_type::USER]).await;
+        }
+        register(dir, &d2, &[identity_type::PRIMITIVE]).await;
+        commons(dir, &c2, &f2, suffix).await;
+        store(dir, &moderation_edge(&f2, &d2, &[duty], &[], true))
+            .await
+            .expect("second chain admitted");
+        assert_moderator_agreement(dir, &c2, duty, &[&f2, &d2], "second live chain").await;
+        assert_eq!(
+            assert_reach_agreement(dir, &f2, &d2, duty, "second live chain").await,
+            ReachabilityVerdict::Reachable
+        );
+        store(dir, &bare_edge_retraction(&f2, &d2))
+            .await
+            .expect("the granter's own edge-retraction lands");
+        assert_eq!(
+            moderators_of(dir, &c2, duty).await.expect("moderators_of"),
+            vec![f2.clone()],
+            "the granter-scoped clause reads rows the incoming clause cannot see — it is not \
+             subsumed and must not be deleted"
+        );
+        assert_eq!(
+            assert_reach_agreement(dir, &f2, &d2, duty, "granter-retracted").await,
+            ReachabilityVerdict::RetractedAtRoot
+        );
+
+        // ── a withdraws naming an ABSENT attestation is a decoy ──────────
+        let d3 = format!("mw-deputy3-{suffix}");
+        let c3 = format!("mw-commons3-{suffix}");
+        let f3 = format!("mw-founder3-{suffix}");
+        for k in [&f3, &c3] {
+            register(dir, k, &[identity_type::USER]).await;
+        }
+        register(dir, &d3, &[identity_type::PRIMITIVE]).await;
+        commons(dir, &c3, &f3, suffix).await;
+        store(dir, &moderation_edge(&f3, &d3, &[duty], &[&d3], true))
+            .await
+            .expect("third chain admitted");
+        store(
+            dir,
+            &withdraws_of(&d3, &d3, &uuid::Uuid::new_v4().to_string()),
+        )
+        .await
+        .expect("a withdraws naming an absent target admits unresolved");
+        assert_eq!(
+            assert_moderator_agreement(dir, &c3, duty, &[&f3, &d3], "unrelated withdraws").await,
+            {
+                let mut want = vec![f3.clone(), d3.clone()];
+                want.sort();
+                want
+            },
+            "a withdraws that references some OTHER attestation must not fold this edge away"
+        );
+
+        // ── scope isolation is untouched ─────────────────────────────────
+        assert_eq!(
+            assert_reach_agreement(dir, &f3, &d3, DELEGATION_SCOPE_REVIEW, "scope isolation").await,
+            ReachabilityVerdict::MissingScope,
+            "a `moderate`-only chain still confers no `review` — the load-bearing scope-isolation \
+             property (CIRISRegistry#90 'and only then')"
+        );
+
+        // ── THE SCOPE DECISION, pinned ───────────────────────────────────
+        // The new clause is gated on `policy.skip_withdrawn_edges`, so the
+        // CONSENT_REVOCATION walk (whose doc pins it BYTE-IDENTICAL to v6.4.0)
+        // is unchanged: a subject-revoked hop still confers proxy revocation
+        // authority. That plane carries the same defect and is filed
+        // separately as CIRISPersist#594, NOT widened here. Flip the gate and
+        // this goes red.
+        //
+        // **This block is CIRISPersist#594's tripwire, and #594 says so.** Do
+        // not delete it when that issue is fixed — RETARGET it. The two
+        // assertions below record the plane's behaviour exactly as it stands
+        // today, including the stronger fact #594 names: this walk consults NO
+        // retraction at all, not even the granter's own.
+        let cr_from = format!("mw-cr-from-{suffix}");
+        let cr_to = format!("mw-cr-to-{suffix}");
+        register(dir, &cr_from, &[identity_type::USER]).await;
+        register(dir, &cr_to, &[identity_type::PRIMITIVE]).await;
+        let cr_edge = moderation_edge(
+            &cr_from,
+            &cr_to,
+            &[DELEGATION_SCOPE_CONSENT_REVOCATION],
+            &[&cr_to],
+            true,
+        );
+        store(dir, &cr_edge).await.expect("cr edge admitted");
+        let cr_targets: std::collections::HashSet<String> =
+            std::iter::once(cr_to.clone()).collect();
+        assert!(
+            issuer_reaches_target_via_consent_revocation_delegation(
+                dir,
+                &cr_from,
+                &cr_targets,
+                MAX_WITHDRAWS_DELEGATION_DEPTH,
+            )
+            .await
+            .expect("consent-revocation walk"),
+            "the live consent-revocation edge confers proxy authority"
+        );
+        store(dir, &withdraws_of(&cr_to, &cr_to, &cr_edge.attestation_id))
+            .await
+            .expect("the subject's rule-2 withdraws lands");
+        assert!(
+            issuer_reaches_target_via_consent_revocation_delegation(
+                dir,
+                &cr_from,
+                &cr_targets,
+                MAX_WITHDRAWS_DELEGATION_DEPTH,
+            )
+            .await
+            .expect("consent-revocation walk"),
+            "CIRISPersist#593 deliberately does NOT widen the consent-revocation plane: its walk \
+             policy sets `skip_withdrawn_edges = false` and its doc pins it byte-identical to \
+             v6.4.0. Widening it silently is what this assertion exists to stop — the same defect \
+             is filed as CIRISPersist#594, with its own adopters and its own adoption note"
+        );
+        // …and the stronger fact, recorded here because it is the reason #594
+        // exists rather than being folded in: the GRANTER's own edge-retraction
+        // is equally invisible on this plane. `skip_withdrawn_edges = false`
+        // means no retraction is consulted at all — the narrow fold #578/#584/
+        // #593 each repaired is a SUBSET of this one. Verified, not inferred.
+        store(dir, &bare_edge_retraction(&cr_from, &cr_to))
+            .await
+            .expect("the granter's own edge-retraction lands");
+        assert!(
+            issuer_reaches_target_via_consent_revocation_delegation(
+                dir,
+                &cr_from,
+                &cr_targets,
+                MAX_WITHDRAWS_DELEGATION_DEPTH,
+            )
+            .await
+            .expect("consent-revocation walk"),
+            "CIRISPersist#594: the consent-revocation proxy walk consults NO retraction — not even \
+             one the granter issued itself. This assertion documents the defect as it stands; when \
+             #594 lands it must be RETARGETED (flipped to `!`), never deleted"
+        );
+    }
+
+    /// **THE READ COST, MEASURED** (CIRISPersist#593) — and the short-circuit,
+    /// proven rather than asserted.
+    ///
+    /// The new incoming-retraction clause costs a directory read the walk did
+    /// not make before, and "≈2× reads, memoized per recipient" is a claim that
+    /// has to be checked against a counter, not against an argument. This body
+    /// pins four numbers on a `founder → deputy → leaf → tail` chain, using the
+    /// memory backend's [`attestation_read_counts`] — a count of what the
+    /// SUBSTRATE was asked for, external to the walk. The counts are properties
+    /// of the shared walk, not of the backend: all three backends run this exact
+    /// body and issue this exact sequence of calls.
+    ///
+    /// [`attestation_read_counts`]: crate::store::memory::MemoryBackend::attestation_read_counts
+    pub(crate) async fn exercise_moderation_walk_read_cost(
+        backend: &crate::store::memory::MemoryBackend,
+        suffix: &str,
+    ) {
+        let duty = DELEGATION_SCOPE_MODERATE;
+        let founder = format!("mc-founder-{suffix}");
+        let deputy = format!("mc-deputy-{suffix}");
+        let leaf = format!("mc-leaf-{suffix}");
+        let tail = format!("mc-tail-{suffix}");
+        register(backend, &founder, &[identity_type::USER]).await;
+        for k in [&deputy, &leaf, &tail] {
+            register(backend, k, &[identity_type::PRIMITIVE]).await;
+        }
+        for (g, r) in [(&founder, &deputy), (&deputy, &leaf), (&leaf, &tail)] {
+            store(backend, &moderation_edge(g, r, &[duty], &[r], true))
+                .await
+                .expect("chain edge admitted");
+        }
+
+        // (1) THE COST. A three-hop probe reads the two granters on the path
+        //     (as it always did) plus the two recipients whose edges survived
+        //     every cheaper gate. Two reads became four: exactly the 2× ceiling
+        //     the walk's doc claims, and NOT a per-hop fan-out.
+        //
+        //     The design this cut was built from estimated "3 reads → 5" for
+        //     this chain. Measured, it is 2 → 4: the predicate stops at the
+        //     edge INTO the target and never dequeues the target itself, so the
+        //     pre-#593 walk read one fewer node than the estimate assumed.
+        backend.reset_attestation_read_counts();
+        assert!(
+            reachable_under_scope(
+                backend,
+                &founder,
+                &leaf,
+                duty,
+                MAX_MODERATION_DELEGATION_DEPTH
+            )
+            .await
+            .expect("reachable_under_scope"),
+            "the live chain reaches the leaf"
+        );
+        assert_eq!(
+            backend.attestation_read_counts(),
+            (2, 2),
+            "(list_attestations_by, list_attestations_for) for a founder -> deputy -> leaf probe. \
+             `by` is unchanged from before CIRISPersist#593 (one per DEQUEUED node: founder, \
+             deputy); `for` is the new clause, one per DISTINCT SURVIVING RECIPIENT (deputy, \
+             leaf). If `for` ever exceeds `by` on a simple chain the memo has stopped working"
+        );
+
+        // (2) THE SHORT-CIRCUIT SURVIVED THE EXTRACTION. A depth-1 target ends
+        //     the walk at the first hit: the founder's out-rows are read, the
+        //     deputy's are NOT, and neither leaf nor tail is ever touched.
+        backend.reset_attestation_read_counts();
+        assert!(
+            reachable_under_scope(
+                backend,
+                &founder,
+                &deputy,
+                duty,
+                MAX_MODERATION_DELEGATION_DEPTH
+            )
+            .await
+            .expect("reachable_under_scope"),
+            "the founder reaches the deputy directly"
+        );
+        assert_eq!(
+            backend.attestation_read_counts(),
+            (1, 1),
+            "the predicate must RETURN at the first edge into `targets` — one granter read, one \
+             recipient read, and no traversal past the hit. CIRISPersist#584 had to give its \
+             up-walk's short-circuit away to make its readers agree; this extraction did not, \
+             and this is the number that proves it"
+        );
+
+        // (3) …and the SAME body still enumerates exhaustively, because the
+        //     enumerating caller passes an EMPTY `targets` that no edge can be
+        //     in. Four granter reads (every node), three recipient reads.
+        backend.reset_attestation_read_counts();
+        let reach = enumerate_scoped_delegation_reach(
+            backend,
+            &founder,
+            duty,
+            MAX_MODERATION_DELEGATION_DEPTH,
+            DelegationWalkPolicy::MODERATION_DUTY,
+        )
+        .await
+        .expect("enumerate_scoped_delegation_reach");
+        let mut reach: Vec<String> = reach.into_iter().collect();
+        reach.sort();
+        assert_eq!(
+            reach,
+            {
+                let mut want = vec![deputy.clone(), leaf.clone(), tail.clone()];
+                want.sort();
+                want
+            },
+            "empty targets ⇒ no short-circuit ⇒ full enumeration from the predicate's own body"
+        );
+        assert_eq!(
+            backend.attestation_read_counts(),
+            (4, 3),
+            "the enumerating projection walks the whole chain — 4 dequeued nodes, 3 distinct \
+             recipients. The contrast with (2) IS the short-circuit"
+        );
+
+        // (4) THE MEMO IS KEYED ON THE RECIPIENT, NOT THE EDGE. Five parallel
+        //     `moderate` edges from one granter to one deputy cost ONE incoming
+        //     read, so the fan-out is bounded by distinct recipients and can
+        //     never be bounded by edges.
+        let f4 = format!("mc-fan-founder-{suffix}");
+        let d4 = format!("mc-fan-deputy-{suffix}");
+        register(backend, &f4, &[identity_type::USER]).await;
+        register(backend, &d4, &[identity_type::PRIMITIVE]).await;
+        for _ in 0..5 {
+            store(backend, &moderation_edge(&f4, &d4, &[duty], &[&d4], true))
+                .await
+                .expect("parallel edge admitted");
+        }
+        backend.reset_attestation_read_counts();
+        assert!(
+            !reachable_under_scope(
+                backend,
+                &f4,
+                &format!("mc-absent-{suffix}"),
+                duty,
+                MAX_MODERATION_DELEGATION_DEPTH
+            )
+            .await
+            .expect("reachable_under_scope"),
+            "the probe target is not in the graph, so the walk runs to exhaustion"
+        );
+        assert_eq!(
+            backend.attestation_read_counts(),
+            (2, 1),
+            "5 edges, ONE distinct recipient, ONE incoming read — memoized per recipient for the \
+             whole walk. Key the memo on the granter instead and this becomes 5"
         );
     }
 }
