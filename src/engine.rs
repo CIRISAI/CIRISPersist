@@ -11209,6 +11209,110 @@ mod tests {
         );
     }
 
+    /// #589 / AV-83 — **`Engine::attestation_promote` does not PRE-STAMP the
+    /// placement**, so a promotion refused on authority grounds leaves the row
+    /// byte-identical (AV-9).
+    ///
+    /// Until v25.2.0 the engine called `set_attestation_cohort_scope` first and
+    /// `promote_attestation` second, on the reasoning that a mid-sequence
+    /// failure left a coherent `(local, <new scope>)` row for a retry to
+    /// complete. That held only while promotion could not REFUSE. Once
+    /// `check_promotion_admission` landed, the pre-stamp meant a refused
+    /// promotion had already rewritten `cohort_scope` and `persist_row_hash`.
+    ///
+    /// The substrate state machine found it (I2a), but found it *through* an
+    /// AV-45 refusal that the shipped gate deliberately does not perform — so
+    /// with the fix as shipped, the harness only rediscovers this hazard when
+    /// its random search happens to pair a scope-CHANGING `Promote` with a
+    /// refusing one. A probabilistic witness for an ordering rule is not a
+    /// witness. This drives the refusal deterministically: a de-admitted
+    /// author, a requested placement that DIFFERS from the row's current one,
+    /// and an assertion on every field the pre-stamp used to move.
+    ///
+    /// Re-deriving the mutation is the point of the test: restoring the
+    /// pre-stamp in `attestation_promote` turns this red and nothing else in
+    /// the suite red.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn attestation_promote_refusal_does_not_prestamp_placement_589() {
+        use crate::federation::types::{attestation_tier, cohort_scope};
+        use crate::federation::{FederationDirectory, SignedAttestation};
+
+        let signer = pqc_signer("occ589ps");
+        let node = signer.derived_key_id();
+        let engine = Engine::with_signer(signer, "sqlite::memory:")
+            .await
+            .expect("engine");
+        let sq = engine.sqlite_backend().expect("sqlite").clone();
+        sq.set_self_key_id(Some(node.clone()));
+
+        let attester = "p589ps-attester".to_string();
+        let subject = "s589ps-subject".to_string();
+        // The node registers with the DETERMINISTIC hybrid pubkeys (not
+        // `seed_promote_key`'s classical-only record): it has to author a real,
+        // hybrid-verifiable de-admission row below, and it is also the
+        // promotion's `scrub_key_id` FK.
+        for k in [&node, &attester, &subject] {
+            crate::federation::tier_ingest::test_support::register_hybrid_key(&*sq, k).await;
+        }
+
+        // A local row at `self` — so the requested `federation` placement is a
+        // real change, and a pre-stamp would be visible.
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut row = crate::federation::bootstrap_admission::test_support::scores_row(
+            &id,
+            &attester,
+            &subject,
+            "trust:demo:v1",
+        );
+        row.tier = attestation_tier::LOCAL.to_owned();
+        row.cohort_scope = cohort_scope::SELF.to_owned();
+        sq.put_attestation(SignedAttestation { attestation: row })
+            .await
+            .expect("#589: the local row admits while its author is in good standing");
+        let before = sq.get_attestation(&id).await.unwrap().expect("row");
+        assert_eq!(before.cohort_scope, cohort_scope::SELF);
+
+        // The node de-admits the author. AV-77 now refuses the promotion — a
+        // refusal that arrives from INSIDE the primitive, which is exactly
+        // where the old ordering had already mutated by the time it fired.
+        sq.put_attestation(SignedAttestation {
+            attestation: crate::federation::bootstrap_admission::test_support::scores_row(
+                &uuid::Uuid::new_v4().to_string(),
+                &node,
+                &attester,
+                crate::federation::admission::PEER_DEADMISSION_DIMENSION,
+            ),
+        })
+        .await
+        .expect("#589: a node may always author its own de-admission");
+
+        let err = engine
+            .attestation_promote(&id, cohort_scope::FEDERATION)
+            .await
+            .expect_err("#589: promoting a de-admitted author's row is refused");
+        assert!(
+            format!("{err}").contains("de-admitted"),
+            "#589: the refusal names the de-admission: {err}"
+        );
+
+        let after = sq.get_attestation(&id).await.unwrap().expect("row");
+        assert_eq!(
+            after.cohort_scope,
+            cohort_scope::SELF,
+            "#589: THE PRE-STAMP IS GONE — a refused promotion must not move cohort_scope"
+        );
+        assert_eq!(
+            after.tier,
+            attestation_tier::LOCAL,
+            "#589: and must not move the tier"
+        );
+        assert_eq!(
+            after.persist_row_hash, before.persist_row_hash,
+            "#589: byte-identical (AV-9 / the state machine's I2a, made deterministic)"
+        );
+    }
+
     // ── v21.2.0 (CIRISPersist#509 FLOOR) — "the payload follows the
     //    consent edge": promote_consented_backlog + its two chokepoints.
 
