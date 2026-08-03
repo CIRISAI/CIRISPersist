@@ -5,6 +5,83 @@ All notable changes per release. Format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html), with mission /
 threat-model citations because this crate's audit story is the point.
 
+## [Unreleased] — #594: a revoked proxy could still revoke consent for someone who cannot hold a key
+
+**Occurrence four of the retraction-fold class, and the only one that consulted no retraction at
+all.** #578, #584 and #593 each consulted too *narrow* a set — granter-scoped, missing
+subject-revocations. On the consent-revocation proxy plane the retraction bucket was **never built**:
+`DelegationWalkPolicy::CONSENT_REVOCATION` set `skip_withdrawn_edges = false`. The narrower defect is
+a strict subset of this one.
+
+The single consumer is CEG 2.4.1.1 **rule (3)** — the proxy path by which an agent revokes consent
+*on behalf of* a subject who cannot hold a federation key: a Discord user-id, a
+content-sha256-bound entity. So a `delegates_to` withdrawn **by its own granter** kept conferring the
+right to speak for exactly the party CC 1.13.2 names as least able to object.
+
+### The flag is deleted, not flipped
+
+`skip_withdrawn_edges` was introduced in v8.7.1 to give the moderation walk per-edge revocation
+*without* changing the consent walk, and documented as keeping it "BYTE-IDENTICAL to the v6.4.0
+behaviour". That was true, and it was the defect: byte-identical-to-v6.4.0 preserved a v6.4.0 **gap**
+rather than a v6.4.0 **decision**. Nothing anywhere recorded that a plane should ignore retractions —
+it read as compatibility, and compatibility with an unexamined default is not a policy.
+
+A flag whose only correct value is `true` is a way for `false` to come back, so there is now no way
+to spell a walk that skips the gates.
+
+### The question this plane raises and the moderation plane does not
+
+Rule-(3) authority **is itself a revocation mechanism**, so honouring retractions here could have
+created a self-defence or self-elevation loop. It does not, and the reason is structural rather than
+a rule bolted on:
+
+- the walk is **directed**, and a `delegates_to` names its **recipient** in `subject_key_ids` — so
+  retracting the edge that empowers you is resignation, which is what rule 2 is for;
+- **sibling proxies under one root never reach each other**, so neither can obtain rule-(3) standing
+  against the other's edge and become the sole proxy for a subject who cannot object.
+
+The sibling case is the one that would be a privilege escalation, and it is prevented by a topology
+property rather than by a check — so it is now **pinned by the witness**, not left as reasoning.
+
+### Adoption — proxy chains that work today will stop working
+
+**Who is affected:** any deployment where a `consent_revocation` `delegates_to` was retracted and the
+proxy kept operating. That worked; it now refuses.
+
+**The affected subject cannot self-serve a replacement** — by construction they hold no key. Only the
+granter (or another party with standing) can appoint a new proxy. Persist honouring the retraction is
+not what strands them; the granter retracting without appointing a successor is. The substrate's job
+is to report that, not to paper over it.
+
+Two sharp edges, both recorded rather than discovered later:
+
+- **Gate (a) is recipient-scoped, not edge-scoped.** It buckets a granter's retractions by
+  `attested_key_id` and never reads `references_attestation_id`, so retracting *one* delegation to a
+  recipient retracts *every* edge to them across all scopes — verified: a `review` retraction by id
+  kills the `consent_revocation` proxy beside it. This predates the cut but only bound the moderation
+  plane. Over-broad in the **safe** direction; narrowing it would *loosen* §11.10 as a side effect of
+  a consent fix, which this cut may not do silently.
+- **The refusal is not diagnosable.** It arrives as a bare `WithdrawsNotAdmitted` carrying only
+  `issuer` + `target_attestation_id`, and `reachable_under_scope_with_reasons` — the surface an
+  operator will reach for — hard-codes `MODERATION_DUTY`, so it answers under attenuation and
+  deputization gates the consent plane does not apply and can report `SignerUnreached` for a chain
+  the consent walk traverses. A classified consent-plane verdict is a new `deontic` FFI surface and a
+  separate cut; closing the authority hole should not wait on it.
+
+### Cost, measured
+
+A two-hop rule-(3) probe: **2 reads → 4** (`2 by, 2 for`), the same 2× ceiling the walk's doc claims
+and identical to the moderation plane's own figure — which is the point, the two planes now run the
+same gates. The pre-fix figure of `(2, 0)` is confirmed by mutation rather than asserted.
+
+### The tripwire is retargeted, not deleted — and restructured
+
+#593 shipped its consent-plane assertions recording the defect, with instructions to flip rather than
+delete them. This is that flip. It also **splits the fixture**: #593's version reused one edge for
+both clauses, so the granter-retraction assertion ran with the subject's retraction already in place
+and would have passed whether or not that clause existed. Two clauses reading different rows need two
+fixtures, or the weaker one is never under test.
+
 ## [28.1.0] — 2026-08-03 — #564: reachability stage 2, and the release primitive that always says no
 
 - **#564 stages 2-4** — `is_load_bearing` gains the composite-keyed classes
