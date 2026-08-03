@@ -786,6 +786,42 @@ def check() -> int:
 
     counts = collections.Counter(pin[s.key] for s in syms)
     tally = "  ".join(f"{c}={counts[c]}" for c in ORDER if counts[c])
+    # ── The evidence-layer projection must not drift from its source. ──────
+    # `evidence/ffi_classification.tsv` exists because CIRISConstitution asked
+    # for it: 53 testimonial rows living only in a gated TSV is itself a
+    # testimonial-class state, and the class should not exemplify its own
+    # wrong. But a projection nothing checks is just a second hand-maintained
+    # list — the defect this whole module exists to close. So it is checked.
+    proj = ROOT / "evidence" / "ffi_classification.tsv"
+    if not proj.exists():
+        print(
+            f"\u2717 {proj.relative_to(ROOT)} is missing. The Constitution reads the "
+            "evidence layer, not scripts/. Run `pyi_surface.py surface` to regenerate it.",
+            file=sys.stderr,
+        )
+        print("::error title=ffi classification::evidence projection absent")
+        return 1
+    want = {(s_.owner, s_.name, pin[s_.key]) for s_ in syms if s_.key in pin}
+    have = set()
+    for line in proj.read_text().splitlines():
+        if line.startswith("#") or not line.strip() or line.startswith("class\t"):
+            continue
+        f = line.split("\t")
+        if len(f) >= 5:
+            have.add((f[3], f[4], f[0]))
+    if want != have:
+        missing, extra = sorted(want - have)[:5], sorted(have - want)[:5]
+        print(
+            f"\u2717 {proj.relative_to(ROOT)} has drifted from scripts/ffi_taxonomy.tsv.\n"
+            f"   in the pin, absent from evidence: {missing}\n"
+            f"   in evidence, absent from the pin: {extra}\n"
+            "   Regenerate with `pyi_surface.py surface`. A projection that can disagree "
+            "with its source is the two-lists class, one layer out.",
+            file=sys.stderr,
+        )
+        print("::error title=ffi classification::evidence projection drifted from the pin")
+        return 1
+
     print(f"OK type stub covers and classifies all {len(syms)} PyO3-exported symbols.")
     print(f"   {tally}")
     print("   COMPLETE, not CORRECT: derived types are structurally exact and")
