@@ -24,7 +24,7 @@
 //! `minted_by_persist` entries — scoped to the three families persist is the
 //! PRODUCER of, because CC 3.1.7 R2(a) is a producer obligation. R2(a) is not
 //! the whole exposure. Measured on the vendored rc3 cut, those three are **3 of
-//! 17**.
+//! 18**.
 //!
 //! # What is derived and what is pinned
 //!
@@ -207,6 +207,24 @@ pub struct PersistFamilyRule {
 /// different asks they are.
 pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
     // ── NoRuleOnTheRow: the row is silent, so the classifier is too. ───────
+    PersistFamilyRule {
+        prefix: "x_private:",
+        rule: "the CC 3.1.7 Private Use range MUST NOT admit at federation tier under ANY \
+               authority, and MUST NOT be promoted to a registered family without minting a \
+               fresh name. Local tier admits; promotion and direct federation writes refuse",
+        enforced_at: &[
+            "federation::admission::check_private_use_not_federatable",
+            "federation::admission::check_promotion_admission",
+        ],
+        gap: RowRuleGap::NoRuleOnTheRow,
+        minted_by_persist: false,
+        cc_ask: "CIRISConstitution#67 + CIRISPersist#571 Asks 2/3 — R2 states the Private Use \
+                 MUST in 3.1.7 PROSE ONLY, names no refusal token where R2(b) names \
+                 `namespace_family_unregistered`, and the generator reaches only 3.1 tables. So \
+                 every substrate must hard-code the literal and nothing detects two disagreeing: \
+                 persist coined `namespace_private_use_not_federatable`. It is not a family, so \
+                 the ask is a `_meta` key, not a row",
+    },
     PersistFamilyRule {
         prefix: "age_self_declared:",
         rule: "the self rung is a `{band}` — an `age_self_declared:level*` spelling is refused \
@@ -404,6 +422,19 @@ pub const RULES_NOT_ON_THE_ROW: &[PersistFamilyRule] = &[
 /// declaration cannot outlive its truth.
 pub const NOT_A_FAMILY_RULE: &[(&str, &str)] = &[
     (
+        "regime:",
+        "NOT persist-ruled, and deliberately so (CIRISPersist#571). `regime:*` is \
+         the OPEN VOCABULARY CC 3.1.7 preserves — it is governed by nothing, so \
+         R2(b) admits it and ordinary consented egress federates it. Governing it \
+         today would REFUSE it: adding the stem to `HARD_CODED_RESERVED_STEMS` \
+         fails the R2(a) build gate AND refuses every emission on all three \
+         backends, killing the local-tier path CIRISAgent uses (proven by \
+         `governing_regime_today_would_refuse_it`). The literal appears in \
+         `regime.rs` only as the family the replication DECISION is about, never \
+         as a gate. It becomes persist-ruled the day CC lands a Part 3 row — and \
+         `regime_family_is_still_uncatalogued_upstream` fires then.",
+    ),
+    (
         "admin_action:",
         "a `hard_case` event-KIND token (`hard_case::kind::ADMIN_ACTION_PREFIX`), carried in the \
          `kind` column of an observed admin action — not a scored dimension",
@@ -542,6 +573,15 @@ pub fn persist_ruled_prefixes() -> Vec<String> {
         // registry and the classifier both speak.
         .chain(std::iter::once(
             registry::family_stem(admission::ATTESTATION_LADDER_DEPRECATED_PREFIX).to_owned(),
+        ))
+        // v27.0.0 (CIRISPersist#571) — persist rules on the CC 3.1.7 Private
+        // Use range: `x_private:` MUST NOT admit at federation tier under any
+        // authority (`check_private_use_not_federatable`, all three doors).
+        // Read at the const the gate itself branches on, never re-spelled —
+        // this arrived from a sibling branch and the scan caught it at merge,
+        // which is the whole reason the scan exists.
+        .chain(std::iter::once(
+            admission::PRIVATE_USE_FAMILY_STEM.to_owned(),
         ))
         // `revocation:peer_admission:v1` is a whole dimension, not a prefix —
         // the gate compares it for EQUALITY. Recorded as the family prefix so
@@ -814,9 +854,9 @@ mod tests {
         // stop, so it is checked here rather than trusted.
         assert_eq!(
             RULES_NOT_ON_THE_ROW.len(),
-            17,
+            18,
             "the inventory now has {} entries; this module's doc says the minted three are \"3 of \
-             17\". Update BOTH numbers so the claim a reader acts on is the claim the build \
+             18\". Update BOTH numbers so the claim a reader acts on is the claim the build \
              checked.",
             RULES_NOT_ON_THE_ROW.len()
         );
