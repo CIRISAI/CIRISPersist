@@ -50,3 +50,44 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 5.3.2.4	CLM-nsproc-cohort-scope-trace	CIRISPersist	src/engine.rs#Engine::promote_consented_backlog	ciris-persist@25.1.0
 5.3.2.4	CLM-nsproc-dimension-trace	CIRISPersist	src/federation/admission.rs#check_trace_dimension_admission	ciris-persist@25.1.0
 5.3.2.4	CLM-nsproc-subject-key-ids-trace	CIRISPersist	src/federation/admission.rs#check_trace_dimension_admission	ciris-persist@25.1.0
+
+# ── UNASSIGNED — awaiting a CC decimal ───────────────────────────────────────
+# v25.1.0 (CIRISPersist#577 follow-up) — adopted from CIRISVerify's registry
+# (CIRISVerify#233), which shipped this section first and was right to.
+#
+# Shipped, tested persist surface with NO CC identifier yet. Listed here so the
+# Constitution can issue decimals against real implementations rather than
+# against a proposal — the direction that matches how every one of these was
+# actually built (persist implements, CC ratifies, and the RC3 batch #46/#47/
+# #48/#49/#67 is that loop running).
+#
+# The decimal column carries `—`, which is CC check_claims.py's documented skip
+# sentinel (`if not dec or dec == "—": continue`). The literal string
+# "UNASSIGNED" there would be neither empty nor `—`, so the checker would add
+# it to the backed-DECIMAL set — registering a fake identifier. The
+# awaiting-assignment marker therefore rides the CLM name instead, where it
+# cannot be mistaken for a CC decimal.
+#
+# These cannot rot while they wait: persist's OWN resolver
+# (`evidence_cc_impl_pointers_resolve`) requires a definition for every src/
+# row regardless of decimal, so a rename fails our build even before CC sees
+# it. Proposed CLM names are suggestions, not claims.
+—	UNASSIGNED-CLM-conferral-plane-named	CIRISPersist	src/federation/trust_root.rs#ConferralPlane	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-drill-freshness-signal-not-gate	CIRISPersist	src/federation/trust_root.rs#DrillFreshness	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-transit-eligibility-shared-root	CIRISPersist	src/federation/trust_root.rs#resolve_transit_eligibility	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-key-refusal-names-its-branch	CIRISPersist	src/federation/register.rs#KeyRefusalReason	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-quota-refusal-names-its-budget	CIRISPersist	src/federation/replication/admission.rs#PeerQuotaRefusal	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-load-bearing-reachability	CIRISPersist	src/federation/load_bearing.rs#is_load_bearing	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-deletion-window-breach-evidence	CIRISPersist	src/federation/deletion_window.rs#run_deletion_window_watch	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-reverse-quorum-objection	CIRISPersist	src/federation/reverse_quorum.rs#record_objection	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-reverse-quorum-dismissal	CIRISPersist	src/federation/reverse_quorum.rs#record_objection_dismissal	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-consent-before-scoring	CIRISPersist	src/federation/admission.rs#check_capacity_consent_admission	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-peer-deadmission-revocable	CIRISPersist	src/federation/admission.rs#check_peer_deadmission	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-wa-adjudication-family	CIRISPersist	src/federation/ownership_reclaim.rs#build_reclaim_petition_envelope	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-wa-quorum-re-derived	CIRISPersist	src/federation/ownership_reclaim.rs#wa_quorum_over_body	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-reclaim-authority-fails-closed	CIRISPersist	src/federation/ownership_reclaim.rs#ReclaimPolicy::from_deployment_pin	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-quarantine-marker-not-command	CIRISPersist	src/federation/quarantine.rs#fold_quarantine	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-quarantine-serve-consult	CIRISPersist	src/federation/quarantine.rs#filter_withheld_rows	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-slash-duty-scope	CIRISPersist	src/federation/admission.rs#check_delegated_duty_scores_admission	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-admin-action-attributed	CIRISPersist	src/federation/hard_case.rs#check_admin_action_attribution	ciris-persist@25.1.0
+—	UNASSIGNED-CLM-revocation-history-bound	CIRISPersist	src/federation/register.rs#check_revocation_bound	ciris-persist@25.1.0

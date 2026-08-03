@@ -981,6 +981,64 @@ mod tests {
         );
     }
 
+    /// v25.1.0 — the Rust verify pin and the wheel's `Requires-Dist` are two
+    /// representations of ONE fact: which major of `ciris-verify` this build
+    /// speaks. Nothing checked that they agree, and they drifted.
+    ///
+    /// `pyproject.toml` last moved its range at the verify **10.0.0** re-pin.
+    /// #577 then took Cargo to `v11.0.0` and #582 to `v11.1.0`, so **v25.0.0
+    /// shipped a wheel declaring `ciris-verify>=10.0.0,<11` over a build that
+    /// linked v11** — `pip install ciris-persist ciris-verify==11.x` resolves
+    /// to a hard conflict against our own dependency. The file's own comment
+    /// block records four earlier instances of exactly this (v3.0.1, v5.0.0,
+    /// v6.2.0, v8.0.0). Four burns and a fifth: the lesson was written down
+    /// and still not enforced, which is what a comment can never do.
+    ///
+    /// Same class as [`evidence_cc_impl_rows_pin_the_current_crate_version`]
+    /// above, and the cure is the same — derive the check instead of trusting
+    /// the discipline. A verify re-pin now fails this test until the wheel
+    /// metadata follows it.
+    #[test]
+    fn verify_pin_major_matches_the_wheel_requires_dist() {
+        let cargo = include_str!("../../../Cargo.toml");
+        let pyproject = include_str!("../../../pyproject.toml");
+
+        let tag_majors: std::collections::BTreeSet<&str> = cargo
+            .lines()
+            .filter_map(|l| l.split_once("tag = \"v"))
+            .filter_map(|(_, rest)| rest.split_once('.'))
+            .map(|(major, _)| major)
+            .collect();
+        assert_eq!(
+            tag_majors.len(),
+            1,
+            "the CIRISVerify pins disagree on major: {tag_majors:?} — verify-core, \
+             ciris-crypto and ciris-keyring MUST flip together or `ciris_crypto` \
+             lands in the graph twice and its types stop unifying"
+        );
+        let cargo_major = tag_majors.iter().next().expect("one major");
+
+        let dist = pyproject
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("\"ciris-verify>="))
+            .expect("pyproject must declare a ciris-verify Requires-Dist range");
+        let floor_major = dist
+            .split_once(">=")
+            .and_then(|(_, r)| r.split_once('.'))
+            .map(|(m, _)| m)
+            .expect("range floor parses");
+
+        assert_eq!(
+            floor_major, *cargo_major,
+            "Cargo pins ciris-verify v{cargo_major}.x but the wheel declares \
+             {dist} — a published wheel whose Requires-Dist excludes the verify \
+             version its own Rust links makes `pip install ciris-persist \
+             ciris-verify=={cargo_major}.x` unsatisfiable. Bump the pyproject \
+             range in the SAME commit as the Cargo tag."
+        );
+    }
+
     /// Citations the manifest makes that name a symbol which is NOT a function
     /// (a type, trait, const, enum variant, or an inherent method spelled
     /// `Type::method`). Liveness is a property of FUNCTIONS; a cited type is

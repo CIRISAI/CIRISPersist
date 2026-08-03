@@ -8180,8 +8180,7 @@ mod tests {
     /// Neither direction may arrive as a side-effect of a dependency bump.
     #[test]
     fn verify_dimension_registry_is_the_only_enumeration() {
-        use ciris_verify_core::federation_provenance::dim::{self, ConsentClass};
-        use std::collections::BTreeSet;
+        use ciris_verify_core::federation_provenance::dim;
 
         // CC part_3's 15 rows; 14 verify FAMILIES (the locale leaf is a
         // sub-form of `provenance:build_manifest:`, not its own family), of
@@ -8206,56 +8205,36 @@ mod tests {
         // THE MEASURING SIDE'S CLASSIFICATION — the ONLY version-dependent
         // read of verify's registry in this crate. Everything else here and
         // in B7 uses `dim::ALL` / `dim::lookup` / `prefix` / `parameterized`,
-        // which are stable across the re-pin.
+        // which were stable across the re-pin.
         //
-        // **Pinned against ciris-verify-core v11.x.** CIRISVerify v12.0.0 —
-        // shipped in response to this rework, and agreeing with it — replaces
-        // this surface:
+        // **Now pinned against ciris-verify-core v12.0.0**, which verify
+        // shipped in response to this rework (CIRISVerify#238) and which
+        // agrees with CC 3.4.5 on all fourteen families:
         //
-        //   * `ConsentClass`                  -> `ConsentDisposition`
-        //   * `ConsensualReputation`          -> `ArtifactVerification` /
-        //                                        `AbuseResponse` (per CC 3.4.5)
-        //   * the predicate becomes a METHOD: `spec.is_consent_gated()`,
+        //   * `ConsentClass`         -> `ConsentDisposition`
+        //   * `ConsensualReputation` -> `ArtifactVerification` / `AbuseResponse`
+        //   * the predicate is now a METHOD, `spec.is_consent_gated()`,
         //     deliberately not an implicit property of a variant name, "so the
         //     wrong gate cannot be re-derived from variant names" — which is
         //     exactly the mistake #569 made.
         //
-        // ON RE-PIN, replace the block below with the STRONGER form verify
-        // proposed (it fires if verify ever re-gates ANY family, not only if
-        // one of four named prefixes moves):
-        //
-        //   for spec in dim::ALL {
-        //       assert!(
-        //           !spec.is_consent_gated(),
-        //           "{} is consent-gated by verify, but CC 3.4.5 gates no \
-        //            verify-owned family — adjudicate before following it",
-        //           spec.prefix
-        //       );
-        //   }
-        //
-        // Keep the two pins above and the ruling block below unchanged.
+        // The v11 form pinned four prefixes BY NAME. This one sweeps the whole
+        // registry, so it fires if verify ever re-gates ANY family rather than
+        // only if one of four named prefixes moves. Strictly stronger, and it
+        // was verify's own proposal.
         // ─────────────────────────────────────────────────────────────────
-        let verify_says_reputation: BTreeSet<&str> = dim::ALL
-            .iter()
-            .filter(|d| d.consent_class == ConsentClass::ConsensualReputation)
-            .map(|d| d.prefix)
-            .collect();
-        assert_eq!(
-            verify_says_reputation,
-            BTreeSet::from([
-                "attestation:license_validity",
-                "attestation:registry_consensus",
-                "cert_validity:",
-                "rollback_detected:",
-            ]),
-            "verify's ConsensualReputation set moved. These are the four families CC 3.4.5 \
-             dispositioned BY NAME and placed outside the consent gate. If this is the v12.0.0 \
-             re-pin, follow the block comment above and switch to the `is_consent_gated()` form. \
-             If it is anything else, the disagreement this test records has changed shape and \
-             needs a human: re-read CC 3.4.5's per-family disposition and decide whether the new \
-             classification changes what the FLOOR says — it usually will not, because verify's \
-             classification is a proposal from the measuring side, not a ruling."
-        );
+        for spec in dim::ALL {
+            assert!(
+                !spec.consent_disposition.is_consent_gated(),
+                "verify now consent-gates `{}`, but CC 3.4.5 gates NO verify-owned family — \
+                 consent-before-scoring binds the family that judges agents (`capacity:*`), \
+                 never the families that verify artifacts. Do NOT follow the measuring side \
+                 here: re-read CC 3.4.5's per-family disposition and adjudicate. Following \
+                 verify's classification over the floor's ruling is precisely the defect \
+                 CIRISPersist#569 shipped and CIRISVerify#238 corrected.",
+                spec.prefix
+            );
+        }
 
         // ── THE FLOOR'S RULING — persist gates NONE of verify's namespace ──
         // Over the WHOLE registry, not just the four above: a CC amendment
